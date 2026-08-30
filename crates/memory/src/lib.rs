@@ -14,6 +14,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 mod access;
 mod backing;
+mod direct;
+mod execution_gate;
 mod host_mapped;
 mod invalidation;
 mod range;
@@ -26,12 +28,17 @@ pub use access::{
 pub use backing::{
     CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalBackingStore,
     CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalPageError, CanonicalWriteBatch,
-    CanonicalWriteBatchError, FastmemPageLease,
+    CanonicalWriteBatchError,
 };
-pub use host_mapped::{
-    FASTMEM_ADDRESS_SPACE_BITS, FASTMEM_PAGE_BITS, FASTMEM_PAGE_SIZE, FASTMEM_READ, FASTMEM_SIZE,
-    FASTMEM_WRITE, FastmemArena, FastmemEntry, FastmemView, HostMappedBacking, HostMappedError,
+pub use direct::{
+    CpuMemoryBackend, DIRECT_PAGE_SIZE, DirectAddressSpaceView, DirectArena, DirectArenaMetrics,
+    DirectBackendPolicy, DirectHostCapabilities, DirectMapRequest, DirectMemoryError,
+    DirectProtectRequest, DirectProtection, DirectStoreControl,
 };
+pub use execution_gate::{
+    ExecutionGate, ExecutionGateMetrics, ExecutionSharedGuard, ExecutionTransitionGuard,
+};
+pub use host_mapped::{HostMappedBacking, HostMappedError};
 pub use invalidation::{
     MEMORY_INVALIDATION_CAPACITY, MemoryInvalidation, MemoryInvalidationCursor,
     MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,

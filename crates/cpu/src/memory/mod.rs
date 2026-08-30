@@ -10,5 +10,5 @@ mod execution;
 mod synthetic;
 
 pub use contracts::*;
-pub use execution::{ExecutionMemory, ExecutionMemoryLease, MappingEpoch};
+pub use execution::{CpuMemoryBackendError, ExecutionMemory, ExecutionMemoryLease, MappingEpoch};
 pub use synthetic::SyntheticMemory;

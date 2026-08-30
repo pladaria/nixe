@@ -1,21 +1,46 @@
 use std::mem::{offset_of, size_of};
 
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp, Block, BlockArg, InstBuilder, Signature, Value, condcodes::IntCC, types,
+    AbiParam, AtomicRmwOp, Block, BlockArg, InstBuilder, MemFlagsData, Signature, Value,
+    condcodes::IntCC, types,
 };
 use nixe_cpu::decode::a64::memory::{Instruction, Operands};
 use nixe_cpu::memory::{AtomicRmwKind, MemoryAccessSize, MemoryOrdering};
 use nixe_cpu::semantics::a64::{
     LoadSpec, ScalarTransfer, literal_load, memory_size, pair_transfer, scalar_transfer,
 };
-use nixe_memory::{
-    FASTMEM_PAGE_BITS, FASTMEM_PAGE_SIZE, FASTMEM_READ, FASTMEM_WRITE, FastmemEntry,
-    GuestVirtualAddress,
-};
+use nixe_cpu_direct_memory::NativeFaultCompletion;
+use nixe_memory::{DIRECT_PAGE_SIZE, DirectStoreControl, GuestVirtualAddress};
 
 use super::{CraneliftTranslator, LazyFlags, trusted_flags};
 use crate::direct::slow;
 use crate::direct::{DirectJitError, EXIT_DATA_FAULT, EXIT_INTERNAL, NativeContext};
+
+// Cranelift reserves five of the 255 non-zero trap codes. A region can use
+// each remaining code to identify one faultable direct access independently
+// of source-location ranges and machine block layout.
+const MAX_DIRECT_FAULT_SITES: usize = 250;
+
+#[derive(Clone, Copy)]
+pub(super) struct MemoryOperation {
+    size: MemoryAccessSize,
+    ordering: MemoryOrdering,
+    completion: Option<NativeFaultCompletion>,
+}
+
+impl MemoryOperation {
+    pub(super) const fn new(
+        size: MemoryAccessSize,
+        ordering: MemoryOrdering,
+        completion: Option<NativeFaultCompletion>,
+    ) -> Self {
+        Self {
+            size,
+            ordering,
+            completion,
+        }
+    }
+}
 
 impl CraneliftTranslator<'_, '_> {
     // A64 scalar memory, exclusive, and LSE behavior follows Arm DDI 0602
@@ -64,7 +89,16 @@ impl CraneliftTranslator<'_, '_> {
         let displacement = sign_extend(u64::from(fields.immediate_19), 19) << 2;
         let address = source.wrapping_offset(displacement);
         let address = self.builder.ins().iconst(types::I64, address.get() as i64);
-        let value = self.memory_read(source, address, size, MemoryOrdering::Relaxed, flags)?;
+        let value = self.memory_read(
+            source,
+            address,
+            MemoryOperation::new(
+                size,
+                MemoryOrdering::Relaxed,
+                Some(integer_load_completion(fields.rt, load)),
+            ),
+            flags,
+        )?;
         self.write_loaded(fields.rt, load, value)
     }
 
@@ -78,14 +112,7 @@ impl CraneliftTranslator<'_, '_> {
         let base = self.read_register(fields.rn, true)?;
         let offset = u64::from(fields.immediate_12) * size.bytes() as u64;
         let address = self.builder.ins().iadd_imm_u(base, offset as i64);
-        self.emit_transfer(
-            source,
-            fields,
-            address,
-            size,
-            MemoryOrdering::Relaxed,
-            flags,
-        )
+        self.emit_transfer(source, fields, address, size, true, flags)
     }
 
     fn emit_indexed(
@@ -112,7 +139,7 @@ impl CraneliftTranslator<'_, '_> {
             fields,
             address,
             size,
-            MemoryOrdering::Relaxed,
+            matches!(instruction, Instruction::Unscaled(_)),
             flags,
         )?;
         if !matches!(instruction, Instruction::Unscaled(_)) {
@@ -155,14 +182,7 @@ impl CraneliftTranslator<'_, '_> {
             offset
         };
         let address = self.builder.ins().iadd(base, offset);
-        self.emit_transfer(
-            source,
-            fields,
-            address,
-            size,
-            MemoryOrdering::Relaxed,
-            flags,
-        )
+        self.emit_transfer(source, fields, address, size, true, flags)
     }
 
     fn emit_pair(
@@ -183,10 +203,29 @@ impl CraneliftTranslator<'_, '_> {
         };
         let second = self.builder.ins().iadd_imm_u(first, size.bytes() as i64);
         if fields.load {
-            let first_value =
-                self.memory_read(source, first, size, MemoryOrdering::Relaxed, flags)?;
-            let second_value =
-                self.memory_read(source, second, size, MemoryOrdering::Relaxed, flags)?;
+            let pair_completion = |access_index| NativeFaultCompletion::IntegerPairLoad {
+                first_register: fields.rt,
+                second_register: fields.rt2,
+                signed: load.signed,
+                destination_bits: load.destination_bits,
+                access_index,
+                writeback_register: fields.rn,
+                writeback_offset: i16::try_from(offset)
+                    .expect("scalar pair writeback offset fits i16"),
+                writeback: matches!(fields.mode, 1 | 3),
+            };
+            let first_value = self.memory_read(
+                source,
+                first,
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, Some(pair_completion(0))),
+                flags,
+            )?;
+            let second_value = self.memory_read(
+                source,
+                second,
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, Some(pair_completion(1))),
+                flags,
+            )?;
             self.write_loaded(fields.rt, load, first_value)?;
             self.write_loaded(fields.rt2, load, second_value)?;
         } else {
@@ -196,16 +235,26 @@ impl CraneliftTranslator<'_, '_> {
                 source,
                 first,
                 first_value,
-                size,
-                MemoryOrdering::Relaxed,
+                MemoryOperation::new(
+                    size,
+                    MemoryOrdering::Relaxed,
+                    Some(NativeFaultCompletion::IntegerStore {
+                        register: fields.rt,
+                    }),
+                ),
                 flags,
             )?;
             self.memory_write(
                 source,
                 second,
                 second_value,
-                size,
-                MemoryOrdering::Relaxed,
+                MemoryOperation::new(
+                    size,
+                    MemoryOrdering::Relaxed,
+                    Some(NativeFaultCompletion::IntegerStore {
+                        register: fields.rt2,
+                    }),
+                ),
                 flags,
             )?;
         }
@@ -225,11 +274,22 @@ impl CraneliftTranslator<'_, '_> {
         let size = memory_size(fields.size);
         let address = self.read_register(fields.rn, true)?;
         if matches!(instruction, Instruction::LoadAcquire(_)) {
-            let value = self.memory_read(source, address, size, MemoryOrdering::Acquire, flags)?;
+            let value = self.memory_read(
+                source,
+                address,
+                MemoryOperation::new(size, MemoryOrdering::Acquire, None),
+                flags,
+            )?;
             self.write_loaded(fields.rt, LoadSpec::unsigned(size), value)
         } else {
             let value = self.register_memory_value(fields.rt, size)?;
-            self.memory_write(source, address, value, size, MemoryOrdering::Release, flags)
+            self.memory_write(
+                source,
+                address,
+                value,
+                MemoryOperation::new(size, MemoryOrdering::Release, None),
+                flags,
+            )
         }
     }
 
@@ -338,16 +398,34 @@ impl CraneliftTranslator<'_, '_> {
         fields: Operands,
         address: Value,
         size: MemoryAccessSize,
-        ordering: MemoryOrdering,
+        direct_load: bool,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
         match scalar_transfer(fields.opc, size) {
             Some(ScalarTransfer::Store) => {
                 let value = self.register_memory_value(fields.rt, size)?;
-                self.memory_write(source, address, value, size, ordering, flags)
+                self.memory_write(
+                    source,
+                    address,
+                    value,
+                    MemoryOperation::new(
+                        size,
+                        MemoryOrdering::Relaxed,
+                        direct_load.then_some(NativeFaultCompletion::IntegerStore {
+                            register: fields.rt,
+                        }),
+                    ),
+                    flags,
+                )
             }
             Some(ScalarTransfer::Load(load)) => {
-                let value = self.memory_read(source, address, size, ordering, flags)?;
+                let completion = direct_load.then(|| integer_load_completion(fields.rt, load));
+                let value = self.memory_read(
+                    source,
+                    address,
+                    MemoryOperation::new(size, MemoryOrdering::Relaxed, completion),
+                    flags,
+                )?;
                 self.write_loaded(fields.rt, load, value)
             }
             None => Err(DirectJitError::unsupported(
@@ -360,58 +438,75 @@ impl CraneliftTranslator<'_, '_> {
         &mut self,
         source: GuestVirtualAddress,
         address: Value,
-        size: MemoryAccessSize,
-        ordering: MemoryOrdering,
+        operation: MemoryOperation,
         flags: &LazyFlags,
     ) -> Result<Value, DirectJitError> {
-        if ordering != MemoryOrdering::Relaxed {
+        let MemoryOperation {
+            size,
+            ordering,
+            completion,
+        } = operation;
+        if ordering != MemoryOrdering::Relaxed
+            || !self.direct_memory
+            || completion.is_none()
+            || self.fault_sites.len() == MAX_DIRECT_FAULT_SITES
+        {
             return self.memory_read_slow(source, address, size, ordering, flags);
         }
         let ty = memory_type(size);
-        let lookup = self.builder.create_block();
-        let hit = self.builder.create_block();
-        let visible_hit = self.builder.create_block();
-        let hit_complete = self.builder.create_block();
-        let slow_block = self.builder.create_block();
-        let merged = self.builder.create_block();
-        self.builder.append_block_param(merged, ty);
-
-        let entries = self.load_context(types::I64, offset_of!(NativeContext, fastmem_entries))?;
-        let arena_size = self.load_context(types::I64, offset_of!(NativeContext, fastmem_size))?;
-        let has_entries = self.builder.ins().icmp_imm_s(IntCC::NotEqual, entries, 0);
+        let arena_size = self.load_context(types::I64, offset_of!(NativeContext, direct_size))?;
+        let last = self
+            .builder
+            .ins()
+            .iadd_imm_u(address, (size.bytes() - 1) as i64);
+        let no_wrap = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, last, address);
         let in_arena = self
             .builder
             .ins()
-            .icmp(IntCC::UnsignedLessThan, address, arena_size);
-        let available = self.builder.ins().band(has_entries, in_arena);
-        self.builder
+            .icmp(IntCC::UnsignedLessThan, last, arena_size);
+        let alignment = self
+            .builder
             .ins()
-            .brif(available, lookup, &[], slow_block, &[]);
+            .band_imm_u(address, (size.bytes() - 1) as i64);
+        let aligned = self.builder.ins().icmp_imm_s(IntCC::Equal, alignment, 0);
+        let eligible = self.builder.ins().band(no_wrap, in_arena);
+        let eligible = self.builder.ins().band(eligible, aligned);
+        let completion = completion.expect("eligible direct load has completion metadata");
+        self.checkpoint_direct_fault_state(flags)?;
 
-        self.builder.switch_to_block(lookup);
-        let entry = self.fastmem_entry(address, entries);
-        let valid = self.fastmem_entry_matches(address, entry, FASTMEM_READ, size)?;
-        self.builder.ins().brif(valid, hit, &[], slow_block, &[]);
+        let native = self.builder.create_block();
+        let checked = self.builder.create_block();
+        let merged = self.builder.create_block();
+        self.builder.append_block_param(merged, ty);
+        self.builder.ins().brif(eligible, native, &[], checked, &[]);
 
-        self.builder.switch_to_block(hit);
-        let (validity_address, visibility_epoch, visible) =
-            self.direct_visibility_control(entry)?;
-        self.builder
-            .ins()
-            .brif(visible, visible_hit, &[], slow_block, &[]);
-        self.builder.switch_to_block(visible_hit);
-        let value = self.direct_load(address, size)?;
-        let still_valid = self.current_visibility_matches(validity_address, visibility_epoch);
-        self.builder
-            .ins()
-            .brif(still_valid, hit_complete, &[], slow_block, &[]);
-        self.builder.switch_to_block(hit_complete);
-        self.builder.ins().jump(merged, &[BlockArg::from(value)]);
-
-        self.builder.switch_to_block(slow_block);
+        self.builder.switch_to_block(checked);
         let value = self.memory_read_slow(source, address, size, ordering, flags)?;
         self.builder.ins().jump(merged, &[BlockArg::from(value)]);
+
+        self.builder.switch_to_block(native);
+        let trap_code = self.record_direct_fault_state(
+            source,
+            size.bytes() as u8,
+            nixe_cpu_direct_memory::NativeMemoryAccessKind::Read,
+            completion,
+        );
+        self.builder.ins().set_pinned_reg(address);
+        let base = self.load_context(types::I64, offset_of!(NativeContext, direct_base))?;
+        let pointer = self.builder.ins().iadd(base, address);
+        // The private trap code preserves this guest operation's identity
+        // through block layout and lowering, including duplicated native
+        // instructions and missing source-location ranges.
+        let fault_flags = MemFlagsData::new().with_trap_code(Some(trap_code));
+        let value = self.builder.ins().load(ty, fault_flags, pointer, 0);
+        self.builder.ins().jump(merged, &[BlockArg::from(value)]);
+
         self.builder.switch_to_block(merged);
+        self.builder
+            .set_srcloc(super::source_location_for_pc(self.region, source));
         Ok(self.builder.block_params(merged)[0])
     }
 
@@ -442,39 +537,87 @@ impl CraneliftTranslator<'_, '_> {
         source: GuestVirtualAddress,
         address: Value,
         value: Value,
-        size: MemoryAccessSize,
-        ordering: MemoryOrdering,
+        operation: MemoryOperation,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
-        if ordering != MemoryOrdering::Relaxed {
+        let MemoryOperation {
+            size,
+            ordering,
+            completion,
+        } = operation;
+        if ordering != MemoryOrdering::Relaxed || !self.direct_memory || completion.is_none() {
             return self.memory_write_slow(source, address, value, size, ordering, flags);
         }
-        let lookup = self.builder.create_block();
-        let hit = self.builder.create_block();
-        let slow_block = self.builder.create_block();
-        let merged = self.builder.create_block();
-        let entries = self.load_context(types::I64, offset_of!(NativeContext, fastmem_entries))?;
-        let arena_size = self.load_context(types::I64, offset_of!(NativeContext, fastmem_size))?;
-        let has_entries = self.builder.ins().icmp_imm_s(IntCC::NotEqual, entries, 0);
+        self.record_direct_access(
+            source,
+            size.bytes() as u8,
+            nixe_cpu_direct_memory::NativeMemoryAccessKind::Write,
+        );
+        self.checkpoint_direct_fault_state(flags)?;
+        self.builder.ins().set_pinned_reg(address);
+        let arena_size = self.load_context(types::I64, offset_of!(NativeContext, direct_size))?;
+        let last = self
+            .builder
+            .ins()
+            .iadd_imm_u(address, (size.bytes() - 1) as i64);
+        let no_wrap = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, last, address);
         let in_arena = self
             .builder
             .ins()
-            .icmp(IntCC::UnsignedLessThan, address, arena_size);
-        let available = self.builder.ins().band(has_entries, in_arena);
-        self.builder
+            .icmp(IntCC::UnsignedLessThan, last, arena_size);
+        let alignment = self
+            .builder
             .ins()
-            .brif(available, lookup, &[], slow_block, &[]);
+            .band_imm_u(address, (size.bytes() - 1) as i64);
+        let aligned = self.builder.ins().icmp_imm_s(IntCC::Equal, alignment, 0);
+        let eligible = self.builder.ins().band(no_wrap, in_arena);
+        let eligible = self.builder.ins().band(eligible, aligned);
+
+        let lookup = self.builder.create_block();
+        let check_armed = self.builder.create_block();
+        let native = self.builder.create_block();
+        let fault = self.builder.create_block();
+        let merged = self.builder.create_block();
+        self.builder.ins().brif(eligible, lookup, &[], fault, &[]);
 
         self.builder.switch_to_block(lookup);
-        let entry = self.fastmem_entry(address, entries);
-        let valid = self.fastmem_entry_matches(address, entry, FASTMEM_WRITE, size)?;
-        self.builder.ins().brif(valid, hit, &[], slow_block, &[]);
+        let controls =
+            self.load_context(types::I64, offset_of!(NativeContext, direct_store_controls))?;
+        let guest_page = self
+            .builder
+            .ins()
+            .ushr_imm_u(address, DIRECT_PAGE_SIZE.trailing_zeros() as i64);
+        let control_offset = self
+            .builder
+            .ins()
+            .imul_imm_u(guest_page, size_of::<usize>() as i64);
+        let control_slot = self.builder.ins().iadd(controls, control_offset);
+        let control = self
+            .builder
+            .ins()
+            .load(types::I64, trusted_flags(), control_slot, 0);
+        let has_control = self.builder.ins().icmp_imm_s(IntCC::NotEqual, control, 0);
+        self.builder
+            .ins()
+            .brif(has_control, check_armed, &[], fault, &[]);
 
-        self.builder.switch_to_block(hit);
-        self.direct_store(address, entry, value, size, slow_block)?;
-        self.builder.ins().jump(merged, &[]);
+        self.builder.switch_to_block(check_armed);
+        let armed_address = self
+            .direct_control_field(control, offset_of!(DirectStoreControl, write_armed_address))?;
+        let armed = self
+            .builder
+            .ins()
+            .atomic_load(types::I64, trusted_flags(), armed_address);
+        let is_armed = self.builder.ins().icmp_imm_s(IntCC::NotEqual, armed, 0);
+        self.builder.ins().brif(is_armed, native, &[], fault, &[]);
 
-        self.builder.switch_to_block(slow_block);
+        self.builder.switch_to_block(native);
+        self.direct_tracked_store(address, control, armed_address, value, fault, merged)?;
+
+        self.builder.switch_to_block(fault);
         self.memory_write_slow(source, address, value, size, ordering, flags)?;
         self.builder.ins().jump(merged, &[]);
         self.builder.switch_to_block(merged);
@@ -517,6 +660,11 @@ impl CraneliftTranslator<'_, '_> {
         source: GuestVirtualAddress,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
+        // The fault-only CFG below retires the current guest instruction on
+        // its data-fault edge. `block_retired` describes the successful
+        // translation path used by later native fault metadata, so restore it
+        // after emitting those alternative blocks.
+        let successful_retired = self.block_retired;
         let callee = self.builder.ins().iconst(types::I64, function as i64);
         let mut signature = Signature::new(self.call_conv);
         signature.params.push(AbiParam::new(types::I64));
@@ -553,6 +701,7 @@ impl CraneliftTranslator<'_, '_> {
         self.builder.switch_to_block(internal);
         self.emit_exit(EXIT_INTERNAL, 0, source, flags)?;
         self.builder.switch_to_block(success);
+        self.block_retired = successful_retired;
         Ok(())
     }
 
@@ -596,246 +745,122 @@ impl CraneliftTranslator<'_, '_> {
         self.write_integer(register, false, value)
     }
 
-    fn fastmem_entry(&mut self, address: Value, entries: Value) -> Value {
-        let guest_page = self
-            .builder
-            .ins()
-            .ushr_imm_u(address, i64::from(FASTMEM_PAGE_BITS));
-        let byte_offset = self
-            .builder
-            .ins()
-            .imul_imm_u(guest_page, size_of::<FastmemEntry>() as i64);
-        self.builder.ins().iadd(entries, byte_offset)
-    }
-
-    fn atomic_entry_load(
+    fn direct_control_field(
         &mut self,
-        ty: cranelift_codegen::ir::Type,
-        entry: Value,
+        control: Value,
         field_offset: usize,
     ) -> Result<Value, DirectJitError> {
-        let pointer = self
-            .builder
-            .ins()
-            .iadd_imm_s(entry, i64::from(context_offset(field_offset)?));
-        Ok(self.builder.ins().atomic_load(ty, trusted_flags(), pointer))
-    }
-
-    fn fastmem_entry_matches(
-        &mut self,
-        address: Value,
-        entry: Value,
-        required_flags: u32,
-        size: MemoryAccessSize,
-    ) -> Result<Value, DirectJitError> {
-        let observed_flags =
-            self.atomic_entry_load(types::I32, entry, offset_of!(FastmemEntry, flags))?;
-        let masked = self
-            .builder
-            .ins()
-            .band_imm_u(observed_flags, i64::from(required_flags));
-        let allowed =
-            self.builder
-                .ins()
-                .icmp_imm_s(IntCC::Equal, masked, i64::from(required_flags));
-        let page_offset = self
-            .builder
-            .ins()
-            .band_imm_u(address, (FASTMEM_PAGE_SIZE - 1) as i64);
-        let within_page = self.builder.ins().icmp_imm_u(
-            IntCC::UnsignedLessThanOrEqual,
-            page_offset,
-            (FASTMEM_PAGE_SIZE as u64 - size.bytes() as u64) as i64,
-        );
-        let alignment = self
-            .builder
-            .ins()
-            .band_imm_u(address, (size.bytes() - 1) as i64);
-        let aligned = self.builder.ins().icmp_imm_s(IntCC::Equal, alignment, 0);
-        let valid = self.builder.ins().band(allowed, within_page);
-        Ok(self.builder.ins().band(valid, aligned))
-    }
-
-    fn direct_visibility_control(
-        &mut self,
-        entry: Value,
-    ) -> Result<(Value, Value, Value), DirectJitError> {
-        let validity_address = self.atomic_entry_load(
+        Ok(self.builder.ins().load(
             types::I64,
-            entry,
-            offset_of!(FastmemEntry, validity_address),
-        )?;
-        let expected_visibility = self.atomic_entry_load(
-            types::I64,
-            entry,
-            offset_of!(FastmemEntry, visibility_epoch),
-        )?;
-        let visible = self.current_visibility_matches(validity_address, expected_visibility);
-        Ok((validity_address, expected_visibility, visible))
+            trusted_flags(),
+            control,
+            context_offset(field_offset)?,
+        ))
     }
 
-    fn current_visibility_matches(&mut self, validity_address: Value, expected: Value) -> Value {
-        let current = self
-            .builder
-            .ins()
-            .atomic_load(types::I64, trusted_flags(), validity_address);
-        self.builder.ins().icmp(IntCC::Equal, current, expected)
-    }
-
-    fn direct_word_pointer(&mut self, address: Value) -> Result<Value, DirectJitError> {
-        let base = self.load_context(types::I64, offset_of!(NativeContext, fastmem_base))?;
-        let word_address = self.builder.ins().band_imm_s(address, !7_i64);
-        Ok(self.builder.ins().iadd(base, word_address))
-    }
-
-    fn direct_load(
+    fn direct_tracked_store(
         &mut self,
         address: Value,
-        size: MemoryAccessSize,
-    ) -> Result<Value, DirectJitError> {
-        let pointer = self.direct_word_pointer(address)?;
-        if size == MemoryAccessSize::Quadword {
-            return Ok(self
-                .builder
-                .ins()
-                .load(types::I128, trusted_flags(), pointer, 0));
-        }
-        let low = self
-            .builder
-            .ins()
-            .atomic_load(types::I64, trusted_flags(), pointer);
-        let ty = memory_type(size);
-        if ty == types::I64 {
-            return Ok(low);
-        }
-        let byte_offset = self.builder.ins().band_imm_u(address, 7);
-        let shift = self.builder.ins().ishl_imm_u(byte_offset, 3);
-        let shifted = self.builder.ins().ushr(low, shift);
-        Ok(self.builder.ins().ireduce(ty, shifted))
-    }
-
-    fn direct_store(
-        &mut self,
-        address: Value,
-        entry: Value,
+        control: Value,
+        armed_address: Value,
         value: Value,
-        size: MemoryAccessSize,
-        slow_block: Block,
+        fault: Block,
+        merged: Block,
     ) -> Result<(), DirectJitError> {
-        let pointer = self.direct_word_pointer(address)?;
-        let sequence_address = self.atomic_entry_load(
-            types::I64,
-            entry,
-            offset_of!(FastmemEntry, write_sequence_address),
+        let base = self.load_context(types::I64, offset_of!(NativeContext, direct_base))?;
+        let pointer = self.builder.ins().iadd(base, address);
+        let sequence_address = self.direct_control_field(
+            control,
+            offset_of!(DirectStoreControl, write_sequence_address),
+        )?;
+        let generation_address =
+            self.direct_control_field(control, offset_of!(DirectStoreControl, generation_address))?;
+        let content_epoch_address = self.direct_control_field(
+            control,
+            offset_of!(DirectStoreControl, content_epoch_address),
+        )?;
+        let cpu_write_epoch_address = self.direct_control_field(
+            control,
+            offset_of!(DirectStoreControl, cpu_write_epoch_address),
+        )?;
+        let active_address = self.direct_control_field(
+            control,
+            offset_of!(DirectStoreControl, cpu_writes_active_address),
         )?;
         let sequence = self.acquire_write_sequence(sequence_address);
-        let (_, _, mut permitted) = self.direct_visibility_control(entry)?;
-        let generation_address = self.atomic_entry_load(
-            types::I64,
-            entry,
-            offset_of!(FastmemEntry, generation_address),
-        )?;
-        let generation =
+        let still_armed =
             self.builder
                 .ins()
-                .atomic_load(types::I64, trusted_flags(), generation_address);
-        let has_generation = self
+                .atomic_load(types::I64, trusted_flags(), armed_address);
+        let still_armed = self
             .builder
             .ins()
-            .icmp_imm_s(IntCC::NotEqual, generation, -1);
-        permitted = self.builder.ins().band(permitted, has_generation);
-        let content_epoch_address = self.atomic_entry_load(
-            types::I64,
-            entry,
-            offset_of!(FastmemEntry, content_epoch_address),
-        )?;
-        let content_epoch =
-            self.builder
-                .ins()
-                .atomic_load(types::I64, trusted_flags(), content_epoch_address);
-        let has_content_epoch = self
-            .builder
-            .ins()
-            .icmp_imm_s(IntCC::NotEqual, content_epoch, -1);
-        permitted = self.builder.ins().band(permitted, has_content_epoch);
-        let cpu_write_epoch_address = self.atomic_entry_load(
-            types::I64,
-            entry,
-            offset_of!(FastmemEntry, cpu_write_epoch_address),
-        )?;
-        let cpu_write_epoch =
-            self.builder
-                .ins()
-                .atomic_load(types::I64, trusted_flags(), cpu_write_epoch_address);
-        let has_cpu_write_epoch =
-            self.builder
-                .ins()
-                .icmp_imm_s(IntCC::NotEqual, cpu_write_epoch, -1);
-        permitted = self.builder.ins().band(permitted, has_cpu_write_epoch);
-        let cpu_writes_active_address = self.atomic_entry_load(
-            types::I64,
-            entry,
-            offset_of!(FastmemEntry, cpu_writes_active_address),
-        )?;
-        let store = self.builder.create_block();
-        let revoked = self.builder.create_block();
-        self.builder.ins().brif(permitted, store, &[], revoked, &[]);
-        self.builder.switch_to_block(revoked);
-        let completed = self.builder.ins().iadd_imm_s(sequence, 2);
+            .icmp_imm_s(IntCC::NotEqual, still_armed, 0);
+        let check_epochs = self.builder.create_block();
+        let publish = self.builder.create_block();
+        let reject = self.builder.create_block();
         self.builder
             .ins()
-            .atomic_store(trusted_flags(), completed, sequence_address);
-        self.builder.ins().jump(slow_block, &[]);
+            .brif(still_armed, check_epochs, &[], reject, &[]);
 
-        self.builder.switch_to_block(store);
+        self.builder.switch_to_block(check_epochs);
+        // Epoch exhaustion is exceptional, but wrapping any observer counter
+        // would silently resurrect stale reservations/snapshots. Test it only
+        // after acquiring the page sequence so concurrent native writers
+        // cannot both observe MAX-1 and race through the final increment.
+        let mut exhausted = None;
+        for epoch in [
+            generation_address,
+            content_epoch_address,
+            cpu_write_epoch_address,
+        ] {
+            let current = self
+                .builder
+                .ins()
+                .atomic_load(types::I64, trusted_flags(), epoch);
+            let at_max = self.builder.ins().icmp_imm_s(IntCC::Equal, current, -1);
+            exhausted = Some(match exhausted {
+                Some(previous) => self.builder.ins().bor(previous, at_max),
+                None => at_max,
+            });
+        }
+        self.builder.ins().brif(
+            exhausted.expect("direct stores publish three epochs"),
+            reject,
+            &[],
+            publish,
+            &[],
+        );
+
+        self.builder.switch_to_block(publish);
         let one = self.builder.ins().iconst(types::I64, 1);
         self.builder.ins().atomic_rmw(
             types::I64,
             trusted_flags(),
             AtomicRmwOp::Add,
-            cpu_writes_active_address,
+            active_address,
             one,
         );
-        if size == MemoryAccessSize::Quadword {
+        if self.builder.func.dfg.value_type(value) == types::I128 {
             self.builder.ins().store(trusted_flags(), value, pointer, 0);
-        } else if size == MemoryAccessSize::Doubleword {
+        } else {
             self.builder
                 .ins()
                 .atomic_store(trusted_flags(), value, pointer);
-        } else {
-            let bits = size.bytes() * 8;
-            let extended = extend_to_i64(&mut self.builder, value);
-            let byte_offset = self.builder.ins().band_imm_u(address, 7);
-            let shift = self.builder.ins().ishl_imm_u(byte_offset, 3);
-            let shifted = self.builder.ins().ishl(extended, shift);
-            let mask = self
-                .builder
-                .ins()
-                .iconst(types::I64, ((1_u64 << bits) - 1) as i64);
-            let mask = self.builder.ins().ishl(mask, shift);
-            self.atomic_masked_store(pointer, shifted, mask);
         }
-        self.builder.ins().atomic_rmw(
-            types::I64,
-            trusted_flags(),
-            AtomicRmwOp::Add,
+        for epoch in [
             generation_address,
-            one,
-        );
-        self.builder.ins().atomic_rmw(
-            types::I64,
-            trusted_flags(),
-            AtomicRmwOp::Add,
             content_epoch_address,
-            one,
-        );
-        self.builder.ins().atomic_rmw(
-            types::I64,
-            trusted_flags(),
-            AtomicRmwOp::Add,
             cpu_write_epoch_address,
-            one,
-        );
+        ] {
+            self.builder.ins().atomic_rmw(
+                types::I64,
+                trusted_flags(),
+                AtomicRmwOp::Add,
+                epoch,
+                one,
+            );
+        }
         let completed = self.builder.ins().iadd_imm_s(sequence, 2);
         self.builder
             .ins()
@@ -844,9 +869,16 @@ impl CraneliftTranslator<'_, '_> {
             types::I64,
             trusted_flags(),
             AtomicRmwOp::Sub,
-            cpu_writes_active_address,
+            active_address,
             one,
         );
+        self.builder.ins().jump(merged, &[]);
+
+        self.builder.switch_to_block(reject);
+        self.builder
+            .ins()
+            .atomic_store(trusted_flags(), sequence, sequence_address);
+        self.builder.ins().jump(fault, &[]);
         Ok(())
     }
 
@@ -895,32 +927,6 @@ impl CraneliftTranslator<'_, '_> {
         self.builder.switch_to_block(acquired);
         self.builder.block_params(acquired)[0]
     }
-
-    fn atomic_masked_store(&mut self, pointer: Value, value: Value, mask: Value) {
-        let retry = self.builder.create_block();
-        let done = self.builder.create_block();
-        self.builder.append_block_param(retry, types::I64);
-        let observed = self
-            .builder
-            .ins()
-            .atomic_load(types::I64, trusted_flags(), pointer);
-        self.builder.ins().jump(retry, &[BlockArg::from(observed)]);
-        self.builder.switch_to_block(retry);
-        let observed = self.builder.block_params(retry)[0];
-        let inverted = self.builder.ins().bnot(mask);
-        let retained = self.builder.ins().band(observed, inverted);
-        let replacement = self.builder.ins().band(value, mask);
-        let next = self.builder.ins().bor(retained, replacement);
-        let previous = self
-            .builder
-            .ins()
-            .atomic_cas(trusted_flags(), pointer, observed, next);
-        let stored = self.builder.ins().icmp(IntCC::Equal, previous, observed);
-        self.builder
-            .ins()
-            .brif(stored, done, &[], retry, &[BlockArg::from(previous)]);
-        self.builder.switch_to_block(done);
-    }
 }
 
 fn memory_type(size: MemoryAccessSize) -> cranelift_codegen::ir::Type {
@@ -930,6 +936,14 @@ fn memory_type(size: MemoryAccessSize) -> cranelift_codegen::ir::Type {
         MemoryAccessSize::Word => types::I32,
         MemoryAccessSize::Doubleword => types::I64,
         MemoryAccessSize::Quadword => types::I128,
+    }
+}
+
+const fn integer_load_completion(register: u8, load: LoadSpec) -> NativeFaultCompletion {
+    NativeFaultCompletion::IntegerLoad {
+        register,
+        signed: load.signed,
+        destination_bits: load.destination_bits,
     }
 }
 

@@ -67,6 +67,7 @@ pub struct InterpreterContext<'a> {
     exclusive_monitor: &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
     architectural_timer: &'a dyn ArchitecturalTimer,
     events: &'a VcpuEventState,
+    direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
 }
 
 impl<'a> InterpreterContext<'a> {
@@ -84,7 +85,16 @@ impl<'a> InterpreterContext<'a> {
             exclusive_monitor,
             architectural_timer,
             events,
+            direct_memory: None,
         }
+    }
+
+    pub(crate) const fn with_direct_memory(
+        mut self,
+        direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+    ) -> Self {
+        self.direct_memory = direct_memory;
+        self
     }
 
     #[must_use]
@@ -112,6 +122,13 @@ impl<'a> InterpreterContext<'a> {
     #[must_use]
     pub const fn memory(self) -> &'a dyn CpuMemory {
         self.memory
+    }
+
+    #[must_use]
+    pub(crate) const fn direct_memory(
+        self,
+    ) -> Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>> {
+        self.direct_memory
     }
 }
 
@@ -141,6 +158,10 @@ pub enum InterpreterError {
         encoding: InstructionEncoding,
         reason: Box<str>,
     },
+    DirectMemory {
+        source: LocationDescriptor,
+        detail: Box<str>,
+    },
 }
 
 impl fmt::Display for InterpreterError {
@@ -163,6 +184,12 @@ impl fmt::Display for InterpreterError {
                 formatter,
                 "invalid instruction stream: {source} encoding={encoding} reason={reason}"
             ),
+            Self::DirectMemory { source, detail } => {
+                write!(
+                    formatter,
+                    "direct interpreter memory failed at {source}: {detail}"
+                )
+            }
         }
     }
 }

@@ -7,18 +7,22 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::{Display, Formatter},
+    marker::PhantomData,
     sync::atomic::AtomicU64,
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use nixe_memory::{
     AddressSpaceId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
     CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, CanonicalWriteBatch,
-    ContentGeneration, ContentMutationEpoch, FastmemArena, FastmemView, GuestPhysicalPageId,
-    GuestVirtualAddress, MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor,
-    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
-    MemoryInvalidationOrigin, MemoryInvalidationSource,
+    ContentGeneration, ContentMutationEpoch, CpuMemoryBackend, DirectAddressSpaceView, DirectArena,
+    DirectArenaMetrics, DirectBackendPolicy, DirectMapRequest, DirectProtectRequest,
+    DirectProtection, ExecutionGate, ExecutionSharedGuard, ExecutionTransitionGuard,
+    GuestPhysicalPageId, GuestVirtualAddress, HostMappedBacking, MappingGeneration,
+    MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationKind,
+    MemoryInvalidationLog, MemoryInvalidationOrigin, MemoryInvalidationSource,
 };
 
 use crate::{
@@ -35,13 +39,13 @@ use super::common::{
 use super::{
     AtomicMemoryResult, AtomicRmwKind, CodeDependencies, CodePageDependency, CodePageSpan,
     CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, DataReadResult,
-    DataWriteResult, FetchedCode, InstructionMemory, MemoryAccess, MemoryAccessClass,
-    MemoryAliasError, MemoryAliasErrorReason, MemoryAliasRequest, MemoryAlignment,
-    MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason, MemoryMappingProperties,
-    MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, MemoryProtectionErrorReason,
-    MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory, SYNTHETIC_PAGE_SIZE,
-    SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo, SyntheticMmio,
-    SyntheticRamPage,
+    DataWriteResult, DirectFaultResolution, FetchedCode, InstructionMemory, MemoryAccess,
+    MemoryAccessClass, MemoryAliasError, MemoryAliasErrorReason, MemoryAliasRequest,
+    MemoryAlignment, MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason,
+    MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
+    MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory,
+    SYNTHETIC_PAGE_SIZE, SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo,
+    SyntheticMmio, SyntheticRamPage,
 };
 
 const LEAF_BITS: u32 = 9;
@@ -150,6 +154,15 @@ struct ExecutionPhysicalSlot {
     // without walking the process address space.
     mapping_count: usize,
     executable_content_mapping_count: usize,
+    aliases: BTreeSet<(AddressSpaceId, u64)>,
+}
+
+enum ExecutionBackendBinding {
+    Checked,
+    LinuxDirect {
+        arena: DirectArena,
+        address_space_size: usize,
+    },
 }
 
 #[derive(Default)]
@@ -161,42 +174,14 @@ struct ExecutionMemoryInner {
     physical_slots: Vec<Option<ExecutionPhysicalSlot>>,
     free_physical_slots: Vec<usize>,
     slots_by_id: BTreeMap<GuestPhysicalPageId, usize>,
-    fastmem: BTreeMap<AddressSpaceId, FastmemArena>,
+    backends: BTreeMap<AddressSpaceId, ExecutionBackendBinding>,
+    backend_reasons: BTreeMap<AddressSpaceId, Box<str>>,
+    direct_failure: Option<Box<str>>,
     next_page_id: u64,
     next_mapping_generation: Option<MappingGeneration>,
 }
 
 impl ExecutionMemoryInner {
-    fn fastmem_mut(&mut self, address_space: AddressSpaceId) -> Option<&mut FastmemArena> {
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.fastmem.entry(address_space)
-        {
-            let arena = FastmemArena::new().ok()?;
-            entry.insert(arena);
-        }
-        self.fastmem.get_mut(&address_space)
-    }
-
-    fn invalidate_fastmem_page(&mut self, address_space: AddressSpaceId, virtual_page: u64) {
-        if let Some(arena) = self.fastmem.get_mut(&address_space) {
-            arena
-                .unmap_page(page_address(virtual_page).get())
-                .expect("a published fastmem mapping can be revoked");
-        }
-    }
-
-    fn invalidate_fastmem_physical_slot(&mut self, physical_slot: usize) {
-        let aliases: Vec<_> = self
-            .mappings
-            .mappings()
-            .filter_map(|(address_space, virtual_page, mapping)| {
-                (mapping.physical_slot == physical_slot).then_some((address_space, virtual_page))
-            })
-            .collect();
-        for (address_space, virtual_page) in aliases {
-            self.invalidate_fastmem_page(address_space, virtual_page);
-        }
-    }
-
     fn page(&self, slot: usize) -> Option<&ExecutionPhysicalPage> {
         Some(&self.physical_slots.get(slot)?.as_ref()?.page)
     }
@@ -219,6 +204,7 @@ impl ExecutionMemoryInner {
                 page,
                 mapping_count: 0,
                 executable_content_mapping_count: 0,
+                aliases: BTreeSet::new(),
             });
             slot
         } else {
@@ -227,6 +213,7 @@ impl ExecutionMemoryInner {
                 page,
                 mapping_count: 0,
                 executable_content_mapping_count: 0,
+                aliases: BTreeSet::new(),
             }));
             slot
         };
@@ -242,6 +229,7 @@ impl ExecutionMemoryInner {
             .expect("removed physical slot exists");
         assert_eq!(physical_slot.mapping_count, 0);
         assert_eq!(physical_slot.executable_content_mapping_count, 0);
+        assert!(physical_slot.aliases.is_empty());
         let removed_id = self.slots_by_id.remove(&id);
         let removed_page = self.physical_slots.get_mut(slot).and_then(Option::take);
         debug_assert_eq!(removed_id, Some(slot));
@@ -255,23 +243,31 @@ impl ExecutionMemoryInner {
         virtual_page: u64,
         mapping: ExecutionMapping,
     ) {
-        assert!(self.mappings.get(address_space, virtual_page).is_none());
-        if mapping.observes_executable_content() {
-            self.invalidate_fastmem_physical_slot(mapping.physical_slot);
-        }
-        let previous = self.mappings.insert(address_space, virtual_page, mapping);
-        debug_assert!(previous.is_none());
-        self.register_mapping(mapping);
+        self.insert_mapping_unpublished(address_space, virtual_page, mapping);
+        self.publish_direct_mapping(address_space, virtual_page);
     }
 
-    fn remove_mapping(
+    fn insert_mapping_unpublished(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_page: u64,
+        mapping: ExecutionMapping,
+    ) {
+        assert!(self.mappings.get(address_space, virtual_page).is_none());
+        let previous = self.mappings.insert(address_space, virtual_page, mapping);
+        debug_assert!(previous.is_none());
+        self.register_mapping(address_space, virtual_page, mapping);
+        self.update_direct_store_eligibility(mapping.physical_slot);
+    }
+
+    fn remove_mapping_unpublished(
         &mut self,
         address_space: AddressSpaceId,
         virtual_page: u64,
     ) -> Option<ExecutionMapping> {
-        self.invalidate_fastmem_page(address_space, virtual_page);
         let mapping = self.mappings.remove(address_space, virtual_page)?;
-        self.unregister_mapping(mapping);
+        self.unregister_mapping(address_space, virtual_page, mapping);
+        self.update_direct_store_eligibility(mapping.physical_slot);
         Some(mapping)
     }
 
@@ -282,7 +278,6 @@ impl ExecutionMemoryInner {
         purpose: MemoryMappingPurpose,
         mapping_generation: MappingGeneration,
     ) {
-        self.invalidate_fastmem_page(address_space, virtual_page);
         let (physical_slot, was_executable_content, is_executable_content) = {
             let mapping = self
                 .mappings
@@ -302,9 +297,7 @@ impl ExecutionMemoryInner {
             was_executable_content,
             is_executable_content,
         );
-        if !was_executable_content && is_executable_content {
-            self.invalidate_fastmem_physical_slot(physical_slot);
-        }
+        self.update_direct_store_eligibility(physical_slot);
     }
 
     fn set_mapping_permissions(
@@ -314,7 +307,6 @@ impl ExecutionMemoryInner {
         permissions: MemoryPermissions,
         mapping_generation: MappingGeneration,
     ) {
-        self.invalidate_fastmem_page(address_space, virtual_page);
         let (physical_slot, was_executable_content, is_executable_content) = {
             let mapping = self
                 .mappings
@@ -334,9 +326,7 @@ impl ExecutionMemoryInner {
             was_executable_content,
             is_executable_content,
         );
-        if !was_executable_content && is_executable_content {
-            self.invalidate_fastmem_physical_slot(physical_slot);
-        }
+        self.update_direct_store_eligibility(physical_slot);
     }
 
     fn set_mapping_properties(
@@ -346,7 +336,6 @@ impl ExecutionMemoryInner {
         properties: MemoryMappingProperties,
         mapping_generation: MappingGeneration,
     ) {
-        self.invalidate_fastmem_page(address_space, virtual_page);
         let (physical_slot, was_executable_content, is_executable_content) = {
             let mapping = self
                 .mappings
@@ -368,9 +357,7 @@ impl ExecutionMemoryInner {
             was_executable_content,
             is_executable_content,
         );
-        if !was_executable_content && is_executable_content {
-            self.invalidate_fastmem_physical_slot(physical_slot);
-        }
+        self.update_direct_store_eligibility(physical_slot);
     }
 
     fn executable_content_page(&self, physical_slot: usize) -> Option<GuestPhysicalPageId> {
@@ -384,6 +371,24 @@ impl ExecutionMemoryInner {
         }
     }
 
+    fn update_direct_store_eligibility(&mut self, physical_slot: usize) {
+        let Some(slot) = self
+            .physical_slots
+            .get(physical_slot)
+            .and_then(Option::as_ref)
+        else {
+            return;
+        };
+        let ExecutionPhysicalPage::Ram(backing) = &slot.page else {
+            return;
+        };
+        let backing = backing.clone();
+        let allowed = slot.executable_content_mapping_count == 0;
+        if let Err(error) = backing.set_direct_stores_allowed(allowed) {
+            self.direct_failure = Some(error.to_string().into_boxed_str());
+        }
+    }
+
     fn mapping_count(&self, physical_slot: usize) -> usize {
         self.physical_slots
             .get(physical_slot)
@@ -391,7 +396,12 @@ impl ExecutionMemoryInner {
             .map_or(0, |slot| slot.mapping_count)
     }
 
-    fn register_mapping(&mut self, mapping: ExecutionMapping) {
+    fn register_mapping(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_page: u64,
+        mapping: ExecutionMapping,
+    ) {
         let slot = self
             .physical_slots
             .get_mut(mapping.physical_slot)
@@ -401,6 +411,8 @@ impl ExecutionMemoryInner {
             .mapping_count
             .checked_add(1)
             .expect("physical mapping count is bounded by guest mappings");
+        assert!(slot.aliases.insert((address_space, virtual_page)));
+        debug_assert_eq!(slot.aliases.len(), slot.mapping_count);
         if mapping.observes_executable_content() {
             slot.executable_content_mapping_count = slot
                 .executable_content_mapping_count
@@ -409,7 +421,12 @@ impl ExecutionMemoryInner {
         }
     }
 
-    fn unregister_mapping(&mut self, mapping: ExecutionMapping) {
+    fn unregister_mapping(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_page: u64,
+        mapping: ExecutionMapping,
+    ) {
         let slot = self
             .physical_slots
             .get_mut(mapping.physical_slot)
@@ -419,6 +436,8 @@ impl ExecutionMemoryInner {
             .mapping_count
             .checked_sub(1)
             .expect("physical mapping count tracks every published mapping");
+        assert!(slot.aliases.remove(&(address_space, virtual_page)));
+        debug_assert_eq!(slot.aliases.len(), slot.mapping_count);
         if mapping.observes_executable_content() {
             slot.executable_content_mapping_count = slot
                 .executable_content_mapping_count
@@ -451,6 +470,164 @@ impl ExecutionMemoryInner {
                 .executable_content_mapping_count
                 .checked_sub(1)
                 .expect("executable mapping count tracks every executable alias");
+        }
+    }
+
+    fn publish_direct_mapping(&mut self, address_space: AddressSpaceId, virtual_page: u64) {
+        if self.direct_failure.is_some() {
+            return;
+        }
+        let Some(ExecutionBackendBinding::LinuxDirect { arena, .. }) =
+            self.backends.get(&address_space)
+        else {
+            return;
+        };
+        let arena = arena.clone();
+        let Some(mapping) = self.mappings.get(address_space, virtual_page) else {
+            return;
+        };
+        let Some(ExecutionPhysicalPage::Ram(backing)) = self.page(mapping.physical_slot) else {
+            return;
+        };
+        let backing = backing.clone();
+        let guest_address = page_address(virtual_page).get();
+        let result = (|| {
+            let host = backing
+                .direct_backing()
+                .map_err(|error| CpuMemoryBackendError::new(error.to_string()))?;
+            let maximum = maximum_direct_protection(mapping);
+            let protection = effective_direct_protection(maximum, &backing);
+            arena
+                .reconcile_page(
+                    guest_address,
+                    Some(DirectMapRequest {
+                        guest_address,
+                        backing: &host,
+                        protection,
+                    }),
+                )
+                .map_err(|error| CpuMemoryBackendError::new(error.to_string()))?;
+            backing
+                .register_direct_alias(&arena, guest_address, maximum)
+                .map_err(|error| CpuMemoryBackendError::new(error.to_string()))
+        })();
+        if let Err(error) = result {
+            self.direct_failure = Some(error.to_string().into_boxed_str());
+        }
+    }
+
+    fn publish_direct_mapping_range(
+        &mut self,
+        address_space: AddressSpaceId,
+        first_page: u64,
+        end_page: u64,
+    ) {
+        if self.direct_failure.is_some() || first_page == end_page {
+            return;
+        }
+        let Some(ExecutionBackendBinding::LinuxDirect { arena, .. }) =
+            self.backends.get(&address_space)
+        else {
+            return;
+        };
+        let arena = arena.clone();
+        let result = (|| {
+            let capacity = usize::try_from(end_page - first_page)
+                .map_err(|_| CpuMemoryBackendError::new("direct map range is too large"))?;
+            let mut desired = Vec::new();
+            desired
+                .try_reserve_exact(capacity)
+                .map_err(|_| CpuMemoryBackendError::new("direct map range allocation failed"))?;
+            for virtual_page in first_page..end_page {
+                let mapping = self
+                    .mappings
+                    .get(address_space, virtual_page)
+                    .expect("published direct range retains every canonical mapping");
+                let Some(ExecutionPhysicalPage::Ram(backing)) = self.page(mapping.physical_slot)
+                else {
+                    continue;
+                };
+                let backing = backing.clone();
+                let host = backing
+                    .direct_backing()
+                    .map_err(|error| CpuMemoryBackendError::new(error.to_string()))?;
+                let maximum = maximum_direct_protection(mapping);
+                let protection = effective_direct_protection(maximum, &backing);
+                desired.push((
+                    page_address(virtual_page).get(),
+                    backing,
+                    host,
+                    maximum,
+                    protection,
+                ));
+            }
+            let mut requests = Vec::new();
+            requests
+                .try_reserve_exact(desired.len())
+                .map_err(|_| CpuMemoryBackendError::new("direct map request allocation failed"))?;
+            requests.extend(
+                desired
+                    .iter()
+                    .map(|(guest_address, _, host, _, protection)| DirectMapRequest {
+                        guest_address: *guest_address,
+                        backing: host,
+                        protection: *protection,
+                    }),
+            );
+            arena
+                .reconcile_mapped_pages(&requests)
+                .map_err(|error| CpuMemoryBackendError::new(error.to_string()))?;
+            for (guest_address, backing, _, maximum, _) in desired {
+                backing
+                    .register_direct_alias(&arena, guest_address, maximum)
+                    .map_err(|error| CpuMemoryBackendError::new(error.to_string()))?;
+            }
+            Ok::<(), CpuMemoryBackendError>(())
+        })();
+        if let Err(error) = result {
+            self.direct_failure = Some(error.to_string().into_boxed_str());
+        }
+    }
+
+    fn revoke_direct_mapping_range(
+        &mut self,
+        address_space: AddressSpaceId,
+        first_page: u64,
+        end_page: u64,
+    ) {
+        if self.direct_failure.is_some() || first_page == end_page {
+            return;
+        }
+        let Some(ExecutionBackendBinding::LinuxDirect { arena, .. }) =
+            self.backends.get(&address_space)
+        else {
+            return;
+        };
+        let arena = arena.clone();
+        for virtual_page in first_page..end_page {
+            let guest_address = page_address(virtual_page).get();
+            if let Some(mapping) = self.mappings.get(address_space, virtual_page)
+                && let Some(ExecutionPhysicalPage::Ram(backing)) = self.page(mapping.physical_slot)
+            {
+                backing.unregister_direct_alias(&arena, guest_address);
+            }
+        }
+        let page_count = end_page - first_page;
+        let result = usize::try_from(page_count)
+            .ok()
+            .and_then(|count| count.checked_mul(SYNTHETIC_PAGE_SIZE))
+            .ok_or_else(|| CpuMemoryBackendError::new("direct revoke range is too large"))
+            .and_then(|size| {
+                arena
+                    .replace_with_none(&[DirectProtectRequest {
+                        guest_address: page_address(first_page).get(),
+                        size,
+                        protection: DirectProtection::None,
+                    }])
+                    .map_err(|error| CpuMemoryBackendError::new(error.to_string()))
+            });
+        if let Err(error) = result {
+            self.direct_failure = Some(error.to_string().into_boxed_str());
         }
     }
 
@@ -491,6 +668,108 @@ impl ExecutionMapping {
     }
 }
 
+fn synchronize_direct_backend(
+    inner: &mut ExecutionMemoryInner,
+    address_space: AddressSpaceId,
+) -> Result<(), CpuMemoryBackendError> {
+    let (arena, address_space_size) = match inner.backends.get(&address_space) {
+        Some(ExecutionBackendBinding::LinuxDirect {
+            arena,
+            address_space_size,
+        }) => (arena.clone(), *address_space_size),
+        Some(ExecutionBackendBinding::Checked) => return Ok(()),
+        None => {
+            return Err(CpuMemoryBackendError::new(
+                "direct synchronization requested for an unbound address space",
+            ));
+        }
+    };
+    let mut desired = Vec::<(
+        u64,
+        CanonicalBackingPage,
+        HostMappedBacking,
+        DirectProtection,
+    )>::new();
+    for (mapped_space, virtual_page, mapping) in inner.mappings.mappings() {
+        if mapped_space != address_space {
+            continue;
+        }
+        let guest_address = virtual_page
+            .checked_mul(SYNTHETIC_PAGE_SIZE as u64)
+            .ok_or_else(|| CpuMemoryBackendError::new("direct guest page address overflows"))?;
+        let guest_end = usize::try_from(guest_address)
+            .ok()
+            .and_then(|start| start.checked_add(SYNTHETIC_PAGE_SIZE));
+        if guest_end.is_none_or(|end| end > address_space_size) {
+            return Err(CpuMemoryBackendError::new(
+                "canonical mapping lies outside its direct address-space arena",
+            ));
+        }
+        let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot) else {
+            continue;
+        };
+        let host = backing
+            .direct_backing()
+            .map_err(|error| CpuMemoryBackendError::new(error.to_string()))?;
+        desired.push((
+            guest_address,
+            backing.clone(),
+            host,
+            effective_direct_protection(maximum_direct_protection(mapping), backing),
+        ));
+    }
+    desired.sort_unstable_by_key(|(guest, _, _, _)| *guest);
+    let requests = desired
+        .iter()
+        .map(|(guest_address, _, backing, protection)| DirectMapRequest {
+            guest_address: *guest_address,
+            backing,
+            protection: *protection,
+        })
+        .collect::<Vec<_>>();
+    arena
+        .reconcile_pages(&requests)
+        .map_err(|error| CpuMemoryBackendError::new(error.to_string()))?;
+    for (guest_address, page, _, _) in desired {
+        let mapping = inner
+            .mappings
+            .get(address_space, guest_address / SYNTHETIC_PAGE_SIZE as u64)
+            .expect("direct binding desired pages retain their mappings");
+        page.register_direct_alias(&arena, guest_address, maximum_direct_protection(mapping))
+            .map_err(|error| CpuMemoryBackendError::new(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn maximum_direct_protection(mapping: ExecutionMapping) -> DirectProtection {
+    if mapping.attributes.contains(MemoryAttributes::UNCACHED)
+        || !mapping.permissions.contains(MemoryPermissions::READ)
+    {
+        return DirectProtection::None;
+    }
+    if mapping.permissions.contains(MemoryPermissions::WRITE) {
+        DirectProtection::ReadWrite
+    } else {
+        DirectProtection::Read
+    }
+}
+
+fn effective_direct_protection(
+    maximum: DirectProtection,
+    backing: &CanonicalBackingPage,
+) -> DirectProtection {
+    if !matches!(
+        backing.visibility_state(),
+        nixe_memory::VisibilityState::Clean | nixe_memory::VisibilityState::CpuNewer
+    ) {
+        return DirectProtection::None;
+    }
+    match maximum {
+        DirectProtection::ReadWrite if !backing.direct_write_is_armed() => DirectProtection::Read,
+        protection => protection,
+    }
+}
+
 /// Process-memory backend used by normal guest execution.
 ///
 /// The backend owns production-specific sparse page tables and physical-page
@@ -505,8 +784,7 @@ pub struct ExecutionMemory {
     backing_store: Option<CanonicalBackingStore>,
     invalidations: Arc<MemoryInvalidationLog>,
     inner: Mutex<ExecutionMemoryInner>,
-    lease_state: Mutex<ExecutionLeaseState>,
-    lease_changed: Condvar,
+    execution_gate: ExecutionGate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -519,17 +797,12 @@ impl MappingEpoch {
     }
 }
 
-#[derive(Debug)]
-struct ExecutionLeaseState {
-    active: usize,
-    mutating: bool,
-    epoch: MappingEpoch,
-}
-
 /// RAII proof that one executor may use mappings from the recorded epoch.
 /// Mapping mutation waits for every such lease to be released at a safepoint.
-pub struct ExecutionMemoryLease<'a> {
-    memory: &'a ExecutionMemory,
+pub struct ExecutionMemoryLease<'memory> {
+    _shared: ExecutionSharedGuard,
+    _memory: PhantomData<&'memory ExecutionMemory>,
+    gate_identity: usize,
     epoch: MappingEpoch,
 }
 
@@ -538,24 +811,16 @@ impl ExecutionMemoryLease<'_> {
     pub const fn epoch(&self) -> MappingEpoch {
         self.epoch
     }
-}
 
-impl Drop for ExecutionMemoryLease<'_> {
-    fn drop(&mut self) {
-        let mut state = self.memory.lock_lease_state();
-        state.active = state
-            .active
-            .checked_sub(1)
-            .expect("an execution lease is released exactly once");
-        if state.active == 0 {
-            self.memory.lease_changed.notify_all();
-        }
+    /// Proves that this live shared guard belongs to `memory`.
+    #[must_use]
+    pub fn authorizes(&self, memory: &dyn CpuMemory) -> bool {
+        memory.execution_gate_identity() == Some(self.gate_identity)
     }
 }
 
 struct MappingMutationGuard<'a> {
-    memory: &'a ExecutionMemory,
-    state: MutexGuard<'a, ExecutionLeaseState>,
+    transition: ExecutionTransitionGuard<'a>,
     committed: bool,
 }
 
@@ -568,18 +833,28 @@ impl MappingMutationGuard<'_> {
 impl Drop for MappingMutationGuard<'_> {
     fn drop(&mut self) {
         if self.committed {
-            self.state.epoch = MappingEpoch(
-                self.state
-                    .epoch
-                    .0
-                    .checked_add(1)
-                    .expect("mapping epoch exhaustion is unreachable in one host run"),
-            );
+            self.transition.commit();
         }
-        self.state.mutating = false;
-        self.memory.lease_changed.notify_all();
     }
 }
+
+/// Failure to construct or publish one immutable process memory backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuMemoryBackendError(Box<str>);
+
+impl CpuMemoryBackendError {
+    fn new(detail: impl Into<Box<str>>) -> Self {
+        Self(detail.into())
+    }
+}
+
+impl Display for CpuMemoryBackendError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CpuMemoryBackendError {}
 
 impl Default for ExecutionMemory {
     fn default() -> Self {
@@ -596,16 +871,15 @@ impl ExecutionMemory {
             next_mapping_generation: Some(MappingGeneration::new(1)),
             ..ExecutionMemoryInner::default()
         };
+        let execution_gate = ExecutionGate::new();
         Self {
-            backing_store: CanonicalBackingStore::allocate().ok(),
+            backing_store: CanonicalBackingStore::allocate_with_execution_gate(
+                execution_gate.clone(),
+            )
+            .ok(),
             invalidations: Arc::new(MemoryInvalidationLog::default()),
             inner: Mutex::new(inner),
-            lease_state: Mutex::new(ExecutionLeaseState {
-                active: 0,
-                mutating: false,
-                epoch: MappingEpoch(1),
-            }),
-            lease_changed: Condvar::new(),
+            execution_gate,
         }
     }
 
@@ -617,68 +891,174 @@ impl ExecutionMemory {
         self.inner.get_mut().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn lock_lease_state(&self) -> MutexGuard<'_, ExecutionLeaseState> {
-        self.lease_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// Acquires one mapping-stable execution lease for a bounded engine slice.
     pub fn acquire_execution_lease(&self) -> ExecutionMemoryLease<'_> {
-        let mut state = self.lock_lease_state();
-        while state.mutating {
-            state = self
-                .lease_changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        state.active = state
-            .active
-            .checked_add(1)
-            .expect("host execution lease count is bounded by active vCPUs");
-        let epoch = state.epoch;
+        let shared = self.execution_gate.acquire_shared();
+        let epoch = MappingEpoch(shared.epoch());
         ExecutionMemoryLease {
-            memory: self,
+            _shared: shared,
+            _memory: PhantomData,
+            gate_identity: self.execution_gate.identity(),
             epoch,
         }
+    }
+
+    /// Connects external ownership transitions to the runtime's bounded CPU
+    /// safepoint request. The callback is cold and is invoked only when an
+    /// exclusive transition finds an active execution slice.
+    pub fn set_transition_notifier(&self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.execution_gate.set_transition_notifier(notifier);
     }
 
     /// Returns the mapping epoch visible to newly acquired execution leases.
     #[must_use]
     pub fn mapping_epoch(&self) -> MappingEpoch {
-        self.lock_lease_state().epoch
+        MappingEpoch(self.execution_gate.epoch())
     }
 
     /// Reports whether a mapping mutation has closed admission to new engine
     /// slices and is waiting for, or currently owns, quiescence.
     #[must_use]
     pub fn mapping_mutation_pending(&self) -> bool {
-        self.lock_lease_state().mutating
+        self.execution_gate.transition_pending()
     }
 
     fn begin_mapping_mutation(&self) -> MappingMutationGuard<'_> {
-        let mut state = self.lock_lease_state();
-        while state.mutating {
-            state = self
-                .lease_changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        // Publish the mutation intent before waiting for existing executors.
-        // Otherwise new leases could continuously overtake a pending mapping
-        // change and prevent the coordinator from ever reaching quiescence.
-        state.mutating = true;
-        while state.active != 0 {
-            state = self
-                .lease_changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
         MappingMutationGuard {
-            memory: self,
-            state,
+            transition: self.execution_gate.acquire_exclusive(),
             committed: false,
         }
+    }
+
+    /// Selects and eagerly publishes the immutable backend for one address
+    /// space before an engine is bound.
+    pub fn bind_cpu_memory_backend(
+        &mut self,
+        address_space: AddressSpaceId,
+        address_space_size: u64,
+        policy: DirectBackendPolicy,
+    ) -> Result<CpuMemoryBackend, CpuMemoryBackendError> {
+        let size = usize::try_from(address_space_size).map_err(|_| {
+            CpuMemoryBackendError::new("guest address-space size exceeds host usize")
+        })?;
+        if size == 0 || !size.is_multiple_of(SYNTHETIC_PAGE_SIZE) {
+            return Err(CpuMemoryBackendError::new(
+                "guest address-space size is not a nonzero page multiple",
+            ));
+        }
+        let inner = self.inner_mut();
+        if inner.backends.contains_key(&address_space) {
+            return Err(CpuMemoryBackendError::new(
+                "CPU memory backend is already bound for this address space",
+            ));
+        }
+        if matches!(policy, DirectBackendPolicy::Disabled) {
+            inner
+                .backends
+                .insert(address_space, ExecutionBackendBinding::Checked);
+            inner.backend_reasons.insert(
+                address_space,
+                "checked backend selected by Disabled policy".into(),
+            );
+            return Ok(CpuMemoryBackend::Checked);
+        }
+        let arena = match DirectArena::new(size) {
+            Ok(arena) => arena,
+            Err(error)
+                if matches!(policy, DirectBackendPolicy::Preferred) && error.is_unsupported() =>
+            {
+                inner
+                    .backends
+                    .insert(address_space, ExecutionBackendBinding::Checked);
+                inner.backend_reasons.insert(
+                    address_space,
+                    format!("checked fallback because LinuxDirect is unsupported: {error}")
+                        .into_boxed_str(),
+                );
+                return Ok(CpuMemoryBackend::Checked);
+            }
+            Err(error) => return Err(CpuMemoryBackendError::new(error.to_string())),
+        };
+        inner.backends.insert(
+            address_space,
+            ExecutionBackendBinding::LinuxDirect {
+                arena,
+                address_space_size: size,
+            },
+        );
+        if let Err(error) = synchronize_direct_backend(inner, address_space) {
+            inner.backends.remove(&address_space);
+            return Err(error);
+        }
+        inner.backend_reasons.insert(
+            address_space,
+            "LinuxDirect selected after host capability validation".into(),
+        );
+        Ok(CpuMemoryBackend::LinuxDirect)
+    }
+
+    /// Returns the immutable backend selected before engine publication.
+    #[must_use]
+    pub fn cpu_memory_backend(&self, address_space: AddressSpaceId) -> Option<CpuMemoryBackend> {
+        self.lock_inner()
+            .backends
+            .get(&address_space)
+            .map(|binding| match binding {
+                ExecutionBackendBinding::Checked => CpuMemoryBackend::Checked,
+                ExecutionBackendBinding::LinuxDirect { .. } => CpuMemoryBackend::LinuxDirect,
+            })
+    }
+
+    /// Returns the cold construction diagnostic for the immutable backend.
+    pub fn cpu_memory_backend_reason(&self, address_space: AddressSpaceId) -> Option<Box<str>> {
+        self.lock_inner()
+            .backend_reasons
+            .get(&address_space)
+            .cloned()
+    }
+
+    /// Returns the direct pointer view selected for generated code or stubs.
+    #[must_use]
+    pub fn direct_address_space_view(
+        &self,
+        address_space: AddressSpaceId,
+    ) -> Option<DirectAddressSpaceView> {
+        match self.lock_inner().backends.get(&address_space)? {
+            ExecutionBackendBinding::Checked => None,
+            ExecutionBackendBinding::LinuxDirect { arena, .. } => Some(arena.view()),
+        }
+    }
+
+    #[must_use]
+    pub fn direct_arena_metrics(
+        &self,
+        address_space: AddressSpaceId,
+    ) -> Option<DirectArenaMetrics> {
+        match self.lock_inner().backends.get(&address_space)? {
+            ExecutionBackendBinding::Checked => None,
+            ExecutionBackendBinding::LinuxDirect { arena, .. } => Some(arena.metrics()),
+        }
+    }
+
+    #[must_use]
+    pub fn direct_protection_at(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Option<DirectProtection> {
+        match self.lock_inner().backends.get(&address_space)? {
+            ExecutionBackendBinding::Checked => None,
+            ExecutionBackendBinding::LinuxDirect { arena, .. } => {
+                arena.protection_at(address.get())
+            }
+        }
+    }
+
+    /// Returns a deterministic backend publication failure, if one poisoned
+    /// the arena during a later canonical mapping transition.
+    #[must_use]
+    pub fn direct_backend_failure(&self) -> Option<Box<str>> {
+        self.lock_inner().direct_failure.clone()
     }
 
     /// Atomically installs initialized RAM pages.
@@ -883,6 +1263,7 @@ impl ExecutionMemory {
         for page in range.first..range.end {
             inner.set_mapping_purpose(address_space, page, purpose, mapping_generation);
         }
+        inner.publish_direct_mapping_range(address_space, range.first, range.end);
         invalidation.commit();
         true
     }
@@ -1604,58 +1985,169 @@ fn bulk_translation_fault(
 }
 
 impl CpuMemory for ExecutionMemory {
-    fn fastmem_view(&self, address_space: AddressSpaceId) -> Option<FastmemView> {
-        self.lock_inner()
-            .fastmem_mut(address_space)
-            .map(|arena| arena.view())
+    fn cpu_memory_backend(&self, address_space: AddressSpaceId) -> CpuMemoryBackend {
+        ExecutionMemory::cpu_memory_backend(self, address_space)
+            .unwrap_or(CpuMemoryBackend::Checked)
     }
 
-    fn arm_fastmem_page(
+    fn cpu_memory_backend_reason(&self, address_space: AddressSpaceId) -> Box<str> {
+        ExecutionMemory::cpu_memory_backend_reason(self, address_space)
+            .unwrap_or_else(|| "checked backend used before explicit process binding".into())
+    }
+
+    fn direct_address_space_view(
         &self,
         address_space: AddressSpaceId,
-        page: GuestVirtualAddress,
-        kind: DataAccessKind,
-    ) -> bool {
-        if page_offset(page) != 0 {
-            return false;
-        }
-        let mut inner = self.lock_inner();
-        let Some(mapping) = inner.mapping_at(address_space, page) else {
-            return false;
-        };
-        if mapping.attributes.contains(MemoryAttributes::UNCACHED)
-            || inner
-                .executable_content_page(mapping.physical_slot)
-                .is_some()
+    ) -> Option<DirectAddressSpaceView> {
+        ExecutionMemory::direct_address_space_view(self, address_space)
+    }
+
+    fn direct_memory_metrics(
+        &self,
+        address_space: AddressSpaceId,
+    ) -> Option<super::DirectMemoryMetrics> {
+        Some(super::DirectMemoryMetrics {
+            arena: self.direct_arena_metrics(address_space)?,
+            execution_gate: self.execution_gate.metrics(),
+        })
+    }
+
+    fn enable_direct_memory_metrics(&self, address_space: AddressSpaceId) {
+        if let Some(ExecutionBackendBinding::LinuxDirect { arena, .. }) =
+            self.lock_inner().backends.get(&address_space)
         {
-            return false;
+            arena.enable_vma_sampling();
+        }
+    }
+
+    fn execution_gate_identity(&self) -> Option<usize> {
+        Some(self.execution_gate.identity())
+    }
+
+    fn acquire_execution_lease(&self) -> Option<ExecutionMemoryLease<'_>> {
+        Some(ExecutionMemory::acquire_execution_lease(self))
+    }
+
+    fn resolve_direct_fault(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        size: crate::memory::MemoryAccessSize,
+        kind: DataAccessKind,
+    ) -> DirectFaultResolution {
+        let byte_count = size.bytes();
+        if byte_count > SYNTHETIC_PAGE_SIZE
+            || page_offset(address) + byte_count > SYNTHETIC_PAGE_SIZE
+            || !address.get().is_multiple_of(byte_count as u64)
+        {
+            return DirectFaultResolution::Checked;
+        }
+        // Registered write-fault sites are emitted only by the deliberate
+        // checked-store block. Native tracked stores have no recoverable site:
+        // a host fault there is a backend invariant violation and remains
+        // fatal/unattributed. Always completing a registered write through
+        // the canonical owner also closes the concurrent first-writer race:
+        // a second already-captured store cannot bypass per-store generation
+        // publication merely because the first writer armed the page before
+        // its dispatcher ran.
+        if kind == DataAccessKind::Write {
+            return DirectFaultResolution::Checked;
+        }
+        let inner = self.lock_inner();
+        let Some(mapping) = inner.mapping_at(address_space, address) else {
+            return DirectFaultResolution::Checked;
+        };
+        if !mapping.permissions.contains(MemoryPermissions::READ)
+            || mapping.attributes.contains(MemoryAttributes::UNCACHED)
+        {
+            return DirectFaultResolution::Checked;
         }
         let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot) else {
-            return false;
+            return DirectFaultResolution::Checked;
         };
-        let backing = backing.clone();
-        let Ok(Some(lease)) =
-            backing.acquire_fastmem(mapping.permissions, matches!(kind, DataAccessKind::Write))
-        else {
-            return false;
-        };
-        let Some(arena) = inner.fastmem_mut(address_space) else {
-            return false;
-        };
-        if arena
-            .map_page(page.get(), lease.host_mapped_backing())
-            .is_err()
-        {
-            return false;
+        let visibility_before = backing.visibility_state();
+        if let Err(error) = backing.prepare_cpu_access() {
+            return match error {
+                CanonicalPageError::Visibility(_) => DirectFaultResolution::Checked,
+                error => DirectFaultResolution::Fatal(error.to_string().into_boxed_str()),
+            };
         }
-        arena
-            .arm_page(
-                page.get(),
-                mapping.permissions,
-                &lease,
-                matches!(kind, DataAccessKind::Write),
-            )
-            .is_ok()
+        let expected = matches!(
+            effective_direct_protection(maximum_direct_protection(mapping), backing),
+            DirectProtection::Read | DirectProtection::ReadWrite
+        );
+        if expected {
+            let protection = inner
+                .backends
+                .get(&address_space)
+                .and_then(|binding| match binding {
+                    ExecutionBackendBinding::LinuxDirect { arena, .. } => {
+                        arena.protection_at(page_address(virtual_page(address)).get())
+                    }
+                    ExecutionBackendBinding::Checked => None,
+                });
+            let published = matches!(
+                protection,
+                Some(DirectProtection::Read | DirectProtection::ReadWrite)
+            );
+            if !published {
+                DirectFaultResolution::Fatal(
+                    format!(
+                        "eligible direct RAM did not publish the required host protection: address={address:?} protection={protection:?} visibility_before={visibility_before:?}"
+                    )
+                    .into_boxed_str(),
+                )
+            } else if matches!(
+                visibility_before,
+                nixe_memory::VisibilityState::GpuNewer { .. }
+            ) {
+                DirectFaultResolution::Retry
+            } else {
+                DirectFaultResolution::Fatal(
+                    "eligible CPU-visible direct RAM faulted despite published protection".into(),
+                )
+            }
+        } else {
+            DirectFaultResolution::Checked
+        }
+    }
+
+    fn complete_direct_write_fault(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        value: MemoryValue,
+    ) -> Result<DataWriteResult, DataAccessFault> {
+        let result = self.write(address_space, address, access, value)?;
+        let backing = {
+            let inner = self.lock_inner();
+            let Some(mapping) = inner.mapping_at(address_space, address) else {
+                return Ok(result);
+            };
+            if !mapping.permissions.contains(MemoryPermissions::WRITE)
+                || mapping.attributes.contains(MemoryAttributes::UNCACHED)
+                || inner
+                    .executable_content_page(mapping.physical_slot)
+                    .is_some()
+                || !matches!(
+                    inner.backends.get(&address_space),
+                    Some(ExecutionBackendBinding::LinuxDirect { .. })
+                )
+            {
+                return Ok(result);
+            }
+            match inner.page(mapping.physical_slot) {
+                Some(ExecutionPhysicalPage::Ram(backing)) => Some(backing.clone()),
+                _ => None,
+            }
+        };
+        if let Some(backing) = backing
+            && let Err(error) = backing.arm_direct_writes()
+        {
+            self.lock_inner().direct_failure = Some(error.to_string().into_boxed_str());
+        }
+        Ok(result)
     }
 
     fn read(
@@ -2533,9 +3025,10 @@ impl ProcessMemory for ExecutionMemory {
                 .free_physical_slots
                 .try_reserve(removed_pages)
                 .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
+            inner.revoke_direct_mapping_range(address_space, new_end_page, old_end_page);
             for page in new_end_page..old_end_page {
                 let mapping = inner
-                    .remove_mapping(address_space, page)
+                    .remove_mapping_unpublished(address_space, page)
                     .expect("shrinking range was preflighted");
                 if inner.mapping_count(mapping.physical_slot) == 0 {
                     inner.remove_page(mapping.physical_page, mapping.physical_slot);
@@ -2596,7 +3089,7 @@ impl ProcessMemory for ExecutionMemory {
             let slot = inner
                 .push_page(physical_page, ExecutionPhysicalPage::Ram(backing))
                 .expect("allocated physical identity is unique");
-            inner.insert_mapping(
+            inner.insert_mapping_unpublished(
                 address_space,
                 page,
                 ExecutionMapping {
@@ -2609,6 +3102,7 @@ impl ProcessMemory for ExecutionMemory {
                 },
             );
         }
+        inner.publish_direct_mapping_range(address_space, old_end_page, new_end_page);
         inner.next_page_id = next_page_id;
         mutation.commit();
         invalidation.commit();
@@ -2706,7 +3200,7 @@ impl ProcessMemory for ExecutionMemory {
                 source_after,
                 mapping_generation,
             );
-            inner.insert_mapping(
+            inner.insert_mapping_unpublished(
                 address_space,
                 destination_page,
                 ExecutionMapping {
@@ -2719,6 +3213,12 @@ impl ProcessMemory for ExecutionMemory {
                 },
             );
         }
+        inner.publish_direct_mapping_range(address_space, source_range.first, source_range.end);
+        inner.publish_direct_mapping_range(
+            address_space,
+            destination_range.first,
+            destination_range.end,
+        );
         mutation.commit();
         invalidation.commit();
         Ok(())
@@ -2808,11 +3308,16 @@ impl ProcessMemory for ExecutionMemory {
         let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
             .ok_or_else(|| error(source, MemoryAliasErrorReason::GenerationExhausted))?;
 
+        inner.revoke_direct_mapping_range(
+            address_space,
+            destination_range.first,
+            destination_range.end,
+        );
         for (source_page, destination_page) in (source_range.first..source_range.end)
             .zip(destination_range.first..destination_range.end)
         {
             let removed = inner
-                .remove_mapping(address_space, destination_page)
+                .remove_mapping_unpublished(address_space, destination_page)
                 .expect("alias destination range was preflighted");
             debug_assert_ne!(inner.mapping_count(removed.physical_slot), 0);
             inner.set_mapping_properties(
@@ -2822,6 +3327,7 @@ impl ProcessMemory for ExecutionMemory {
                 mapping_generation,
             );
         }
+        inner.publish_direct_mapping_range(address_space, source_range.first, source_range.end);
         mutation.commit();
         invalidation.commit();
         Ok(())
@@ -2890,6 +3396,7 @@ impl ProcessMemory for ExecutionMemory {
         for page in range.first..range.end {
             inner.set_mapping_permissions(address_space, page, permissions, mapping_generation);
         }
+        inner.publish_direct_mapping_range(address_space, range.first, range.end);
         mutation.commit();
         invalidation.commit();
         Ok(())
@@ -2945,7 +3452,6 @@ impl ProcessMemory for ExecutionMemory {
         let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         for page in range.first..range.end {
-            inner.invalidate_fastmem_page(address_space, page);
             let mapping = inner
                 .mappings
                 .get_mut(address_space, page)
@@ -2954,6 +3460,7 @@ impl ProcessMemory for ExecutionMemory {
                 .expect("attribute mask was validated");
             mapping.mapping_generation = mapping_generation;
         }
+        inner.publish_direct_mapping_range(address_space, range.first, range.end);
         mutation.commit();
         invalidation.commit();
         Ok(())
@@ -2964,13 +3471,13 @@ impl ProcessMemory for ExecutionMemory {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::memory::{CacheMaintenanceKind, MemoryAccessSize};
     use nixe_memory::{
-        CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
-        DeviceVisibilityRequest, FASTMEM_READ, FASTMEM_WRITE, FastmemEntry, NonCpuDeviceId,
-        VisibilityCoordinator, VisibilityCoordinatorError, VisibilityState,
+        CpuVisibilityRequest, DIRECT_PAGE_SIZE, DeviceAccessDeclaration, DeviceVisibilityPoint,
+        DeviceVisibilityRequest, NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
+        VisibilityState,
     };
 
     struct DeviceWriteback {
@@ -2992,6 +3499,58 @@ mod tests {
         ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
             Ok(self.bytes.clone())
         }
+    }
+
+    #[test]
+    #[ignore = "release-only bulk-memory evidence benchmark"]
+    fn bounded_bulk_transfer_cost_is_reproducible() {
+        const BULK_SIZE: usize = 4 * 1024 * 1024;
+        const ITERATIONS: u32 = 16;
+        let space = AddressSpaceId::new(7);
+        let address = GuestVirtualAddress::new(0x1000);
+        let memory = ExecutionMemory::new();
+        memory
+            .resize_zeroed_mapping(
+                space,
+                address,
+                0,
+                BULK_SIZE as u64,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        let input = vec![0x5a; BULK_SIZE];
+        let mut output = vec![0; BULK_SIZE];
+        memory.write_bytes(space, address, &input).unwrap();
+        memory.read_bytes(space, address, &mut output).unwrap();
+        assert_eq!(output, input);
+
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut scratch = vec![0; BULK_SIZE];
+            scratch.copy_from_slice(std::hint::black_box(&input));
+            std::hint::black_box(scratch);
+        }
+        let scratch_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            memory.read_bytes(space, address, &mut output).unwrap();
+            std::hint::black_box(&output);
+        }
+        let read_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            memory
+                .write_bytes(space, address, std::hint::black_box(&input))
+                .unwrap();
+        }
+        let write_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+
+        println!(
+            "bulk_bytes={BULK_SIZE} scratch_allocate_copy_ns={scratch_ns} canonical_read_ns={read_ns} canonical_write_ns={write_ns}"
+        );
     }
 
     #[test]
@@ -3055,6 +3614,29 @@ mod tests {
                 address: GuestVirtualAddress::new(0x2000),
                 reason: CanonicalRangeTranslationErrorReason::PermissionDenied,
             }
+        );
+    }
+
+    #[test]
+    fn cpu_memory_backend_selection_is_immutable_after_binding() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(7);
+        assert_eq!(
+            memory
+                .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Disabled)
+                .unwrap(),
+            CpuMemoryBackend::Checked
+        );
+        assert!(
+            memory
+                .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
+                .unwrap_err()
+                .to_string()
+                .contains("already bound")
+        );
+        assert_eq!(
+            memory.cpu_memory_backend(space),
+            Some(CpuMemoryBackend::Checked)
         );
     }
 
@@ -3400,6 +3982,41 @@ mod tests {
     }
 
     #[test]
+    fn direct_backend_represents_every_permission_shape_conservatively() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(41);
+        let cases = [
+            (0x1000, MemoryPermissions::READ, DirectProtection::Read),
+            (
+                0x2000,
+                MemoryPermissions::READ_WRITE,
+                DirectProtection::Read,
+            ),
+            (0x3000, MemoryPermissions::WRITE, DirectProtection::None),
+            (
+                0x4000,
+                MemoryPermissions::READ_EXECUTE,
+                DirectProtection::Read,
+            ),
+            (0x5000, MemoryPermissions::EXECUTE, DirectProtection::None),
+        ];
+        for (index, (address, permissions, _)) in cases.iter().copied().enumerate() {
+            let page = GuestPhysicalPageId::new(index as u64 + 1);
+            assert!(memory.add_ram_page(page));
+            assert!(memory.map_page(space, GuestVirtualAddress::new(address), page, permissions,));
+        }
+        memory
+            .bind_cpu_memory_backend(space, 0x8000, DirectBackendPolicy::Required)
+            .unwrap();
+        for (address, _, expected) in cases {
+            assert_eq!(
+                memory.direct_protection_at(space, GuestVirtualAddress::new(address)),
+                Some(expected),
+            );
+        }
+    }
+
+    #[test]
     fn physical_slots_track_executable_aliases_across_mapping_transitions() {
         let mut memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(1);
@@ -3416,17 +4033,24 @@ mod tests {
             MemoryPermissions::READ_WRITE,
         ));
         memory
-            .write(space, writable, access, MemoryValue::U8(0x10))
+            .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
             .unwrap();
-        assert!(memory.arm_fastmem_page(space, writable, DataAccessKind::Write));
-        let fastmem = memory.fastmem_view(space).unwrap();
-        let writable_entry = unsafe {
-            &*((fastmem.entries as *const FastmemEntry)
-                .add((writable.get() as usize) >> nixe_memory::FASTMEM_PAGE_BITS))
+        memory
+            .complete_direct_write_fault(space, writable, access, MemoryValue::U8(0x10))
+            .unwrap();
+        let view = memory.direct_address_space_view(space).unwrap();
+        let writable_control = unsafe {
+            &*((view.store_controls as *const AtomicUsize)
+                .add(writable.get() as usize / DIRECT_PAGE_SIZE))
+        };
+        assert_ne!(writable_control.load(Ordering::Acquire), 0);
+        let arena = match &memory.inner_mut().backends[&space] {
+            ExecutionBackendBinding::LinuxDirect { arena, .. } => arena.clone(),
+            ExecutionBackendBinding::Checked => panic!("required direct backend was not bound"),
         };
         assert_eq!(
-            writable_entry.flags.load(Ordering::Acquire),
-            FASTMEM_READ | FASTMEM_WRITE
+            arena.protection_at(writable.get()),
+            Some(DirectProtection::ReadWrite)
         );
         assert!(memory.map_page(
             space,
@@ -3434,7 +4058,11 @@ mod tests {
             physical_page,
             MemoryPermissions::READ_EXECUTE,
         ));
-        assert_eq!(writable_entry.flags.load(Ordering::Acquire), 0);
+        assert_eq!(writable_control.load(Ordering::Acquire), 0);
+        assert_eq!(
+            arena.protection_at(writable.get()),
+            Some(DirectProtection::Read)
+        );
 
         let physical_slot = memory.inner_mut().slots_by_id[&physical_page];
         {
@@ -3587,6 +4215,215 @@ mod tests {
         assert_eq!(inner.physical_slots.len(), 4);
         assert_eq!(inner.slots_by_id.len(), 4);
         assert!(inner.free_physical_slots.is_empty());
+    }
+
+    #[test]
+    fn direct_backend_eagerly_maps_aliases_and_revokes_them_for_device_ownership() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(31);
+        let first = GuestVirtualAddress::new(0x1000);
+        let second = GuestVirtualAddress::new(0x2000);
+        let physical = GuestPhysicalPageId::new(7);
+        assert!(memory.add_ram_page(physical));
+        assert!(memory.map_page(space, first, physical, MemoryPermissions::READ_WRITE));
+        assert!(memory.map_page(space, second, physical, MemoryPermissions::READ));
+        assert_eq!(
+            memory
+                .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
+                .unwrap(),
+            CpuMemoryBackend::LinuxDirect
+        );
+        assert_eq!(
+            memory.direct_protection_at(space, first),
+            Some(DirectProtection::Read)
+        );
+        assert_eq!(
+            memory.direct_protection_at(space, second),
+            Some(DirectProtection::Read)
+        );
+
+        memory
+            .write(
+                space,
+                first,
+                MemoryAccess::normal(crate::memory::MemoryAccessSize::Byte),
+                MemoryValue::U8(0x44),
+            )
+            .unwrap();
+        let view = memory.direct_address_space_view(space).unwrap();
+        assert_eq!(
+            unsafe { ((view.base + second.get() as usize) as *const u8).read() },
+            0x44
+        );
+
+        let retained = memory
+            .translate_canonical_range(space, first, PAGE_SIZE, MemoryPermissions::READ)
+            .unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(DeviceWriteback {
+            bytes: vec![0x77; SYNTHETIC_PAGE_SIZE].into_boxed_slice(),
+        });
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(9),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        retained
+            .prepare_device_access(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        retained
+            .publish_device_write(declaration, coordinator)
+            .unwrap();
+        assert_eq!(
+            memory.direct_protection_at(space, first),
+            Some(DirectProtection::None)
+        );
+        assert_eq!(
+            memory.direct_protection_at(space, second),
+            Some(DirectProtection::None)
+        );
+
+        let lease = memory.acquire_execution_lease();
+        assert_eq!(
+            memory
+                .read(
+                    space,
+                    second,
+                    MemoryAccess::normal(crate::memory::MemoryAccessSize::Byte),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U8(0x77)
+        );
+        assert_eq!(
+            memory.direct_protection_at(space, first),
+            Some(DirectProtection::Read)
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn direct_backend_batches_zeroed_mapping_growth_and_shrink() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(32);
+        let start = GuestVirtualAddress::new(0x1000);
+        let page_count = 32_u64;
+        let size = page_count * SYNTHETIC_PAGE_SIZE as u64;
+        assert_eq!(
+            memory
+                .bind_cpu_memory_backend(space, size + 0x2000, DirectBackendPolicy::Required,)
+                .unwrap(),
+            CpuMemoryBackend::LinuxDirect
+        );
+
+        memory
+            .resize_zeroed_mapping(
+                space,
+                start,
+                0,
+                size,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        let grown = memory.direct_arena_metrics(space).unwrap();
+        assert_eq!(grown.mmap_calls, 1);
+        assert_eq!(grown.mmap_pages, page_count);
+
+        memory
+            .resize_zeroed_mapping(
+                space,
+                start,
+                size,
+                SYNTHETIC_PAGE_SIZE as u64,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        let shrunk = memory.direct_arena_metrics(space).unwrap();
+        assert_eq!(shrunk.mmap_calls, grown.mmap_calls + 1);
+        assert_eq!(shrunk.replaced_pages, page_count - 1);
+        assert_eq!(shrunk.peak_mapped_pages, page_count);
+    }
+
+    #[test]
+    fn direct_backend_batches_contiguous_protection_mutations() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(33);
+        let start = GuestVirtualAddress::new(0x10_0000);
+        let page_count = 64_u64;
+        let size = page_count * SYNTHETIC_PAGE_SIZE as u64;
+        memory
+            .bind_cpu_memory_backend(
+                space,
+                start.get() + size + SYNTHETIC_PAGE_SIZE as u64,
+                DirectBackendPolicy::Required,
+            )
+            .unwrap();
+        memory
+            .resize_zeroed_mapping(
+                space,
+                start,
+                0,
+                size,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+
+        let mapped = memory.direct_arena_metrics(space).unwrap();
+        memory
+            .set_attributes(
+                space,
+                start,
+                size,
+                MemoryAttributes::UNCACHED,
+                MemoryAttributes::UNCACHED,
+            )
+            .unwrap();
+        let uncached = memory.direct_arena_metrics(space).unwrap();
+        assert_eq!(uncached.mprotect_calls, mapped.mprotect_calls + 1);
+        assert_eq!(uncached.mprotect_pages, mapped.mprotect_pages + page_count);
+        assert_eq!(
+            memory.direct_protection_at(space, start),
+            Some(DirectProtection::None)
+        );
+
+        memory
+            .set_attributes(
+                space,
+                start,
+                size,
+                MemoryAttributes::UNCACHED,
+                MemoryAttributes::NONE,
+            )
+            .unwrap();
+        let cached = memory.direct_arena_metrics(space).unwrap();
+        assert_eq!(cached.mprotect_calls, uncached.mprotect_calls + 1);
+        assert_eq!(cached.mprotect_pages, uncached.mprotect_pages + page_count);
+        assert_eq!(
+            memory.direct_protection_at(space, start),
+            Some(DirectProtection::Read)
+        );
+
+        memory
+            .set_permissions(space, start, size, MemoryPermissions::WRITE)
+            .unwrap();
+        let write_only = memory.direct_arena_metrics(space).unwrap();
+        assert_eq!(write_only.mprotect_calls, cached.mprotect_calls + 1);
+        assert_eq!(
+            write_only.mprotect_pages,
+            cached.mprotect_pages + page_count
+        );
+        memory
+            .set_permissions(space, start, size, MemoryPermissions::READ)
+            .unwrap();
+        let readable = memory.direct_arena_metrics(space).unwrap();
+        assert_eq!(readable.mprotect_calls, write_only.mprotect_calls + 1);
+        assert_eq!(
+            readable.mprotect_pages,
+            write_only.mprotect_pages + page_count
+        );
     }
 
     #[test]

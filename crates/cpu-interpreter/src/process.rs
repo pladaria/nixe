@@ -9,28 +9,61 @@ use nixe_cpu::execution::{
 };
 use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
 use nixe_cpu::memory::CpuMemory;
+use nixe_cpu::memory::ExecutionMemoryLease;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::A64State;
-use nixe_memory::GuestVirtualAddress;
+use nixe_memory::{CpuMemoryBackend, DirectAddressSpaceView, GuestVirtualAddress};
 
 use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError, execute_decoded};
 
 pub struct InterpreterProcess {
     cpu: ProcessCpuContext,
+    memory_backend: Option<InterpreterMemoryBackend>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterpreterMemoryBackend {
+    Checked,
+    LinuxDirect {
+        address_space: nixe_memory::AddressSpaceId,
+        view: DirectAddressSpaceView,
+    },
 }
 
 impl InterpreterProcess {
     #[must_use]
     pub const fn new(cpu: ProcessCpuContext) -> Self {
-        Self { cpu }
+        Self {
+            cpu,
+            memory_backend: None,
+        }
     }
 
-    pub fn bind_memory(&mut self, _binding: MemoryBinding<'_>) -> Result<(), CpuFault> {
+    pub fn bind_memory(&mut self, binding: MemoryBinding<'_>) -> Result<(), CpuFault> {
+        let backend = match binding.memory.cpu_memory_backend(binding.address_space) {
+            CpuMemoryBackend::Checked => InterpreterMemoryBackend::Checked,
+            CpuMemoryBackend::LinuxDirect => InterpreterMemoryBackend::LinuxDirect {
+                address_space: binding.address_space,
+                view: binding
+                    .memory
+                    .direct_address_space_view(binding.address_space)
+                    .ok_or_else(|| backend_fault("LinuxDirect binding has no arena view"))?,
+            },
+        };
+        if self
+            .memory_backend
+            .is_some_and(|current| current != backend)
+        {
+            return Err(backend_fault(
+                "interpreter memory backend cannot change after binding",
+            ));
+        }
+        self.memory_backend = Some(backend);
         Ok(())
     }
 
     pub fn create_thread(&mut self, id: CpuThreadId) -> Result<InterpreterThread, CpuFault> {
-        Ok(InterpreterThread::new(id, self.cpu))
+        InterpreterThread::new(id, self.cpu, self.memory_backend)
     }
 
     pub fn request_stop(&mut self) -> Result<(), CpuFault> {
@@ -44,12 +77,42 @@ impl InterpreterProcess {
 pub struct InterpreterThread {
     id: CpuThreadId,
     cpu: ProcessCpuContext,
+    memory_backend: Option<InterpreterMemoryBackend>,
     exclusive_monitor: RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
     control: CpuControl,
+    direct_memory: Option<RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+}
+
+struct InterpreterDirectSlice<'a> {
+    frontend: Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+}
+
+impl<'a> InterpreterDirectSlice<'a> {
+    fn begin(
+        frontend: Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+    ) -> Result<Self, nixe_cpu_direct_memory::FaultRuntimeError> {
+        if let Some(frontend) = frontend {
+            frontend.borrow_mut().begin_slice()?;
+        }
+        Ok(Self { frontend })
+    }
+}
+
+impl Drop for InterpreterDirectSlice<'_> {
+    fn drop(&mut self) {
+        if let Some(frontend) = self.frontend {
+            frontend
+                .borrow_mut()
+                .end_slice()
+                .expect("active interpreter direct-memory slice ends on its worker TID");
+        }
+    }
 }
 
 pub struct InterpreterRunRequest<'a> {
     pub memory: &'a dyn CpuMemory,
+    /// Live mapping-stability proof required by a LinuxDirect backend.
+    pub memory_lease: Option<ExecutionMemoryLease<'a>>,
     pub state: &'a mut A64State,
     pub instruction_budget: u64,
     pub loader_return: Option<GuestVirtualAddress>,
@@ -58,18 +121,42 @@ pub struct InterpreterRunRequest<'a> {
 }
 
 impl InterpreterThread {
-    fn new(id: CpuThreadId, cpu: ProcessCpuContext) -> Self {
-        Self {
+    fn new(
+        id: CpuThreadId,
+        cpu: ProcessCpuContext,
+        memory_backend: Option<InterpreterMemoryBackend>,
+    ) -> Result<Self, CpuFault> {
+        let direct_memory = match memory_backend {
+            Some(InterpreterMemoryBackend::LinuxDirect {
+                address_space,
+                view,
+            }) => Some(RefCell::new(
+                unsafe { nixe_cpu_direct_memory::DirectScalarFrontend::new(view, address_space) }
+                    .map_err(|error| backend_fault(error.to_string()))?,
+            )),
+            Some(InterpreterMemoryBackend::Checked) | None => None,
+        };
+        Ok(Self {
             id,
             cpu,
+            memory_backend,
             exclusive_monitor: RefCell::new(Default::default()),
             control: CpuControl::default(),
-        }
+            direct_memory,
+        })
     }
 
     #[must_use]
     pub const fn id(&self) -> CpuThreadId {
         self.id
+    }
+
+    /// Scalar accesses which had to return to the checked memory owner.
+    #[must_use]
+    pub fn direct_checked_accesses(&self) -> u64 {
+        self.direct_memory
+            .as_ref()
+            .map_or(0, |direct| direct.borrow().checked_accesses())
     }
 
     pub fn run_slice(
@@ -78,13 +165,18 @@ impl InterpreterThread {
     ) -> Result<ExecutionReport, CpuFault> {
         let mut remaining = request.instruction_budget;
         let mut executed = 0_u64;
+        self.validate_memory_backend(request.memory)?;
+        self.validate_memory_lease(request.memory, request.memory_lease.as_ref())?;
+        let _direct_slice = InterpreterDirectSlice::begin(self.direct_memory.as_ref())
+            .map_err(|error| instruction_fault(CpuFaultKind::Internal, 0, request.state, error))?;
         let context = InterpreterContext::new(
             self.cpu,
             request.memory,
             &self.exclusive_monitor,
             request.timer,
             &request.events,
-        );
+        )
+        .with_direct_memory(self.direct_memory.as_ref());
         loop {
             if let Some((source, result_code)) =
                 loader_return_observation(self.cpu, request.state, request.loader_return)
@@ -160,7 +252,8 @@ impl InterpreterThread {
             let step = execute_decoded(context, request.state, &decoded).map_err(|error| {
                 let kind = match error {
                     InterpreterError::UnsupportedInstruction { .. } => CpuFaultKind::Unavailable,
-                    InterpreterError::InvalidInstructionStream { .. } => CpuFaultKind::Internal,
+                    InterpreterError::InvalidInstructionStream { .. }
+                    | InterpreterError::DirectMemory { .. } => CpuFaultKind::Internal,
                 };
                 instruction_fault(kind, executed, request.state, error)
             })?;
@@ -179,6 +272,7 @@ impl InterpreterThread {
         &mut self,
         binding: MemoryBinding<'_>,
     ) -> Result<(), CpuFault> {
+        self.validate_memory_backend(binding.memory)?;
         self.control
             .acknowledge_invalidation(binding.invalidation_cursor.get());
         Ok(())
@@ -197,6 +291,44 @@ impl InterpreterThread {
 
     pub fn clear_local_exclusive_reservation(&mut self) {
         *self.exclusive_monitor.get_mut() = Default::default();
+    }
+
+    fn validate_memory_backend(&self, memory: &dyn CpuMemory) -> Result<(), CpuFault> {
+        let expected = self
+            .memory_backend
+            .unwrap_or(InterpreterMemoryBackend::Checked);
+        let actual = match memory.cpu_memory_backend(self.cpu.address_space_id()) {
+            CpuMemoryBackend::Checked => InterpreterMemoryBackend::Checked,
+            CpuMemoryBackend::LinuxDirect => InterpreterMemoryBackend::LinuxDirect {
+                address_space: self.cpu.address_space_id(),
+                view: memory
+                    .direct_address_space_view(self.cpu.address_space_id())
+                    .ok_or_else(|| backend_fault("LinuxDirect execution has no arena view"))?,
+            },
+        };
+        if actual != expected {
+            return Err(backend_fault(
+                "interpreter execution memory differs from its immutable process binding",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_memory_lease(
+        &self,
+        memory: &dyn CpuMemory,
+        lease: Option<&ExecutionMemoryLease<'_>>,
+    ) -> Result<(), CpuFault> {
+        if matches!(
+            self.memory_backend,
+            Some(InterpreterMemoryBackend::LinuxDirect { .. })
+        ) && !lease.is_some_and(|lease| lease.authorizes(memory))
+        {
+            return Err(backend_fault(
+                "LinuxDirect interpreter execution requires its live mapping lease",
+            ));
+        }
+        Ok(())
     }
 
     fn report(
@@ -225,6 +357,16 @@ fn instruction_fault(
         instructions_executed,
         message: message.to_string().into(),
         context: Box::new(state.register_context()),
+    }
+}
+
+fn backend_fault(message: impl ToString) -> CpuFault {
+    CpuFault {
+        backend: "interpreter",
+        kind: CpuFaultKind::Internal,
+        instructions_executed: 0,
+        message: message.to_string().into(),
+        context: Box::new(A64State::default().register_context()),
     }
 }
 

@@ -3,13 +3,21 @@
 use std::fmt::{Display, Formatter};
 
 use nixe_memory::{
-    AddressSpaceId, ContentGeneration, ContentMutationEpoch, GuestPhysicalPageId,
-    GuestVirtualAddress, MappingGeneration,
+    AddressSpaceId, ContentGeneration, ContentMutationEpoch, DirectArenaMetrics,
+    ExecutionGateMetrics, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
 };
 
 use crate::error::InstructionFetchFault;
+use crate::memory::ExecutionMemoryLease;
 
 pub use nixe_memory::MemoryPermissions;
+
+/// Optional transition-boundary diagnostics for a selected direct backend.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DirectMemoryMetrics {
+    pub arena: DirectArenaMetrics,
+    pub execution_gate: ExecutionGateMetrics,
+}
 
 /// Page size used by the synthetic and production memory backends.
 pub const SYNTHETIC_PAGE_SIZE: usize = 4096;
@@ -807,6 +815,18 @@ pub struct DataAccessFault {
     pub reason: DataAccessFaultReason,
 }
 
+/// Policy result for an attributed direct native memory fault.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DirectFaultResolution {
+    /// Canonical state and host protection have been published; resume exactly
+    /// the original guest operation through native retry or checkpoint re-entry.
+    Retry,
+    /// Exit to the existing checked architectural operation without retrying.
+    Checked,
+    /// A CPU-visible eligible mapping faulted despite its published host view.
+    Fatal(Box<str>),
+}
+
 impl DataAccessFault {
     /// Creates a structured data-access fault for a memory implementation.
     #[must_use]
@@ -837,19 +857,68 @@ pub enum CacheMaintenanceKind {
 
 /// Engine-facing semantic memory contract shared by every CPU provider.
 pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
-    /// Returns the Linux fastmem arena used by generated native code.
-    fn fastmem_view(&self, _address_space: AddressSpaceId) -> Option<nixe_memory::FastmemView> {
+    /// Returns the immutable process-level memory backend selected at binding.
+    fn cpu_memory_backend(&self, _address_space: AddressSpaceId) -> nixe_memory::CpuMemoryBackend {
+        nixe_memory::CpuMemoryBackend::Checked
+    }
+
+    /// Cold diagnostic explaining the immutable backend selection.
+    fn cpu_memory_backend_reason(&self, _address_space: AddressSpaceId) -> Box<str> {
+        "checked backend selected by this memory implementation".into()
+    }
+
+    /// Returns the direct arena bound once for generated code or native stubs.
+    fn direct_address_space_view(
+        &self,
+        _address_space: AddressSpaceId,
+    ) -> Option<nixe_memory::DirectAddressSpaceView> {
         None
     }
 
-    /// Arms one ordinary CPU-visible RAM page in the native fastmem arena.
-    fn arm_fastmem_page(
+    /// Returns cold-path diagnostics without adding work to successful guest
+    /// accesses. Checked and synthetic backends return no direct metrics.
+    fn direct_memory_metrics(&self, _address_space: AddressSpaceId) -> Option<DirectMemoryMetrics> {
+        None
+    }
+
+    /// Enables cold host-state sampling for an explicitly requested direct
+    /// performance report. Normal execution does not perform this sampling.
+    fn enable_direct_memory_metrics(&self, _address_space: AddressSpaceId) {}
+
+    /// Stable transition-gate identity used only to validate a direct
+    /// execution lease at a frontend boundary.
+    fn execution_gate_identity(&self) -> Option<usize> {
+        None
+    }
+
+    /// Acquires a fresh mapping-stability proof immediately before native
+    /// direct-memory entry. Checked backends do not need one.
+    fn acquire_execution_lease(&self) -> Option<ExecutionMemoryLease<'_>> {
+        None
+    }
+
+    /// Classifies one attributed native fault without executing MMIO or the
+    /// guest operation a second time.
+    fn resolve_direct_fault(
         &self,
         _address_space: AddressSpaceId,
-        _page: GuestVirtualAddress,
+        _address: GuestVirtualAddress,
+        _size: MemoryAccessSize,
         _kind: DataAccessKind,
-    ) -> bool {
-        false
+    ) -> DirectFaultResolution {
+        DirectFaultResolution::Checked
+    }
+
+    /// Completes one faulted native scalar store exactly once through the
+    /// canonical path and arms subsequent direct stores when eligible.
+    fn complete_direct_write_fault(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        value: MemoryValue,
+    ) -> Result<DataWriteResult, DataAccessFault> {
+        self.write(address_space, address, access, value)
     }
 
     /// Performs one complete architectural read.

@@ -8,13 +8,34 @@ use nixe_cpu::memory::{
     MemoryPermissions, MemoryValue, ProcessMemory, SYNTHETIC_PAGE_SIZE,
 };
 use nixe_memory::{
-    AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationKind,
-    MemoryInvalidationSource,
+    AddressSpaceId, CanonicalRangeTranslator, CpuVisibilityRequest, DeviceAccessDeclaration,
+    DeviceVisibilityPoint, DeviceVisibilityRequest, GuestPhysicalPageId, GuestVirtualAddress,
+    MemoryInvalidationKind, MemoryInvalidationSource, NonCpuDeviceId, VisibilityCoordinator,
+    VisibilityCoordinatorError,
 };
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
 const PRIMARY: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);
 const ALIAS: GuestVirtualAddress = GuestVirtualAddress::new(0x2000);
+
+struct NoopVisibility;
+
+impl VisibilityCoordinator for NoopVisibility {
+    fn make_device_visible(
+        &self,
+        _request: DeviceVisibilityRequest,
+        _canonical_bytes: &[u8],
+    ) -> Result<(), VisibilityCoordinatorError> {
+        Ok(())
+    }
+
+    fn make_cpu_visible(
+        &self,
+        _request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+        Ok(vec![0; SYNTHETIC_PAGE_SIZE].into_boxed_slice())
+    }
+}
 
 fn shared_memory() -> Arc<ExecutionMemory> {
     let mut memory = ExecutionMemory::new();
@@ -67,6 +88,51 @@ fn mapping_mutation_waits_for_execution_leases_and_advances_one_epoch() {
 }
 
 #[test]
+fn execution_lease_only_authorizes_its_own_memory() {
+    let first = shared_memory();
+    let second = shared_memory();
+    let lease = first.acquire_execution_lease();
+
+    assert!(lease.authorizes(first.as_ref()));
+    assert!(!lease.authorizes(second.as_ref()));
+}
+
+#[test]
+fn external_device_transition_requests_a_safepoint_and_waits_for_the_active_slice() {
+    let memory = shared_memory();
+    let retained = memory
+        .translate_canonical_range(
+            SPACE,
+            PRIMARY,
+            SYNTHETIC_PAGE_SIZE as u64,
+            MemoryPermissions::READ,
+        )
+        .unwrap();
+    let lease = memory.acquire_execution_lease();
+    let (notified_tx, notified_rx) = mpsc::channel();
+    memory.set_transition_notifier(Some(Arc::new(move || {
+        let _ = notified_tx.send(());
+    })));
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let declaration =
+            DeviceAccessDeclaration::read(NonCpuDeviceId::new(9), DeviceVisibilityPoint::new(1));
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(NoopVisibility);
+        let result = retained.prepare_device_access(declaration, coordinator);
+        finished_tx.send(result).unwrap();
+    });
+
+    notified_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
+    drop(lease);
+    finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
 fn pending_mapping_mutation_cannot_be_overtaken_by_a_new_execution_lease() {
     let memory = shared_memory();
     let initial = memory.mapping_epoch();
@@ -105,6 +171,37 @@ fn pending_mapping_mutation_cannot_be_overtaken_by_a_new_execution_lease() {
         initial.get() + 1
     );
     waiter.join().unwrap();
+}
+
+#[test]
+fn bulk_write_snapshot_waits_for_active_native_execution_without_advancing_mapping_epoch() {
+    let memory = shared_memory();
+    let initial = memory.mapping_epoch();
+    let active = memory.acquire_execution_lease();
+    let (notified_tx, notified_rx) = mpsc::channel();
+    memory.set_transition_notifier(Some(Arc::new(move || {
+        let _ = notified_tx.send(());
+    })));
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let writer_memory = Arc::clone(&memory);
+    let writer = thread::spawn(move || {
+        let result = writer_memory.write_bytes(SPACE, PRIMARY, &[0x5a]);
+        finished_tx.send(result).unwrap();
+    });
+
+    notified_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
+    drop(active);
+    finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    writer.join().unwrap();
+
+    let mut observed = [0];
+    memory.read_bytes(SPACE, PRIMARY, &mut observed).unwrap();
+    assert_eq!(observed, [0x5a]);
+    assert_eq!(memory.mapping_epoch(), initial);
 }
 
 #[test]

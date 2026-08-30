@@ -4,7 +4,9 @@ mod region;
 mod slow;
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -18,11 +20,24 @@ use nixe_cpu::execution::{
 };
 use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
 use nixe_cpu::memory::{CodePageDependency, CodePageSpan, CpuMemory, DataAccessFault};
+use nixe_cpu::memory::{
+    DataAccessKind, DirectFaultResolution, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
+    MemoryAlignment, MemoryOrdering, MemoryValue,
+};
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv};
+#[cfg(target_arch = "aarch64")]
+use nixe_cpu_direct_memory::record_retry_reentry;
+use nixe_cpu_direct_memory::{
+    CapturedFault, CheckedCompletion, FaultDisposition, FaultFrontend, InvocationOutcome,
+    NativeFaultCompletion, NativeFaultRegion, NativeFaultRegistry, NativeFaultSite,
+    NativeInvocation, NativeMemoryAccessKind, WorkerFaultContext, record_checked_completion,
+    record_frontend_fault,
+};
 use nixe_memory::{
-    GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidation, MemoryInvalidationCursor,
-    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationSource,
+    CpuMemoryBackend, DirectAddressSpaceView, GuestPhysicalPageId, GuestVirtualAddress,
+    MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationKind,
+    MemoryInvalidationSource,
 };
 
 use crate::configuration::JitConfiguration;
@@ -34,6 +49,7 @@ use self::lookup::{NativeLookupSlot, RegionLookup};
 use self::region::{RegionKey, RegionLimits, discover_region};
 
 const DEFAULT_MAX_NATIVE_CODE_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_NATIVE_FAULT_REGIONS: usize = 262_144;
 
 const EXIT_NONE: u32 = 0;
 const EXIT_DISPATCH: u32 = 1;
@@ -168,9 +184,9 @@ struct NativeContext {
     timer: *const dyn ArchitecturalTimer,
     events: *const VcpuEventState,
     address_space: u64,
-    fastmem_base: usize,
-    fastmem_entries: usize,
-    fastmem_size: usize,
+    direct_base: usize,
+    direct_size: usize,
+    direct_store_controls: usize,
     instruction_budget: u64,
     loader_return: u64,
     control_pending: usize,
@@ -187,6 +203,7 @@ struct NativeContext {
     invalidation_cursor: u64,
     process_pending: *const AtomicU32,
     data_fault: Option<DataAccessFault>,
+    direct_fault_error: Option<Box<str>>,
 }
 
 impl NativeContext {
@@ -205,7 +222,7 @@ impl NativeContext {
         native_lookup: *const NativeLookupSlot,
         process_pending: &AtomicU32,
     ) -> Self {
-        let fastmem = memory.fastmem_view(address_space);
+        let direct = memory.direct_address_space_view(address_space);
         let state_pointer = std::ptr::from_mut(&mut *state);
         let x = state.general_register_storage_mut().as_mut_ptr();
         let vector = state.vector_register_storage_mut().as_mut_ptr();
@@ -240,9 +257,9 @@ impl NativeContext {
             timer,
             events,
             address_space: address_space.get(),
-            fastmem_base: fastmem.map_or(0, |view| view.base),
-            fastmem_entries: fastmem.map_or(0, |view| view.entries),
-            fastmem_size: fastmem.map_or(0, |view| view.address_space_size),
+            direct_base: direct.map_or(0, |view| view.base),
+            direct_size: direct.map_or(0, |view| view.address_space_size),
+            direct_store_controls: direct.map_or(0, |view| view.store_controls),
             instruction_budget,
             loader_return: loader_return.map_or(u64::MAX, GuestVirtualAddress::get),
             control_pending: control.pending_word_address(),
@@ -259,10 +276,14 @@ impl NativeContext {
             invalidation_cursor: MemoryInvalidationCursor::INITIAL.get(),
             process_pending,
             data_fault: None,
+            direct_fault_error: None,
         }
     }
 
-    fn exit(&self) -> Result<DirectExit, DirectJitError> {
+    fn exit(&mut self) -> Result<DirectExit, DirectJitError> {
+        if let Some(detail) = self.direct_fault_error.take() {
+            return Err(DirectJitError::internal(detail));
+        }
         let pc = GuestVirtualAddress::new(self.exit_pc);
         let instructions = self.retired;
         match self.exit_kind {
@@ -332,6 +353,14 @@ struct PublishedRegion {
     links: Box<[StaticLink]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BoundMemoryBackend {
+    address_space: nixe_memory::AddressSpaceId,
+    end_exclusive: GuestVirtualAddress,
+    backend: CpuMemoryBackend,
+    direct: Option<DirectAddressSpaceView>,
+}
+
 struct ProcessState {
     compiler: DirectCompiler,
     lookup: RegionLookup,
@@ -346,6 +375,7 @@ struct ProcessState {
     compiled_guest_blocks: usize,
     compiled_keys: Option<HashSet<RegionKey>>,
     compiled_guest_pcs: Option<HashSet<RegionKey>>,
+    memory_backend: Option<BoundMemoryBackend>,
 }
 
 impl ProcessState {
@@ -364,6 +394,7 @@ pub struct JitProcess {
     diagnostics: Option<Diagnostics>,
     performance: Option<Performance>,
     slow_memory_calls: AtomicU64,
+    fault_registry: Arc<NativeFaultRegistry>,
     state: Mutex<ProcessState>,
 }
 
@@ -400,6 +431,10 @@ impl JitProcess {
         }
         let compiled_keys = performance.is_some().then(HashSet::new);
         let compiled_guest_pcs = performance.is_some().then(HashSet::new);
+        let fault_registry = Arc::new(
+            NativeFaultRegistry::with_capacity(MAX_NATIVE_FAULT_REGIONS)
+                .map_err(|error| DirectJitError::unsupported(error.to_string()))?,
+        );
         Ok(Self {
             cpu,
             limits: RegionLimits::default(),
@@ -408,6 +443,7 @@ impl JitProcess {
             diagnostics,
             performance,
             slow_memory_calls: AtomicU64::new(0),
+            fault_registry,
             state: Mutex::new(ProcessState {
                 compiler: DirectCompiler::new()?,
                 lookup: RegionLookup::new(),
@@ -422,8 +458,86 @@ impl JitProcess {
                 compiled_guest_blocks: 0,
                 compiled_keys,
                 compiled_guest_pcs,
+                memory_backend: None,
             }),
         })
+    }
+
+    pub fn bind_memory(&self, binding: MemoryBinding<'_>) -> Result<(), DirectJitError> {
+        if binding.address_space != self.cpu.address_space_id() {
+            return Err(DirectJitError::invalid(
+                "JIT memory binding uses a different process address space",
+            ));
+        }
+        let backend = binding.memory.cpu_memory_backend(binding.address_space);
+        let direct = match backend {
+            CpuMemoryBackend::Checked => None,
+            CpuMemoryBackend::LinuxDirect => {
+                nixe_cpu_direct_memory::install()
+                    .map_err(|error| DirectJitError::unsupported(error.to_string()))?;
+                let view = binding
+                    .memory
+                    .direct_address_space_view(binding.address_space)
+                    .ok_or_else(|| {
+                        DirectJitError::internal(
+                            "LinuxDirect memory binding has no direct address-space view",
+                        )
+                    })?;
+                if view.address_space_size as u64 != binding.end_exclusive.get() {
+                    return Err(DirectJitError::invalid(
+                        "direct arena size differs from the process address space",
+                    ));
+                }
+                Some(view)
+            }
+        };
+        let requested = BoundMemoryBackend {
+            address_space: binding.address_space,
+            end_exclusive: binding.end_exclusive,
+            backend,
+            direct,
+        };
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(bound) = state.memory_backend {
+                if bound != requested {
+                    return Err(DirectJitError::invalid(
+                        "JIT process memory backend is immutable after binding",
+                    ));
+                }
+            } else {
+                state.compiler.bind_memory_backend(backend)?;
+                state.memory_backend = Some(requested);
+            }
+        }
+        if let Some(performance) = &self.performance {
+            performance.record_memory_backend(
+                backend,
+                binding
+                    .memory
+                    .cpu_memory_backend_reason(binding.address_space),
+            );
+        }
+        if self.performance.is_some() && direct.is_some() {
+            binding
+                .memory
+                .enable_direct_memory_metrics(binding.address_space);
+        }
+        Ok(())
+    }
+
+    fn bound_memory_backend(&self) -> Result<BoundMemoryBackend, DirectJitError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .memory_backend
+            .unwrap_or(BoundMemoryBackend {
+                address_space: self.cpu.address_space_id(),
+                end_exclusive: GuestVirtualAddress::new(0),
+                backend: CpuMemoryBackend::Checked,
+                direct: None,
+            }))
     }
 
     fn entry_for(
@@ -459,7 +573,7 @@ impl JitProcess {
             performance.record_lookup(false);
         }
 
-        let (region, link_targets, slots, compiled) = loop {
+        let (region, link_targets, slots, mut compiled) = loop {
             let region = discover_region(self.cpu, memory, location, self.limits, |pc| {
                 state.lookup.get(key.at(pc)).is_some()
             })?;
@@ -499,6 +613,9 @@ impl JitProcess {
                         .expect("enabled performance captured compilation start")
                         .elapsed(),
                 );
+                for access in &compiled.direct_accesses {
+                    performance.record_direct_access(access.kind, access.size);
+                }
             }
             if let (Some(diagnostics), Some(dump)) = (&self.diagnostics, compiled.dump.take()) {
                 diagnostics
@@ -557,6 +674,43 @@ impl JitProcess {
             .zip(slots)
             .map(|(target, slot)| StaticLink { target, slot })
             .collect();
+        if !compiled.fault_sites.is_empty() {
+            let native_end = entry.checked_add(compiled.native_bytes).ok_or_else(|| {
+                DirectJitError::internal("compiled native region address overflows")
+            })?;
+            let sites = std::mem::take(&mut compiled.fault_sites)
+                .into_vec()
+                .into_iter()
+                .map(|site| {
+                    let native_start =
+                        entry
+                            .checked_add(site.native_start as usize)
+                            .ok_or_else(|| {
+                                DirectJitError::internal("native fault-site start overflows")
+                            })?;
+                    let native_end =
+                        entry.checked_add(site.native_end as usize).ok_or_else(|| {
+                            DirectJitError::internal("native fault-site end overflows")
+                        })?;
+                    Ok(NativeFaultSite {
+                        native_start,
+                        native_end,
+                        access: site.access,
+                        completion: site.completion,
+                        guest_address: Some(site.guest_address),
+                        retired_delta: site.retired_delta,
+                    })
+                })
+                .collect::<Result<Vec<_>, DirectJitError>>()?;
+            let metadata = Arc::new(NativeFaultRegion {
+                native_start: entry,
+                native_end,
+                sites: Arc::from(sites),
+            });
+            self.fault_registry
+                .publish(Arc::clone(&metadata))
+                .map_err(|error| DirectJitError::internal(error.to_string()))?;
+        }
         let published = Arc::new(PublishedRegion {
             key,
             entry_keys: entry_keys.into_boxed_slice(),
@@ -622,6 +776,36 @@ impl JitProcess {
             published.entry,
             state.invalidation_cursor.get(),
         ))
+    }
+
+    /// Reconciles invalidations and returns an already-published entry without
+    /// compiling. Callers use this after acquiring the short native-execution
+    /// lease; a missing entry means that a transition invalidated the region
+    /// between compilation and lease acquisition, so compilation is retried
+    /// outside the lease.
+    fn published_entry_for(
+        &self,
+        memory: &(impl CpuMemory + ?Sized),
+        location: LocationDescriptor,
+    ) -> Result<Option<(NativeGateway, usize, u64)>, DirectJitError> {
+        let key = RegionKey::new(self.cpu, location);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        reconcile_invalidations(
+            &mut state,
+            memory,
+            key.address_space,
+            self.performance.as_ref(),
+        )?;
+        if self.pending.load(Ordering::Acquire) != 0 {
+            return Err(DirectJitError::shutdown());
+        }
+        Ok(state.lookup.get(key).map(|entry| {
+            (
+                state.compiler.gateway(),
+                entry.entry,
+                state.invalidation_cursor.get(),
+            )
+        }))
     }
 
     fn reconcile(&self, memory: &(impl CpuMemory + ?Sized)) -> Result<(), DirectJitError> {
@@ -864,6 +1048,7 @@ fn retire_region(state: &mut ProcessState, key: RegionKey) {
 pub struct JitThread {
     control: CpuControl,
     exclusive: Mutex<ExclusiveMonitorState>,
+    fault_context: Mutex<Option<WorkerFaultContext>>,
     #[cfg(test)]
     events: VcpuEventState,
     #[cfg(test)]
@@ -890,6 +1075,7 @@ impl JitThread {
         Self {
             control: CpuControl::default(),
             exclusive: Mutex::new(ExclusiveMonitorState::default()),
+            fault_context: Mutex::new(None),
             #[cfg(test)]
             events: VcpuEventState::default(),
             #[cfg(test)]
@@ -920,8 +1106,29 @@ impl JitThread {
         binding: MemoryBinding<'_>,
     ) -> Result<(), CpuFault> {
         process
+            .bind_memory(binding)
+            .map_err(|error| jit_fault(error, 0, &A64State::default()))?;
+        process
             .synchronize_address_space(binding.memory)
             .map_err(|error| jit_fault(error, 0, &A64State::default()))?;
+        let backend = process
+            .bound_memory_backend()
+            .map_err(|error| jit_fault(error, 0, &A64State::default()))?;
+        if backend.backend == CpuMemoryBackend::LinuxDirect {
+            let context = self
+                .fault_context
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner);
+            if context.is_none() {
+                *context = Some(WorkerFaultContext::register().map_err(|error| {
+                    jit_fault(
+                        DirectJitError::unsupported(error.to_string()),
+                        0,
+                        &A64State::default(),
+                    )
+                })?);
+            }
+        }
         self.control
             .acknowledge_invalidation(binding.invalidation_cursor.get());
         Ok(())
@@ -934,14 +1141,43 @@ impl JitThread {
     ) -> Result<(), CpuFault> {
         self.synchronize_address_space(process, binding)?;
         self.clear_local_exclusive_reservation();
+        self.fault_context
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         Ok(())
     }
 
     pub fn run_slice(
         &mut self,
         process: &JitProcess,
-        request: RunRequest<'_>,
+        mut request: RunRequest<'_>,
     ) -> Result<ExecutionReport, CpuFault> {
+        let backend = process
+            .bound_memory_backend()
+            .map_err(|error| jit_fault(error, 0, request.state))?;
+        if backend.backend == CpuMemoryBackend::LinuxDirect
+            && !request
+                .memory_lease
+                .as_ref()
+                .is_some_and(|lease| lease.authorizes(request.memory))
+        {
+            return Err(jit_fault(
+                DirectJitError::invalid(
+                    "LinuxDirect JIT execution requires its live mapping lease",
+                ),
+                0,
+                request.state,
+            ));
+        }
+        // The caller lease proves the public binding, but retaining it while
+        // discovering and compiling a region can stall unrelated GPU or
+        // mapping transitions for the complete compile. Native execution
+        // acquires its own fresh lease after the compiled entry has been
+        // revalidated against pending invalidations.
+        if backend.backend == CpuMemoryBackend::LinuxDirect {
+            drop(request.memory_lease.take());
+        }
         let mut executed = 0;
         let mut remaining = request.instruction_budget;
         loop {
@@ -1081,6 +1317,23 @@ impl JitThread {
             timer,
             events,
         } = request;
+        let backend = process.bound_memory_backend()?;
+        let actual_backend = memory.cpu_memory_backend(process.cpu.address_space_id());
+        let actual_direct = memory.direct_address_space_view(process.cpu.address_space_id());
+        if actual_backend != backend.backend || actual_direct != backend.direct {
+            return Err(DirectJitError::invalid(
+                "JIT execution memory differs from its immutable process binding",
+            ));
+        }
+        let mut fault_context = self
+            .fault_context
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if backend.backend == CpuMemoryBackend::LinuxDirect && fault_context.is_none() {
+            return Err(DirectJitError::internal(
+                "direct JIT worker entered native code without a fault context",
+            ));
+        }
         let mut exclusive = self
             .exclusive
             .lock()
@@ -1116,16 +1369,76 @@ impl JitThread {
                 });
             }
             let location = LocationDescriptor::new(pc, process.cpu.profile_id());
-            let (gateway, entry, invalidation_cursor) = process.entry_for(memory, location)?;
+            let compiled_entry = process.entry_for(memory, location)?;
+            let native_lease = if backend.backend == CpuMemoryBackend::LinuxDirect {
+                let lease = memory.acquire_execution_lease().ok_or_else(|| {
+                    DirectJitError::invalid(
+                        "LinuxDirect memory cannot acquire its native execution lease",
+                    )
+                })?;
+                if !lease.authorizes(memory) {
+                    return Err(DirectJitError::invalid(
+                        "LinuxDirect memory acquired a lease from another owner",
+                    ));
+                }
+                Some(lease)
+            } else {
+                None
+            };
+            let (gateway, entry, invalidation_cursor) =
+                if backend.backend == CpuMemoryBackend::LinuxDirect {
+                    let Some(entry) = process.published_entry_for(memory, location)? else {
+                        drop(native_lease);
+                        continue;
+                    };
+                    entry
+                } else {
+                    compiled_entry
+                };
             context.invalidation_cursor = invalidation_cursor;
             let native_started = process.performance.as_ref().map(|_| Instant::now());
-            unsafe { gateway(&mut context, entry) };
+            if let Some(arena) = backend.direct {
+                let worker = fault_context
+                    .as_mut()
+                    .expect("direct backend retains a registered fault context");
+                let gateway = unsafe {
+                    std::mem::transmute::<NativeGateway, nixe_cpu_direct_memory::NativeGateway>(
+                        gateway,
+                    )
+                };
+                let outcome = unsafe {
+                    worker.invoke(
+                        arena,
+                        &process.fault_registry,
+                        dispatch_direct_fault,
+                        std::ptr::from_mut(&mut context).cast(),
+                        NativeInvocation {
+                            gateway,
+                            context: std::ptr::from_mut(&mut context).cast(),
+                            entry,
+                        },
+                    )
+                }
+                .map_err(|error| DirectJitError::internal(error.to_string()))?;
+                if outcome == InvocationOutcome::Retry {
+                    return Err(DirectJitError::internal(
+                        "direct JIT gateway unexpectedly requested caller retry",
+                    ));
+                }
+            } else {
+                unsafe { gateway(&mut context, entry) };
+            }
+            drop(native_lease);
             if let Some(performance) = &process.performance {
                 performance.record_native_time(
                     native_started
                         .expect("enabled performance captured native start")
                         .elapsed(),
                 );
+                if let Some(metrics) = memory.direct_memory_metrics(process.cpu.address_space_id())
+                {
+                    performance.record_direct_memory(metrics);
+                }
             }
             let exit = context.exit()?;
             if let Some(performance) = &process.performance {
@@ -1145,6 +1458,496 @@ impl JitThread {
             }
             return Ok(exit);
         }
+    }
+}
+
+unsafe extern "C" fn dispatch_direct_fault(
+    opaque: *mut c_void,
+    fault: *mut CapturedFault,
+) -> FaultDisposition {
+    record_frontend_fault(FaultFrontend::Jit);
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        dispatch_direct_fault_inner(&mut *opaque.cast::<NativeContext>(), &*fault)
+    }))
+    .unwrap_or(FaultDisposition::Fatal)
+}
+
+unsafe fn dispatch_direct_fault_inner(
+    context: &mut NativeContext,
+    fault: &CapturedFault,
+) -> FaultDisposition {
+    let site = fault.site();
+    if site.access.address_space.get() != context.address_space {
+        return FaultDisposition::Fatal;
+    }
+    let Some(guest_address_register) = site.guest_address else {
+        return FaultDisposition::Fatal;
+    };
+    let Ok(guest_address) = fault.read_host_integer(guest_address_register) else {
+        return FaultDisposition::Fatal;
+    };
+    let Some(size) = direct_access_size(site.access.size) else {
+        return FaultDisposition::Fatal;
+    };
+    let kind = match site.access.kind {
+        NativeMemoryAccessKind::Read => DataAccessKind::Read,
+        NativeMemoryAccessKind::Write => DataAccessKind::Write,
+    };
+    let memory = unsafe { &*context.memory };
+    let address = GuestVirtualAddress::new(guest_address);
+    let access = MemoryAccess::new(
+        size,
+        MemoryAlignment::Unaligned,
+        MemoryOrdering::Relaxed,
+        MemoryAccessClass::Normal,
+    );
+    match memory.resolve_direct_fault(site.access.address_space, address, size, kind) {
+        DirectFaultResolution::Retry => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                FaultDisposition::Retry
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // AArch64 glibc does not restore all volatile host state from
+                // setcontext. Re-enter the faulting guest checkpoint instead;
+                // this path is cold and leaves generated memory accesses bare.
+                let pre_retired = direct_fault_retired(context, fault);
+                unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
+                context.retired = pre_retired;
+                context.exit_pc = site.access.guest_pc.get();
+                context.exit_kind = EXIT_DISPATCH;
+                context.exit_detail = 0;
+                context.data_fault = None;
+                context.direct_fault_error = None;
+                record_retry_reentry();
+                FaultDisposition::Escape
+            }
+        }
+        DirectFaultResolution::Checked => {
+            let pre_retired = direct_fault_retired(context, fault);
+            unsafe { &*context.slow_memory_calls }.fetch_add(1, Ordering::Relaxed);
+            match kind {
+                DataAccessKind::Read => {
+                    match site.completion {
+                        NativeFaultCompletion::IntegerPairLoad { .. } => {
+                            if !complete_direct_pair_read(
+                                context,
+                                memory,
+                                site,
+                                address,
+                                size,
+                                access,
+                                pre_retired,
+                            ) {
+                                return FaultDisposition::Fatal;
+                            }
+                            return FaultDisposition::Escape;
+                        }
+                        NativeFaultCompletion::VectorPairLoad { .. } => {
+                            if !complete_direct_vector_pair_read(
+                                context,
+                                memory,
+                                site,
+                                address,
+                                size,
+                                access,
+                                pre_retired,
+                            ) {
+                                return FaultDisposition::Fatal;
+                            }
+                            return FaultDisposition::Escape;
+                        }
+                        _ => {}
+                    }
+                    match memory.read(site.access.address_space, address, access) {
+                        Ok(result) => {
+                            if !complete_direct_read(
+                                context,
+                                site.completion,
+                                size,
+                                result.value.bits(),
+                            ) {
+                                return FaultDisposition::Fatal;
+                            }
+                            let next = site.access.guest_pc.wrapping_offset(4);
+                            unsafe { &mut *context.state }.set_pc(next.get());
+                            context.retired = pre_retired.saturating_add(1);
+                            context.exit_pc = next.get();
+                            context.exit_kind = EXIT_DISPATCH;
+                            context.exit_detail = 0;
+                            context.data_fault = None;
+                            record_checked_completion(DataAccessKind::Read, result.region.into());
+                        }
+                        Err(data_fault) => {
+                            unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
+                            context.retired = pre_retired.saturating_add(1);
+                            context.exit_pc = site.access.guest_pc.get();
+                            context.exit_kind = EXIT_DATA_FAULT;
+                            context.exit_detail = 0;
+                            context.data_fault = Some(data_fault);
+                            record_checked_completion(
+                                DataAccessKind::Read,
+                                CheckedCompletion::GuestFault,
+                            );
+                        }
+                    }
+                }
+                DataAccessKind::Write => {
+                    let Some(value) = direct_store_value(context, site.completion, size) else {
+                        return FaultDisposition::Fatal;
+                    };
+                    match memory.complete_direct_write_fault(
+                        site.access.address_space,
+                        address,
+                        access,
+                        value,
+                    ) {
+                        Ok(result) => {
+                            let next = site.access.guest_pc.wrapping_offset(4);
+                            unsafe { &mut *context.state }.set_pc(next.get());
+                            context.retired = pre_retired.saturating_add(1);
+                            context.exit_pc = next.get();
+                            context.exit_kind = EXIT_DISPATCH;
+                            context.exit_detail = 0;
+                            context.data_fault = None;
+                            record_checked_completion(DataAccessKind::Write, result.region.into());
+                        }
+                        Err(data_fault) => {
+                            unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
+                            context.retired = pre_retired.saturating_add(1);
+                            context.exit_pc = site.access.guest_pc.get();
+                            context.exit_kind = EXIT_DATA_FAULT;
+                            context.exit_detail = 0;
+                            context.data_fault = Some(data_fault);
+                            record_checked_completion(
+                                DataAccessKind::Write,
+                                CheckedCompletion::GuestFault,
+                            );
+                        }
+                    }
+                }
+            }
+            FaultDisposition::Escape
+        }
+        DirectFaultResolution::Fatal(detail) => {
+            let pre_retired = direct_fault_retired(context, fault);
+            unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
+            context.retired = pre_retired;
+            context.exit_pc = site.access.guest_pc.get();
+            context.exit_kind = EXIT_INTERNAL;
+            context.direct_fault_error = Some(detail);
+            FaultDisposition::Escape
+        }
+    }
+}
+
+fn direct_fault_retired(context: &NativeContext, fault: &CapturedFault) -> u64 {
+    context
+        .retired
+        .saturating_add(u64::from(fault.site().retired_delta))
+}
+
+fn complete_direct_read(
+    context: &mut NativeContext,
+    completion: NativeFaultCompletion,
+    size: MemoryAccessSize,
+    bits: u128,
+) -> bool {
+    match completion {
+        NativeFaultCompletion::IntegerLoad {
+            register,
+            signed,
+            destination_bits,
+        } => {
+            let Some(value) = integer_load_value(size, bits, signed, destination_bits) else {
+                return false;
+            };
+            write_integer_result(unsafe { &mut *context.state }, register, value)
+        }
+        NativeFaultCompletion::VectorLoad { register } => {
+            unsafe { &mut *context.state }.set_vector(register, bits)
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_direct_pair_read(
+    context: &mut NativeContext,
+    memory: &dyn CpuMemory,
+    site: &NativeFaultSite,
+    fault_address: GuestVirtualAddress,
+    size: MemoryAccessSize,
+    access: MemoryAccess,
+    pre_retired: u64,
+) -> bool {
+    let NativeFaultCompletion::IntegerPairLoad {
+        first_register,
+        second_register,
+        signed,
+        destination_bits,
+        access_index,
+        writeback_register,
+        writeback_offset,
+        writeback,
+    } = site.completion
+    else {
+        return false;
+    };
+    if access_index > 1 || first_register > 31 || second_register > 31 || writeback_register > 31 {
+        return false;
+    }
+    let displacement = u64::from(access_index) * size.bytes() as u64;
+    let Some(first_address) = fault_address.get().checked_sub(displacement) else {
+        return false;
+    };
+    let Some(second_address) = first_address.checked_add(size.bytes() as u64) else {
+        return false;
+    };
+    let first_address = GuestVirtualAddress::new(first_address);
+    let second_address = GuestVirtualAddress::new(second_address);
+    let first = match memory.read(site.access.address_space, first_address, access) {
+        Ok(result) => {
+            record_checked_completion(DataAccessKind::Read, result.region.into());
+            result.value.bits()
+        }
+        Err(data_fault) => {
+            finish_checked_direct_fault(context, site.access.guest_pc, pre_retired, data_fault);
+            record_checked_completion(DataAccessKind::Read, CheckedCompletion::GuestFault);
+            return true;
+        }
+    };
+    let second = match memory.read(site.access.address_space, second_address, access) {
+        Ok(result) => {
+            record_checked_completion(DataAccessKind::Read, result.region.into());
+            result.value.bits()
+        }
+        Err(data_fault) => {
+            finish_checked_direct_fault(context, site.access.guest_pc, pre_retired, data_fault);
+            record_checked_completion(DataAccessKind::Read, CheckedCompletion::GuestFault);
+            return true;
+        }
+    };
+    let Some(first) = integer_load_value(size, first, signed, destination_bits) else {
+        return false;
+    };
+    let Some(second) = integer_load_value(size, second, signed, destination_bits) else {
+        return false;
+    };
+    let state = unsafe { &mut *context.state };
+    let writeback = if writeback {
+        let register = if writeback_register == 31 {
+            A64Register::StackPointer
+        } else {
+            let Some(register) = A64GeneralRegister::new(writeback_register) else {
+                return false;
+            };
+            A64Register::General(register)
+        };
+        Some((
+            register,
+            state
+                .read_x(register)
+                .wrapping_add_signed(i64::from(writeback_offset)),
+        ))
+    } else {
+        None
+    };
+    if !write_integer_result(state, first_register, first)
+        || !write_integer_result(state, second_register, second)
+    {
+        return false;
+    }
+    if let Some((register, value)) = writeback {
+        state.write_x(register, value);
+    }
+    finish_checked_direct_success(context, site.access.guest_pc, pre_retired);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_direct_vector_pair_read(
+    context: &mut NativeContext,
+    memory: &dyn CpuMemory,
+    site: &NativeFaultSite,
+    fault_address: GuestVirtualAddress,
+    size: MemoryAccessSize,
+    access: MemoryAccess,
+    pre_retired: u64,
+) -> bool {
+    let NativeFaultCompletion::VectorPairLoad {
+        first_register,
+        second_register,
+        access_index,
+        writeback_register,
+        writeback_offset,
+        writeback,
+    } = site.completion
+    else {
+        return false;
+    };
+    if access_index > 1 || first_register > 31 || second_register > 31 || writeback_register > 31 {
+        return false;
+    }
+    let displacement = u64::from(access_index) * size.bytes() as u64;
+    let Some(first_address) = fault_address.get().checked_sub(displacement) else {
+        return false;
+    };
+    let Some(second_address) = first_address.checked_add(size.bytes() as u64) else {
+        return false;
+    };
+    let first = match memory.read(
+        site.access.address_space,
+        GuestVirtualAddress::new(first_address),
+        access,
+    ) {
+        Ok(result) => {
+            record_checked_completion(DataAccessKind::Read, result.region.into());
+            result.value.bits()
+        }
+        Err(data_fault) => {
+            finish_checked_direct_fault(context, site.access.guest_pc, pre_retired, data_fault);
+            record_checked_completion(DataAccessKind::Read, CheckedCompletion::GuestFault);
+            return true;
+        }
+    };
+    let second = match memory.read(
+        site.access.address_space,
+        GuestVirtualAddress::new(second_address),
+        access,
+    ) {
+        Ok(result) => {
+            record_checked_completion(DataAccessKind::Read, result.region.into());
+            result.value.bits()
+        }
+        Err(data_fault) => {
+            finish_checked_direct_fault(context, site.access.guest_pc, pre_retired, data_fault);
+            record_checked_completion(DataAccessKind::Read, CheckedCompletion::GuestFault);
+            return true;
+        }
+    };
+    let state = unsafe { &mut *context.state };
+    let writeback = if writeback {
+        let register = if writeback_register == 31 {
+            A64Register::StackPointer
+        } else {
+            let Some(register) = A64GeneralRegister::new(writeback_register) else {
+                return false;
+            };
+            A64Register::General(register)
+        };
+        Some((
+            register,
+            state
+                .read_x(register)
+                .wrapping_add_signed(i64::from(writeback_offset)),
+        ))
+    } else {
+        None
+    };
+    if !state.set_vector(first_register, first) || !state.set_vector(second_register, second) {
+        return false;
+    }
+    if let Some((register, value)) = writeback {
+        state.write_x(register, value);
+    }
+    finish_checked_direct_success(context, site.access.guest_pc, pre_retired);
+    true
+}
+
+fn integer_load_value(
+    size: MemoryAccessSize,
+    bits: u128,
+    signed: bool,
+    destination_bits: u8,
+) -> Option<u64> {
+    if !matches!(destination_bits, 32 | 64) || size == MemoryAccessSize::Quadword {
+        return None;
+    }
+    let source_bits = (size.bytes() * 8) as u32;
+    let value = if signed {
+        let shift = 64 - source_bits;
+        (((bits as u64) << shift) as i64 >> shift) as u64
+    } else {
+        bits as u64
+    };
+    Some(if destination_bits == 32 {
+        u64::from(value as u32)
+    } else {
+        value
+    })
+}
+
+fn write_integer_result(state: &mut A64State, register: u8, value: u64) -> bool {
+    if register == 31 {
+        return true;
+    }
+    let Some(register) = A64GeneralRegister::new(register) else {
+        return false;
+    };
+    state.write_x(A64Register::General(register), value);
+    true
+}
+
+fn finish_checked_direct_success(
+    context: &mut NativeContext,
+    source: GuestVirtualAddress,
+    pre_retired: u64,
+) {
+    let next = source.wrapping_offset(4);
+    unsafe { &mut *context.state }.set_pc(next.get());
+    context.retired = pre_retired.saturating_add(1);
+    context.exit_pc = next.get();
+    context.exit_kind = EXIT_DISPATCH;
+    context.exit_detail = 0;
+    context.data_fault = None;
+}
+
+fn finish_checked_direct_fault(
+    context: &mut NativeContext,
+    source: GuestVirtualAddress,
+    pre_retired: u64,
+    data_fault: DataAccessFault,
+) {
+    unsafe { &mut *context.state }.set_pc(source.get());
+    context.retired = pre_retired.saturating_add(1);
+    context.exit_pc = source.get();
+    context.exit_kind = EXIT_DATA_FAULT;
+    context.exit_detail = 0;
+    context.data_fault = Some(data_fault);
+}
+
+fn direct_store_value(
+    context: &NativeContext,
+    completion: NativeFaultCompletion,
+    size: MemoryAccessSize,
+) -> Option<MemoryValue> {
+    let bits = match completion {
+        NativeFaultCompletion::IntegerStore { register } => {
+            if register == 31 {
+                0
+            } else {
+                let register = A64GeneralRegister::new(register)?;
+                u128::from(unsafe { &*context.state }.read_x(A64Register::General(register)))
+            }
+        }
+        NativeFaultCompletion::VectorStore { register } => {
+            unsafe { &*context.state }.vector(register)?
+        }
+        _ => return None,
+    };
+    Some(MemoryValue::from_bits(size, bits))
+}
+
+const fn direct_access_size(bytes: u8) -> Option<MemoryAccessSize> {
+    match bytes {
+        1 => Some(MemoryAccessSize::Byte),
+        2 => Some(MemoryAccessSize::Halfword),
+        4 => Some(MemoryAccessSize::Word),
+        8 => Some(MemoryAccessSize::Doubleword),
+        16 => Some(MemoryAccessSize::Quadword),
+        _ => None,
     }
 }
 

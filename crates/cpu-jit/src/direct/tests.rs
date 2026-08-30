@@ -1,12 +1,15 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use nixe_cpu::decode::{self, DecodeResult, DecodeSupport};
+use nixe_cpu::execution::MemoryBinding;
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::{
-    CacheMaintenanceKind, CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize,
-    MemoryPermissions, MemoryValue, ProcessMemory, SyntheticMemory, SyntheticMmio,
+    CacheMaintenanceKind, CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessClass,
+    MemoryAccessSize, MemoryAlignment, MemoryAttributes, MemoryOrdering, MemoryPermissions,
+    MemoryValue, ProcessMemory, SyntheticMemory, SyntheticMmio,
 };
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -15,8 +18,10 @@ use nixe_cpu_interpreter::{
     InstructionStep, InterpreterContext, execute_one, execute_one_with_context,
 };
 use nixe_memory::{
-    AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationKind,
-    MemoryInvalidationSource,
+    AddressSpaceId, CanonicalRangeTranslator, CpuVisibilityRequest, DeviceAccessDeclaration,
+    DeviceVisibilityPoint, DeviceVisibilityRequest, DirectBackendPolicy, GuestPhysicalPageId,
+    GuestVirtualAddress, MemoryInvalidationKind, MemoryInvalidationSource, NonCpuDeviceId,
+    VisibilityCoordinator, VisibilityCoordinatorError,
 };
 
 use super::lookup::{RegionLookup, index_for_pc, lookup_salt};
@@ -26,6 +31,27 @@ use super::*;
 const CODE: u64 = 0x1000;
 const DATA: u64 = 0x8000;
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
+
+struct DeviceWriteback {
+    bytes: Box<[u8]>,
+}
+
+impl VisibilityCoordinator for DeviceWriteback {
+    fn make_device_visible(
+        &self,
+        _request: DeviceVisibilityRequest,
+        _canonical_bytes: &[u8],
+    ) -> Result<(), VisibilityCoordinatorError> {
+        Ok(())
+    }
+
+    fn make_cpu_visible(
+        &self,
+        _request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+        Ok(self.bytes.clone())
+    }
+}
 
 #[test]
 fn configured_diagnostics_dump_direct_clif_native_code_and_one_compact_report() {
@@ -82,9 +108,11 @@ fn configured_diagnostics_dump_direct_clif_native_code_and_one_compact_report() 
     let report: toml::Value =
         toml::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
     let table = report.as_table().unwrap();
-    assert_eq!(table["version"].as_integer(), Some(4));
+    assert_eq!(table["version"].as_integer(), Some(7));
     let expected: BTreeSet<_> = [
         "version",
+        "memory_backend",
+        "memory_backend_reason",
         "regions_discovered",
         "guest_blocks_discovered",
         "regions_compiled",
@@ -101,6 +129,9 @@ fn configured_diagnostics_dump_direct_clif_native_code_and_one_compact_report() 
         "compile_time_ns",
         "native_time_ns",
         "slow_memory_calls",
+        "direct_faults",
+        "compiled_direct_accesses",
+        "direct_memory",
         "invalidations",
         "invalidation_details",
         "exit_reasons",
@@ -112,6 +143,7 @@ fn configured_diagnostics_dump_direct_clif_native_code_and_one_compact_report() 
         expected
     );
     assert_eq!(table["regions_compiled"].as_integer(), Some(1));
+    assert_eq!(table["memory_backend"].as_str(), Some("unbound"));
     assert_eq!(table["region_entry_points"].as_integer(), Some(1));
     assert_eq!(table["compiled_guest_instructions"].as_integer(), Some(2));
     assert_eq!(table["unique_guest_instructions"].as_integer(), Some(2));
@@ -123,6 +155,22 @@ fn configured_diagnostics_dump_direct_clif_native_code_and_one_compact_report() 
     assert_eq!(table["guest_instructions"].as_integer(), Some(1));
     assert!(table["clif_instructions"].as_integer().unwrap() > 0);
     assert!(table["native_bytes"].as_integer().unwrap() > 0);
+    assert_eq!(
+        table["direct_memory"]["writable_alias_pages_armed"].as_integer(),
+        Some(0)
+    );
+    assert_eq!(
+        table["direct_memory"]["writable_alias_pages_revoked"].as_integer(),
+        Some(0)
+    );
+    assert_eq!(
+        table["direct_memory"]["transition_safepoint_notifications"].as_integer(),
+        Some(0)
+    );
+    assert_eq!(
+        table["compiled_direct_accesses"]["read_8"].as_integer(),
+        Some(0)
+    );
     assert_eq!(
         table["invalidation_details"]["regions_retired"].as_integer(),
         Some(0)
@@ -136,6 +184,115 @@ fn configured_diagnostics_dump_direct_clif_native_code_and_one_compact_report() 
         Some(1)
     );
     assert_eq!(table["exit_reasons"]["budget"].as_integer(), Some(1));
+}
+
+#[test]
+fn direct_diagnostics_count_compiled_access_sites_by_kind_and_width() {
+    let root = tempfile::tempdir().unwrap();
+    let reports = root.path().join("reports");
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    let data_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.add_ram_page(data_page));
+    for (offset, encoding) in [
+        (0, 0x3940_0020_u32),  // LDRB W0,[X1]
+        (4, 0x3900_0020_u32),  // STRB W0,[X1]
+        (8, 0x7940_0020_u32),  // LDRH W0,[X1]
+        (12, 0x7900_0020_u32), // STRH W0,[X1]
+        (16, 0xb940_0020_u32), // LDR W0,[X1]
+        (20, 0xb900_0020_u32), // STR W0,[X1]
+        (24, 0xf940_0020_u32), // LDR X0,[X1]
+        // Register-offset lowering can duplicate the faultable guard while
+        // arranging native control flow. It is still one logical guest site.
+        (28, 0xf822_7820_u32), // STR X0,[X1,X2,LSL#3]
+        (32, 0x3dc0_0020_u32), // LDR Q0,[X1]
+        (36, 0x3d80_0020_u32), // STR Q0,[X1]
+        (40, breakpoint(0)),
+    ] {
+        assert!(memory.initialize_ram(code_page, offset, &encoding.to_le_bytes()));
+    }
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+
+    let process = JitProcess::with_configuration(
+        cpu(),
+        JitConfiguration::default()
+            .with_performance_report_directory(Some(reports.clone()))
+            .with_performance_report_title("Direct access counts"),
+    )
+    .unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+    thread.run(&process, &memory, &mut state, 8).unwrap();
+    process.shutdown();
+
+    let report_path = std::fs::read_dir(reports)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let report: toml::Value =
+        toml::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
+    assert_eq!(report["memory_backend"].as_str(), Some("linux_direct"));
+    assert!(
+        report["memory_backend_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("host capability validation"))
+    );
+    let accesses = &report["compiled_direct_accesses"];
+    for width in [1, 2, 4, 8] {
+        assert_eq!(
+            accesses[format!("read_{width}")].as_integer(),
+            Some(1),
+            "unexpected direct read sites for width {width}: {accesses}"
+        );
+        assert_eq!(
+            accesses[format!("write_{width}")].as_integer(),
+            Some(1),
+            "unexpected direct write sites for width {width}: {accesses}"
+        );
+    }
+    assert_eq!(accesses["read_16"].as_integer(), Some(1));
+    assert_eq!(accesses["write_16"].as_integer(), Some(1));
+    assert_eq!(
+        report["direct_faults"]["tracking_writes"].as_integer(),
+        Some(0),
+        "statically detected first writes complete without a host signal"
+    );
+    assert!(
+        report["direct_memory"]["writable_alias_pages_armed"]
+            .as_integer()
+            .is_some_and(|value| value >= 1)
+    );
+    assert!(
+        report["direct_memory"]["vma_samples"]
+            .as_integer()
+            .is_some_and(|value| value >= 1)
+    );
 }
 
 #[test]
@@ -1292,33 +1449,522 @@ fn scalar_memory_addressing_and_transfer_forms_match_the_interpreter() {
 }
 
 #[test]
-fn clean_ram_loads_and_stores_leave_the_rust_slow_path_after_arming() {
+fn linux_direct_clean_scalar_reads_are_eager_and_never_enter_rust() {
     for encoding in [
+        0x3940_0020, // LDRB W0,[X1]
+        0x7940_0020, // LDRH W0,[X1]
+        0xb940_0020, // LDR W0,[X1]
         0xf940_0020, // LDR X0,[X1]
-        0xf900_0023, // STR X3,[X1]
-        0x3dc0_0020, // LDR Q0,[X1]
-        0x3d80_0020, // STR Q0,[X1]
     ] {
-        let memory = execution_memory_with_data(encoding);
+        let mut memory = execution_memory_with_data(encoding);
+        assert_eq!(
+            memory
+                .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+                .unwrap(),
+            nixe_memory::CpuMemoryBackend::LinuxDirect
+        );
         let process = JitProcess::new(cpu()).unwrap();
-        let thread = JitThread::new();
+        let binding = MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: &memory,
+            mapping_epoch: memory.mapping_epoch().get(),
+            invalidation_cursor: memory.invalidation_cursor(),
+        };
+        process.bind_memory(binding).unwrap();
+        let mut thread = JitThread::new();
+        thread.synchronize_address_space(&process, binding).unwrap();
         let mut state = memory_state();
-        assert!(state.set_vector(0, 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00));
-        thread.run(&process, &memory, &mut state, 1).unwrap();
-        let after_first = process.slow_memory_calls.load(Ordering::Relaxed);
-        assert_eq!(after_first, 1, "{encoding:#010x}");
-
-        state.set_pc(CODE);
-        write_register(&mut state, 0, 0);
-        write_register(&mut state, 3, 0x1122_3344_5566_7788);
-        assert!(state.set_vector(0, 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100));
         thread.run(&process, &memory, &mut state, 1).unwrap();
         assert_eq!(
             process.slow_memory_calls.load(Ordering::Relaxed),
-            after_first,
-            "{encoding:#010x} returned to Rust after fastmem was armed"
+            0,
+            "{encoding:#010x} did not use its eager direct alias"
+        );
+
+        state.set_pc(CODE);
+        write_register(&mut state, 0, 0);
+        thread.run(&process, &memory, &mut state, 1).unwrap();
+        assert_eq!(
+            process.slow_memory_calls.load(Ordering::Relaxed),
+            0,
+            "{encoding:#010x} returned to Rust on a repeated direct read"
         );
     }
+}
+
+#[test]
+fn linux_direct_jit_rejects_a_replacement_arena_before_native_entry() {
+    let mut first = execution_memory_with_data(0xf940_0020);
+    first
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let mut replacement = execution_memory_with_data(0xf940_0020);
+    replacement
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &first,
+        mapping_epoch: first.mapping_epoch().get(),
+        invalidation_cursor: first.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    drop(first);
+    let mut state = memory_state();
+
+    let error = thread
+        .run(&process, &replacement, &mut state, 1)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("differs from its immutable process binding")
+    );
+}
+
+#[test]
+fn linux_direct_jit_requires_a_live_mapping_lease() {
+    let mut memory = execution_memory_with_data(0xf940_0020);
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+
+    let error = thread
+        .run_slice(
+            &process,
+            RunRequest {
+                cpu: cpu(),
+                memory: &memory,
+                memory_lease: None,
+                state: &mut state,
+                instruction_budget: 1,
+                loader_return: None,
+                timer: &ZeroTimer,
+                events: VcpuEventState::default(),
+            },
+        )
+        .unwrap_err();
+    assert!(error.message.contains("requires its live mapping lease"));
+}
+
+#[test]
+fn linux_direct_jit_compiles_outside_the_native_execution_lease() {
+    let mut memory = execution_memory_with_data(0xd53b_e020); // MRS X0,CNTVCT_EL0
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let memory = Arc::new(memory);
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    process
+        .bind_memory(MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: memory.as_ref(),
+            mapping_epoch: memory.mapping_epoch().get(),
+            invalidation_cursor: memory.invalidation_cursor(),
+        })
+        .unwrap();
+
+    let timer = Arc::new(BlockingTimer {
+        entered: Arc::new(Barrier::new(2)),
+        release: Arc::new(Barrier::new(2)),
+    });
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (run_tx, run_rx) = mpsc::channel();
+    let worker_memory = Arc::clone(&memory);
+    let worker_process = Arc::clone(&process);
+    let worker_timer = Arc::clone(&timer);
+    let worker = std::thread::spawn(move || {
+        let binding = MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: worker_memory.as_ref(),
+            mapping_epoch: worker_memory.mapping_epoch().get(),
+            invalidation_cursor: worker_memory.invalidation_cursor(),
+        };
+        let mut thread = JitThread::new();
+        thread
+            .synchronize_address_space(worker_process.as_ref(), binding)
+            .unwrap();
+        let lease = worker_memory.acquire_execution_lease();
+        ready_tx.send(()).unwrap();
+        run_rx.recv().unwrap();
+        let mut state = state(CODE, 0);
+        thread.run_slice(
+            worker_process.as_ref(),
+            RunRequest {
+                cpu: cpu(),
+                memory: worker_memory.as_ref(),
+                memory_lease: Some(lease),
+                state: &mut state,
+                instruction_budget: 1,
+                loader_return: None,
+                timer: worker_timer.as_ref(),
+                events: VcpuEventState::default(),
+            },
+        )
+    });
+    ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let (transition_tx, transition_rx) = mpsc::channel();
+    let transition_memory = Arc::clone(&memory);
+    let transition = std::thread::spawn(move || {
+        let result = transition_memory.set_attributes(
+            SPACE,
+            GuestVirtualAddress::new(DATA),
+            0x1000,
+            MemoryAttributes::UNCACHED,
+            MemoryAttributes::UNCACHED,
+        );
+        transition_tx.send(result).unwrap();
+    });
+    let wait_started = Instant::now();
+    while !memory.mapping_mutation_pending() {
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(1),
+            "mapping transition did not close execution admission"
+        );
+        std::thread::yield_now();
+    }
+    run_tx.send(()).unwrap();
+
+    timer.entered.wait();
+    let transition_result = transition_rx.recv_timeout(Duration::from_secs(1));
+    timer.release.wait();
+    let report = worker.join().unwrap().unwrap();
+    transition.join().unwrap();
+
+    transition_result
+        .expect("mapping transition must complete before native entry")
+        .unwrap();
+    assert_eq!(report.instructions_executed, 1);
+    assert_eq!(report.stop, CpuExit::BudgetExhausted);
+}
+
+#[test]
+fn linux_direct_gpu_newer_read_reconciles_and_retries_the_native_load_once() {
+    let mut memory = execution_memory_with_data(0xf940_0020); // LDR X0,[X1]
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let retained = memory
+        .translate_canonical_range(
+            SPACE,
+            GuestVirtualAddress::new(DATA),
+            0x1000,
+            MemoryPermissions::READ_WRITE,
+        )
+        .unwrap();
+    let mut bytes = vec![0_u8; 0x1000];
+    bytes[..8].copy_from_slice(&0xa5c3_9678_1234_fedc_u64.to_le_bytes());
+    let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(DeviceWriteback {
+        bytes: bytes.into_boxed_slice(),
+    });
+    let declaration = DeviceAccessDeclaration::write(
+        NonCpuDeviceId::new(19),
+        DeviceVisibilityPoint::new(1),
+        DeviceVisibilityPoint::new(2),
+    )
+    .unwrap();
+    retained
+        .prepare_device_access(declaration, Arc::clone(&coordinator))
+        .unwrap();
+    retained
+        .publish_device_write(declaration, coordinator)
+        .unwrap();
+
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state, 1).unwrap(),
+        DirectExit::Budget { .. }
+    ));
+    assert_eq!(read_register(&state, 0), 0xa5c3_9678_1234_fedc);
+    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn linux_direct_scalar_stores_fault_once_then_publish_natively() {
+    for (encoding, size, first, second) in [
+        (0x3900_0020_u32, MemoryAccessSize::Byte, 0xa5_u64, 0x5a_u64),
+        (0x7900_0020, MemoryAccessSize::Halfword, 0xa5c3, 0x5a3c),
+        (
+            0xb900_0020,
+            MemoryAccessSize::Word,
+            0xa5c3_9678,
+            0x5a3c_6987,
+        ),
+        (
+            0xf900_0020,
+            MemoryAccessSize::Doubleword,
+            0xa5c3_9678_1234_fedc,
+            0x5a3c_6987_edcb_0123,
+        ),
+    ] {
+        let mut memory = ExecutionMemory::new();
+        let code_page = GuestPhysicalPageId::new(1);
+        let data_page = GuestPhysicalPageId::new(2);
+        assert!(memory.add_ram_page(code_page));
+        assert!(memory.add_ram_page(data_page));
+        assert!(memory.initialize_ram(code_page, 0, &encoding.to_le_bytes()));
+        assert!(memory.initialize_ram(code_page, 4, &breakpoint(0).to_le_bytes()));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(CODE),
+            code_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(DATA),
+            data_page,
+            MemoryPermissions::READ_WRITE,
+        ));
+        memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap();
+        let process = JitProcess::new(cpu()).unwrap();
+        let binding = MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: &memory,
+            mapping_epoch: memory.mapping_epoch().get(),
+            invalidation_cursor: memory.invalidation_cursor(),
+        };
+        process.bind_memory(binding).unwrap();
+        let mut thread = JitThread::new();
+        thread.synchronize_address_space(&process, binding).unwrap();
+        let mut state = memory_state();
+        write_register(&mut state, 0, first);
+        write_register(&mut state, 1, DATA);
+        assert!(matches!(
+            thread.run(&process, &memory, &mut state, 1).unwrap(),
+            DirectExit::Budget { .. }
+        ));
+        assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            memory
+                .read(
+                    SPACE,
+                    GuestVirtualAddress::new(DATA),
+                    MemoryAccess::normal(size),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::from_bits(size, u128::from(first)),
+        );
+
+        state.set_pc(CODE);
+        write_register(&mut state, 0, second);
+        assert!(matches!(
+            thread.run(&process, &memory, &mut state, 1).unwrap(),
+            DirectExit::Budget { .. }
+        ));
+        assert_eq!(
+            process.slow_memory_calls.load(Ordering::Relaxed),
+            1,
+            "{encoding:#010x} returned to Rust after direct-store publication",
+        );
+        assert_eq!(
+            memory
+                .read(
+                    SPACE,
+                    GuestVirtualAddress::new(DATA),
+                    MemoryAccess::normal(size),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::from_bits(size, u128::from(second)),
+        );
+    }
+}
+
+#[test]
+fn linux_direct_scalar_pair_loads_remain_native() {
+    let mut memory = execution_memory_with_data(0xa940_0c20); // LDP X0,X3,[X1]
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state, 1).unwrap(),
+        DirectExit::Budget { .. }
+    ));
+    assert_eq!(read_register(&state, 0), 0x0706_0504_0302_0100);
+    assert_eq!(read_register(&state, 3), 0x0f0e_0d0c_0b0a_0908);
+    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn linux_direct_simd_quadword_loads_and_stores_use_the_shared_arena() {
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    let data_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.add_ram_page(data_page));
+    assert!(memory.initialize_ram(code_page, 0, &0x3d80_0020_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 4, &0x3dc0_0022_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 8, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+    let first = 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00;
+    assert!(state.set_vector(0, first));
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state, 2).unwrap(),
+        DirectExit::Budget { .. }
+    ));
+    assert_eq!(state.vector(2), Some(first));
+    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 1);
+
+    let second = 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100;
+    state.set_pc(CODE);
+    assert!(state.set_vector(0, second));
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state, 1).unwrap(),
+        DirectExit::Budget { .. }
+    ));
+    assert_eq!(
+        process.slow_memory_calls.load(Ordering::Relaxed),
+        1,
+        "an armed 16-byte SIMD store returned to Rust",
+    );
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(DATA),
+                MemoryAccess::normal(MemoryAccessSize::Quadword),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U128(second),
+    );
+}
+
+#[test]
+fn linux_direct_unaligned_scalar_accesses_complete_through_checked_memory() {
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    let data_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.add_ram_page(data_page));
+    assert!(memory.initialize_ram(code_page, 0, &0xf900_0020_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 4, &0xf940_0022_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 8, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+    let address = GuestVirtualAddress::new(DATA + 4);
+    let value = 0xa5c3_9678_1234_fedc;
+    write_register(&mut state, 0, value);
+    write_register(&mut state, 1, address.get());
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state, 2).unwrap(),
+        DirectExit::Budget { .. }
+    ));
+    assert_eq!(read_register(&state, 2), value);
+    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 2);
+    let access = MemoryAccess::new(
+        MemoryAccessSize::Doubleword,
+        MemoryAlignment::Unaligned,
+        MemoryOrdering::Relaxed,
+        MemoryAccessClass::Normal,
+    );
+    assert_eq!(
+        memory.read(SPACE, address, access).unwrap().value,
+        MemoryValue::U64(value),
+    );
 }
 
 #[test]
@@ -1364,6 +2010,268 @@ fn unmapped_memory_fault_matches_the_interpreter_at_the_faulting_pc() {
 }
 
 #[test]
+fn linux_direct_unmapped_read_reconstructs_exact_prefault_state() {
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.initialize_ram(code_page, 0, &0xf940_0020_u32.to_le_bytes())); // LDR X0,[X1]
+    assert!(memory.initialize_ram(code_page, 4, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert_eq!(
+        memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap(),
+        nixe_memory::CpuMemoryBackend::LinuxDirect
+    );
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = rich_state();
+    state.set_pc(CODE);
+    write_register(&mut state, 1, DATA);
+    let before = state.clone();
+    let exit = thread.run(&process, &memory, &mut state, 1).unwrap();
+    assert!(matches!(
+        exit,
+        DirectExit::DataFault {
+            pc,
+            instructions: 1,
+            ..
+        } if pc == GuestVirtualAddress::new(CODE)
+    ));
+    assert_eq!(state, before);
+}
+
+#[test]
+fn linux_direct_discarded_load_retains_its_architectural_fault() {
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.initialize_ram(code_page, 0, &0xf940_003f_u32.to_le_bytes())); // LDR XZR,[X1]
+    assert!(memory.initialize_ram(code_page, 4, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = rich_state();
+    state.set_pc(CODE);
+    write_register(&mut state, 1, DATA);
+    let before = state.clone();
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state, 1).unwrap(),
+        DirectExit::DataFault {
+            pc,
+            instructions: 1,
+            ..
+        } if pc == GuestVirtualAddress::new(CODE)
+    ));
+    assert_eq!(state, before);
+}
+
+#[test]
+fn linux_direct_overwritten_load_retains_its_architectural_fault() {
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(code_page));
+    for (offset, encoding) in [
+        (0, 0xf940_0108_u32), // LDR X8,[X8]
+        (4, 0xaa02_03e8_u32), // MOV X8,X2
+        (8, breakpoint(0)),
+    ] {
+        assert!(memory.initialize_ram(code_page, offset, &encoding.to_le_bytes()));
+    }
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = rich_state();
+    state.set_pc(CODE);
+    write_register(&mut state, 8, DATA);
+    let before = state.clone();
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state, 2).unwrap(),
+        DirectExit::DataFault {
+            pc,
+            instructions: 1,
+            ..
+        } if pc == GuestVirtualAddress::new(CODE)
+    ));
+    assert_eq!(state, before);
+}
+
+#[test]
+fn linux_direct_poison_guard_preserves_the_unconfined_guest_address() {
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.initialize_ram(code_page, 0, &0xf940_0020_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 4, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert_eq!(
+        memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap(),
+        nixe_memory::CpuMemoryBackend::LinuxDirect
+    );
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = rich_state();
+    write_register(&mut state, 1, u64::MAX);
+    let DirectExit::DataFault { fault, .. } = thread.run(&process, &memory, &mut state, 1).unwrap()
+    else {
+        panic!("unconfined direct read did not produce a guest data fault");
+    };
+    assert_eq!(fault.address, GuestVirtualAddress::new(u64::MAX));
+}
+
+#[test]
+fn linux_direct_fault_recovers_every_dirty_register_class_and_spills() {
+    let mut encodings = vec![
+        0xd51b_4405_u32, // MSR FPCR,X5
+        0x1e62_1824_u32, // FDIV D4,D1,D2: 0/0 publishes IOC in FPSR
+    ];
+    encodings.extend((0_u32..31).map(|register| {
+        0x9100_0400 | (register << 5) | register // ADD Xn,Xn,#1
+    }));
+    encodings.extend((0_u32..32).map(|register| {
+        0x4e01_0c20 | register // DUP Vn.16B,W1
+    }));
+    encodings.extend([
+        0x9100_43ff, // ADD SP,SP,#16
+        0xb100_0442, // ADDS X2,X2,#1
+        0xf940_03a0, // LDR X0,[X29]
+    ]);
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(code_page));
+    for (index, encoding) in encodings.iter().copied().enumerate() {
+        assert!(memory.initialize_ram(code_page, index * 4, &encoding.to_le_bytes()));
+    }
+    assert!(memory.initialize_ram(code_page, encodings.len() * 4, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert_eq!(
+        memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap(),
+        nixe_memory::CpuMemoryBackend::LinuxDirect
+    );
+
+    let mut initial = rich_state();
+    write_register(&mut initial, 29, DATA - 1);
+    write_register(&mut initial, 5, 2 << 22);
+    initial.set_fpcr(1 << 22);
+    initial.set_fpsr(0x80);
+    let mut expected = initial.clone();
+    for encoding in &encodings[..encodings.len() - 1] {
+        assert_eq!(
+            execute_one(&cpu().platform(), &mut expected, *encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &memory, &monitor, &ZeroTimer, &events);
+    let InstructionStep::Exit(nixe_cpu::execution::CpuExit::DataFault {
+        source,
+        fault: expected_fault,
+    }) = execute_one_with_context(context, &mut expected, encodings[encodings.len() - 1]).unwrap()
+    else {
+        panic!("reference interpreter did not fault");
+    };
+
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut actual = initial;
+    let DirectExit::DataFault {
+        pc,
+        fault,
+        instructions,
+    } = thread.run(&process, &memory, &mut actual, 128).unwrap()
+    else {
+        panic!("direct JIT did not fault");
+    };
+    assert_eq!(pc, source.pc);
+    assert_eq!(fault, expected_fault);
+    assert_eq!(instructions, encodings.len() as u64);
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn pair_second_access_fault_preserves_load_destinations_and_first_store() {
     for encoding in [0x2940_0c20_u32, 0x2900_0c20] {
         let expected_memory = memory_with_data(encoding);
@@ -1394,6 +2302,105 @@ fn pair_second_access_fault_preserves_load_destinations_and_first_store() {
         assert_eq!(actual, expected, "{encoding:#010x}");
         assert_memory_prefix_equal(&actual_memory, &expected_memory, 4096);
     }
+}
+
+#[test]
+fn linux_direct_pair_second_access_fault_matches_checked_partial_semantics() {
+    for encoding in [0x2940_0c20_u32, 0x2900_0c20] {
+        let expected_memory = memory_with_data(encoding);
+        let mut actual_memory = execution_memory_with_data(encoding);
+        actual_memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap();
+        let mut initial = memory_state();
+        write_register(&mut initial, 1, DATA + 4092);
+
+        let mut expected = initial.clone();
+        let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+        let events = nixe_cpu::execution::VcpuEventState::default();
+        let context =
+            InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+        assert!(matches!(
+            execute_one_with_context(context, &mut expected, encoding).unwrap(),
+            InstructionStep::Exit(nixe_cpu::execution::CpuExit::DataFault { .. })
+        ));
+
+        let process = JitProcess::new(cpu()).unwrap();
+        let binding = MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: &actual_memory,
+            mapping_epoch: actual_memory.mapping_epoch().get(),
+            invalidation_cursor: actual_memory.invalidation_cursor(),
+        };
+        process.bind_memory(binding).unwrap();
+        let mut thread = JitThread::new();
+        thread.synchronize_address_space(&process, binding).unwrap();
+        let mut actual = initial;
+        assert!(matches!(
+            thread
+                .run(&process, &actual_memory, &mut actual, 1)
+                .unwrap(),
+            DirectExit::DataFault { .. }
+        ));
+        assert_eq!(actual, expected, "{encoding:#010x}");
+
+        let access = MemoryAccess::normal(MemoryAccessSize::Word);
+        assert_eq!(
+            actual_memory
+                .read(SPACE, GuestVirtualAddress::new(DATA + 4092), access,)
+                .unwrap()
+                .value,
+            expected_memory
+                .read(SPACE, GuestVirtualAddress::new(DATA + 4092), access,)
+                .unwrap()
+                .value,
+            "{encoding:#010x}",
+        );
+    }
+}
+
+#[test]
+fn linux_direct_simd_pair_fault_preserves_both_load_destinations() {
+    let encoding = 0xad40_0c22_u32; // LDP Q2,Q3,[X1]
+    let expected_memory = memory_with_data(encoding);
+    let mut actual_memory = execution_memory_with_data(encoding);
+    actual_memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let mut initial = memory_state();
+    write_register(&mut initial, 1, DATA + 4080);
+    assert!(initial.set_vector(2, 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00));
+    assert!(initial.set_vector(3, 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100));
+
+    let mut expected = initial.clone();
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    assert!(matches!(
+        execute_one_with_context(context, &mut expected, encoding).unwrap(),
+        InstructionStep::Exit(nixe_cpu::execution::CpuExit::DataFault { .. })
+    ));
+
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &actual_memory,
+        mapping_epoch: actual_memory.mapping_epoch().get(),
+        invalidation_cursor: actual_memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut actual = initial;
+    assert!(matches!(
+        thread
+            .run(&process, &actual_memory, &mut actual, 1)
+            .unwrap(),
+        DirectExit::DataFault { .. }
+    ));
+    assert_eq!(actual, expected);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1469,6 +2476,66 @@ fn special_page_accesses_use_precise_typed_slow_calls() {
         events[1],
         MmioEvent::Write(0, _, MemoryValue::U64(0x8877_6655_4433_2211))
     ));
+}
+
+#[test]
+fn linux_direct_dynamic_mmio_faults_complete_each_operation_exactly_once() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.initialize_ram(code_page, 0, &0xf940_0020_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 4, &0xf900_0023_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 8, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    let mmio_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_mmio_page(
+        mmio_page,
+        RecordingMmio {
+            events: Arc::clone(&events),
+        },
+    ));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        mmio_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+
+    let exit = thread.run(&process, &memory, &mut state, 2).unwrap();
+    assert!(matches!(
+        exit,
+        DirectExit::Budget {
+            instructions: 2,
+            ..
+        }
+    ));
+    assert_eq!(read_x0(&state), 0x0123_4567_89ab_cdef);
+    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 2);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0], MmioEvent::Read(0, _)));
+    assert!(matches!(events[1], MmioEvent::Write(0, _, _)));
 }
 
 #[test]
@@ -2103,6 +3170,137 @@ fn memory_and_system_shapes_remain_bounded() {
         assert!(region.clif_instructions <= 512, "{encoding:#010x}");
         assert!(region.native_bytes <= 4096, "{encoding:#010x}");
     }
+}
+
+#[test]
+fn linux_direct_scalar_memory_shapes_are_compact() {
+    for (name, encoding, clif_limit, native_limit) in [
+        ("load", 0xf940_0020_u32, 144, 896),
+        ("store", 0xf900_0020_u32, 256, 1536),
+    ] {
+        let mut memory = execution_memory_with_data(encoding);
+        memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap();
+        let process = JitProcess::new(cpu()).unwrap();
+        process
+            .bind_memory(MemoryBinding {
+                address_space: SPACE,
+                end_exclusive: GuestVirtualAddress::new(0x1_0000),
+                memory: &memory,
+                mapping_epoch: memory.mapping_epoch().get(),
+                invalidation_cursor: memory.invalidation_cursor(),
+            })
+            .unwrap();
+        process.entry_for(&memory, location(CODE)).unwrap();
+        let state = process.state.lock().unwrap();
+        let region = state
+            .region_for(RegionKey::new(cpu(), location(CODE)))
+            .unwrap();
+        println!(
+            "direct_shape={name} clif_instructions={} native_bytes={}",
+            region.clif_instructions, region.native_bytes
+        );
+        assert!(
+            region.clif_instructions <= clif_limit,
+            "{name}: {} CLIF instructions exceed {clif_limit}",
+            region.clif_instructions,
+        );
+        assert!(
+            region.native_bytes <= native_limit,
+            "{name}: {} native bytes exceed {native_limit}",
+            region.native_bytes,
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual release microbenchmark"]
+fn direct_jit_scalar_loops_materially_beat_checked_memory_by_width() {
+    for (width, load, store) in [
+        (1, 0x3940_0020_u32, 0x3900_0020_u32),
+        (2, 0x7940_0020_u32, 0x7900_0020_u32),
+        (4, 0xb940_0020_u32, 0xb900_0020_u32),
+        (8, 0xf940_0020_u32, 0xf900_0020_u32),
+    ] {
+        let direct_read = jit_scalar_loop_ns(load, DirectBackendPolicy::Required);
+        let checked_read = jit_scalar_loop_ns(load, DirectBackendPolicy::Disabled);
+        let direct_store = jit_scalar_loop_ns(store, DirectBackendPolicy::Required);
+        let checked_store = jit_scalar_loop_ns(store, DirectBackendPolicy::Disabled);
+        println!(
+            "width={width} direct_jit_ns_per_read={direct_read} checked_jit_ns_per_read={checked_read} direct_jit_ns_per_store={direct_store} checked_jit_ns_per_store={checked_store}"
+        );
+        assert!(
+            direct_read * 10 < checked_read * 9,
+            "width {width} direct JIT read did not improve checked memory by 10%"
+        );
+        assert!(
+            direct_store * 10 < checked_store * 9,
+            "width {width} direct JIT store did not improve checked memory by 10%"
+        );
+    }
+}
+
+fn jit_scalar_loop_ns(encoding: u32, policy: DirectBackendPolicy) -> u128 {
+    const WARMUP_ITERATIONS: u64 = 10_000;
+    const MEASURED_ITERATIONS: u64 = 1_000_000;
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    let data_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.add_ram_page(data_page));
+    for (offset, word) in [
+        (0, encoding),
+        (4, 0xf100_0442),                           // SUBS X2,X2,#1
+        (8, conditional_branch(CODE + 8, CODE, 1)), // B.NE
+        (12, breakpoint(0)),
+    ] {
+        assert!(memory.initialize_ram(code_page, offset, &word.to_le_bytes()));
+    }
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, policy)
+        .unwrap();
+
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+
+    let run = |iterations| {
+        let mut state = memory_state();
+        write_register(&mut state, 0, 0xa5c3_9678_1234_fedc);
+        write_register(&mut state, 1, DATA);
+        write_register(&mut state, 2, iterations);
+        assert!(matches!(
+            thread
+                .run(&process, &memory, &mut state, iterations * 3)
+                .unwrap(),
+            DirectExit::Budget { .. }
+        ));
+    };
+    run(WARMUP_ITERATIONS);
+    let started = std::time::Instant::now();
+    run(MEASURED_ITERATIONS);
+    started.elapsed().as_nanos() / u128::from(MEASURED_ITERATIONS)
 }
 
 #[test]

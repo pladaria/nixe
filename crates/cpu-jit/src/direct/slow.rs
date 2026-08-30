@@ -10,8 +10,8 @@ use nixe_cpu::decode::a64::fp_simd::{
 use nixe_cpu::execution::SchedulerRequest;
 use nixe_cpu::memory::{
     AtomicRmwKind, BarrierAccess, BarrierDomain, BarrierOperation, CacheMaintenanceKind,
-    DataAccessFault, DataAccessKind, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
-    MemoryAlignment, MemoryOrdering, MemoryValue,
+    DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment,
+    MemoryOrdering, MemoryValue,
 };
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
@@ -221,13 +221,6 @@ fn read_memory<const SIZE: u8, const ORDER: u8>(
         )?;
         context.slow_result_low = result.value.bits() as u64;
         context.slow_result_high = (result.value.bits() >> 64) as u64;
-        if !aligned && fast_candidate(address, SIZE) {
-            let _ = memory.arm_fastmem_page(
-                AddressSpaceId::new(context.address_space),
-                page(address),
-                DataAccessKind::Read,
-            );
-        }
         Ok(())
     });
 }
@@ -241,7 +234,7 @@ unsafe extern "C" fn write_relaxed_128(
     contain(context, |context| {
         unsafe { &*context.slow_memory_calls }.fetch_add(1, Ordering::Relaxed);
         let memory = unsafe { &*context.memory };
-        memory.write(
+        memory.complete_direct_write_fault(
             AddressSpaceId::new(context.address_space),
             GuestVirtualAddress::new(address),
             access::<16, 0>(MemoryAccessClass::Normal, false),
@@ -250,13 +243,6 @@ unsafe extern "C" fn write_relaxed_128(
                 u128::from(low) | (u128::from(high) << 64),
             ),
         )?;
-        if fast_candidate(address, 16) {
-            let _ = memory.arm_fastmem_page(
-                AddressSpaceId::new(context.address_space),
-                page(address),
-                DataAccessKind::Write,
-            );
-        }
         Ok(())
     });
 }
@@ -287,19 +273,12 @@ fn write_memory<const SIZE: u8, const ORDER: u8>(
         unsafe { &*context.slow_memory_calls }.fetch_add(1, Ordering::Relaxed);
         let access = access::<SIZE, ORDER>(MemoryAccessClass::Normal, aligned);
         let memory = unsafe { &*context.memory };
-        memory.write(
+        memory.complete_direct_write_fault(
             AddressSpaceId::new(context.address_space),
             GuestVirtualAddress::new(address),
             access,
             MemoryValue::from_bits(size::<SIZE>(), u128::from(value)),
         )?;
-        if !aligned && fast_candidate(address, SIZE) {
-            let _ = memory.arm_fastmem_page(
-                AddressSpaceId::new(context.address_space),
-                page(address),
-                DataAccessKind::Write,
-            );
-        }
         Ok(())
     });
 }
@@ -970,14 +949,4 @@ const fn barrier_access<const ACCESS: u8>() -> BarrierAccess {
         2 => BarrierAccess::ReadsAndWrites,
         _ => panic!("invalid direct barrier access"),
     }
-}
-
-fn fast_candidate(address: u64, size: u8) -> bool {
-    address & (size as u64 - 1) == 0
-        && (address & (nixe_memory::FASTMEM_PAGE_SIZE as u64 - 1))
-            <= nixe_memory::FASTMEM_PAGE_SIZE as u64 - size as u64
-}
-
-const fn page(address: u64) -> GuestVirtualAddress {
-    GuestVirtualAddress::new(address & !(nixe_memory::FASTMEM_PAGE_SIZE as u64 - 1))
 }

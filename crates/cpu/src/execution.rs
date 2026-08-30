@@ -10,7 +10,7 @@ use crate::coverage::CoverageId;
 use crate::error::{InstructionFetchFault, UnallocatedEncoding};
 use crate::exception::ExceptionKind;
 use crate::location::{InstructionEncoding, LocationDescriptor};
-use crate::memory::{CpuMemory, DataAccessFault};
+use crate::memory::{CpuMemory, DataAccessFault, ExecutionMemoryLease};
 use crate::profile::ProcessCpuContext;
 use crate::state::{RegisterContext, ThreadCpuState};
 
@@ -102,6 +102,8 @@ pub enum SchedulerRequest {
 pub struct RunRequest<'a> {
     pub cpu: ProcessCpuContext,
     pub memory: &'a dyn CpuMemory,
+    /// Live mapping-stability proof required by a LinuxDirect backend.
+    pub memory_lease: Option<ExecutionMemoryLease<'a>>,
     pub state: &'a mut ThreadCpuState,
     pub instruction_budget: u64,
     pub loader_return: Option<GuestVirtualAddress>,
@@ -350,7 +352,6 @@ impl ControlSnapshot {
 
 #[derive(Default)]
 struct CpuControlState {
-    pending: AtomicU32,
     requests: AtomicU32,
     invalidation_epoch: AtomicU64,
     acknowledged_invalidation_epoch: AtomicU64,
@@ -390,7 +391,6 @@ impl CpuControl {
         self.state
             .requests
             .fetch_or(request.bit(), Ordering::Release);
-        self.state.pending.store(1, Ordering::Release);
     }
 
     pub fn request_invalidation(&self, epoch: u64) {
@@ -402,11 +402,6 @@ impl CpuControl {
 
     #[must_use]
     pub fn take_pending(&self) -> Option<ControlSnapshot> {
-        if self.state.pending.load(Ordering::Acquire) == 0
-            || self.state.pending.swap(0, Ordering::AcqRel) == 0
-        {
-            return None;
-        }
         let requests = self.state.requests.swap(0, Ordering::AcqRel);
         (requests != 0).then(|| ControlSnapshot {
             requests,
@@ -416,7 +411,7 @@ impl CpuControl {
 
     #[must_use]
     pub fn pending_word_address(&self) -> usize {
-        std::ptr::from_ref(&self.state.pending).addr()
+        std::ptr::from_ref(&self.state.requests).addr()
     }
 
     pub fn acknowledge(&self, snapshot: ControlSnapshot) {
@@ -439,5 +434,30 @@ impl CpuControl {
             .acknowledged_invalidation_epoch
             .load(Ordering::Acquire)
             >= epoch
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_pending_word_is_the_linearizable_request_set() {
+        let control = CpuControl::default();
+        let pending = unsafe { &*(control.pending_word_address() as *const AtomicU32) };
+
+        control.request(ControlRequest::CodeInvalidation);
+        assert_eq!(pending.load(Ordering::Acquire), CONTROL_CODE_INVALIDATION);
+        let snapshot = control.take_pending().unwrap();
+        assert!(snapshot.contains(ControlRequest::CodeInvalidation));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+
+        control.request(ControlRequest::Preempt);
+        assert_ne!(pending.load(Ordering::Acquire), 0);
+        assert!(
+            control
+                .take_pending()
+                .is_some_and(|snapshot| snapshot.contains(ControlRequest::Preempt))
+        );
     }
 }
