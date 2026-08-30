@@ -98,6 +98,7 @@ pub enum VisibilityError {
     ResourceExhausted,
     IncorrectWritebackSize { expected: usize, observed: usize },
     GenerationExhausted(GenerationExhausted),
+    HostMemory(Box<str>),
     VisibilityEpochExhausted,
     ConcurrentTransition,
 }
@@ -121,6 +122,7 @@ impl Display for VisibilityError {
                 "visibility writeback size mismatch: expected {expected}, observed {observed}"
             ),
             Self::GenerationExhausted(error) => error.fmt(formatter),
+            Self::HostMemory(error) => write!(formatter, "host memory publication failed: {error}"),
             Self::VisibilityEpochExhausted => {
                 formatter.write_str("canonical visibility epoch is exhausted")
             }

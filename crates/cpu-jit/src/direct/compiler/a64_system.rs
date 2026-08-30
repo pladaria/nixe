@@ -160,6 +160,7 @@ impl CraneliftTranslator<'_, '_> {
             0xd51b_4420 => {
                 let value = self.builder.ins().ireduce(types::I32, value);
                 self.builder.def_var(self.fpsr_state, value);
+                self.block_dirty_fpsr = true;
             }
             0xd51b_d040 => self.store_state_u64(offset_of!(NativeContext, tpidr_el0), value)?,
             _ => {

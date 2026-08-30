@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use nixe_cpu::execution::{
     ArchitecturalTimer, ControlRequest, CpuControl, CpuFault, CpuFaultKind, CpuProcessId,
@@ -74,7 +74,13 @@ impl CpuBackend {
     fn bind_memory(&mut self, binding: MemoryBinding<'_>) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(process) => process.bind_memory(binding),
-            Self::Jit(_) => Ok(()),
+            Self::Jit(process) => process.bind_memory(binding).map_err(|error| CpuFault {
+                backend: "jit",
+                kind: CpuFaultKind::Unavailable,
+                instructions_executed: 0,
+                message: error.to_string().into_boxed_str(),
+                context: Box::new(ThreadCpuState::default().register_context()),
+            }),
         }
     }
 
@@ -130,6 +136,7 @@ impl CpuThread {
             Self::Interpreter(thread) => {
                 let RunRequest {
                     memory,
+                    memory_lease,
                     state,
                     instruction_budget,
                     loader_return,
@@ -139,6 +146,7 @@ impl CpuThread {
                 } = request;
                 thread.run_slice(InterpreterRunRequest {
                     memory,
+                    memory_lease,
                     state,
                     instruction_budget,
                     loader_return,
@@ -310,6 +318,38 @@ pub(crate) struct ProcessExecutionControl {
     shutdown_result: Option<Result<(), CpuFault>>,
     stopping: bool,
     pending_safepoint: AtomicBool,
+    transition_safepoints: Arc<TransitionSafepoints>,
+}
+
+#[derive(Default)]
+struct TransitionSafepoints {
+    controls: Mutex<BTreeMap<nixe_scheduler::VirtualCpuId, CpuControl>>,
+}
+
+impl TransitionSafepoints {
+    fn register(&self, vcpu: nixe_scheduler::VirtualCpuId, control: CpuControl) {
+        self.lock_controls().insert(vcpu, control);
+    }
+
+    fn clear(&self) {
+        self.lock_controls().clear();
+    }
+
+    fn request(&self) {
+        for control in self
+            .lock_controls()
+            .values()
+            .filter(|control| control.execution_active())
+        {
+            control.request(ControlRequest::Preempt);
+        }
+    }
+
+    fn lock_controls(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<nixe_scheduler::VirtualCpuId, CpuControl>> {
+        self.controls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 pub(crate) struct CpuThreadTeardownState {
@@ -366,6 +406,13 @@ impl ProcessExecutionControl {
             let _ = backend.shutdown();
             return Err(fault);
         }
+        let transition_safepoints = Arc::new(TransitionSafepoints::default());
+        let weak_safepoints = Arc::downgrade(&transition_safepoints);
+        memory.set_transition_notifier(Some(Arc::new(move || {
+            if let Some(safepoints) = weak_safepoints.upgrade() {
+                safepoints.request();
+            }
+        })));
         Ok(Self {
             backend,
             process_id,
@@ -377,6 +424,7 @@ impl ProcessExecutionControl {
             shutdown_result: None,
             stopping: false,
             pending_safepoint: AtomicBool::new(false),
+            transition_safepoints,
         })
     }
 
@@ -464,6 +512,7 @@ impl ProcessExecutionControl {
         if self.pending_safepoint.swap(false, Ordering::AcqRel) {
             control.request(ControlRequest::Preempt);
         }
+        self.transition_safepoints.register(vcpu, control.clone());
         self.controls.insert(vcpu, control);
         Ok(thread)
     }
@@ -497,6 +546,7 @@ impl ProcessExecutionControl {
             ));
         }
         self.controls.clear();
+        self.transition_safepoints.clear();
         Ok(())
     }
 
@@ -566,6 +616,11 @@ impl VcpuExecutionState {
         thread: &mut CpuThread,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
         let memory_lease = self.memory.acquire_execution_lease();
+        if let Some(error) = self.memory.direct_backend_failure() {
+            return Err(ProcessExecutionError::Cpu {
+                fault: runtime_fault(self.cpu, CpuFaultKind::Internal, error),
+            });
+        }
         thread
             .synchronize_address_space(
                 MemoryBinding {
@@ -588,6 +643,7 @@ impl VcpuExecutionState {
             .run_slice(RunRequest {
                 cpu: self.cpu,
                 memory: self.memory.as_ref(),
+                memory_lease: Some(memory_lease),
                 state: &mut self.thread,
                 instruction_budget: self.instruction_budget,
                 loader_return: self.loader_return,
@@ -618,4 +674,28 @@ pub(crate) fn current_location(
     state: &ThreadCpuState,
 ) -> LocationDescriptor {
     nixe_cpu::location::current_location(cpu, state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_transition_requests_preemption_only_from_active_cpu_slices() {
+        let safepoints = TransitionSafepoints::default();
+        let control = CpuControl::default();
+        safepoints.register(nixe_scheduler::VirtualCpuId::new(0), control.clone());
+
+        safepoints.request();
+        assert!(control.take_pending().is_none());
+
+        let execution = control.enter_execution();
+        safepoints.request();
+        assert!(
+            control
+                .take_pending()
+                .is_some_and(|pending| pending.contains(ControlRequest::Preempt))
+        );
+        drop(execution);
+    }
 }

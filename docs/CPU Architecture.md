@@ -26,8 +26,15 @@ bounded slice. It returns a typed exit and an exact retired-instruction count.
 ## Interpreter
 
 `nixe-cpu-interpreter` decodes one A64 instruction and executes its semantics
-directly. It is the portable correctness oracle and has no JIT dependency,
-translation cache or native-code path.
+directly. It is the correctness oracle and has no JIT dependency or
+translation cache. On a selected Linux direct-memory backend, eligible relaxed
+scalar RAM accesses call fixed native load/store stubs shared with the JIT's
+fault runtime. One stable arena/registry/dispatcher snapshot is published for
+the bounded interpreter slice, not for every stub call. The stubs contain no
+permission or visibility policy. Ordered, atomic, exclusive, cross-page,
+device and unsupported accesses continue through the canonical checked
+interface. An explicitly selected checked backend uses that interface for
+every access.
 
 ## Direct JIT
 
@@ -81,9 +88,67 @@ eviction, reclamation, persistent code cache or executor epoch.
 
 Canonical memory remains the sole authority for mappings, permissions,
 physical aliases, visibility, atomics, exclusive reservations, code
-dependencies and faults. Ordinary eligible RAM emits direct host loads and
-stores through memory-owned fastmem metadata. MMIO, cross-page operations and
-other precise cases call small typed slow functions.
+dependencies and faults. Each process address space selects an immutable
+`Checked` or `LinuxDirect` backend before an engine binds. On supported Linux
+hosts, ordinary RAM is eagerly mapped into a guarded host address-space arena;
+host page protections represent guest data permissions and CPU/device
+visibility. Eligible JIT reads contain only confinement, required alignment,
+base addition and the native load. There is no generated page-table,
+permission or visibility lookup.
+
+Eligible relaxed scalar stores use the same arena and a compact physical-page
+publication control. The control is tracking metadata, not access authority:
+the host mapping alone grants write access. The first write after a visibility
+or observer baseline completes once through canonical checked memory and arms
+all semantically writable aliases. Subsequent native stores serialize through
+one page sequence and advance the content generation, CPU-write epoch and
+exclusive-reservation generation for every store. Pages observed as executable
+content keep native stores disabled until that observer is removed. Each store
+revalidates its armed epoch after acquiring the physical-page sequence;
+revocation clears that epoch and drains an acquired writer before reducing host
+protection.
+
+The pointer table used to find those controls is a sparse anonymous
+`MAP_NORESERVE` mapping. It retains one indexed load in native code while only
+committing host pages for guest ranges whose controls are published; its
+reserved byte count is reported separately from resident guest mappings.
+
+`nixe-cpu-direct-memory` owns the bounded Linux signal runtime used by both
+frontends: process-wide handler installation and chaining, per-worker alternate
+stacks and slots, immutable native-PC attribution, assembly landing/retry/escape
+pads, and fixed interpreter stubs. The signal handler only captures bounded
+state and redirects control. Canonical classification and guest-fault creation
+run later on a normal dispatcher stack. Unattributed, nested and out-of-arena
+host faults remain fatal. Each frontend compares the arena view supplied by
+the currently borrowed memory object with its immutable process binding before
+native entry; a stale or replacement arena is rejected before any raw pointer
+is used. A public direct request must also supply an `ExecutionMemoryLease`
+whose execution-gate identity belongs to that exact borrowed memory; missing
+or foreign leases are rejected. The interpreter retains that proof for its
+bounded slice. The JIT releases the caller proof while discovering and
+compiling, then acquires a fresh lease and reconciles invalidations before each
+native interval. If the entry was retired between compilation and acquisition,
+it retries compilation outside the lease. The lease type borrows its
+`ExecutionMemory`, so safe code cannot destroy the arena owner while a native
+proof remains live. Statically identifiable ordered, atomic, exclusive,
+device-specialized and complex structure/lane cases use typed checked
+operations directly. The JIT direct proof covers common relaxed scalar and
+SIMD transfers through 16 bytes plus scalar/SIMD pairs; interpreter stubs cover
+the common scalar 1/2/4/8-byte class. Dynamically addressed MMIO,
+unaligned/cross-page targets and inaccessible mappings may reach the same
+checked classifier through an attributed fault; their independent counters
+reveal whether a site needs later specialization.
+
+Before each faultable JIT access, dirty architectural SSA values are committed
+to `A64State`. Fault metadata retains the source operation, the pinned integer
+register containing its guest address, and only the destination/writeback
+contract needed to finish that operation; it does not retain Cranelift
+post-register-allocation state maps. Pair loads withhold both destinations and
+writeback until both accesses succeed, so a fault on either access observes
+the exact pre-instruction state. A resolved visibility fault completes once:
+x86-64 retries the original native instruction, while AArch64 re-enters the
+same committed guest-PC checkpoint because glibc cannot restore every volatile
+register.
 
 Every compiled region retains physical code-page dependencies and the virtual
 mapping spans used to fetch it. Mapping changes remove only regions whose
@@ -131,8 +196,13 @@ counts compiled, unique and overlapping guest instructions, making residual
 overlap visible even for indirect targets inside a linear block. Invalidation
 details attribute each record to mappings, device, host or cache maintenance
 and distinguish relevant records, retired regions, lost history and repeated
-compilation of one entry PC. Diagnostics do not select Cranelift policy or
-change guest semantics.
+compilation of one entry PC. Direct-memory details separately report semantic,
+tracking, MMIO, retry, unattributed and nested faults, plus compiled direct
+sites by access width; mapping/protection batches, VMA growth and
+transition-gate wait time are sampled only when reporting is enabled. Writable
+alias pages armed and revoked are reported independently from the number of
+host protection syscalls, so batching cannot hide protection churn.
+Diagnostics do not select Cranelift policy or change guest semantics.
 
 ## Concurrency and teardown
 

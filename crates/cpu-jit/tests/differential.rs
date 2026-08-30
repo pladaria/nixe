@@ -167,6 +167,7 @@ fn interpreter_request<'a>(
 ) -> InterpreterRunRequest<'a> {
     InterpreterRunRequest {
         memory,
+        memory_lease: None,
         state,
         instruction_budget,
         loader_return: None,
@@ -184,6 +185,7 @@ fn request<'a>(
     RunRequest {
         cpu,
         memory,
+        memory_lease: None,
         state,
         instruction_budget,
         loader_return: None,

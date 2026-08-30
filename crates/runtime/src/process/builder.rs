@@ -7,6 +7,7 @@ pub struct ProcessBuilder {
     virtual_clock: crate::VirtualClock,
     sd_card_root: Option<PathBuf>,
     cpu_backend: execution::CpuBackendConfig,
+    memory_backend: nixe_memory::DirectBackendPolicy,
 }
 
 impl std::fmt::Debug for ProcessBuilder {
@@ -17,6 +18,7 @@ impl std::fmt::Debug for ProcessBuilder {
             .field("virtual_clock", &self.virtual_clock)
             .field("sd_card_root", &self.sd_card_root)
             .field("cpu_backend", &self.cpu_backend)
+            .field("memory_backend", &self.memory_backend)
             .finish()
     }
 }
@@ -53,6 +55,13 @@ impl ProcessBuilder {
     #[must_use]
     pub fn with_cpu_backend(mut self, backend: execution::CpuBackendConfig) -> Self {
         self.cpu_backend = backend;
+        self
+    }
+
+    /// Selects checked or Linux direct process memory before CPU binding.
+    #[must_use]
+    pub const fn with_memory_backend(mut self, policy: nixe_memory::DirectBackendPolicy) -> Self {
+        self.memory_backend = policy;
         self
     }
 
@@ -285,6 +294,13 @@ impl ProcessBuilder {
                 "CPU process identity exhausted",
             )
         })?;
+        memory
+            .bind_cpu_memory_backend(
+                self.config.address_space_id,
+                address_space.exclusive_limit(),
+                self.memory_backend,
+            )
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let execution = execution::ProcessExecutionControl::new(
             execution::ProcessExecutionConfiguration {
                 virtual_clock: self.virtual_clock.clone(),

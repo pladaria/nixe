@@ -13,7 +13,7 @@ use nixe_cpu::memory::{MemoryAccessSize, MemoryOrdering};
 use nixe_cpu::semantics::conditions::Condition;
 use nixe_memory::GuestVirtualAddress;
 
-use super::{CraneliftTranslator, LazyFlags};
+use super::{CraneliftTranslator, LazyFlags, a64_memory::MemoryOperation};
 use crate::direct::slow;
 use crate::direct::{DirectJitError, EXIT_ARCHITECTURAL, EXIT_INTERNAL, NativeContext};
 
@@ -217,6 +217,7 @@ impl CraneliftTranslator<'_, '_> {
             DirectJitError::internal(format!("direct JIT vector V{index} was not planned"))
         })?;
         self.builder.def_var(variable, value);
+        self.block_dirty_vector_registers[usize::from(index)] = true;
         Ok(())
     }
 
@@ -866,7 +867,8 @@ impl CraneliftTranslator<'_, '_> {
                             offset
                         };
                         let address = self.builder.ins().iadd(base, offset);
-                        return self.emit_vector_transfer(source, fields, address, size, flags);
+                        return self
+                            .emit_vector_transfer(source, fields, address, size, true, flags);
                     }
                     _ => unreachable!(),
                 };
@@ -875,7 +877,11 @@ impl CraneliftTranslator<'_, '_> {
                 } else {
                     self.builder.ins().iadd_imm_u(base, offset as i64)
                 };
-                self.emit_vector_transfer(source, fields, address, size, flags)?;
+                let direct = matches!(
+                    instruction,
+                    Instruction::MemoryUnsigned(_) | Instruction::MemoryUnscaled(_)
+                );
+                self.emit_vector_transfer(source, fields, address, size, direct, flags)?;
                 if matches!(
                     instruction,
                     Instruction::MemoryPostIndex(_) | Instruction::MemoryPreIndex(_)
@@ -894,10 +900,20 @@ impl CraneliftTranslator<'_, '_> {
         fields: Operands,
         address: Value,
         size: MemoryAccessSize,
+        direct: bool,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
         if fields.load {
-            let value = self.memory_read(source, address, size, MemoryOrdering::Relaxed, flags)?;
+            let completion =
+                direct.then_some(nixe_cpu_direct_memory::NativeFaultCompletion::VectorLoad {
+                    register: fields.rd,
+                });
+            let value = self.memory_read(
+                source,
+                address,
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, completion),
+                flags,
+            )?;
             let value = if size == MemoryAccessSize::Quadword {
                 value
             } else {
@@ -906,9 +922,19 @@ impl CraneliftTranslator<'_, '_> {
             let value = self.vector_as(value, types::I8X16);
             self.write_vector(fields.rd, value)
         } else {
+            let completion =
+                direct.then_some(nixe_cpu_direct_memory::NativeFaultCompletion::VectorStore {
+                    register: fields.rd,
+                });
             let value = self.read_vector_as(fields.rd, types::I128)?;
             let value = reduce_integer(&mut self.builder, value, size);
-            self.memory_write(source, address, value, size, MemoryOrdering::Relaxed, flags)
+            self.memory_write(
+                source,
+                address,
+                value,
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, completion),
+                flags,
+            )
         }
     }
 
@@ -933,10 +959,49 @@ impl CraneliftTranslator<'_, '_> {
             base
         };
         let second = self.builder.ins().iadd_imm_u(first, size.bytes() as i64);
-        for (register, address) in [(fields.rd, first), (fields.rt2, second)] {
-            let mut transfer = fields;
-            transfer.rd = register;
-            self.emit_vector_transfer(source, transfer, address, size, flags)?;
+        if fields.load {
+            let completion =
+                |access_index| nixe_cpu_direct_memory::NativeFaultCompletion::VectorPairLoad {
+                    first_register: fields.rd,
+                    second_register: fields.rt2,
+                    access_index,
+                    writeback_register: fields.rn,
+                    writeback_offset: i16::try_from(offset)
+                        .expect("SIMD pair writeback offset fits i16"),
+                    writeback: matches!(fields.mode, 1 | 3),
+                };
+            let first_value = self.memory_read(
+                source,
+                first,
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, Some(completion(0))),
+                flags,
+            )?;
+            let second_value = self.memory_read(
+                source,
+                second,
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, Some(completion(1))),
+                flags,
+            )?;
+            let first_value = if size == MemoryAccessSize::Quadword {
+                first_value
+            } else {
+                self.builder.ins().uextend(types::I128, first_value)
+            };
+            let second_value = if size == MemoryAccessSize::Quadword {
+                second_value
+            } else {
+                self.builder.ins().uextend(types::I128, second_value)
+            };
+            let first_value = self.vector_as(first_value, types::I8X16);
+            let second_value = self.vector_as(second_value, types::I8X16);
+            self.write_vector(fields.rd, first_value)?;
+            self.write_vector(fields.rt2, second_value)?;
+        } else {
+            for (register, address) in [(fields.rd, first), (fields.rt2, second)] {
+                let mut transfer = fields;
+                transfer.rd = register;
+                self.emit_vector_transfer(source, transfer, address, size, true, flags)?;
+            }
         }
         if matches!(fields.mode, 1 | 3) {
             self.write_register_with_sp(fields.rn, true, updated)?;
@@ -969,7 +1034,7 @@ impl CraneliftTranslator<'_, '_> {
             let address = self.builder.ins().iadd_imm_u(base, displacement as i64);
             let mut transfer = fields;
             transfer.rd = fields.rd.wrapping_add(index) & 31;
-            self.emit_vector_transfer(source, transfer, address, size, flags)?;
+            self.emit_vector_transfer(source, transfer, address, size, false, flags)?;
         }
         if matches!(
             instruction,
@@ -1001,7 +1066,12 @@ impl CraneliftTranslator<'_, '_> {
         let lane_ty = integer_lane_type(lane_bits)?;
         let vector_ty = vector_type(lane_ty, lane_bits)?;
         if fields.load {
-            let value = self.memory_read(source, address, size, MemoryOrdering::Relaxed, flags)?;
+            let value = self.memory_read(
+                source,
+                address,
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, None),
+                flags,
+            )?;
             let previous = self.read_vector_as(fields.rd, vector_ty)?;
             let value = cast_integer(&mut self.builder, value, lane_ty, false);
             let result = self.builder.ins().insertlane(previous, value, lane);
@@ -1010,7 +1080,13 @@ impl CraneliftTranslator<'_, '_> {
         } else {
             let vector = self.read_vector_as(fields.rd, vector_ty)?;
             let value = self.builder.ins().extractlane(vector, lane);
-            self.memory_write(source, address, value, size, MemoryOrdering::Relaxed, flags)?;
+            self.memory_write(
+                source,
+                address,
+                value,
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, None),
+                flags,
+            )?;
         }
         if matches!(instruction, Instruction::MemorySingleStructurePostIndex(_)) {
             let offset = if fields.rm == 31 {
@@ -1318,6 +1394,7 @@ impl CraneliftTranslator<'_, '_> {
             .ins()
             .load(types::I32, super::trusted_flags(), self.fpsr, 0);
         self.builder.def_var(self.fpsr_state, fpsr);
+        self.block_dirty_fpsr = true;
         match instruction {
             Instruction::FloatToSignedInt(_) | Instruction::FloatToUnsignedInt(_) => {
                 if fields.rd != 31 {

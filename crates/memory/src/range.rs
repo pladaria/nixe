@@ -243,6 +243,24 @@ impl CanonicalCpuWriteDependency {
             pages: Vec<(CanonicalBackingPage, ContentGeneration)>,
         }
 
+        let ranges = ranges.into_iter().collect::<Vec<_>>();
+        let mut execution_stores = BTreeMap::new();
+        for range in &ranges {
+            for segment in range.segments() {
+                execution_stores
+                    .entry(segment.backing.store().identity())
+                    .or_insert_with(|| segment.backing.store().clone());
+            }
+        }
+        let execution_stores = execution_stores.into_values().collect::<Vec<_>>();
+        let mut transitions = execution_stores
+            .iter()
+            .map(|store| store.execution_gate().acquire_exclusive())
+            .collect::<Vec<_>>();
+        for transition in &mut transitions {
+            transition.commit();
+        }
+
         let mut stores = BTreeMap::<crate::BackingStoreId, StoreBuilder>::new();
         for range in ranges {
             for segment in range.segments() {
@@ -445,6 +463,16 @@ impl PartialEq for CanonicalCpuWriteDependency {
 impl Eq for CanonicalCpuWriteDependency {}
 
 impl CanonicalBackingRange {
+    fn execution_stores(&self) -> Vec<crate::CanonicalBackingStore> {
+        let mut stores = BTreeMap::new();
+        for segment in self.segments.iter() {
+            stores
+                .entry(segment.backing.store().identity())
+                .or_insert_with(|| segment.backing.store().clone());
+        }
+        stores.into_values().collect()
+    }
+
     /// Creates a non-empty range and checks its total length.
     pub fn new(segments: Vec<CanonicalBackingSegment>) -> Result<Self, CanonicalRangeError> {
         if segments.is_empty() {
@@ -611,6 +639,14 @@ impl CanonicalBackingRange {
         declaration: DeviceAccessDeclaration,
         coordinator: Arc<dyn VisibilityCoordinator>,
     ) -> Result<(), VisibilityError> {
+        let stores = self.execution_stores();
+        let mut transitions = stores
+            .iter()
+            .map(|store| store.execution_gate().acquire_exclusive())
+            .collect::<Vec<_>>();
+        for transition in &mut transitions {
+            transition.commit();
+        }
         let mut visited = BTreeSet::new();
         for segment in self.segments.iter() {
             if visited.insert(segment.page()) {
@@ -633,6 +669,14 @@ impl CanonicalBackingRange {
         declaration: DeviceAccessDeclaration,
         coordinator: Arc<dyn VisibilityCoordinator>,
     ) -> Result<(), VisibilityError> {
+        let stores = self.execution_stores();
+        let mut transitions = stores
+            .iter()
+            .map(|store| store.execution_gate().acquire_exclusive())
+            .collect::<Vec<_>>();
+        for transition in &mut transitions {
+            transition.commit();
+        }
         let mut visited = BTreeSet::new();
         for segment in self.segments.iter() {
             if !visited.insert(segment.page()) {
@@ -675,6 +719,14 @@ impl CanonicalBackingRange {
         if !declaration.kind().writes() {
             return Err(VisibilityError::DeclarationDoesNotWrite);
         }
+        let stores = self.execution_stores();
+        let mut transitions = stores
+            .iter()
+            .map(|store| store.execution_gate().acquire_exclusive())
+            .collect::<Vec<_>>();
+        for transition in &mut transitions {
+            transition.commit();
+        }
         let mut visited = BTreeSet::new();
         for segment in self.segments.iter() {
             if visited.insert(segment.page()) {
@@ -689,6 +741,14 @@ impl CanonicalBackingRange {
     /// Marks every retained page invalid after an unrecoverable residency or
     /// visibility failure.
     pub fn invalidate_visibility(&self) -> Result<(), VisibilityError> {
+        let stores = self.execution_stores();
+        let mut transitions = stores
+            .iter()
+            .map(|store| store.execution_gate().acquire_exclusive())
+            .collect::<Vec<_>>();
+        for transition in &mut transitions {
+            transition.commit();
+        }
         let mut visited = BTreeSet::new();
         for segment in self.segments.iter() {
             if visited.insert(segment.page()) {

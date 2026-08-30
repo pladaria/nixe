@@ -1208,10 +1208,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nixe-cpu-direct-memory"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nixe-cpu",
+ "nixe-memory",
+]
+
+[[package]]
 name = "nixe-cpu-interpreter"
 version = "0.1.0"
 dependencies = [
  "nixe-cpu",
+ "nixe-cpu-direct-memory",
  "nixe-memory",
 ]
 
@@ -1226,6 +1236,7 @@ dependencies = [
  "cranelift-native",
  "log",
  "nixe-cpu",
+ "nixe-cpu-direct-memory",
  "nixe-cpu-interpreter",
  "nixe-memory",
  "tempfile",

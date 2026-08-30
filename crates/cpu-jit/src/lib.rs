@@ -4,7 +4,7 @@
 //! compiler, native lookup table, and slow paths remain private to the backend.
 
 #[cfg(not(target_os = "linux"))]
-compile_error!("nixe-cpu-jit requires Linux fastmem support");
+compile_error!("nixe-cpu-jit requires Linux direct-memory support");
 
 mod configuration;
 mod diagnostics;

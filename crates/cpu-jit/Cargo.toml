@@ -12,6 +12,7 @@ cranelift-module = "=0.134.3"
 cranelift-native = "=0.134.3"
 log.workspace = true
 nixe-cpu.workspace = true
+nixe-cpu-direct-memory.workspace = true
 nixe-memory.workspace = true
 
 [dev-dependencies]

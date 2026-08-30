@@ -18,7 +18,27 @@ use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use super::{advance, read, register_offset_address, sign_extend, write};
 use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
 
-type MemoryStep = Result<Option<()>, DataAccessFault>;
+enum MemoryStepError {
+    Data(DataAccessFault),
+    Direct(Box<str>),
+}
+
+impl From<DataAccessFault> for MemoryStepError {
+    fn from(fault: DataAccessFault) -> Self {
+        Self::Data(fault)
+    }
+}
+
+impl From<nixe_cpu_direct_memory::DirectScalarAccessError> for MemoryStepError {
+    fn from(error: nixe_cpu_direct_memory::DirectScalarAccessError) -> Self {
+        match error {
+            nixe_cpu_direct_memory::DirectScalarAccessError::DataFault(fault) => Self::Data(fault),
+            error => Self::Direct(error.to_string().into_boxed_str()),
+        }
+    }
+}
+
+type MemoryStep = Result<Option<()>, MemoryStepError>;
 
 pub(super) fn execute(
     context: InterpreterContext<'_>,
@@ -30,12 +50,12 @@ pub(super) fn execute(
     let address_space = context.process().address_space_id();
     let fields = instruction.operands();
     let result = match instruction {
-        Instruction::Literal(_) => literal(memory, address_space, state, decoded, fields),
-        Instruction::Unsigned(_) => unsigned(memory, address_space, state, fields),
+        Instruction::Literal(_) => literal(context, address_space, state, decoded, fields),
+        Instruction::Unsigned(_) => unsigned(context, address_space, state, fields),
         Instruction::Unscaled(_) | Instruction::PostIndex(_) | Instruction::PreIndex(_) => {
-            indexed(memory, address_space, state, fields, instruction)
+            indexed(context, address_space, state, fields, instruction)
         }
-        Instruction::Register(_) => register_offset(memory, address_space, state, fields),
+        Instruction::Register(_) => register_offset(context, address_space, state, fields),
         Instruction::Pair(_) => pair(memory, address_space, state, fields),
         Instruction::LoadAcquire(_) | Instruction::StoreRelease(_) => {
             acquire_release(memory, address_space, state, fields, instruction)
@@ -55,7 +75,13 @@ pub(super) fn execute(
             Ok(InstructionStep::Continue)
         }
         Ok(None) => Err(super::super::unsupported(decoded)),
-        Err(fault) => Ok(InstructionStep::data_fault(decoded.location, fault)),
+        Err(MemoryStepError::Data(fault)) => {
+            Ok(InstructionStep::data_fault(decoded.location, fault))
+        }
+        Err(MemoryStepError::Direct(detail)) => Err(InterpreterError::DirectMemory {
+            source: decoded.location,
+            detail,
+        }),
     }
 }
 
@@ -258,8 +284,8 @@ fn access(size: MemoryAccessSize, ordering: MemoryOrdering, aligned: bool) -> Me
 }
 
 fn literal(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
+    _address_space: AddressSpaceId,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: Operands,
@@ -271,17 +297,18 @@ fn literal(
         .location
         .pc
         .wrapping_offset(sign_extend(u64::from(fields.immediate_19), 19) << 2);
-    let value = memory.read(
-        address_space,
+    let value = scalar_read(
+        context,
+        state,
         address,
         access(size, MemoryOrdering::Relaxed, false),
     )?;
-    write_loaded(state, fields.rt, size, load, value.value);
+    write_loaded(state, fields.rt, size, load, value);
     Ok(Some(()))
 }
 
 fn unsigned(
-    memory: &dyn CpuMemory,
+    context: InterpreterContext<'_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -292,7 +319,7 @@ fn unsigned(
         base.wrapping_add(u64::from(fields.immediate_12) * size.bytes() as u64),
     );
     transfer(
-        memory,
+        context,
         address_space,
         state,
         fields,
@@ -303,7 +330,7 @@ fn unsigned(
 }
 
 fn indexed(
-    memory: &dyn CpuMemory,
+    context: InterpreterContext<'_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -325,7 +352,7 @@ fn indexed(
         base
     };
     if transfer(
-        memory,
+        context,
         address_space,
         state,
         fields,
@@ -344,7 +371,7 @@ fn indexed(
 }
 
 fn register_offset(
-    memory: &dyn CpuMemory,
+    context: InterpreterContext<'_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -361,7 +388,7 @@ fn register_offset(
         return Ok(None);
     };
     transfer(
-        memory,
+        context,
         address_space,
         state,
         fields,
@@ -455,8 +482,8 @@ fn acquire_release(
 }
 
 fn transfer(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
+    _address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
     address: GuestVirtualAddress,
@@ -465,20 +492,80 @@ fn transfer(
 ) -> MemoryStep {
     match scalar_transfer(fields.opc, size) {
         Some(ScalarTransfer::Store) => {
-            memory.write(
-                address_space,
+            scalar_write(
+                context,
+                state,
                 address,
-                descriptor,
                 register_value(state, fields.rt, size),
+                descriptor,
             )?;
         }
         Some(ScalarTransfer::Load(load)) => {
-            let value = memory.read(address_space, address, descriptor)?.value;
+            let value = scalar_read(context, state, address, descriptor)?;
             write_loaded(state, fields.rt, size, load, value);
         }
         None => return Ok(None),
     }
     Ok(Some(()))
+}
+
+fn scalar_read(
+    context: InterpreterContext<'_>,
+    state: &A64State,
+    address: GuestVirtualAddress,
+    descriptor: MemoryAccess,
+) -> Result<MemoryValue, MemoryStepError> {
+    if descriptor.ordering == MemoryOrdering::Relaxed
+        && descriptor.class == MemoryAccessClass::Normal
+        && descriptor.size != MemoryAccessSize::Quadword
+        && let Some(direct) = context.direct_memory()
+    {
+        return direct
+            .borrow_mut()
+            .read(
+                context.memory(),
+                GuestVirtualAddress::new(state.pc()),
+                address,
+                descriptor,
+            )
+            .map_err(Into::into);
+    }
+    Ok(context
+        .memory()
+        .read(context.process().address_space_id(), address, descriptor)?
+        .value)
+}
+
+fn scalar_write(
+    context: InterpreterContext<'_>,
+    state: &A64State,
+    address: GuestVirtualAddress,
+    value: MemoryValue,
+    descriptor: MemoryAccess,
+) -> Result<(), MemoryStepError> {
+    if descriptor.ordering == MemoryOrdering::Relaxed
+        && descriptor.class == MemoryAccessClass::Normal
+        && descriptor.size != MemoryAccessSize::Quadword
+        && let Some(direct) = context.direct_memory()
+    {
+        return direct
+            .borrow_mut()
+            .write(
+                context.memory(),
+                GuestVirtualAddress::new(state.pc()),
+                address,
+                descriptor,
+                value,
+            )
+            .map_err(Into::into);
+    }
+    context.memory().write(
+        context.process().address_space_id(),
+        address,
+        descriptor,
+        value,
+    )?;
+    Ok(())
 }
 
 fn register_value(state: &A64State, register: u8, size: MemoryAccessSize) -> MemoryValue {
