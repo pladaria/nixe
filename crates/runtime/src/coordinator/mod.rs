@@ -313,9 +313,11 @@ impl RuntimeCoordinator {
                 lease,
                 progress: report.progress,
                 stop: recorded_stop(&report.stop),
-                context: record
-                    .retains_architectural_context()
-                    .then(|| Box::new(report.context.clone())),
+                context: if record.retains_architectural_context() {
+                    report.context.clone().map(Box::new)
+                } else {
+                    None
+                },
             });
         }
     }

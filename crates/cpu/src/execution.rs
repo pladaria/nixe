@@ -270,16 +270,23 @@ pub struct ExecutionReport {
     /// instructions; the normal JIT reports completed native boundaries.
     pub progress: u64,
     pub stop: CpuExit,
-    pub context: RegisterContext,
+    /// Exact architectural state at the reported stop, when the frontend can
+    /// provide it without reconstructing values from native execution.
+    pub context: Option<RegisterContext>,
 }
 
 impl Display for ExecutionReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "progress={} stop=[{}] registers=[{}]",
-            self.progress, self.stop, self.context
-        )
+            "progress={} stop=[{}] registers=[",
+            self.progress, self.stop
+        )?;
+        match &self.context {
+            Some(context) => Display::fmt(context, formatter)?,
+            None => formatter.write_str("unavailable")?,
+        }
+        formatter.write_str("]")
     }
 }
 

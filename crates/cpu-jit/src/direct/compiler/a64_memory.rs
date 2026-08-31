@@ -9,36 +9,37 @@ use nixe_cpu::memory::{AtomicRmwKind, MemoryAccessSize, MemoryOrdering};
 use nixe_cpu::semantics::a64::{
     LoadSpec, ScalarTransfer, literal_load, memory_size, pair_transfer, scalar_transfer,
 };
-use nixe_cpu_direct_memory::NativeFaultCompletion;
 use nixe_memory::{DIRECT_PAGE_SIZE, DirectStoreControl, GuestVirtualAddress};
 
 use super::{CraneliftTranslator, LazyFlags, trusted_flags};
 use crate::direct::slow;
 use crate::direct::{DirectJitError, NativeContext};
 
-// Cranelift reserves five of the 255 non-zero trap codes. A region can use
-// each remaining code to identify one faultable direct access independently
-// of source-location ranges and machine block layout.
-const MAX_DIRECT_FAULT_SITES: usize = 250;
-
 #[derive(Clone, Copy)]
 pub(super) struct MemoryOperation {
     size: MemoryAccessSize,
     ordering: MemoryOrdering,
-    completion: Option<NativeFaultCompletion>,
+    direct: bool,
+    element_index: u8,
 }
 
 impl MemoryOperation {
     pub(super) const fn new(
         size: MemoryAccessSize,
         ordering: MemoryOrdering,
-        completion: Option<NativeFaultCompletion>,
+        direct: bool,
     ) -> Self {
         Self {
             size,
             ordering,
-            completion,
+            direct,
+            element_index: 0,
         }
+    }
+
+    pub(super) const fn with_element_index(mut self, element_index: u8) -> Self {
+        self.element_index = element_index;
+        self
     }
 }
 
@@ -92,11 +93,7 @@ impl CraneliftTranslator<'_, '_> {
         let value = self.memory_read(
             source,
             address,
-            MemoryOperation::new(
-                size,
-                MemoryOrdering::Relaxed,
-                Some(integer_load_completion(fields.rt, load)),
-            ),
+            MemoryOperation::new(size, MemoryOrdering::Relaxed, true),
             flags,
         )?;
         self.write_loaded(fields.rt, load, value)
@@ -203,27 +200,16 @@ impl CraneliftTranslator<'_, '_> {
         };
         let second = self.builder.ins().iadd_imm_u(first, size.bytes() as i64);
         if fields.load {
-            let pair_completion = |access_index| NativeFaultCompletion::IntegerPairLoad {
-                first_register: fields.rt,
-                second_register: fields.rt2,
-                signed: load.signed,
-                destination_bits: load.destination_bits,
-                access_index,
-                writeback_register: fields.rn,
-                writeback_offset: i16::try_from(offset)
-                    .expect("scalar pair writeback offset fits i16"),
-                writeback: matches!(fields.mode, 1 | 3),
-            };
             let first_value = self.memory_read(
                 source,
                 first,
-                MemoryOperation::new(size, MemoryOrdering::Relaxed, Some(pair_completion(0))),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, true),
                 flags,
             )?;
             let second_value = self.memory_read(
                 source,
                 second,
-                MemoryOperation::new(size, MemoryOrdering::Relaxed, Some(pair_completion(1))),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, true).with_element_index(1),
                 flags,
             )?;
             self.write_loaded(fields.rt, load, first_value)?;
@@ -235,26 +221,14 @@ impl CraneliftTranslator<'_, '_> {
                 source,
                 first,
                 first_value,
-                MemoryOperation::new(
-                    size,
-                    MemoryOrdering::Relaxed,
-                    Some(NativeFaultCompletion::IntegerStore {
-                        register: fields.rt,
-                    }),
-                ),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, true),
                 flags,
             )?;
             self.memory_write(
                 source,
                 second,
                 second_value,
-                MemoryOperation::new(
-                    size,
-                    MemoryOrdering::Relaxed,
-                    Some(NativeFaultCompletion::IntegerStore {
-                        register: fields.rt2,
-                    }),
-                ),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, true).with_element_index(1),
                 flags,
             )?;
         }
@@ -277,7 +251,7 @@ impl CraneliftTranslator<'_, '_> {
             let value = self.memory_read(
                 source,
                 address,
-                MemoryOperation::new(size, MemoryOrdering::Acquire, None),
+                MemoryOperation::new(size, MemoryOrdering::Acquire, false),
                 flags,
             )?;
             self.write_loaded(fields.rt, LoadSpec::unsigned(size), value)
@@ -287,7 +261,7 @@ impl CraneliftTranslator<'_, '_> {
                 source,
                 address,
                 value,
-                MemoryOperation::new(size, MemoryOrdering::Release, None),
+                MemoryOperation::new(size, MemoryOrdering::Release, false),
                 flags,
             )
         }
@@ -408,22 +382,15 @@ impl CraneliftTranslator<'_, '_> {
                     source,
                     address,
                     value,
-                    MemoryOperation::new(
-                        size,
-                        MemoryOrdering::Relaxed,
-                        direct_load.then_some(NativeFaultCompletion::IntegerStore {
-                            register: fields.rt,
-                        }),
-                    ),
+                    MemoryOperation::new(size, MemoryOrdering::Relaxed, direct_load),
                     flags,
                 )
             }
             Some(ScalarTransfer::Load(load)) => {
-                let completion = direct_load.then(|| integer_load_completion(fields.rt, load));
                 let value = self.memory_read(
                     source,
                     address,
-                    MemoryOperation::new(size, MemoryOrdering::Relaxed, completion),
+                    MemoryOperation::new(size, MemoryOrdering::Relaxed, direct_load),
                     flags,
                 )?;
                 self.write_loaded(fields.rt, load, value)
@@ -444,13 +411,10 @@ impl CraneliftTranslator<'_, '_> {
         let MemoryOperation {
             size,
             ordering,
-            completion,
+            direct,
+            element_index,
         } = operation;
-        if ordering != MemoryOrdering::Relaxed
-            || !self.direct_memory
-            || completion.is_none()
-            || self.fault_sites.len() == MAX_DIRECT_FAULT_SITES
-        {
+        if ordering != MemoryOrdering::Relaxed || !self.direct_memory || !direct {
             return self.memory_read_slow(source, address, size, ordering, flags);
         }
         let ty = memory_type(size);
@@ -473,9 +437,6 @@ impl CraneliftTranslator<'_, '_> {
         let aligned = self.builder.ins().icmp_imm_s(IntCC::Equal, alignment, 0);
         let eligible = self.builder.ins().band(no_wrap, in_arena);
         let eligible = self.builder.ins().band(eligible, aligned);
-        let completion = completion.expect("eligible direct load has completion metadata");
-        self.checkpoint_direct_fault_state(flags)?;
-
         let native = self.builder.create_block();
         let checked = self.cold_block();
         let merged = self.builder.create_block();
@@ -487,18 +448,14 @@ impl CraneliftTranslator<'_, '_> {
         self.builder.ins().jump(merged, &[BlockArg::from(value)]);
 
         self.builder.switch_to_block(native);
-        let trap_code = self.record_direct_fault_state(
+        self.record_direct_fault_state(
             source,
             size.bytes() as u8,
             nixe_cpu_direct_memory::NativeMemoryAccessKind::Read,
-            completion,
+            element_index,
         );
-        self.builder.ins().set_pinned_reg(address);
         let pointer = self.builder.ins().iadd(self.direct_base, address);
-        // The private trap code preserves this guest operation's identity
-        // through block layout and lowering, including duplicated native
-        // instructions and missing source-location ranges.
-        let fault_flags = MemFlagsData::new().with_trap_code(Some(trap_code));
+        let fault_flags = MemFlagsData::new().with_trap_code(Some(super::DIRECT_MEMORY_TRAP));
         let value = self.builder.ins().load(ty, fault_flags, pointer, 0);
         self.builder.ins().jump(merged, &[BlockArg::from(value)]);
 
@@ -541,13 +498,12 @@ impl CraneliftTranslator<'_, '_> {
         let MemoryOperation {
             size,
             ordering,
-            completion,
+            direct,
+            element_index: _,
         } = operation;
-        if ordering != MemoryOrdering::Relaxed || !self.direct_memory || completion.is_none() {
+        if ordering != MemoryOrdering::Relaxed || !self.direct_memory || !direct {
             return self.memory_write_slow(source, address, value, size, ordering, flags);
         }
-        self.checkpoint_direct_fault_state(flags)?;
-        self.builder.ins().set_pinned_reg(address);
         let last = self
             .builder
             .ins()
@@ -868,14 +824,6 @@ fn memory_type(size: MemoryAccessSize) -> cranelift_codegen::ir::Type {
         MemoryAccessSize::Word => types::I32,
         MemoryAccessSize::Doubleword => types::I64,
         MemoryAccessSize::Quadword => types::I128,
-    }
-}
-
-const fn integer_load_completion(register: u8, load: LoadSpec) -> NativeFaultCompletion {
-    NativeFaultCompletion::IntegerLoad {
-        register,
-        signed: load.signed,
-        destination_bits: load.destination_bits,
     }
 }
 

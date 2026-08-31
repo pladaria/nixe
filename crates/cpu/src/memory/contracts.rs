@@ -800,11 +800,14 @@ pub struct DataAccessFault {
 /// Policy result for an attributed direct native memory fault.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DirectFaultResolution {
-    /// Canonical state and host protection have been published; resume exactly
-    /// the original guest operation through native retry or checkpoint re-entry.
+    /// Host protection and page state have been repaired; retry the exact
+    /// native instruction with its captured host context.
     Retry,
-    /// Exit to the existing checked architectural operation without retrying.
-    Checked,
+    /// Temporary pre-cutover scalar store path which completes synchronously
+    /// from its explicit call inputs. Raw JIT sites never use this outcome.
+    CheckedStore,
+    /// Guest-visible invalid access. The raw operation is not completed.
+    Fault(DataAccessFault),
     /// A CPU-visible eligible mapping faulted despite its published host view.
     Fatal(Box<str>),
 }
@@ -873,12 +876,19 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
     /// guest operation a second time.
     fn resolve_direct_fault(
         &self,
-        _address_space: AddressSpaceId,
-        _address: GuestVirtualAddress,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
         _size: MemoryAccessSize,
-        _kind: DataAccessKind,
+        kind: DataAccessKind,
     ) -> DirectFaultResolution {
-        DirectFaultResolution::Checked
+        DirectFaultResolution::Fault(DataAccessFault::new(
+            address_space,
+            address,
+            kind,
+            DataAccessFaultReason::HostBacking(
+                "memory backend cannot resolve a native direct fault".into(),
+            ),
+        ))
     }
 
     /// Completes one faulted native scalar store exactly once through the

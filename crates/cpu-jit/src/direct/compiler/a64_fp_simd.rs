@@ -867,8 +867,14 @@ impl CraneliftTranslator<'_, '_> {
                             offset
                         };
                         let address = self.builder.ins().iadd(base, offset);
-                        return self
-                            .emit_vector_transfer(source, fields, address, size, true, flags);
+                        return self.emit_vector_transfer(
+                            source,
+                            fields,
+                            address,
+                            size,
+                            Some(0),
+                            flags,
+                        );
                     }
                     _ => unreachable!(),
                 };
@@ -881,7 +887,14 @@ impl CraneliftTranslator<'_, '_> {
                     instruction,
                     Instruction::MemoryUnsigned(_) | Instruction::MemoryUnscaled(_)
                 );
-                self.emit_vector_transfer(source, fields, address, size, direct, flags)?;
+                self.emit_vector_transfer(
+                    source,
+                    fields,
+                    address,
+                    size,
+                    direct.then_some(0),
+                    flags,
+                )?;
                 if matches!(
                     instruction,
                     Instruction::MemoryPostIndex(_) | Instruction::MemoryPreIndex(_)
@@ -900,18 +913,17 @@ impl CraneliftTranslator<'_, '_> {
         fields: Operands,
         address: Value,
         size: MemoryAccessSize,
-        direct: bool,
+        direct_element: Option<u8>,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
+        let direct = direct_element.is_some();
+        let element_index = direct_element.unwrap_or(0);
         if fields.load {
-            let completion =
-                direct.then_some(nixe_cpu_direct_memory::NativeFaultCompletion::VectorLoad {
-                    register: fields.rd,
-                });
             let value = self.memory_read(
                 source,
                 address,
-                MemoryOperation::new(size, MemoryOrdering::Relaxed, completion),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, direct)
+                    .with_element_index(element_index),
                 flags,
             )?;
             let value = if size == MemoryAccessSize::Quadword {
@@ -922,17 +934,14 @@ impl CraneliftTranslator<'_, '_> {
             let value = self.vector_as(value, types::I8X16);
             self.write_vector(fields.rd, value)
         } else {
-            let completion =
-                direct.then_some(nixe_cpu_direct_memory::NativeFaultCompletion::VectorStore {
-                    register: fields.rd,
-                });
             let value = self.read_vector_as(fields.rd, types::I128)?;
             let value = reduce_integer(&mut self.builder, value, size);
             self.memory_write(
                 source,
                 address,
                 value,
-                MemoryOperation::new(size, MemoryOrdering::Relaxed, completion),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, direct)
+                    .with_element_index(element_index),
                 flags,
             )
         }
@@ -960,26 +969,16 @@ impl CraneliftTranslator<'_, '_> {
         };
         let second = self.builder.ins().iadd_imm_u(first, size.bytes() as i64);
         if fields.load {
-            let completion =
-                |access_index| nixe_cpu_direct_memory::NativeFaultCompletion::VectorPairLoad {
-                    first_register: fields.rd,
-                    second_register: fields.rt2,
-                    access_index,
-                    writeback_register: fields.rn,
-                    writeback_offset: i16::try_from(offset)
-                        .expect("SIMD pair writeback offset fits i16"),
-                    writeback: matches!(fields.mode, 1 | 3),
-                };
             let first_value = self.memory_read(
                 source,
                 first,
-                MemoryOperation::new(size, MemoryOrdering::Relaxed, Some(completion(0))),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, true),
                 flags,
             )?;
             let second_value = self.memory_read(
                 source,
                 second,
-                MemoryOperation::new(size, MemoryOrdering::Relaxed, Some(completion(1))),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, true).with_element_index(1),
                 flags,
             )?;
             let first_value = if size == MemoryAccessSize::Quadword {
@@ -997,10 +996,20 @@ impl CraneliftTranslator<'_, '_> {
             self.write_vector(fields.rd, first_value)?;
             self.write_vector(fields.rt2, second_value)?;
         } else {
-            for (register, address) in [(fields.rd, first), (fields.rt2, second)] {
+            for (element_index, (register, address)) in [(fields.rd, first), (fields.rt2, second)]
+                .into_iter()
+                .enumerate()
+            {
                 let mut transfer = fields;
                 transfer.rd = register;
-                self.emit_vector_transfer(source, transfer, address, size, true, flags)?;
+                self.emit_vector_transfer(
+                    source,
+                    transfer,
+                    address,
+                    size,
+                    Some(element_index as u8),
+                    flags,
+                )?;
             }
         }
         if matches!(fields.mode, 1 | 3) {
@@ -1034,7 +1043,7 @@ impl CraneliftTranslator<'_, '_> {
             let address = self.builder.ins().iadd_imm_u(base, displacement as i64);
             let mut transfer = fields;
             transfer.rd = fields.rd.wrapping_add(index) & 31;
-            self.emit_vector_transfer(source, transfer, address, size, false, flags)?;
+            self.emit_vector_transfer(source, transfer, address, size, None, flags)?;
         }
         if matches!(
             instruction,
@@ -1069,7 +1078,7 @@ impl CraneliftTranslator<'_, '_> {
             let value = self.memory_read(
                 source,
                 address,
-                MemoryOperation::new(size, MemoryOrdering::Relaxed, None),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, false),
                 flags,
             )?;
             let previous = self.read_vector_as(fields.rd, vector_ty)?;
@@ -1084,7 +1093,7 @@ impl CraneliftTranslator<'_, '_> {
                 source,
                 address,
                 value,
-                MemoryOperation::new(size, MemoryOrdering::Relaxed, None),
+                MemoryOperation::new(size, MemoryOrdering::Relaxed, false),
                 flags,
             )?;
         }
