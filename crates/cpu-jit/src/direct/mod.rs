@@ -19,16 +19,12 @@ use nixe_cpu::execution::{
 };
 use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
 use nixe_cpu::memory::{CodePageDependency, CodePageSpan, CpuMemory, DataAccessFault};
-use nixe_cpu::memory::{
-    DataAccessKind, DirectFaultResolution, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
-    MemoryAlignment, MemoryOrdering, MemoryValue,
-};
+use nixe_cpu::memory::{DataAccessKind, DirectFaultResolution, MemoryAccessSize};
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv};
 use nixe_cpu_direct_memory::{
-    CapturedFault, FaultDisposition, InvocationOutcome, NativeFaultCompletion, NativeFaultRegion,
-    NativeFaultRegistry, NativeFaultSite, NativeInvocation, NativeMemoryAccessKind,
-    WorkerFaultContext,
+    CapturedFault, FaultDisposition, NativeFaultRegion, NativeFaultRegistry, NativeFaultSite,
+    NativeInvocation, NativeMemoryAccessKind, WorkerFaultContext,
 };
 use nixe_memory::{
     CpuMemoryBackend, DirectAddressSpaceView, GuestPhysicalPageId, GuestVirtualAddress,
@@ -551,8 +547,6 @@ impl JitProcess {
                         native_start,
                         native_end,
                         access: site.access,
-                        completion: site.completion,
-                        guest_address: Some(site.guest_address),
                     })
                 })
                 .collect::<Result<Vec<_>, DirectJitError>>()?;
@@ -1171,7 +1165,7 @@ impl JitThread {
                         gateway,
                     )
                 };
-                let outcome = unsafe {
+                unsafe {
                     worker.invoke(
                         arena,
                         &process.fault_registry,
@@ -1185,11 +1179,6 @@ impl JitThread {
                     )
                 }
                 .map_err(|error| DirectJitError::internal(error.to_string()))?;
-                if outcome == InvocationOutcome::Retry {
-                    return Err(DirectJitError::internal(
-                        "direct JIT gateway unexpectedly requested caller retry",
-                    ));
-                }
             } else {
                 unsafe { gateway(&mut context, entry) };
             }
@@ -1222,10 +1211,14 @@ unsafe fn dispatch_direct_fault_inner(
     if site.access.address_space.get() != context.address_space {
         return FaultDisposition::Fatal;
     }
-    let Some(guest_address_register) = site.guest_address else {
+    let fault_address = fault.fault_address();
+    let Some(arena_end) = context.direct_base.checked_add(context.direct_size) else {
         return FaultDisposition::Fatal;
     };
-    let Ok(guest_address) = fault.read_host_integer(guest_address_register) else {
+    if fault_address < context.direct_base || fault_address >= arena_end {
+        return FaultDisposition::Fatal;
+    }
+    let Ok(guest_address) = u64::try_from(fault_address - context.direct_base) else {
         return FaultDisposition::Fatal;
     };
     let Some(size) = direct_access_size(site.access.size) else {
@@ -1237,108 +1230,22 @@ unsafe fn dispatch_direct_fault_inner(
     };
     let memory = unsafe { &*context.memory };
     let address = GuestVirtualAddress::new(guest_address);
-    let access = MemoryAccess::new(
-        size,
-        MemoryAlignment::Unaligned,
-        MemoryOrdering::Relaxed,
-        MemoryAccessClass::Normal,
-    );
     match memory.resolve_direct_fault(site.access.address_space, address, size, kind) {
-        DirectFaultResolution::Retry => {
-            #[cfg(target_arch = "x86_64")]
-            {
-                FaultDisposition::Retry
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                // AArch64 glibc does not restore all volatile host state from
-                // setcontext. Re-enter the faulting guest checkpoint instead;
-                // this path is cold and leaves generated memory accesses bare.
-                unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
-                context.exit_pc = site.access.guest_pc.get();
-                context.exit_kind = EXIT_DISPATCH;
-                context.exit_detail = 0;
-                context.data_fault = None;
-                context.direct_fault_error = None;
-                FaultDisposition::Escape
-            }
+        DirectFaultResolution::Retry => FaultDisposition::Retry,
+        DirectFaultResolution::CheckedStore => {
+            unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
+            context.exit_pc = site.access.guest_pc.get();
+            context.exit_kind = EXIT_INTERNAL;
+            context.direct_fault_error =
+                Some("raw JIT fault reached the scalar-store-only checked path".into());
+            FaultDisposition::Escape
         }
-        DirectFaultResolution::Checked => {
-            match kind {
-                DataAccessKind::Read => {
-                    match site.completion {
-                        NativeFaultCompletion::IntegerPairLoad { .. } => {
-                            if !complete_direct_pair_read(
-                                context, memory, site, address, size, access,
-                            ) {
-                                return FaultDisposition::Fatal;
-                            }
-                            return FaultDisposition::Escape;
-                        }
-                        NativeFaultCompletion::VectorPairLoad { .. } => {
-                            if !complete_direct_vector_pair_read(
-                                context, memory, site, address, size, access,
-                            ) {
-                                return FaultDisposition::Fatal;
-                            }
-                            return FaultDisposition::Escape;
-                        }
-                        _ => {}
-                    }
-                    match memory.read(site.access.address_space, address, access) {
-                        Ok(result) => {
-                            if !complete_direct_read(
-                                context,
-                                site.completion,
-                                size,
-                                result.value.bits(),
-                            ) {
-                                return FaultDisposition::Fatal;
-                            }
-                            let next = site.access.guest_pc.wrapping_offset(4);
-                            unsafe { &mut *context.state }.set_pc(next.get());
-                            context.exit_pc = next.get();
-                            context.exit_kind = EXIT_DISPATCH;
-                            context.exit_detail = 0;
-                            context.data_fault = None;
-                        }
-                        Err(data_fault) => {
-                            unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
-                            context.exit_pc = site.access.guest_pc.get();
-                            context.exit_kind = EXIT_DATA_FAULT;
-                            context.exit_detail = 0;
-                            context.data_fault = Some(data_fault);
-                        }
-                    }
-                }
-                DataAccessKind::Write => {
-                    let Some(value) = direct_store_value(context, site.completion, size) else {
-                        return FaultDisposition::Fatal;
-                    };
-                    match memory.complete_direct_write_fault(
-                        site.access.address_space,
-                        address,
-                        access,
-                        value,
-                    ) {
-                        Ok(_) => {
-                            let next = site.access.guest_pc.wrapping_offset(4);
-                            unsafe { &mut *context.state }.set_pc(next.get());
-                            context.exit_pc = next.get();
-                            context.exit_kind = EXIT_DISPATCH;
-                            context.exit_detail = 0;
-                            context.data_fault = None;
-                        }
-                        Err(data_fault) => {
-                            unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
-                            context.exit_pc = site.access.guest_pc.get();
-                            context.exit_kind = EXIT_DATA_FAULT;
-                            context.exit_detail = 0;
-                            context.data_fault = Some(data_fault);
-                        }
-                    }
-                }
-            }
+        DirectFaultResolution::Fault(data_fault) => {
+            unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
+            context.exit_pc = site.access.guest_pc.get();
+            context.exit_kind = EXIT_DATA_FAULT;
+            context.exit_detail = 0;
+            context.data_fault = Some(data_fault);
             FaultDisposition::Escape
         }
         DirectFaultResolution::Fatal(detail) => {
@@ -1349,273 +1256,6 @@ unsafe fn dispatch_direct_fault_inner(
             FaultDisposition::Escape
         }
     }
-}
-
-fn complete_direct_read(
-    context: &mut NativeContext,
-    completion: NativeFaultCompletion,
-    size: MemoryAccessSize,
-    bits: u128,
-) -> bool {
-    match completion {
-        NativeFaultCompletion::IntegerLoad {
-            register,
-            signed,
-            destination_bits,
-        } => {
-            let Some(value) = integer_load_value(size, bits, signed, destination_bits) else {
-                return false;
-            };
-            write_integer_result(unsafe { &mut *context.state }, register, value)
-        }
-        NativeFaultCompletion::VectorLoad { register } => {
-            unsafe { &mut *context.state }.set_vector(register, bits)
-        }
-        _ => false,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn complete_direct_pair_read(
-    context: &mut NativeContext,
-    memory: &dyn CpuMemory,
-    site: &NativeFaultSite,
-    fault_address: GuestVirtualAddress,
-    size: MemoryAccessSize,
-    access: MemoryAccess,
-) -> bool {
-    let NativeFaultCompletion::IntegerPairLoad {
-        first_register,
-        second_register,
-        signed,
-        destination_bits,
-        access_index,
-        writeback_register,
-        writeback_offset,
-        writeback,
-    } = site.completion
-    else {
-        return false;
-    };
-    if access_index > 1 || first_register > 31 || second_register > 31 || writeback_register > 31 {
-        return false;
-    }
-    let displacement = u64::from(access_index) * size.bytes() as u64;
-    let Some(first_address) = fault_address.get().checked_sub(displacement) else {
-        return false;
-    };
-    let Some(second_address) = first_address.checked_add(size.bytes() as u64) else {
-        return false;
-    };
-    let first_address = GuestVirtualAddress::new(first_address);
-    let second_address = GuestVirtualAddress::new(second_address);
-    let first = match memory.read(site.access.address_space, first_address, access) {
-        Ok(result) => result.value.bits(),
-        Err(data_fault) => {
-            finish_checked_direct_fault(context, site.access.guest_pc, data_fault);
-            return true;
-        }
-    };
-    let second = match memory.read(site.access.address_space, second_address, access) {
-        Ok(result) => result.value.bits(),
-        Err(data_fault) => {
-            finish_checked_direct_fault(context, site.access.guest_pc, data_fault);
-            return true;
-        }
-    };
-    let Some(first) = integer_load_value(size, first, signed, destination_bits) else {
-        return false;
-    };
-    let Some(second) = integer_load_value(size, second, signed, destination_bits) else {
-        return false;
-    };
-    let state = unsafe { &mut *context.state };
-    let writeback = if writeback {
-        let register = if writeback_register == 31 {
-            A64Register::StackPointer
-        } else {
-            let Some(register) = A64GeneralRegister::new(writeback_register) else {
-                return false;
-            };
-            A64Register::General(register)
-        };
-        Some((
-            register,
-            state
-                .read_x(register)
-                .wrapping_add_signed(i64::from(writeback_offset)),
-        ))
-    } else {
-        None
-    };
-    if !write_integer_result(state, first_register, first)
-        || !write_integer_result(state, second_register, second)
-    {
-        return false;
-    }
-    if let Some((register, value)) = writeback {
-        state.write_x(register, value);
-    }
-    finish_checked_direct_success(context, site.access.guest_pc);
-    true
-}
-
-#[allow(clippy::too_many_arguments)]
-fn complete_direct_vector_pair_read(
-    context: &mut NativeContext,
-    memory: &dyn CpuMemory,
-    site: &NativeFaultSite,
-    fault_address: GuestVirtualAddress,
-    size: MemoryAccessSize,
-    access: MemoryAccess,
-) -> bool {
-    let NativeFaultCompletion::VectorPairLoad {
-        first_register,
-        second_register,
-        access_index,
-        writeback_register,
-        writeback_offset,
-        writeback,
-    } = site.completion
-    else {
-        return false;
-    };
-    if access_index > 1 || first_register > 31 || second_register > 31 || writeback_register > 31 {
-        return false;
-    }
-    let displacement = u64::from(access_index) * size.bytes() as u64;
-    let Some(first_address) = fault_address.get().checked_sub(displacement) else {
-        return false;
-    };
-    let Some(second_address) = first_address.checked_add(size.bytes() as u64) else {
-        return false;
-    };
-    let first = match memory.read(
-        site.access.address_space,
-        GuestVirtualAddress::new(first_address),
-        access,
-    ) {
-        Ok(result) => result.value.bits(),
-        Err(data_fault) => {
-            finish_checked_direct_fault(context, site.access.guest_pc, data_fault);
-            return true;
-        }
-    };
-    let second = match memory.read(
-        site.access.address_space,
-        GuestVirtualAddress::new(second_address),
-        access,
-    ) {
-        Ok(result) => result.value.bits(),
-        Err(data_fault) => {
-            finish_checked_direct_fault(context, site.access.guest_pc, data_fault);
-            return true;
-        }
-    };
-    let state = unsafe { &mut *context.state };
-    let writeback = if writeback {
-        let register = if writeback_register == 31 {
-            A64Register::StackPointer
-        } else {
-            let Some(register) = A64GeneralRegister::new(writeback_register) else {
-                return false;
-            };
-            A64Register::General(register)
-        };
-        Some((
-            register,
-            state
-                .read_x(register)
-                .wrapping_add_signed(i64::from(writeback_offset)),
-        ))
-    } else {
-        None
-    };
-    if !state.set_vector(first_register, first) || !state.set_vector(second_register, second) {
-        return false;
-    }
-    if let Some((register, value)) = writeback {
-        state.write_x(register, value);
-    }
-    finish_checked_direct_success(context, site.access.guest_pc);
-    true
-}
-
-fn integer_load_value(
-    size: MemoryAccessSize,
-    bits: u128,
-    signed: bool,
-    destination_bits: u8,
-) -> Option<u64> {
-    if !matches!(destination_bits, 32 | 64) || size == MemoryAccessSize::Quadword {
-        return None;
-    }
-    let source_bits = (size.bytes() * 8) as u32;
-    let value = if signed {
-        let shift = 64 - source_bits;
-        (((bits as u64) << shift) as i64 >> shift) as u64
-    } else {
-        bits as u64
-    };
-    Some(if destination_bits == 32 {
-        u64::from(value as u32)
-    } else {
-        value
-    })
-}
-
-fn write_integer_result(state: &mut A64State, register: u8, value: u64) -> bool {
-    if register == 31 {
-        return true;
-    }
-    let Some(register) = A64GeneralRegister::new(register) else {
-        return false;
-    };
-    state.write_x(A64Register::General(register), value);
-    true
-}
-
-fn finish_checked_direct_success(context: &mut NativeContext, source: GuestVirtualAddress) {
-    let next = source.wrapping_offset(4);
-    unsafe { &mut *context.state }.set_pc(next.get());
-    context.exit_pc = next.get();
-    context.exit_kind = EXIT_DISPATCH;
-    context.exit_detail = 0;
-    context.data_fault = None;
-}
-
-fn finish_checked_direct_fault(
-    context: &mut NativeContext,
-    source: GuestVirtualAddress,
-    data_fault: DataAccessFault,
-) {
-    unsafe { &mut *context.state }.set_pc(source.get());
-    context.exit_pc = source.get();
-    context.exit_kind = EXIT_DATA_FAULT;
-    context.exit_detail = 0;
-    context.data_fault = Some(data_fault);
-}
-
-fn direct_store_value(
-    context: &NativeContext,
-    completion: NativeFaultCompletion,
-    size: MemoryAccessSize,
-) -> Option<MemoryValue> {
-    let bits = match completion {
-        NativeFaultCompletion::IntegerStore { register } => {
-            if register == 31 {
-                0
-            } else {
-                let register = A64GeneralRegister::new(register)?;
-                u128::from(unsafe { &*context.state }.read_x(A64Register::General(register)))
-            }
-        }
-        NativeFaultCompletion::VectorStore { register } => {
-            unsafe { &*context.state }.vector(register)?
-        }
-        _ => return None,
-    };
-    Some(MemoryValue::from_bits(size, bits))
 }
 
 const fn direct_access_size(bytes: u8) -> Option<MemoryAccessSize> {
@@ -1644,10 +1284,11 @@ fn direct_exit_progress(exit: &DirectExit) -> u64 {
 }
 
 fn report(progress: u64, stop: CpuExit, state: &A64State) -> ExecutionReport {
+    let context = (!matches!(stop, CpuExit::DataFault { .. })).then(|| state.register_context());
     ExecutionReport {
         progress,
         stop,
-        context: state.register_context(),
+        context,
     }
 }
 

@@ -719,9 +719,7 @@ fn synchronize_direct_backend(
 }
 
 fn maximum_direct_protection(mapping: ExecutionMapping) -> DirectProtection {
-    if mapping.attributes.contains(MemoryAttributes::UNCACHED)
-        || !mapping.permissions.contains(MemoryPermissions::READ)
-    {
+    if !mapping.permissions.contains(MemoryPermissions::READ) {
         return DirectProtection::None;
     }
     if mapping.permissions.contains(MemoryPermissions::WRITE) {
@@ -1964,37 +1962,75 @@ impl CpuMemory for ExecutionMemory {
         size: crate::memory::MemoryAccessSize,
         kind: DataAccessKind,
     ) -> DirectFaultResolution {
+        let fault = |address, reason| {
+            DirectFaultResolution::Fault(DataAccessFault::new(address_space, address, kind, reason))
+        };
         let byte_count = size.bytes();
         if byte_count > SYNTHETIC_PAGE_SIZE
             || page_offset(address) + byte_count > SYNTHETIC_PAGE_SIZE
             || !address.get().is_multiple_of(byte_count as u64)
         {
-            return DirectFaultResolution::Checked;
-        }
-        // Until Phase 4 gives raw stores an attributable native fault site,
-        // the scalar/JIT pre-cutover path deliberately faults through a poison
-        // address and must complete the store canonically rather than retrying
-        // that poison access.
-        if kind == DataAccessKind::Write {
-            return DirectFaultResolution::Checked;
+            return fault(
+                address,
+                DataAccessFaultReason::HostBacking(
+                    "operation shape is not eligible for a raw direct access".into(),
+                ),
+            );
         }
         let inner = self.lock_inner();
         let Some(mapping) = inner.mapping_at(address_space, address) else {
-            return DirectFaultResolution::Checked;
+            return fault(address, DataAccessFaultReason::Unmapped);
         };
-        if !mapping.permissions.contains(MemoryPermissions::READ)
-            || mapping.attributes.contains(MemoryAttributes::UNCACHED)
-        {
-            return DirectFaultResolution::Checked;
+        let required = match kind {
+            DataAccessKind::Read => MemoryPermissions::READ,
+            DataAccessKind::Write => MemoryPermissions::WRITE,
+        };
+        if !mapping.permissions.contains(required) {
+            return fault(
+                address,
+                match kind {
+                    DataAccessKind::Read => DataAccessFaultReason::ReadPermissionDenied,
+                    DataAccessKind::Write => DataAccessFaultReason::WritePermissionDenied,
+                },
+            );
         }
-        let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot) else {
-            return DirectFaultResolution::Checked;
+        let backing = match inner.page(mapping.physical_slot) {
+            Some(ExecutionPhysicalPage::Ram(backing)) => backing,
+            Some(ExecutionPhysicalPage::Mmio(_)) => {
+                return fault(
+                    address,
+                    DataAccessFaultReason::Device(
+                        "device memory requires an explicitly typed access".into(),
+                    ),
+                );
+            }
+            None => {
+                return fault(
+                    address,
+                    DataAccessFaultReason::HostBacking(
+                        "guest mapping has no physical backing".into(),
+                    ),
+                );
+            }
         };
         let backing = backing.clone();
+        // The pre-cutover scalar store frontend owns the complete store value
+        // and may finish valid RAM synchronously. Phase 5 removes this outcome
+        // when raw JIT stores replace DirectStoreControl.
+        if kind == DataAccessKind::Write {
+            return DirectFaultResolution::CheckedStore;
+        }
+        // Fault resolution runs while the vCPU retains its shared execution
+        // lease. Never hold the mapping mutex while entering a backing-page
+        // transition; mapping/protection revalidation reacquires it afterwards.
+        drop(inner);
         let visibility_before = backing.visibility_state();
         if let Err(error) = backing.prepare_cpu_access() {
             return match error {
-                CanonicalPageError::Visibility(_) => DirectFaultResolution::Checked,
+                CanonicalPageError::Visibility(error) => fault(
+                    address,
+                    DataAccessFaultReason::HostBacking(error.to_string().into()),
+                ),
                 error => DirectFaultResolution::Fatal(error.to_string().into_boxed_str()),
             };
         }
@@ -2003,7 +2039,8 @@ impl CpuMemory for ExecutionMemory {
             DirectProtection::Read | DirectProtection::ReadWrite
         );
         if expected {
-            let protection = inner
+            let protection = self
+                .lock_inner()
                 .backends
                 .get(&address_space)
                 .and_then(|binding| match binding {
@@ -2034,7 +2071,12 @@ impl CpuMemory for ExecutionMemory {
                 )
             }
         } else {
-            DirectFaultResolution::Checked
+            fault(
+                address,
+                DataAccessFaultReason::HostBacking(
+                    "guest mapping is not eligible for a raw direct read".into(),
+                ),
+            )
         }
     }
 
@@ -2052,7 +2094,6 @@ impl CpuMemory for ExecutionMemory {
                 return Ok(result);
             };
             if !mapping.permissions.contains(MemoryPermissions::WRITE)
-                || mapping.attributes.contains(MemoryAttributes::UNCACHED)
                 || !matches!(
                     inner.backends.get(&address_space),
                     Some(ExecutionBackendBinding::LinuxDirect { .. })
@@ -4195,7 +4236,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             memory.direct_protection_at(space, start),
-            Some(DirectProtection::None)
+            Some(DirectProtection::Read)
         );
 
         memory

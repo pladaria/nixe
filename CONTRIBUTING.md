@@ -1,66 +1,50 @@
 # Contributing
 
-Thank you for your interest in contributing to this project.
+## Project goal
 
-## Project Structure
+Nixe aims to run commercial Nintendo Switch software and, eventually, Switch 2 software. The production path
+must therefore be correct, simple, and highly optimized.
 
-The current directory and crate structure is an initial proposal. It is temporary and may change as the
-project evolves, new technical information becomes available, and implementation needs become clearer.
+Correctness is essential, but testing, diagnostics, and abstractions are means to that goal, not goals in
+themselves. Do not add layers, validation, state duplication, compatibility paths, or other runtime work merely
+to make testing easier. Keep the guest-visible path direct and efficient; put exhaustive checks in tests, debug
+builds, or dedicated tools when they are not required by emulation semantics.
 
-Contributors should avoid treating the existing module boundaries as permanent. Architectural changes are
-expected when they move the project toward the architecture required to emulate commercial software accurately
-and efficiently. Do not preserve temporary boundaries, layers, or data flows merely because they already work.
+## Architecture
 
-Correctness is required, but correctness within the current design is not the final objective. Among correct
-solutions, prefer the one aligned with the intended architecture and its long-term performance requirements,
-even when it requires broader restructuring. Avoid short-term fixes that make that architecture harder to reach.
+The current module and crate boundaries are provisional. Change or remove them when the target architecture or
+performance requires it. Do not preserve temporary boundaries or legacy implementations merely because they work.
 
-## Completion Standard
+An architectural change, migration, refactor, or replacement is complete only when the superseded implementation
+and its obsolete adapters, branches, abstractions, and tests have been removed. Keep multiple paths only when
+they represent genuinely distinct guest-visible behavior or supported host backends.
 
-An architectural change, migration, refactor, or replacement is not complete until the superseded implementation
-has been removed in full. This includes old and alternate execution paths, compatibility branches, transitional
-adapters, obsolete abstractions, dead code, and tests that encode the previous design. Multiple paths are acceptable
-only when they represent distinct behavior required by the target architecture, not as a way to preserve legacy code.
+Keep platform-independent code separate from console-specific behavior. Share code across platforms only when
+the abstraction is supported by verified technical knowledge.
 
-Update tests to exercise the new contract directly. Remove tests that are no longer relevant instead of retaining
-production compatibility paths solely to keep them passing. The finished change must leave one coherent current
-implementation, without a hidden fallback to the design it replaced.
+## Correctness and failure handling
 
-## Language
+Unsupported guest-visible behavior must stop execution with a precise, actionable error. Do not ignore it,
+fabricate success, substitute defaults, or hide it as a warning.
 
-English is the required language for all project content, including: source code, source code comments,
-documentation, commits, etc.
+Validate state when the operation consumes it. Avoid speculative preflight checks, transactions, rollback, and
+recovery when direct execution is sufficient and guest-visible semantics do not require them.
 
-## Testing Guidelines
+Do not classify removal of an emulator-critical bottleneck as premature optimization.
 
-We follow standard Rust conventions to separate unit and integration tests. Please adhere to the following rules:
+## Testing
 
-- **Unit Tests:** Place them at the bottom of the source file they test (e.g., `src/foo.rs`) inside a `#[cfg(test)] mod tests` block. Use them to verify internal logic and private functions.
-- **Integration Tests:** Place them in separate files inside the root `tests/` directory (e.g., `tests/api_tests.rs`). Use them to test the public API as an external consumer.
-- **Prohibited:** Do **NOT** put integration tests, end-to-end flows, or public API testing inside `src/lib.rs` or `mod.rs`. Keep these files focused exclusively on module definitions and internal unit tests.
+Add focused tests for behavior that benefits from regression coverage. Use Rust's conventional unit tests for
+internal logic and integration tests for public interfaces. Tests must verify the current contract; do not retain
+production compatibility paths solely to keep obsolete tests passing.
 
-## Fail-fast Policy
+## References and implementation notes
 
-Nixe prioritizes correctness over resilience.
+When implementation relies on external technical references, link them in a nearby comment. For CPU instructions
+implemented by the interpreter or JIT, consult the official Arm documentation and include a nearby link to the
+relevant page.
 
-- Unsupported guest-visible behavior must stop execution immediately with a precise, actionable error. Never ignore
-  it, fabricate success, substitute defaults, or downgrade it to a warning or debug message.
-- Validate state when an operation consumes it. Unrelated partial state must not block the operation, but required
-  invalid or incomplete state must fail.
-- Prefer direct, single-pass execution. Add preflight validation, transactions, rollback, or recovery only when
-  required by guest-visible semantics or a documented emulator invariant, not speculatively.
-- Tests must preserve these failure boundaries and reject fabricated success paths.
+## Language and contents
 
-## Contribution Principles
-
-- Preserve guest-visible correctness and clear behavior. Do not classify removal of architectural bottlenecks on
-  emulator-critical paths as premature optimization.
-- Add tests for new behavior whenever practical.
-- When an implementation relies on external references, record those references in nearby code comments and link
-  to the relevant resources. Prefer stable, versioned, or commit-pinned links when available.
-- When implementing CPU instructions for the interpreter or JIT, consult the official Arm documentation and add
-  a nearby comment linking to the relevant page.
-- Keep platform-independent code separate from console-specific behavior.
-- Share code between platforms only when the abstraction is supported by verified technical knowledge.
-- Do not include copyrighted games, firmware, cryptographic keys, leaked material, or other content that
-  cannot be legally redistributed.
+Use English for source code, comments, documentation, and commits. Do not include copyrighted games, firmware,
+cryptographic keys, leaked material, or other content that cannot legally be redistributed.

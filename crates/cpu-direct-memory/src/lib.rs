@@ -9,6 +9,8 @@
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
+#[cfg(target_arch = "x86_64")]
+use std::mem::offset_of;
 use std::mem::{ManuallyDrop, MaybeUninit, size_of};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -24,6 +26,7 @@ use nixe_memory::{
 };
 
 const MAX_WORKER_SLOTS: usize = 128;
+const MAX_UNCHANGED_RETRIES: usize = 8;
 const SIGNAL_STACK_SIZE: usize = 64 * 1024;
 const DISPATCH_STACK_SIZE: usize = 64 * 1024;
 // Linux UAPI `siginfo.h` values not exported by every libc target module.
@@ -37,11 +40,6 @@ const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 const FP_XSTATE_SW_BYTES_OFFSET: usize = 464;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostIntegerRegister {
-    pub encoding: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeMemoryAccessKind {
     Read,
     Write,
@@ -53,43 +51,7 @@ pub struct NativeMemoryAccess {
     pub guest_pc: GuestVirtualAddress,
     pub kind: NativeMemoryAccessKind,
     pub size: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NativeFaultCompletion {
-    None,
-    IntegerLoad {
-        register: u8,
-        signed: bool,
-        destination_bits: u8,
-    },
-    IntegerPairLoad {
-        first_register: u8,
-        second_register: u8,
-        signed: bool,
-        destination_bits: u8,
-        access_index: u8,
-        writeback_register: u8,
-        writeback_offset: i16,
-        writeback: bool,
-    },
-    IntegerStore {
-        register: u8,
-    },
-    VectorLoad {
-        register: u8,
-    },
-    VectorPairLoad {
-        first_register: u8,
-        second_register: u8,
-        access_index: u8,
-        writeback_register: u8,
-        writeback_offset: i16,
-        writeback: bool,
-    },
-    VectorStore {
-        register: u8,
-    },
+    pub element_index: u8,
 }
 
 /// One exact native instruction interval which may access a direct arena.
@@ -98,11 +60,6 @@ pub struct NativeFaultSite {
     pub native_start: usize,
     pub native_end: usize,
     pub access: NativeMemoryAccess,
-    pub completion: NativeFaultCompletion,
-    /// Effective guest address retained in Cranelift's reserved pinned register.
-    /// Register retaining the effective guest address. Fixed stubs publish
-    /// their dynamic address through `StubCall` and therefore use `None`.
-    pub guest_address: Option<HostIntegerRegister>,
 }
 
 /// Immutable metadata for one finalized native function.
@@ -302,21 +259,9 @@ pub struct CapturedFault {
 
 impl CapturedFault {
     #[must_use]
-    pub fn signal(&self) -> i32 {
-        unsafe { self.slot.as_ref() }.signal.load(Ordering::Relaxed)
-    }
-
-    #[must_use]
     pub fn fault_address(&self) -> usize {
         unsafe { self.slot.as_ref() }
             .fault_address
-            .load(Ordering::Relaxed)
-    }
-
-    #[must_use]
-    pub fn native_pc(&self) -> usize {
-        unsafe { self.slot.as_ref() }
-            .native_pc
             .load(Ordering::Relaxed)
     }
 
@@ -329,26 +274,16 @@ impl CapturedFault {
         );
         unsafe { &*site }
     }
-
-    /// Reads one integer register from the captured host frame.
-    pub fn read_host_integer(
-        &self,
-        register: HostIntegerRegister,
-    ) -> Result<u64, FaultRuntimeError> {
-        let slot = unsafe { self.slot.as_ref() };
-        let context = unsafe { &*(*slot.context.get()).as_ptr() };
-        read_host_integer(context, register)
-    }
 }
 
 #[derive(Debug)]
 #[repr(C)]
 struct FaultSlot {
+    #[cfg(target_arch = "x86_64")]
     resume: UnsafeCell<ResumeRecord>,
     tid: AtomicI32,
     active: AtomicBool,
     dispatching: AtomicBool,
-    retry_escape: AtomicBool,
     arena_base: AtomicUsize,
     arena_guard_end: AtomicUsize,
     registry: AtomicPtr<NativeFaultRegistry>,
@@ -361,7 +296,14 @@ struct FaultSlot {
     fault_address: AtomicUsize,
     native_pc: AtomicUsize,
     site: AtomicPtr<NativeFaultSite>,
+    retry_pc: AtomicUsize,
+    retry_address: AtomicUsize,
+    retry_count: AtomicUsize,
     context: UnsafeCell<MaybeUninit<libc::ucontext_t>>,
+    #[cfg(target_arch = "aarch64")]
+    signal_frame: AtomicUsize,
+    #[cfg(target_arch = "aarch64")]
+    signal_context: AtomicUsize,
     #[cfg(target_arch = "x86_64")]
     fpstate: UnsafeCell<AlignedFpState>,
 }
@@ -370,16 +312,30 @@ struct FaultSlot {
 #[repr(align(64))]
 struct AlignedFpState([u8; MAX_X86_FPSTATE_SIZE]);
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug)]
 #[repr(C, align(16))]
 struct ResumeRecord {
-    pc: usize,
     rax: usize,
-    r11: usize,
-    rdi: usize,
+    rbx: usize,
+    rcx: usize,
+    rdx: usize,
+    rbp: usize,
+    rsp: usize,
     rsi: usize,
+    rdi: usize,
+    r8: usize,
+    r9: usize,
+    r10: usize,
+    r11: usize,
+    r12: usize,
+    r13: usize,
+    r14: usize,
+    r15: usize,
+    pc: usize,
     rflags: usize,
     fpstate: usize,
+    xstate_features: usize,
 }
 
 unsafe impl Sync for FaultSlot {}
@@ -388,19 +344,32 @@ unsafe impl Send for FaultSlot {}
 impl FaultSlot {
     fn new() -> Self {
         Self {
+            #[cfg(target_arch = "x86_64")]
             resume: UnsafeCell::new(ResumeRecord {
-                pc: 0,
                 rax: 0,
-                r11: 0,
-                rdi: 0,
+                rbx: 0,
+                rcx: 0,
+                rdx: 0,
+                rbp: 0,
+                rsp: 0,
                 rsi: 0,
+                rdi: 0,
+                r8: 0,
+                r9: 0,
+                r10: 0,
+                r11: 0,
+                r12: 0,
+                r13: 0,
+                r14: 0,
+                r15: 0,
+                pc: 0,
                 rflags: 0,
                 fpstate: 0,
+                xstate_features: 0,
             }),
             tid: AtomicI32::new(0),
             active: AtomicBool::new(false),
             dispatching: AtomicBool::new(false),
-            retry_escape: AtomicBool::new(false),
             arena_base: AtomicUsize::new(0),
             arena_guard_end: AtomicUsize::new(0),
             registry: AtomicPtr::new(std::ptr::null_mut()),
@@ -413,7 +382,14 @@ impl FaultSlot {
             fault_address: AtomicUsize::new(0),
             native_pc: AtomicUsize::new(0),
             site: AtomicPtr::new(std::ptr::null_mut()),
+            retry_pc: AtomicUsize::new(0),
+            retry_address: AtomicUsize::new(0),
+            retry_count: AtomicUsize::new(0),
             context: UnsafeCell::new(MaybeUninit::uninit()),
+            #[cfg(target_arch = "aarch64")]
+            signal_frame: AtomicUsize::new(0),
+            #[cfg(target_arch = "aarch64")]
+            signal_context: AtomicUsize::new(0),
             #[cfg(target_arch = "x86_64")]
             fpstate: UnsafeCell::new(AlignedFpState([0; MAX_X86_FPSTATE_SIZE])),
         }
@@ -678,7 +654,7 @@ impl WorkerFaultContext {
             .store(dispatcher as usize, Ordering::Relaxed);
         slot.opaque.store(opaque, Ordering::Relaxed);
         slot.site.store(std::ptr::null_mut(), Ordering::Relaxed);
-        slot.retry_escape.store(false, Ordering::Relaxed);
+        slot.retry_count.store(0, Ordering::Relaxed);
         if slot
             .active
             .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
@@ -735,13 +711,13 @@ impl WorkerFaultContext {
 }
 
 fn invocation_outcome(escaped: u32, slot: &FaultSlot) -> InvocationOutcome {
-    if escaped == 0 {
+    let outcome = if escaped == 0 {
         InvocationOutcome::Returned
-    } else if slot.retry_escape.swap(false, Ordering::AcqRel) {
-        InvocationOutcome::Retry
     } else {
         InvocationOutcome::Escaped
-    }
+    };
+    slot.retry_count.store(0, Ordering::Relaxed);
+    outcome
 }
 
 impl Drop for WorkerFaultContext {
@@ -769,9 +745,6 @@ impl Drop for WorkerFaultContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvocationOutcome {
     Returned,
-    /// The native access was made visible, but this architecture requires the
-    /// caller to re-enter it instead of restoring a partial libc `ucontext`.
-    Retry,
     Escaped,
 }
 
@@ -875,9 +848,12 @@ impl DirectScalarFrontend {
         access: MemoryAccess,
     ) -> Result<MemoryValue, DirectScalarAccessError> {
         let size = validate_scalar_access(access)?;
-        let pointer = self
-            .direct_pointer(address, size)
-            .unwrap_or_else(|| self.poison_page());
+        let Some(pointer) = self.direct_pointer(address, size) else {
+            return memory
+                .read(self.address_space, address, access)
+                .map(|result| result.value)
+                .map_err(DirectScalarAccessError::DataFault);
+        };
         let mut call = StubCall::new(
             pointer,
             0,
@@ -918,6 +894,12 @@ impl DirectScalarFrontend {
             return Err(DirectScalarAccessError::Backend(
                 "direct scalar store value does not match its access width".into(),
             ));
+        }
+        if self.direct_pointer(address, size).is_none() {
+            return memory
+                .complete_direct_write_fault(self.address_space, address, access, value)
+                .map(|_| ())
+                .map_err(DirectScalarAccessError::DataFault);
         }
         let publication = self.store_publication(address, size);
         // A store which did not acquire publication ownership must fault even
@@ -993,49 +975,39 @@ impl DirectScalarFrontend {
                 "direct scalar frontend already has an active call",
             ));
         }
-        let outcome = loop {
-            let outcome = if self.batch_active {
-                let worker = self
-                    .worker
-                    .as_mut()
-                    .expect("an active scalar slice owns a worker");
-                unsafe { worker.invoke_scalar_in_batch(call_pointer.cast(), entry) }
-            } else {
-                let arena = self.arena;
-                let opaque = std::ptr::from_ref(self.dispatcher_context.as_ref())
-                    .cast_mut()
-                    .cast();
-                let worker = self
-                    .worker
-                    .as_mut()
-                    .expect("a prepared scalar call owns a worker");
-                unsafe {
-                    worker.invoke(
-                        arena,
-                        registry.expect("an unbatched scalar call prepared its registry"),
-                        dispatch_scalar_stub_fault,
-                        opaque,
-                        NativeInvocation {
-                            gateway: scalar_stub_gateway,
-                            context: call_pointer.cast(),
-                            entry,
-                        },
-                    )
-                }
-            }?;
-            if outcome != InvocationOutcome::Retry {
-                break Ok(outcome);
+        let outcome = if self.batch_active {
+            let worker = self
+                .worker
+                .as_mut()
+                .expect("an active scalar slice owns a worker");
+            unsafe { worker.invoke_scalar_in_batch(call_pointer.cast(), entry) }
+        } else {
+            let arena = self.arena;
+            let opaque = std::ptr::from_ref(self.dispatcher_context.as_ref())
+                .cast_mut()
+                .cast();
+            let worker = self
+                .worker
+                .as_mut()
+                .expect("a prepared scalar call owns a worker");
+            unsafe {
+                worker.invoke(
+                    arena,
+                    registry.expect("an unbatched scalar call prepared its registry"),
+                    dispatch_scalar_stub_fault,
+                    opaque,
+                    NativeInvocation {
+                        gateway: scalar_stub_gateway,
+                        context: call_pointer.cast(),
+                        entry,
+                    },
+                )
             }
-            if call.kind == DataAccessKind::Write {
-                break Err(FaultRuntimeError::new(
-                    "a direct scalar write unexpectedly requested native retry",
-                ));
-            }
-        };
+        }?;
         self.dispatcher_context
             .current_call
             .store(std::ptr::null_mut(), Ordering::Release);
-        outcome
+        Ok(outcome)
     }
 
     fn worker(&mut self) -> Result<&mut WorkerFaultContext, FaultRuntimeError> {
@@ -1244,7 +1216,7 @@ unsafe extern "C" fn scalar_stub_gateway(context: *mut libc::c_void, entry: usiz
 
 unsafe extern "C" fn dispatch_scalar_stub_fault(
     opaque: *mut libc::c_void,
-    _fault: *mut CapturedFault,
+    fault: *mut CapturedFault,
 ) -> FaultDisposition {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let context = unsafe { &*opaque.cast::<ScalarDispatcherContext>() };
@@ -1253,6 +1225,17 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
             return FaultDisposition::Fatal;
         }
         let call = unsafe { &mut *call };
+        let site = unsafe { &*fault }.site();
+        let expected_kind = match call.kind {
+            DataAccessKind::Read => NativeMemoryAccessKind::Read,
+            DataAccessKind::Write => NativeMemoryAccessKind::Write,
+        };
+        if site.access.kind != expected_kind
+            || site.access.size != call.access.size.bytes() as u8
+            || site.access.element_index != 0
+        {
+            return FaultDisposition::Fatal;
+        }
         let memory = unsafe { &*call.memory };
         match memory.resolve_direct_fault(
             call.address_space,
@@ -1261,30 +1244,25 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
             call.kind,
         ) {
             DirectFaultResolution::Retry => FaultDisposition::Retry,
-            DirectFaultResolution::Checked => {
-                match call.kind {
-                    DataAccessKind::Read => {
-                        match memory.read(call.address_space, call.address, call.access) {
-                            Ok(result) => {
-                                call.output = result.value.bits() as u64;
-                            }
-                            Err(fault) => {
-                                call.data_fault = Some(fault);
-                            }
-                        }
-                    }
-                    DataAccessKind::Write => match memory.complete_direct_write_fault(
-                        call.address_space,
-                        call.address,
-                        call.access,
-                        MemoryValue::from_bits(call.access.size, u128::from(call.value)),
-                    ) {
-                        Ok(_) => {}
-                        Err(fault) => {
-                            call.data_fault = Some(fault);
-                        }
-                    },
+            DirectFaultResolution::CheckedStore => {
+                if call.kind != DataAccessKind::Write {
+                    return FaultDisposition::Fatal;
                 }
+                match memory.complete_direct_write_fault(
+                    call.address_space,
+                    call.address,
+                    call.access,
+                    MemoryValue::from_bits(call.access.size, u128::from(call.value)),
+                ) {
+                    Ok(_) => {}
+                    Err(fault) => {
+                        call.data_fault = Some(fault);
+                    }
+                }
+                FaultDisposition::Escape
+            }
+            DirectFaultResolution::Fault(fault) => {
+                call.data_fault = Some(fault);
                 FaultDisposition::Escape
             }
             DirectFaultResolution::Fatal(detail) => {
@@ -1433,9 +1411,8 @@ fn scalar_stub_region(
                     DataAccessKind::Write => NativeMemoryAccessKind::Write,
                 },
                 size,
+                element_index: 0,
             },
-            completion: NativeFaultCompletion::None,
-            guest_address: None,
         }]),
     }
 }
@@ -1512,6 +1489,8 @@ unsafe extern "C" {
     fn nixe_direct_escape_now(pc: usize, sp: usize) -> !;
     #[cfg(target_arch = "x86_64")]
     fn nixe_direct_retry_trampoline();
+    #[cfg(target_arch = "aarch64")]
+    fn nixe_direct_retry_signal_frame(frame: usize) -> !;
 }
 
 #[unsafe(no_mangle)]
@@ -1527,6 +1506,12 @@ unsafe extern "C" fn nixe_direct_prepare_escape(
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
+    // Lock order for every production dispatcher is deliberately one-way:
+    // immutable captured/site data -> memory mapping snapshot -> backing/page
+    // transition -> mapping revalidation/protection publication. The signal
+    // handler owns none of those locks, and fault-time resolution never tries
+    // to acquire the exclusive execution gate while its caller holds a shared
+    // native-execution lease.
     let slot = unsafe { &*slot };
     let dispatcher = slot.dispatcher.load(Ordering::Acquire);
     if dispatcher == 0 {
@@ -1539,6 +1524,21 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
     let disposition = unsafe { dispatcher(slot.opaque.load(Ordering::Relaxed), &mut fault) };
     match disposition {
         FaultDisposition::Retry => {
+            let native_pc = slot.native_pc.load(Ordering::Relaxed);
+            let fault_address = slot.fault_address.load(Ordering::Relaxed);
+            let repeated = slot.retry_pc.load(Ordering::Relaxed) == native_pc
+                && slot.retry_address.load(Ordering::Relaxed) == fault_address;
+            let attempts = if repeated {
+                slot.retry_count.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                slot.retry_pc.store(native_pc, Ordering::Relaxed);
+                slot.retry_address.store(fault_address, Ordering::Relaxed);
+                slot.retry_count.store(1, Ordering::Relaxed);
+                1
+            };
+            if attempts > MAX_UNCHANGED_RETRIES {
+                fatal_signal(slot.signal.load(Ordering::Relaxed));
+            }
             #[cfg(target_arch = "x86_64")]
             {
                 let context = unsafe { &mut *(*slot.context.get()).as_mut_ptr() };
@@ -1547,18 +1547,20 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
             }
             #[cfg(target_arch = "aarch64")]
             {
-                // glibc's AArch64 setcontext intentionally restores only a
-                // subset of volatile GPR/SIMD state. Escaping lets the caller
-                // re-enter the exact registered access without relying on a
-                // partial context restore.
-                slot.retry_escape.store(true, Ordering::Release);
-                slot.dispatching.store(false, Ordering::Release);
-                unsafe {
-                    nixe_direct_escape_now(
-                        slot.escape_pc.load(Ordering::Acquire),
-                        slot.escape_sp.load(Ordering::Acquire),
-                    )
+                let signal_frame = slot.signal_frame.load(Ordering::Relaxed);
+                let signal_context = slot.signal_context.load(Ordering::Relaxed);
+                if signal_frame == 0 || signal_context == 0 {
+                    fatal_signal(slot.signal.load(Ordering::Relaxed));
                 }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (*slot.context.get()).as_ptr(),
+                        signal_context as *mut libc::ucontext_t,
+                        1,
+                    );
+                }
+                slot.dispatching.store(false, Ordering::Release);
+                unsafe { nixe_direct_retry_signal_frame(signal_frame) }
             }
         }
         FaultDisposition::Escape => {
@@ -1643,10 +1645,18 @@ unsafe extern "C" fn signal_handler(
             size_of::<libc::ucontext_t>(),
         );
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Linux places siginfo first in the AArch64 rt_sigframe and passes a
+        // pointer to its embedded ucontext separately. Retaining both raw
+        // addresses lets the cold dispatcher restore that exact kernel frame.
+        slot.signal_frame.store(info.addr(), Ordering::Relaxed);
+        slot.signal_context.store(context.addr(), Ordering::Relaxed);
+    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let source = (*context).uc_mcontext.fpregs;
-        let Some(fpstate_size) = x86_fpstate_size(source) else {
+        let Some((fpstate_size, xstate_features)) = x86_fpstate(source) else {
             slot.dispatching.store(false, Ordering::Release);
             chain_or_reraise(signal, info, context.cast());
         };
@@ -1658,13 +1668,26 @@ unsafe extern "C" fn signal_handler(
         (*(*slot.context.get()).as_mut_ptr()).uc_mcontext.fpregs =
             (*slot.fpstate.get()).0.as_mut_ptr().cast();
         let resume = &mut *slot.resume.get();
-        resume.pc = (*context).uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
         resume.rax = (*context).uc_mcontext.gregs[libc::REG_RAX as usize] as usize;
-        resume.r11 = (*context).uc_mcontext.gregs[libc::REG_R11 as usize] as usize;
-        resume.rdi = (*context).uc_mcontext.gregs[libc::REG_RDI as usize] as usize;
+        resume.rbx = (*context).uc_mcontext.gregs[libc::REG_RBX as usize] as usize;
+        resume.rcx = (*context).uc_mcontext.gregs[libc::REG_RCX as usize] as usize;
+        resume.rdx = (*context).uc_mcontext.gregs[libc::REG_RDX as usize] as usize;
+        resume.rbp = (*context).uc_mcontext.gregs[libc::REG_RBP as usize] as usize;
+        resume.rsp = (*context).uc_mcontext.gregs[libc::REG_RSP as usize] as usize;
         resume.rsi = (*context).uc_mcontext.gregs[libc::REG_RSI as usize] as usize;
+        resume.rdi = (*context).uc_mcontext.gregs[libc::REG_RDI as usize] as usize;
+        resume.r8 = (*context).uc_mcontext.gregs[libc::REG_R8 as usize] as usize;
+        resume.r9 = (*context).uc_mcontext.gregs[libc::REG_R9 as usize] as usize;
+        resume.r10 = (*context).uc_mcontext.gregs[libc::REG_R10 as usize] as usize;
+        resume.r11 = (*context).uc_mcontext.gregs[libc::REG_R11 as usize] as usize;
+        resume.r12 = (*context).uc_mcontext.gregs[libc::REG_R12 as usize] as usize;
+        resume.r13 = (*context).uc_mcontext.gregs[libc::REG_R13 as usize] as usize;
+        resume.r14 = (*context).uc_mcontext.gregs[libc::REG_R14 as usize] as usize;
+        resume.r15 = (*context).uc_mcontext.gregs[libc::REG_R15 as usize] as usize;
+        resume.pc = (*context).uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
         resume.rflags = (*context).uc_mcontext.gregs[libc::REG_EFL as usize] as usize;
         resume.fpstate = (*slot.fpstate.get()).0.as_ptr().addr();
+        resume.xstate_features = xstate_features;
     }
     slot.signal.store(signal, Ordering::Relaxed);
     slot.fault_address.store(fault_address, Ordering::Relaxed);
@@ -1686,22 +1709,27 @@ const fn accepted_memory_fault_code(signal: i32, code: i32) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn x86_fpstate_size(source: *mut libc::_libc_fpstate) -> Option<usize> {
+unsafe fn x86_fpstate(source: *mut libc::_libc_fpstate) -> Option<(usize, usize)> {
     if source.is_null() {
         return None;
     }
     let bytes = source.cast::<u8>();
     let magic =
         unsafe { std::ptr::read_unaligned(bytes.add(FP_XSTATE_SW_BYTES_OFFSET).cast::<u32>()) };
-    let size = if magic == FP_XSTATE_MAGIC1 {
+    let (size, xstate_features) = if magic == FP_XSTATE_MAGIC1 {
         unsafe {
-            std::ptr::read_unaligned(bytes.add(FP_XSTATE_SW_BYTES_OFFSET + 4).cast::<u32>())
-                as usize
+            (
+                std::ptr::read_unaligned(bytes.add(FP_XSTATE_SW_BYTES_OFFSET + 4).cast::<u32>())
+                    as usize,
+                std::ptr::read_unaligned(bytes.add(FP_XSTATE_SW_BYTES_OFFSET + 8).cast::<u64>())
+                    as usize,
+            )
         }
     } else {
-        size_of::<libc::_libc_fpstate>()
+        (size_of::<libc::_libc_fpstate>(), 0)
     };
-    (size >= size_of::<libc::_libc_fpstate>() && size <= MAX_X86_FPSTATE_SIZE).then_some(size)
+    (size >= size_of::<libc::_libc_fpstate>() && size <= MAX_X86_FPSTATE_SIZE)
+        .then_some((size, xstate_features))
 }
 
 fn current_tid() -> i32 {
@@ -1796,40 +1824,6 @@ unsafe fn redirect_to_landing(
     context.uc_mcontext.gregs[libc::REG_RDI as usize] = slot as *const FaultSlot as libc::greg_t;
 }
 
-#[cfg(target_arch = "x86_64")]
-fn read_host_integer(
-    context: &libc::ucontext_t,
-    register: HostIntegerRegister,
-) -> Result<u64, FaultRuntimeError> {
-    let index = x86_greg_index(register.encoding).ok_or_else(|| {
-        FaultRuntimeError::new("fault metadata names an unsupported x86 integer register")
-    })?;
-    Ok(context.uc_mcontext.gregs[index] as u64)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn x86_greg_index(encoding: u8) -> Option<usize> {
-    Some(match encoding {
-        0 => libc::REG_RAX,
-        1 => libc::REG_RCX,
-        2 => libc::REG_RDX,
-        3 => libc::REG_RBX,
-        4 => libc::REG_RSP,
-        5 => libc::REG_RBP,
-        6 => libc::REG_RSI,
-        7 => libc::REG_RDI,
-        8 => libc::REG_R8,
-        9 => libc::REG_R9,
-        10 => libc::REG_R10,
-        11 => libc::REG_R11,
-        12 => libc::REG_R12,
-        13 => libc::REG_R13,
-        14 => libc::REG_R14,
-        15 => libc::REG_R15,
-        _ => return None,
-    } as usize)
-}
-
 #[cfg(target_arch = "aarch64")]
 fn context_pc(context: &libc::ucontext_t) -> usize {
     context.uc_mcontext.pc as usize
@@ -1853,19 +1847,6 @@ unsafe fn redirect_to_landing(
         dispatch_top & !15,
     );
     context.uc_mcontext.regs[0] = slot as *const FaultSlot as u64;
-}
-
-#[cfg(target_arch = "aarch64")]
-fn read_host_integer(
-    context: &libc::ucontext_t,
-    register: HostIntegerRegister,
-) -> Result<u64, FaultRuntimeError> {
-    if register.encoding >= 31 {
-        return Err(FaultRuntimeError::new(
-            "fault metadata names an unsupported AArch64 integer register",
-        ));
-    }
-    Ok(context.uc_mcontext.regs[register.encoding as usize])
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -1963,18 +1944,59 @@ nixe_direct_escape_now:
     .globl nixe_direct_retry_trampoline
     .type nixe_direct_retry_trampoline,@function
 nixe_direct_retry_trampoline:
-    mov rsi,[rdi+48]
+    mov rsi,[rdi+{fpstate}]
+    mov rax,[rdi+{xstate_features}]
+    test rax,rax
+    jz 1f
+    mov rdx,rax
+    shr rdx,32
+    xrstor64 [rsi]
+    jmp 2f
+1:
     fxrstor64 [rsi]
-    push qword ptr [rdi+40]
+2:
+    push qword ptr [rdi+{rflags}]
     popfq
-    push qword ptr [rdi]
-    mov rax,[rdi+8]
-    mov r11,[rdi+16]
-    mov rsi,[rdi+32]
-    mov rdi,[rdi+24]
+    mov rsp,[rdi+{rsp}]
+    push qword ptr [rdi+{pc}]
+    mov rax,[rdi+{rax}]
+    mov rbx,[rdi+{rbx}]
+    mov rcx,[rdi+{rcx}]
+    mov rdx,[rdi+{rdx}]
+    mov rbp,[rdi+{rbp}]
+    mov rsi,[rdi+{rsi}]
+    mov r8,[rdi+{r8}]
+    mov r9,[rdi+{r9}]
+    mov r10,[rdi+{r10}]
+    mov r11,[rdi+{r11}]
+    mov r12,[rdi+{r12}]
+    mov r13,[rdi+{r13}]
+    mov r14,[rdi+{r14}]
+    mov r15,[rdi+{r15}]
+    mov rdi,[rdi+{rdi}]
     ret
     .size nixe_direct_retry_trampoline,.-nixe_direct_retry_trampoline
-"#
+"#,
+    rax = const offset_of!(ResumeRecord, rax),
+    rbx = const offset_of!(ResumeRecord, rbx),
+    rcx = const offset_of!(ResumeRecord, rcx),
+    rdx = const offset_of!(ResumeRecord, rdx),
+    rbp = const offset_of!(ResumeRecord, rbp),
+    rsp = const offset_of!(ResumeRecord, rsp),
+    rsi = const offset_of!(ResumeRecord, rsi),
+    rdi = const offset_of!(ResumeRecord, rdi),
+    r8 = const offset_of!(ResumeRecord, r8),
+    r9 = const offset_of!(ResumeRecord, r9),
+    r10 = const offset_of!(ResumeRecord, r10),
+    r11 = const offset_of!(ResumeRecord, r11),
+    r12 = const offset_of!(ResumeRecord, r12),
+    r13 = const offset_of!(ResumeRecord, r13),
+    r14 = const offset_of!(ResumeRecord, r14),
+    r15 = const offset_of!(ResumeRecord, r15),
+    pc = const offset_of!(ResumeRecord, pc),
+    rflags = const offset_of!(ResumeRecord, rflags),
+    fpstate = const offset_of!(ResumeRecord, fpstate),
+    xstate_features = const offset_of!(ResumeRecord, xstate_features),
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -2043,6 +2065,283 @@ nixe_direct_stub_write_\name\()_end:
 "#
 );
 
+#[cfg(all(test, target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .text
+    .globl nixe_x86_retry_probe
+    .type nixe_x86_retry_probe,@function
+nixe_x86_retry_probe:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx,rdi
+    mov qword ptr [rbx+8],0
+    mov rbp,0x2122232425262728
+    mov r12,0x3132333435363738
+    mov r13,0x4142434445464748
+    mov r14,0x5152535455565758
+    mov r15,0x6162636465666768
+    mov rcx,0x1112131415161718
+    mov rdx,0x7172737475767778
+    mov rsi,0x8182838485868788
+    mov r8,0x9192939495969798
+    mov r9,0xa1a2a3a4a5a6a7a8
+    mov r10,0xb1b2b3b4b5b6b7b8
+    mov r11,0xc1c2c3c4c5c6c7c8
+    vpcmpeqd ymm0,ymm0,ymm0
+    cmp rbx,rbx
+    stc
+    mov rax,[rbx]
+    .globl nixe_x86_retry_probe_fault
+nixe_x86_retry_probe_fault:
+    mov al,byte ptr [rax]
+    pushfq
+    pop rax
+    and eax,0x41
+    cmp eax,0x41
+    jne 9f
+    mov rax,0x1112131415161718
+    cmp rcx,rax
+    jne 9f
+    mov rax,0x7172737475767778
+    cmp rdx,rax
+    jne 9f
+    mov rax,0x8182838485868788
+    cmp rsi,rax
+    jne 9f
+    cmp rdi,rbx
+    jne 9f
+    mov rax,0x9192939495969798
+    cmp r8,rax
+    jne 9f
+    mov rax,0xa1a2a3a4a5a6a7a8
+    cmp r9,rax
+    jne 9f
+    mov rax,0xb1b2b3b4b5b6b7b8
+    cmp r10,rax
+    jne 9f
+    mov rax,0xc1c2c3c4c5c6c7c8
+    cmp r11,rax
+    jne 9f
+    mov rax,0x2122232425262728
+    cmp rbp,rax
+    jne 9f
+    mov rax,0x3132333435363738
+    cmp r12,rax
+    jne 9f
+    mov rax,0x4142434445464748
+    cmp r13,rax
+    jne 9f
+    mov rax,0x5152535455565758
+    cmp r14,rax
+    jne 9f
+    mov rax,0x6162636465666768
+    cmp r15,rax
+    jne 9f
+    vpmovmskb eax,ymm0
+    cmp eax,-1
+    jne 9f
+    mov qword ptr [rbx+8],1
+9:
+    vzeroupper
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+    .globl nixe_x86_retry_probe_end
+nixe_x86_retry_probe_end:
+    .size nixe_x86_retry_probe,.-nixe_x86_retry_probe
+
+    .globl nixe_x86_retry_store_probe
+    .type nixe_x86_retry_store_probe,@function
+nixe_x86_retry_store_probe:
+    mov rax,[rdi]
+    mov rcx,1
+    .globl nixe_x86_retry_store_probe_fault
+nixe_x86_retry_store_probe_fault:
+    lock xadd qword ptr [rax],rcx
+    ret
+    .globl nixe_x86_retry_store_probe_end
+nixe_x86_retry_store_probe_end:
+    .size nixe_x86_retry_store_probe,.-nixe_x86_retry_store_probe
+"#
+);
+
+#[cfg(all(test, target_arch = "aarch64"))]
+core::arch::global_asm!(
+    r#"
+    .text
+    .globl nixe_aarch64_retry_probe
+    .type nixe_aarch64_retry_probe,%function
+nixe_aarch64_retry_probe:
+    stp x29,x30,[sp,#-16]!
+    stp x19,x20,[sp,#-16]!
+    stp x21,x22,[sp,#-16]!
+    stp x23,x24,[sp,#-16]!
+    stp x25,x26,[sp,#-16]!
+    stp x27,x28,[sp,#-16]!
+    stp q8,q9,[sp,#-32]!
+    stp q10,q11,[sp,#-32]!
+    stp q12,q13,[sp,#-32]!
+    stp q14,q15,[sp,#-32]!
+    mov x19,x0
+    mrs x0,fpcr
+    mrs x1,fpsr
+    stp x0,x1,[sp,#-16]!
+    ldr x20,[x19]
+    str xzr,[x19,#8]
+    mov x1,#1
+    mov x2,#2
+    mov x3,#3
+    mov x4,#4
+    mov x5,#5
+    mov x6,#6
+    mov x7,#7
+    mov x8,#8
+    mov x9,#9
+    mov x10,#10
+    mov x11,#11
+    mov x12,#12
+    mov x13,#13
+    mov x14,#14
+    mov x15,#15
+    mov x16,#16
+    mov x17,#17
+    mov x18,#18
+    mov x21,#21
+    mov x22,#22
+    mov x23,#23
+    mov x24,#24
+    mov x25,#25
+    mov x26,#26
+    mov x27,#27
+    mov x28,#28
+    movi v0.16b,#0x5a
+    movi v8.16b,#0x87
+    movi v31.16b,#0xa5
+    mov x0,#0x400000
+    msr fpcr,x0
+    mov x0,#0x81
+    msr fpsr,x0
+    cmp xzr,xzr
+    .globl nixe_aarch64_retry_probe_fault
+nixe_aarch64_retry_probe_fault:
+    ldrb w0,[x20]
+    mrs x0,nzcv
+    lsr x0,x0,#28
+    cmp x0,#6
+    b.ne 9f
+    cmp x1,#1
+    b.ne 9f
+    cmp x2,#2
+    b.ne 9f
+    cmp x3,#3
+    b.ne 9f
+    cmp x4,#4
+    b.ne 9f
+    cmp x5,#5
+    b.ne 9f
+    cmp x6,#6
+    b.ne 9f
+    cmp x7,#7
+    b.ne 9f
+    cmp x8,#8
+    b.ne 9f
+    cmp x9,#9
+    b.ne 9f
+    cmp x10,#10
+    b.ne 9f
+    cmp x11,#11
+    b.ne 9f
+    cmp x12,#12
+    b.ne 9f
+    cmp x13,#13
+    b.ne 9f
+    cmp x14,#14
+    b.ne 9f
+    cmp x15,#15
+    b.ne 9f
+    cmp x16,#16
+    b.ne 9f
+    cmp x17,#17
+    b.ne 9f
+    cmp x18,#18
+    b.ne 9f
+    cmp x21,#21
+    b.ne 9f
+    cmp x22,#22
+    b.ne 9f
+    cmp x23,#23
+    b.ne 9f
+    cmp x24,#24
+    b.ne 9f
+    cmp x25,#25
+    b.ne 9f
+    cmp x26,#26
+    b.ne 9f
+    cmp x27,#27
+    b.ne 9f
+    cmp x28,#28
+    b.ne 9f
+    umov w0,v0.b[0]
+    cmp w0,#0x5a
+    b.ne 9f
+    umov w0,v8.b[15]
+    cmp w0,#0x87
+    b.ne 9f
+    umov w0,v31.b[7]
+    cmp w0,#0xa5
+    b.ne 9f
+    mrs x0,fpcr
+    mov x1,#0x400000
+    cmp x0,x1
+    b.ne 9f
+    mrs x0,fpsr
+    cmp x0,#0x81
+    b.ne 9f
+    mov x0,#1
+    str x0,[x19,#8]
+9:
+    ldp x0,x1,[sp],#16
+    msr fpcr,x0
+    msr fpsr,x1
+    ldp q14,q15,[sp],#32
+    ldp q12,q13,[sp],#32
+    ldp q10,q11,[sp],#32
+    ldp q8,q9,[sp],#32
+    ldp x27,x28,[sp],#16
+    ldp x25,x26,[sp],#16
+    ldp x23,x24,[sp],#16
+    ldp x21,x22,[sp],#16
+    ldp x19,x20,[sp],#16
+    ldp x29,x30,[sp],#16
+    ret
+    .globl nixe_aarch64_retry_probe_end
+nixe_aarch64_retry_probe_end:
+    .size nixe_aarch64_retry_probe,.-nixe_aarch64_retry_probe
+
+    .globl nixe_aarch64_retry_store_probe
+    .type nixe_aarch64_retry_store_probe,%function
+nixe_aarch64_retry_store_probe:
+    ldr x1,[x0]
+    mov x2,#0x1357
+    .globl nixe_aarch64_retry_store_probe_fault
+nixe_aarch64_retry_store_probe_fault:
+    str x2,[x1]
+    ret
+    .globl nixe_aarch64_retry_store_probe_end
+nixe_aarch64_retry_store_probe_end:
+    .size nixe_aarch64_retry_store_probe,.-nixe_aarch64_retry_store_probe
+"#
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,14 +2353,71 @@ mod tests {
     use nixe_cpu::memory::{ExecutionMemory, MemoryPermissions};
     use nixe_memory::{
         CanonicalBackingPage, CanonicalBackingStore, CanonicalRangeTranslator, ContentGeneration,
-        DirectArena, DirectBackendPolicy, DirectMapRequest, DirectProtectRequest, DirectProtection,
-        GuestPhysicalPageId,
+        CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
+        DeviceVisibilityRequest, DirectArena, DirectBackendPolicy, DirectMapRequest,
+        DirectProtectRequest, DirectProtection, GuestPhysicalPageId, NonCpuDeviceId,
+        VisibilityCoordinator, VisibilityCoordinatorError, VisibilityState,
     };
+
+    struct DeviceWriteback {
+        bytes: Box<[u8]>,
+    }
+
+    impl VisibilityCoordinator for DeviceWriteback {
+        fn make_device_visible(
+            &self,
+            _request: DeviceVisibilityRequest,
+            _canonical_bytes: &[u8],
+        ) -> Result<(), VisibilityCoordinatorError> {
+            Ok(())
+        }
+
+        fn make_cpu_visible(
+            &self,
+            _request: CpuVisibilityRequest,
+        ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+            Ok(self.bytes.clone())
+        }
+    }
 
     #[repr(C)]
     struct SyntheticContext {
         address: *const u8,
         observed: u8,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[repr(C)]
+    struct X86RetryContext {
+        address: *const u8,
+        preserved: u64,
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[repr(C)]
+    struct Aarch64RetryContext {
+        address: *const u8,
+        preserved: u64,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe extern "C" {
+        fn nixe_x86_retry_probe(context: *mut libc::c_void);
+        static nixe_x86_retry_probe_fault: u8;
+        static nixe_x86_retry_probe_end: u8;
+        fn nixe_x86_retry_store_probe(context: *mut libc::c_void);
+        static nixe_x86_retry_store_probe_fault: u8;
+        static nixe_x86_retry_store_probe_end: u8;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe extern "C" {
+        fn nixe_aarch64_retry_probe(context: *mut libc::c_void);
+        static nixe_aarch64_retry_probe_fault: u8;
+        static nixe_aarch64_retry_probe_end: u8;
+        fn nixe_aarch64_retry_store_probe(context: *mut libc::c_void);
+        static nixe_aarch64_retry_store_probe_fault: u8;
+        static nixe_aarch64_retry_store_probe_end: u8;
     }
 
     #[inline(never)]
@@ -2117,11 +2473,55 @@ mod tests {
         FaultDisposition::Retry
     }
 
+    unsafe extern "C" fn retry_write(
+        opaque: *mut libc::c_void,
+        _fault: *mut CapturedFault,
+    ) -> FaultDisposition {
+        let arena = unsafe { &*opaque.cast::<DirectArena>() };
+        arena
+            .protect_ranges(&[DirectProtectRequest {
+                guest_address: 0x1000,
+                size: 4096,
+                protection: DirectProtection::ReadWrite,
+            }])
+            .unwrap();
+        FaultDisposition::Retry
+    }
+
+    struct ConcurrentRetry {
+        arena: Arc<DirectArena>,
+        faults: Barrier,
+    }
+
+    unsafe extern "C" fn retry_concurrently(
+        opaque: *mut libc::c_void,
+        _fault: *mut CapturedFault,
+    ) -> FaultDisposition {
+        let retry = unsafe { &*opaque.cast::<ConcurrentRetry>() };
+        retry.faults.wait();
+        retry
+            .arena
+            .protect_ranges(&[DirectProtectRequest {
+                guest_address: 0x1000,
+                size: 4096,
+                protection: DirectProtection::Read,
+            }])
+            .unwrap();
+        FaultDisposition::Retry
+    }
+
     unsafe extern "C" fn escape(
         _opaque: *mut libc::c_void,
         _fault: *mut CapturedFault,
     ) -> FaultDisposition {
         FaultDisposition::Escape
+    }
+
+    unsafe extern "C" fn retry_without_progress(
+        _opaque: *mut libc::c_void,
+        _fault: *mut CapturedFault,
+    ) -> FaultDisposition {
+        FaultDisposition::Retry
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2191,9 +2591,8 @@ mod tests {
                 guest_pc: GuestVirtualAddress::new(0x8000),
                 kind: NativeMemoryAccessKind::Read,
                 size: 1,
+                element_index: 0,
             },
-            completion: NativeFaultCompletion::None,
-            guest_address: None,
         };
         let registry = NativeFaultRegistry::new(vec![NativeFaultRegion {
             native_start: start,
@@ -2213,27 +2612,268 @@ mod tests {
             observed: 0,
         };
         let mut worker = WorkerFaultContext::register().unwrap();
-        let outcome = loop {
-            let outcome = unsafe {
-                worker.invoke(
-                    view,
-                    &registry,
-                    retry,
-                    std::ptr::from_ref(&arena).cast_mut().cast(),
-                    NativeInvocation {
-                        gateway,
-                        context: std::ptr::from_mut(&mut context).cast(),
-                        entry: faulting_read as *const () as usize,
-                    },
-                )
-            }
-            .unwrap();
-            if outcome != InvocationOutcome::Retry {
-                break outcome;
-            }
-        };
+        let outcome = unsafe {
+            worker.invoke(
+                view,
+                &registry,
+                retry,
+                std::ptr::from_ref(&arena).cast_mut().cast(),
+                NativeInvocation {
+                    gateway,
+                    context: std::ptr::from_mut(&mut context).cast(),
+                    entry: faulting_read as *const () as usize,
+                },
+            )
+        }
+        .unwrap();
         assert_eq!(outcome, InvocationOutcome::Returned);
         assert_eq!(context.observed, 0x5a);
+    }
+
+    #[test]
+    fn simultaneous_workers_retry_their_native_load_after_one_page_transition() {
+        let (arena, registry) = fixture();
+        let arena = Arc::new(arena);
+        let view = arena.view();
+        let retry = Arc::new(ConcurrentRetry {
+            arena: Arc::clone(&arena),
+            faults: Barrier::new(3),
+        });
+        let workers = (0..2)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let retry = Arc::clone(&retry);
+                std::thread::spawn(move || {
+                    let mut context = SyntheticContext {
+                        address: (view.base + 0x1000) as *const u8,
+                        observed: 0,
+                    };
+                    let mut worker = WorkerFaultContext::register().unwrap();
+                    let outcome = unsafe {
+                        worker.invoke(
+                            view,
+                            &registry,
+                            retry_concurrently,
+                            Arc::as_ptr(&retry).cast_mut().cast(),
+                            NativeInvocation {
+                                gateway,
+                                context: std::ptr::from_mut(&mut context).cast(),
+                                entry: faulting_read as *const () as usize,
+                            },
+                        )
+                    }
+                    .unwrap();
+                    (outcome, context.observed)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        retry.faults.wait();
+        for worker in workers {
+            let (outcome, observed) = worker.join().unwrap();
+            assert_eq!(outcome, InvocationOutcome::Returned);
+            assert_eq!(observed, 0x5a);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_retry_restores_gprs_flags_and_avx_state() {
+        if !std::arch::is_x86_feature_detected!("avx") {
+            return;
+        }
+        let (arena, _) = fixture();
+        let view = arena.view();
+        let start = nixe_x86_retry_probe as *const () as usize;
+        let registry = Arc::new(
+            NativeFaultRegistry::new(vec![NativeFaultRegion {
+                native_start: start,
+                native_end: std::ptr::addr_of!(nixe_x86_retry_probe_end).addr(),
+                sites: Arc::from([NativeFaultSite {
+                    native_start: std::ptr::addr_of!(nixe_x86_retry_probe_fault).addr(),
+                    native_end: std::ptr::addr_of!(nixe_x86_retry_probe_fault).addr() + 1,
+                    access: NativeMemoryAccess {
+                        address_space: AddressSpaceId::new(1),
+                        guest_pc: GuestVirtualAddress::new(0x8000),
+                        kind: NativeMemoryAccessKind::Read,
+                        size: 1,
+                        element_index: 0,
+                    },
+                }]),
+            }])
+            .unwrap(),
+        );
+        let mut context = X86RetryContext {
+            address: (view.base + 0x1000) as *const u8,
+            preserved: 0,
+        };
+        let mut worker = WorkerFaultContext::register().unwrap();
+        let outcome = unsafe {
+            worker.invoke(
+                view,
+                &registry,
+                retry,
+                std::ptr::from_ref(&arena).cast_mut().cast(),
+                NativeInvocation {
+                    gateway,
+                    context: std::ptr::from_mut(&mut context).cast(),
+                    entry: start,
+                },
+            )
+        }
+        .unwrap();
+
+        assert_eq!(outcome, InvocationOutcome::Returned);
+        assert_eq!(context.preserved, 1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_retry_executes_the_faulting_store_once() {
+        let (arena, _) = fixture();
+        let view = arena.view();
+        let start = nixe_x86_retry_store_probe as *const () as usize;
+        let registry = Arc::new(
+            NativeFaultRegistry::new(vec![NativeFaultRegion {
+                native_start: start,
+                native_end: std::ptr::addr_of!(nixe_x86_retry_store_probe_end).addr(),
+                sites: Arc::from([NativeFaultSite {
+                    native_start: std::ptr::addr_of!(nixe_x86_retry_store_probe_fault).addr(),
+                    native_end: std::ptr::addr_of!(nixe_x86_retry_store_probe_fault).addr() + 1,
+                    access: NativeMemoryAccess {
+                        address_space: AddressSpaceId::new(1),
+                        guest_pc: GuestVirtualAddress::new(0x8000),
+                        kind: NativeMemoryAccessKind::Write,
+                        size: 8,
+                        element_index: 0,
+                    },
+                }]),
+            }])
+            .unwrap(),
+        );
+        let address = view.base + 0x1000;
+        let mut context = X86RetryContext {
+            address: address as *const u8,
+            preserved: 0,
+        };
+        let mut worker = WorkerFaultContext::register().unwrap();
+        let outcome = unsafe {
+            worker.invoke(
+                view,
+                &registry,
+                retry_write,
+                std::ptr::from_ref(&arena).cast_mut().cast(),
+                NativeInvocation {
+                    gateway,
+                    context: std::ptr::from_mut(&mut context).cast(),
+                    entry: start,
+                },
+            )
+        }
+        .unwrap();
+
+        assert_eq!(outcome, InvocationOutcome::Returned);
+        assert_eq!(
+            unsafe { (address as *const u64).read_volatile() },
+            u64::from_le_bytes([0x5a; 8]) + 1,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_retry_restores_gprs_nzcv_fp_and_simd_state() {
+        let (arena, _) = fixture();
+        let view = arena.view();
+        let start = nixe_aarch64_retry_probe as *const () as usize;
+        let registry = Arc::new(
+            NativeFaultRegistry::new(vec![NativeFaultRegion {
+                native_start: start,
+                native_end: std::ptr::addr_of!(nixe_aarch64_retry_probe_end).addr(),
+                sites: Arc::from([NativeFaultSite {
+                    native_start: std::ptr::addr_of!(nixe_aarch64_retry_probe_fault).addr(),
+                    native_end: std::ptr::addr_of!(nixe_aarch64_retry_probe_fault).addr() + 4,
+                    access: NativeMemoryAccess {
+                        address_space: AddressSpaceId::new(1),
+                        guest_pc: GuestVirtualAddress::new(0x8000),
+                        kind: NativeMemoryAccessKind::Read,
+                        size: 1,
+                        element_index: 0,
+                    },
+                }]),
+            }])
+            .unwrap(),
+        );
+        let mut context = Aarch64RetryContext {
+            address: (view.base + 0x1000) as *const u8,
+            preserved: 0,
+        };
+        let mut worker = WorkerFaultContext::register().unwrap();
+        let outcome = unsafe {
+            worker.invoke(
+                view,
+                &registry,
+                retry,
+                std::ptr::from_ref(&arena).cast_mut().cast(),
+                NativeInvocation {
+                    gateway,
+                    context: std::ptr::from_mut(&mut context).cast(),
+                    entry: start,
+                },
+            )
+        }
+        .unwrap();
+
+        assert_eq!(outcome, InvocationOutcome::Returned);
+        assert_eq!(context.preserved, 1);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_retry_executes_the_faulting_store_in_place() {
+        let (arena, _) = fixture();
+        let view = arena.view();
+        let start = nixe_aarch64_retry_store_probe as *const () as usize;
+        let registry = Arc::new(
+            NativeFaultRegistry::new(vec![NativeFaultRegion {
+                native_start: start,
+                native_end: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_end).addr(),
+                sites: Arc::from([NativeFaultSite {
+                    native_start: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_fault).addr(),
+                    native_end: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_fault).addr() + 4,
+                    access: NativeMemoryAccess {
+                        address_space: AddressSpaceId::new(1),
+                        guest_pc: GuestVirtualAddress::new(0x8000),
+                        kind: NativeMemoryAccessKind::Write,
+                        size: 8,
+                        element_index: 0,
+                    },
+                }]),
+            }])
+            .unwrap(),
+        );
+        let address = view.base + 0x1000;
+        let mut context = Aarch64RetryContext {
+            address: address as *const u8,
+            preserved: 0,
+        };
+        let mut worker = WorkerFaultContext::register().unwrap();
+        let outcome = unsafe {
+            worker.invoke(
+                view,
+                &registry,
+                retry_write,
+                std::ptr::from_ref(&arena).cast_mut().cast(),
+                NativeInvocation {
+                    gateway,
+                    context: std::ptr::from_mut(&mut context).cast(),
+                    entry: start,
+                },
+            )
+        }
+        .unwrap();
+
+        assert_eq!(outcome, InvocationOutcome::Returned);
+        assert_eq!(unsafe { (address as *const u64).read_volatile() }, 0x1357);
     }
 
     #[test]
@@ -2385,6 +3025,67 @@ mod tests {
     }
 
     #[test]
+    fn scalar_frontend_retries_the_faulting_stub_after_gpu_writeback() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(1);
+        let address = GuestVirtualAddress::new(0x1000);
+        let page = GuestPhysicalPageId::new(1);
+        assert!(memory.add_ram_page(page));
+        assert!(memory.map_page(space, address, page, MemoryPermissions::READ_WRITE));
+        memory
+            .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
+            .unwrap();
+        let range = memory
+            .translate_canonical_range(
+                space,
+                address,
+                DIRECT_PAGE_SIZE as u64,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        let mut bytes = vec![0; DIRECT_PAGE_SIZE];
+        bytes[9] = 0xa5;
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(DeviceWriteback {
+            bytes: bytes.into_boxed_slice(),
+        });
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(4),
+            DeviceVisibilityPoint::new(11),
+            DeviceVisibilityPoint::new(12),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        range
+            .publish_device_write(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        assert!(matches!(
+            range.segments()[0].visibility_state(),
+            VisibilityState::GpuNewer { .. }
+        ));
+
+        let mut frontend = unsafe {
+            DirectScalarFrontend::new(memory.direct_address_space_view(space).unwrap(), space)
+        }
+        .unwrap();
+        let value = frontend
+            .read(
+                &memory,
+                GuestVirtualAddress::new(0x8000),
+                GuestVirtualAddress::new(address.get() + 9),
+                MemoryAccess::normal(MemoryAccessSize::Byte),
+            )
+            .unwrap();
+
+        assert_eq!(value, MemoryValue::U8(0xa5));
+        assert_eq!(
+            range.segments()[0].visibility_state(),
+            VisibilityState::Clean
+        );
+    }
+
+    #[test]
     fn store_publication_revalidates_armed_after_acquiring_the_page_sequence() {
         struct Controls {
             sequence: AtomicU64,
@@ -2467,9 +3168,8 @@ mod tests {
                 guest_pc: GuestVirtualAddress::new(0x8000),
                 kind: NativeMemoryAccessKind::Read,
                 size: 1,
+                element_index: 0,
             },
-            completion: NativeFaultCompletion::None,
-            guest_address: None,
         }
     }
 
@@ -2530,10 +3230,10 @@ mod tests {
         } else {
             default_registry
         };
-        let dispatcher = if case == "nested" {
-            nested_fault
-        } else {
-            escape
+        let dispatcher = match case.as_str() {
+            "nested" => nested_fault,
+            "retry_livelock" => retry_without_progress,
+            _ => escape,
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let _ = unsafe {
@@ -2559,6 +3259,7 @@ mod tests {
             "outside_address",
             "outside_pc",
             "nested",
+            "retry_livelock",
             "alternate_stack_guard",
             "unrelated_sigbus",
             "chain",
@@ -2730,7 +3431,18 @@ nixe_direct_escape_now:
     mov sp,x1
     br x0
     .size nixe_direct_escape_now,.-nixe_direct_escape_now
+
+    .globl nixe_direct_retry_signal_frame
+    .type nixe_direct_retry_signal_frame,%function
+nixe_direct_retry_signal_frame:
+    mov sp,x0
+    mov x8,#{sys_rt_sigreturn}
+    svc #0
+    brk #0
+    .size nixe_direct_retry_signal_frame,.-nixe_direct_retry_signal_frame
 "#
+    ,
+    sys_rt_sigreturn = const libc::SYS_rt_sigreturn,
 );
 
 #[cfg(target_arch = "aarch64")]

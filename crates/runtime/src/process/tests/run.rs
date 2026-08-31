@@ -10,7 +10,7 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
     assert_eq!(report.progress, 1);
     assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
     assert!(report.stop.exception_dispatch_request().is_none());
-    let context = &report.context;
+    let context = report.context.as_ref().unwrap();
     assert_eq!(context.pc.get(), entry + 0x80);
     assert!(report.to_string().contains("flags=N0Z0C0V0"));
     let state = process.main_thread().state();
@@ -258,7 +258,7 @@ fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
         report.stop,
         crate::ExecutionStop::FetchFault { .. }
     ));
-    let context = &report.context;
+    let context = report.context.as_ref().unwrap();
     assert_eq!(context.pc.get(), 0x1000);
     assert!(report.to_string().contains("fetch-fault"));
 }

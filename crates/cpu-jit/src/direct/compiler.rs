@@ -17,9 +17,7 @@ use nixe_cpu::semantics::conditions::Condition;
 use nixe_memory::CpuMemoryBackend;
 use nixe_memory::GuestVirtualAddress;
 
-use nixe_cpu_direct_memory::{
-    HostIntegerRegister, NativeFaultCompletion, NativeMemoryAccess, NativeMemoryAccessKind,
-};
+use nixe_cpu_direct_memory::{NativeMemoryAccess, NativeMemoryAccessKind};
 
 use super::lookup::{
     DIRECT_LOOKUP_MASK, NATIVE_LOOKUP_HEAD_OFFSET, NATIVE_LOOKUP_NODE_ENTRY_OFFSET,
@@ -33,6 +31,7 @@ use super::{
 };
 
 const GENERAL_REGISTER_COUNT: usize = 31;
+const DIRECT_MEMORY_TRAP: TrapCode = TrapCode::unwrap_user(1);
 
 mod a64;
 mod a64_fp_simd;
@@ -57,14 +56,11 @@ pub(super) struct CompiledFaultSite {
     pub(super) native_start: u32,
     pub(super) native_end: u32,
     pub(super) access: NativeMemoryAccess,
-    pub(super) completion: NativeFaultCompletion,
-    pub(super) guest_address: HostIntegerRegister,
 }
 
 struct PendingFaultSite {
     access: NativeMemoryAccess,
-    completion: NativeFaultCompletion,
-    trap_code: TrapCode,
+    source_location: SourceLoc,
 }
 
 struct PendingDirectMetadata {
@@ -142,7 +138,6 @@ impl DirectCompiler {
         let mut flags = settings::builder();
         for (name, value) in [
             ("preserve_frame_pointers", "true"),
-            ("enable_pinned_reg", "true"),
             ("use_colocated_libcalls", "false"),
             ("is_pic", "false"),
             ("opt_level", "speed"),
@@ -665,83 +660,21 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         source: GuestVirtualAddress,
         size: u8,
         kind: NativeMemoryAccessKind,
-        completion: NativeFaultCompletion,
-    ) -> TrapCode {
+        element_index: u8,
+    ) {
         let access = NativeMemoryAccess {
             address_space: self.region.key.address_space,
             guest_pc: source,
             kind,
             size,
+            element_index,
         };
-        let trap_code = u8::try_from(self.fault_sites.len() + 1)
-            .ok()
-            .and_then(TrapCode::user)
-            .expect("direct fault-site capacity was checked before translation");
-        self.builder
-            .set_srcloc(source_location_for_pc(self.region, source));
+        let source_location = direct_fault_source_location(self.fault_sites.len());
+        self.builder.set_srcloc(source_location);
         self.fault_sites.push(PendingFaultSite {
             access,
-            completion,
-            trap_code,
+            source_location,
         });
-        trap_code
-    }
-
-    fn checkpoint_direct_fault_state(&mut self, flags: &LazyFlags) -> Result<(), DirectJitError> {
-        for index in 0..GENERAL_REGISTER_COUNT {
-            if !self.block_dirty_registers[index] {
-                continue;
-            }
-            let value = self.builder.use_var(
-                self.registers[index].expect("a dirty fault checkpoint GPR has an SSA variable"),
-            );
-            self.builder.ins().store(
-                trusted_flags(),
-                value,
-                self.x,
-                i32::try_from(index * size_of::<u64>()).expect("architectural GPR offset fits i32"),
-            );
-        }
-        if self.block_dirty_stack_pointer {
-            let value = self.builder.use_var(
-                self.stack_pointer
-                    .expect("a dirty fault checkpoint SP has an SSA variable"),
-            );
-            self.builder.ins().store(trusted_flags(), value, self.sp, 0);
-        }
-        for index in 0..self.block_dirty_vector_registers.len() {
-            if !self.block_dirty_vector_registers[index] {
-                continue;
-            }
-            let value = self.builder.use_var(
-                self.vector_registers[index]
-                    .expect("a dirty fault checkpoint vector has an SSA variable"),
-            );
-            self.builder.ins().store(
-                trusted_flags(),
-                value,
-                self.vector,
-                i32::try_from(index * size_of::<u128>())
-                    .expect("architectural vector offset fits i32"),
-            );
-        }
-        if self.block_dirty_fpsr {
-            let value = self.builder.use_var(self.fpsr_state);
-            self.builder
-                .ins()
-                .store(trusted_flags(), value, self.fpsr, 0);
-        }
-        if flags.dirty() {
-            let packed = self.packed_flags(flags);
-            self.builder
-                .ins()
-                .store(trusted_flags(), packed, self.nzcv, 0);
-        }
-        self.block_dirty_registers.fill(false);
-        self.block_dirty_stack_pointer = false;
-        self.block_dirty_vector_registers.fill(false);
-        self.block_dirty_fpsr = false;
-        Ok(())
     }
 
     fn translate_block(&mut self, block_index: usize) -> Result<(), DirectJitError> {
@@ -2718,40 +2651,58 @@ fn source_location_for_pc(region: &NativeRegion, pc: GuestVirtualAddress) -> Sou
     )
 }
 
+fn direct_fault_source_location(index: usize) -> SourceLoc {
+    let index = u32::try_from(index).expect("direct fault-site identity space exhausted");
+    SourceLoc::new(
+        u32::MAX
+            .checked_sub(index)
+            .and_then(|value| value.checked_sub(1))
+            .expect("direct fault-site identity space exhausted"),
+    )
+}
+
 fn compile_fault_sites(
     compiled: &cranelift_codegen::CompiledCode,
     pending_sites: &[PendingFaultSite],
 ) -> Result<Vec<CompiledFaultSite>, DirectJitError> {
+    let pending_by_source: HashMap<_, _> = pending_sites
+        .iter()
+        .map(|pending| (pending.source_location, pending))
+        .collect();
+    if pending_by_source.len() != pending_sites.len() {
+        return Err(DirectJitError::internal(
+            "direct fault-site source locations are not unique",
+        ));
+    }
+    let source_ranges = compiled.buffer.get_srclocs_sorted();
     let mut output = Vec::new();
-    for pending in pending_sites {
-        let traps: Vec<_> = compiled
-            .buffer
-            .traps()
-            .iter()
-            .filter(|trap| trap.code == pending.trap_code)
-            .collect();
-        if traps.is_empty() {
-            // Region discovery can retain a guest block which Cranelift later
-            // proves unreachable. No native access exists in that case and
-            // therefore no fault interval is required. Reachable direct loads
-            // carry a trapping user code, so Cranelift may not delete them as
-            // dead value computations.
-            continue;
+    for trap in compiled
+        .buffer
+        .traps()
+        .iter()
+        .filter(|trap| trap.code == DIRECT_MEMORY_TRAP)
+    {
+        let source_index = source_ranges
+            .partition_point(|range| range.start <= trap.offset)
+            .checked_sub(1)
+            .ok_or_else(|| {
+                DirectJitError::internal("direct memory trap has no source-location range")
+            })?;
+        let source = &source_ranges[source_index];
+        if trap.offset >= source.end {
+            return Err(DirectJitError::internal(
+                "direct memory trap falls outside its source-location range",
+            ));
         }
-        // Cranelift may duplicate one faultable CLIF operation while lowering
-        // control flow. Every native trap carrying this access's private
-        // source location is an exact machine-code realization of the same
-        // guest operation and therefore needs identical immutable metadata.
-        output.extend(traps.into_iter().map(|trap| {
-            let native_start = trap.offset;
-            CompiledFaultSite {
-                native_start,
-                native_end: native_start.saturating_add(1),
-                access: pending.access,
-                completion: pending.completion,
-                guest_address: pinned_guest_address_location(),
-            }
-        }));
+        let pending = pending_by_source.get(&source.loc).ok_or_else(|| {
+            DirectJitError::internal("direct memory trap has no pending fault site")
+        })?;
+        let native_start = trap.offset;
+        output.push(CompiledFaultSite {
+            native_start,
+            native_end: native_start.saturating_add(1),
+            access: pending.access,
+        });
     }
     output.sort_unstable_by_key(|site| site.native_start);
     if output
@@ -2763,16 +2714,6 @@ fn compile_fault_sites(
         ));
     }
     Ok(output)
-}
-
-#[cfg(target_arch = "x86_64")]
-const fn pinned_guest_address_location() -> HostIntegerRegister {
-    HostIntegerRegister { encoding: 15 }
-}
-
-#[cfg(target_arch = "aarch64")]
-const fn pinned_guest_address_location() -> HostIntegerRegister {
-    HostIntegerRegister { encoding: 21 }
 }
 
 fn unsupported_instruction(

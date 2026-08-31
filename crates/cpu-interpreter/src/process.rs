@@ -327,7 +327,7 @@ impl InterpreterThread {
         ExecutionReport {
             progress,
             stop,
-            context: state.register_context(),
+            context: Some(state.register_context()),
         }
     }
 }

@@ -73,7 +73,7 @@ impl Library {
                     let package_started = Instant::now();
                     let discovered = TitleCatalog::load_package_with_key_set(&path, &mut keys)
                         .map_err(|error| error.to_string())?;
-                    log::debug!(
+                    log::trace!(
                         "package {} catalogued in {:?}",
                         path.display(),
                         package_started.elapsed()
