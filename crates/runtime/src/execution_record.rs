@@ -35,7 +35,7 @@ pub enum ExecutionObservation {
     Completion {
         sequence: u64,
         lease: Lease,
-        instructions_executed: u64,
+        progress: u64,
         stop: RecordedStop,
         context: Option<Box<RegisterContext>>,
     },

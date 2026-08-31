@@ -425,7 +425,7 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
 
     loop {
         let report = process.run_slice(512).unwrap();
-        executed += report.instructions_executed;
+        executed += report.progress;
         assert!(
             executed <= 100_000,
             "libnx startup exceeded its acceptance bound"

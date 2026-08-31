@@ -311,7 +311,7 @@ impl RuntimeCoordinator {
             record.push(crate::ExecutionObservation::Completion {
                 sequence,
                 lease,
-                instructions_executed: report.instructions_executed,
+                progress: report.progress,
                 stop: recorded_stop(&report.stop),
                 context: record
                     .retains_architectural_context()

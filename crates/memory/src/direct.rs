@@ -160,9 +160,6 @@ impl DirectAddressSpaceView {
 pub struct DirectStoreControl {
     pub write_sequence_address: usize,
     pub generation_address: usize,
-    pub content_epoch_address: usize,
-    pub cpu_write_epoch_address: usize,
-    pub cpu_writes_active_address: usize,
     pub write_armed_address: usize,
 }
 

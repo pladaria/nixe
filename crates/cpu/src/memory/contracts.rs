@@ -2,10 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 
-use nixe_memory::{
-    AddressSpaceId, ContentGeneration, ContentMutationEpoch, GuestPhysicalPageId,
-    GuestVirtualAddress, MappingGeneration,
-};
+use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration};
 
 use crate::error::InstructionFetchFault;
 use crate::memory::ExecutionMemoryLease;
@@ -77,13 +74,11 @@ pub struct SyntheticMappingInfo {
     pub purpose: MemoryMappingPurpose,
 }
 
-/// Identity and content version of one physical code page.
+/// Physical and virtual-mapping identity of one fetched code page.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CodePageDependency {
     /// Stable physical-page identity, shared by virtual aliases.
     pub page: GuestPhysicalPageId,
-    /// Monotonic content generation observed during the fetch.
-    pub generation: ContentGeneration,
     /// Generation of the virtual mapping used for the fetch.
     pub mapping_generation: MappingGeneration,
 }
@@ -192,12 +187,6 @@ impl CodePageSpan {
 /// operation. Returned integers are canonical bit patterns; implementations
 /// must decode guest bytes explicitly and never rely on host endianness.
 pub trait InstructionMemory: Send + Sync {
-    /// Returns the latest completely published canonical-content mutation.
-    ///
-    /// This address-space-wide value is an O(1) rejection filter. Exact code
-    /// dependencies remain authoritative when a consumer observes a change.
-    fn content_mutation_epoch(&self) -> ContentMutationEpoch;
-
     /// Returns the virtual code-page extent containing `address`.
     ///
     /// Translators use this only as a block-cut boundary. Fetch methods remain
@@ -987,7 +976,9 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         access: MemoryAccess,
     ) -> Result<(DataReadResult, crate::exclusive::ExclusiveReservation), DataAccessFault>;
 
-    /// Conditionally stores if the supplied physical reservation is current.
+    /// Conditionally stores through a local physical reservation when the
+    /// current value still equals the value observed by the exclusive load.
+    /// A change-and-restore ABA sequence is intentionally accepted.
     fn store_exclusive(
         &self,
         address_space: AddressSpaceId,

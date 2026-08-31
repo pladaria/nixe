@@ -35,16 +35,11 @@ pub(super) fn allocate_cpu_process_id() -> Option<CpuProcessId> {
 
 pub use nixe_cpu::execution::{CpuExit as ExecutionStop, ExecutionReport};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum CpuBackendConfig {
     Interpreter,
+    #[default]
     Jit,
-}
-
-impl Default for CpuBackendConfig {
-    fn default() -> Self {
-        Self::Jit
-    }
 }
 
 enum CpuBackend {
@@ -73,7 +68,7 @@ impl CpuBackend {
             Self::Jit(process) => process.bind_memory(binding).map_err(|error| CpuFault {
                 backend: "jit",
                 kind: CpuFaultKind::Unavailable,
-                instructions_executed: 0,
+                progress: 0,
                 message: error.to_string().into_boxed_str(),
                 context: Box::new(ThreadCpuState::default().register_context()),
             }),
@@ -583,7 +578,7 @@ fn runtime_fault(
     CpuFault {
         backend: "runtime",
         kind,
-        instructions_executed: 0,
+        progress: 0,
         message: message.into(),
         context: Box::new(ThreadCpuState::default().register_context()),
     }

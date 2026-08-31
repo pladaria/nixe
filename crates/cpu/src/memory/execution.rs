@@ -17,12 +17,12 @@ use nixe_memory::{
     AddressSpaceId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
     CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, CanonicalWriteBatch,
-    ContentGeneration, ContentMutationEpoch, CpuMemoryBackend, DirectAddressSpaceView, DirectArena,
-    DirectBackendPolicy, DirectMapRequest, DirectProtectRequest, DirectProtection, ExecutionGate,
-    ExecutionSharedGuard, ExecutionTransitionGuard, GuestPhysicalPageId, GuestVirtualAddress,
-    HostMappedBacking, MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor,
-    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
-    MemoryInvalidationOrigin, MemoryInvalidationSource,
+    ContentGeneration, CpuMemoryBackend, DirectAddressSpaceView, DirectArena, DirectBackendPolicy,
+    DirectMapRequest, DirectProtectRequest, DirectProtection, ExecutionGate, ExecutionSharedGuard,
+    ExecutionTransitionGuard, GuestPhysicalPageId, GuestVirtualAddress, HostMappedBacking,
+    MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError,
+    MemoryInvalidationKind, MemoryInvalidationLog, MemoryInvalidationOrigin,
+    MemoryInvalidationSource,
 };
 
 use crate::{
@@ -257,7 +257,6 @@ impl ExecutionMemoryInner {
         let previous = self.mappings.insert(address_space, virtual_page, mapping);
         debug_assert!(previous.is_none());
         self.register_mapping(address_space, virtual_page, mapping);
-        self.update_direct_store_eligibility(mapping.physical_slot);
     }
 
     fn remove_mapping_unpublished(
@@ -267,7 +266,6 @@ impl ExecutionMemoryInner {
     ) -> Option<ExecutionMapping> {
         let mapping = self.mappings.remove(address_space, virtual_page)?;
         self.unregister_mapping(address_space, virtual_page, mapping);
-        self.update_direct_store_eligibility(mapping.physical_slot);
         Some(mapping)
     }
 
@@ -297,7 +295,6 @@ impl ExecutionMemoryInner {
             was_executable_content,
             is_executable_content,
         );
-        self.update_direct_store_eligibility(physical_slot);
     }
 
     fn set_mapping_permissions(
@@ -326,7 +323,6 @@ impl ExecutionMemoryInner {
             was_executable_content,
             is_executable_content,
         );
-        self.update_direct_store_eligibility(physical_slot);
     }
 
     fn set_mapping_properties(
@@ -357,7 +353,6 @@ impl ExecutionMemoryInner {
             was_executable_content,
             is_executable_content,
         );
-        self.update_direct_store_eligibility(physical_slot);
     }
 
     fn executable_content_page(&self, physical_slot: usize) -> Option<GuestPhysicalPageId> {
@@ -368,24 +363,6 @@ impl ExecutionMemoryInner {
         match &slot.page {
             ExecutionPhysicalPage::Ram(page) => Some(page.identity().page()),
             ExecutionPhysicalPage::Mmio(_) => None,
-        }
-    }
-
-    fn update_direct_store_eligibility(&mut self, physical_slot: usize) {
-        let Some(slot) = self
-            .physical_slots
-            .get(physical_slot)
-            .and_then(Option::as_ref)
-        else {
-            return;
-        };
-        let ExecutionPhysicalPage::Ram(backing) = &slot.page else {
-            return;
-        };
-        let backing = backing.clone();
-        let allowed = slot.executable_content_mapping_count == 0;
-        if let Err(error) = backing.set_direct_stores_allowed(allowed) {
-            self.direct_failure = Some(error.to_string().into_boxed_str());
         }
     }
 
@@ -1263,18 +1240,6 @@ impl ExecutionMemory {
         self.lock_inner().slots_by_id.len()
     }
 
-    /// Returns the store-wide epoch of the latest published content mutation.
-    ///
-    /// This is an O(1) change detector. Per-page content generations remain
-    /// authoritative for code dependencies, aliases, and retained ranges.
-    #[must_use]
-    pub fn content_mutation_epoch(&self) -> ContentMutationEpoch {
-        self.backing_store.as_ref().map_or(
-            ContentMutationEpoch::INITIAL,
-            CanonicalBackingStore::content_epoch,
-        )
-    }
-
     /// Creates a zero-filled RAM page for explicit runtime or differential setup.
     pub fn add_ram_page(&mut self, page: GuestPhysicalPageId) -> bool {
         let Some(store) = self.backing_store.clone() else {
@@ -1608,8 +1573,8 @@ impl ExecutionMemory {
             ));
         }
         let mut bytes = [0; N];
-        let generation = backing
-            .read_with_generation(page_offset(address), &mut bytes)
+        backing
+            .read(page_offset(address), &mut bytes)
             .map_err(|reason| {
                 InstructionFetchFault::new(
                     address_space,
@@ -1621,7 +1586,6 @@ impl ExecutionMemory {
             bytes,
             CodeDependencies::one(CodePageDependency {
                 page: mapping.physical_page,
-                generation,
                 mapping_generation: mapping.mapping_generation,
             }),
         ))
@@ -1774,10 +1738,6 @@ impl MemoryInvalidationSource for ExecutionMemory {
 }
 
 impl InstructionMemory for ExecutionMemory {
-    fn content_mutation_epoch(&self) -> ContentMutationEpoch {
-        ExecutionMemory::content_mutation_epoch(self)
-    }
-
     fn code_page_span(
         &self,
         address_space: AddressSpaceId,
@@ -1897,13 +1857,11 @@ impl CanonicalRangeTranslator for ExecutionMemory {
             };
             let offset = page_offset(cursor) as u64;
             let count = remaining.min(page_size - offset);
-            let generation = backing.content_generation();
             let segment = CanonicalBackingSegment::new(
                 backing,
                 offset,
                 count,
                 mapping.permissions,
-                generation,
                 mapping.mapping_generation,
             )
             .map_err(|_| {
@@ -2013,14 +1971,10 @@ impl CpuMemory for ExecutionMemory {
         {
             return DirectFaultResolution::Checked;
         }
-        // Registered write-fault sites are emitted only by the deliberate
-        // checked-store block. Native tracked stores have no recoverable site:
-        // a host fault there is a backend invariant violation and remains
-        // fatal/unattributed. Always completing a registered write through
-        // the canonical owner also closes the concurrent first-writer race:
-        // a second already-captured store cannot bypass per-store generation
-        // publication merely because the first writer armed the page before
-        // its dispatcher ran.
+        // Until Phase 4 gives raw stores an attributable native fault site,
+        // the scalar/JIT pre-cutover path deliberately faults through a poison
+        // address and must complete the store canonically rather than retrying
+        // that poison access.
         if kind == DataAccessKind::Write {
             return DirectFaultResolution::Checked;
         }
@@ -2036,6 +1990,7 @@ impl CpuMemory for ExecutionMemory {
         let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot) else {
             return DirectFaultResolution::Checked;
         };
+        let backing = backing.clone();
         let visibility_before = backing.visibility_state();
         if let Err(error) = backing.prepare_cpu_access() {
             return match error {
@@ -2044,7 +1999,7 @@ impl CpuMemory for ExecutionMemory {
             };
         }
         let expected = matches!(
-            effective_direct_protection(maximum_direct_protection(mapping), backing),
+            effective_direct_protection(maximum_direct_protection(mapping), &backing),
             DirectProtection::Read | DirectProtection::ReadWrite
         );
         if expected {
@@ -2098,9 +2053,6 @@ impl CpuMemory for ExecutionMemory {
             };
             if !mapping.permissions.contains(MemoryPermissions::WRITE)
                 || mapping.attributes.contains(MemoryAttributes::UNCACHED)
-                || inner
-                    .executable_content_page(mapping.physical_slot)
-                    .is_some()
                 || !matches!(
                     inner.backends.get(&address_space),
                     Some(ExecutionBackendBinding::LinuxDirect { .. })
@@ -2114,7 +2066,7 @@ impl CpuMemory for ExecutionMemory {
             }
         };
         if let Some(backing) = backing
-            && let Err(error) = backing.arm_direct_writes()
+            && let Err(error) = backing.resolve_direct_write_fault()
         {
             self.lock_inner().direct_failure = Some(error.to_string().into_boxed_str());
         }
@@ -2650,7 +2602,7 @@ impl CpuMemory for ExecutionMemory {
         };
         let byte_count = access.size.bytes();
         let mut bytes = [0_u8; 16];
-        let generation = backing
+        let _generation = backing
             .read_with_generation(page_offset(address), &mut bytes[..byte_count])
             .map_err(|reason| {
                 DataAccessFault::new(
@@ -2661,16 +2613,17 @@ impl CpuMemory for ExecutionMemory {
                 )
             })?;
         super::contracts::complete_ordered_read(access.ordering);
+        let value = MemoryValue::from_le_slice(access.size, &bytes[..byte_count]);
         Ok((
             DataReadResult {
-                value: MemoryValue::from_le_slice(access.size, &bytes[..byte_count]),
+                value,
                 region: MemoryRegionKind::Ram,
             },
             ExclusiveReservation {
                 page: mapping.physical_page,
                 byte_offset: page_offset(address) as u16,
                 access_size: access.size.bytes() as u8,
-                generation,
+                expected: value,
             },
         ))
     }
@@ -2707,8 +2660,7 @@ impl CpuMemory for ExecutionMemory {
                 DataAccessFaultReason::MixedRegions,
             ));
         }
-        let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(resolved.first.physical_slot)
-        else {
+        let Some(ExecutionPhysicalPage::Ram(_)) = inner.page(resolved.first.physical_slot) else {
             return Err(DataAccessFault::new(
                 address_space,
                 address,
@@ -2716,19 +2668,10 @@ impl CpuMemory for ExecutionMemory {
                 DataAccessFaultReason::MixedRegions,
             ));
         };
-        backing.prepare_cpu_access().map_err(|reason| {
-            DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::HostBacking(reason.to_string().into()),
-            )
-        })?;
-        let generation = backing.content_generation();
         let matches = reservation.page == resolved.first.physical_page
             && usize::from(reservation.byte_offset) == page_offset(address)
-            && usize::from(reservation.access_size) == access.size.bytes()
-            && reservation.generation == generation;
+            && usize::from(reservation.access_size) == access.size.bytes();
+        drop(inner);
         if !matches {
             return Ok((
                 DataWriteResult {
@@ -2737,55 +2680,24 @@ impl CpuMemory for ExecutionMemory {
                 false,
             ));
         }
-        backing.prepare_write().map_err(|reason| {
-            DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::HostBacking(reason.to_string().into()),
-            )
-        })?;
-        let next_generation = generation.next().map_err(|_| {
-            DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::ContentGenerationExhausted,
-            )
-        })?;
-        let mut bytes = [0_u8; 16];
-        let byte_count = access.size.bytes();
-        value.copy_le_bytes(&mut bytes[..byte_count]);
-        super::contracts::begin_ordered_write(access.ordering);
-        match backing.write_preflighted(
-            page_offset(address),
-            &bytes[..byte_count],
-            generation,
-            next_generation,
-        ) {
-            Ok(()) => {}
-            Err(CanonicalPageError::StaleGeneration { .. }) => {
-                return Ok((
-                    DataWriteResult {
-                        region: MemoryRegionKind::Ram,
-                    },
-                    false,
-                ));
-            }
-            Err(reason) => {
-                return Err(DataAccessFault::new(
-                    address_space,
-                    address,
-                    DataAccessKind::Write,
-                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
-                ));
-            }
-        }
+        let atomic_access = MemoryAccess::new(
+            access.size,
+            MemoryAlignment::Natural,
+            access.ordering,
+            MemoryAccessClass::Atomic,
+        );
+        let result = self.atomic_compare_exchange(
+            address_space,
+            address,
+            atomic_access,
+            reservation.expected,
+            value,
+        )?;
         Ok((
             DataWriteResult {
                 region: MemoryRegionKind::Ram,
             },
-            true,
+            result.stored,
         ))
     }
 }
@@ -3647,21 +3559,15 @@ mod tests {
         };
 
         assert_eq!(retained.size(), 0x1000);
-        assert!(retained.segments()[0].content_is_current());
-        assert_eq!(
-            retained.segments()[0].content_generation(),
-            ContentGeneration::new(2)
-        );
+        let mut observed = [0; 1];
+        retained.read(7, &mut observed).unwrap();
+        assert_eq!(observed, [0x5a]);
     }
 
     #[test]
     fn cpu_read_reconciles_gpu_newer_backing_through_neutral_slow_path() {
         let memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(10);
-        assert_eq!(
-            memory.content_mutation_epoch(),
-            ContentMutationEpoch::INITIAL
-        );
         memory
             .resize_zeroed_mapping(
                 space,
@@ -3697,10 +3603,6 @@ mod tests {
         retained
             .publish_device_write(declaration, Arc::clone(&coordinator))
             .unwrap();
-        assert_eq!(
-            memory.content_mutation_epoch(),
-            ContentMutationEpoch::new(1)
-        );
         assert!(matches!(
             retained.segments()[0].visibility_state(),
             VisibilityState::GpuNewer { .. }
@@ -3714,11 +3616,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.value, MemoryValue::U8(0xa5));
-        assert_eq!(
-            memory.content_mutation_epoch(),
-            ContentMutationEpoch::new(1),
-            "downloading an already-published device write is not a second mutation"
-        );
         assert_eq!(
             retained.segments()[0].visibility_state(),
             VisibilityState::Clean
@@ -3736,10 +3633,6 @@ mod tests {
         retained
             .publish_device_write(second_write, coordinator)
             .unwrap();
-        assert_eq!(
-            memory.content_mutation_epoch(),
-            ContentMutationEpoch::new(2)
-        );
         memory
             .write(
                 space,
@@ -3748,10 +3641,6 @@ mod tests {
                 MemoryValue::U8(0x33),
             )
             .unwrap();
-        assert_eq!(
-            memory.content_mutation_epoch(),
-            ContentMutationEpoch::new(3)
-        );
         assert_eq!(
             retained.segments()[0].visibility_state(),
             VisibilityState::CpuNewer
@@ -3977,10 +3866,10 @@ mod tests {
             physical_page,
             MemoryPermissions::READ_EXECUTE,
         ));
-        assert_eq!(writable_control.load(Ordering::Acquire), 0);
+        assert_ne!(writable_control.load(Ordering::Acquire), 0);
         assert_eq!(
             arena.protection_at(writable.get()),
-            Some(DirectProtection::Read)
+            Some(DirectProtection::ReadWrite)
         );
 
         let physical_slot = memory.inner_mut().slots_by_id[&physical_page];

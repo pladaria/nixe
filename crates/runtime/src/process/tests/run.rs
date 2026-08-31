@@ -7,7 +7,7 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
     let entry = process.entry_module().entry_address();
 
     let report = process.run(1).unwrap();
-    assert_eq!(report.instructions_executed, 1);
+    assert_eq!(report.progress, 1);
     assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
     assert!(report.stop.exception_dispatch_request().is_none());
     let context = &report.context;
@@ -39,21 +39,21 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
         .unwrap();
 
     let first = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-    assert_eq!(first.instructions_executed, 1);
+    assert_eq!(first.progress, 1);
     assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
     let state = process.main_thread().state();
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 1);
     assert_eq!(state.pc(), entry + 4);
 
     let second = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-    assert_eq!(second.instructions_executed, 1);
+    assert_eq!(second.progress, 1);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
     let state = process.main_thread().state();
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 3);
     assert_eq!(state.pc(), entry + 8);
 
     let svc = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-    assert_eq!(svc.instructions_executed, 1);
+    assert_eq!(svc.progress, 1);
     assert!(matches!(
         svc.stop,
         crate::ExecutionStop::SupervisorCall {
@@ -73,7 +73,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
         crate::ExceptionHandlingResult::Resumed
     );
     let resumed = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-    assert_eq!(resumed.instructions_executed, 1);
+    assert_eq!(resumed.progress, 1);
     assert_eq!(resumed.stop, crate::ExecutionStop::BudgetExhausted);
     let state = process.main_thread().state();
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 7);
@@ -103,10 +103,10 @@ fn fixed_virtual_timer_is_stable_across_reference_slices() {
     );
 
     let first = process.run(2).unwrap();
-    assert_eq!(first.instructions_executed, 2);
+    assert_eq!(first.progress, 2);
     assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
     let second = process.run(1).unwrap();
-    assert_eq!(second.instructions_executed, 1);
+    assert_eq!(second.progress, 1);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
 
     let state = process.main_thread().state();
@@ -239,7 +239,7 @@ fn reference_execution_observes_safepoints_before_fetch() {
     process.request_safepoint();
 
     let report = process.run(10).unwrap();
-    assert_eq!(report.instructions_executed, 0);
+    assert_eq!(report.progress, 0);
     assert_eq!(report.stop, crate::ExecutionStop::Safepoint);
     let state = process.main_thread().state();
     assert_eq!(state.pc(), entry);
@@ -253,7 +253,7 @@ fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
     state.set_pc(0x1000);
 
     let report = process.run(1).unwrap();
-    assert_eq!(report.instructions_executed, 0);
+    assert_eq!(report.progress, 0);
     assert!(matches!(
         report.stop,
         crate::ExecutionStop::FetchFault { .. }
@@ -273,7 +273,7 @@ fn reference_execution_rejects_unsupported_and_invalid_code() {
         panic!("unsupported instruction must be a CPU fault");
     };
     assert_eq!(fault.kind, nixe_cpu::execution::CpuFaultKind::Unavailable);
-    assert_eq!(fault.instructions_executed, 0);
+    assert_eq!(fault.progress, 0);
     assert!(fault.message.contains("unsupported instruction"));
 
     let mut unallocated = reference_process_builder().build(&plan).unwrap();
@@ -285,7 +285,7 @@ fn reference_execution_rejects_unsupported_and_invalid_code() {
         fault.kind,
         nixe_cpu::execution::CpuFaultKind::InvalidRequest
     );
-    assert_eq!(fault.instructions_executed, 0);
+    assert_eq!(fault.progress, 0);
     assert!(fault.message.contains("invalid instruction stream"));
 }
 

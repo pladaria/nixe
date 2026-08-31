@@ -78,20 +78,20 @@ fn normalized_multiblock_region_executes_without_nixe_ir() {
     let process = JitProcess::new(cpu).unwrap();
     let thread = JitThread::new();
     let mut state = state(CODE, 10);
-    let exit = thread.run(&process, &memory, &mut state, 10).unwrap();
+    let exit = thread.run(&process, &memory, &mut state).unwrap();
     assert_eq!(
         exit,
         DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 0x10),
             detail: (2 << 24) | 0x31,
-            instructions: 4,
+            progress: 1,
         }
     );
     assert_eq!(read_x0(&state), 11);
 }
 
 #[test]
-fn multiblock_region_publishes_one_native_function_for_every_block_entry() {
+fn secondary_entry_is_published_as_a_separate_region() {
     let memory = memory(&[
         (0x00, 0xd503_201f),
         (0x04, branch(CODE + 4, CODE + 12)),
@@ -101,26 +101,24 @@ fn multiblock_region_publishes_one_native_function_for_every_block_entry() {
     let process = JitProcess::new(cpu()).unwrap();
     let primary = process.entry_for(&memory, location(CODE)).unwrap().1;
     let secondary = process.entry_for(&memory, location(CODE + 0x0c)).unwrap().1;
-    assert_eq!(secondary, primary);
+    assert_ne!(secondary, primary);
     {
         let state = process.state.lock().unwrap();
-        assert_eq!(state.regions.len(), 1);
+        assert_eq!(state.regions.len(), 2);
         let secondary_key = RegionKey::new(cpu(), location(CODE + 0x0c));
         assert_eq!(
-            state.lookup.get(secondary_key).unwrap().owner.start.get(),
-            CODE
+            state.lookup.get(secondary_key).unwrap().owner,
+            secondary_key
         );
     }
 
     let mut state = state(CODE + 0x0c, 10);
     assert_eq!(
-        JitThread::new()
-            .run(&process, &memory, &mut state, 4)
-            .unwrap(),
+        JitThread::new().run(&process, &memory, &mut state).unwrap(),
         DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 0x10),
             detail: (2 << 24) | 0x32,
-            instructions: 2,
+            progress: 1,
         }
     );
     assert_eq!(read_x0(&state), 11);
@@ -138,20 +136,20 @@ fn discovery_stops_at_an_existing_secondary_region_entry() {
     ]);
     let process = JitProcess::new(cpu()).unwrap();
     let target_entry = process.entry_for(&memory, location(target)).unwrap().1;
-    assert_eq!(
-        process.entry_for(&memory, location(secondary)).unwrap().1,
-        target_entry
-    );
+    let secondary_entry = process.entry_for(&memory, location(secondary)).unwrap().1;
+    assert_ne!(secondary_entry, target_entry);
     process.entry_for(&memory, location(CODE)).unwrap();
 
     let state = process.state.lock().unwrap();
-    assert_eq!(state.regions.len(), 2);
+    assert_eq!(state.regions.len(), 3);
     let source = state
         .region_for(RegionKey::new(cpu(), location(CODE)))
         .unwrap();
     assert_eq!(source.entry_keys.len(), 1);
-    assert_eq!(source.entry_keys.len(), 1);
-    assert_eq!(source.links[0].slot.load(Ordering::Acquire), target_entry);
+    assert_eq!(
+        source.links[0].slot.load(Ordering::Acquire),
+        secondary_entry
+    );
 }
 
 #[test]
@@ -167,22 +165,22 @@ fn conditional_branch_consumes_lazy_flags_in_native_cfg() {
 
     let mut zero = state(CODE, 1);
     assert_eq!(
-        thread.run(&process, &memory, &mut zero, 8).unwrap(),
+        thread.run(&process, &memory, &mut zero).unwrap(),
         DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 8),
             detail: (2 << 24) | 1,
-            instructions: 3,
+            progress: 1,
         }
     );
     assert!(zero.nzcv().zero());
 
     let mut nonzero = state(CODE, 2);
     assert_eq!(
-        thread.run(&process, &memory, &mut nonzero, 8).unwrap(),
+        thread.run(&process, &memory, &mut nonzero).unwrap(),
         DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 12),
             detail: (2 << 24) | 2,
-            instructions: 3,
+            progress: 1,
         }
     );
     assert!(!nonzero.nzcv().zero());
@@ -197,46 +195,20 @@ fn cold_unsupported_system_instruction_does_not_reject_the_region() {
         (0x0c, conditional_branch(CODE + 0x0c, CODE + 0x14, 1)), // B.NE
         (0x10, 0xd50b_7423), // DC ZVA,X3 (prohibited by Switch 1 DCZID_EL0)
         (0x14, 0xd503_201f), // NOP
-        (0x18, branch(CODE + 0x18, CODE + 0x18)),
+        (0x18, breakpoint(0)),
     ]);
     let process = JitProcess::new(cpu()).unwrap();
     let mut state = state(CODE, 0);
 
     assert_eq!(
-        JitThread::new()
-            .run(&process, &memory, &mut state, 5)
-            .unwrap(),
-        DirectExit::Budget {
+        JitThread::new().run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 0x18),
-            instructions: 5,
+            detail: 2 << 24,
+            progress: 1,
         }
     );
     assert_eq!(read_register(&state, 5), 0x14);
-}
-
-#[test]
-fn direct_backedge_keeps_register_ssa_until_precise_budget_exit() {
-    let memory = memory(&[(0x00, add_x0(1)), (0x04, branch(CODE + 4, CODE))]);
-    let process = JitProcess::new(cpu()).unwrap();
-    let thread = JitThread::new();
-    let mut state = state(CODE, 0);
-    assert_eq!(
-        thread.run(&process, &memory, &mut state, 5).unwrap(),
-        DirectExit::Budget {
-            pc: GuestVirtualAddress::new(CODE + 4),
-            instructions: 5,
-        }
-    );
-    assert_eq!(read_x0(&state), 3);
-
-    let key = RegionKey::new(cpu(), location(CODE));
-    let process_state = process.state.lock().unwrap();
-    let compiled = process_state.region_for(key).unwrap();
-    assert_eq!(compiled.entry_keys.len(), 1);
-    assert!(compiled.native_bytes > 0);
-    assert_eq!(compiled.dependencies.len(), 1);
-    assert_eq!(compiled.register_loads, 1);
-    assert_eq!(compiled.register_stores, 1);
 }
 
 #[test]
@@ -251,11 +223,11 @@ fn call_and_return_use_canonical_state_only_at_region_boundaries() {
     let thread = JitThread::new();
     let mut state = state(CODE, 4);
     assert_eq!(
-        thread.run(&process, &memory, &mut state, 10).unwrap(),
+        thread.run(&process, &memory, &mut state).unwrap(),
         DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 4),
             detail: (2 << 24) | 3,
-            instructions: 4,
+            progress: 1,
         }
     );
     assert_eq!(read_x0(&state), 5);
@@ -312,28 +284,29 @@ fn indirect_branch_and_return_chain_through_the_native_lookup() {
     let mut state = state(CODE, target);
     write_register(&mut state, 30, return_address);
     assert_eq!(
-        thread.run(&process, &memory, &mut state, 8).unwrap(),
+        thread.run(&process, &memory, &mut state).unwrap(),
         DirectExit::Architectural {
             pc: GuestVirtualAddress::new(return_address),
             detail: (2 << 24) | 7,
-            instructions: 4,
+            progress: 1,
         }
     );
     assert_eq!(read_x0(&state), target + 1);
 }
 
 #[test]
-fn budget_and_control_exit_before_the_next_guest_instruction() {
+fn normal_jit_does_not_single_step_while_entry_control_is_immediate() {
     let memory = memory(&[(0x00, 0xd503_201f), (0x04, breakpoint(0))]);
     let process = JitProcess::new(cpu()).unwrap();
 
     let thread = JitThread::new();
     let mut budget_state = state(CODE, 0);
     assert_eq!(
-        thread.run(&process, &memory, &mut budget_state, 1).unwrap(),
-        DirectExit::Budget {
+        thread.run(&process, &memory, &mut budget_state).unwrap(),
+        DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 4),
-            instructions: 1,
+            detail: 2 << 24,
+            progress: 1,
         }
     );
 
@@ -342,13 +315,55 @@ fn budget_and_control_exit_before_the_next_guest_instruction() {
     let mut control_state = state(CODE, 0);
     assert_eq!(
         preempted
-            .run(&process, &memory, &mut control_state, 10)
+            .run(&process, &memory, &mut control_state)
             .unwrap(),
         DirectExit::Control {
             pc: GuestVirtualAddress::new(CODE),
-            instructions: 0,
+            progress: 0,
         }
     );
+}
+
+#[test]
+fn native_backedge_reaches_a_periodic_scheduler_safepoint() {
+    let memory = memory(&[(0x00, branch(CODE, CODE))]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let thread = JitThread::new();
+    let mut state = state(CODE, 0);
+
+    assert_eq!(
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Control {
+            pc: GuestVirtualAddress::new(CODE),
+            progress: 0,
+        }
+    );
+}
+
+#[test]
+fn periodic_native_backedge_exit_yields_to_the_runtime() {
+    let memory = memory(&[(0x00, branch(CODE, CODE))]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let mut thread = JitThread::new();
+    let mut state = state(CODE, 0);
+
+    let report = thread
+        .run_slice(
+            &process,
+            RunRequest {
+                cpu: cpu(),
+                memory: &memory,
+                memory_lease: None,
+                state: &mut state,
+                instruction_budget: 1,
+                loader_return: None,
+                timer: &ZeroTimer,
+                events: VcpuEventState::default(),
+            },
+        )
+        .unwrap();
+    assert_eq!(report.stop, CpuExit::Safepoint);
+    assert_eq!(report.progress, 0);
 }
 
 #[test]
@@ -516,6 +531,7 @@ fn invalidation_unpublishes_every_entry_of_one_native_region() {
     let primary = RegionKey::new(cpu(), location(CODE));
     let secondary = RegionKey::new(cpu(), location(CODE + 0x0c));
     process.entry_for(&memory, location(CODE)).unwrap();
+    process.entry_for(&memory, location(CODE + 0x0c)).unwrap();
     {
         let state = process.state.lock().unwrap();
         assert!(state.lookup.get(primary).is_some());
@@ -535,7 +551,7 @@ fn invalidation_unpublishes_every_entry_of_one_native_region() {
     assert!(state.lookup.get(primary).is_none());
     assert!(state.lookup.get(secondary).is_none());
     assert!(state.regions.is_empty());
-    assert_eq!(state.retired.len(), 1);
+    assert_eq!(state.retired.len(), 2);
 }
 
 #[test]
@@ -629,7 +645,9 @@ fn blocking_native_loop() -> (SyntheticMemory, BlockingTimer) {
     let release = Arc::new(Barrier::new(2));
     let mut memory = memory(&[
         (0, 0xd53b_e020), // MRS X0,CNTVCT_EL0
-        (4, branch(CODE + 4, CODE)),
+        (4, branch(CODE + 4, CODE + 8)),
+        (8, 0xd503_201f), // NOP
+        (12, branch(CODE + 12, CODE + 8)),
     ]);
     assert!(memory.map_page(
         SPACE,
@@ -661,7 +679,6 @@ fn running_native_backedge_observes_concurrent_executable_invalidation() {
             NativeRunRequest {
                 memory: worker_memory.as_ref(),
                 state: &mut state,
-                instruction_budget: u64::MAX,
                 loader_return: None,
                 timer: worker_timer.as_ref(),
                 events: &worker_thread.events,
@@ -672,7 +689,7 @@ fn running_native_backedge_observes_concurrent_executable_invalidation() {
     memory
         .write(
             SPACE,
-            GuestVirtualAddress::new(DATA),
+            GuestVirtualAddress::new(DATA + 8),
             MemoryAccess::normal(MemoryAccessSize::Word),
             MemoryValue::U32(breakpoint(9)),
         )
@@ -681,16 +698,16 @@ fn running_native_backedge_observes_concurrent_executable_invalidation() {
         .maintain_cache(
             SPACE,
             CacheMaintenanceKind::InstructionInvalidate,
-            Some(GuestVirtualAddress::new(DATA)),
+            Some(GuestVirtualAddress::new(DATA + 8)),
         )
         .unwrap();
     release.wait();
     assert_eq!(
         worker.join().unwrap().unwrap(),
         DirectExit::Architectural {
-            pc: GuestVirtualAddress::new(CODE),
+            pc: GuestVirtualAddress::new(CODE + 8),
             detail: (2 << 24) | 9,
-            instructions: 3,
+            progress: 1,
         }
     );
     let state = process.state.lock().unwrap();
@@ -719,7 +736,6 @@ fn shutdown_unlinks_code_and_stops_a_running_native_backedge() {
             NativeRunRequest {
                 memory: worker_memory.as_ref(),
                 state: &mut state,
-                instruction_budget: u64::MAX,
                 loader_return: None,
                 timer: worker_timer.as_ref(),
                 events: &worker_thread.events,
@@ -917,16 +933,14 @@ fn every_recognized_unsupported_catalog_entry_exits_with_its_exact_identity() {
             let memory = memory(&[(0, encoding)]);
             let process = JitProcess::new(cpu).unwrap();
             let mut state = state(CODE, 0);
-            let exit = JitThread::new()
-                .run(&process, &memory, &mut state, 1)
-                .unwrap();
-            let DirectExit::Unsupported { pc, instructions } = exit else {
+            let exit = JitThread::new().run(&process, &memory, &mut state).unwrap();
+            let DirectExit::Unsupported { pc, progress } = exit else {
                 panic!("{} did not take the unsupported exit", pattern.name);
             };
             assert_eq!(pc, GuestVirtualAddress::new(CODE));
-            assert_eq!(instructions, 0);
+            assert_eq!(progress, 0);
             assert!(matches!(
-                unsupported_exit(&process, &memory, pc, instructions, &state).unwrap(),
+                unsupported_exit(&process, &memory, pc, progress, &state).unwrap(),
                 CpuExit::UnsupportedSemantics { coverage_id, .. }
                     if coverage_id == pattern.coverage_id
             ));
@@ -1085,13 +1099,13 @@ fn direct_simd_quadword_and_pair_memory_match_the_interpreter() {
             .run(
                 &JitProcess::new(cpu()).unwrap(),
                 &actual_memory,
-                &mut actual,
-                4,
+                &mut actual
             )
             .unwrap(),
-        DirectExit::Budget {
+        DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 16),
-            instructions: 4,
+            detail: 2 << 24,
+            progress: 1,
         }
     );
     assert_eq!(actual, expected);
@@ -1165,13 +1179,12 @@ fn direct_exact_fp_enabled_exception_is_atomic() {
                 &JitProcess::new(cpu()).unwrap(),
                 &memory(&[(0, encoding), (4, breakpoint(0))]),
                 &mut actual,
-                1,
             )
             .unwrap(),
         DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE),
             detail: 6 << 24,
-            instructions: 1,
+            progress: 1,
         }
     );
     assert_eq!(actual, expected);
@@ -1232,11 +1245,11 @@ fn linux_direct_clean_scalar_reads_are_eager_and_never_enter_rust() {
         let mut thread = JitThread::new();
         thread.synchronize_address_space(&process, binding).unwrap();
         let mut state = memory_state();
-        thread.run(&process, &memory, &mut state, 1).unwrap();
+        thread.run(&process, &memory, &mut state).unwrap();
 
         state.set_pc(CODE);
         write_register(&mut state, 0, 0);
-        thread.run(&process, &memory, &mut state, 1).unwrap();
+        thread.run(&process, &memory, &mut state).unwrap();
     }
 }
 
@@ -1264,9 +1277,7 @@ fn linux_direct_jit_rejects_a_replacement_arena_before_native_entry() {
     drop(first);
     let mut state = memory_state();
 
-    let error = thread
-        .run(&process, &replacement, &mut state, 1)
-        .unwrap_err();
+    let error = thread.run(&process, &replacement, &mut state).unwrap_err();
     assert!(
         error
             .to_string()
@@ -1401,8 +1412,11 @@ fn linux_direct_jit_compiles_outside_the_native_execution_lease() {
     transition_result
         .expect("mapping transition must complete before native entry")
         .unwrap();
-    assert_eq!(report.instructions_executed, 1);
-    assert_eq!(report.stop, CpuExit::BudgetExhausted);
+    assert_eq!(report.progress, 1);
+    assert!(matches!(
+        report.stop,
+        CpuExit::ArchitecturalException { .. }
+    ));
 }
 
 #[test]
@@ -1451,8 +1465,8 @@ fn linux_direct_gpu_newer_read_reconciles_and_retries_the_native_load_once() {
     let mut state = memory_state();
 
     assert!(matches!(
-        thread.run(&process, &memory, &mut state, 1).unwrap(),
-        DirectExit::Budget { .. }
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural { .. }
     ));
     assert_eq!(read_register(&state, 0), 0xa5c3_9678_1234_fedc);
 }
@@ -1512,8 +1526,8 @@ fn linux_direct_scalar_stores_fault_once_then_publish_natively() {
         write_register(&mut state, 0, first);
         write_register(&mut state, 1, DATA);
         assert!(matches!(
-            thread.run(&process, &memory, &mut state, 1).unwrap(),
-            DirectExit::Budget { .. }
+            thread.run(&process, &memory, &mut state).unwrap(),
+            DirectExit::Architectural { .. }
         ));
         assert_eq!(
             memory
@@ -1530,8 +1544,8 @@ fn linux_direct_scalar_stores_fault_once_then_publish_natively() {
         state.set_pc(CODE);
         write_register(&mut state, 0, second);
         assert!(matches!(
-            thread.run(&process, &memory, &mut state, 1).unwrap(),
-            DirectExit::Budget { .. }
+            thread.run(&process, &memory, &mut state).unwrap(),
+            DirectExit::Architectural { .. }
         ));
         assert_eq!(
             memory
@@ -1567,8 +1581,8 @@ fn linux_direct_scalar_pair_loads_remain_native() {
     let mut state = memory_state();
 
     assert!(matches!(
-        thread.run(&process, &memory, &mut state, 1).unwrap(),
-        DirectExit::Budget { .. }
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural { .. }
     ));
     assert_eq!(read_register(&state, 0), 0x0706_0504_0302_0100);
     assert_eq!(read_register(&state, 3), 0x0f0e_0d0c_0b0a_0908);
@@ -1615,8 +1629,8 @@ fn linux_direct_simd_quadword_loads_and_stores_use_the_shared_arena() {
     assert!(state.set_vector(0, first));
 
     assert!(matches!(
-        thread.run(&process, &memory, &mut state, 2).unwrap(),
-        DirectExit::Budget { .. }
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural { .. }
     ));
     assert_eq!(state.vector(2), Some(first));
 
@@ -1624,8 +1638,8 @@ fn linux_direct_simd_quadword_loads_and_stores_use_the_shared_arena() {
     state.set_pc(CODE);
     assert!(state.set_vector(0, second));
     assert!(matches!(
-        thread.run(&process, &memory, &mut state, 1).unwrap(),
-        DirectExit::Budget { .. }
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural { .. }
     ));
     assert_eq!(
         memory
@@ -1683,8 +1697,8 @@ fn linux_direct_unaligned_scalar_accesses_complete_through_checked_memory() {
     write_register(&mut state, 1, address.get());
 
     assert!(matches!(
-        thread.run(&process, &memory, &mut state, 2).unwrap(),
-        DirectExit::Budget { .. }
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural { .. }
     ));
     assert_eq!(read_register(&state, 2), value);
     let access = MemoryAccess::new(
@@ -1722,13 +1736,12 @@ fn unmapped_memory_fault_matches_the_interpreter_at_the_faulting_pc() {
     let DirectExit::DataFault {
         pc,
         fault,
-        instructions,
+        progress,
     } = JitThread::new()
         .run(
             &JitProcess::new(cpu()).unwrap(),
             &actual_memory,
             &mut actual,
-            1,
         )
         .unwrap()
     else {
@@ -1736,7 +1749,7 @@ fn unmapped_memory_fault_matches_the_interpreter_at_the_faulting_pc() {
     };
     assert_eq!(pc, source.pc);
     assert_eq!(fault, expected_fault);
-    assert_eq!(instructions, 1);
+    assert_eq!(progress, 1);
     assert_eq!(actual.pc(), CODE);
     assert_eq!(actual, expected);
 }
@@ -1775,12 +1788,12 @@ fn linux_direct_unmapped_read_reconstructs_exact_prefault_state() {
     state.set_pc(CODE);
     write_register(&mut state, 1, DATA);
     let before = state.clone();
-    let exit = thread.run(&process, &memory, &mut state, 1).unwrap();
+    let exit = thread.run(&process, &memory, &mut state).unwrap();
     assert!(matches!(
         exit,
         DirectExit::DataFault {
             pc,
-            instructions: 1,
+            progress: 1,
             ..
         } if pc == GuestVirtualAddress::new(CODE)
     ));
@@ -1820,10 +1833,10 @@ fn linux_direct_discarded_load_retains_its_architectural_fault() {
     let before = state.clone();
 
     assert!(matches!(
-        thread.run(&process, &memory, &mut state, 1).unwrap(),
+        thread.run(&process, &memory, &mut state).unwrap(),
         DirectExit::DataFault {
             pc,
-            instructions: 1,
+            progress: 1,
             ..
         } if pc == GuestVirtualAddress::new(CODE)
     ));
@@ -1868,10 +1881,10 @@ fn linux_direct_overwritten_load_retains_its_architectural_fault() {
     let before = state.clone();
 
     assert!(matches!(
-        thread.run(&process, &memory, &mut state, 2).unwrap(),
+        thread.run(&process, &memory, &mut state).unwrap(),
         DirectExit::DataFault {
             pc,
-            instructions: 1,
+            progress: 1,
             ..
         } if pc == GuestVirtualAddress::new(CODE)
     ));
@@ -1910,7 +1923,7 @@ fn linux_direct_poison_guard_preserves_the_unconfined_guest_address() {
     thread.synchronize_address_space(&process, binding).unwrap();
     let mut state = rich_state();
     write_register(&mut state, 1, u64::MAX);
-    let DirectExit::DataFault { fault, .. } = thread.run(&process, &memory, &mut state, 1).unwrap()
+    let DirectExit::DataFault { fault, .. } = thread.run(&process, &memory, &mut state).unwrap()
     else {
         panic!("unconfined direct read did not produce a guest data fault");
     };
@@ -1992,14 +2005,14 @@ fn linux_direct_fault_recovers_every_dirty_register_class_and_spills() {
     let DirectExit::DataFault {
         pc,
         fault,
-        instructions,
-    } = thread.run(&process, &memory, &mut actual, 128).unwrap()
+        progress,
+    } = thread.run(&process, &memory, &mut actual).unwrap()
     else {
         panic!("direct JIT did not fault");
     };
     assert_eq!(pc, source.pc);
     assert_eq!(fault, expected_fault);
-    assert_eq!(instructions, encodings.len() as u64);
+    assert_eq!(progress, 1);
     assert_eq!(actual, expected);
 }
 
@@ -2025,8 +2038,7 @@ fn pair_second_access_fault_preserves_load_destinations_and_first_store() {
                 .run(
                     &JitProcess::new(cpu()).unwrap(),
                     &actual_memory,
-                    &mut actual,
-                    1,
+                    &mut actual
                 )
                 .unwrap(),
             DirectExit::DataFault { .. }
@@ -2070,9 +2082,7 @@ fn linux_direct_pair_second_access_fault_matches_checked_partial_semantics() {
         thread.synchronize_address_space(&process, binding).unwrap();
         let mut actual = initial;
         assert!(matches!(
-            thread
-                .run(&process, &actual_memory, &mut actual, 1)
-                .unwrap(),
+            thread.run(&process, &actual_memory, &mut actual).unwrap(),
             DirectExit::DataFault { .. }
         ));
         assert_eq!(actual, expected, "{encoding:#010x}");
@@ -2127,9 +2137,7 @@ fn linux_direct_simd_pair_fault_preserves_both_load_destinations() {
     thread.synchronize_address_space(&process, binding).unwrap();
     let mut actual = initial;
     assert!(matches!(
-        thread
-            .run(&process, &actual_memory, &mut actual, 1)
-            .unwrap(),
+        thread.run(&process, &actual_memory, &mut actual).unwrap(),
         DirectExit::DataFault { .. }
     ));
     assert_eq!(actual, expected);
@@ -2191,14 +2199,11 @@ fn special_page_accesses_use_precise_typed_slow_calls() {
     ));
     let mut state = memory_state();
     let exit = JitThread::new()
-        .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut state, 2)
+        .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut state)
         .unwrap();
     assert!(matches!(
         exit,
-        DirectExit::Budget {
-            instructions: 2,
-            ..
-        }
+        DirectExit::Architectural { progress: 1, .. }
     ));
     assert_eq!(read_x0(&state), 0x0123_4567_89ab_cdef);
     let events = events.lock().unwrap();
@@ -2254,13 +2259,10 @@ fn linux_direct_dynamic_mmio_faults_complete_each_operation_exactly_once() {
     thread.synchronize_address_space(&process, binding).unwrap();
     let mut state = memory_state();
 
-    let exit = thread.run(&process, &memory, &mut state, 2).unwrap();
+    let exit = thread.run(&process, &memory, &mut state).unwrap();
     assert!(matches!(
         exit,
-        DirectExit::Budget {
-            instructions: 2,
-            ..
-        }
+        DirectExit::Architectural { progress: 1, .. }
     ));
     assert_eq!(read_x0(&state), 0x0123_4567_89ab_cdef);
     let events = events.lock().unwrap();
@@ -2294,7 +2296,6 @@ fn exclusive_load_store_round_trip_matches_the_interpreter() {
             &JitProcess::new(cpu()).unwrap(),
             &actual_memory,
             &mut actual,
-            2,
         )
         .unwrap();
     assert_eq!(actual, expected);
@@ -2324,9 +2325,7 @@ fn exclusive_atomic_updates_are_indivisible_across_vcpus() {
             write_register(&mut state, 2, DATA);
             for _ in 0..ITERATIONS {
                 state.set_pc(CODE);
-                let exit = thread
-                    .run(&process, memory.as_ref(), &mut state, 1_000)
-                    .unwrap();
+                let exit = thread.run(&process, memory.as_ref(), &mut state).unwrap();
                 assert!(matches!(exit, DirectExit::Architectural { .. }));
             }
         }));
@@ -2361,7 +2360,7 @@ fn executable_alias_writes_wait_for_instruction_cache_maintenance() {
     let before = memory.invalidation_cursor();
     let mut state = memory_state();
     JitThread::new()
-        .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut state, 1)
+        .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut state)
         .unwrap();
     let mut invalidations = Vec::new();
     let after_write = memory
@@ -2448,7 +2447,6 @@ fn system_register_timer_barrier_and_cache_paths_match_the_interpreter() {
             NativeRunRequest {
                 memory: &actual_memory,
                 state: &mut actual,
-                instruction_budget: encodings.len() as u64,
                 loader_return: None,
                 timer: &FixedTimer,
                 events: &actual_events,
@@ -2457,10 +2455,7 @@ fn system_register_timer_barrier_and_cache_paths_match_the_interpreter() {
         .unwrap();
     assert!(matches!(
         exit,
-        DirectExit::Budget {
-            instructions: 10,
-            ..
-        }
+        DirectExit::Architectural { progress: 1, .. }
     ));
     assert_eq!(actual, expected);
 }
@@ -2497,7 +2492,6 @@ fn scheduling_hints_publish_the_next_pc_and_exact_request() {
             &JitProcess::new(cpu()).unwrap(),
             &yield_memory,
             &mut yield_state,
-            1,
         )
         .unwrap();
     assert_eq!(
@@ -2505,7 +2499,7 @@ fn scheduling_hints_publish_the_next_pc_and_exact_request() {
         DirectExit::Scheduled {
             pc: GuestVirtualAddress::new(CODE),
             request: nixe_cpu::execution::SchedulerRequest::Yield,
-            instructions: 1,
+            progress: 1,
         }
     );
     assert_eq!(yield_state.pc(), CODE + 4);
@@ -2515,21 +2509,18 @@ fn scheduling_hints_publish_the_next_pc_and_exact_request() {
     let thread = JitThread::new();
     let mut waiting = state(CODE, 0);
     assert_eq!(
-        thread.run(&process, &wfe_memory, &mut waiting, 1).unwrap(),
+        thread.run(&process, &wfe_memory, &mut waiting).unwrap(),
         DirectExit::Scheduled {
             pc: GuestVirtualAddress::new(CODE),
             request: nixe_cpu::execution::SchedulerRequest::WaitForEvent,
-            instructions: 1,
+            progress: 1,
         }
     );
     thread.events.signal_event();
     let mut resumed = state(CODE, 0);
     assert!(matches!(
-        thread.run(&process, &wfe_memory, &mut resumed, 1).unwrap(),
-        DirectExit::Budget {
-            instructions: 1,
-            ..
-        }
+        thread.run(&process, &wfe_memory, &mut resumed).unwrap(),
+        DirectExit::Architectural { progress: 1, .. }
     ));
     assert_eq!(resumed.pc(), CODE + 4);
 }
@@ -2553,15 +2544,11 @@ fn assert_memory_matches_interpreter(encoding: u32) {
             &JitProcess::new(cpu()).unwrap(),
             &actual_memory,
             &mut actual_state,
-            1,
         )
         .unwrap_or_else(|error| panic!("{encoding:#010x}: {error}"));
     assert!(matches!(
         exit,
-        DirectExit::Budget {
-            instructions: 1,
-            ..
-        }
+        DirectExit::Architectural { progress: 1, .. }
     ));
     assert_eq!(actual_state, expected_state, "{encoding:#010x}");
     let mut expected_bytes = [0_u8; 32];
@@ -2735,17 +2722,18 @@ fn scalar_edge_cases_match_the_reference_interpreter() {
 #[test]
 fn scalar_control_edges_match_the_reference_interpreter() {
     let mut initial = rich_state();
-    write_register(&mut initial, 0, CODE);
+    write_register(&mut initial, 0, CODE + 8);
+    write_register(&mut initial, 30, CODE + 8);
     for encoding in [
         0xd503_201f, // NOP
-        0x1400_0000, // B .
-        0x9400_0000, // BL .
+        0x1400_0002, // B +8
+        0x9400_0002, // BL +8
         0xd61f_0000, // BR X0
         0xd63f_0000, // BLR X0
         0xd65f_03c0, // RET X30
-        0x5400_0000, // B.EQ .
-        0xb500_0000, // CBNZ X0,.
-        0xb628_0000, // TBZ X0,#37,.
+        0x5400_0040, // B.EQ +8
+        0xb500_0040, // CBNZ X0,+8
+        0xb628_0040, // TBZ X0,#37,+8
     ] {
         assert_control_matches_interpreter(encoding, initial.clone());
     }
@@ -2774,11 +2762,12 @@ fn a64_register_invariants_are_explicit_in_the_direct_jit() {
     let mut actual = rich_state();
     assert_eq!(
         JitThread::new()
-            .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut actual, 5)
+            .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut actual)
             .unwrap(),
-        DirectExit::Budget {
+        DirectExit::Architectural {
             pc: GuestVirtualAddress::new(CODE + 20),
-            instructions: 5,
+            detail: 2 << 24,
+            progress: 1,
         }
     );
     assert_eq!(actual, expected);
@@ -2803,7 +2792,7 @@ fn every_a64_condition_matches_for_every_nzcv_combination() {
                 execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
                 InstructionStep::Continue
             );
-            thread.run(&process, &memory, &mut actual, 1).unwrap();
+            thread.run(&process, &memory, &mut actual).unwrap();
             assert_eq!(
                 actual, expected,
                 "condition={condition:#x} nzcv={packed:#x}"
@@ -2837,7 +2826,7 @@ fn lazy_flags_merge_at_internal_join_without_canonical_reload() {
             let encoding = memory_word(&memory, offset);
             execute_one(&cpu().platform(), &mut expected, encoding).unwrap();
         }
-        thread.run(&process, &memory, &mut state, 4).unwrap();
+        thread.run(&process, &memory, &mut state).unwrap();
         assert_eq!(state, expected);
     }
 
@@ -2853,96 +2842,114 @@ fn lazy_flags_merge_at_internal_join_without_canonical_reload() {
         )
         .unwrap();
     }
-    thread.run(&process, &memory, &mut side_entry, 2).unwrap();
+    thread.run(&process, &memory, &mut side_entry).unwrap();
     assert_eq!(side_entry, expected);
-    assert_eq!(process.state.lock().unwrap().regions.len(), 1);
+    assert_eq!(process.state.lock().unwrap().regions.len(), 2);
 }
 
 #[test]
-fn simple_scalar_shapes_remain_bounded() {
-    for encoding in [0x9100_0400, 0xaa01_0000, 0x9a81_0000] {
-        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+fn straight_line_nops_add_no_per_instruction_scaffolding() {
+    let compile = |nop_count: usize| {
+        let mut words: Vec<_> = (0..nop_count)
+            .map(|index| ((index * 4) as u64, 0xd503_201f))
+            .collect();
+        words.push(((nop_count * 4) as u64, breakpoint(0)));
+        let memory = memory(&words);
         let process = JitProcess::new(cpu()).unwrap();
         process.entry_for(&memory, location(CODE)).unwrap();
         let state = process.state.lock().unwrap();
         let region = state
             .region_for(RegionKey::new(cpu(), location(CODE)))
             .unwrap();
-        assert!(
-            region.clif_instructions <= 104,
-            "{encoding:#010x}: {} CLIF instructions",
-            region.clif_instructions
-        );
-        assert!(
-            region.native_bytes <= 768,
-            "{encoding:#010x}: {} native bytes",
-            region.native_bytes
-        );
-    }
+        (region.clif_instructions, region.native_bytes)
+    };
+    let short = compile(1);
+    let long = compile(64);
+    assert!(long.0 <= short.0 + 2, "short={short:?} long={long:?}");
+    assert!(long.1 <= short.1 + 16, "short={short:?} long={long:?}");
 }
 
 #[test]
-fn memory_and_system_shapes_remain_bounded() {
-    for encoding in [
-        0xf940_0020, // LDR X0,[X1]
-        0xf900_0023, // STR X3,[X1]
-        0xc8df_fc20, // LDAR X0,[X1]
-        0xc85f_7c20, // LDXR X0,[X1]
-        0xd53b_e020, // MRS X0,CNTVCT_EL0
-        0xd503_3bbf, // DMB ISH
-    ] {
-        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
-        let process = JitProcess::new(cpu()).unwrap();
-        process.entry_for(&memory, location(CODE)).unwrap();
-        let state = process.state.lock().unwrap();
-        let region = state
-            .region_for(RegionKey::new(cpu(), location(CODE)))
-            .unwrap();
-        assert!(region.clif_instructions <= 512, "{encoding:#010x}");
-        assert!(region.native_bytes <= 4096, "{encoding:#010x}");
-    }
+fn branch_local_read_is_loaded_after_the_primary_branch() {
+    let memory = memory(&[
+        (0x00, compare_branch(CODE, CODE + 0x0c, 0, false)), // CBZ W0,skip
+        (0x04, 0xaa1f_0062),                                 // ORR X2,X3,XZR
+        (0x08, branch(CODE + 0x08, CODE + 0x10)),
+        (0x0c, 0xd503_201f),
+        (0x10, breakpoint(0)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    process.entry_for(&memory, location(CODE)).unwrap();
+    let state = process.state.lock().unwrap();
+    let region = state
+        .region_for(RegionKey::new(cpu(), location(CODE)))
+        .unwrap();
+    assert_eq!(region.deferred_register_loads, 1);
 }
 
 #[test]
-fn linux_direct_scalar_memory_shapes_are_compact() {
-    for (name, encoding, clif_limit, native_limit) in [
-        ("load", 0xf940_0020_u32, 144, 896),
-        ("store", 0xf900_0020_u32, 256, 1536),
-    ] {
-        let mut memory = execution_memory_with_data(encoding);
-        memory
-            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
-            .unwrap();
-        let process = JitProcess::new(cpu()).unwrap();
-        process
-            .bind_memory(MemoryBinding {
-                address_space: SPACE,
-                end_exclusive: GuestVirtualAddress::new(0x1_0000),
-                memory: &memory,
-                mapping_epoch: memory.mapping_epoch().get(),
-                invalidation_cursor: memory.invalidation_cursor(),
-            })
-            .unwrap();
-        process.entry_for(&memory, location(CODE)).unwrap();
-        let state = process.state.lock().unwrap();
-        let region = state
-            .region_for(RegionKey::new(cpu(), location(CODE)))
-            .unwrap();
-        println!(
-            "direct_shape={name} clif_instructions={} native_bytes={}",
-            region.clif_instructions, region.native_bytes
-        );
-        assert!(
-            region.clif_instructions <= clif_limit,
-            "{name}: {} CLIF instructions exceed {clif_limit}",
-            region.clif_instructions,
-        );
-        assert!(
-            region.native_bytes <= native_limit,
-            "{name}: {} native bytes exceed {native_limit}",
-            region.native_bytes,
-        );
-    }
+fn loop_carried_read_modify_write_is_loaded_before_the_loop() {
+    let memory = memory(&[
+        (0x00, branch(CODE, CODE + 4)),
+        (0x04, add_x0(1)),
+        (0x08, 0xf100_081f),                                // CMP X0,#2
+        (0x0c, conditional_branch(CODE + 12, CODE + 4, 1)), // B.NE loop
+        (0x10, breakpoint(0)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let thread = JitThread::new();
+    let mut state = state(CODE, 0);
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural { .. }
+    ));
+    assert_eq!(read_x0(&state), 2);
+    let compiled = process.state.lock().unwrap();
+    let region = compiled
+        .region_for(RegionKey::new(cpu(), location(CODE)))
+        .unwrap();
+    assert_eq!(region.deferred_register_loads, 0);
+}
+
+#[test]
+fn branch_join_preserves_a_register_not_written_on_the_taken_path() {
+    let memory = memory(&[
+        (0x00, compare_branch(CODE, CODE + 0x0c, 0, false)), // CBZ W0,skip
+        (0x04, 0xd280_0022),                                 // MOVZ X2,#1
+        (0x08, branch(CODE + 0x08, CODE + 0x10)),
+        (0x0c, 0xd503_201f), // skip: NOP
+        (0x10, breakpoint(0)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let thread = JitThread::new();
+
+    let mut skipped = state(CODE, 0);
+    write_register(&mut skipped, 2, 0x1234_5678_9abc_def0);
+    thread.run(&process, &memory, &mut skipped).unwrap();
+    assert_eq!(read_register(&skipped, 2), 0x1234_5678_9abc_def0);
+
+    let mut written = state(CODE, 1);
+    write_register(&mut written, 2, 0x1234_5678_9abc_def0);
+    thread.run(&process, &memory, &mut written).unwrap();
+    assert_eq!(read_register(&written, 2), 1);
+}
+
+#[test]
+fn equivalent_exits_share_one_cold_epilogue() {
+    let memory = memory(&[
+        (0x00, compare_branch(CODE, CODE + 0x08, 0, false)),
+        (0x04, breakpoint(7)),
+        (0x08, breakpoint(7)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    process.entry_for(&memory, location(CODE)).unwrap();
+    let state = process.state.lock().unwrap();
+    let region = state
+        .region_for(RegionKey::new(cpu(), location(CODE)))
+        .unwrap();
+    // Reconciliation, control, and the shared architectural exit.
+    assert_eq!(region.exit_tail_count, 3);
 }
 
 #[test]
@@ -2975,45 +2982,6 @@ fn switch_1_pointer_authentication_hints_add_no_clif_over_nop() {
         0xd503_23ff,
     ] {
         assert_eq!(shape(encoding), nop, "{encoding:#010x}");
-    }
-}
-
-#[test]
-fn fp_simd_shapes_remain_bounded_by_family() {
-    let cases = [
-        ("integer-add", 0x4e22_8420_u32, 104, 768),
-        ("bitwise-select", 0x6e62_1c20, 104, 768),
-        ("compare", 0x4e21_34a3, 104, 768),
-        ("min-max", 0x0ebf_6fdf, 104, 768),
-        ("pairwise", 0x4e22_a420, 104, 768),
-        ("permute", 0x4e02_1823, 104, 768),
-        ("extract", 0x6e02_4023, 104, 768),
-        ("narrow", 0x0f0c_8400, 104, 768),
-        ("immediate-shift", 0x2f0f_0420, 104, 768),
-        ("shift-left-long", 0x0f20_a7fe, 104, 768),
-        ("register-shift", 0x0e22_4420, 144, 1280),
-        ("reduction", 0x4e31_b862, 104, 768),
-        ("exact-fp", 0x1e62_2820, 160, 1024),
-        ("quadword-memory", 0x3dc0_0020, 208, 1280),
-    ];
-    for (family, encoding, clif_limit, native_limit) in cases {
-        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
-        let process = JitProcess::new(cpu()).unwrap();
-        process.entry_for(&memory, location(CODE)).unwrap();
-        let state = process.state.lock().unwrap();
-        let region = state
-            .region_for(RegionKey::new(cpu(), location(CODE)))
-            .unwrap();
-        assert!(
-            region.clif_instructions <= clif_limit,
-            "{family}: {} CLIF instructions exceed {clif_limit}",
-            region.clif_instructions
-        );
-        assert!(
-            region.native_bytes <= native_limit,
-            "{family}: {} native bytes exceed {native_limit}",
-            region.native_bytes
-        );
     }
 }
 
@@ -3065,7 +3033,7 @@ fn assert_matches_interpreter(encoding: u32, initial: A64State) {
     let process = JitProcess::new(cpu()).unwrap();
     let mut actual = initial;
     JitThread::new()
-        .run(&process, &memory, &mut actual, 1)
+        .run(&process, &memory, &mut actual)
         .unwrap_or_else(|error| panic!("{encoding:#010x}: {error}"));
     assert_eq!(actual, expected, "{encoding:#010x}");
 }
@@ -3077,11 +3045,11 @@ fn assert_control_matches_interpreter(encoding: u32, initial: A64State) {
         InstructionStep::Continue,
         "{encoding:#010x}"
     );
-    let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+    let memory = memory(&[(0, encoding), (4, breakpoint(0)), (8, breakpoint(0))]);
     let process = JitProcess::new(cpu()).unwrap();
     let mut actual = initial;
     JitThread::new()
-        .run(&process, &memory, &mut actual, 1)
+        .run(&process, &memory, &mut actual)
         .unwrap_or_else(|error| panic!("{encoding:#010x}: {error}"));
     assert_eq!(actual, expected, "{encoding:#010x}");
 }

@@ -988,9 +988,8 @@ struct RetainedBackingCacheEntry {
 }
 
 /// Owner-local cache for page-versioned backing views derived from stable
-/// Maxwell mappings. CPU-write epochs make the common validation path O(1)
-/// per backing store. Lost journal history conservatively rebuilds the entry
-/// from authoritative page generations.
+/// Maxwell mappings. Page dirty dependencies retain entries until one of the
+/// physical pages represented by the resource becomes dirty.
 #[derive(Debug, Default)]
 pub(crate) struct MaxwellThreeDRetainedBackingCache {
     entries: BTreeMap<RetainedBackingKey, Arc<RetainedBackingCacheEntry>>,
@@ -2761,7 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_backing_cache_uses_store_epoch_then_exact_page_overlap() {
+    fn retained_backing_cache_tracks_dirty_physical_pages() {
         let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
         let mut address_space =
             MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
@@ -2820,13 +2819,6 @@ mod tests {
             &after_disjoint_write.mappings,
             &after_overlapping_write.mappings
         ));
-        assert_eq!(
-            after_overlapping_write.backing.range().segments()[0].content_generation(),
-            source.segments()[0].mapping().backing().segments()[0]
-                .content_generation()
-                .next()
-                .unwrap()
-        );
 
         address_space.unmap(mapping.offset()).unwrap();
         let replacement = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();

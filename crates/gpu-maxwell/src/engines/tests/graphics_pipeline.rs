@@ -304,10 +304,7 @@ fn compression_threshold_reserved_values_and_failed_packet_keeps_valid_prefix() 
 
 #[test]
 fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes() {
-    // Keep one canonical page outside the image so the regression can exhaust
-    // bounded store-wide CPU-write provenance without touching represented
-    // color bytes.
-    let allocation = CanonicalAllocation::zeroed(0x11000, 0x1000).unwrap();
+    let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
     let mapping = map_resource(
         &mut address_space,
@@ -487,37 +484,19 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
 
     let resources_after_writeback =
         resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    let after_writeback = lower_maxwell_three_d_operation(
-        triggered.state(),
-        &resources_after_writeback,
-        triggered.trigger(),
-        None,
-        FrontendSubmissionId::new(16),
-        Vec::new(),
-        &lowering_capabilities(BackendFeatures::CLEAR),
-        &mut cache,
-    )
-    .unwrap();
-    assert!(after_writeback.resource_creations().is_empty());
-
-    // The canonical store retains 256 exact write records; one additional
-    // write forces validation through authoritative page generations.
-    for value in 0..=256 {
-        allocation.write(0x10000, &[value as u8]).unwrap();
-    }
-    let resources_after_disjoint_journal_overflow =
-        resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    lower_maxwell_three_d_operation(
-        triggered.state(),
-        &resources_after_disjoint_journal_overflow,
-        triggered.trigger(),
-        None,
-        FrontendSubmissionId::new(17),
-        Vec::new(),
-        &lowering_capabilities(BackendFeatures::CLEAR),
-        &mut cache,
-    )
-    .unwrap();
+    assert!(matches!(
+        lower_maxwell_three_d_operation(
+            triggered.state(),
+            &resources_after_writeback,
+            triggered.trigger(),
+            None,
+            FrontendSubmissionId::new(16),
+            Vec::new(),
+            &lowering_capabilities(BackendFeatures::CLEAR),
+            &mut cache,
+        ),
+        Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target: 0 })
+    ));
 
     allocation.write(0, &[0xa5]).unwrap();
     let resources_after_cpu_write =
@@ -528,7 +507,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             &resources_after_cpu_write,
             triggered.trigger(),
             None,
-            FrontendSubmissionId::new(18),
+            FrontendSubmissionId::new(17),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::CLEAR),
             &mut cache,

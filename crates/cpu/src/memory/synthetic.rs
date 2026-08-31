@@ -1,10 +1,9 @@
 //! Deterministic memory backend for frontend and runtime tests.
 
 use nixe_memory::{
-    AddressSpaceId, ContentGeneration, ContentMutationEpoch, GuestPhysicalPageId,
-    GuestVirtualAddress, MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor,
-    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
-    MemoryInvalidationOrigin, MemoryInvalidationSource,
+    AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationKind,
+    MemoryInvalidationLog, MemoryInvalidationOrigin, MemoryInvalidationSource,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -63,7 +62,6 @@ struct SyntheticMemoryInner {
     next_page_id: u64,
     next_mapping_generation: Option<MappingGeneration>,
     install_failure: Option<(SyntheticInstallStage, usize, Box<str>)>,
-    content_epoch: ContentMutationEpoch,
 }
 
 impl Default for SyntheticMemoryInner {
@@ -76,7 +74,6 @@ impl Default for SyntheticMemoryInner {
             next_page_id: 1,
             next_mapping_generation: Some(MappingGeneration::new(1)),
             install_failure: None,
-            content_epoch: ContentMutationEpoch::INITIAL,
         }
     }
 }
@@ -190,14 +187,6 @@ impl SyntheticMemory {
         }
         if stored {
             super::contracts::begin_ordered_write(access.ordering);
-            let next_content_epoch = inner.content_epoch.next().map_err(|_| {
-                DataAccessFault::new(
-                    address_space,
-                    address,
-                    DataAccessKind::Write,
-                    DataAccessFaultReason::ContentGenerationExhausted,
-                )
-            })?;
             let PhysicalPage::Ram { bytes, generation } = inner
                 .pages
                 .get_mut(&page)
@@ -216,7 +205,6 @@ impl SyntheticMemory {
             let bytes = bytes.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
             replacement.copy_le_bytes(&mut bytes[offset..offset + byte_count]);
             *generation = next_generation;
-            inner.content_epoch = next_content_epoch;
         }
         super::contracts::complete_ordered_read(access.ordering);
         Ok(AtomicMemoryResult {
@@ -522,9 +510,6 @@ impl SyntheticMemory {
     ) -> bool {
         let invalidations = &self.invalidations;
         let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let Ok(next_epoch) = inner.content_epoch.next() else {
-            return false;
-        };
         let code_observed = inner.mappings.values().any(|mapping| {
             mapping.physical_page == page
                 && (mapping.permissions.contains(MemoryPermissions::EXECUTE)
@@ -563,7 +548,6 @@ impl SyntheticMemory {
         };
         destination.copy_from_slice(bytes);
         *generation = next_generation;
-        inner.content_epoch = next_epoch;
         if let Some(invalidation) = invalidation {
             invalidation.commit();
         }
@@ -641,7 +625,7 @@ impl SyntheticMemory {
             }
             let Some(PhysicalPage::Ram {
                 bytes: contents,
-                generation,
+                generation: _,
             }) = inner.pages.get(&mapping.physical_page)
             else {
                 return Err(InstructionFetchFault::new(
@@ -658,7 +642,6 @@ impl SyntheticMemory {
                 bytes,
                 CodeDependencies::one(CodePageDependency {
                     page: mapping.physical_page,
-                    generation: *generation,
                     mapping_generation: mapping.mapping_generation,
                 }),
             ));
@@ -697,7 +680,7 @@ impl SyntheticMemory {
             }
             let Some(PhysicalPage::Ram {
                 bytes: contents,
-                generation,
+                generation: _,
             }) = inner.pages.get(&mapping.physical_page)
             else {
                 return Err(InstructionFetchFault::new(
@@ -711,7 +694,6 @@ impl SyntheticMemory {
                 .map_or(0, |contents| contents[page_offset(current)]);
             let dependency = CodePageDependency {
                 page: mapping.physical_page,
-                generation: *generation,
                 mapping_generation: mapping.mapping_generation,
             };
             dependencies = Some(match dependencies {
@@ -762,10 +744,6 @@ fn fail_install_if_requested(
 }
 
 impl InstructionMemory for SyntheticMemory {
-    fn content_mutation_epoch(&self) -> ContentMutationEpoch {
-        self.lock_inner().content_epoch
-    }
-
     fn code_page_span(
         &self,
         address_space: AddressSpaceId,
@@ -982,14 +960,6 @@ impl CpuMemory for SyntheticMemory {
                 region: MemoryRegionKind::Device,
             });
         }
-        let next_content_epoch = inner.content_epoch.next().map_err(|_| {
-            DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::ContentGenerationExhausted,
-            )
-        })?;
         let byte_count = access.size.bytes();
         let mut bytes = [0_u8; 16];
         value.copy_le_bytes(&mut bytes[..byte_count]);
@@ -1087,7 +1057,6 @@ impl CpuMemory for SyntheticMemory {
                 }
             }
         }
-        inner.content_epoch = next_content_epoch;
         Ok(DataWriteResult {
             region: MemoryRegionKind::Ram,
         })
@@ -1231,7 +1200,7 @@ impl CpuMemory for SyntheticMemory {
             ));
         }
         let mapping = resolved.first;
-        let PhysicalPage::Ram { bytes, generation } = inner
+        let PhysicalPage::Ram { bytes, .. } = inner
             .pages
             .get(&mapping.physical_page)
             .expect("mapping references a page")
@@ -1250,16 +1219,17 @@ impl CpuMemory for SyntheticMemory {
             value_bytes[..byte_count].copy_from_slice(&bytes[offset..offset + byte_count]);
         }
         super::contracts::complete_ordered_read(access.ordering);
+        let value = MemoryValue::from_le_slice(access.size, &value_bytes[..byte_count]);
         Ok((
             DataReadResult {
-                value: MemoryValue::from_le_slice(access.size, &value_bytes[..byte_count]),
+                value,
                 region: MemoryRegionKind::Ram,
             },
             crate::exclusive::ExclusiveReservation {
                 page: mapping.physical_page,
                 byte_offset: page_offset(address) as u16,
                 access_size: access.size.bytes() as u8,
-                generation: *generation,
+                expected: value,
             },
         ))
     }
@@ -1280,7 +1250,7 @@ impl CpuMemory for SyntheticMemory {
                 DataAccessFaultReason::ValueSizeMismatch,
             ));
         }
-        let mut inner = self.lock_inner();
+        let inner = self.lock_inner();
         let resolved = resolve_access(
             &inner,
             address_space,
@@ -1296,21 +1266,21 @@ impl CpuMemory for SyntheticMemory {
                 DataAccessFaultReason::MixedRegions,
             ));
         }
-        let generation = match inner.pages.get(&resolved.first.physical_page) {
-            Some(PhysicalPage::Ram { generation, .. }) => *generation,
-            _ => {
-                return Err(DataAccessFault::new(
-                    address_space,
-                    address,
-                    DataAccessKind::Write,
-                    DataAccessFaultReason::MixedRegions,
-                ));
-            }
-        };
+        if !matches!(
+            inner.pages.get(&resolved.first.physical_page),
+            Some(PhysicalPage::Ram { .. })
+        ) {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::MixedRegions,
+            ));
+        }
         let matches = reservation.page == resolved.first.physical_page
             && usize::from(reservation.byte_offset) == page_offset(address)
-            && usize::from(reservation.access_size) == access.size.bytes()
-            && reservation.generation == generation;
+            && usize::from(reservation.access_size) == access.size.bytes();
+        drop(inner);
         if !matches {
             return Ok((
                 DataWriteResult {
@@ -1319,44 +1289,24 @@ impl CpuMemory for SyntheticMemory {
                 false,
             ));
         }
-        let next_content_epoch = inner.content_epoch.next().map_err(|_| {
-            DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::ContentGenerationExhausted,
-            )
-        })?;
-        let PhysicalPage::Ram {
-            bytes: contents,
-            generation,
-        } = inner
-            .pages
-            .get_mut(&resolved.first.physical_page)
-            .expect("resolved exclusive RAM page exists")
-        else {
-            unreachable!()
-        };
-        let next_generation = generation.next().map_err(|_| {
-            DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::ContentGenerationExhausted,
-            )
-        })?;
-        let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
-        let byte_count = access.size.bytes();
-        let offset = page_offset(address);
-        super::contracts::begin_ordered_write(access.ordering);
-        value.copy_le_bytes(&mut contents[offset..offset + byte_count]);
-        *generation = next_generation;
-        inner.content_epoch = next_content_epoch;
+        let atomic_access = MemoryAccess::new(
+            access.size,
+            MemoryAlignment::Natural,
+            access.ordering,
+            MemoryAccessClass::Atomic,
+        );
+        let result = self.atomic_compare_exchange(
+            address_space,
+            address,
+            atomic_access,
+            reservation.expected,
+            value,
+        )?;
         Ok((
             DataWriteResult {
                 region: MemoryRegionKind::Ram,
             },
-            true,
+            result.stored,
         ))
     }
 
@@ -1508,17 +1458,6 @@ impl ProcessMemory for SyntheticMemory {
             )
         })?;
         let mut inner = self.lock_inner();
-        let next_content_epoch = (!bytes.is_empty())
-            .then(|| inner.content_epoch.next())
-            .transpose()
-            .map_err(|_| {
-                DataAccessFault::new(
-                    address_space,
-                    address,
-                    DataAccessKind::Write,
-                    DataAccessFaultReason::ContentGenerationExhausted,
-                )
-            })?;
         if let Some(((.., fault_address, _), reason)) = inner
             .data_faults
             .iter()
@@ -1649,9 +1588,6 @@ impl ProcessMemory for SyntheticMemory {
                 unreachable!("bulk write RAM page was validated")
             };
             *generation = next;
-        }
-        if let Some(next) = next_content_epoch {
-            inner.content_epoch = next;
         }
         if let Some(invalidation) = invalidation {
             invalidation.commit();
@@ -2305,7 +2241,6 @@ mod tests {
             a64_or_a32.dependencies.iter().collect::<Vec<_>>(),
             vec![CodePageDependency {
                 page: PAGE_1,
-                generation: ContentGeneration::new(1),
                 mapping_generation: MappingGeneration::new(1),
             }]
         );
@@ -2392,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn aliases_report_physical_identity_and_observe_generation_changes() {
+    fn aliases_share_physical_identity_without_instruction_generations() {
         let mut memory = code_memory();
         assert!(memory.map_page(SPACE, ALIAS, PAGE_1, MemoryPermissions::READ_WRITE_EXECUTE));
         let before = memory.fetch32(SPACE, CODE).unwrap();
@@ -2410,11 +2345,11 @@ mod tests {
         assert_eq!(after.bits, 0x1122_3344);
         assert_eq!(before.dependencies.iter().next().unwrap().page, PAGE_1);
         assert_eq!(after.dependencies.iter().next().unwrap().page, PAGE_1);
-        assert_ne!(before.dependencies, after.dependencies);
+        assert_eq!(before.dependencies, after.dependencies);
     }
 
     #[test]
-    fn mapping_and_content_generations_change_independently_in_both_backends() {
+    fn code_dependencies_track_mapping_identity_in_both_backends() {
         let mut synthetic = SyntheticMemory::new();
         let mut execution = ExecutionMemory::new();
         for memory in [
@@ -2447,8 +2382,7 @@ mod tests {
         let execution_after_write = execution.fetch32(SPACE, CODE).unwrap();
         assert_eq!(synthetic_after_write, execution_after_write);
         let after_write = synthetic_after_write.dependencies.iter().next().unwrap();
-        assert_ne!(after_write.generation, before.generation);
-        assert_eq!(after_write.mapping_generation, before.mapping_generation);
+        assert_eq!(after_write, before);
 
         for memory in [
             &synthetic as &dyn ProcessMemory,
@@ -2475,7 +2409,6 @@ mod tests {
         let execution_after_remap = execution.fetch32(SPACE, CODE).unwrap();
         assert_eq!(synthetic_after_remap, execution_after_remap);
         let after_remap = synthetic_after_remap.dependencies.iter().next().unwrap();
-        assert_eq!(after_remap.generation, after_write.generation);
         assert_ne!(
             after_remap.mapping_generation,
             after_write.mapping_generation
@@ -3307,10 +3240,8 @@ mod tests {
         let after_execution = execution.fetch32(SPACE, CODE).unwrap();
         assert_eq!(before_synthetic, before_execution);
         assert_eq!(after_synthetic, after_execution);
-        assert_ne!(
-            before_execution.dependencies, after_execution.dependencies,
-            "a write through a non-executable alias must invalidate fetched code"
-        );
+        assert_eq!(after_execution.bits, 0x5566_7788);
+        assert_eq!(before_execution.dependencies, after_execution.dependencies);
     }
 
     #[test]

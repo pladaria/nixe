@@ -17,9 +17,6 @@ both platforms whenever technically appropriate.
 
 The project is currently in an early development and research phase.
 
-The current interpreter and direct-JIT design is documented in
-[CPU Architecture](docs/CPU%20Architecture.md).
-
 ## Testing
 
 Run

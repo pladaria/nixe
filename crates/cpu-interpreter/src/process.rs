@@ -151,14 +151,6 @@ impl InterpreterThread {
         self.id
     }
 
-    /// Scalar accesses which had to return to the checked memory owner.
-    #[must_use]
-    pub fn direct_checked_accesses(&self) -> u64 {
-        self.direct_memory
-            .as_ref()
-            .map_or(0, |direct| direct.borrow().checked_accesses())
-    }
-
     pub fn run_slice(
         &mut self,
         request: InterpreterRunRequest<'_>,
@@ -331,14 +323,9 @@ impl InterpreterThread {
         Ok(())
     }
 
-    fn report(
-        &self,
-        instructions_executed: u64,
-        stop: CpuExit,
-        state: &A64State,
-    ) -> ExecutionReport {
+    fn report(&self, progress: u64, stop: CpuExit, state: &A64State) -> ExecutionReport {
         ExecutionReport {
-            instructions_executed,
+            progress,
             stop,
             context: state.register_context(),
         }
@@ -347,14 +334,14 @@ impl InterpreterThread {
 
 fn instruction_fault(
     kind: CpuFaultKind,
-    instructions_executed: u64,
+    progress: u64,
     state: &A64State,
     message: impl ToString,
 ) -> CpuFault {
     CpuFault {
         backend: "interpreter",
         kind,
-        instructions_executed,
+        progress,
         message: message.to_string().into(),
         context: Box::new(state.register_context()),
     }
@@ -364,7 +351,7 @@ fn backend_fault(message: impl ToString) -> CpuFault {
     CpuFault {
         backend: "interpreter",
         kind: CpuFaultKind::Internal,
-        instructions_executed: 0,
+        progress: 0,
         message: message.to_string().into(),
         context: Box::new(A64State::default().register_context()),
     }

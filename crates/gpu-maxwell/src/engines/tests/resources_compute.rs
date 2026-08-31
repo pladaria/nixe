@@ -728,25 +728,6 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
     );
     assert!(remapped_plan.resource_invalidations().is_empty());
 
-    // A large submission may overflow the store-wide CPU-write journal with
-    // command-buffer or semaphore writes on unrelated canonical pages. The
-    // unchanged depth pages remain authoritative evidence that the retained
-    // 2CZ representation is current.
-    for value in 0..=256_u16 {
-        allocation.write(0xf000, &[value as u8]).unwrap();
-    }
-    lower_maxwell_three_d_operation(
-        remapped.state(),
-        &resolve_maxwell_three_d_resources(remapped.state(), &address_space).unwrap(),
-        remapped.trigger(),
-        None,
-        FrontendSubmissionId::new(14),
-        Vec::new(),
-        &capabilities,
-        &mut cache,
-    )
-    .unwrap();
-
     allocation.write(0, &[1]).unwrap();
     let cpu_modified_resources =
         resolve_maxwell_three_d_resources(remapped.state(), &address_space).unwrap();
@@ -756,7 +737,7 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
             &cpu_modified_resources,
             remapped.trigger(),
             None,
-            FrontendSubmissionId::new(15),
+            FrontendSubmissionId::new(14),
             Vec::new(),
             &capabilities,
             &mut cache,
@@ -1331,12 +1312,12 @@ fn resource_snapshot_resolves_buffers_aliases_and_content_generations() {
     assert_eq!(vertex.role(), MaxwellThreeDResourceRole::VertexStream(0));
     assert_eq!(vertex.view().size(), 0x100);
     assert_eq!(
-        vertex.view().backing().range().segments()[0].content_generation(),
+        vertex.view().backing().range().segments()[0].page(),
         allocation
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap()
             .segments()[0]
-            .content_generation()
+            .page()
     );
     assert_eq!(
         resolved.mark_image_dirty(0),

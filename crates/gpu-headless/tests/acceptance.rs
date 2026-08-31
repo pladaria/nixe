@@ -51,7 +51,6 @@ fn backing(
         page_offset,
         size,
         MemoryPermissions::READ_WRITE,
-        page.content_generation(),
         MappingGeneration::INITIAL,
     )
     .unwrap();

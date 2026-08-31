@@ -1,6 +1,6 @@
 //! Retained canonical RAM backing.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,139 +9,24 @@ use crate::direct::DirectArenaWeak;
 use crate::host_mapped::{HostMappedBacking, HostMappedStore};
 use crate::{
     BackingIdentityExhausted, BackingStoreId, CanonicalBackingRange, CanonicalBackingSegment,
-    CanonicalPageId, ContentGeneration, ContentMutationEpoch, CpuVisibilityRequest, CpuWriteEpoch,
-    DIRECT_PAGE_SIZE, DeviceAccessDeclaration, DeviceVisibilityRequest, DirectArena,
-    DirectMemoryError, DirectProtectRequest, DirectProtection, DirectStoreControl, ExecutionGate,
-    GenerationExhausted, GuestPhysicalPageId, MappingGeneration, MemoryInvalidationKind,
-    MemoryInvalidationLog, MemoryInvalidationOrigin, MemoryPermissions, NonCpuDeviceId,
-    VisibilityCoordinator, VisibilityError, VisibilityState,
+    CanonicalPageId, ContentGeneration, CpuVisibilityRequest, DIRECT_PAGE_SIZE,
+    DeviceAccessDeclaration, DeviceVisibilityRequest, DirectArena, DirectMemoryError,
+    DirectProtectRequest, DirectProtection, DirectStoreControl, ExecutionGate, GenerationExhausted,
+    GuestPhysicalPageId, MappingGeneration, MemoryInvalidationKind, MemoryInvalidationLog,
+    MemoryInvalidationOrigin, MemoryPermissions, NonCpuDeviceId, VisibilityCoordinator,
+    VisibilityError, VisibilityState,
 };
 
 struct CanonicalBackingStoreInner {
     identity: BackingStoreId,
-    content_epoch: AtomicU64,
-    cpu_write_epoch: AtomicU64,
-    cpu_writes_active: AtomicU64,
     execution_gate: ExecutionGate,
     host: OnceLock<HostMappedStore>,
-    mutation: Mutex<CanonicalStoreMutationState>,
-}
-
-#[derive(Debug, Default)]
-struct CanonicalStoreMutationState {
-    cpu_writes: StoreCpuWriteJournal,
-}
-
-pub(crate) const STORE_CPU_WRITE_JOURNAL_CAPACITY: usize = 256;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct StoreCpuWriteRecord {
-    epoch: CpuWriteEpoch,
-    page: CanonicalPageId,
-    start: u64,
-    end: u64,
-}
-
-#[derive(Debug, Default)]
-struct StoreCpuWriteJournal {
-    records: VecDeque<StoreCpuWriteRecord>,
-    lost_through: Option<CpuWriteEpoch>,
-}
-
-impl StoreCpuWriteJournal {
-    fn prepare(&mut self) -> Result<(), CanonicalContentMutationError> {
-        if self.records.capacity() < STORE_CPU_WRITE_JOURNAL_CAPACITY {
-            self.records
-                .try_reserve_exact(STORE_CPU_WRITE_JOURNAL_CAPACITY - self.records.len())
-                .map_err(|_| CanonicalContentMutationError::ResourceExhausted)?;
-        }
-        Ok(())
-    }
-
-    fn record(&mut self, epoch: CpuWriteEpoch, page: CanonicalPageId, start: u64, end: u64) {
-        if start == end {
-            return;
-        }
-        if self.records.len() == STORE_CPU_WRITE_JOURNAL_CAPACITY {
-            let removed = self
-                .records
-                .pop_front()
-                .expect("a full store CPU-write journal has a front record");
-            self.lost_through = Some(
-                self.lost_through
-                    .map_or(removed.epoch, |current| current.max(removed.epoch)),
-            );
-        }
-        self.records.push_back(StoreCpuWriteRecord {
-            epoch,
-            page,
-            start,
-            end,
-        });
-    }
-
-    fn overlap_since(
-        &self,
-        epoch: CpuWriteEpoch,
-        intervals: &[(CanonicalPageId, u64, u64)],
-    ) -> CanonicalCpuWriteOverlap {
-        if self
-            .lost_through
-            .is_some_and(|lost_through| epoch < lost_through)
-        {
-            return CanonicalCpuWriteOverlap::Unknown;
-        }
-        if self
-            .records
-            .iter()
-            .rev()
-            .take_while(|record| record.epoch > epoch)
-            .any(|record| store_record_overlaps_intervals(*record, intervals))
-        {
-            CanonicalCpuWriteOverlap::Yes
-        } else {
-            CanonicalCpuWriteOverlap::No
-        }
-    }
-}
-
-fn store_record_overlaps_intervals(
-    record: StoreCpuWriteRecord,
-    intervals: &[(CanonicalPageId, u64, u64)],
-) -> bool {
-    let mut index = intervals.partition_point(|(page, _, _)| *page < record.page);
-    while let Some((page, start, end)) = intervals.get(index) {
-        if *page != record.page {
-            break;
-        }
-        if record.start < *end && *start < record.end {
-            return true;
-        }
-        index += 1;
-    }
-    false
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CanonicalContentMutationError {
-    GenerationExhausted(GenerationExhausted),
-    ResourceExhausted,
-}
-
-fn page_mutation_error(error: CanonicalContentMutationError) -> CanonicalPageError {
-    match error {
-        CanonicalContentMutationError::GenerationExhausted(error) => {
-            CanonicalPageError::MutationEpochExhausted(error)
-        }
-        CanonicalContentMutationError::ResourceExhausted => CanonicalPageError::ResourceExhausted,
-    }
 }
 
 /// Shared authority for every canonical page in one backing store.
 ///
 /// Per-page content generations remain authoritative for aliases and retained
-/// ranges. This store-wide epoch is only a monotonic O(1) change detector for
-/// CPU-engine memory synchronization.
+/// ranges.
 #[derive(Clone)]
 pub struct CanonicalBackingStore {
     inner: Arc<CanonicalBackingStoreInner>,
@@ -160,12 +45,8 @@ impl CanonicalBackingStore {
         Ok(Self {
             inner: Arc::new(CanonicalBackingStoreInner {
                 identity: BackingStoreId::allocate()?,
-                content_epoch: AtomicU64::new(ContentMutationEpoch::INITIAL.get()),
-                cpu_write_epoch: AtomicU64::new(CpuWriteEpoch::INITIAL.get()),
-                cpu_writes_active: AtomicU64::new(0),
                 execution_gate,
                 host: OnceLock::new(),
-                mutation: Mutex::new(CanonicalStoreMutationState::default()),
             }),
         })
     }
@@ -182,22 +63,6 @@ impl CanonicalBackingStore {
         self.inner.identity
     }
 
-    /// Returns the latest completely published content mutation in O(1).
-    #[must_use]
-    pub fn content_epoch(&self) -> ContentMutationEpoch {
-        ContentMutationEpoch::new(self.inner.content_epoch.load(Ordering::Acquire))
-    }
-
-    /// Returns the latest completely published CPU-originated write in O(1).
-    #[must_use]
-    pub fn cpu_write_epoch(&self) -> CpuWriteEpoch {
-        CpuWriteEpoch::new(self.inner.cpu_write_epoch.load(Ordering::Acquire))
-    }
-
-    pub(crate) fn cpu_writes_active(&self) -> u64 {
-        self.inner.cpu_writes_active.load(Ordering::Acquire)
-    }
-
     fn host(&self) -> Result<&HostMappedStore, CanonicalPageError> {
         if let Some(host) = self.inner.host.get() {
             return Ok(host);
@@ -210,78 +75,6 @@ impl CanonicalBackingStore {
             .get()
             .expect("the host-mapped store was initialized"))
     }
-
-    fn begin_mutation(
-        &self,
-        content: bool,
-        cpu_write: bool,
-    ) -> Result<CanonicalContentMutation<'_>, CanonicalContentMutationError> {
-        let mut guard = self
-            .inner
-            .mutation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if content {
-            self.content_epoch()
-                .next()
-                .map_err(CanonicalContentMutationError::GenerationExhausted)?;
-        }
-        if cpu_write {
-            self.inner.cpu_writes_active.fetch_add(1, Ordering::AcqRel);
-        }
-        if cpu_write && let Err(error) = self.cpu_write_epoch().next() {
-            self.inner.cpu_writes_active.fetch_sub(1, Ordering::AcqRel);
-            return Err(CanonicalContentMutationError::GenerationExhausted(error));
-        }
-        if cpu_write && let Err(error) = guard.cpu_writes.prepare() {
-            self.inner.cpu_writes_active.fetch_sub(1, Ordering::AcqRel);
-            return Err(error);
-        }
-        Ok(CanonicalContentMutation {
-            store: self,
-            guard,
-            content,
-            cpu_write,
-            cpu_write_records: Vec::new(),
-        })
-    }
-
-    fn begin_cpu_write(
-        &self,
-    ) -> Result<CanonicalContentMutation<'_>, CanonicalContentMutationError> {
-        self.begin_mutation(true, true)
-    }
-
-    fn begin_cpu_dirty(
-        &self,
-    ) -> Result<CanonicalContentMutation<'_>, CanonicalContentMutationError> {
-        self.begin_mutation(false, true)
-    }
-
-    fn begin_device_write(&self) -> Result<CanonicalContentMutation<'_>, GenerationExhausted> {
-        self.begin_mutation(true, false)
-            .map_err(|error| match error {
-                CanonicalContentMutationError::GenerationExhausted(error) => error,
-                CanonicalContentMutationError::ResourceExhausted => {
-                    unreachable!("device mutations do not reserve CPU-write journal storage")
-                }
-            })
-    }
-
-    pub(crate) fn cpu_write_overlap_since(
-        &self,
-        epoch: CpuWriteEpoch,
-        intervals: &[(CanonicalPageId, u64, u64)],
-    ) -> (CpuWriteEpoch, CanonicalCpuWriteOverlap) {
-        let mutation = self
-            .inner
-            .mutation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current = self.cpu_write_epoch();
-        let overlap = mutation.cpu_writes.overlap_since(epoch, intervals);
-        (current, overlap)
-    }
 }
 
 impl std::fmt::Debug for CanonicalBackingStore {
@@ -289,65 +82,7 @@ impl std::fmt::Debug for CanonicalBackingStore {
         formatter
             .debug_struct("CanonicalBackingStore")
             .field("identity", &self.identity())
-            .field("content_epoch", &self.content_epoch())
-            .field("cpu_write_epoch", &self.cpu_write_epoch())
             .finish()
-    }
-}
-
-struct CanonicalContentMutation<'a> {
-    store: &'a CanonicalBackingStore,
-    guard: std::sync::MutexGuard<'a, CanonicalStoreMutationState>,
-    content: bool,
-    cpu_write: bool,
-    cpu_write_records: Vec<(CanonicalPageId, u64, u64)>,
-}
-
-impl CanonicalContentMutation<'_> {
-    fn record_cpu_write(
-        &mut self,
-        page: CanonicalPageId,
-        start: u64,
-        end: u64,
-    ) -> Result<(), CanonicalContentMutationError> {
-        if self.cpu_write && start != end {
-            self.cpu_write_records
-                .try_reserve(1)
-                .map_err(|_| CanonicalContentMutationError::ResourceExhausted)?;
-            self.cpu_write_records.push((page, start, end));
-        }
-        Ok(())
-    }
-
-    fn commit(mut self) {
-        if self.cpu_write {
-            let previous = self
-                .store
-                .inner
-                .cpu_write_epoch
-                .fetch_add(1, Ordering::Release);
-            let epoch = CpuWriteEpoch::new(previous + 1);
-            for (page, start, end) in self.cpu_write_records.drain(..) {
-                self.guard.cpu_writes.record(epoch, page, start, end);
-            }
-        }
-        if self.content {
-            self.store
-                .inner
-                .content_epoch
-                .fetch_add(1, Ordering::Release);
-        }
-    }
-}
-
-impl Drop for CanonicalContentMutation<'_> {
-    fn drop(&mut self) {
-        if self.cpu_write {
-            self.store
-                .inner
-                .cpu_writes_active
-                .fetch_sub(1, Ordering::Release);
-        }
     }
 }
 
@@ -366,10 +101,8 @@ enum PageVisibility {
 struct CanonicalPageState {
     visibility: PageVisibility,
     visibility_epoch: u64,
+    cpu_dirty_observer_armed: bool,
     direct_write_epoch: Option<u64>,
-    direct_write_generation: Option<ContentGeneration>,
-    direct_stores_allowed: bool,
-    cpu_writes: CpuWriteJournal,
     direct_aliases: BTreeMap<(usize, u64), CanonicalDirectAlias>,
 }
 
@@ -379,143 +112,13 @@ struct CanonicalDirectAlias {
     maximum_protection: DirectProtection,
 }
 
-const CPU_WRITE_JOURNAL_CAPACITY: usize = 32;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CpuWriteRecord {
-    generation: ContentGeneration,
-    start: u64,
-    end: u64,
-}
-
-#[derive(Debug, Default)]
-struct CpuWriteJournal {
-    records: VecDeque<CpuWriteRecord>,
-    lost_through: Option<ContentGeneration>,
-}
-
-impl CpuWriteJournal {
-    fn prepare(&mut self) -> Result<(), CanonicalPageError> {
-        if self.records.capacity() < CPU_WRITE_JOURNAL_CAPACITY {
-            self.records
-                .try_reserve_exact(CPU_WRITE_JOURNAL_CAPACITY - self.records.len())
-                .map_err(|_| CanonicalPageError::ResourceExhausted)?;
-        }
-        Ok(())
-    }
-
-    fn record(&mut self, generation: ContentGeneration, start: u64, end: u64) {
-        if start == end {
-            return;
-        }
-        if self.records.len() == CPU_WRITE_JOURNAL_CAPACITY {
-            let removed = self
-                .records
-                .pop_front()
-                .expect("a full CPU-write journal has a front record");
-            self.lost_through = Some(self.lost_through.map_or(removed.generation, |current| {
-                current.max(removed.generation)
-            }));
-        }
-        self.records.push_back(CpuWriteRecord {
-            generation,
-            start,
-            end,
-        });
-    }
-
-    fn overlap_since(
-        &self,
-        generation: ContentGeneration,
-        start: u64,
-        end: u64,
-    ) -> CanonicalCpuWriteOverlap {
-        if self
-            .lost_through
-            .is_some_and(|lost_through| generation < lost_through)
-        {
-            return CanonicalCpuWriteOverlap::Unknown;
-        }
-        if self.records.iter().any(|record| {
-            record.generation > generation && record.start < end && start < record.end
-        }) {
-            CanonicalCpuWriteOverlap::Yes
-        } else {
-            CanonicalCpuWriteOverlap::No
-        }
-    }
-
-    fn append_ranges_since(
-        &self,
-        generation: ContentGeneration,
-        start: u64,
-        end: u64,
-        output: &mut Vec<CanonicalCpuWriteRange>,
-    ) {
-        if self
-            .lost_through
-            .is_some_and(|lost_through| generation < lost_through)
-        {
-            output.push(CanonicalCpuWriteRange::new(start, end - start));
-            return;
-        }
-        for record in self
-            .records
-            .iter()
-            .filter(|record| record.generation > generation)
-        {
-            let dirty_start = record.start.max(start);
-            let dirty_end = record.end.min(end);
-            if dirty_start < dirty_end {
-                output.push(CanonicalCpuWriteRange::new(
-                    dirty_start,
-                    dirty_end - dirty_start,
-                ));
-            }
-        }
-    }
-}
-
-/// Whether canonical CPU-side writes touched a byte range after a snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CanonicalCpuWriteOverlap {
-    No,
-    Yes,
-    /// The bounded provenance journal no longer covers the requested snapshot.
-    Unknown,
-}
-
-/// One non-empty CPU-written byte interval within a canonical page.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CanonicalCpuWriteRange {
-    offset: u64,
-    size: u64,
-}
-
-impl CanonicalCpuWriteRange {
-    pub(crate) const fn new(offset: u64, size: u64) -> Self {
-        Self { offset, size }
-    }
-
-    /// Returns the first dirty byte within the canonical page.
-    #[must_use]
-    pub const fn offset(self) -> u64 {
-        self.offset
-    }
-
-    /// Returns the number of dirty bytes.
-    #[must_use]
-    pub const fn size(self) -> u64 {
-        self.size
-    }
-}
-
 struct CanonicalPageInner {
     store: CanonicalBackingStore,
     identity: CanonicalPageId,
     size: usize,
     backing: OnceLock<HostMappedBacking>,
     generation: AtomicU64,
+    cpu_dirty_epoch: AtomicU64,
     write_sequence: AtomicU64,
     direct_write_armed: AtomicU64,
     direct_store_control: OnceLock<DirectStoreControl>,
@@ -584,6 +187,7 @@ impl CanonicalBackingPage {
                 size,
                 backing: OnceLock::new(),
                 generation: AtomicU64::new(generation.get()),
+                cpu_dirty_epoch: AtomicU64::new(0),
                 write_sequence: AtomicU64::new(0),
                 direct_write_armed: AtomicU64::new(0),
                 direct_store_control: OnceLock::new(),
@@ -591,10 +195,8 @@ impl CanonicalBackingPage {
                 state: Mutex::new(CanonicalPageState {
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
+                    cpu_dirty_observer_armed: false,
                     direct_write_epoch: None,
-                    direct_write_generation: None,
-                    direct_stores_allowed: true,
-                    cpu_writes: CpuWriteJournal::default(),
                     direct_aliases: BTreeMap::new(),
                 }),
             }),
@@ -623,6 +225,7 @@ impl CanonicalBackingPage {
                 size: bytes.len(),
                 backing: initialized_backing,
                 generation: AtomicU64::new(generation.get()),
+                cpu_dirty_epoch: AtomicU64::new(0),
                 write_sequence: AtomicU64::new(0),
                 direct_write_armed: AtomicU64::new(0),
                 direct_store_control: OnceLock::new(),
@@ -630,10 +233,8 @@ impl CanonicalBackingPage {
                 state: Mutex::new(CanonicalPageState {
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
+                    cpu_dirty_observer_armed: false,
                     direct_write_epoch: None,
-                    direct_write_generation: None,
-                    direct_stores_allowed: true,
-                    cpu_writes: CpuWriteJournal::default(),
                     direct_aliases: BTreeMap::new(),
                 }),
             }),
@@ -668,10 +269,6 @@ impl CanonicalBackingPage {
         &self.inner.store
     }
 
-    pub(crate) fn cpu_write_epoch(&self) -> CpuWriteEpoch {
-        self.store().cpu_write_epoch()
-    }
-
     /// Returns the byte size of this backing page.
     #[must_use]
     pub fn size(&self) -> usize {
@@ -682,6 +279,43 @@ impl CanonicalBackingPage {
     #[must_use]
     pub fn content_generation(&self) -> ContentGeneration {
         ContentGeneration::new(self.inner.generation.load(Ordering::Acquire))
+    }
+
+    /// Returns the page-granular clean-to-dirty observation epoch.
+    #[must_use]
+    pub(crate) fn cpu_dirty_epoch(&self) -> u64 {
+        self.inner.cpu_dirty_epoch.load(Ordering::Acquire)
+    }
+
+    /// Establishes a read-only CPU-write baseline while the backing store's
+    /// execution gate is held exclusively by the caller.
+    pub(crate) fn arm_cpu_dirty_observer_quiescent(&self) -> Result<u64, CanonicalPageError> {
+        self.ensure_backing()?;
+        let mut state = self.lock_state();
+        match state.visibility {
+            PageVisibility::Clean | PageVisibility::CpuNewer | PageVisibility::GpuNewer { .. } => {}
+            PageVisibility::Conflicting => {
+                return Err(CanonicalPageError::Visibility(
+                    VisibilityError::ConflictingAccess,
+                ));
+            }
+            PageVisibility::Invalid => {
+                return Err(CanonicalPageError::Visibility(
+                    VisibilityError::InvalidState,
+                ));
+            }
+        }
+        if !state.cpu_dirty_observer_armed {
+            self.disarm_direct_writes();
+            state.cpu_dirty_observer_armed = true;
+            if let Err(error) = self.publish_direct_alias_protection(&mut state) {
+                state.cpu_dirty_observer_armed = false;
+                return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                    error.to_string().into_boxed_str(),
+                )));
+            }
+        }
+        Ok(self.cpu_dirty_epoch())
     }
 
     /// Reports whether native-store publication is armed for this page's
@@ -727,7 +361,7 @@ impl CanonicalBackingPage {
         );
         arena.publish_store_control(
             guest_address,
-            (state.direct_stores_allowed && maximum_protection == DirectProtection::ReadWrite)
+            (maximum_protection == DirectProtection::ReadWrite)
                 .then(|| self.direct_store_control()),
         )?;
         self.publish_direct_alias_protection(&mut state)
@@ -744,76 +378,67 @@ impl CanonicalBackingPage {
     /// Arms compact native-store publication for the current CPU visibility
     /// epoch and exposes every semantically writable alias as read/write.
     ///
-    /// The first checked store in an epoch has already published its exact
-    /// byte range. Native stores then advance the per-store generations while
-    /// the bounded journal conservatively represents them as whole-page dirty.
+    /// The page dirty transition has already been published before this is
+    /// called. Native stores retain only the temporary pre-Phase-5 content
+    /// publication required by `DirectStoreControl`.
     pub fn arm_direct_writes(&self) -> Result<bool, CanonicalPageError> {
         self.ensure_backing()?;
         let mut state = self.lock_state();
-        if !state.direct_stores_allowed || !matches!(state.visibility, PageVisibility::CpuNewer) {
+        self.arm_direct_writes_locked(&mut state)
+    }
+
+    /// Resolves the cold first-write transition before retrying the native
+    /// store which faulted. The page becomes CPU-visible and dirty before any
+    /// writable alias is republished.
+    pub fn resolve_direct_write_fault(&self) -> Result<bool, CanonicalPageError> {
+        self.ensure_backing()?;
+        loop {
+            self.ensure_cpu_visible()
+                .map_err(CanonicalPageError::Visibility)?;
+            let mut state = self.lock_state();
+            match state.visibility {
+                PageVisibility::Clean => {
+                    self.publish_visibility(&mut state, PageVisibility::CpuNewer)
+                        .map_err(CanonicalPageError::Visibility)?;
+                }
+                PageVisibility::CpuNewer => {}
+                PageVisibility::GpuNewer { .. } => continue,
+                PageVisibility::Conflicting => {
+                    return Err(CanonicalPageError::Visibility(
+                        VisibilityError::ConflictingAccess,
+                    ));
+                }
+                PageVisibility::Invalid => {
+                    return Err(CanonicalPageError::Visibility(
+                        VisibilityError::InvalidState,
+                    ));
+                }
+            }
+            self.publish_cpu_dirty(&mut state)?;
+            return self.arm_direct_writes_locked(&mut state);
+        }
+    }
+
+    fn arm_direct_writes_locked(
+        &self,
+        state: &mut CanonicalPageState,
+    ) -> Result<bool, CanonicalPageError> {
+        if state.cpu_dirty_observer_armed || !matches!(state.visibility, PageVisibility::CpuNewer) {
             return Ok(false);
         }
         if state.direct_write_epoch == Some(state.visibility_epoch) {
             return Ok(true);
         }
-        let generation = self.content_generation();
-        state.cpu_writes.prepare()?;
-        let mut mutation = self
-            .store()
-            .begin_cpu_dirty()
-            .map_err(|error| match error {
-                CanonicalContentMutationError::GenerationExhausted(error) => {
-                    CanonicalPageError::MutationEpochExhausted(error)
-                }
-                CanonicalContentMutationError::ResourceExhausted => {
-                    CanonicalPageError::ResourceExhausted
-                }
-            })?;
-        state.cpu_writes.record(generation, 0, self.size() as u64);
-        mutation
-            .record_cpu_write(self.identity(), 0, self.size() as u64)
-            .map_err(page_mutation_error)?;
-        mutation.commit();
         state.direct_write_epoch = Some(state.visibility_epoch);
-        state.direct_write_generation = Some(generation);
-        if let Err(error) =
-            self.publish_direct_aliases(&mut state, |alias| alias.maximum_protection)
-        {
+        self.inner.direct_write_armed.store(1, Ordering::Release);
+        if let Err(error) = self.publish_direct_alias_protection(state) {
+            self.inner.direct_write_armed.store(0, Ordering::Release);
             state.direct_write_epoch = None;
-            state.direct_write_generation = None;
             return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
                 error.to_string().into_boxed_str(),
             )));
         }
-        self.inner.direct_write_armed.store(1, Ordering::Release);
         Ok(true)
-    }
-
-    /// Enables or disables native stores for every alias of executable
-    /// content. Checked stores retain the exact code-invalidation contract.
-    pub fn set_direct_stores_allowed(&self, allowed: bool) -> Result<(), DirectMemoryError> {
-        let mut state = self.lock_state();
-        if state.direct_stores_allowed == allowed {
-            return Ok(());
-        }
-        self.disarm_direct_writes();
-        state.direct_write_epoch = None;
-        state.direct_write_generation = None;
-        state.direct_stores_allowed = allowed;
-        let mut live_aliases = Vec::with_capacity(state.direct_aliases.len());
-        state.direct_aliases.retain(|_, alias| {
-            let Some(arena) = alias.arena.upgrade() else {
-                return false;
-            };
-            live_aliases.push((arena, alias.guest_address, alias.maximum_protection));
-            true
-        });
-        for (arena, guest_address, maximum_protection) in live_aliases {
-            let control = (allowed && maximum_protection == DirectProtection::ReadWrite)
-                .then(|| self.direct_store_control());
-            arena.publish_store_control(guest_address, control)?;
-        }
-        self.publish_direct_alias_protection(&mut state)
     }
 
     fn direct_store_control(&self) -> &DirectStoreControl {
@@ -822,16 +447,6 @@ impl CanonicalBackingPage {
             .get_or_init(|| DirectStoreControl {
                 write_sequence_address: std::ptr::from_ref(&self.inner.write_sequence).addr(),
                 generation_address: std::ptr::from_ref(&self.inner.generation).addr(),
-                content_epoch_address: std::ptr::from_ref(&self.inner.store.inner.content_epoch)
-                    .addr(),
-                cpu_write_epoch_address: std::ptr::from_ref(
-                    &self.inner.store.inner.cpu_write_epoch,
-                )
-                .addr(),
-                cpu_writes_active_address: std::ptr::from_ref(
-                    &self.inner.store.inner.cpu_writes_active,
-                )
-                .addr(),
                 write_armed_address: std::ptr::from_ref(&self.inner.direct_write_armed).addr(),
             })
     }
@@ -847,9 +462,50 @@ impl CanonicalBackingPage {
         self.read_with_generation(offset, output).map(|_| ())
     }
 
-    /// Copies bytes and observes their content generation under the same page
-    /// lock. Exclusive-load adapters use this to avoid pairing stale bytes with
-    /// a newer reservation generation.
+    /// Copies bytes while the caller holds this store's execution gate
+    /// exclusively. No ordinary writer can overlap, so no per-store sequence
+    /// observation is needed.
+    pub(crate) fn read_quiescent(
+        &self,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), CanonicalPageError> {
+        self.checked_end(offset, output.len())?;
+        let state = self.lock_state();
+        match state.visibility {
+            PageVisibility::Clean | PageVisibility::CpuNewer => {
+                self.load_bytes_quiescent(offset, output);
+                Ok(())
+            }
+            PageVisibility::GpuNewer { .. } => Err(CanonicalPageError::Visibility(
+                VisibilityError::ConcurrentTransition,
+            )),
+            PageVisibility::Conflicting => Err(CanonicalPageError::Visibility(
+                VisibilityError::ConflictingAccess,
+            )),
+            PageVisibility::Invalid => Err(CanonicalPageError::Visibility(
+                VisibilityError::InvalidState,
+            )),
+        }
+    }
+
+    /// Reports whether canonical bytes may be copied while the caller holds
+    /// this store's execution gate exclusively.
+    pub(crate) fn cpu_visible_quiescent(&self) -> Result<bool, CanonicalPageError> {
+        match self.lock_state().visibility {
+            PageVisibility::Clean | PageVisibility::CpuNewer => Ok(true),
+            PageVisibility::GpuNewer { .. } => Ok(false),
+            PageVisibility::Conflicting => Err(CanonicalPageError::Visibility(
+                VisibilityError::ConflictingAccess,
+            )),
+            PageVisibility::Invalid => Err(CanonicalPageError::Visibility(
+                VisibilityError::InvalidState,
+            )),
+        }
+    }
+
+    /// Copies bytes and observes their content generation under one stable
+    /// page snapshot for checked scalar, code-fetch, and atomic adapters.
     pub fn read_with_generation(
         &self,
         offset: usize,
@@ -896,48 +552,44 @@ impl CanonicalBackingPage {
             .try_reserve_exact(self.size())
             .map_err(|_| CanonicalPageError::ResourceExhausted)?;
         bytes.resize(self.size(), 0);
-        loop {
-            self.ensure_cpu_visible()
-                .map_err(CanonicalPageError::Visibility)?;
-            let mut state = self.lock_state();
-            match state.visibility {
-                PageVisibility::Clean | PageVisibility::CpuNewer => {
-                    state.cpu_writes.prepare()?;
-                    self.disarm_direct_writes();
-                    self.finalize_direct_provenance(&mut state);
-                    let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
-                        state.visibility = PageVisibility::Invalid;
-                        return Err(CanonicalPageError::Visibility(
-                            VisibilityError::VisibilityEpochExhausted,
-                        ));
-                    };
-                    state.visibility_epoch = next_epoch;
-                    state.direct_write_epoch = None;
-                    state.direct_write_generation = None;
-                    if let Err(error) = self.publish_direct_alias_protection(&mut state) {
-                        state.visibility = PageVisibility::Invalid;
-                        return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
-                            error.to_string().into_boxed_str(),
-                        )));
-                    }
-                    self.load_bytes(0, &mut bytes);
-                    let generation = self.content_generation();
-                    let visibility_epoch = state.visibility_epoch;
-                    return Ok((bytes.into_boxed_slice(), generation, visibility_epoch));
-                }
-                PageVisibility::GpuNewer { .. } => {}
-                PageVisibility::Conflicting => {
-                    return Err(CanonicalPageError::Visibility(
-                        VisibilityError::ConflictingAccess,
-                    ));
-                }
-                PageVisibility::Invalid => {
-                    return Err(CanonicalPageError::Visibility(
-                        VisibilityError::InvalidState,
-                    ));
-                }
+        let mut state = self.lock_state();
+        match state.visibility {
+            PageVisibility::Clean | PageVisibility::CpuNewer => {}
+            PageVisibility::GpuNewer { .. } => {
+                return Err(CanonicalPageError::Visibility(
+                    VisibilityError::ConcurrentTransition,
+                ));
+            }
+            PageVisibility::Conflicting => {
+                return Err(CanonicalPageError::Visibility(
+                    VisibilityError::ConflictingAccess,
+                ));
+            }
+            PageVisibility::Invalid => {
+                return Err(CanonicalPageError::Visibility(
+                    VisibilityError::InvalidState,
+                ));
             }
         }
+        self.disarm_direct_writes();
+        let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
+            state.visibility = PageVisibility::Invalid;
+            return Err(CanonicalPageError::Visibility(
+                VisibilityError::VisibilityEpochExhausted,
+            ));
+        };
+        state.visibility_epoch = next_epoch;
+        state.direct_write_epoch = None;
+        if let Err(error) = self.publish_direct_alias_protection(&mut state) {
+            state.visibility = PageVisibility::Invalid;
+            return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                error.to_string().into_boxed_str(),
+            )));
+        }
+        self.load_bytes_quiescent(0, &mut bytes);
+        let generation = self.content_generation();
+        let visibility_epoch = state.visibility_epoch;
+        Ok((bytes.into_boxed_slice(), generation, visibility_epoch))
     }
 
     /// Materializes zero storage before a multi-page write is published.
@@ -950,7 +602,6 @@ impl CanonicalBackingPage {
         let mut state = self.lock_state();
         self.require_cpu_authority(&mut state)
             .map_err(CanonicalPageError::Visibility)?;
-        state.cpu_writes.prepare()?;
         Ok(())
     }
 
@@ -974,43 +625,27 @@ impl CanonicalBackingPage {
         expected: ContentGeneration,
         next: ContentGeneration,
     ) -> Result<(), CanonicalPageError> {
-        let end = self.checked_end(offset, bytes.len())?;
+        self.checked_end(offset, bytes.len())?;
         self.ensure_backing()?;
         if expected.next() != Ok(next) {
             return Err(CanonicalPageError::InvalidGenerationTransition);
         }
-        let mut mutation = self
-            .store()
-            .begin_cpu_write()
-            .map_err(|error| match error {
-                CanonicalContentMutationError::GenerationExhausted(error) => {
-                    CanonicalPageError::MutationEpochExhausted(error)
-                }
-                CanonicalContentMutationError::ResourceExhausted => {
-                    CanonicalPageError::ResourceExhausted
-                }
-            })?;
         let mut state = self.lock_state();
-        state.cpu_writes.prepare()?;
         self.require_cpu_authority(&mut state)
             .map_err(CanonicalPageError::Visibility)?;
         if matches!(state.visibility, PageVisibility::Clean) {
             self.publish_visibility(&mut state, PageVisibility::CpuNewer)
                 .map_err(CanonicalPageError::Visibility)?;
         }
+        self.publish_cpu_dirty(&mut state)?;
         let writer = self.lock_writer();
         let observed = self.content_generation();
         if observed != expected {
             return Err(CanonicalPageError::StaleGeneration { expected, observed });
         }
-        mutation
-            .record_cpu_write(self.identity(), offset as u64, end as u64)
-            .map_err(page_mutation_error)?;
         self.store_bytes_locked(offset, bytes);
         self.inner.generation.store(next.get(), Ordering::Release);
         drop(writer);
-        state.cpu_writes.record(next, offset as u64, end as u64);
-        mutation.commit();
         Ok(())
     }
 
@@ -1025,27 +660,16 @@ impl CanonicalBackingPage {
         bytes: &[u8],
         generation: ContentGeneration,
     ) -> Result<(), CanonicalPageError> {
-        let end = self.checked_end(offset, bytes.len())?;
+        self.checked_end(offset, bytes.len())?;
         self.ensure_backing()?;
-        let mut mutation = self
-            .store()
-            .begin_cpu_write()
-            .map_err(|error| match error {
-                CanonicalContentMutationError::GenerationExhausted(error) => {
-                    CanonicalPageError::MutationEpochExhausted(error)
-                }
-                CanonicalContentMutationError::ResourceExhausted => {
-                    CanonicalPageError::ResourceExhausted
-                }
-            })?;
         let mut state = self.lock_state();
-        state.cpu_writes.prepare()?;
         self.require_cpu_authority(&mut state)
             .map_err(CanonicalPageError::Visibility)?;
         if matches!(state.visibility, PageVisibility::Clean) {
             self.publish_visibility(&mut state, PageVisibility::CpuNewer)
                 .map_err(CanonicalPageError::Visibility)?;
         }
+        self.publish_cpu_dirty(&mut state)?;
         let writer = self.lock_writer();
         let observed = self.content_generation();
         if observed != generation {
@@ -1054,70 +678,8 @@ impl CanonicalBackingPage {
                 observed,
             });
         }
-        mutation
-            .record_cpu_write(self.identity(), offset as u64, end as u64)
-            .map_err(page_mutation_error)?;
         self.store_bytes_locked(offset, bytes);
         drop(writer);
-        state
-            .cpu_writes
-            .record(generation, offset as u64, end as u64);
-        mutation.commit();
-        Ok(())
-    }
-
-    /// Reports exact CPU-side byte writes newer than `generation`.
-    pub fn cpu_write_overlap_since(
-        &self,
-        generation: ContentGeneration,
-        offset: u64,
-        size: u64,
-    ) -> Result<CanonicalCpuWriteOverlap, CanonicalPageError> {
-        let end = offset
-            .checked_add(size)
-            .ok_or(CanonicalPageError::InvalidRange)?;
-        if end > self.size() as u64 {
-            return Err(CanonicalPageError::InvalidRange);
-        }
-        let state = self.lock_state();
-        if state
-            .direct_write_generation
-            .is_some_and(|armed| generation >= armed && self.content_generation() > generation)
-        {
-            return Ok(CanonicalCpuWriteOverlap::Unknown);
-        }
-        Ok(state.cpu_writes.overlap_since(generation, offset, end))
-    }
-
-    /// Appends CPU-written byte intervals newer than `generation`.
-    ///
-    /// Intervals use page-local offsets. When bounded provenance has expired,
-    /// the complete requested interval is appended so callers cannot miss a
-    /// write.
-    pub fn append_cpu_write_ranges_since(
-        &self,
-        generation: ContentGeneration,
-        offset: u64,
-        size: u64,
-        output: &mut Vec<CanonicalCpuWriteRange>,
-    ) -> Result<(), CanonicalPageError> {
-        let end = offset
-            .checked_add(size)
-            .ok_or(CanonicalPageError::InvalidRange)?;
-        if end > self.size() as u64 {
-            return Err(CanonicalPageError::InvalidRange);
-        }
-        let state = self.lock_state();
-        if state
-            .direct_write_generation
-            .is_some_and(|armed| generation >= armed && self.content_generation() > generation)
-        {
-            output.push(CanonicalCpuWriteRange::new(offset, size));
-        } else {
-            state
-                .cpu_writes
-                .append_ranges_since(generation, offset, end, output);
-        }
         Ok(())
     }
 
@@ -1146,7 +708,7 @@ impl CanonicalBackingPage {
                 .try_reserve_exact(self.inner.size)
                 .map_err(|_| VisibilityError::ResourceExhausted)?;
             bytes.resize(self.inner.size, 0);
-            self.load_bytes(0, &mut bytes);
+            self.load_bytes_quiescent(0, &mut bytes);
             (bytes, self.content_generation(), state.visibility_epoch)
         };
         let request = DeviceVisibilityRequest {
@@ -1217,10 +779,6 @@ impl CanonicalBackingPage {
             })
             .transpose()
             .map_err(|_| VisibilityError::ResourceExhausted)?;
-        let mutation = self
-            .store()
-            .begin_device_write()
-            .map_err(VisibilityError::GenerationExhausted)?;
         let mut state = self.lock_state();
         self.revoke_direct_access(&mut state)?;
         match &state.visibility {
@@ -1246,7 +804,6 @@ impl CanonicalBackingPage {
                 coordinator,
             },
         )?;
-        mutation.commit();
         if let Some(invalidation) = invalidation {
             invalidation.commit();
         }
@@ -1319,6 +876,14 @@ impl CanonicalBackingPage {
             return Err(VisibilityError::ConcurrentTransition);
         }
         self.publish_visibility(&mut state, PageVisibility::Clean)?;
+        self.publish_cpu_dirty(&mut state)
+            .map_err(|error| match error {
+                CanonicalPageError::CpuDirtyEpochExhausted => {
+                    VisibilityError::CpuDirtyEpochExhausted
+                }
+                CanonicalPageError::Visibility(error) => error,
+                _ => unreachable!("CPU dirty publication has no other failure mode"),
+            })?;
         self.store_bytes(0, &bytes);
         self.inner
             .generation
@@ -1358,12 +923,14 @@ impl CanonicalBackingPage {
         visibility: PageVisibility,
     ) -> Result<(), VisibilityError> {
         self.disarm_direct_writes();
-        self.publish_direct_alias_protection_for(state, &visibility)
-            .map_err(|error| {
-                state.visibility = PageVisibility::Invalid;
-                VisibilityError::HostMemory(error.to_string().into_boxed_str())
-            })?;
-        self.finalize_direct_provenance(state);
+        self.publish_direct_alias_protection_for(
+            state,
+            matches!(visibility, PageVisibility::Clean | PageVisibility::CpuNewer),
+        )
+        .map_err(|error| {
+            state.visibility = PageVisibility::Invalid;
+            VisibilityError::HostMemory(error.to_string().into_boxed_str())
+        })?;
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
             state.visibility = PageVisibility::Invalid;
             return Err(VisibilityError::VisibilityEpochExhausted);
@@ -1371,7 +938,21 @@ impl CanonicalBackingPage {
         state.visibility = visibility;
         state.visibility_epoch = next_epoch;
         state.direct_write_epoch = None;
-        state.direct_write_generation = None;
+        Ok(())
+    }
+
+    fn publish_cpu_dirty(&self, state: &mut CanonicalPageState) -> Result<(), CanonicalPageError> {
+        if !state.cpu_dirty_observer_armed {
+            return Ok(());
+        }
+        let Some(next) = self.cpu_dirty_epoch().checked_add(1) else {
+            self.revoke_direct_access(state)
+                .map_err(CanonicalPageError::Visibility)?;
+            state.visibility = PageVisibility::Invalid;
+            return Err(CanonicalPageError::CpuDirtyEpochExhausted);
+        };
+        state.cpu_dirty_observer_armed = false;
+        self.inner.cpu_dirty_epoch.store(next, Ordering::Release);
         Ok(())
     }
 
@@ -1382,14 +963,12 @@ impl CanonicalBackingPage {
                 state.visibility = PageVisibility::Invalid;
                 VisibilityError::HostMemory(error.to_string().into_boxed_str())
             })?;
-        self.finalize_direct_provenance(state);
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
             state.visibility = PageVisibility::Invalid;
             return Err(VisibilityError::VisibilityEpochExhausted);
         };
         state.visibility_epoch = next_epoch;
         state.direct_write_epoch = None;
-        state.direct_write_generation = None;
         Ok(())
     }
 
@@ -1397,44 +976,29 @@ impl CanonicalBackingPage {
         &self,
         state: &mut CanonicalPageState,
     ) -> Result<(), DirectMemoryError> {
-        match state.visibility {
-            PageVisibility::Clean | PageVisibility::CpuNewer => {
-                self.publish_direct_alias_maximums(state)
-            }
-            PageVisibility::GpuNewer { .. }
-            | PageVisibility::Conflicting
-            | PageVisibility::Invalid => {
-                self.publish_direct_aliases_as(state, DirectProtection::None)
-            }
-        }
+        self.publish_direct_alias_protection_for(
+            state,
+            matches!(
+                state.visibility,
+                PageVisibility::Clean | PageVisibility::CpuNewer
+            ),
+        )
     }
 
     fn publish_direct_alias_protection_for(
         &self,
         state: &mut CanonicalPageState,
-        visibility: &PageVisibility,
+        cpu_visible: bool,
     ) -> Result<(), DirectMemoryError> {
-        match visibility {
-            PageVisibility::Clean | PageVisibility::CpuNewer => {
-                self.publish_direct_alias_maximums(state)
-            }
-            PageVisibility::GpuNewer { .. }
-            | PageVisibility::Conflicting
-            | PageVisibility::Invalid => {
-                self.publish_direct_aliases_as(state, DirectProtection::None)
-            }
-        }
-    }
-
-    fn publish_direct_alias_maximums(
-        &self,
-        state: &mut CanonicalPageState,
-    ) -> Result<(), DirectMemoryError> {
-        let write_armed = state.direct_stores_allowed
+        let write_enabled = cpu_visible
+            && !state.cpu_dirty_observer_armed
             && self.inner.direct_write_armed.load(Ordering::Acquire) != 0;
-        self.publish_direct_aliases(state, |alias| match alias.maximum_protection {
-            DirectProtection::ReadWrite if !write_armed => DirectProtection::Read,
-            protection => protection,
+        self.publish_direct_aliases(state, |alias| {
+            match (cpu_visible, alias.maximum_protection) {
+                (false, _) => DirectProtection::None,
+                (true, DirectProtection::ReadWrite) if !write_enabled => DirectProtection::Read,
+                (true, protection) => protection,
+            }
         })
     }
 
@@ -1474,17 +1038,6 @@ impl CanonicalBackingPage {
         Ok(())
     }
 
-    fn finalize_direct_provenance(&self, state: &mut CanonicalPageState) {
-        if state
-            .direct_write_generation
-            .is_some_and(|armed| self.content_generation() > armed)
-        {
-            state
-                .cpu_writes
-                .record(self.content_generation(), 0, self.size() as u64);
-        }
-    }
-
     fn checked_end(&self, offset: usize, size: usize) -> Result<usize, CanonicalPageError> {
         offset
             .checked_add(size)
@@ -1499,27 +1052,17 @@ impl CanonicalBackingPage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn load_bytes(&self, offset: usize, output: &mut [u8]) {
+    fn load_bytes_quiescent(&self, offset: usize, output: &mut [u8]) {
         let Some(backing) = self.inner.backing.get() else {
             output.fill(0);
             return;
         };
-        loop {
-            let before = self.inner.write_sequence.load(Ordering::Acquire);
-            if before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            for (index, byte) in output.iter_mut().enumerate() {
-                let position = offset + index;
-                let word_address = backing.base() + (position & !7);
-                let word = unsafe { AtomicU64::from_ptr(word_address as *mut u64) }
-                    .load(Ordering::Acquire);
-                *byte = (word >> ((position % 8) * 8)) as u8;
-            }
-            if self.inner.write_sequence.load(Ordering::Acquire) == before {
-                return;
-            }
+        for (index, byte) in output.iter_mut().enumerate() {
+            let position = offset + index;
+            let word_address = backing.base() + (position & !7);
+            let word =
+                unsafe { AtomicU64::from_ptr(word_address as *mut u64) }.load(Ordering::Acquire);
+            *byte = (word >> ((position % 8) * 8)) as u8;
         }
     }
 
@@ -1668,6 +1211,65 @@ impl CanonicalWriteBatch {
         }
     }
 
+    fn prepare_unstaged_cpu_visible(
+        &self,
+        range: &CanonicalBackingRange,
+        offset: u64,
+        end: u64,
+    ) -> Result<(), CanonicalWriteBatchError> {
+        let mut logical_start = 0_u64;
+        let mut visited = BTreeSet::new();
+        for segment in range.segments() {
+            let logical_end = logical_start
+                .checked_add(segment.size())
+                .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+            if offset.max(logical_start) < end.min(logical_end)
+                && !self.pages.contains_key(&segment.page())
+                && visited.insert(segment.page())
+            {
+                segment
+                    .backing()
+                    .prepare_cpu_access()
+                    .map_err(CanonicalWriteBatchError::Page)?;
+            }
+            logical_start = logical_end;
+            if logical_start >= end {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn unstaged_cpu_visible_quiescent(
+        &self,
+        range: &CanonicalBackingRange,
+        offset: u64,
+        end: u64,
+    ) -> Result<bool, CanonicalWriteBatchError> {
+        let mut logical_start = 0_u64;
+        let mut visited = BTreeSet::new();
+        for segment in range.segments() {
+            let logical_end = logical_start
+                .checked_add(segment.size())
+                .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+            if offset.max(logical_start) < end.min(logical_end)
+                && !self.pages.contains_key(&segment.page())
+                && visited.insert(segment.page())
+                && !segment
+                    .backing()
+                    .cpu_visible_quiescent()
+                    .map_err(CanonicalWriteBatchError::Page)?
+            {
+                return Ok(false);
+            }
+            logical_start = logical_end;
+            if logical_start >= end {
+                break;
+            }
+        }
+        Ok(true)
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pages.is_empty()
@@ -1753,54 +1355,70 @@ impl CanonicalWriteBatch {
         if output.is_empty() {
             return Ok(());
         }
+        loop {
+            self.prepare_unstaged_cpu_visible(range, offset, end)?;
+            let mut stores = BTreeMap::new();
+            for segment in range.segments() {
+                stores
+                    .entry(segment.backing().store().identity())
+                    .or_insert_with(|| segment.backing().store().clone());
+            }
+            let _transitions = stores
+                .values()
+                .map(|store| store.execution_gate().acquire_exclusive())
+                .collect::<Vec<_>>();
+            if !self.unstaged_cpu_visible_quiescent(range, offset, end)? {
+                continue;
+            }
 
-        let mut logical_start = 0_u64;
-        let mut copied = 0_usize;
-        for segment in range.segments() {
-            let logical_end = logical_start
-                .checked_add(segment.size())
-                .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
-            let read_start = offset.max(logical_start);
-            let read_end = end.min(logical_end);
-            if read_start < read_end {
-                if !segment.permissions().contains(MemoryPermissions::READ) {
-                    return Err(CanonicalWriteBatchError::PermissionDenied {
-                        page: segment.page(),
-                        available: segment.permissions(),
-                    });
-                }
-                let within_segment = read_start - logical_start;
-                let page_offset = segment
-                    .offset()
-                    .checked_add(within_segment)
+            let mut logical_start = 0_u64;
+            let mut copied = 0_usize;
+            for segment in range.segments() {
+                let logical_end = logical_start
+                    .checked_add(segment.size())
                     .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
-                let page_offset = usize::try_from(page_offset)
-                    .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
-                let count = usize::try_from(read_end - read_start)
-                    .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
-                let copied_end = copied
-                    .checked_add(count)
-                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
-                if let Some(pending) = self.pages.get(&segment.page()) {
-                    output[copied..copied_end]
-                        .copy_from_slice(&pending.bytes[page_offset..page_offset + count]);
-                } else {
-                    segment
-                        .backing()
-                        .read(page_offset, &mut output[copied..copied_end])
-                        .map_err(CanonicalWriteBatchError::Page)?;
+                let read_start = offset.max(logical_start);
+                let read_end = end.min(logical_end);
+                if read_start < read_end {
+                    if !segment.permissions().contains(MemoryPermissions::READ) {
+                        return Err(CanonicalWriteBatchError::PermissionDenied {
+                            page: segment.page(),
+                            available: segment.permissions(),
+                        });
+                    }
+                    let within_segment = read_start - logical_start;
+                    let page_offset = segment
+                        .offset()
+                        .checked_add(within_segment)
+                        .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                    let page_offset = usize::try_from(page_offset)
+                        .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+                    let count = usize::try_from(read_end - read_start)
+                        .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+                    let copied_end = copied
+                        .checked_add(count)
+                        .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                    if let Some(pending) = self.pages.get(&segment.page()) {
+                        output[copied..copied_end]
+                            .copy_from_slice(&pending.bytes[page_offset..page_offset + count]);
+                    } else {
+                        segment
+                            .backing()
+                            .read_quiescent(page_offset, &mut output[copied..copied_end])
+                            .map_err(CanonicalWriteBatchError::Page)?;
+                    }
+                    copied = copied_end;
                 }
-                copied = copied_end;
+                logical_start = logical_end;
+                if logical_start >= end {
+                    break;
+                }
             }
-            logical_start = logical_end;
-            if logical_start >= end {
-                break;
+            if copied != output.len() {
+                return Err(CanonicalWriteBatchError::IncompleteRange);
             }
+            return Ok(());
         }
-        if copied != output.len() {
-            return Err(CanonicalWriteBatchError::IncompleteRange);
-        }
-        Ok(())
     }
 
     /// Stages one checked logical write. Discard the batch if this fails.
@@ -1826,81 +1444,89 @@ impl CanonicalWriteBatch {
             return Ok(());
         }
 
-        // Acquire every involved store in stable identity order. Native CPU
-        // writers are now quiescent for the whole multi-page snapshot, so
-        // pages can revoke write publication without a per-page NONE/read
-        // protection round trip. Dropping these uncommitted guards preserves
-        // the mapping epoch: staging changes no mapping or guest byte.
-        let mut stores = BTreeMap::new();
-        for segment in range.segments() {
-            stores
-                .entry(segment.page().store())
-                .or_insert_with(|| segment.backing().store().clone());
-        }
-        let _transitions = stores
-            .values()
-            .map(|store| store.execution_gate().acquire_exclusive())
-            .collect::<Vec<_>>();
+        loop {
+            self.prepare_unstaged_cpu_visible(range, offset, end)?;
 
-        let mut logical_start = 0_u64;
-        let mut copied = 0_usize;
-        for segment in range.segments() {
-            let logical_end = logical_start
-                .checked_add(segment.size())
-                .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
-            let write_start = offset.max(logical_start);
-            let write_end = end.min(logical_end);
-            if write_start < write_end {
-                if !segment.permissions().contains(MemoryPermissions::WRITE) {
-                    return Err(CanonicalWriteBatchError::PermissionDenied {
-                        page: segment.page(),
-                        available: segment.permissions(),
-                    });
-                }
-                let pending = match self.pages.entry(segment.page()) {
-                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        let (page_bytes, generation, visibility_epoch) = segment
-                            .backing()
-                            .snapshot_cpu_write_quiescent()
-                            .map_err(CanonicalWriteBatchError::Page)?;
-                        entry.insert(PendingCanonicalPageWrite {
-                            backing: segment.backing().clone(),
-                            expected_generation: generation,
-                            expected_visibility_epoch: visibility_epoch,
-                            bytes: page_bytes,
-                            dirty_ranges: Vec::new(),
-                        })
+            // Acquire every involved store in stable identity order. Native
+            // CPU writers are quiescent for the whole multi-page snapshot, so
+            // pages can revoke write publication without a per-page NONE/read
+            // protection round trip. Dropping these uncommitted guards
+            // preserves the mapping epoch: staging changes no mapping or
+            // guest byte.
+            let mut stores = BTreeMap::new();
+            for segment in range.segments() {
+                stores
+                    .entry(segment.page().store())
+                    .or_insert_with(|| segment.backing().store().clone());
+            }
+            let _transitions = stores
+                .values()
+                .map(|store| store.execution_gate().acquire_exclusive())
+                .collect::<Vec<_>>();
+            if !self.unstaged_cpu_visible_quiescent(range, offset, end)? {
+                continue;
+            }
+
+            let mut logical_start = 0_u64;
+            let mut copied = 0_usize;
+            for segment in range.segments() {
+                let logical_end = logical_start
+                    .checked_add(segment.size())
+                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                let write_start = offset.max(logical_start);
+                let write_end = end.min(logical_end);
+                if write_start < write_end {
+                    if !segment.permissions().contains(MemoryPermissions::WRITE) {
+                        return Err(CanonicalWriteBatchError::PermissionDenied {
+                            page: segment.page(),
+                            available: segment.permissions(),
+                        });
                     }
-                };
-                let within_segment = write_start - logical_start;
-                let page_offset = segment
-                    .offset()
-                    .checked_add(within_segment)
-                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
-                let page_offset = usize::try_from(page_offset)
-                    .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
-                let count = usize::try_from(write_end - write_start)
-                    .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
-                let copied_end = copied
-                    .checked_add(count)
-                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
-                pending.bytes[page_offset..page_offset + count]
-                    .copy_from_slice(&bytes[copied..copied_end]);
-                pending
-                    .dirty_ranges
-                    .push((page_offset as u64, (page_offset + count) as u64));
-                copied = copied_end;
+                    let pending = match self.pages.entry(segment.page()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            let (page_bytes, generation, visibility_epoch) = segment
+                                .backing()
+                                .snapshot_cpu_write_quiescent()
+                                .map_err(CanonicalWriteBatchError::Page)?;
+                            entry.insert(PendingCanonicalPageWrite {
+                                backing: segment.backing().clone(),
+                                expected_generation: generation,
+                                expected_visibility_epoch: visibility_epoch,
+                                bytes: page_bytes,
+                                dirty_ranges: Vec::new(),
+                            })
+                        }
+                    };
+                    let within_segment = write_start - logical_start;
+                    let page_offset = segment
+                        .offset()
+                        .checked_add(within_segment)
+                        .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                    let page_offset = usize::try_from(page_offset)
+                        .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+                    let count = usize::try_from(write_end - write_start)
+                        .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+                    let copied_end = copied
+                        .checked_add(count)
+                        .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                    pending.bytes[page_offset..page_offset + count]
+                        .copy_from_slice(&bytes[copied..copied_end]);
+                    pending
+                        .dirty_ranges
+                        .push((page_offset as u64, (page_offset + count) as u64));
+                    copied = copied_end;
+                }
+                logical_start = logical_end;
+                if logical_start >= end {
+                    break;
+                }
             }
-            logical_start = logical_end;
-            if logical_start >= end {
-                break;
+            if copied != bytes.len() {
+                return Err(CanonicalWriteBatchError::IncompleteRange);
             }
+            return Ok(());
         }
-        if copied != bytes.len() {
-            return Err(CanonicalWriteBatchError::IncompleteRange);
-        }
-        Ok(())
     }
 
     /// Publishes every staged byte mutation and advances each page once.
@@ -1911,8 +1537,18 @@ impl CanonicalWriteBatch {
             next_generation: ContentGeneration,
             next_visibility_epoch: u64,
             bytes: Option<Box<[u8]>>,
-            dirty_ranges: Vec<(u64, u64)>,
         }
+
+        let mut stores = BTreeMap::new();
+        for pending in self.pages.values() {
+            stores
+                .entry(pending.backing.store().identity())
+                .or_insert_with(|| pending.backing.store().clone());
+        }
+        let _transitions = stores
+            .values()
+            .map(|store| store.execution_gate().acquire_exclusive())
+            .collect::<Vec<_>>();
 
         let mut backings = Vec::new();
         let mut writes = Vec::new();
@@ -1938,7 +1574,6 @@ impl CanonicalWriteBatch {
                 next_generation,
                 next_visibility_epoch,
                 bytes: Some(pending.bytes),
-                dirty_ranges: pending.dirty_ranges,
             });
         }
         for backing in &backings {
@@ -1946,26 +1581,6 @@ impl CanonicalWriteBatch {
                 .ensure_backing()
                 .map_err(CanonicalWriteBatchError::Page)?;
         }
-
-        let mut stores = backings
-            .iter()
-            .map(|backing| backing.store().clone())
-            .collect::<Vec<_>>();
-        stores.sort_by_key(CanonicalBackingStore::identity);
-        stores.dedup_by_key(|store| store.identity());
-        let mut mutations = stores
-            .iter()
-            .map(|store| {
-                store.begin_cpu_write().map_err(|error| match error {
-                    CanonicalContentMutationError::GenerationExhausted(error) => {
-                        CanonicalWriteBatchError::GenerationExhausted(error)
-                    }
-                    CanonicalContentMutationError::ResourceExhausted => {
-                        CanonicalWriteBatchError::ResourceExhausted
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
 
         let mut states = backings
             .iter()
@@ -1981,23 +1596,10 @@ impl CanonicalWriteBatch {
             {
                 return Err(CanonicalWriteBatchError::ConcurrentMutation);
             }
-        }
-        for (backing, write) in backings.iter().zip(&writes) {
-            let mutation = mutations
-                .iter_mut()
-                .find(|mutation| mutation.store.identity() == backing.identity().store())
-                .expect("every written backing store has a prepared mutation");
-            for &(start, end) in &write.dirty_ranges {
-                mutation
-                    .record_cpu_write(backing.identity(), start, end)
-                    .map_err(|error| match error {
-                        CanonicalContentMutationError::GenerationExhausted(error) => {
-                            CanonicalWriteBatchError::GenerationExhausted(error)
-                        }
-                        CanonicalContentMutationError::ResourceExhausted => {
-                            CanonicalWriteBatchError::ResourceExhausted
-                        }
-                    })?;
+            if state.cpu_dirty_observer_armed && backing.cpu_dirty_epoch() == u64::MAX {
+                return Err(CanonicalWriteBatchError::Page(
+                    CanonicalPageError::CpuDirtyEpochExhausted,
+                ));
             }
         }
         for ((backing, state), write) in backings.iter().zip(states.iter_mut()).zip(&mut writes) {
@@ -2005,6 +1607,9 @@ impl CanonicalWriteBatch {
                 .bytes
                 .take()
                 .expect("prepared canonical batch write retains its bytes");
+            backing
+                .publish_cpu_dirty(state)
+                .expect("CPU dirty epochs were preflighted while page states are locked");
             backing.store_bytes(0, &bytes);
             backing
                 .inner
@@ -2013,13 +1618,6 @@ impl CanonicalWriteBatch {
             state.visibility = PageVisibility::CpuNewer;
             state.visibility_epoch = write.next_visibility_epoch;
             state.direct_write_epoch = None;
-            state.direct_write_generation = None;
-            for &(start, end) in &write.dirty_ranges {
-                state.cpu_writes.record(write.next_generation, start, end);
-            }
-        }
-        for mutation in mutations {
-            mutation.commit();
         }
         Ok(())
     }
@@ -2103,8 +1701,8 @@ pub enum CanonicalPageError {
     },
     /// The supplied next generation was not the exact successor.
     InvalidGenerationTransition,
-    /// The store-wide content mutation epoch cannot advance without wrapping.
-    MutationEpochExhausted(GenerationExhausted),
+    /// The page-granular CPU dirty epoch cannot advance without wrapping.
+    CpuDirtyEpochExhausted,
     /// Required CPU/device visibility work could not be completed.
     Visibility(VisibilityError),
 }
@@ -2124,7 +1722,9 @@ impl Display for CanonicalPageError {
             Self::InvalidGenerationTransition => {
                 formatter.write_str("canonical page generation transition is not consecutive")
             }
-            Self::MutationEpochExhausted(error) => error.fmt(formatter),
+            Self::CpuDirtyEpochExhausted => {
+                formatter.write_str("canonical CPU dirty epoch is exhausted")
+            }
             Self::Visibility(error) => error.fmt(formatter),
         }
     }
@@ -2211,19 +1811,39 @@ impl CanonicalAllocation {
     pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), CanonicalAllocationError> {
         let end = self.checked_end(offset, output.len())?;
         let _transaction = self.lock_transaction();
-        let mut cursor = offset;
-        let mut copied = 0;
-        while cursor < end {
-            let page_index = cursor / self.inner.page_size;
-            let page_offset = cursor % self.inner.page_size;
-            let count = (self.inner.page_size - page_offset).min(end - cursor);
-            self.inner.pages[page_index]
-                .read(page_offset, &mut output[copied..copied + count])
-                .map_err(CanonicalAllocationError::Page)?;
-            cursor += count;
-            copied += count;
+        if output.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let first_page = offset / self.inner.page_size;
+        let last_page = (end - 1) / self.inner.page_size;
+        loop {
+            for page in &self.inner.pages[first_page..=last_page] {
+                page.prepare_cpu_access()
+                    .map_err(CanonicalAllocationError::Page)?;
+            }
+            let _execution = self.inner.store.execution_gate().acquire_exclusive();
+            let cpu_visible = self.inner.pages[first_page..=last_page]
+                .iter()
+                .map(CanonicalBackingPage::cpu_visible_quiescent)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CanonicalAllocationError::Page)?;
+            if !cpu_visible.into_iter().all(std::convert::identity) {
+                continue;
+            }
+            let mut cursor = offset;
+            let mut copied = 0;
+            while cursor < end {
+                let page_index = cursor / self.inner.page_size;
+                let page_offset = cursor % self.inner.page_size;
+                let count = (self.inner.page_size - page_offset).min(end - cursor);
+                self.inner.pages[page_index]
+                    .read_quiescent(page_offset, &mut output[copied..copied + count])
+                    .map_err(CanonicalAllocationError::Page)?;
+                cursor += count;
+                copied += count;
+            }
+            return Ok(());
+        }
     }
 
     /// Atomically writes a checked logical range and advances each affected
@@ -2236,13 +1856,33 @@ impl CanonicalAllocation {
         }
         let first_page = offset / self.inner.page_size;
         let last_page = (end - 1) / self.inner.page_size;
+        for page in &self.inner.pages[first_page..=last_page] {
+            page.prepare_write()
+                .map_err(CanonicalAllocationError::Page)?;
+        }
+        let _execution = loop {
+            let execution = self.inner.store.execution_gate().acquire_exclusive();
+            if self.inner.pages[first_page..=last_page]
+                .iter()
+                .map(CanonicalBackingPage::cpu_visible_quiescent)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CanonicalAllocationError::Page)?
+                .into_iter()
+                .all(std::convert::identity)
+            {
+                break execution;
+            }
+            drop(execution);
+            for page in &self.inner.pages[first_page..=last_page] {
+                page.prepare_write()
+                    .map_err(CanonicalAllocationError::Page)?;
+            }
+        };
         let mut generations = Vec::new();
         generations
             .try_reserve_exact(last_page - first_page + 1)
             .map_err(|_| CanonicalAllocationError::ResourceExhausted)?;
         for page in &self.inner.pages[first_page..=last_page] {
-            page.prepare_write()
-                .map_err(CanonicalAllocationError::Page)?;
             let current = page.content_generation();
             let next = current
                 .next()
@@ -2284,7 +1924,6 @@ impl CanonicalAllocation {
                     0,
                     size as u64,
                     permissions,
-                    page.content_generation(),
                     MappingGeneration::INITIAL,
                 )
                 .map_err(CanonicalAllocationError::Range)?,
@@ -2348,8 +1987,8 @@ mod tests {
     use std::thread;
 
     use crate::{
-        DeviceVisibilityPoint, DirectArena, DirectMapRequest, DirectProtection, GenerationKind,
-        VisibilityCoordinatorError, VisibilityState,
+        CanonicalCpuWriteDependency, DeviceVisibilityPoint, DirectArena, DirectMapRequest,
+        DirectProtection, GenerationKind, VisibilityCoordinatorError, VisibilityState,
     };
 
     #[derive(Default)]
@@ -2426,106 +2065,6 @@ mod tests {
     }
 
     #[test]
-    fn store_epoch_detects_a_mutation_when_the_max_page_generation_does_not_change() {
-        let store = CanonicalBackingStore::allocate().unwrap();
-        let dominant = CanonicalBackingPage::zeroed(
-            &store,
-            GuestPhysicalPageId::new(1),
-            0x1000,
-            ContentGeneration::new(100),
-        )
-        .unwrap();
-        let changed = CanonicalBackingPage::zeroed(
-            &store,
-            GuestPhysicalPageId::new(2),
-            0x1000,
-            ContentGeneration::INITIAL,
-        )
-        .unwrap();
-
-        assert_eq!(store.content_epoch(), ContentMutationEpoch::INITIAL);
-        changed
-            .write_preflighted(
-                0,
-                &[0x5a],
-                ContentGeneration::INITIAL,
-                ContentGeneration::new(1),
-            )
-            .unwrap();
-
-        assert_eq!(dominant.content_generation(), ContentGeneration::new(100));
-        assert_eq!(changed.content_generation(), ContentGeneration::new(1));
-        assert_eq!(store.content_epoch(), ContentMutationEpoch::new(1));
-    }
-
-    #[test]
-    fn rejected_page_write_does_not_advance_the_store_epoch() {
-        let store = CanonicalBackingStore::allocate().unwrap();
-        let page = CanonicalBackingPage::zeroed(
-            &store,
-            GuestPhysicalPageId::new(1),
-            0x1000,
-            ContentGeneration::INITIAL,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            page.write_preflighted(
-                0,
-                &[0x5a],
-                ContentGeneration::new(7),
-                ContentGeneration::new(8),
-            ),
-            Err(CanonicalPageError::StaleGeneration { .. })
-        ));
-        assert_eq!(store.content_epoch(), ContentMutationEpoch::INITIAL);
-    }
-
-    #[test]
-    fn concurrent_page_publications_do_not_lose_store_epoch_updates() {
-        const WRITES_PER_PAGE: u64 = 64;
-
-        let store = CanonicalBackingStore::allocate().unwrap();
-        let pages = [
-            CanonicalBackingPage::zeroed(
-                &store,
-                GuestPhysicalPageId::new(1),
-                1,
-                ContentGeneration::INITIAL,
-            )
-            .unwrap(),
-            CanonicalBackingPage::zeroed(
-                &store,
-                GuestPhysicalPageId::new(2),
-                1,
-                ContentGeneration::INITIAL,
-            )
-            .unwrap(),
-        ];
-        let workers = pages.map(|page| {
-            thread::spawn(move || {
-                for generation in 0..WRITES_PER_PAGE {
-                    page.write_preflighted(
-                        0,
-                        &[generation as u8],
-                        ContentGeneration::new(generation),
-                        ContentGeneration::new(generation + 1),
-                    )
-                    .unwrap();
-                }
-            })
-        });
-
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        assert_eq!(
-            store.content_epoch(),
-            ContentMutationEpoch::new(WRITES_PER_PAGE * 2)
-        );
-    }
-
-    #[test]
     fn retained_allocation_spans_pages_and_versions_written_contents() {
         let allocation = CanonicalAllocation::zeroed(0x1800, 0x1000).unwrap();
         let before = allocation
@@ -2534,23 +2073,15 @@ mod tests {
         assert_eq!(before.size(), 0x1800);
         assert_eq!(before.segments().len(), 2);
         assert_eq!(before.segments()[1].size(), 0x800);
+        let cpu_writes = CanonicalCpuWriteDependency::capture(&before).unwrap();
 
         allocation.write(0xffe, &[1, 2, 3, 4]).unwrap();
         let mut bytes = [0; 4];
         allocation.read(0xffe, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3, 4]);
-        assert!(!before.segments()[0].content_is_current());
-        assert!(!before.segments()[1].content_is_current());
+        assert!(!cpu_writes.remains_current());
 
         let after = allocation.backing_range(MemoryPermissions::READ).unwrap();
-        assert_eq!(
-            after.segments()[0].content_generation(),
-            ContentGeneration::new(1)
-        );
-        assert_eq!(
-            after.segments()[1].content_generation(),
-            ContentGeneration::new(1)
-        );
         assert_ne!(after.segments()[0].page(), after.segments()[1].page());
         assert_eq!(
             after.segments()[0].page().store(),
@@ -2567,20 +2098,15 @@ mod tests {
         };
 
         assert_eq!(retained.size(), 0x1000);
-        assert!(retained.segments()[0].content_is_current());
-        assert_eq!(
-            retained.segments()[0].content_generation(),
-            ContentGeneration::new(1)
-        );
+        let mut observed = [0; 1];
+        retained.read(7, &mut observed).unwrap();
+        assert_eq!(observed, [0x5a]);
     }
 
     #[test]
     fn device_visibility_round_trip_uses_injected_slow_path() {
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         allocation.write(4, &[0x11]).unwrap();
-        let content_epoch_after_cpu_write = allocation.inner.store.content_epoch();
-        let cpu_write_epoch = allocation.inner.store.cpu_write_epoch();
-        assert_eq!(cpu_write_epoch, CpuWriteEpoch::new(1));
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
@@ -2614,16 +2140,6 @@ mod tests {
         range
             .publish_device_write(declaration, Arc::clone(&erased))
             .unwrap();
-        let device_write_epoch = allocation.inner.store.content_epoch();
-        assert_eq!(
-            device_write_epoch,
-            content_epoch_after_cpu_write.next().unwrap()
-        );
-        assert_eq!(
-            allocation.inner.store.cpu_write_epoch(),
-            cpu_write_epoch,
-            "device writes do not invalidate the CPU-write-only fast path"
-        );
         assert_eq!(
             range.segments()[0].visibility_state(),
             VisibilityState::GpuNewer {
@@ -2632,11 +2148,10 @@ mod tests {
             }
         );
 
-        let before_download = range.segments()[0].content_generation();
+        let before_download = range.segments()[0].backing().content_generation();
         let mut observed = [0; 1];
         allocation.read(4, &mut observed).unwrap();
         assert_eq!(observed, [0x5a]);
-        assert_eq!(allocation.inner.store.content_epoch(), device_write_epoch);
         assert_eq!(coordinator.downloads.lock().unwrap().len(), 1);
         assert_eq!(
             range.segments()[0].visibility_state(),
@@ -2647,9 +2162,92 @@ mod tests {
                 .backing_range(MemoryPermissions::READ)
                 .unwrap()
                 .segments()[0]
+                .backing()
                 .content_generation(),
             before_download.next().unwrap()
         );
+    }
+
+    #[test]
+    fn device_newer_write_fault_reconciles_then_dirties_in_one_page_resolver() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let host = page.direct_backing().unwrap();
+        let arena = DirectArena::new(0x3000).unwrap();
+        arena
+            .map_pages(&[DirectMapRequest {
+                guest_address: 0x1000,
+                backing: &host,
+                protection: DirectProtection::Read,
+            }])
+            .unwrap();
+        page.register_direct_alias(&arena, 0x1000, DirectProtection::ReadWrite)
+            .unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let mut device_bytes = vec![0; 0x1000];
+        device_bytes[7] = 0xa5;
+        let coordinator: Arc<dyn VisibilityCoordinator> =
+            Arc::new(RecordingCoordinator::with_writeback(device_bytes));
+        let declaration = DeviceAccessDeclaration::read_write(
+            NonCpuDeviceId::new(9),
+            DeviceVisibilityPoint::new(30),
+            DeviceVisibilityPoint::new(31),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        range
+            .publish_device_write(declaration, coordinator)
+            .unwrap();
+        assert_eq!(arena.protection_at(0x1000), Some(DirectProtection::None));
+
+        assert!(page.resolve_direct_write_fault().unwrap());
+
+        let mut observed = [0];
+        page.read(7, &mut observed).unwrap();
+        assert_eq!(observed, [0xa5]);
+        assert_eq!(page.visibility_state(), VisibilityState::CpuNewer);
+        assert_eq!(
+            arena.protection_at(0x1000),
+            Some(DirectProtection::ReadWrite)
+        );
+        assert!(!dependency.remains_current());
+    }
+
+    #[test]
+    fn device_materialization_publishes_page_dirty_without_a_cpu_fault() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> =
+            Arc::new(RecordingCoordinator::with_writeback(vec![0x5a; 0x1000]));
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(10),
+            DeviceVisibilityPoint::new(40),
+            DeviceVisibilityPoint::new(41),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        range
+            .publish_device_write(declaration, coordinator)
+            .unwrap();
+
+        assert_eq!(page.cpu_dirty_epoch(), 0);
+        assert!(dependency.remains_current());
+        let mut observed = [0; 1];
+        range.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [0x5a]);
+        assert_eq!(page.cpu_dirty_epoch(), 1);
+        assert!(!dependency.remains_current());
     }
 
     #[test]
@@ -2686,7 +2284,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_cpu_write_rejects_an_in_flight_device_snapshot() {
+    fn cpu_write_waits_for_an_in_flight_device_snapshot() {
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
@@ -2695,27 +2293,37 @@ mod tests {
         let erased: Arc<dyn VisibilityCoordinator> = coordinator.clone();
         let declaration =
             DeviceAccessDeclaration::read(NonCpuDeviceId::new(8), DeviceVisibilityPoint::new(1));
+        let cpu_writes = CanonicalCpuWriteDependency::capture(&range).unwrap();
         let worker_range = range.clone();
         let worker = thread::spawn(move || {
             worker_range.prepare_device_access(declaration, Arc::clone(&erased))
         });
 
         coordinator.entered.wait();
-        allocation.write(0, &[0x5a]).unwrap();
+        let writer_allocation = allocation.clone();
+        let (writer_started, started) = std::sync::mpsc::channel();
+        let (writer_completed, completed) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            writer_started.send(()).unwrap();
+            writer_completed
+                .send(writer_allocation.write(0, &[0x5a]))
+                .unwrap();
+        });
+        started.recv().unwrap();
+        assert_eq!(
+            completed.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
         coordinator.release.wait();
 
-        assert_eq!(
-            worker.join().unwrap(),
-            Err(VisibilityError::ConcurrentTransition)
-        );
+        assert_eq!(worker.join().unwrap(), Ok(()));
+        assert_eq!(completed.recv().unwrap(), Ok(()));
+        writer.join().unwrap();
         assert_eq!(
             range.segments()[0].visibility_state(),
-            VisibilityState::Conflicting
+            VisibilityState::CpuNewer
         );
-        assert!(
-            !range.segments()[0].content_is_current(),
-            "the concurrent CPU write must publish its content generation"
-        );
+        assert!(!cpu_writes.remains_current());
     }
 
     #[test]
@@ -2734,7 +2342,6 @@ mod tests {
                 0,
                 0x1000,
                 MemoryPermissions::READ_WRITE,
-                ContentGeneration::MAX,
                 MappingGeneration::INITIAL,
             )
             .unwrap(),
@@ -2777,7 +2384,7 @@ mod tests {
         let generations = range
             .segments()
             .iter()
-            .map(CanonicalBackingSegment::content_generation)
+            .map(|segment| segment.backing().content_generation())
             .collect::<Vec<_>>();
         let mut batch = CanonicalWriteBatch::new();
         batch.stage(&range, 0x0ffe, &[1, 2, 3, 4]).unwrap();
@@ -2786,11 +2393,6 @@ mod tests {
         allocation.read(0x0ffe, &mut before).unwrap();
         assert_eq!(before, [0; 4]);
         batch.commit().unwrap();
-        assert_eq!(
-            allocation.inner.store.content_epoch(),
-            ContentMutationEpoch::new(1),
-            "one failure-atomic batch publishes one store mutation"
-        );
 
         allocation.read(0x0ffe, &mut before).unwrap();
         assert_eq!(before, [1, 2, 3, 4]);
@@ -2801,7 +2403,10 @@ mod tests {
             .iter()
             .zip(generations)
         {
-            assert_eq!(segment.content_generation(), previous.next().unwrap());
+            assert_eq!(
+                segment.backing().content_generation(),
+                previous.next().unwrap()
+            );
         }
     }
 
@@ -2834,6 +2439,107 @@ mod tests {
         committed.stage(&range, 0, &[0x22]).unwrap();
         committed.commit().unwrap();
         assert_eq!(arena.protection_at(0x1000), Some(DirectProtection::Read));
+    }
+
+    #[test]
+    fn cpu_dirty_capture_protects_every_physical_alias() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let host = page.direct_backing().unwrap();
+        let first = DirectArena::new(0x4000).unwrap();
+        let second = DirectArena::new(0x4000).unwrap();
+        for (arena, address) in [(&first, 0x1000), (&second, 0x2000)] {
+            arena
+                .map_pages(&[DirectMapRequest {
+                    guest_address: address,
+                    backing: &host,
+                    protection: DirectProtection::Read,
+                }])
+                .unwrap();
+            page.register_direct_alias(arena, address, DirectProtection::ReadWrite)
+                .unwrap();
+        }
+        allocation.write(0, &[1]).unwrap();
+        assert!(page.arm_direct_writes().unwrap());
+        assert_eq!(
+            first.protection_at(0x1000),
+            Some(DirectProtection::ReadWrite)
+        );
+        assert_eq!(
+            second.protection_at(0x2000),
+            Some(DirectProtection::ReadWrite)
+        );
+
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+
+        assert!(dependency.remains_current());
+        assert_eq!(first.protection_at(0x1000), Some(DirectProtection::Read));
+        assert_eq!(second.protection_at(0x2000), Some(DirectProtection::Read));
+        allocation.write(0x800, &[2]).unwrap();
+        assert!(!dependency.remains_current());
+    }
+
+    #[test]
+    fn concurrent_first_write_transitions_advance_one_dirty_epoch() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let page = page.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    page.resolve_direct_write_fault().unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        assert!(workers.into_iter().all(|worker| worker.join().unwrap()));
+        assert_eq!(page.cpu_dirty_epoch(), 1);
+        assert!(!dependency.remains_current());
+    }
+
+    #[test]
+    fn dirty_resolution_preserves_each_alias_maximum_permission() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let host = page.direct_backing().unwrap();
+        let arena = DirectArena::new(0x4000).unwrap();
+        for (address, maximum) in [
+            (0x1000, DirectProtection::ReadWrite),
+            (0x2000, DirectProtection::Read),
+        ] {
+            arena
+                .map_pages(&[DirectMapRequest {
+                    guest_address: address,
+                    backing: &host,
+                    protection: DirectProtection::Read,
+                }])
+                .unwrap();
+            page.register_direct_alias(&arena, address, maximum)
+                .unwrap();
+        }
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+
+        assert!(page.resolve_direct_write_fault().unwrap());
+        assert!(!dependency.remains_current());
+        assert_eq!(
+            arena.protection_at(0x1000),
+            Some(DirectProtection::ReadWrite)
+        );
+        assert_eq!(arena.protection_at(0x2000), Some(DirectProtection::Read));
     }
 
     #[test]
@@ -2885,7 +2591,7 @@ mod tests {
         let disarm_page = page.clone();
         let (completed, completion) = std::sync::mpsc::channel();
         let disarmer = thread::spawn(move || {
-            let result = disarm_page.set_direct_stores_allowed(false);
+            let result = disarm_page.arm_cpu_dirty_observer_quiescent();
             completed.send(result).unwrap();
         });
         while page.direct_write_is_armed() {
@@ -2909,7 +2615,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_write_batch_publishes_once_to_each_distinct_store() {
+    fn canonical_write_batch_commits_across_distinct_stores() {
         let first_store = CanonicalBackingStore::allocate().unwrap();
         let second_store = CanonicalBackingStore::allocate().unwrap();
         let first = CanonicalBackingPage::zeroed(
@@ -2932,7 +2638,6 @@ mod tests {
                 0,
                 4,
                 MemoryPermissions::READ_WRITE,
-                ContentGeneration::INITIAL,
                 MappingGeneration::INITIAL,
             )
             .unwrap(),
@@ -2941,7 +2646,6 @@ mod tests {
                 0,
                 4,
                 MemoryPermissions::READ_WRITE,
-                ContentGeneration::INITIAL,
                 MappingGeneration::INITIAL,
             )
             .unwrap(),
@@ -2951,9 +2655,9 @@ mod tests {
         batch.stage(&range, 2, &[1, 2, 3, 4]).unwrap();
 
         batch.commit().unwrap();
-
-        assert_eq!(first_store.content_epoch(), ContentMutationEpoch::new(1));
-        assert_eq!(second_store.content_epoch(), ContentMutationEpoch::new(1));
+        let mut observed = [0; 8];
+        range.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [0, 0, 1, 2, 3, 4, 0, 0]);
     }
 
     #[test]
@@ -2965,16 +2669,10 @@ mod tests {
         let mut batch = CanonicalWriteBatch::new();
         batch.stage(&range, 0x0fff, &[0xaa, 0xbb]).unwrap();
         allocation.write(0x1000, &[0x55]).unwrap();
-        let epoch_after_concurrent_write = allocation.inner.store.content_epoch();
 
         assert_eq!(
             batch.commit(),
             Err(CanonicalWriteBatchError::ConcurrentMutation)
-        );
-        assert_eq!(
-            allocation.inner.store.content_epoch(),
-            epoch_after_concurrent_write,
-            "a rejected batch must not publish another mutation"
         );
         let mut first = [0xff; 1];
         let mut second = [0xff; 1];
@@ -3003,106 +2701,5 @@ mod tests {
         let mut canonical = [0xff; 4];
         allocation.read(0x0ffe, &mut canonical).unwrap();
         assert_eq!(canonical, [0; 4]);
-    }
-
-    #[test]
-    fn cpu_write_provenance_distinguishes_ranges_within_one_page() {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let range = allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap();
-        let page = range.segments()[0].backing().clone();
-        let generation = page.content_generation();
-
-        allocation.write(0x300, &[0x5a]).unwrap();
-        assert_eq!(
-            page.cpu_write_overlap_since(generation, 0x100, 0x100),
-            Ok(CanonicalCpuWriteOverlap::No)
-        );
-        assert_eq!(
-            page.cpu_write_overlap_since(generation, 0x280, 0x100),
-            Ok(CanonicalCpuWriteOverlap::Yes)
-        );
-    }
-
-    #[test]
-    fn canonical_write_batch_records_only_staged_dirty_ranges() {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let range = allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap();
-        let page = range.segments()[0].backing().clone();
-        let generation = page.content_generation();
-        let mut batch = CanonicalWriteBatch::new();
-        batch.stage(&range, 0x700, &[1, 2, 3, 4]).unwrap();
-        batch.commit().unwrap();
-
-        assert_eq!(
-            page.cpu_write_overlap_since(generation, 0x100, 0x100),
-            Ok(CanonicalCpuWriteOverlap::No)
-        );
-        assert_eq!(
-            page.cpu_write_overlap_since(generation, 0x702, 1),
-            Ok(CanonicalCpuWriteOverlap::Yes)
-        );
-    }
-
-    #[test]
-    fn expired_cpu_write_provenance_is_conservatively_unknown() {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let range = allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap();
-        let page = range.segments()[0].backing().clone();
-        let generation = page.content_generation();
-        for index in 0..=CPU_WRITE_JOURNAL_CAPACITY {
-            allocation.write(index, &[index as u8]).unwrap();
-        }
-
-        assert_eq!(
-            page.cpu_write_overlap_since(generation, 0x800, 0x100),
-            Ok(CanonicalCpuWriteOverlap::Unknown)
-        );
-    }
-
-    #[test]
-    fn cpu_write_provenance_returns_exact_intervals() {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let range = allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap();
-        let page = range.segments()[0].backing().clone();
-        let generation = page.content_generation();
-        allocation.write(0x103, &[1, 2, 3]).unwrap();
-        allocation.write(0x108, &[4, 5]).unwrap();
-
-        let mut dirty = Vec::new();
-        page.append_cpu_write_ranges_since(generation, 0x100, 0x10, &mut dirty)
-            .unwrap();
-        assert_eq!(
-            dirty,
-            [
-                CanonicalCpuWriteRange::new(0x103, 3),
-                CanonicalCpuWriteRange::new(0x108, 2)
-            ]
-        );
-    }
-
-    #[test]
-    fn expired_cpu_write_ranges_return_the_complete_requested_interval() {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let range = allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap();
-        let page = range.segments()[0].backing().clone();
-        let generation = page.content_generation();
-        for index in 0..=CPU_WRITE_JOURNAL_CAPACITY {
-            allocation.write(index, &[index as u8]).unwrap();
-        }
-
-        let mut dirty = Vec::new();
-        page.append_cpu_write_ranges_since(generation, 0x800, 0x100, &mut dirty)
-            .unwrap();
-        assert_eq!(dirty, [CanonicalCpuWriteRange::new(0x800, 0x100)]);
     }
 }
