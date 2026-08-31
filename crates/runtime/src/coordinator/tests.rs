@@ -123,7 +123,7 @@ fn one_slice_flows_through_a_scheduler_lease() {
     let execution = coordinator.run_next(1).unwrap().unwrap();
     assert_eq!(execution.lease.process, id);
     assert_eq!(execution.lease.vcpu, VirtualCpuId::new(7));
-    assert_eq!(execution.report.instructions_executed, 1);
+    assert_eq!(execution.report.progress, 1);
     assert_eq!(
         coordinator
             .scheduler()
@@ -231,7 +231,7 @@ fn scheduler_hints_use_vcpu_owned_event_and_interrupt_state() {
         )
         .unwrap();
     let local_exit = local.run_next(3).unwrap().unwrap();
-    assert_eq!(local_exit.report.instructions_executed, 3);
+    assert_eq!(local_exit.report.progress, 3);
     assert!(matches!(
         local_exit.report.stop,
         ExecutionStop::Scheduled {

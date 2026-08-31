@@ -540,8 +540,7 @@ fn finish_execution(result: WorkerResult) -> Result<(), String> {
         |exit| format!("{:?}", exit.cause),
     );
     log::info!(
-        "execution finished: instructions={}, SVC calls={}, rejected SVC kinds={}, cause={}, code={:#x}",
-        summary.instructions,
+        "execution finished: SVC calls={}, rejected SVC kinds={}, cause={}, code={:#x}",
         summary.svc_calls,
         summary.rejected_svc_kinds,
         exit_cause,
@@ -551,7 +550,6 @@ fn finish_execution(result: WorkerResult) -> Result<(), String> {
 }
 
 struct ExecutionSummary {
-    instructions: u64,
     svc_calls: u64,
     rejected_svc_kinds: usize,
 }
@@ -577,11 +575,10 @@ fn execute(
         video_system,
     )
     .with_diagnostics(horizon_environment.diagnostics);
-    let mut instructions = 0_u64;
     let execution_started = Instant::now();
     let execution_rate_enabled = log::log_enabled!(log::Level::Info);
     let mut execution_completions = 0_u64;
-    let mut last_rate_instructions = 0_u64;
+    let mut last_rate_completions = 0_u64;
     let mut last_rate_elapsed = Duration::ZERO;
     let mut rejected = BTreeSet::new();
     let mut next_input_poll = Duration::ZERO;
@@ -602,7 +599,7 @@ fn execute(
             {
                 return Err("host stop could not terminate the guest process cleanly".to_owned());
             }
-            return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
+            return Ok(execution_summary(&dispatcher, rejected.len()));
         }
         let elapsed = execution_started.elapsed();
         dispatcher
@@ -621,7 +618,7 @@ fn execute(
             if log::log_enabled!(log::Level::Debug) {
                 for (button, pressed) in button_transitions(active_buttons, current_buttons) {
                     log::debug!(
-                        "emulated button {button} {}: instructions={instructions} elapsed={elapsed:?}",
+                        "emulated button {button} {}: elapsed={elapsed:?}",
                         if pressed { "pressed" } else { "released" }
                     );
                 }
@@ -657,20 +654,20 @@ fn execute(
         }
         for execution in executions {
             let report = execution.report;
-            instructions = instructions.saturating_add(report.instructions_executed);
             if execution_rate_enabled {
                 execution_completions = execution_completions.wrapping_add(1);
                 if execution_completions.is_multiple_of(EXECUTION_RATE_COMPLETIONS) {
                     let elapsed = execution_started.elapsed();
                     let interval = elapsed.saturating_sub(last_rate_elapsed);
                     if interval >= EXECUTION_RATE_LOG_INTERVAL {
-                        let interval_instructions =
-                            instructions.saturating_sub(last_rate_instructions);
-                        let ips = interval_instructions as f64 / interval.as_secs_f64();
+                        let interval_completions =
+                            execution_completions.wrapping_sub(last_rate_completions);
+                        let completions_per_second =
+                            interval_completions as f64 / interval.as_secs_f64();
                         log::info!(
-                            "guest CPU rate: ips={ips:.0}, instructions={instructions}, elapsed={elapsed:?}"
+                            "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
                         );
-                        last_rate_instructions = instructions;
+                        last_rate_completions = execution_completions;
                         last_rate_elapsed = elapsed;
                     }
                 }
@@ -728,25 +725,19 @@ fn execute(
                             }
                         }
                         ExceptionHandlingResult::Terminated { .. } => {
-                            return Ok(execution_summary(
-                                instructions,
-                                &dispatcher,
-                                rejected.len(),
-                            ));
+                            return Ok(execution_summary(&dispatcher, rejected.len()));
                         }
                         ExceptionHandlingResult::Suspended => {}
                         ExceptionHandlingResult::Fault(error) => {
                             dump_maxwell_pushbuffer_on_fault(&error);
-                            return Err(format!(
-                                "Horizon SVC dispatch failed after {instructions} instructions: {error}; {report}"
-                            ));
+                            return Err(format!("Horizon SVC dispatch failed: {error}; {report}"));
                         }
                     }
                 }
                 ExecutionStop::LoaderReturn { .. } => {
-                    return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
+                    return Ok(execution_summary(&dispatcher, rejected.len()));
                 }
-                stop => return Err(execution_stop_error(stop, instructions, &report)),
+                stop => return Err(execution_stop_error(stop, &report)),
             }
         }
     }
@@ -956,22 +947,16 @@ fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
 }
 
 fn execution_summary(
-    instructions: u64,
     dispatcher: &HorizonSvcDispatcher,
     rejected_svc_kinds: usize,
 ) -> ExecutionSummary {
     ExecutionSummary {
-        instructions,
         svc_calls: dispatcher.coverage().iter().map(|entry| entry.calls).sum(),
         rejected_svc_kinds,
     }
 }
 
-fn execution_stop_error(
-    stop: &ExecutionStop,
-    instructions: u64,
-    report: &nixe_runtime::ExecutionReport,
-) -> String {
+fn execution_stop_error(stop: &ExecutionStop, report: &nixe_runtime::ExecutionReport) -> String {
     let reason = match stop {
         ExecutionStop::UnsupportedSemantics {
             source,
@@ -999,7 +984,7 @@ fn execution_stop_error(
         }
         _ => format!("unexpected execution stop: {stop}"),
     };
-    format!("{reason} after {instructions} instructions; diagnostic: {report}")
+    format!("{reason}; diagnostic: {report}")
 }
 
 #[cfg(test)]

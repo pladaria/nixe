@@ -15,7 +15,7 @@ use nixe_memory::GuestVirtualAddress;
 
 use super::{CraneliftTranslator, LazyFlags, a64_memory::MemoryOperation};
 use crate::direct::slow;
-use crate::direct::{DirectJitError, EXIT_ARCHITECTURAL, EXIT_INTERNAL, NativeContext};
+use crate::direct::{DirectJitError, NativeContext};
 
 impl CraneliftTranslator<'_, '_> {
     // A64 Advanced SIMD and floating-point behavior follows Arm DDI 0602
@@ -1361,24 +1361,14 @@ impl CraneliftTranslator<'_, '_> {
             .call_indirect(signature, callee, &call_arguments);
         let status = self.load_context(types::I32, offset_of!(NativeContext, slow_status))?;
         let success = self.builder.create_block();
-        let failed = self.builder.create_block();
+        let failed = self.cold_block();
         let succeeded = self.builder.ins().icmp_imm_s(IntCC::Equal, status, 0);
         self.builder
             .ins()
             .brif(succeeded, success, &[], failed, &[]);
         self.builder.switch_to_block(failed);
-        let trapped =
-            self.builder
-                .ins()
-                .icmp_imm_s(IntCC::Equal, status, i64::from(slow::STATUS_FP_TRAP));
-        let trap = self.builder.create_block();
-        let internal = self.builder.create_block();
-        self.builder.ins().brif(trapped, trap, &[], internal, &[]);
-        self.builder.switch_to_block(trap);
-        self.retire_one();
-        self.emit_exit(EXIT_ARCHITECTURAL, 6 << 24, source, flags)?;
-        self.builder.switch_to_block(internal);
-        self.emit_exit(EXIT_INTERNAL, 0, source, flags)?;
+        self.commit_state(source, flags)?;
+        self.dispatch_fp_failure(status, source);
         self.builder.switch_to_block(success);
         Ok(())
     }

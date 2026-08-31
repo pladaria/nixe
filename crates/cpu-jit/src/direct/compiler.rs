@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem::{offset_of, size_of};
 
 use cranelift_codegen::ir::{
@@ -11,6 +11,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use nixe_cpu::decode::a64::{A64Instruction, control, fp_simd, integer, memory, system};
+use nixe_cpu::execution::CpuControl;
 use nixe_cpu::location::DecodedInstruction;
 use nixe_cpu::semantics::conditions::Condition;
 use nixe_memory::CpuMemoryBackend;
@@ -25,9 +26,10 @@ use super::lookup::{
     NATIVE_LOOKUP_NODE_NEXT_OFFSET, NATIVE_LOOKUP_NODE_PC_OFFSET, NativeLookupSlot, lookup_salt,
 };
 use super::region::{BlockTerminator, NativeRegion};
+use super::slow;
 use super::{
-    DirectJitError, EXIT_ARCHITECTURAL, EXIT_BUDGET, EXIT_CONTROL, EXIT_DISPATCH, EXIT_INTERNAL,
-    EXIT_RECONCILE, EXIT_UNSUPPORTED, NativeContext,
+    DirectJitError, EXIT_ARCHITECTURAL, EXIT_CONTROL, EXIT_DATA_FAULT, EXIT_DISPATCH,
+    EXIT_INTERNAL, EXIT_RECONCILE, EXIT_UNSUPPORTED, NativeContext,
 };
 
 const GENERAL_REGISTER_COUNT: usize = 31;
@@ -46,9 +48,9 @@ pub(super) struct CompiledRegion {
     pub(super) clif_instructions: usize,
     pub(super) fault_sites: Box<[CompiledFaultSite]>,
     #[cfg(test)]
-    pub(super) register_loads: usize,
+    pub(super) deferred_register_loads: usize,
     #[cfg(test)]
-    pub(super) register_stores: usize,
+    pub(super) exit_tail_count: usize,
 }
 
 pub(super) struct CompiledFaultSite {
@@ -57,18 +59,69 @@ pub(super) struct CompiledFaultSite {
     pub(super) access: NativeMemoryAccess,
     pub(super) completion: NativeFaultCompletion,
     pub(super) guest_address: HostIntegerRegister,
-    pub(super) retired_delta: u32,
 }
 
 struct PendingFaultSite {
     access: NativeMemoryAccess,
     completion: NativeFaultCompletion,
     trap_code: TrapCode,
-    retired_delta: u32,
 }
 
 struct PendingDirectMetadata {
     fault_sites: Vec<PendingFaultSite>,
+    #[cfg(test)]
+    exit_tail_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DirtyState {
+    integer: IntegerRegisterSet,
+    vector: [bool; 32],
+    fpsr: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RegisterLoadBlocks {
+    integer: [Option<GuestVirtualAddress>; GENERAL_REGISTER_COUNT],
+    sp: Option<GuestVirtualAddress>,
+    vector: [Option<GuestVirtualAddress>; 32],
+}
+
+impl DirtyState {
+    const fn all() -> Self {
+        Self {
+            integer: IntegerRegisterSet {
+                x: [true; GENERAL_REGISTER_COUNT],
+                sp: true,
+            },
+            vector: [true; 32],
+            fpsr: true,
+        }
+    }
+
+    fn merge(&mut self, other: Self) -> bool {
+        let previous = *self;
+        for (dirty, incoming) in self.integer.x.iter_mut().zip(other.integer.x) {
+            *dirty |= incoming;
+        }
+        self.integer.sp |= other.integer.sp;
+        for (dirty, incoming) in self.vector.iter_mut().zip(other.vector) {
+            *dirty |= incoming;
+        }
+        self.fpsr |= other.fpsr;
+        *self != previous
+    }
+
+    fn intersect(&mut self, other: Self) {
+        for (dirty, incoming) in self.integer.x.iter_mut().zip(other.integer.x) {
+            *dirty &= incoming;
+        }
+        self.integer.sp &= other.integer.sp;
+        for (dirty, incoming) in self.vector.iter_mut().zip(other.vector) {
+            *dirty &= incoming;
+        }
+        self.fpsr &= other.fpsr;
+    }
 }
 
 pub(super) struct DirectCompiler {
@@ -209,7 +262,18 @@ impl DirectCompiler {
         let entry = self.module.get_finalized_function(function).addr();
         self.module.clear_context(&mut self.context);
         #[cfg(test)]
-        let (accessed, dirty) = register_access(region);
+        let dirty_at_entry = dirty_states_at_entry(region);
+        #[cfg(test)]
+        let load_blocks = register_load_blocks(region, &dirty_at_entry);
+        #[cfg(test)]
+        let deferred_register_loads = load_blocks
+            .integer
+            .into_iter()
+            .chain([load_blocks.sp])
+            .chain(load_blocks.vector)
+            .flatten()
+            .filter(|block| *block != region.key.start)
+            .count();
         Ok(CompiledRegion {
             entry,
             native_bytes,
@@ -217,9 +281,9 @@ impl DirectCompiler {
             clif_instructions,
             fault_sites: fault_sites.into_boxed_slice(),
             #[cfg(test)]
-            register_loads: accessed.count(),
+            deferred_register_loads,
             #[cfg(test)]
-            register_stores: dirty.count(),
+            exit_tail_count: pending_direct.exit_tail_count,
         })
     }
 
@@ -327,8 +391,12 @@ struct CraneliftTranslator<'a, 'region> {
     blocks: HashMap<GuestVirtualAddress, Block>,
     flags_at_entry: HashMap<GuestVirtualAddress, LazyFlags>,
     merged_flag_entries: HashSet<GuestVirtualAddress>,
-    checkpoint_blocks: HashSet<GuestVirtualAddress>,
+    dirty_at_entry: HashMap<GuestVirtualAddress, DirtyState>,
+    register_load_blocks: RegisterLoadBlocks,
     static_slots: VecDeque<(GuestVirtualAddress, usize)>,
+    exit_tails: BTreeMap<(u32, u32), Block>,
+    slow_failure_tail: Option<Block>,
+    fp_failure_tail: Option<Block>,
     prologue: Block,
     context: ir::Value,
     x: ir::Value,
@@ -337,28 +405,24 @@ struct CraneliftTranslator<'a, 'region> {
     pc: ir::Value,
     nzcv: ir::Value,
     fpsr: ir::Value,
-    budget: ir::Value,
+    direct_base: ir::Value,
+    direct_size: ir::Value,
+    direct_store_controls: ir::Value,
     loader_return: ir::Value,
     control_pending: ir::Value,
+    synchronization_counter: ir::Value,
     invalidation_signal: ir::Value,
     process_pending: ir::Value,
     initial_flags: ir::Value,
-    retired: Variable,
     packed_flags: Variable,
     fpsr_state: Variable,
     registers: [Option<Variable>; GENERAL_REGISTER_COUNT],
     stack_pointer: Option<Variable>,
-    dirty_registers: [bool; GENERAL_REGISTER_COUNT],
-    dirty_stack_pointer: bool,
     vector_registers: [Option<Variable>; 32],
-    dirty_vector_registers: [bool; 32],
-    dirty_fpsr: bool,
     block_dirty_registers: [bool; GENERAL_REGISTER_COUNT],
     block_dirty_stack_pointer: bool,
     block_dirty_vector_registers: [bool; 32],
     block_dirty_fpsr: bool,
-    block_dirty_flags: bool,
-    block_retired: u32,
     call_conv: CallConv,
     direct_memory: bool,
     fault_sites: Vec<PendingFaultSite>,
@@ -397,18 +461,22 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         builder.append_block_params_for_function_params(prologue);
         builder.switch_to_block(prologue);
         let placeholder = builder.ins().iconst(types::I64, 0);
-        let retired = builder.declare_var(types::I64);
         let packed_flags = builder.declare_var(types::I32);
         let fpsr_state = builder.declare_var(types::I32);
-        let (_, dirty_registers) = register_access(region);
+        let dirty_at_entry = dirty_states_at_entry(region);
+        let register_load_blocks = register_load_blocks(region, &dirty_at_entry);
         Ok(Self {
             builder,
             region,
             blocks,
             flags_at_entry: HashMap::new(),
             merged_flag_entries: merged_flag_entries(region),
-            checkpoint_blocks: internally_reached_blocks(region),
+            dirty_at_entry,
+            register_load_blocks,
             static_slots,
+            exit_tails: BTreeMap::new(),
+            slow_failure_tail: None,
+            fp_failure_tail: None,
             prologue,
             context: placeholder,
             x: placeholder,
@@ -417,28 +485,24 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             pc: placeholder,
             nzcv: placeholder,
             fpsr: placeholder,
-            budget: placeholder,
+            direct_base: placeholder,
+            direct_size: placeholder,
+            direct_store_controls: placeholder,
             loader_return: placeholder,
             control_pending: placeholder,
+            synchronization_counter: placeholder,
             invalidation_signal: placeholder,
             process_pending: placeholder,
             initial_flags: placeholder,
-            retired,
             packed_flags,
             fpsr_state,
             registers: [None; GENERAL_REGISTER_COUNT],
             stack_pointer: None,
-            dirty_registers: dirty_registers.x,
-            dirty_stack_pointer: dirty_registers.sp,
             vector_registers: [None; 32],
-            dirty_vector_registers: vector_register_access(region).1,
-            dirty_fpsr: fp_status_access(region).1,
             block_dirty_registers: [false; GENERAL_REGISTER_COUNT],
             block_dirty_stack_pointer: false,
             block_dirty_vector_registers: [false; 32],
             block_dirty_fpsr: false,
-            block_dirty_flags: false,
-            block_retired: 0,
             call_conv,
             direct_memory,
             fault_sites: Vec::new(),
@@ -456,12 +520,20 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.pc = self.load_context_pointer(offset_of!(NativeContext, pc))?;
         self.nzcv = self.load_context_pointer(offset_of!(NativeContext, nzcv))?;
         self.fpsr = self.load_context_pointer(offset_of!(NativeContext, fpsr))?;
-        self.budget =
-            self.load_context(types::I64, offset_of!(NativeContext, instruction_budget))?;
+        if self.direct_memory {
+            self.direct_base =
+                self.load_context(types::I64, offset_of!(NativeContext, direct_base))?;
+            self.direct_size =
+                self.load_context(types::I64, offset_of!(NativeContext, direct_size))?;
+            self.direct_store_controls =
+                self.load_context(types::I64, offset_of!(NativeContext, direct_store_controls))?;
+        }
         self.loader_return =
             self.load_context(types::I64, offset_of!(NativeContext, loader_return))?;
         self.control_pending =
             self.load_context_pointer(offset_of!(NativeContext, control_pending))?;
+        self.synchronization_counter =
+            self.load_context_pointer(offset_of!(NativeContext, synchronization_counter))?;
         self.invalidation_signal =
             self.load_context_pointer(offset_of!(NativeContext, invalidation_signal))?;
         self.process_pending =
@@ -479,55 +551,59 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             self.builder.ins().iconst(types::I32, 0)
         };
         self.builder.def_var(self.fpsr_state, initial_fpsr);
-        let initial_retired = self.load_context(types::I64, offset_of!(NativeContext, retired))?;
-        self.builder.def_var(self.retired, initial_retired);
-
-        let (accessed, _) = register_access(self.region);
-        for (index, accessed) in accessed.x.into_iter().enumerate() {
-            if !accessed {
+        let (read, written) = register_access(self.region);
+        for index in 0..GENERAL_REGISTER_COUNT {
+            if !read.x[index] && !written.x[index] {
                 continue;
             }
             let variable = self.builder.declare_var(types::I64);
-            let value = self.builder.ins().load(
-                types::I64,
-                trusted_flags(),
-                self.x,
-                i32::try_from(index * size_of::<u64>()).expect("architectural GPR offset fits i32"),
-            );
-            self.builder.def_var(variable, value);
+            if self.register_load_blocks.integer[index] == Some(self.region.key.start) {
+                let value = self.builder.ins().load(
+                    types::I64,
+                    trusted_flags(),
+                    self.x,
+                    i32::try_from(index * size_of::<u64>())
+                        .expect("architectural GPR offset fits i32"),
+                );
+                self.builder.def_var(variable, value);
+            }
             self.registers[index] = Some(variable);
         }
-        if accessed.sp {
+        if read.sp || written.sp {
             let variable = self.builder.declare_var(types::I64);
-            let value = self
-                .builder
-                .ins()
-                .load(types::I64, trusted_flags(), self.sp, 0);
-            self.builder.def_var(variable, value);
+            if self.register_load_blocks.sp == Some(self.region.key.start) {
+                let value = self
+                    .builder
+                    .ins()
+                    .load(types::I64, trusted_flags(), self.sp, 0);
+                self.builder.def_var(variable, value);
+            }
             self.stack_pointer = Some(variable);
         }
 
-        let (accessed_vectors, _) = vector_register_access(self.region);
-        for (index, accessed) in accessed_vectors.into_iter().enumerate() {
-            if !accessed {
+        let (read_vectors, written_vectors) = vector_register_access(self.region);
+        for index in 0..read_vectors.len() {
+            if !read_vectors[index] && !written_vectors[index] {
                 continue;
             }
             let variable = self.builder.declare_var(types::I8X16);
-            let value = self.builder.ins().load(
-                types::I8X16,
-                trusted_flags(),
-                self.vector,
-                i32::try_from(index * size_of::<u128>())
-                    .expect("architectural vector offset fits i32"),
-            );
-            self.builder.def_var(variable, value);
+            if self.register_load_blocks.vector[index] == Some(self.region.key.start) {
+                let value = self.builder.ins().load(
+                    types::I8X16,
+                    trusted_flags(),
+                    self.vector,
+                    i32::try_from(index * size_of::<u128>())
+                        .expect("architectural vector offset fits i32"),
+                );
+                self.builder.def_var(variable, value);
+            }
             self.vector_registers[index] = Some(variable);
         }
 
         let entry_pc = self
             .builder
             .ins()
-            .load(types::I64, trusted_flags(), self.pc, 0);
+            .iconst(types::I64, self.region.key.start.get() as i64);
         let current =
             self.builder
                 .ins()
@@ -541,7 +617,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 .atomic_load(types::I32, plain_flags(), self.process_pending);
         let shutting_down = self.builder.ins().icmp_imm_s(IntCC::NotEqual, process, 0);
         let reconcile = self.builder.ins().bor(invalidated, shutting_down);
-        let reconcile_exit = self.builder.create_block();
+        let reconcile_exit = self.cold_block();
         let control_check = self.builder.create_block();
         self.builder
             .ins()
@@ -554,7 +630,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 .ins()
                 .atomic_load(types::I32, plain_flags(), self.control_pending);
         let has_control = self.builder.ins().icmp_imm_s(IntCC::NotEqual, pending, 0);
-        let control_exit = self.builder.create_block();
+        let control_exit = self.cold_block();
         let dispatch = self.builder.create_block();
         self.builder
             .ins()
@@ -562,11 +638,14 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder.switch_to_block(control_exit);
         self.finish_exit_value(EXIT_CONTROL, 0, entry_pc)?;
         self.builder.switch_to_block(dispatch);
-        self.emit_entry_dispatch(entry_pc)?;
+        let primary = self.block(self.region.key.start)?;
+        self.builder.ins().jump(primary, &[]);
 
         for block_index in 0..self.region.blocks.len() {
             self.translate_block(block_index)?;
         }
+        self.emit_helper_failure_tails()?;
+        self.emit_exit_tails()?;
         if !self.static_slots.is_empty() {
             return Err(DirectJitError::internal(
                 "direct JIT region left static-link slots unused",
@@ -576,27 +655,9 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder.finalize(target_config);
         Ok(PendingDirectMetadata {
             fault_sites: self.fault_sites,
+            #[cfg(test)]
+            exit_tail_count: self.exit_tails.len(),
         })
-    }
-
-    fn emit_entry_dispatch(&mut self, entry_pc: ir::Value) -> Result<(), DirectJitError> {
-        if self.region.blocks.len() == 1 {
-            let target = self.block(self.region.key.start)?;
-            self.builder.ins().jump(target, &[]);
-            return Ok(());
-        }
-        for record in &self.region.blocks {
-            let target = self.block(record.start.pc)?;
-            let expected = self
-                .builder
-                .ins()
-                .iconst(types::I64, record.start.pc.get() as i64);
-            let matches = self.builder.ins().icmp(IntCC::Equal, entry_pc, expected);
-            let next = self.builder.create_block();
-            self.builder.ins().brif(matches, target, &[], next, &[]);
-            self.builder.switch_to_block(next);
-        }
-        self.finish_exit_value(EXIT_INTERNAL, 0, entry_pc)
     }
 
     fn record_direct_fault_state(
@@ -622,7 +683,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             access,
             completion,
             trap_code,
-            retired_delta: self.block_retired,
         });
         trap_code
     }
@@ -671,20 +731,16 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 .ins()
                 .store(trusted_flags(), value, self.fpsr, 0);
         }
-        if self.block_dirty_flags {
+        if flags.dirty() {
             let packed = self.packed_flags(flags);
             self.builder
                 .ins()
                 .store(trusted_flags(), packed, self.nzcv, 0);
         }
-        let retired = self.builder.use_var(self.retired);
-        self.store_context(retired, offset_of!(NativeContext, retired))?;
         self.block_dirty_registers.fill(false);
         self.block_dirty_stack_pointer = false;
         self.block_dirty_vector_registers.fill(false);
         self.block_dirty_fpsr = false;
-        self.block_dirty_flags = false;
-        self.block_retired = 0;
         Ok(())
     }
 
@@ -692,6 +748,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         let record = &self.region.blocks[block_index];
         let block = self.block(record.start.pc)?;
         self.builder.switch_to_block(block);
+        self.load_block_registers(record.start.pc)?;
         let mut flags = if self.merged_flag_entries.contains(&record.start.pc) {
             LazyFlags::Packed(self.builder.use_var(self.packed_flags))
         } else {
@@ -700,56 +757,41 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 .cloned()
                 .unwrap_or(LazyFlags::Canonical(self.initial_flags))
         };
-        let retired = self.builder.use_var(self.retired);
-        self.store_context(retired, offset_of!(NativeContext, retired))?;
-        self.block_retired = 0;
-        self.block_dirty_registers.fill(false);
-        self.block_dirty_stack_pointer = false;
-        self.block_dirty_vector_registers.fill(false);
-        self.block_dirty_fpsr = false;
-        self.block_dirty_flags = false;
-        if self.checkpoint_blocks.contains(&record.start.pc) {
-            self.commit_registers()?;
-            let packed = self.packed_flags(&flags);
-            self.builder
-                .ins()
-                .store(trusted_flags(), packed, self.nzcv, 0);
-            flags = LazyFlags::Canonical(packed);
-        }
+        let dirty = self
+            .dirty_at_entry
+            .get(&record.start.pc)
+            .copied()
+            .unwrap_or_default();
+        self.block_dirty_registers = dirty.integer.x;
+        self.block_dirty_stack_pointer = dirty.integer.sp;
+        self.block_dirty_vector_registers = dirty.vector;
+        self.block_dirty_fpsr = dirty.fpsr;
         for (index, decoded) in record.instructions.iter().enumerate() {
             self.builder
                 .set_srcloc(source_location(self.region, decoded));
-            self.guard_budget(decoded.location.pc, &flags)?;
             let instruction =
                 nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding);
             let terminal = index + 1 == record.instructions.len();
             if terminal && matches!(record.terminator, BlockTerminator::Unsupported) {
                 break;
             }
-            let previous_flags = flags.clone();
             match instruction {
-                A64Instruction::Control(control::Instruction::Nop(_)) => {
-                    self.retire_one();
-                }
+                A64Instruction::Control(control::Instruction::Nop(_)) => {}
                 A64Instruction::Integer(instruction) => {
                     if let Some(updated) =
                         self.emit_integer(decoded.location.pc, instruction, &flags)?
                     {
                         flags = updated;
                     }
-                    self.retire_one();
                 }
                 A64Instruction::Memory(instruction) => {
                     self.emit_memory(decoded.location.pc, instruction, &flags)?;
-                    self.retire_one();
                 }
                 A64Instruction::System(instruction) => {
                     self.emit_system(decoded.location.pc, instruction, &mut flags)?;
-                    self.retire_one();
                 }
                 A64Instruction::FpSimd(instruction) => {
                     self.emit_fp_simd(decoded.location.pc, instruction, &mut flags)?;
-                    self.retire_one();
                 }
                 A64Instruction::Control(
                     control::Instruction::BranchImmediate(_)
@@ -760,16 +802,61 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                     | control::Instruction::BranchRegister(_)
                     | control::Instruction::SupervisorCall(_)
                     | control::Instruction::Breakpoint(_),
-                ) => self.retire_one(),
+                ) => {}
                 _ => {
                     return Err(unsupported_instruction(decoded));
                 }
             }
-            if flags != previous_flags {
-                self.block_dirty_flags = true;
-            }
         }
         self.emit_terminator(record, flags)
+    }
+
+    fn load_block_registers(&mut self, block: GuestVirtualAddress) -> Result<(), DirectJitError> {
+        if block == self.region.key.start {
+            return Ok(());
+        }
+        for index in 0..GENERAL_REGISTER_COUNT {
+            if self.register_load_blocks.integer[index] != Some(block) {
+                continue;
+            }
+            let variable = self.registers[index].ok_or_else(|| {
+                DirectJitError::internal("lazy-loaded direct JIT GPR has no SSA variable")
+            })?;
+            let value = self.builder.ins().load(
+                types::I64,
+                trusted_flags(),
+                self.x,
+                i32::try_from(index * size_of::<u64>()).expect("architectural GPR offset fits i32"),
+            );
+            self.builder.def_var(variable, value);
+        }
+        if self.register_load_blocks.sp == Some(block) {
+            let variable = self.stack_pointer.ok_or_else(|| {
+                DirectJitError::internal("lazy-loaded direct JIT SP has no SSA variable")
+            })?;
+            let value = self
+                .builder
+                .ins()
+                .load(types::I64, trusted_flags(), self.sp, 0);
+            self.builder.def_var(variable, value);
+        }
+        for index in 0..self.vector_registers.len() {
+            if self.register_load_blocks.vector[index] != Some(block) {
+                continue;
+            }
+            let variable = self.vector_registers[index].ok_or_else(|| {
+                DirectJitError::internal("lazy-loaded direct JIT vector has no SSA variable")
+            })?;
+            let value = self.builder.ins().load(
+                types::I8X16,
+                trusted_flags(),
+                self.vector,
+                i32::try_from(index * size_of::<u128>())
+                    .expect("architectural vector offset fits i32"),
+            );
+            self.builder.def_var(variable, value);
+        }
+        Ok(())
     }
 
     fn emit_terminator(
@@ -894,18 +981,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         if let Some(block) = self.blocks.get(&target).copied() {
             self.propagate_flags(target, flags)?;
             if target.get() <= source.get() {
-                self.guard_reconciliation(target, flags)?;
-                let pending =
-                    self.builder
-                        .ins()
-                        .atomic_load(types::I32, plain_flags(), self.control_pending);
-                let has_control = self.builder.ins().icmp_imm_s(IntCC::NotEqual, pending, 0);
-                let control = self.builder.create_block();
-                self.builder
-                    .ins()
-                    .brif(has_control, control, &[], block, &[]);
-                self.builder.switch_to_block(control);
-                self.emit_exit(EXIT_CONTROL, 0, target, flags)
+                self.emit_backedge_synchronization(target, flags, block)
             } else {
                 self.builder.ins().jump(block, &[]);
                 Ok(())
@@ -913,6 +989,40 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         } else {
             self.emit_static_exit(target, flags)
         }
+    }
+
+    fn emit_backedge_synchronization(
+        &mut self,
+        target: GuestVirtualAddress,
+        flags: &LazyFlags,
+        destination: Block,
+    ) -> Result<(), DirectJitError> {
+        let count =
+            self.builder
+                .ins()
+                .atomic_load(types::I32, plain_flags(), self.synchronization_counter);
+        let expired = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
+        let poll = self.cold_block();
+        let proceed = self.builder.create_block();
+        self.builder.ins().brif(expired, poll, &[], proceed, &[]);
+
+        self.builder.switch_to_block(proceed);
+        let next = self.builder.ins().iadd_imm_s(count, -1);
+        self.builder
+            .ins()
+            .atomic_store(plain_flags(), next, self.synchronization_counter);
+        self.builder.ins().jump(destination, &[]);
+
+        self.builder.switch_to_block(poll);
+        self.guard_reconciliation(target, flags)?;
+        let reset = self
+            .builder
+            .ins()
+            .iconst(types::I32, i64::from(CpuControl::SYNCHRONIZATION_INTERVAL));
+        self.builder
+            .ins()
+            .atomic_store(plain_flags(), reset, self.synchronization_counter);
+        self.emit_exit(EXIT_CONTROL, 0, target, flags)
     }
 
     fn emit_static_exit(
@@ -947,7 +1057,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 .icmp(IntCC::NotEqual, target_pc_value, self.loader_return);
         let linked = self.builder.ins().band(linked, not_loader_return);
         let chain = self.builder.create_block();
-        let miss = self.builder.create_block();
+        let miss = self.cold_block();
         self.builder.ins().brif(linked, chain, &[], miss, &[]);
         self.builder.switch_to_block(chain);
         let signature = self.builder.import_signature(tail_signature());
@@ -969,8 +1079,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             .ins()
             .store(trusted_flags(), target, self.pc, 0);
         self.store_context(target, offset_of!(NativeContext, exit_pc))?;
-        let retired = self.builder.use_var(self.retired);
-        self.store_context(retired, offset_of!(NativeContext, retired))?;
         let lookup = self.load_context_pointer(offset_of!(NativeContext, native_lookup))?;
         let words = self.builder.ins().ushr_imm_u(target, 2);
         let middle = self.builder.ins().ushr_imm_u(words, 16);
@@ -1003,7 +1111,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder.append_block_param(search, types::I64);
         let inspect = self.builder.create_block();
         let chain = self.builder.create_block();
-        let miss = self.builder.create_block();
+        let miss = self.cold_block();
         self.builder.ins().jump(search, &[BlockArg::from(head)]);
         self.builder.switch_to_block(search);
         let node = self.builder.block_params(search)[0];
@@ -1064,25 +1172,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         Ok(())
     }
 
-    fn guard_budget(
-        &mut self,
-        source: GuestVirtualAddress,
-        flags: &LazyFlags,
-    ) -> Result<(), DirectJitError> {
-        let retired = self.builder.use_var(self.retired);
-        let exhausted =
-            self.builder
-                .ins()
-                .icmp(IntCC::UnsignedGreaterThanOrEqual, retired, self.budget);
-        let exit = self.builder.create_block();
-        let execute = self.builder.create_block();
-        self.builder.ins().brif(exhausted, exit, &[], execute, &[]);
-        self.builder.switch_to_block(exit);
-        self.emit_exit(EXIT_BUDGET, 0, source, flags)?;
-        self.builder.switch_to_block(execute);
-        Ok(())
-    }
-
     fn guard_reconciliation(
         &mut self,
         source: GuestVirtualAddress,
@@ -1101,7 +1190,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 .atomic_load(types::I32, plain_flags(), self.process_pending);
         let shutting_down = self.builder.ins().icmp_imm_s(IntCC::NotEqual, process, 0);
         let pending = self.builder.ins().bor(invalidated, shutting_down);
-        let exit = self.builder.create_block();
+        let exit = self.cold_block();
         let execute = self.builder.create_block();
         self.builder.ins().brif(pending, exit, &[], execute, &[]);
         self.builder.switch_to_block(exit);
@@ -1421,16 +1510,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         Ok(())
     }
 
-    fn retire_one(&mut self) {
-        let retired = self.builder.use_var(self.retired);
-        let retired = self.builder.ins().iadd_imm_s(retired, 1);
-        self.builder.def_var(self.retired, retired);
-        self.block_retired = self
-            .block_retired
-            .checked_add(1)
-            .expect("a native region retirement delta fits u32");
-    }
-
     fn read_register(
         &mut self,
         index: u8,
@@ -1494,14 +1573,12 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder
             .ins()
             .store(trusted_flags(), target, self.pc, 0);
-        let retired = self.builder.use_var(self.retired);
-        self.store_context(retired, offset_of!(NativeContext, retired))?;
         Ok(())
     }
 
     fn commit_registers(&mut self) -> Result<(), DirectJitError> {
-        for index in 0..self.dirty_registers.len() {
-            if !self.dirty_registers[index] {
+        for index in 0..self.block_dirty_registers.len() {
+            if !self.block_dirty_registers[index] {
                 continue;
             }
             let variable = self.registers[index].ok_or_else(|| {
@@ -1515,15 +1592,15 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 i32::try_from(index * size_of::<u64>()).expect("architectural GPR offset fits i32"),
             );
         }
-        if self.dirty_stack_pointer {
+        if self.block_dirty_stack_pointer {
             let variable = self.stack_pointer.ok_or_else(|| {
                 DirectJitError::internal("dirty direct JIT stack pointer has no SSA variable")
             })?;
             let value = self.builder.use_var(variable);
             self.builder.ins().store(trusted_flags(), value, self.sp, 0);
         }
-        for index in 0..self.dirty_vector_registers.len() {
-            if !self.dirty_vector_registers[index] {
+        for index in 0..self.block_dirty_vector_registers.len() {
+            if !self.block_dirty_vector_registers[index] {
                 continue;
             }
             let variable = self.vector_registers[index].ok_or_else(|| {
@@ -1538,7 +1615,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                     .expect("architectural vector offset fits i32"),
             );
         }
-        if self.dirty_fpsr {
+        if self.block_dirty_fpsr {
             let fpsr = self.builder.use_var(self.fpsr_state);
             self.builder
                 .ins()
@@ -1584,12 +1661,103 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         detail: u32,
         pc: ir::Value,
     ) -> Result<(), DirectJitError> {
-        self.store_context(pc, offset_of!(NativeContext, exit_pc))?;
-        let kind = self.builder.ins().iconst(types::I32, i64::from(kind));
-        self.store_context(kind, offset_of!(NativeContext, exit_kind))?;
-        let detail = self.builder.ins().iconst(types::I32, i64::from(detail));
-        self.store_context(detail, offset_of!(NativeContext, exit_detail))?;
-        self.builder.ins().return_(&[]);
+        let tail = if let Some(tail) = self.exit_tails.get(&(kind, detail)).copied() {
+            tail
+        } else {
+            let tail = self.builder.create_block();
+            self.builder.append_block_param(tail, types::I64);
+            self.builder.set_cold_block(tail);
+            self.exit_tails.insert((kind, detail), tail);
+            tail
+        };
+        self.builder.ins().jump(tail, &[BlockArg::from(pc)]);
+        Ok(())
+    }
+
+    fn dispatch_slow_failure(&mut self, status: ir::Value, pc: GuestVirtualAddress) {
+        let tail = if let Some(tail) = self.slow_failure_tail {
+            tail
+        } else {
+            let tail = self.cold_block();
+            self.builder.append_block_param(tail, types::I32);
+            self.builder.append_block_param(tail, types::I64);
+            self.slow_failure_tail = Some(tail);
+            tail
+        };
+        let pc = self.builder.ins().iconst(types::I64, pc.get() as i64);
+        self.builder
+            .ins()
+            .jump(tail, &[BlockArg::from(status), BlockArg::from(pc)]);
+    }
+
+    fn dispatch_fp_failure(&mut self, status: ir::Value, pc: GuestVirtualAddress) {
+        let tail = if let Some(tail) = self.fp_failure_tail {
+            tail
+        } else {
+            let tail = self.cold_block();
+            self.builder.append_block_param(tail, types::I32);
+            self.builder.append_block_param(tail, types::I64);
+            self.fp_failure_tail = Some(tail);
+            tail
+        };
+        let pc = self.builder.ins().iconst(types::I64, pc.get() as i64);
+        self.builder
+            .ins()
+            .jump(tail, &[BlockArg::from(status), BlockArg::from(pc)]);
+    }
+
+    fn emit_helper_failure_tails(&mut self) -> Result<(), DirectJitError> {
+        if let Some(tail) = self.slow_failure_tail {
+            self.builder.switch_to_block(tail);
+            let status = self.builder.block_params(tail)[0];
+            let pc = self.builder.block_params(tail)[1];
+            let data_fault = self.builder.ins().icmp_imm_s(IntCC::Equal, status, 1);
+            let fault = self.cold_block();
+            let internal = self.cold_block();
+            self.builder
+                .ins()
+                .brif(data_fault, fault, &[], internal, &[]);
+            self.builder.switch_to_block(fault);
+            self.finish_exit_value(EXIT_DATA_FAULT, 0, pc)?;
+            self.builder.switch_to_block(internal);
+            self.finish_exit_value(EXIT_INTERNAL, 0, pc)?;
+        }
+        if let Some(tail) = self.fp_failure_tail {
+            self.builder.switch_to_block(tail);
+            let status = self.builder.block_params(tail)[0];
+            let pc = self.builder.block_params(tail)[1];
+            let trapped = self.builder.ins().icmp_imm_s(
+                IntCC::Equal,
+                status,
+                i64::from(slow::STATUS_FP_TRAP),
+            );
+            let trap = self.cold_block();
+            let internal = self.cold_block();
+            self.builder.ins().brif(trapped, trap, &[], internal, &[]);
+            self.builder.switch_to_block(trap);
+            self.finish_exit_value(EXIT_ARCHITECTURAL, 6 << 24, pc)?;
+            self.builder.switch_to_block(internal);
+            self.finish_exit_value(EXIT_INTERNAL, 0, pc)?;
+        }
+        Ok(())
+    }
+
+    fn emit_exit_tails(&mut self) -> Result<(), DirectJitError> {
+        let tails: Vec<_> = self
+            .exit_tails
+            .iter()
+            .map(|(&(kind, detail), &block)| (kind, detail, block))
+            .collect();
+        for (kind, detail, block) in tails {
+            self.builder.switch_to_block(block);
+            let pc = self.builder.block_params(block)[0];
+            self.store_context(pc, offset_of!(NativeContext, exit_pc))?;
+            let kind = self.builder.ins().iconst(types::I32, i64::from(kind));
+            self.store_context(kind, offset_of!(NativeContext, exit_kind))?;
+            let detail = self.builder.ins().iconst(types::I32, i64::from(detail));
+            self.store_context(detail, offset_of!(NativeContext, exit_detail))?;
+            self.builder.ins().return_(&[]);
+        }
         Ok(())
     }
 
@@ -1619,19 +1787,18 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             DirectJitError::internal(format!("direct JIT region has no block for {pc}"))
         })
     }
+
+    fn cold_block(&mut self) -> Block {
+        let block = self.builder.create_block();
+        self.builder.set_cold_block(block);
+        block
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct IntegerRegisterSet {
     x: [bool; GENERAL_REGISTER_COUNT],
     sp: bool,
-}
-
-impl IntegerRegisterSet {
-    #[cfg(test)]
-    fn count(self) -> usize {
-        self.x.into_iter().filter(|set| *set).count() + usize::from(self.sp)
-    }
 }
 
 fn register_access(region: &NativeRegion) -> (IntegerRegisterSet, IntegerRegisterSet) {
@@ -1901,8 +2068,7 @@ fn register_access_fp_simd_vector(
     let read = |accessed: &mut [bool; 32], index: u8| {
         accessed[usize::from(index)] = true;
     };
-    let write = |accessed: &mut [bool; 32], dirty: &mut [bool; 32], index: u8| {
-        accessed[usize::from(index)] = true;
+    let write = |_accessed: &mut [bool; 32], dirty: &mut [bool; 32], index: u8| {
         dirty[usize::from(index)] = true;
     };
     match instruction {
@@ -2082,13 +2248,80 @@ fn merged_flag_entries(region: &NativeRegion) -> HashSet<GuestVirtualAddress> {
         .collect()
 }
 
-fn internally_reached_blocks(region: &NativeRegion) -> HashSet<GuestVirtualAddress> {
+fn register_load_blocks(
+    region: &NativeRegion,
+    dirty_at_entry: &HashMap<GuestVirtualAddress, DirtyState>,
+) -> RegisterLoadBlocks {
+    let primary = region.key.start;
+    let dominators = block_dominators(region);
+    let (_, integer_written) = register_access(region);
+    let (_, vector_written) = vector_register_access(region);
+    let conditionally_dirty = conditionally_dirty_at_entry(region, dirty_at_entry);
+    let mut integer_uses: [Vec<GuestVirtualAddress>; GENERAL_REGISTER_COUNT] =
+        std::array::from_fn(|_| Vec::new());
+    let mut sp_uses = Vec::new();
+    let mut vector_uses: [Vec<GuestVirtualAddress>; 32] = std::array::from_fn(|_| Vec::new());
+    for block in &region.blocks {
+        let (integer_read, _, vector_read, _, _, _) = block_register_access(block);
+        for (index, read) in integer_read.x.into_iter().enumerate() {
+            if read {
+                integer_uses[index].push(block.start.pc);
+            }
+        }
+        if integer_read.sp {
+            sp_uses.push(block.start.pc);
+        }
+        for (index, read) in vector_read.into_iter().enumerate() {
+            if read {
+                vector_uses[index].push(block.start.pc);
+            }
+        }
+    }
+    let integer = std::array::from_fn(|index| {
+        if integer_uses[index].is_empty() && !conditionally_dirty.integer.x[index] {
+            None
+        } else if integer_written.x[index] {
+            Some(primary)
+        } else {
+            common_dominator(&integer_uses[index], &dominators)
+        }
+    });
+    let sp = if sp_uses.is_empty() && !conditionally_dirty.integer.sp {
+        None
+    } else if integer_written.sp {
+        Some(primary)
+    } else {
+        common_dominator(&sp_uses, &dominators)
+    };
+    let vector = std::array::from_fn(|index| {
+        if vector_uses[index].is_empty() && !conditionally_dirty.vector[index] {
+            None
+        } else if vector_written[index] {
+            Some(primary)
+        } else {
+            common_dominator(&vector_uses[index], &dominators)
+        }
+    });
+    RegisterLoadBlocks {
+        integer,
+        sp,
+        vector,
+    }
+}
+
+fn block_dominators(
+    region: &NativeRegion,
+) -> HashMap<GuestVirtualAddress, HashSet<GuestVirtualAddress>> {
     let starts: HashSet<_> = region.blocks.iter().map(|block| block.start.pc).collect();
-    let mut reached = HashSet::new();
+    let mut predecessors: HashMap<_, Vec<_>> = starts
+        .iter()
+        .copied()
+        .map(|start| (start, Vec::new()))
+        .collect();
     for block in &region.blocks {
         let mut record = |target| {
-            if starts.contains(&target) {
-                reached.insert(target);
+            if let Some(incoming) = predecessors.get_mut(&target) {
+                incoming.push(block.start.pc);
             }
         };
         match block.terminator {
@@ -2104,7 +2337,275 @@ fn internally_reached_blocks(region: &NativeRegion) -> HashSet<GuestVirtualAddre
             | BlockTerminator::Limit { .. } => {}
         }
     }
-    reached
+    let primary = region.key.start;
+    let mut dominators: HashMap<_, _> = starts
+        .iter()
+        .copied()
+        .map(|start| {
+            let set = if start == primary {
+                HashSet::from([primary])
+            } else {
+                starts.clone()
+            };
+            (start, set)
+        })
+        .collect();
+    loop {
+        let previous = dominators.clone();
+        let mut changed = false;
+        for &start in &starts {
+            if start == primary {
+                continue;
+            }
+            let incoming = &predecessors[&start];
+            let mut next = incoming
+                .first()
+                .map_or_else(HashSet::new, |first| previous[first].clone());
+            for predecessor in incoming.iter().skip(1) {
+                next.retain(|candidate| previous[predecessor].contains(candidate));
+            }
+            next.insert(start);
+            if next != dominators[&start] {
+                dominators.insert(start, next);
+                changed = true;
+            }
+        }
+        if !changed {
+            return dominators;
+        }
+    }
+}
+
+fn common_dominator(
+    uses: &[GuestVirtualAddress],
+    dominators: &HashMap<GuestVirtualAddress, HashSet<GuestVirtualAddress>>,
+) -> Option<GuestVirtualAddress> {
+    let first = *uses.first()?;
+    let mut common = dominators.get(&first)?.clone();
+    for used in &uses[1..] {
+        common.retain(|candidate| dominators[used].contains(candidate));
+    }
+    common
+        .into_iter()
+        .max_by_key(|candidate| dominators[candidate].len())
+}
+
+fn dirty_states_at_entry(region: &NativeRegion) -> HashMap<GuestVirtualAddress, DirtyState> {
+    let starts: HashSet<_> = region.blocks.iter().map(|block| block.start.pc).collect();
+    let mut states: HashMap<_, _> = starts
+        .iter()
+        .copied()
+        .map(|start| (start, DirtyState::default()))
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &region.blocks {
+            let mut outgoing = states[&block.start.pc];
+            outgoing.merge(block_dirty_state(block));
+            let mut propagate = |target| {
+                if let Some(state) = states.get_mut(&target) {
+                    changed |= state.merge(outgoing);
+                }
+            };
+            match block.terminator {
+                BlockTerminator::Direct { target } => propagate(target),
+                BlockTerminator::Conditional { taken, not_taken } => {
+                    propagate(taken);
+                    propagate(not_taken);
+                }
+                BlockTerminator::Call { .. }
+                | BlockTerminator::Indirect
+                | BlockTerminator::Architectural { .. }
+                | BlockTerminator::Unsupported
+                | BlockTerminator::Limit { .. } => {}
+            }
+        }
+    }
+    states
+}
+
+fn conditionally_dirty_at_entry(
+    region: &NativeRegion,
+    may: &HashMap<GuestVirtualAddress, DirtyState>,
+) -> DirtyState {
+    let starts: HashSet<_> = region.blocks.iter().map(|block| block.start.pc).collect();
+    let block_dirty: HashMap<_, _> = region
+        .blocks
+        .iter()
+        .map(|block| (block.start.pc, block_dirty_state(block)))
+        .collect();
+    let primary = region.key.start;
+    let mut predecessors: HashMap<_, Vec<_>> = starts
+        .iter()
+        .copied()
+        .map(|start| (start, Vec::new()))
+        .collect();
+    for block in &region.blocks {
+        let mut record = |target| {
+            if let Some(incoming) = predecessors.get_mut(&target) {
+                incoming.push(block.start.pc);
+            }
+        };
+        match block.terminator {
+            BlockTerminator::Direct { target } => record(target),
+            BlockTerminator::Conditional { taken, not_taken } => {
+                record(taken);
+                record(not_taken);
+            }
+            BlockTerminator::Call { .. }
+            | BlockTerminator::Indirect
+            | BlockTerminator::Architectural { .. }
+            | BlockTerminator::Unsupported
+            | BlockTerminator::Limit { .. } => {}
+        }
+    }
+
+    let mut must: HashMap<_, _> = starts
+        .iter()
+        .copied()
+        .map(|start| {
+            (
+                start,
+                if start == primary {
+                    DirtyState::default()
+                } else {
+                    DirtyState::all()
+                },
+            )
+        })
+        .collect();
+    loop {
+        let previous = must.clone();
+        let mut changed = false;
+        for &start in &starts {
+            if start == primary {
+                continue;
+            }
+            let mut incoming = predecessors[&start].iter();
+            let mut next = incoming
+                .next()
+                .map_or_else(DirtyState::default, |predecessor| {
+                    let mut state = previous[predecessor];
+                    state.merge(block_dirty[predecessor]);
+                    state
+                });
+            for predecessor in incoming {
+                let mut state = previous[predecessor];
+                state.merge(block_dirty[predecessor]);
+                next.intersect(state);
+            }
+            if next != must[&start] {
+                must.insert(start, next);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut conditional = DirtyState::default();
+    for start in starts {
+        let mut partial = may[&start];
+        let definitely = must[&start];
+        for (value, definite) in partial.integer.x.iter_mut().zip(definitely.integer.x) {
+            *value &= !definite;
+        }
+        partial.integer.sp &= !definitely.integer.sp;
+        for (value, definite) in partial.vector.iter_mut().zip(definitely.vector) {
+            *value &= !definite;
+        }
+        partial.fpsr &= !definitely.fpsr;
+        conditional.merge(partial);
+    }
+    conditional
+}
+
+fn block_dirty_state(block: &super::region::BasicBlockRecord) -> DirtyState {
+    let (_, integer_dirty, _, vector_dirty, _, fpsr_dirty) = block_register_access(block);
+    DirtyState {
+        integer: integer_dirty,
+        vector: vector_dirty,
+        fpsr: fpsr_dirty,
+    }
+}
+
+fn block_register_access(
+    block: &super::region::BasicBlockRecord,
+) -> (
+    IntegerRegisterSet,
+    IntegerRegisterSet,
+    [bool; 32],
+    [bool; 32],
+    bool,
+    bool,
+) {
+    let mut integer_accessed = IntegerRegisterSet::default();
+    let mut integer_dirty = IntegerRegisterSet::default();
+    let mut vector_accessed = [false; 32];
+    let mut vector_dirty = [false; 32];
+    let mut fpsr_read = false;
+    let mut fpsr_dirty = false;
+    for decoded in &block.instructions {
+        match nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
+            A64Instruction::Integer(instruction) => {
+                register_access_integer(instruction, &mut integer_accessed, &mut integer_dirty)
+            }
+            A64Instruction::Memory(instruction) => {
+                register_access_memory(instruction, &mut integer_accessed, &mut integer_dirty)
+            }
+            A64Instruction::System(instruction) => {
+                register_access_system(instruction, &mut integer_accessed, &mut integer_dirty);
+                let fields = instruction.operands();
+                fpsr_read |= matches!(instruction, system::Instruction::ReadRegister(_))
+                    && fields.system_key == 0xd53b_4420;
+                if matches!(instruction, system::Instruction::WriteRegister(_))
+                    && fields.system_key == 0xd51b_4420
+                {
+                    fpsr_dirty = true;
+                }
+            }
+            A64Instruction::FpSimd(instruction) => {
+                register_access_fp_simd_general(
+                    instruction,
+                    &mut integer_accessed,
+                    &mut integer_dirty,
+                );
+                register_access_fp_simd_vector(
+                    instruction,
+                    &mut vector_accessed,
+                    &mut vector_dirty,
+                );
+                if fp_simd_uses_exact_status(instruction) {
+                    fpsr_read = true;
+                    fpsr_dirty = true;
+                }
+            }
+            A64Instruction::Control(control::Instruction::BranchLinkImmediate(_)) => {
+                mark_write(&mut integer_accessed, &mut integer_dirty, 30, false);
+            }
+            A64Instruction::Control(control::Instruction::BranchRegister(fields)) => {
+                mark_read(&mut integer_accessed, fields.rn, false);
+                if fields.branch_register_key == 0xd63f_0000 {
+                    mark_write(&mut integer_accessed, &mut integer_dirty, 30, false);
+                }
+            }
+            A64Instruction::Control(
+                control::Instruction::CompareBranch(fields)
+                | control::Instruction::TestBranch(fields),
+            ) => mark_read(&mut integer_accessed, fields.rd, false),
+            _ => {}
+        }
+    }
+    (
+        integer_accessed,
+        integer_dirty,
+        vector_accessed,
+        vector_dirty,
+        fpsr_read,
+        fpsr_dirty,
+    )
 }
 
 fn register_access_integer(
@@ -2188,17 +2689,15 @@ fn mark_read(accessed: &mut IntegerRegisterSet, index: u8, register31_is_sp: boo
 }
 
 fn mark_write(
-    accessed: &mut IntegerRegisterSet,
+    _accessed: &mut IntegerRegisterSet,
     dirty: &mut IntegerRegisterSet,
     index: u8,
     register31_is_sp: bool,
 ) {
     if index == 31 {
-        accessed.sp |= register31_is_sp;
         dirty.sp |= register31_is_sp;
     } else {
         let slot = usize::from(index);
-        accessed.x[slot] = true;
         dirty.x[slot] = true;
     }
 }
@@ -2251,7 +2750,6 @@ fn compile_fault_sites(
                 access: pending.access,
                 completion: pending.completion,
                 guest_address: pinned_guest_address_location(),
-                retired_delta: pending.retired_delta,
             }
         }));
     }

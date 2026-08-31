@@ -103,8 +103,6 @@ pub struct NativeFaultSite {
     /// Register retaining the effective guest address. Fixed stubs publish
     /// their dynamic address through `StubCall` and therefore use `None`.
     pub guest_address: Option<HostIntegerRegister>,
-    /// Instructions completed after the current block-entry retirement checkpoint.
-    pub retired_delta: u32,
 }
 
 /// Immutable metadata for one finalized native function.
@@ -801,12 +799,12 @@ impl std::error::Error for DirectScalarAccessError {}
 ///
 /// Binding selects this object once for a LinuxDirect process. Accesses contain
 /// no page-table walk or permission test; host protection remains the access
-/// authority, while the compact store control publishes observer generations.
+/// authority, while the compact store control publishes the temporary page
+/// generation required before the raw-store cutover.
 pub struct DirectScalarFrontend {
     worker: Option<WorkerFaultContext>,
     arena: DirectAddressSpaceView,
     address_space: AddressSpaceId,
-    checked_accesses: u64,
     dispatcher_context: ManuallyDrop<Box<ScalarDispatcherContext>>,
     batch_active: bool,
 }
@@ -831,18 +829,9 @@ impl DirectScalarFrontend {
             worker: None,
             arena,
             address_space,
-            checked_accesses: 0,
             dispatcher_context: ManuallyDrop::new(Box::new(ScalarDispatcherContext::default())),
             batch_active: false,
         })
-    }
-
-    /// Number of guest accesses completed through the checked memory owner.
-    /// This is intentionally per frontend so performance tests need not rely
-    /// on process-global signal counters shared by parallel test workers.
-    #[must_use]
-    pub const fn checked_accesses(&self) -> u64 {
-        self.checked_accesses
     }
 
     /// Publishes the stable fault snapshot once for an interpreter slice.
@@ -900,7 +889,6 @@ impl DirectScalarFrontend {
             DataAccessKind::Read,
         );
         self.invoke(&mut call, scalar_stub(size, DataAccessKind::Read)?)?;
-        self.checked_accesses += u64::from(call.checked_completion);
         call.finish()?;
         Ok(MemoryValue::from_bits(size, u128::from(call.output)))
     }
@@ -961,7 +949,6 @@ impl DirectScalarFrontend {
             (None, _) => {}
         }
         invocation.map_err(DirectScalarAccessError::Runtime)?;
-        self.checked_accesses += u64::from(call.checked_completion);
         call.finish()
     }
 
@@ -1101,12 +1088,7 @@ impl DirectScalarFrontend {
             return None;
         }
         let generation = unsafe { atomic_at(control.generation_address) };
-        let content = unsafe { atomic_at(control.content_epoch_address) };
-        let cpu = unsafe { atomic_at(control.cpu_write_epoch_address) };
-        if [generation, content, cpu]
-            .into_iter()
-            .any(|counter| counter.load(Ordering::Acquire) == u64::MAX)
-        {
+        if generation.load(Ordering::Acquire) == u64::MAX {
             return None;
         }
         DirectStorePublication::acquire(*control)
@@ -1173,18 +1155,12 @@ impl DirectStorePublication {
             }
         }
         let armed = unsafe { atomic_at(control.write_armed_address) };
-        let exhausted = [
-            control.generation_address,
-            control.content_epoch_address,
-            control.cpu_write_epoch_address,
-        ]
-        .into_iter()
-        .any(|address| unsafe { atomic_at(address) }.load(Ordering::Acquire) == u64::MAX);
+        let exhausted =
+            unsafe { atomic_at(control.generation_address) }.load(Ordering::Acquire) == u64::MAX;
         if armed.load(Ordering::Acquire) == 0 || exhausted {
             sequence.store(observed, Ordering::Release);
             return None;
         }
-        unsafe { atomic_at(control.cpu_writes_active_address) }.fetch_add(1, Ordering::AcqRel);
         Some(Self {
             control,
             sequence: observed,
@@ -1192,13 +1168,7 @@ impl DirectStorePublication {
     }
 
     fn commit(self) {
-        for address in [
-            self.control.generation_address,
-            self.control.content_epoch_address,
-            self.control.cpu_write_epoch_address,
-        ] {
-            unsafe { atomic_at(address) }.fetch_add(1, Ordering::Release);
-        }
+        unsafe { atomic_at(self.control.generation_address) }.fetch_add(1, Ordering::Release);
         self.finish();
     }
 
@@ -1209,8 +1179,6 @@ impl DirectStorePublication {
     fn finish(self) {
         unsafe { atomic_at(self.control.write_sequence_address) }
             .store(self.sequence.wrapping_add(2), Ordering::Release);
-        unsafe { atomic_at(self.control.cpu_writes_active_address) }
-            .fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -1225,7 +1193,6 @@ struct StubCall {
     address: GuestVirtualAddress,
     access: MemoryAccess,
     kind: DataAccessKind,
-    checked_completion: bool,
     data_fault: Option<DataAccessFault>,
     backend_error: Option<Box<str>>,
 }
@@ -1253,7 +1220,6 @@ impl StubCall {
             address,
             access,
             kind,
-            checked_completion: false,
             data_fault: None,
             backend_error: None,
         }
@@ -1296,7 +1262,6 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
         ) {
             DirectFaultResolution::Retry => FaultDisposition::Retry,
             DirectFaultResolution::Checked => {
-                call.checked_completion = true;
                 match call.kind {
                     DataAccessKind::Read => {
                         match memory.read(call.address_space, call.address, call.access) {
@@ -1471,7 +1436,6 @@ fn scalar_stub_region(
             },
             completion: NativeFaultCompletion::None,
             guest_address: None,
-            retired_delta: 0,
         }]),
     }
 }
@@ -2089,8 +2053,8 @@ mod tests {
 
     use nixe_cpu::memory::{ExecutionMemory, MemoryPermissions};
     use nixe_memory::{
-        CanonicalBackingPage, CanonicalBackingStore, ContentGeneration, DirectArena,
-        DirectBackendPolicy, DirectMapRequest, DirectProtectRequest, DirectProtection,
+        CanonicalBackingPage, CanonicalBackingStore, CanonicalRangeTranslator, ContentGeneration,
+        DirectArena, DirectBackendPolicy, DirectMapRequest, DirectProtectRequest, DirectProtection,
         GuestPhysicalPageId,
     };
 
@@ -2230,7 +2194,6 @@ mod tests {
             },
             completion: NativeFaultCompletion::None,
             guest_address: None,
-            retired_delta: 0,
         };
         let registry = NativeFaultRegistry::new(vec![NativeFaultRegion {
             native_start: start,
@@ -2426,26 +2389,17 @@ mod tests {
         struct Controls {
             sequence: AtomicU64,
             generation: AtomicU64,
-            content: AtomicU64,
-            cpu: AtomicU64,
-            active: AtomicU64,
             armed: AtomicU64,
         }
 
         let controls = Arc::new(Controls {
             sequence: AtomicU64::new(1),
             generation: AtomicU64::new(7),
-            content: AtomicU64::new(8),
-            cpu: AtomicU64::new(9),
-            active: AtomicU64::new(0),
             armed: AtomicU64::new(1),
         });
         let control = DirectStoreControl {
             write_sequence_address: std::ptr::from_ref(&controls.sequence).addr(),
             generation_address: std::ptr::from_ref(&controls.generation).addr(),
-            content_epoch_address: std::ptr::from_ref(&controls.content).addr(),
-            cpu_write_epoch_address: std::ptr::from_ref(&controls.cpu).addr(),
-            cpu_writes_active_address: std::ptr::from_ref(&controls.active).addr(),
             write_armed_address: std::ptr::from_ref(&controls.armed).addr(),
         };
         let started = Arc::new(Barrier::new(2));
@@ -2461,7 +2415,6 @@ mod tests {
 
         assert!(worker.join().unwrap());
         assert_eq!(controls.sequence.load(Ordering::Acquire), 0);
-        assert_eq!(controls.active.load(Ordering::Acquire), 0);
         assert_eq!(controls.generation.load(Ordering::Acquire), 7);
     }
 
@@ -2517,7 +2470,6 @@ mod tests {
             },
             completion: NativeFaultCompletion::None,
             guest_address: None,
-            retired_delta: 0,
         }
     }
 
@@ -2644,6 +2596,10 @@ mod tests {
         memory
             .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
             .unwrap();
+        let range = memory
+            .translate_canonical_range(space, address, 1, MemoryPermissions::READ)
+            .unwrap();
+        let cpu_writes = nixe_memory::CanonicalCpuWriteDependency::capture(&range).unwrap();
         let view = memory.direct_address_space_view(space).unwrap();
         let memory = Arc::new(memory);
         let barrier = Arc::new(Barrier::new(2));
@@ -2667,16 +2623,14 @@ mod tests {
                             },
                         )
                         .unwrap();
-                    direct.checked_accesses()
                 })
             })
             .collect::<Vec<_>>();
-        let checked = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .sum::<u64>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
 
-        assert_eq!(checked, 2);
+        assert!(!cpu_writes.remains_current());
         let MemoryValue::U8(observed) = memory
             .read(space, address, MemoryAccess::normal(MemoryAccessSize::Byte))
             .unwrap()

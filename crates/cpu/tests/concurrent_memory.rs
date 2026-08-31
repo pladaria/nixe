@@ -205,6 +205,39 @@ fn bulk_write_snapshot_waits_for_active_native_execution_without_advancing_mappi
 }
 
 #[test]
+fn bulk_read_snapshot_waits_for_active_native_execution() {
+    let memory = shared_memory();
+    memory
+        .write(
+            SPACE,
+            PRIMARY,
+            MemoryAccess::normal(MemoryAccessSize::Byte),
+            MemoryValue::U8(0x5a),
+        )
+        .unwrap();
+    let active = memory.acquire_execution_lease();
+    let (notified_tx, notified_rx) = mpsc::channel();
+    memory.set_transition_notifier(Some(Arc::new(move || {
+        let _ = notified_tx.send(());
+    })));
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let reader_memory = Arc::clone(&memory);
+    let reader = thread::spawn(move || {
+        let mut observed = [0];
+        let result = reader_memory.read_bytes(SPACE, PRIMARY, &mut observed);
+        finished_tx.send((result, observed)).unwrap();
+    });
+
+    notified_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
+    drop(active);
+    let (result, observed) = finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    result.unwrap();
+    assert_eq!(observed, [0x5a]);
+    reader.join().unwrap();
+}
+
+#[test]
 fn concurrent_alias_access_remains_coherent_without_torn_values() {
     let memory = shared_memory();
     let start = Arc::new(Barrier::new(3));
@@ -255,7 +288,7 @@ fn failed_mapping_update_does_not_advance_the_epoch() {
 }
 
 #[test]
-fn contending_exclusive_stores_allow_only_one_generation_winner() {
+fn contending_exclusive_stores_allow_only_one_cas_winner() {
     let memory = shared_memory();
     let access = MemoryAccess::new(
         MemoryAccessSize::Word,
@@ -292,6 +325,37 @@ fn contending_exclusive_stores_allow_only_one_generation_winner() {
     for worker in workers {
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn exclusive_store_accepts_a_restored_expected_value_after_aba() {
+    let memory = shared_memory();
+    let access = MemoryAccess::new(
+        MemoryAccessSize::Word,
+        MemoryAlignment::Natural,
+        MemoryOrdering::AcquireRelease,
+        MemoryAccessClass::Exclusive,
+    );
+    memory
+        .write(SPACE, PRIMARY, access, MemoryValue::U32(7))
+        .unwrap();
+    let (_, reservation) = memory.load_exclusive(SPACE, PRIMARY, access).unwrap();
+    memory
+        .write(SPACE, ALIAS, access, MemoryValue::U32(9))
+        .unwrap();
+    memory
+        .write(SPACE, ALIAS, access, MemoryValue::U32(7))
+        .unwrap();
+
+    let (_, stored) = memory
+        .store_exclusive(SPACE, ALIAS, access, MemoryValue::U32(11), reservation)
+        .unwrap();
+
+    assert!(stored);
+    assert_eq!(
+        memory.read(SPACE, PRIMARY, access).unwrap().value,
+        MemoryValue::U32(11)
+    );
 }
 
 #[test]

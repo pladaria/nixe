@@ -14,7 +14,7 @@ use nixe_memory::{DIRECT_PAGE_SIZE, DirectStoreControl, GuestVirtualAddress};
 
 use super::{CraneliftTranslator, LazyFlags, trusted_flags};
 use crate::direct::slow;
-use crate::direct::{DirectJitError, EXIT_DATA_FAULT, EXIT_INTERNAL, NativeContext};
+use crate::direct::{DirectJitError, NativeContext};
 
 // Cranelift reserves five of the 255 non-zero trap codes. A region can use
 // each remaining code to identify one faultable direct access independently
@@ -454,7 +454,6 @@ impl CraneliftTranslator<'_, '_> {
             return self.memory_read_slow(source, address, size, ordering, flags);
         }
         let ty = memory_type(size);
-        let arena_size = self.load_context(types::I64, offset_of!(NativeContext, direct_size))?;
         let last = self
             .builder
             .ins()
@@ -466,7 +465,7 @@ impl CraneliftTranslator<'_, '_> {
         let in_arena = self
             .builder
             .ins()
-            .icmp(IntCC::UnsignedLessThan, last, arena_size);
+            .icmp(IntCC::UnsignedLessThan, last, self.direct_size);
         let alignment = self
             .builder
             .ins()
@@ -478,7 +477,7 @@ impl CraneliftTranslator<'_, '_> {
         self.checkpoint_direct_fault_state(flags)?;
 
         let native = self.builder.create_block();
-        let checked = self.builder.create_block();
+        let checked = self.cold_block();
         let merged = self.builder.create_block();
         self.builder.append_block_param(merged, ty);
         self.builder.ins().brif(eligible, native, &[], checked, &[]);
@@ -495,8 +494,7 @@ impl CraneliftTranslator<'_, '_> {
             completion,
         );
         self.builder.ins().set_pinned_reg(address);
-        let base = self.load_context(types::I64, offset_of!(NativeContext, direct_base))?;
-        let pointer = self.builder.ins().iadd(base, address);
+        let pointer = self.builder.ins().iadd(self.direct_base, address);
         // The private trap code preserves this guest operation's identity
         // through block layout and lowering, including duplicated native
         // instructions and missing source-location ranges.
@@ -550,7 +548,6 @@ impl CraneliftTranslator<'_, '_> {
         }
         self.checkpoint_direct_fault_state(flags)?;
         self.builder.ins().set_pinned_reg(address);
-        let arena_size = self.load_context(types::I64, offset_of!(NativeContext, direct_size))?;
         let last = self
             .builder
             .ins()
@@ -562,7 +559,7 @@ impl CraneliftTranslator<'_, '_> {
         let in_arena = self
             .builder
             .ins()
-            .icmp(IntCC::UnsignedLessThan, last, arena_size);
+            .icmp(IntCC::UnsignedLessThan, last, self.direct_size);
         let alignment = self
             .builder
             .ins()
@@ -574,13 +571,11 @@ impl CraneliftTranslator<'_, '_> {
         let lookup = self.builder.create_block();
         let check_armed = self.builder.create_block();
         let native = self.builder.create_block();
-        let fault = self.builder.create_block();
+        let fault = self.cold_block();
         let merged = self.builder.create_block();
         self.builder.ins().brif(eligible, lookup, &[], fault, &[]);
 
         self.builder.switch_to_block(lookup);
-        let controls =
-            self.load_context(types::I64, offset_of!(NativeContext, direct_store_controls))?;
         let guest_page = self
             .builder
             .ins()
@@ -589,7 +584,10 @@ impl CraneliftTranslator<'_, '_> {
             .builder
             .ins()
             .imul_imm_u(guest_page, size_of::<usize>() as i64);
-        let control_slot = self.builder.ins().iadd(controls, control_offset);
+        let control_slot = self
+            .builder
+            .ins()
+            .iadd(self.direct_store_controls, control_offset);
         let control = self
             .builder
             .ins()
@@ -655,11 +653,6 @@ impl CraneliftTranslator<'_, '_> {
         source: GuestVirtualAddress,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
-        // The fault-only CFG below retires the current guest instruction on
-        // its data-fault edge. `block_retired` describes the successful
-        // translation path used by later native fault metadata, so restore it
-        // after emitting those alternative blocks.
-        let successful_retired = self.block_retired;
         let callee = self.builder.ins().iconst(types::I64, function as i64);
         let mut signature = Signature::new(self.call_conv);
         signature.params.push(AbiParam::new(types::I64));
@@ -679,24 +672,14 @@ impl CraneliftTranslator<'_, '_> {
         let status = self.load_context(types::I32, offset_of!(NativeContext, slow_status))?;
         let succeeded = self.builder.ins().icmp_imm_s(IntCC::Equal, status, 0);
         let success = self.builder.create_block();
-        let failed = self.builder.create_block();
+        let failed = self.cold_block();
         self.builder
             .ins()
             .brif(succeeded, success, &[], failed, &[]);
         self.builder.switch_to_block(failed);
-        let data_fault = self.builder.ins().icmp_imm_s(IntCC::Equal, status, 1);
-        let fault = self.builder.create_block();
-        let internal = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(data_fault, fault, &[], internal, &[]);
-        self.builder.switch_to_block(fault);
-        self.retire_one();
-        self.emit_exit(EXIT_DATA_FAULT, 0, source, flags)?;
-        self.builder.switch_to_block(internal);
-        self.emit_exit(EXIT_INTERNAL, 0, source, flags)?;
+        self.commit_state(source, flags)?;
+        self.dispatch_slow_failure(status, source);
         self.builder.switch_to_block(success);
-        self.block_retired = successful_retired;
         Ok(())
     }
 
@@ -762,26 +745,13 @@ impl CraneliftTranslator<'_, '_> {
         fault: Block,
         merged: Block,
     ) -> Result<(), DirectJitError> {
-        let base = self.load_context(types::I64, offset_of!(NativeContext, direct_base))?;
-        let pointer = self.builder.ins().iadd(base, address);
+        let pointer = self.builder.ins().iadd(self.direct_base, address);
         let sequence_address = self.direct_control_field(
             control,
             offset_of!(DirectStoreControl, write_sequence_address),
         )?;
         let generation_address =
             self.direct_control_field(control, offset_of!(DirectStoreControl, generation_address))?;
-        let content_epoch_address = self.direct_control_field(
-            control,
-            offset_of!(DirectStoreControl, content_epoch_address),
-        )?;
-        let cpu_write_epoch_address = self.direct_control_field(
-            control,
-            offset_of!(DirectStoreControl, cpu_write_epoch_address),
-        )?;
-        let active_address = self.direct_control_field(
-            control,
-            offset_of!(DirectStoreControl, cpu_writes_active_address),
-        )?;
         let sequence = self.acquire_write_sequence(sequence_address);
         let still_armed =
             self.builder
@@ -793,49 +763,29 @@ impl CraneliftTranslator<'_, '_> {
             .icmp_imm_s(IntCC::NotEqual, still_armed, 0);
         let check_epochs = self.builder.create_block();
         let publish = self.builder.create_block();
-        let reject = self.builder.create_block();
+        let reject = self.cold_block();
         self.builder
             .ins()
             .brif(still_armed, check_epochs, &[], reject, &[]);
 
         self.builder.switch_to_block(check_epochs);
-        // Epoch exhaustion is exceptional, but wrapping any observer counter
-        // would silently resurrect stale reservations/snapshots. Test it only
-        // after acquiring the page sequence so concurrent native writers
-        // cannot both observe MAX-1 and race through the final increment.
-        let mut exhausted = None;
-        for epoch in [
-            generation_address,
-            content_epoch_address,
-            cpu_write_epoch_address,
-        ] {
-            let current = self
-                .builder
+        // Epoch exhaustion is exceptional. Test it only after acquiring the
+        // page sequence so concurrent native writers cannot both observe
+        // MAX-1 and race through the final increment.
+        let current_generation =
+            self.builder
                 .ins()
-                .atomic_load(types::I64, trusted_flags(), epoch);
-            let at_max = self.builder.ins().icmp_imm_s(IntCC::Equal, current, -1);
-            exhausted = Some(match exhausted {
-                Some(previous) => self.builder.ins().bor(previous, at_max),
-                None => at_max,
-            });
-        }
-        self.builder.ins().brif(
-            exhausted.expect("direct stores publish three epochs"),
-            reject,
-            &[],
-            publish,
-            &[],
-        );
+                .atomic_load(types::I64, trusted_flags(), generation_address);
+        let exhausted = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, current_generation, -1);
+        self.builder
+            .ins()
+            .brif(exhausted, reject, &[], publish, &[]);
 
         self.builder.switch_to_block(publish);
         let one = self.builder.ins().iconst(types::I64, 1);
-        self.builder.ins().atomic_rmw(
-            types::I64,
-            trusted_flags(),
-            AtomicRmwOp::Add,
-            active_address,
-            one,
-        );
         if self.builder.func.dfg.value_type(value) == types::I128 {
             self.builder.ins().store(trusted_flags(), value, pointer, 0);
         } else {
@@ -843,30 +793,17 @@ impl CraneliftTranslator<'_, '_> {
                 .ins()
                 .atomic_store(trusted_flags(), value, pointer);
         }
-        for epoch in [
+        self.builder.ins().atomic_rmw(
+            types::I64,
+            trusted_flags(),
+            AtomicRmwOp::Add,
             generation_address,
-            content_epoch_address,
-            cpu_write_epoch_address,
-        ] {
-            self.builder.ins().atomic_rmw(
-                types::I64,
-                trusted_flags(),
-                AtomicRmwOp::Add,
-                epoch,
-                one,
-            );
-        }
+            one,
+        );
         let completed = self.builder.ins().iadd_imm_s(sequence, 2);
         self.builder
             .ins()
             .atomic_store(trusted_flags(), completed, sequence_address);
-        self.builder.ins().atomic_rmw(
-            types::I64,
-            trusted_flags(),
-            AtomicRmwOp::Sub,
-            active_address,
-            one,
-        );
         self.builder.ins().jump(merged, &[]);
 
         self.builder.switch_to_block(reject);

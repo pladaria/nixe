@@ -100,6 +100,7 @@ pub enum VisibilityError {
     GenerationExhausted(GenerationExhausted),
     HostMemory(Box<str>),
     VisibilityEpochExhausted,
+    CpuDirtyEpochExhausted,
     ConcurrentTransition,
 }
 
@@ -125,6 +126,9 @@ impl Display for VisibilityError {
             Self::HostMemory(error) => write!(formatter, "host memory publication failed: {error}"),
             Self::VisibilityEpochExhausted => {
                 formatter.write_str("canonical visibility epoch is exhausted")
+            }
+            Self::CpuDirtyEpochExhausted => {
+                formatter.write_str("canonical CPU dirty epoch is exhausted")
             }
             Self::ConcurrentTransition => {
                 formatter.write_str("canonical visibility changed during a transition")

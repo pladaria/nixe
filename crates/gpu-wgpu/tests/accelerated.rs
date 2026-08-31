@@ -212,7 +212,6 @@ fn backing(
         0,
         page.size() as u64,
         MemoryPermissions::READ_WRITE,
-        page.content_generation(),
         MappingGeneration::INITIAL,
     )
     .unwrap();

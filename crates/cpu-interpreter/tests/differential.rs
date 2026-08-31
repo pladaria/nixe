@@ -61,7 +61,7 @@ fn concrete_thread_matches_direct_single_step_state_counts_and_stops() {
             })
             .unwrap();
         assert_eq!(adapted, direct);
-        assert_eq!(report.instructions_executed, 1);
+        assert_eq!(report.progress, 1);
         assert_eq!(
             matches!(report.stop, CpuExit::SupervisorCall { .. }),
             expected_exception
@@ -77,7 +77,7 @@ fn concrete_thread_matches_direct_single_step_state_counts_and_stops() {
 }
 
 #[test]
-fn linux_direct_interpreter_stores_fault_once_then_use_the_fixed_stub() {
+fn linux_direct_interpreter_stores_continue_after_the_first_protected_write() {
     const DATA: u64 = 0x8000;
     let cases = [
         (0x3900_0020_u32, MemoryAccessSize::Byte, 0xa5_u64, 0x5a_u64),
@@ -108,7 +108,6 @@ fn linux_direct_interpreter_stores_fault_once_then_use_the_fixed_stub() {
             .run_slice(direct_request(&memory, &mut state))
             .unwrap();
         assert_eq!(first_report.stop, CpuExit::BudgetExhausted);
-        assert_eq!(thread.direct_checked_accesses(), 1);
         assert_eq!(read_value(&memory, DATA, size), first);
 
         state.set_pc(CODE);
@@ -117,17 +116,12 @@ fn linux_direct_interpreter_stores_fault_once_then_use_the_fixed_stub() {
             .run_slice(direct_request(&memory, &mut state))
             .unwrap();
         assert_eq!(second_report.stop, CpuExit::BudgetExhausted);
-        assert_eq!(
-            thread.direct_checked_accesses(),
-            1,
-            "{encoding:#010x} returned to checked memory after arming"
-        );
         assert_eq!(read_value(&memory, DATA, size), second);
     }
 }
 
 #[test]
-fn linux_direct_interpreter_clean_reads_do_not_enter_checked_memory() {
+fn linux_direct_interpreter_reads_directly_mapped_values() {
     const DATA: u64 = 0x8000;
     for (encoding, size, value) in [
         (0x3940_0020_u32, MemoryAccessSize::Byte, 0xa5_u64),
@@ -156,7 +150,6 @@ fn linux_direct_interpreter_clean_reads_do_not_enter_checked_memory() {
             .run_slice(direct_request(&memory, &mut state))
             .unwrap();
         assert_eq!(report.stop, CpuExit::BudgetExhausted);
-        assert_eq!(thread.direct_checked_accesses(), 0);
         assert_eq!(read_register(&state, 0), value);
     }
 }
@@ -178,7 +171,6 @@ fn linux_direct_interpreter_preserves_unaligned_ordinary_accesses() {
         .run_slice(direct_request(&memory, &mut state))
         .unwrap();
     assert_eq!(report.stop, CpuExit::BudgetExhausted);
-    assert_eq!(thread.direct_checked_accesses(), 1);
     let access = MemoryAccess::new(
         MemoryAccessSize::Doubleword,
         MemoryAlignment::Unaligned,
@@ -281,9 +273,8 @@ fn linux_direct_interpreter_reports_unmapped_fault_with_exact_prefault_state() {
     };
     assert_eq!(source.pc, GuestVirtualAddress::new(CODE));
     assert_eq!(fault.address, GuestVirtualAddress::new(DATA));
-    assert_eq!(report.instructions_executed, 1);
+    assert_eq!(report.progress, 1);
     assert_eq!(state, before);
-    assert_eq!(thread.direct_checked_accesses(), 1);
 }
 
 #[test]
@@ -300,7 +291,6 @@ fn native_store_through_an_alias_invalidates_exclusive_reservations() {
     thread
         .run_slice(direct_request(&memory, &mut state))
         .unwrap();
-    assert_eq!(thread.direct_checked_accesses(), 1);
     let access = MemoryAccess::normal(MemoryAccessSize::Byte);
     let (_, reservation) = memory
         .load_exclusive(
@@ -315,7 +305,6 @@ fn native_store_through_an_alias_invalidates_exclusive_reservations() {
     thread
         .run_slice(direct_request(&memory, &mut state))
         .unwrap();
-    assert_eq!(thread.direct_checked_accesses(), 1);
     let (_, stored) = memory
         .store_exclusive(
             AddressSpaceId::new(1),
@@ -330,7 +319,7 @@ fn native_store_through_an_alias_invalidates_exclusive_reservations() {
 }
 
 #[test]
-fn executable_physical_alias_keeps_every_store_on_the_checked_path() {
+fn executable_physical_alias_uses_the_same_direct_store_path() {
     const DATA: u64 = 0x8000;
     const EXECUTABLE_ALIAS: u64 = 0x9000;
     let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, AddressSpaceId::new(1));
@@ -349,7 +338,6 @@ fn executable_physical_alias_keeps_every_store_on_the_checked_path() {
         .run_slice(direct_request(&memory, &mut state))
         .unwrap();
 
-    assert_eq!(thread.direct_checked_accesses(), 2);
     assert_eq!(read_value(&memory, DATA, MemoryAccessSize::Byte), 0x55);
 }
 

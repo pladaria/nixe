@@ -20,7 +20,7 @@ use nixe_gpu::{
     ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderSpecialFunction, ShaderStage,
     ShaderTextureSampleOutput, ShaderVerificationError, VerifiedShaderIr, lower_shader_ir_to_wgsl,
 };
-use nixe_memory::{CanonicalBackingRange, CanonicalBackingSegment, MemoryPermissions};
+use nixe_memory::{CanonicalBackingRange, CanonicalCpuWriteDependency, MemoryPermissions};
 
 use crate::{
     MAXWELL_PIPELINE_SHADER_COUNT, MAXWELL_VERTEX_ATTRIBUTE_COUNT, MaxwellGpuAccessError,
@@ -108,12 +108,12 @@ pub(crate) struct MaxwellShaderBinary {
     address: u64,
     header: MaxwellShaderProgramHeader,
     bundles: Box<[MaxwellShaderInstructionBundle]>,
-    source_pages: Box<[CanonicalBackingSegment]>,
+    source_cpu_writes: Box<[CanonicalCpuWriteDependency]>,
     source_mappings: Box<[crate::MaxwellGpuMapping]>,
 }
 
-// Mapping identity and content generations prove that the snapshot was read
-// coherently, but do not alter the decoded program. Cache identity therefore
+// Mapping identity and page dirty dependencies prove that the snapshot remains
+// current, but do not alter the decoded program. Cache identity therefore
 // follows only bytes which can affect translation.
 impl PartialEq for MaxwellShaderBinary {
     fn eq(&self, other: &Self) -> bool {
@@ -171,9 +171,9 @@ impl MaxwellShaderTranslationInputs {
                 .all(|mapping| address_space.retained_mapping_is_current(mapping))
                 && program
                     .binary
-                    .source_pages
+                    .source_cpu_writes
                     .iter()
-                    .all(CanonicalBackingSegment::content_is_current)
+                    .all(CanonicalCpuWriteDependency::remains_current)
         })
     }
 
@@ -764,7 +764,8 @@ struct MaxwellShaderMemoryView<'a> {
 
 struct MaxwellShaderRead {
     bytes: Vec<u8>,
-    snapshots: Vec<CanonicalBackingRange>,
+    snapshot: CanonicalBackingRange,
+    cpu_writes: CanonicalCpuWriteDependency,
     mappings: Vec<crate::MaxwellGpuMapping>,
 }
 
@@ -830,19 +831,21 @@ impl<'a> MaxwellShaderMemoryView<'a> {
                 address,
                 error,
             })?;
-        let mut bytes = vec![0_u8; size];
-        let mut snapshots = Vec::new();
+        let mut canonical_segments = Vec::new();
         let mut mappings = Vec::new();
         for segment in resolved.segments() {
-            let snapshot = segment
+            segment
                 .mapping()
                 .backing()
-                .snapshot_subrange(segment.backing_offset(), segment.size())
+                .snapshot_subrange_into(
+                    segment.backing_offset(),
+                    segment.size(),
+                    &mut canonical_segments,
+                )
                 .map_err(|_| MaxwellShaderTranslationError::SourceChangedDuringRead {
                     stage,
                     address,
                 })?;
-            snapshots.push(snapshot);
             if !mappings
                 .iter()
                 .any(|mapping: &crate::MaxwellGpuMapping| mapping.id() == segment.mapping().id())
@@ -850,21 +853,19 @@ impl<'a> MaxwellShaderMemoryView<'a> {
                 mappings.push(segment.mapping().clone());
             }
         }
-        self.address_space
-            .read_resolved(&resolved, &mut bytes)
+        let snapshot = CanonicalBackingRange::new(canonical_segments).map_err(|_| {
+            MaxwellShaderTranslationError::SourceChangedDuringRead { stage, address }
+        })?;
+        let cpu_writes = CanonicalCpuWriteDependency::capture(&snapshot)
+            .ok_or(MaxwellShaderTranslationError::SourceChangedDuringRead { stage, address })?;
+        let mut bytes = cpu_writes
+            .snapshot_all(&snapshot)
             .map_err(|error| MaxwellShaderTranslationError::Memory {
                 stage,
                 address,
-                error,
-            })?;
-        if snapshots.iter().any(|snapshot| {
-            snapshot
-                .segments()
-                .iter()
-                .any(|backing| !backing.content_is_current())
-        }) {
-            return Err(MaxwellShaderTranslationError::SourceChangedDuringRead { stage, address });
-        }
+                error: MaxwellGpuAccessError::Backing(error),
+            })?
+            .into_vec();
 
         let read_end =
             address
@@ -915,7 +916,8 @@ impl<'a> MaxwellShaderMemoryView<'a> {
         }
         Ok(MaxwellShaderRead {
             bytes,
-            snapshots,
+            snapshot,
+            cpu_writes,
             mappings,
         })
     }
@@ -4474,9 +4476,15 @@ fn read_shader_binary(
         MAXWELL_SHADER_PROGRAM_HEADER_SIZE,
     )?;
     let header = decode_program_header(&header_read.bytes)?;
-    let mut source_pages = BTreeMap::new();
+    let mut source_pages = BTreeSet::new();
+    let mut source_cpu_writes = Vec::new();
     let mut source_mappings = BTreeMap::new();
-    retain_shader_read_evidence(&header_read, &mut source_pages, &mut source_mappings);
+    retain_shader_read_evidence(
+        &header_read,
+        &mut source_pages,
+        &mut source_cpu_writes,
+        &mut source_mappings,
+    );
     let mut bundles = Vec::new();
     let code_address = address
         .checked_add(MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64)
@@ -4501,7 +4509,12 @@ fn read_shader_binary(
             bundle_address,
             MAXWELL_SCHEDULE_BUNDLE_SIZE,
         )?;
-        retain_shader_read_evidence(&read, &mut source_pages, &mut source_mappings);
+        retain_shader_read_evidence(
+            &read,
+            &mut source_pages,
+            &mut source_cpu_writes,
+            &mut source_mappings,
+        );
         let words = read
             .bytes
             .chunks_exact(MAXWELL_INSTRUCTION_SIZE)
@@ -4518,9 +4531,9 @@ fn read_shader_binary(
             .any(|instruction| instruction >> 48 == 0xe300);
         bundles.push(bundle);
         if exits {
-            if source_pages
-                .values()
-                .any(|backing| !backing.content_is_current())
+            if source_cpu_writes
+                .iter()
+                .any(|dependency| !dependency.remains_current())
             {
                 return Err(MaxwellShaderTranslationError::SourceChangedDuringRead {
                     stage,
@@ -4531,7 +4544,7 @@ fn read_shader_binary(
                 address,
                 header,
                 bundles: bundles.into_boxed_slice(),
-                source_pages: source_pages.into_values().collect(),
+                source_cpu_writes: source_cpu_writes.into_boxed_slice(),
                 source_mappings: source_mappings.into_values().collect(),
             });
         }
@@ -4544,13 +4557,16 @@ fn read_shader_binary(
 
 fn retain_shader_read_evidence(
     read: &MaxwellShaderRead,
-    pages: &mut BTreeMap<nixe_memory::CanonicalPageId, CanonicalBackingSegment>,
+    pages: &mut BTreeSet<nixe_memory::CanonicalPageId>,
+    cpu_writes: &mut Vec<CanonicalCpuWriteDependency>,
     mappings: &mut BTreeMap<crate::MaxwellMappingId, crate::MaxwellGpuMapping>,
 ) {
-    for segment in read.snapshots.iter().flat_map(|range| range.segments()) {
-        pages
-            .entry(segment.page())
-            .or_insert_with(|| segment.clone());
+    let mut introduced_page = false;
+    for segment in read.snapshot.segments() {
+        introduced_page |= pages.insert(segment.page());
+    }
+    if introduced_page {
+        cpu_writes.push(read.cpu_writes.clone());
     }
     for mapping in &read.mappings {
         mappings

@@ -45,7 +45,6 @@ const MAX_NATIVE_FAULT_REGIONS: usize = 262_144;
 
 const EXIT_NONE: u32 = 0;
 const EXIT_DISPATCH: u32 = 1;
-const EXIT_BUDGET: u32 = 2;
 const EXIT_CONTROL: u32 = 3;
 const EXIT_ARCHITECTURAL: u32 = 4;
 const EXIT_UNSUPPORTED: u32 = 5;
@@ -53,6 +52,8 @@ const EXIT_DATA_FAULT: u32 = 6;
 const EXIT_SCHEDULED: u32 = 7;
 const EXIT_INTERNAL: u32 = 8;
 const EXIT_RECONCILE: u32 = 9;
+
+const COARSE_PROGRESS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirectJitErrorKind {
@@ -118,43 +119,39 @@ impl std::error::Error for DirectJitError {}
 enum DirectExit {
     Dispatch {
         pc: GuestVirtualAddress,
-        instructions: u64,
-    },
-    Budget {
-        pc: GuestVirtualAddress,
-        instructions: u64,
+        progress: u64,
     },
     Control {
         pc: GuestVirtualAddress,
-        instructions: u64,
+        progress: u64,
     },
     Architectural {
         pc: GuestVirtualAddress,
         detail: u32,
-        instructions: u64,
+        progress: u64,
     },
     Unsupported {
         pc: GuestVirtualAddress,
-        instructions: u64,
+        progress: u64,
     },
     DataFault {
         pc: GuestVirtualAddress,
         fault: DataAccessFault,
-        instructions: u64,
+        progress: u64,
     },
     Scheduled {
         pc: GuestVirtualAddress,
         request: SchedulerRequest,
-        instructions: u64,
+        progress: u64,
     },
     LoaderReturn {
         pc: GuestVirtualAddress,
         result_code: u64,
-        instructions: u64,
+        progress: u64,
     },
     Internal {
         pc: GuestVirtualAddress,
-        instructions: u64,
+        progress: u64,
     },
     Reconcile,
 }
@@ -179,10 +176,9 @@ struct NativeContext {
     direct_base: usize,
     direct_size: usize,
     direct_store_controls: usize,
-    instruction_budget: u64,
     loader_return: u64,
     control_pending: usize,
-    retired: u64,
+    synchronization_counter: usize,
     exit_pc: u64,
     exit_kind: u32,
     exit_detail: u32,
@@ -206,7 +202,6 @@ impl NativeContext {
         timer: &dyn ArchitecturalTimer,
         events: &VcpuEventState,
         address_space: nixe_memory::AddressSpaceId,
-        instruction_budget: u64,
         loader_return: Option<GuestVirtualAddress>,
         control: &CpuControl,
         native_lookup: *const NativeLookupSlot,
@@ -250,10 +245,9 @@ impl NativeContext {
             direct_base: direct.map_or(0, |view| view.base),
             direct_size: direct.map_or(0, |view| view.address_space_size),
             direct_store_controls: direct.map_or(0, |view| view.store_controls),
-            instruction_budget,
             loader_return: loader_return.map_or(u64::MAX, GuestVirtualAddress::get),
             control_pending: control.pending_word_address(),
-            retired: 0,
+            synchronization_counter: control.synchronization_counter_address(),
             exit_pc: 0,
             exit_kind: EXIT_NONE,
             exit_detail: 0,
@@ -274,23 +268,24 @@ impl NativeContext {
             return Err(DirectJitError::internal(detail));
         }
         let pc = GuestVirtualAddress::new(self.exit_pc);
-        let instructions = self.retired;
         match self.exit_kind {
-            EXIT_DISPATCH => Ok(DirectExit::Dispatch { pc, instructions }),
-            EXIT_BUDGET => Ok(DirectExit::Budget { pc, instructions }),
-            EXIT_CONTROL => Ok(DirectExit::Control { pc, instructions }),
+            EXIT_DISPATCH => Ok(DirectExit::Dispatch {
+                pc,
+                progress: COARSE_PROGRESS,
+            }),
+            EXIT_CONTROL => Ok(DirectExit::Control { pc, progress: 0 }),
             EXIT_ARCHITECTURAL => Ok(DirectExit::Architectural {
                 pc,
                 detail: self.exit_detail,
-                instructions,
+                progress: COARSE_PROGRESS,
             }),
-            EXIT_UNSUPPORTED => Ok(DirectExit::Unsupported { pc, instructions }),
+            EXIT_UNSUPPORTED => Ok(DirectExit::Unsupported { pc, progress: 0 }),
             EXIT_DATA_FAULT => Ok(DirectExit::DataFault {
                 pc,
                 fault: self.data_fault.clone().ok_or_else(|| {
                     DirectJitError::internal("direct JIT data-fault exit has no fault")
                 })?,
-                instructions,
+                progress: COARSE_PROGRESS,
             }),
             EXIT_SCHEDULED => {
                 let request = match self.exit_detail {
@@ -307,10 +302,10 @@ impl NativeContext {
                 Ok(DirectExit::Scheduled {
                     pc,
                     request,
-                    instructions,
+                    progress: COARSE_PROGRESS,
                 })
             }
-            EXIT_INTERNAL => Ok(DirectExit::Internal { pc, instructions }),
+            EXIT_INTERNAL => Ok(DirectExit::Internal { pc, progress: 0 }),
             EXIT_RECONCILE => Ok(DirectExit::Reconcile),
             kind => Err(DirectJitError::internal(format!(
                 "direct JIT returned unknown native exit {kind}"
@@ -333,9 +328,9 @@ struct PublishedRegion {
     #[cfg(test)]
     clif_instructions: usize,
     #[cfg(test)]
-    register_loads: usize,
+    deferred_register_loads: usize,
     #[cfg(test)]
-    register_stores: usize,
+    exit_tail_count: usize,
     dependencies: Box<[CodePageDependency]>,
     mapping_dependencies: Box<[CodePageSpan]>,
     links: Box<[StaticLink]>,
@@ -524,11 +519,11 @@ impl JitProcess {
             }
         };
         let entry = compiled.entry;
-        let entry_keys: Vec<_> = region
-            .blocks
-            .iter()
-            .map(|block| key.at(block.start.pc))
-            .collect();
+        // Only the requested primary entry is published. An address reached
+        // internally stays on the SSA edge; a later external request for that
+        // address discovers its own region instead of paying a dispatcher in
+        // every primary entry.
+        let entry_keys = vec![key];
         let links: Vec<_> = link_targets
             .into_iter()
             .zip(slots)
@@ -558,7 +553,6 @@ impl JitProcess {
                         access: site.access,
                         completion: site.completion,
                         guest_address: Some(site.guest_address),
-                        retired_delta: site.retired_delta,
                     })
                 })
                 .collect::<Result<Vec<_>, DirectJitError>>()?;
@@ -580,9 +574,9 @@ impl JitProcess {
             #[cfg(test)]
             clif_instructions: compiled.clif_instructions,
             #[cfg(test)]
-            register_loads: compiled.register_loads,
+            deferred_register_loads: compiled.deferred_register_loads,
             #[cfg(test)]
-            register_stores: compiled.register_stores,
+            exit_tail_count: compiled.exit_tail_count,
             dependencies: region.dependencies,
             mapping_dependencies: region.mapping_dependencies,
             links: links.into_boxed_slice(),
@@ -853,7 +847,6 @@ impl Default for JitThread {
 struct NativeRunRequest<'a> {
     memory: &'a dyn CpuMemory,
     state: &'a mut A64State,
-    instruction_budget: u64,
     loader_return: Option<GuestVirtualAddress>,
     timer: &'a dyn ArchitecturalTimer,
     events: &'a VcpuEventState,
@@ -966,7 +959,6 @@ impl JitThread {
             drop(request.memory_lease.take());
         }
         let mut executed = 0;
-        let mut remaining = request.instruction_budget;
         loop {
             let pending_interrupts = request.events.take_pending_interrupts();
             if pending_interrupts != 0 {
@@ -984,34 +976,25 @@ impl JitThread {
                     NativeRunRequest {
                         memory: request.memory,
                         state: request.state,
-                        instruction_budget: remaining,
                         loader_return: request.loader_return,
                         timer: request.timer,
                         events: &request.events,
                     },
                 )
                 .map_err(|error| jit_fault(error, executed, request.state))?;
-            let retired = direct_exit_instructions(&exit);
-            executed = executed.saturating_add(retired);
-            remaining = remaining.saturating_sub(retired);
+            let completed = direct_exit_progress(&exit);
+            executed = executed.saturating_add(completed);
             let source = |pc| LocationDescriptor::new(pc, process.cpu.profile_id());
             let stop = match exit {
                 DirectExit::Dispatch { .. } => continue,
-                DirectExit::Budget { .. } => CpuExit::BudgetExhausted,
                 DirectExit::Control { .. } => {
-                    let Some(control) = self.control.take_pending() else {
-                        return Err(internal_fault(
-                            "native control exit has no pending request",
-                            executed,
-                            request.state,
-                        ));
-                    };
-                    self.control.acknowledge(control);
-                    if control.contains(ControlRequest::Preempt) {
-                        CpuExit::Safepoint
-                    } else {
-                        continue;
+                    if let Some(control) = self.control.take_pending() {
+                        self.control.acknowledge(control);
+                        if !control.contains(ControlRequest::Preempt) {
+                            continue;
+                        }
                     }
+                    CpuExit::Safepoint
                 }
                 DirectExit::Architectural { pc, detail, .. } => {
                     let class = detail >> 24;
@@ -1076,19 +1059,22 @@ impl JitThread {
         process: &JitProcess,
         memory: &dyn CpuMemory,
         state: &mut A64State,
-        instruction_budget: u64,
     ) -> Result<DirectExit, DirectJitError> {
-        self.run_with_runtime(
-            process,
-            NativeRunRequest {
-                memory,
-                state,
-                instruction_budget,
-                loader_return: None,
-                timer: &ZeroTimer,
-                events: &self.events,
-            },
-        )
+        loop {
+            let exit = self.run_with_runtime(
+                process,
+                NativeRunRequest {
+                    memory,
+                    state,
+                    loader_return: None,
+                    timer: &ZeroTimer,
+                    events: &self.events,
+                },
+            )?;
+            if !matches!(exit, DirectExit::Dispatch { .. }) {
+                return Ok(exit);
+            }
+        }
     }
 
     fn run_with_runtime(
@@ -1099,7 +1085,6 @@ impl JitThread {
         let NativeRunRequest {
             memory,
             state,
-            instruction_budget,
             loader_return,
             timer,
             events,
@@ -1133,7 +1118,6 @@ impl JitThread {
             timer,
             events,
             process.cpu.address_space_id(),
-            instruction_budget,
             loader_return,
             &self.control,
             native_lookup,
@@ -1147,7 +1131,7 @@ impl JitThread {
                     result_code: state.read_x(A64Register::General(
                         A64GeneralRegister::new(0).expect("valid result register"),
                     )),
-                    instructions: context.retired,
+                    progress: 0,
                 });
             }
             let location = LocationDescriptor::new(pc, process.cpu.profile_id());
@@ -1215,9 +1199,6 @@ impl JitThread {
                 process.reconcile(memory)?;
                 continue;
             }
-            if matches!(exit, DirectExit::Dispatch { .. }) {
-                continue;
-            }
             return Ok(exit);
         }
     }
@@ -1273,9 +1254,7 @@ unsafe fn dispatch_direct_fault_inner(
                 // AArch64 glibc does not restore all volatile host state from
                 // setcontext. Re-enter the faulting guest checkpoint instead;
                 // this path is cold and leaves generated memory accesses bare.
-                let pre_retired = direct_fault_retired(context, fault);
                 unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
-                context.retired = pre_retired;
                 context.exit_pc = site.access.guest_pc.get();
                 context.exit_kind = EXIT_DISPATCH;
                 context.exit_detail = 0;
@@ -1285,19 +1264,12 @@ unsafe fn dispatch_direct_fault_inner(
             }
         }
         DirectFaultResolution::Checked => {
-            let pre_retired = direct_fault_retired(context, fault);
             match kind {
                 DataAccessKind::Read => {
                     match site.completion {
                         NativeFaultCompletion::IntegerPairLoad { .. } => {
                             if !complete_direct_pair_read(
-                                context,
-                                memory,
-                                site,
-                                address,
-                                size,
-                                access,
-                                pre_retired,
+                                context, memory, site, address, size, access,
                             ) {
                                 return FaultDisposition::Fatal;
                             }
@@ -1305,13 +1277,7 @@ unsafe fn dispatch_direct_fault_inner(
                         }
                         NativeFaultCompletion::VectorPairLoad { .. } => {
                             if !complete_direct_vector_pair_read(
-                                context,
-                                memory,
-                                site,
-                                address,
-                                size,
-                                access,
-                                pre_retired,
+                                context, memory, site, address, size, access,
                             ) {
                                 return FaultDisposition::Fatal;
                             }
@@ -1331,7 +1297,6 @@ unsafe fn dispatch_direct_fault_inner(
                             }
                             let next = site.access.guest_pc.wrapping_offset(4);
                             unsafe { &mut *context.state }.set_pc(next.get());
-                            context.retired = pre_retired.saturating_add(1);
                             context.exit_pc = next.get();
                             context.exit_kind = EXIT_DISPATCH;
                             context.exit_detail = 0;
@@ -1339,7 +1304,6 @@ unsafe fn dispatch_direct_fault_inner(
                         }
                         Err(data_fault) => {
                             unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
-                            context.retired = pre_retired.saturating_add(1);
                             context.exit_pc = site.access.guest_pc.get();
                             context.exit_kind = EXIT_DATA_FAULT;
                             context.exit_detail = 0;
@@ -1360,7 +1324,6 @@ unsafe fn dispatch_direct_fault_inner(
                         Ok(_) => {
                             let next = site.access.guest_pc.wrapping_offset(4);
                             unsafe { &mut *context.state }.set_pc(next.get());
-                            context.retired = pre_retired.saturating_add(1);
                             context.exit_pc = next.get();
                             context.exit_kind = EXIT_DISPATCH;
                             context.exit_detail = 0;
@@ -1368,7 +1331,6 @@ unsafe fn dispatch_direct_fault_inner(
                         }
                         Err(data_fault) => {
                             unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
-                            context.retired = pre_retired.saturating_add(1);
                             context.exit_pc = site.access.guest_pc.get();
                             context.exit_kind = EXIT_DATA_FAULT;
                             context.exit_detail = 0;
@@ -1380,21 +1342,13 @@ unsafe fn dispatch_direct_fault_inner(
             FaultDisposition::Escape
         }
         DirectFaultResolution::Fatal(detail) => {
-            let pre_retired = direct_fault_retired(context, fault);
             unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
-            context.retired = pre_retired;
             context.exit_pc = site.access.guest_pc.get();
             context.exit_kind = EXIT_INTERNAL;
             context.direct_fault_error = Some(detail);
             FaultDisposition::Escape
         }
     }
-}
-
-fn direct_fault_retired(context: &NativeContext, fault: &CapturedFault) -> u64 {
-    context
-        .retired
-        .saturating_add(u64::from(fault.site().retired_delta))
 }
 
 fn complete_direct_read(
@@ -1429,7 +1383,6 @@ fn complete_direct_pair_read(
     fault_address: GuestVirtualAddress,
     size: MemoryAccessSize,
     access: MemoryAccess,
-    pre_retired: u64,
 ) -> bool {
     let NativeFaultCompletion::IntegerPairLoad {
         first_register,
@@ -1459,14 +1412,14 @@ fn complete_direct_pair_read(
     let first = match memory.read(site.access.address_space, first_address, access) {
         Ok(result) => result.value.bits(),
         Err(data_fault) => {
-            finish_checked_direct_fault(context, site.access.guest_pc, pre_retired, data_fault);
+            finish_checked_direct_fault(context, site.access.guest_pc, data_fault);
             return true;
         }
     };
     let second = match memory.read(site.access.address_space, second_address, access) {
         Ok(result) => result.value.bits(),
         Err(data_fault) => {
-            finish_checked_direct_fault(context, site.access.guest_pc, pre_retired, data_fault);
+            finish_checked_direct_fault(context, site.access.guest_pc, data_fault);
             return true;
         }
     };
@@ -1503,7 +1456,7 @@ fn complete_direct_pair_read(
     if let Some((register, value)) = writeback {
         state.write_x(register, value);
     }
-    finish_checked_direct_success(context, site.access.guest_pc, pre_retired);
+    finish_checked_direct_success(context, site.access.guest_pc);
     true
 }
 
@@ -1515,7 +1468,6 @@ fn complete_direct_vector_pair_read(
     fault_address: GuestVirtualAddress,
     size: MemoryAccessSize,
     access: MemoryAccess,
-    pre_retired: u64,
 ) -> bool {
     let NativeFaultCompletion::VectorPairLoad {
         first_register,
@@ -1545,7 +1497,7 @@ fn complete_direct_vector_pair_read(
     ) {
         Ok(result) => result.value.bits(),
         Err(data_fault) => {
-            finish_checked_direct_fault(context, site.access.guest_pc, pre_retired, data_fault);
+            finish_checked_direct_fault(context, site.access.guest_pc, data_fault);
             return true;
         }
     };
@@ -1556,7 +1508,7 @@ fn complete_direct_vector_pair_read(
     ) {
         Ok(result) => result.value.bits(),
         Err(data_fault) => {
-            finish_checked_direct_fault(context, site.access.guest_pc, pre_retired, data_fault);
+            finish_checked_direct_fault(context, site.access.guest_pc, data_fault);
             return true;
         }
     };
@@ -1585,7 +1537,7 @@ fn complete_direct_vector_pair_read(
     if let Some((register, value)) = writeback {
         state.write_x(register, value);
     }
-    finish_checked_direct_success(context, site.access.guest_pc, pre_retired);
+    finish_checked_direct_success(context, site.access.guest_pc);
     true
 }
 
@@ -1623,14 +1575,9 @@ fn write_integer_result(state: &mut A64State, register: u8, value: u64) -> bool 
     true
 }
 
-fn finish_checked_direct_success(
-    context: &mut NativeContext,
-    source: GuestVirtualAddress,
-    pre_retired: u64,
-) {
+fn finish_checked_direct_success(context: &mut NativeContext, source: GuestVirtualAddress) {
     let next = source.wrapping_offset(4);
     unsafe { &mut *context.state }.set_pc(next.get());
-    context.retired = pre_retired.saturating_add(1);
     context.exit_pc = next.get();
     context.exit_kind = EXIT_DISPATCH;
     context.exit_detail = 0;
@@ -1640,11 +1587,9 @@ fn finish_checked_direct_success(
 fn finish_checked_direct_fault(
     context: &mut NativeContext,
     source: GuestVirtualAddress,
-    pre_retired: u64,
     data_fault: DataAccessFault,
 ) {
     unsafe { &mut *context.state }.set_pc(source.get());
-    context.retired = pre_retired.saturating_add(1);
     context.exit_pc = source.get();
     context.exit_kind = EXIT_DATA_FAULT;
     context.exit_detail = 0;
@@ -1684,30 +1629,29 @@ const fn direct_access_size(bytes: u8) -> Option<MemoryAccessSize> {
     }
 }
 
-fn direct_exit_instructions(exit: &DirectExit) -> u64 {
+fn direct_exit_progress(exit: &DirectExit) -> u64 {
     match exit {
-        DirectExit::Dispatch { instructions, .. }
-        | DirectExit::Budget { instructions, .. }
-        | DirectExit::Control { instructions, .. }
-        | DirectExit::Architectural { instructions, .. }
-        | DirectExit::Unsupported { instructions, .. }
-        | DirectExit::DataFault { instructions, .. }
-        | DirectExit::Scheduled { instructions, .. }
-        | DirectExit::Internal { instructions, .. }
-        | DirectExit::LoaderReturn { instructions, .. } => *instructions,
+        DirectExit::Dispatch { progress, .. }
+        | DirectExit::Control { progress, .. }
+        | DirectExit::Architectural { progress, .. }
+        | DirectExit::Unsupported { progress, .. }
+        | DirectExit::DataFault { progress, .. }
+        | DirectExit::Scheduled { progress, .. }
+        | DirectExit::Internal { progress, .. }
+        | DirectExit::LoaderReturn { progress, .. } => *progress,
         DirectExit::Reconcile => 0,
     }
 }
 
-fn report(instructions_executed: u64, stop: CpuExit, state: &A64State) -> ExecutionReport {
+fn report(progress: u64, stop: CpuExit, state: &A64State) -> ExecutionReport {
     ExecutionReport {
-        instructions_executed,
+        progress,
         stop,
         context: state.register_context(),
     }
 }
 
-fn jit_fault(error: DirectJitError, instructions_executed: u64, state: &A64State) -> CpuFault {
+fn jit_fault(error: DirectJitError, progress: u64, state: &A64State) -> CpuFault {
     let kind = match error.kind {
         DirectJitErrorKind::InvalidGuestCode => CpuFaultKind::InvalidRequest,
         DirectJitErrorKind::Unsupported
@@ -1718,21 +1662,17 @@ fn jit_fault(error: DirectJitError, instructions_executed: u64, state: &A64State
     CpuFault {
         backend: "jit",
         kind,
-        instructions_executed,
+        progress,
         message: error.detail,
         context: Box::new(state.register_context()),
     }
 }
 
-fn internal_fault(
-    message: impl Into<Box<str>>,
-    instructions_executed: u64,
-    state: &A64State,
-) -> CpuFault {
+fn internal_fault(message: impl Into<Box<str>>, progress: u64, state: &A64State) -> CpuFault {
     CpuFault {
         backend: "jit",
         kind: CpuFaultKind::Internal,
-        instructions_executed,
+        progress,
         message: message.into(),
         context: Box::new(state.register_context()),
     }
@@ -1742,13 +1682,13 @@ fn unsupported_exit(
     process: &JitProcess,
     memory: &dyn CpuMemory,
     pc: GuestVirtualAddress,
-    instructions_executed: u64,
+    progress: u64,
     state: &A64State,
 ) -> Result<CpuExit, CpuFault> {
     let source = LocationDescriptor::new(pc, process.cpu.profile_id());
     let fetched = memory
         .fetch32(process.cpu.address_space_id(), pc)
-        .map_err(|fault| internal_fault(fault.to_string(), instructions_executed, state))?;
+        .map_err(|fault| internal_fault(fault.to_string(), progress, state))?;
     let encoding = InstructionEncoding::from_u32(fetched.bits);
     match decode::decode(process.cpu.decoder(), source, encoding) {
         DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
@@ -1761,12 +1701,12 @@ fn unsupported_exit(
         }
         DecodeResult::Unallocated { reason, .. } => Err(internal_fault(
             format!("native unsupported exit decoded as unallocated: {reason}"),
-            instructions_executed,
+            progress,
             state,
         )),
         DecodeResult::Reserved { name, reason, .. } => Err(internal_fault(
             format!("native unsupported exit decoded as reserved {name}: {reason}"),
-            instructions_executed,
+            progress,
             state,
         )),
     }

@@ -2,8 +2,8 @@ use super::*;
 
 impl RuntimeCoordinator {
     /// Executes one deterministic slice using the runtime-owned adaptive
-    /// quantum. Exact-budget entry points remain available for replay and
-    /// deterministic tests.
+    /// quantum. The interpreter consumes exact instructions; the normal JIT
+    /// is preempted through its control-driven synchronization points.
     pub fn run_next_adaptive(&mut self) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
         let execution = self.run_next(self.adaptive_budget.current)?;
         self.adaptive_budget

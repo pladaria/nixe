@@ -105,6 +105,8 @@ pub struct RunRequest<'a> {
     /// Live mapping-stability proof required by a LinuxDirect backend.
     pub memory_lease: Option<ExecutionMemoryLease<'a>>,
     pub state: &'a mut ThreadCpuState,
+    /// Exact instruction limit for the interpreter. The normal JIT uses
+    /// control-driven entry and backedge synchronization instead.
     pub instruction_budget: u64,
     pub loader_return: Option<GuestVirtualAddress>,
     pub timer: &'a dyn ArchitecturalTimer,
@@ -264,7 +266,9 @@ impl Display for CpuExit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionReport {
-    pub instructions_executed: u64,
+    /// Backend-defined coarse forward progress. The interpreter reports exact
+    /// instructions; the normal JIT reports completed native boundaries.
+    pub progress: u64,
     pub stop: CpuExit,
     pub context: RegisterContext,
 }
@@ -273,8 +277,8 @@ impl Display for ExecutionReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "instructions={} stop=[{}] registers=[{}]",
-            self.instructions_executed, self.stop, self.context
+            "progress={} stop=[{}] registers=[{}]",
+            self.progress, self.stop, self.context
         )
     }
 }
@@ -290,7 +294,7 @@ pub enum CpuFaultKind {
 pub struct CpuFault {
     pub backend: &'static str,
     pub kind: CpuFaultKind,
-    pub instructions_executed: u64,
+    pub progress: u64,
     pub message: Box<str>,
     pub context: Box<RegisterContext>,
 }
@@ -299,8 +303,8 @@ impl Display for CpuFault {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "backend={} kind={:?} after={} message={} registers=[{}]",
-            self.backend, self.kind, self.instructions_executed, self.message, self.context
+            "backend={} kind={:?} progress={} message={} registers=[{}]",
+            self.backend, self.kind, self.progress, self.message, self.context
         )
     }
 }
@@ -350,12 +354,24 @@ impl ControlSnapshot {
     }
 }
 
-#[derive(Default)]
 struct CpuControlState {
     requests: AtomicU32,
+    synchronization_counter: AtomicU32,
     invalidation_epoch: AtomicU64,
     acknowledged_invalidation_epoch: AtomicU64,
     active_executions: AtomicU32,
+}
+
+impl Default for CpuControlState {
+    fn default() -> Self {
+        Self {
+            requests: AtomicU32::new(0),
+            synchronization_counter: AtomicU32::new(CpuControl::SYNCHRONIZATION_INTERVAL),
+            invalidation_epoch: AtomicU64::new(0),
+            acknowledged_invalidation_epoch: AtomicU64::new(0),
+            active_executions: AtomicU32::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -374,6 +390,8 @@ impl Drop for ExecutionGuard {
 }
 
 impl CpuControl {
+    pub const SYNCHRONIZATION_INTERVAL: u32 = 4000;
+
     #[must_use]
     pub fn enter_execution(&self) -> ExecutionGuard {
         self.state.active_executions.fetch_add(1, Ordering::AcqRel);
@@ -391,6 +409,9 @@ impl CpuControl {
         self.state
             .requests
             .fetch_or(request.bit(), Ordering::Release);
+        self.state
+            .synchronization_counter
+            .store(0, Ordering::Release);
     }
 
     pub fn request_invalidation(&self, epoch: u64) {
@@ -412,6 +433,11 @@ impl CpuControl {
     #[must_use]
     pub fn pending_word_address(&self) -> usize {
         std::ptr::from_ref(&self.state.requests).addr()
+    }
+
+    #[must_use]
+    pub fn synchronization_counter_address(&self) -> usize {
+        std::ptr::from_ref(&self.state.synchronization_counter).addr()
     }
 
     pub fn acknowledge(&self, snapshot: ControlSnapshot) {
@@ -445,9 +471,16 @@ mod tests {
     fn native_pending_word_is_the_linearizable_request_set() {
         let control = CpuControl::default();
         let pending = unsafe { &*(control.pending_word_address() as *const AtomicU32) };
+        let synchronization =
+            unsafe { &*(control.synchronization_counter_address() as *const AtomicU32) };
+        assert_eq!(
+            synchronization.load(Ordering::Acquire),
+            CpuControl::SYNCHRONIZATION_INTERVAL
+        );
 
         control.request(ControlRequest::CodeInvalidation);
         assert_eq!(pending.load(Ordering::Acquire), CONTROL_CODE_INVALIDATION);
+        assert_eq!(synchronization.load(Ordering::Acquire), 0);
         let snapshot = control.take_pending().unwrap();
         assert!(snapshot.contains(ControlRequest::CodeInvalidation));
         assert_eq!(pending.load(Ordering::Acquire), 0);

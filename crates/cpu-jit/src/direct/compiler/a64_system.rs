@@ -86,13 +86,12 @@ impl CraneliftTranslator<'_, '_> {
         } else {
             self.builder.ins().iconst(types::I8, 1)
         };
-        let schedule = self.builder.create_block();
+        let schedule = self.cold_block();
         let resume = self.builder.create_block();
         self.builder
             .ins()
             .brif(should_schedule, schedule, &[], resume, &[]);
         self.builder.switch_to_block(schedule);
-        self.retire_one();
         self.commit_state(source.wrapping_add(4), flags)?;
         self.finish_exit(EXIT_SCHEDULED, slow::scheduler_detail(request), source)?;
         self.builder.switch_to_block(resume);

@@ -27,12 +27,12 @@ impl ArchitecturalTimer for FixedTimer {
 }
 
 #[test]
-fn concrete_interpreter_and_jit_match_on_a_bounded_synthetic_process() {
+fn concrete_interpreter_and_jit_match_at_an_architectural_boundary() {
     let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, SPACE);
     let mut memory = ExecutionMemory::new();
     let page = GuestPhysicalPageId::new(1);
     assert!(memory.add_ram_page(page));
-    let code = [0xd503_201f_u32, 0x1400_0000];
+    let code = [0xd503_201f_u32, 0xd420_0000];
     assert!(
         memory.initialize_ram(
             page,
@@ -63,17 +63,18 @@ fn concrete_interpreter_and_jit_match_on_a_bounded_synthetic_process() {
     let mut interpreter_state = a64_state();
     let mut jit_state = state();
     let interpreter_report = interpreter
-        .run_slice(interpreter_request(&memory, &mut interpreter_state, 1))
+        .run_slice(interpreter_request(&memory, &mut interpreter_state, 2))
         .unwrap();
     let jit_report = jit
         .run_slice(&jit_process, request(cpu, &memory, &mut jit_state, 1))
         .unwrap();
 
     assert_eq!(interpreter_state, jit_state);
-    assert_eq!(interpreter_report.instructions_executed, 1);
-    assert_eq!(jit_report.instructions_executed, 1);
-    assert_eq!(interpreter_report.stop, CpuExit::BudgetExhausted);
-    assert_eq!(jit_report.stop, CpuExit::BudgetExhausted);
+    assert!(matches!(
+        interpreter_report.stop,
+        CpuExit::ArchitecturalException { .. }
+    ));
+    assert_eq!(interpreter_report.stop, jit_report.stop);
 
     drop(jit);
     jit_process.shutdown();
@@ -98,7 +99,7 @@ fn switch_1_pointer_authentication_hint_family_is_differentially_nop() {
         0xd503_23ff,
     ];
     let mut code = hints.to_vec();
-    code.push(0x1400_0000);
+    code.push(0xd420_0000);
     let memory = executable_memory(&code);
     let binding = MemoryBinding {
         address_space: SPACE,
@@ -121,20 +122,25 @@ fn switch_1_pointer_authentication_hint_family_is_differentially_nop() {
     let mut interpreter_state = a64_state();
     interpreter_state.write_x(link_register, signed_pointer);
     let mut jit_state = interpreter_state.clone();
-    let budget = hints.len() as u64;
+    let interpreter_budget = hints.len() as u64 + 1;
     let interpreter_report = interpreter
-        .run_slice(interpreter_request(&memory, &mut interpreter_state, budget))
+        .run_slice(interpreter_request(
+            &memory,
+            &mut interpreter_state,
+            interpreter_budget,
+        ))
         .unwrap();
     let jit_report = jit
-        .run_slice(&jit_process, request(cpu, &memory, &mut jit_state, budget))
+        .run_slice(&jit_process, request(cpu, &memory, &mut jit_state, 1))
         .unwrap();
 
     assert_eq!(interpreter_state, jit_state);
     assert_eq!(interpreter_state.read_x(link_register), signed_pointer);
-    assert_eq!(interpreter_report.instructions_executed, budget);
-    assert_eq!(jit_report.instructions_executed, budget);
-    assert_eq!(interpreter_report.stop, CpuExit::BudgetExhausted);
-    assert_eq!(jit_report.stop, CpuExit::BudgetExhausted);
+    assert!(matches!(
+        interpreter_report.stop,
+        CpuExit::ArchitecturalException { .. }
+    ));
+    assert_eq!(interpreter_report.stop, jit_report.stop);
 
     drop(jit);
     jit_process.shutdown();

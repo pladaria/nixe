@@ -541,9 +541,10 @@ mod tests {
         assert_eq!(memory.size(), 0x1000);
         assert!(memory.same_backing(&duplicate));
         let range = memory.backing_range().unwrap();
+        let cpu_writes = nixe_memory::CanonicalCpuWriteDependency::capture(&range).unwrap();
         assert_eq!(range.size(), 0x1000);
         memory.write(3, &[0x5a]).unwrap();
-        assert!(!range.segments()[0].content_is_current());
+        assert!(!cpu_writes.remains_current());
         assert!(matches!(
             SharedMemoryObject::zeroed(MAX_SHARED_MEMORY_BYTES + 1),
             Err(HandleError::ObjectTooLarge(_))

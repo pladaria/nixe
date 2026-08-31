@@ -18,8 +18,7 @@ use nixe_gpu::{
     VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use nixe_memory::{
-    CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalPageId, ContentGeneration,
-    CpuVisibilityRequest, VisibilityState,
+    CanonicalCpuWriteDependency, CanonicalPageId, CpuVisibilityRequest, VisibilityState,
 };
 use wgpu::util::StagingBelt;
 use wgpu::{
@@ -146,15 +145,14 @@ struct PresentationImport {
     source: Buffer,
     texture: Texture,
     bind_group: BindGroup,
-    uploaded: Vec<ContentGeneration>,
-    cpu_writes: Option<nixe_memory::CanonicalCpuWriteDependency>,
+    cpu_writes: CanonicalCpuWriteDependency,
     initialized: bool,
     last_used: u64,
     resident_bytes: u64,
 }
 
 struct ResourceContent {
-    uploaded: Vec<ContentGeneration>,
+    cpu_writes: Vec<CanonicalCpuWriteDependency>,
     initialized: bool,
     device_writes: Vec<DeviceWrite>,
 }
@@ -199,32 +197,25 @@ const MAX_RESIDENT_RESOURCE_COUNT: usize = 4_096;
 const MAX_RESIDENT_RESOURCE_BYTES: u64 = 512 * 1024 * 1024;
 
 impl ResourceContent {
-    fn new(info: &BackendResourceCreateInfo) -> Option<Self> {
-        let uploaded = match info {
+    fn new(info: &BackendResourceCreateInfo) -> Result<Option<Self>, BackendDriverError> {
+        let cpu_writes = match info {
             BackendResourceCreateInfo::Buffer {
                 view: Some(view), ..
-            } => view
-                .backing()
-                .range()
-                .segments()
-                .iter()
-                .map(|segment| segment.current_content_generation())
-                .collect(),
+            } => vec![capture_cpu_writes(view.backing().range())?],
             BackendResourceCreateInfo::Image {
                 view: Some(view), ..
             } => view
                 .bindings()
                 .iter()
-                .flat_map(|binding| binding.backing().range().segments())
-                .map(|segment| segment.current_content_generation())
-                .collect(),
-            _ => return None,
+                .map(|binding| capture_cpu_writes(binding.backing().range()))
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Ok(None),
         };
-        Some(Self {
-            uploaded,
+        Ok(Some(Self {
+            cpu_writes,
             initialized: false,
             device_writes: Vec::new(),
-        })
+        }))
     }
 
     fn has_device_writes(&self) -> bool {
@@ -818,10 +809,6 @@ pub(crate) struct WgpuBackendDriver {
     upload_bytes: u64,
     upload_canonical: Vec<u8>,
     upload_linear: Vec<u8>,
-    cpu_dirty_ranges: Vec<CanonicalCpuWriteRange>,
-    transfer_ranges: Vec<TransferRange>,
-    uploaded_generations: Vec<ContentGeneration>,
-    dirty_image_bindings: Vec<usize>,
     vertex_pull_binding_key: Vec<(u32, BackendResourceHandle)>,
     draw_bind_groups: Vec<Vec<BindGroup>>,
     draw_pipelines: Vec<PreparedRenderPipeline>,
@@ -892,10 +879,6 @@ impl WgpuBackendDriver {
             upload_bytes: 0,
             upload_canonical: Vec::new(),
             upload_linear: Vec::new(),
-            cpu_dirty_ranges: Vec::new(),
-            transfer_ranges: Vec::new(),
-            uploaded_generations: Vec::new(),
-            dirty_image_bindings: Vec::new(),
             vertex_pull_binding_key: Vec::new(),
             draw_bind_groups: Vec::new(),
             draw_pipelines: Vec::new(),
@@ -962,10 +945,6 @@ impl WgpuBackendDriver {
         self.upload_staging = StagingBelt::new(self.device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         self.upload_canonical = Vec::new();
         self.upload_linear = Vec::new();
-        self.cpu_dirty_ranges = Vec::new();
-        self.transfer_ranges = Vec::new();
-        self.uploaded_generations = Vec::new();
-        self.dirty_image_bindings = Vec::new();
         self.vertex_pull_binding_key = Vec::new();
         self.draw_bind_groups = Vec::new();
         self.draw_pipelines = Vec::new();
@@ -1136,7 +1115,7 @@ impl WgpuBackendDriver {
         handle: BackendResourceHandle,
         encoder: &mut CommandEncoder,
     ) -> Result<(), BackendDriverError> {
-        let (buffer, view, upload_all) = {
+        let (buffer, view, initialized, cpu_writes) = {
             let record = self.resource_record(handle)?;
             let Resource::Buffer {
                 buffer,
@@ -1150,71 +1129,56 @@ impl WgpuBackendDriver {
                 .content
                 .as_ref()
                 .expect("a canonically backed buffer has content state");
-            let range = view.backing().range();
-            if range.segments().len() != content.uploaded.len() {
-                return Err(BackendDriverError::failure(
-                    "wgpu buffer content record does not match its immutable backing",
-                ));
-            }
-            (buffer.clone(), view.clone(), !content.initialized)
+            let cpu_writes = content.cpu_writes.first().cloned().ok_or_else(|| {
+                BackendDriverError::failure("wgpu buffer has no CPU-write dependency")
+            })?;
+            (
+                buffer.clone(),
+                view.clone(),
+                content.initialized,
+                cpu_writes,
+            )
         };
-        let mut uploaded_generations = std::mem::take(&mut self.uploaded_generations);
-        uploaded_generations.clear();
-        uploaded_generations.extend_from_slice(
-            &self
-                .resource_record(handle)?
-                .content
-                .as_ref()
-                .expect("a canonically backed buffer has content state")
-                .uploaded,
-        );
-        self.transfer_ranges.clear();
-        if upload_all {
-            self.transfer_ranges.push(TransferRange {
-                offset: 0,
-                size: view.size(),
-            });
+        let snapshots = if initialized {
+            cpu_writes
+                .snapshot_dirty_pages(view.backing().range(), 4)
+                .map_err(|error| BackendDriverError::failure(error.to_string()))?
         } else {
-            collect_dirty_buffer_ranges(
-                view.backing().range(),
-                &uploaded_generations,
-                view.buffer_offset(),
-                &mut self.cpu_dirty_ranges,
-                &mut self.transfer_ranges,
-            )?;
-        }
-        self.uploaded_generations = uploaded_generations;
-        if self.transfer_ranges.is_empty() {
+            vec![(
+                0,
+                cpu_writes
+                    .snapshot_all(view.backing().range())
+                    .map_err(|error| BackendDriverError::failure(error.to_string()))?,
+            )]
+        };
+        if snapshots.is_empty() {
             return Ok(());
         }
-        let ranges = std::mem::take(&mut self.transfer_ranges);
-        let mut upload_canonical = std::mem::take(&mut self.upload_canonical);
-        for range in &ranges {
-            let size = usize_from_u64(range.size, "buffer upload size")?;
-            upload_canonical.resize(size, 0);
-            view.backing()
-                .range()
-                .read(range.offset, &mut upload_canonical)
-                .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-            self.stage_buffer_upload(
-                encoder,
-                &buffer,
-                view.buffer_offset() + range.offset,
-                upload_canonical.as_slice(),
-            )?;
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(snapshots.len())
+            .map_err(|_| BackendDriverError::failure("buffer upload ranges exhausted"))?;
+        for (offset, bytes) in snapshots {
+            let size = u64::try_from(bytes.len()).map_err(|_| unsupported("buffer upload size"))?;
+            let buffer_offset = view
+                .buffer_offset()
+                .checked_add(offset)
+                .ok_or_else(|| unsupported("buffer upload offset overflow"))?;
+            if !buffer_offset.is_multiple_of(4) || !size.is_multiple_of(4) {
+                return Err(unsupported("unaligned canonically backed buffer upload"));
+            }
+            self.stage_buffer_upload(encoder, &buffer, buffer_offset, &bytes)?;
+            ranges.push(TransferRange { offset, size });
         }
-        self.upload_canonical = upload_canonical;
         let record = self.resource_record_mut(handle)?;
         let content = record
             .content
             .as_mut()
             .expect("a canonically backed buffer has content state");
-        record_uploaded([view.backing().range()], &mut content.uploaded);
         content.initialized = true;
         for range in &ranges {
             subtract_buffer_write_range(&mut content.device_writes, *range, None);
         }
-        self.transfer_ranges = ranges;
         Ok(())
     }
 
@@ -1223,7 +1187,7 @@ impl WgpuBackendDriver {
         handle: BackendResourceHandle,
         encoder: &mut CommandEncoder,
     ) -> Result<(), BackendDriverError> {
-        let (texture, description, view, initialized) = {
+        let (texture, description, view, initialized, cpu_writes) = {
             let record = self.resource_record(handle)?;
             let Resource::Image {
                 texture,
@@ -1243,46 +1207,45 @@ impl WgpuBackendDriver {
                 *description,
                 view.clone(),
                 content.initialized,
+                content.cpu_writes.clone(),
             )
         };
-        let mut uploaded_generations = std::mem::take(&mut self.uploaded_generations);
-        uploaded_generations.clear();
-        uploaded_generations.extend_from_slice(
-            &self
-                .resource_record(handle)?
-                .content
-                .as_ref()
-                .expect("a canonically backed image has content state")
-                .uploaded,
-        );
-        let mut dirty_bindings = std::mem::take(&mut self.dirty_image_bindings);
-        dirty_bindings.clear();
-        collect_dirty_image_bindings(
-            &view,
-            &uploaded_generations,
-            initialized,
-            &mut dirty_bindings,
-        )?;
-        self.uploaded_generations = uploaded_generations;
+        if cpu_writes.len() != view.bindings().len() {
+            return Err(BackendDriverError::failure(
+                "wgpu image CPU-write dependencies do not match its immutable bindings",
+            ));
+        }
+        let mut dirty_bindings = Vec::new();
+        dirty_bindings
+            .try_reserve_exact(cpu_writes.len())
+            .map_err(|_| BackendDriverError::failure("image upload snapshots exhausted"))?;
+        for (binding, dependency) in cpu_writes.iter().enumerate() {
+            let range = view.bindings()[binding].backing().range();
+            let bytes = if initialized {
+                dependency
+                    .snapshot_whole_if_dirty(range)
+                    .map_err(|error| BackendDriverError::failure(error.to_string()))?
+            } else {
+                Some(
+                    dependency
+                        .snapshot_all(range)
+                        .map_err(|error| BackendDriverError::failure(error.to_string()))?,
+                )
+            };
+            if let Some(bytes) = bytes {
+                dirty_bindings.push((binding, bytes));
+            }
+        }
         if dirty_bindings.is_empty() {
-            self.dirty_image_bindings = dirty_bindings;
             return Ok(());
         }
-        for binding_index in dirty_bindings.iter().copied() {
+        for (binding_index, canonical) in &dirty_bindings {
+            let binding_index = *binding_index;
             let binding = &view.bindings()[binding_index];
             let subresources = binding.subresources();
             let extent = description
                 .mip_extent(subresources.mip_level)
                 .ok_or_else(|| unsupported("invalid image upload mip"))?;
-            self.upload_canonical.resize(
-                usize_from_u64(binding.backing().size(), "image upload size")?,
-                0,
-            );
-            binding
-                .backing()
-                .range()
-                .read(0, &mut self.upload_canonical)
-                .map_err(|error| BackendDriverError::failure(error.to_string()))?;
             let bytes_per_texel = usize::from(
                 description
                     .format()
@@ -1297,7 +1260,7 @@ impl WgpuBackendDriver {
                 wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
             )?;
             linearize_canonical_image_into(
-                &self.upload_canonical,
+                canonical,
                 &mut self.upload_linear,
                 binding.layout(),
                 ImageCopyShape {
@@ -1340,17 +1303,13 @@ impl WgpuBackendDriver {
             .content
             .as_mut()
             .expect("a canonically backed image has content state");
-        for binding in dirty_bindings.iter().copied() {
-            record_image_binding_uploaded(&view, binding, &mut content.uploaded);
-        }
         content.initialized = true;
         content.device_writes.retain(|write| {
             let DeviceWriteRegion::ImageBinding(binding) = write.region else {
                 return true;
             };
-            !dirty_bindings.contains(&binding)
+            !dirty_bindings.iter().any(|(dirty, _)| *dirty == binding)
         });
-        self.dirty_image_bindings = dirty_bindings;
         Ok(())
     }
 
@@ -2720,10 +2679,9 @@ impl WgpuBackendDriver {
             .presentation_imports
             .get(&import_key)
             .filter(|import| import.initialized)
-            .and_then(|import| import.cpu_writes.as_ref())
             .map_or_else(
                 || request.cpu_writes.remains_current(),
-                nixe_memory::CanonicalCpuWriteDependency::remains_current,
+                |import| import.cpu_writes.remains_current(),
             );
         if cpu_contents_unchanged
             && let Some(key) = direct_presentation_key(&request)
@@ -2889,14 +2847,7 @@ impl WgpuBackendDriver {
             source,
             texture,
             bind_group,
-            uploaded: request
-                .backing
-                .range()
-                .segments()
-                .iter()
-                .map(|segment| segment.current_content_generation())
-                .collect(),
-            cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(request.backing.range()),
+            cpu_writes: capture_cpu_writes(request.backing.range())?,
             initialized: false,
             last_used: 0,
             resident_bytes,
@@ -2933,12 +2884,7 @@ impl WgpuBackendDriver {
         import: &mut PresentationImport,
     ) -> Result<Texture, BackendDriverError> {
         import.last_used = self.take_resource_use()?;
-        if import.initialized
-            && import
-                .cpu_writes
-                .as_ref()
-                .is_some_and(nixe_memory::CanonicalCpuWriteDependency::remains_current)
-        {
+        if import.initialized && import.cpu_writes.remains_current() {
             return Ok(import.texture.clone());
         }
         for segment in request.backing.range().segments() {
@@ -2959,29 +2905,21 @@ impl WgpuBackendDriver {
                 }
             }
         }
-        self.transfer_ranges.clear();
-        if !import.initialized {
-            self.transfer_ranges.push(TransferRange {
-                offset: 0,
-                size: align_u64(request.backing.size(), 4)?,
-            });
-        } else if request.backing.size().is_multiple_of(4) {
-            collect_dirty_buffer_ranges(
-                request.backing.range(),
-                &import.uploaded,
+        let snapshots = if import.initialized {
+            import
+                .cpu_writes
+                .snapshot_dirty_pages(request.backing.range(), 4)
+                .map_err(|error| BackendDriverError::failure(error.to_string()))?
+        } else {
+            vec![(
                 0,
-                &mut self.cpu_dirty_ranges,
-                &mut self.transfer_ranges,
-            )?;
-        } else if ranges_need_upload([request.backing.range()], &import.uploaded)? {
-            self.transfer_ranges.push(TransferRange {
-                offset: 0,
-                size: align_u64(request.backing.size(), 4)?,
-            });
-        }
-        if self.transfer_ranges.is_empty() {
-            import.cpu_writes =
-                nixe_memory::CanonicalCpuWriteDependency::capture(request.backing.range());
+                import
+                    .cpu_writes
+                    .snapshot_all(request.backing.range())
+                    .map_err(|error| BackendDriverError::failure(error.to_string()))?,
+            )]
+        };
+        if snapshots.is_empty() {
             return Ok(import.texture.clone());
         }
 
@@ -2991,23 +2929,16 @@ impl WgpuBackendDriver {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Nixe presentation import"),
             });
-        let ranges = std::mem::take(&mut self.transfer_ranges);
         let mut upload = std::mem::take(&mut self.upload_canonical);
-        for range in &ranges {
-            let size = usize_from_u64(range.size, "presentation upload size")?;
+        for (offset, bytes) in snapshots {
+            let size = align_u64(
+                u64::try_from(bytes.len()).map_err(|_| unsupported("presentation upload size"))?,
+                4,
+            )?;
             upload.clear();
-            upload.resize(size, 0);
-            let available = request.backing.size().saturating_sub(range.offset);
-            let read_size = range.size.min(available);
-            request
-                .backing
-                .range()
-                .read(
-                    range.offset,
-                    &mut upload[..usize_from_u64(read_size, "presentation source range")?],
-                )
-                .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-            self.stage_buffer_upload(&mut encoder, &import.source, range.offset, &upload)?;
+            upload.extend_from_slice(&bytes);
+            upload.resize(usize_from_u64(size, "presentation upload size")?, 0);
+            self.stage_buffer_upload(&mut encoder, &import.source, offset, &upload)?;
         }
         self.upload_canonical = upload;
         let pipeline = self.presentation_import_pipeline()?;
@@ -3025,11 +2956,7 @@ impl WgpuBackendDriver {
             let _queue_access = self.queue_access.lock();
             self.queue.submit([encoder.finish()]);
         }
-        record_uploaded([request.backing.range()], &mut import.uploaded);
-        import.cpu_writes =
-            nixe_memory::CanonicalCpuWriteDependency::capture(request.backing.range());
         import.initialized = true;
-        self.transfer_ranges = ranges;
         Ok(import.texture.clone())
     }
 
@@ -3371,7 +3298,7 @@ impl BackendDriver for WgpuBackendDriver {
         self.resources[index] = Some(WgpuResourceSlot {
             handle,
             record: ResourceRecord {
-                content: ResourceContent::new(info),
+                content: ResourceContent::new(info)?,
                 immutable: info.clone(),
                 host: Some(resource),
                 last_use: None,
@@ -4046,181 +3973,12 @@ fn image_subresources_overlap(left: ImageSubresourceRange, right: ImageSubresour
         && u32::from(right.base_layer) < u32::from(left.base_layer) + u32::from(left.layer_count)
 }
 
-fn ranges_need_upload<'a>(
-    ranges: impl IntoIterator<Item = &'a nixe_memory::CanonicalBackingRange>,
-    uploaded: &[ContentGeneration],
-) -> Result<bool, BackendDriverError> {
-    let mut index = 0;
-    let mut dirty = false;
-    for range in ranges {
-        for segment in range.segments() {
-            let baseline = uploaded.get(index).copied().ok_or_else(|| {
-                BackendDriverError::failure(
-                    "wgpu resource content record does not match its immutable backing",
-                )
-            })?;
-            index += 1;
-            if baseline == segment.current_content_generation() {
-                continue;
-            }
-            match segment
-                .cpu_write_overlap_since(baseline)
-                .map_err(|error| BackendDriverError::failure(error.to_string()))?
-            {
-                CanonicalCpuWriteOverlap::No => {}
-                CanonicalCpuWriteOverlap::Yes | CanonicalCpuWriteOverlap::Unknown => dirty = true,
-            }
-        }
-    }
-    if index != uploaded.len() {
-        return Err(BackendDriverError::failure(
-            "wgpu resource content record does not match its immutable backing",
-        ));
-    }
-    Ok(dirty)
-}
-
-fn collect_dirty_image_bindings(
-    view: &nixe_gpu::ImageView,
-    uploaded: &[ContentGeneration],
-    initialized: bool,
-    output: &mut Vec<usize>,
-) -> Result<(), BackendDriverError> {
-    let mut generation = 0_usize;
-    for (binding, image_binding) in view.bindings().iter().enumerate() {
-        let count = image_binding.backing().range().segments().len();
-        let end = generation
-            .checked_add(count)
-            .ok_or_else(|| unsupported("image content generation range overflow"))?;
-        let baselines = uploaded.get(generation..end).ok_or_else(|| {
-            BackendDriverError::failure(
-                "wgpu resource content record does not match its immutable backing",
-            )
-        })?;
-        if !initialized || ranges_need_upload([image_binding.backing().range()], baselines)? {
-            // A canonical byte interval cannot be copied directly into a host
-            // texture until the pitch/block-linear layout is converted. One
-            // immutable image binding is therefore the exact transfer domain.
-            output.push(binding);
-        }
-        generation = end;
-    }
-    if generation != uploaded.len() {
-        return Err(BackendDriverError::failure(
-            "wgpu resource content record does not match its immutable backing",
-        ));
-    }
-    Ok(())
-}
-
-fn record_image_binding_uploaded(
-    view: &nixe_gpu::ImageView,
-    binding: usize,
-    uploaded: &mut [ContentGeneration],
-) {
-    let first = view.bindings()[..binding]
-        .iter()
-        .map(|binding| binding.backing().range().segments().len())
-        .sum::<usize>();
-    let segments = view.bindings()[binding].backing().range().segments();
-    for (baseline, segment) in uploaded[first..first + segments.len()]
-        .iter_mut()
-        .zip(segments)
-    {
-        *baseline = segment.current_content_generation();
-    }
-}
-
-fn collect_dirty_buffer_ranges(
+fn capture_cpu_writes(
     range: &nixe_memory::CanonicalBackingRange,
-    uploaded: &[ContentGeneration],
-    buffer_offset: u64,
-    page_dirty: &mut Vec<CanonicalCpuWriteRange>,
-    output: &mut Vec<TransferRange>,
-) -> Result<(), BackendDriverError> {
-    if range.segments().len() != uploaded.len() {
-        return Err(BackendDriverError::failure(
-            "wgpu resource content record does not match its immutable backing",
-        ));
-    }
-    let view_end = buffer_offset
-        .checked_add(range.size())
-        .ok_or_else(|| unsupported("buffer upload range overflow"))?;
-    let mut logical_offset = 0_u64;
-    for (segment, baseline) in range.segments().iter().zip(uploaded) {
-        if *baseline == segment.current_content_generation() {
-            logical_offset += segment.size();
-            continue;
-        }
-        page_dirty.clear();
-        segment
-            .append_cpu_write_ranges_since(*baseline, page_dirty)
-            .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-        for dirty in page_dirty.iter().copied() {
-            let dirty_start = buffer_offset
-                .checked_add(logical_offset)
-                .and_then(|offset| offset.checked_add(dirty.offset()))
-                .ok_or_else(|| unsupported("buffer dirty range overflow"))?;
-            let dirty_end = dirty_start
-                .checked_add(dirty.size())
-                .ok_or_else(|| unsupported("buffer dirty range overflow"))?;
-            let aligned_start = dirty_start / 4 * 4;
-            let aligned_end = align_u64(dirty_end, 4)?;
-            if aligned_start < buffer_offset || aligned_end > view_end {
-                if !buffer_offset.is_multiple_of(4) || !range.size().is_multiple_of(4) {
-                    return Err(unsupported("unaligned canonically backed buffer upload"));
-                }
-                output.clear();
-                output.push(TransferRange {
-                    offset: 0,
-                    size: range.size(),
-                });
-                return Ok(());
-            }
-            output.push(TransferRange {
-                offset: aligned_start - buffer_offset,
-                size: aligned_end - aligned_start,
-            });
-        }
-        logical_offset = logical_offset
-            .checked_add(segment.size())
-            .ok_or_else(|| unsupported("buffer upload range overflow"))?;
-    }
-    normalize_transfer_ranges(output);
-    Ok(())
-}
-
-fn normalize_transfer_ranges(ranges: &mut Vec<TransferRange>) {
-    ranges.sort_unstable_by_key(|range| range.offset);
-    let mut output = 0_usize;
-    for input in 0..ranges.len() {
-        let current = ranges[input];
-        if output != 0 {
-            let previous = &mut ranges[output - 1];
-            let previous_end = previous.offset + previous.size;
-            if current.offset <= previous_end {
-                previous.size = previous_end.max(current.offset + current.size) - previous.offset;
-                continue;
-            }
-        }
-        ranges[output] = current;
-        output += 1;
-    }
-    ranges.truncate(output);
-}
-
-fn record_uploaded<'a>(
-    ranges: impl IntoIterator<Item = &'a nixe_memory::CanonicalBackingRange>,
-    uploaded: &mut [ContentGeneration],
-) {
-    let mut index = 0;
-    for range in ranges {
-        for segment in range.segments() {
-            uploaded[index] = segment.current_content_generation();
-            index += 1;
-        }
-    }
-    debug_assert_eq!(index, uploaded.len());
+) -> Result<CanonicalCpuWriteDependency, BackendDriverError> {
+    CanonicalCpuWriteDependency::capture(range).ok_or_else(|| {
+        BackendDriverError::failure("failed to establish canonical CPU-write dependency")
+    })
 }
 
 fn collect_demanded_writebacks(
@@ -4730,13 +4488,13 @@ mod tests {
         SampleCount, TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexFormat,
         VertexStepMode, ViewportTransform,
     };
-    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+    use nixe_memory::{CanonicalAllocation, CanonicalCpuWriteDependency, MemoryPermissions};
     use wgpu::{CompareFunction, TextureFormat, TextureUsages, TextureViewDimension};
 
     use super::{
         DemandedBufferWriteback, DemandedWriteback, DeviceWrite, DeviceWriteRegion, ImageCopyShape,
-        MAX_DEVICE_WRITE_REGIONS, TransferRange, WebGpuViewport, collect_dirty_buffer_ranges,
-        compare_function, image_texture_plan, least_recent_key, linearize_canonical_image,
+        MAX_DEVICE_WRITE_REGIONS, TransferRange, WebGpuViewport, compare_function,
+        image_texture_plan, least_recent_key, linearize_canonical_image,
         prepare_demanded_writebacks, record_buffer_device_write, sampled_texture_view_descriptor,
         subtract_completed_buffer_write, vertex_entry_point, webgpu_viewport,
         write_linear_image_to_canonical,
@@ -4810,29 +4568,30 @@ mod tests {
     }
 
     #[test]
-    fn buffer_upload_tracking_selects_only_modified_aligned_bytes() {
+    fn buffer_upload_tracking_selects_the_modified_page_segment() {
         let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
-        let uploaded = range
-            .segments()
-            .iter()
-            .map(|segment| segment.current_content_generation())
-            .collect::<Vec<_>>();
-        let mut page_dirty = Vec::new();
-        let mut dirty = Vec::new();
-        collect_dirty_buffer_ranges(&range, &uploaded, 0, &mut page_dirty, &mut dirty).unwrap();
-        assert!(dirty.is_empty());
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        assert!(
+            dependency
+                .snapshot_dirty_pages(&range, 4)
+                .unwrap()
+                .is_empty()
+        );
 
         allocation.write(0x1101, &[1, 2]).unwrap();
-        collect_dirty_buffer_ranges(&range, &uploaded, 0, &mut page_dirty, &mut dirty).unwrap();
-        assert_eq!(
-            dirty,
-            [TransferRange {
-                offset: 0x1100,
-                size: 4
-            }]
+        let dirty = dependency.snapshot_dirty_pages(&range, 4).unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, 0x1000);
+        assert_eq!(dirty[0].1.len(), 0x1000);
+        assert_eq!(&dirty[0].1[0x101..0x103], &[1, 2]);
+        assert!(
+            dependency
+                .snapshot_dirty_pages(&range, 4)
+                .unwrap()
+                .is_empty()
         );
     }
 
