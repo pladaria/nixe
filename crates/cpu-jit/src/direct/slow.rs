@@ -231,7 +231,7 @@ unsafe extern "C" fn write_relaxed_128(
 ) {
     contain(context, |context| {
         let memory = unsafe { &*context.memory };
-        memory.complete_direct_write_fault(
+        memory.write(
             AddressSpaceId::new(context.address_space),
             GuestVirtualAddress::new(address),
             access::<16, 0>(MemoryAccessClass::Normal, false),
@@ -269,7 +269,7 @@ fn write_memory<const SIZE: u8, const ORDER: u8>(
     contain(context, |context| {
         let access = access::<SIZE, ORDER>(MemoryAccessClass::Normal, aligned);
         let memory = unsafe { &*context.memory };
-        memory.complete_direct_write_fault(
+        memory.write(
             AddressSpaceId::new(context.address_space),
             GuestVirtualAddress::new(address),
             access,

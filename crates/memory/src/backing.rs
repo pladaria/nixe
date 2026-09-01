@@ -11,7 +11,7 @@ use crate::{
     BackingIdentityExhausted, BackingStoreId, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalPageId, ContentGeneration, CpuVisibilityRequest, DIRECT_PAGE_SIZE,
     DeviceAccessDeclaration, DeviceVisibilityRequest, DirectArena, DirectMemoryError,
-    DirectProtectRequest, DirectProtection, DirectStoreControl, ExecutionGate, GenerationExhausted,
+    DirectProtectRequest, DirectProtection, ExecutionGate, GenerationExhausted,
     GuestPhysicalPageId, MappingGeneration, MemoryInvalidationKind, MemoryInvalidationLog,
     MemoryInvalidationOrigin, MemoryPermissions, NonCpuDeviceId, VisibilityCoordinator,
     VisibilityError, VisibilityState,
@@ -25,8 +25,8 @@ struct CanonicalBackingStoreInner {
 
 /// Shared authority for every canonical page in one backing store.
 ///
-/// Per-page content generations remain authoritative for aliases and retained
-/// ranges.
+/// Content generations identify cold canonical/device revisions. Ordinary CPU
+/// stores are observed, when needed, through the page dirty epoch instead.
 #[derive(Clone)]
 pub struct CanonicalBackingStore {
     inner: Arc<CanonicalBackingStoreInner>,
@@ -102,7 +102,6 @@ struct CanonicalPageState {
     visibility: PageVisibility,
     visibility_epoch: u64,
     cpu_dirty_observer_armed: bool,
-    direct_write_epoch: Option<u64>,
     direct_aliases: BTreeMap<(usize, u64), CanonicalDirectAlias>,
 }
 
@@ -119,25 +118,15 @@ struct CanonicalPageInner {
     backing: OnceLock<HostMappedBacking>,
     generation: AtomicU64,
     cpu_dirty_epoch: AtomicU64,
-    write_sequence: AtomicU64,
-    direct_write_armed: AtomicU64,
-    direct_store_control: OnceLock<DirectStoreControl>,
     executable_invalidations: OnceLock<Arc<MemoryInvalidationLog>>,
     state: Mutex<CanonicalPageState>,
 }
 
-struct CanonicalWriter<'a> {
-    page: &'a CanonicalBackingPage,
-    sequence: u64,
-}
-
-impl Drop for CanonicalWriter<'_> {
-    fn drop(&mut self) {
-        self.page
-            .inner
-            .write_sequence
-            .store(self.sequence.wrapping_add(2), Ordering::Release);
-    }
+struct CanonicalWriteSnapshot {
+    bytes: Box<[u8]>,
+    generation: ContentGeneration,
+    visibility_epoch: u64,
+    dirty_epoch: u64,
 }
 
 /// A retained canonical RAM page.
@@ -188,15 +177,11 @@ impl CanonicalBackingPage {
                 backing: OnceLock::new(),
                 generation: AtomicU64::new(generation.get()),
                 cpu_dirty_epoch: AtomicU64::new(0),
-                write_sequence: AtomicU64::new(0),
-                direct_write_armed: AtomicU64::new(0),
-                direct_store_control: OnceLock::new(),
                 executable_invalidations: OnceLock::new(),
                 state: Mutex::new(CanonicalPageState {
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
                     cpu_dirty_observer_armed: false,
-                    direct_write_epoch: None,
                     direct_aliases: BTreeMap::new(),
                 }),
             }),
@@ -226,15 +211,11 @@ impl CanonicalBackingPage {
                 backing: initialized_backing,
                 generation: AtomicU64::new(generation.get()),
                 cpu_dirty_epoch: AtomicU64::new(0),
-                write_sequence: AtomicU64::new(0),
-                direct_write_armed: AtomicU64::new(0),
-                direct_store_control: OnceLock::new(),
                 executable_invalidations: OnceLock::new(),
                 state: Mutex::new(CanonicalPageState {
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
                     cpu_dirty_observer_armed: false,
-                    direct_write_epoch: None,
                     direct_aliases: BTreeMap::new(),
                 }),
             }),
@@ -306,7 +287,6 @@ impl CanonicalBackingPage {
             }
         }
         if !state.cpu_dirty_observer_armed {
-            self.disarm_direct_writes();
             state.cpu_dirty_observer_armed = true;
             if let Err(error) = self.publish_direct_alias_protection(&mut state) {
                 state.cpu_dirty_observer_armed = false;
@@ -316,13 +296,6 @@ impl CanonicalBackingPage {
             }
         }
         Ok(self.cpu_dirty_epoch())
-    }
-
-    /// Reports whether native-store publication is armed for this page's
-    /// current CPU-visible epoch.
-    #[must_use]
-    pub fn direct_write_is_armed(&self) -> bool {
-        self.inner.direct_write_armed.load(Ordering::Acquire) != 0
     }
 
     /// Materializes and retains the canonical shared-file view used by direct
@@ -359,50 +332,45 @@ impl CanonicalBackingPage {
                 maximum_protection,
             },
         );
-        arena.publish_store_control(
-            guest_address,
-            (maximum_protection == DirectProtection::ReadWrite)
-                .then(|| self.direct_store_control()),
-        )?;
         self.publish_direct_alias_protection(&mut state)
     }
 
     /// Removes one derived alias after its host mapping has been revoked.
     pub fn unregister_direct_alias(&self, arena: &DirectArena, guest_address: u64) {
-        let _ = arena.publish_store_control(guest_address, None);
         self.lock_state()
             .direct_aliases
             .remove(&(arena.identity(), guest_address));
-    }
-
-    /// Arms compact native-store publication for the current CPU visibility
-    /// epoch and exposes every semantically writable alias as read/write.
-    ///
-    /// The page dirty transition has already been published before this is
-    /// called. Native stores retain only the temporary pre-Phase-5 content
-    /// publication required by `DirectStoreControl`.
-    pub fn arm_direct_writes(&self) -> Result<bool, CanonicalPageError> {
-        self.ensure_backing()?;
-        let mut state = self.lock_state();
-        self.arm_direct_writes_locked(&mut state)
     }
 
     /// Resolves the cold first-write transition before retrying the native
     /// store which faulted. The page becomes CPU-visible and dirty before any
     /// writable alias is republished.
     pub fn resolve_direct_write_fault(&self) -> Result<bool, CanonicalPageError> {
-        self.ensure_backing()?;
+        self.prepare_cpu_write()?;
+        Ok(true)
+    }
+
+    /// Returns the conservative authority state shared by every page alias.
+    #[must_use]
+    pub fn visibility_state(&self) -> VisibilityState {
+        Self::visibility_snapshot(&self.lock_state().visibility)
+    }
+
+    /// Copies a checked byte range out of canonical storage.
+    pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), CanonicalPageError> {
+        self.checked_end(offset, output.len())?;
         loop {
-            self.ensure_cpu_visible()
-                .map_err(CanonicalPageError::Visibility)?;
-            let mut state = self.lock_state();
+            let state = self.lock_state();
             match state.visibility {
-                PageVisibility::Clean => {
-                    self.publish_visibility(&mut state, PageVisibility::CpuNewer)
+                PageVisibility::Clean | PageVisibility::CpuNewer => {
+                    self.load_bytes_quiescent(offset, output);
+                    return Ok(());
+                }
+                PageVisibility::GpuNewer { .. } => {
+                    drop(state);
+                    self.ensure_cpu_visible()
                         .map_err(CanonicalPageError::Visibility)?;
                 }
-                PageVisibility::CpuNewer => {}
-                PageVisibility::GpuNewer { .. } => continue,
                 PageVisibility::Conflicting => {
                     return Err(CanonicalPageError::Visibility(
                         VisibilityError::ConflictingAccess,
@@ -414,52 +382,47 @@ impl CanonicalBackingPage {
                     ));
                 }
             }
-            self.publish_cpu_dirty(&mut state)?;
-            return self.arm_direct_writes_locked(&mut state);
         }
     }
 
-    fn arm_direct_writes_locked(
-        &self,
-        state: &mut CanonicalPageState,
-    ) -> Result<bool, CanonicalPageError> {
-        if state.cpu_dirty_observer_armed || !matches!(state.visibility, PageVisibility::CpuNewer) {
-            return Ok(false);
-        }
-        if state.direct_write_epoch == Some(state.visibility_epoch) {
-            return Ok(true);
-        }
-        state.direct_write_epoch = Some(state.visibility_epoch);
-        self.inner.direct_write_armed.store(1, Ordering::Release);
-        if let Err(error) = self.publish_direct_alias_protection(state) {
-            self.inner.direct_write_armed.store(0, Ordering::Release);
-            state.direct_write_epoch = None;
-            return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
-                error.to_string().into_boxed_str(),
-            )));
-        }
-        Ok(true)
-    }
-
-    fn direct_store_control(&self) -> &DirectStoreControl {
+    /// Atomically reads one naturally aligned scalar from canonical storage.
+    pub fn atomic_load(&self, offset: usize, size: usize) -> Result<u128, CanonicalPageError> {
+        self.checked_end(offset, size)?;
+        self.prepare_cpu_access()?;
+        self.ensure_backing()?;
         self.inner
-            .direct_store_control
-            .get_or_init(|| DirectStoreControl {
-                write_sequence_address: std::ptr::from_ref(&self.inner.write_sequence).addr(),
-                generation_address: std::ptr::from_ref(&self.inner.generation).addr(),
-                write_armed_address: std::ptr::from_ref(&self.inner.direct_write_armed).addr(),
+            .backing
+            .get()
+            .expect("atomic access materialized canonical backing")
+            .atomic_load(offset, size)
+            .map_err(|error| {
+                CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                    error.to_string().into_boxed_str(),
+                ))
             })
     }
 
-    /// Returns the conservative authority state shared by every page alias.
-    #[must_use]
-    pub fn visibility_state(&self) -> VisibilityState {
-        Self::visibility_snapshot(&self.lock_state().visibility)
-    }
-
-    /// Copies a checked byte range out of canonical storage.
-    pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), CanonicalPageError> {
-        self.read_with_generation(offset, output).map(|_| ())
+    /// Atomically compares and conditionally replaces one naturally aligned
+    /// scalar in canonical storage. Every physical alias shares this location.
+    pub fn atomic_compare_exchange(
+        &self,
+        offset: usize,
+        size: usize,
+        expected: u128,
+        replacement: u128,
+    ) -> Result<(u128, bool), CanonicalPageError> {
+        self.checked_end(offset, size)?;
+        self.prepare_cpu_write()?;
+        self.inner
+            .backing
+            .get()
+            .expect("atomic access materialized canonical backing")
+            .atomic_compare_exchange(offset, size, expected, replacement)
+            .map_err(|error| {
+                CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                    error.to_string().into_boxed_str(),
+                ))
+            })
     }
 
     /// Copies bytes while the caller holds this store's execution gate
@@ -504,49 +467,11 @@ impl CanonicalBackingPage {
         }
     }
 
-    /// Copies bytes and observes their content generation under one stable
-    /// page snapshot for checked scalar, code-fetch, and atomic adapters.
-    pub fn read_with_generation(
-        &self,
-        offset: usize,
-        output: &mut [u8],
-    ) -> Result<ContentGeneration, CanonicalPageError> {
-        self.checked_end(offset, output.len())?;
-        loop {
-            let state = self.lock_state();
-            match state.visibility {
-                PageVisibility::Clean | PageVisibility::CpuNewer => {
-                    return Ok(self.load_bytes_with_generation(offset, output));
-                }
-                PageVisibility::GpuNewer { .. } => {
-                    // Device reconciliation cannot run while the observation
-                    // lock is held. CPU-visible pages complete above with one
-                    // lock acquisition; only this uncommon path retries.
-                    drop(state);
-                    self.ensure_cpu_visible()
-                        .map_err(CanonicalPageError::Visibility)?;
-                }
-                PageVisibility::Conflicting => {
-                    return Err(CanonicalPageError::Visibility(
-                        VisibilityError::ConflictingAccess,
-                    ));
-                }
-                PageVisibility::Invalid => {
-                    return Err(CanonicalPageError::Visibility(
-                        VisibilityError::InvalidState,
-                    ));
-                }
-            }
-        }
-    }
-
-    /// Captures a checked-write snapshot while this store's execution gate is
-    /// held exclusively by the caller. Quiescence lets the page revoke native
-    /// write publication directly to its steady readable protection instead
-    /// of transiently publishing `PROT_NONE` and restoring it per page.
-    fn snapshot_cpu_write_quiescent(
-        &self,
-    ) -> Result<(Box<[u8]>, ContentGeneration, u64), CanonicalPageError> {
+    /// Captures a protected write snapshot while this store's execution gate
+    /// is held exclusively by the caller. The first later CPU write advances
+    /// the page dirty epoch, so commit can reject a stale snapshot without
+    /// ordinary stores publishing a content generation.
+    fn snapshot_cpu_write_quiescent(&self) -> Result<CanonicalWriteSnapshot, CanonicalPageError> {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(self.size())
@@ -571,25 +496,25 @@ impl CanonicalBackingPage {
                 ));
             }
         }
-        self.disarm_direct_writes();
-        let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
-            state.visibility = PageVisibility::Invalid;
-            return Err(CanonicalPageError::Visibility(
-                VisibilityError::VisibilityEpochExhausted,
-            ));
-        };
-        state.visibility_epoch = next_epoch;
-        state.direct_write_epoch = None;
-        if let Err(error) = self.publish_direct_alias_protection(&mut state) {
-            state.visibility = PageVisibility::Invalid;
-            return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
-                error.to_string().into_boxed_str(),
-            )));
+        if !state.cpu_dirty_observer_armed {
+            state.cpu_dirty_observer_armed = true;
+            if let Err(error) = self.publish_direct_alias_protection(&mut state) {
+                state.cpu_dirty_observer_armed = false;
+                return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                    error.to_string().into_boxed_str(),
+                )));
+            }
         }
         self.load_bytes_quiescent(0, &mut bytes);
         let generation = self.content_generation();
         let visibility_epoch = state.visibility_epoch;
-        Ok((bytes.into_boxed_slice(), generation, visibility_epoch))
+        let dirty_epoch = self.cpu_dirty_epoch();
+        Ok(CanonicalWriteSnapshot {
+            bytes: bytes.into_boxed_slice(),
+            generation,
+            visibility_epoch,
+            dirty_epoch,
+        })
     }
 
     /// Materializes zero storage before a multi-page write is published.
@@ -605,10 +530,38 @@ impl CanonicalBackingPage {
         Ok(())
     }
 
+    /// Prepares an ordinary CPU write without creating a per-store version.
+    pub fn prepare_cpu_write(&self) -> Result<(), CanonicalPageError> {
+        self.prepare_cpu_access()?;
+        self.ensure_backing()?;
+        let mut state = self.lock_state();
+        self.require_cpu_authority(&mut state)
+            .map_err(CanonicalPageError::Visibility)?;
+        if matches!(state.visibility, PageVisibility::Clean) {
+            self.publish_visibility(&mut state, PageVisibility::CpuNewer)
+                .map_err(CanonicalPageError::Visibility)?;
+        }
+        self.publish_cpu_dirty(&mut state)
+    }
+
+    /// Commits bytes after [`Self::prepare_cpu_write`] validated the page.
+    pub fn write_cpu_prepared(
+        &self,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), CanonicalPageError> {
+        self.checked_end(offset, bytes.len())?;
+        if self.inner.backing.get().is_none() {
+            return Err(CanonicalPageError::ResourceExhausted);
+        }
+        self.copy_bytes(offset, bytes);
+        Ok(())
+    }
+
     /// Establishes canonical CPU visibility without reading or modifying bytes.
     ///
-    /// CPU adapters use this before operations, such as exclusive stores,
-    /// whose success depends on observing the newest content generation.
+    /// CPU adapters use this before operations which require canonical bytes
+    /// to have been reconciled from a device owner.
     pub fn prepare_cpu_access(&self) -> Result<(), CanonicalPageError> {
         self.ensure_cpu_visible()
             .map_err(CanonicalPageError::Visibility)
@@ -616,8 +569,9 @@ impl CanonicalBackingPage {
 
     /// Atomically writes bytes and publishes a preflighted next generation.
     ///
-    /// The expected generation prevents a retained observer from committing a
-    /// write using stale preflight state.
+    /// The expected generation prevents two cold generation-publishing
+    /// transactions from committing the same revision. Ordinary CPU writes
+    /// are deliberately outside this generation protocol.
     pub fn write_preflighted(
         &self,
         offset: usize,
@@ -638,14 +592,12 @@ impl CanonicalBackingPage {
                 .map_err(CanonicalPageError::Visibility)?;
         }
         self.publish_cpu_dirty(&mut state)?;
-        let writer = self.lock_writer();
         let observed = self.content_generation();
         if observed != expected {
             return Err(CanonicalPageError::StaleGeneration { expected, observed });
         }
-        self.store_bytes_locked(offset, bytes);
+        self.copy_bytes(offset, bytes);
         self.inner.generation.store(next.get(), Ordering::Release);
-        drop(writer);
         Ok(())
     }
 
@@ -670,7 +622,6 @@ impl CanonicalBackingPage {
                 .map_err(CanonicalPageError::Visibility)?;
         }
         self.publish_cpu_dirty(&mut state)?;
-        let writer = self.lock_writer();
         let observed = self.content_generation();
         if observed != generation {
             return Err(CanonicalPageError::StaleGeneration {
@@ -678,8 +629,7 @@ impl CanonicalBackingPage {
                 observed,
             });
         }
-        self.store_bytes_locked(offset, bytes);
-        drop(writer);
+        self.copy_bytes(offset, bytes);
         Ok(())
     }
 
@@ -817,78 +767,91 @@ impl CanonicalBackingPage {
     }
 
     fn ensure_cpu_visible(&self) -> Result<(), VisibilityError> {
-        let (device, visible_at, coordinator, epoch, next_generation) = {
-            let mut state = self.lock_state();
-            match &state.visibility {
-                PageVisibility::Clean | PageVisibility::CpuNewer => return Ok(()),
-                PageVisibility::Conflicting => return Err(VisibilityError::ConflictingAccess),
-                PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
-                PageVisibility::GpuNewer {
-                    device,
-                    visible_at,
-                    coordinator,
-                } => {
-                    let next = match self.content_generation().next() {
-                        Ok(next) => next,
-                        Err(error) => {
-                            self.publish_visibility(&mut state, PageVisibility::Invalid)?;
-                            return Err(VisibilityError::GenerationExhausted(error));
-                        }
-                    };
-                    (
-                        *device,
-                        *visible_at,
-                        Arc::clone(coordinator),
-                        state.visibility_epoch,
-                        next,
-                    )
-                }
-            }
-        };
-        let request = CpuVisibilityRequest {
-            page: self.identity(),
-            size: self.size(),
-            device,
-            visible_at,
-        };
-        let bytes = match coordinator.make_cpu_visible(request) {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        loop {
+            let (device, visible_at, coordinator, epoch, next_generation) = {
                 let mut state = self.lock_state();
-                self.publish_visibility(&mut state, PageVisibility::Invalid)?;
-                return Err(VisibilityError::Coordinator(error));
-            }
-        };
-        if bytes.len() != self.size() {
-            let observed = bytes.len();
-            let mut state = self.lock_state();
-            self.publish_visibility(&mut state, PageVisibility::Invalid)?;
-            return Err(VisibilityError::IncorrectWritebackSize {
-                expected: self.size(),
-                observed,
-            });
-        }
-        self.ensure_backing()
-            .map_err(|_| VisibilityError::ResourceExhausted)?;
-        let mut state = self.lock_state();
-        if state.visibility_epoch != epoch {
-            self.publish_visibility(&mut state, PageVisibility::Conflicting)?;
-            return Err(VisibilityError::ConcurrentTransition);
-        }
-        self.publish_visibility(&mut state, PageVisibility::Clean)?;
-        self.publish_cpu_dirty(&mut state)
-            .map_err(|error| match error {
-                CanonicalPageError::CpuDirtyEpochExhausted => {
-                    VisibilityError::CpuDirtyEpochExhausted
+                match &state.visibility {
+                    PageVisibility::Clean | PageVisibility::CpuNewer => return Ok(()),
+                    PageVisibility::Conflicting => {
+                        return Err(VisibilityError::ConflictingAccess);
+                    }
+                    PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
+                    PageVisibility::GpuNewer {
+                        device,
+                        visible_at,
+                        coordinator,
+                    } => {
+                        let next = match self.content_generation().next() {
+                            Ok(next) => next,
+                            Err(error) => {
+                                self.publish_visibility(&mut state, PageVisibility::Invalid)?;
+                                return Err(VisibilityError::GenerationExhausted(error));
+                            }
+                        };
+                        (
+                            *device,
+                            *visible_at,
+                            Arc::clone(coordinator),
+                            state.visibility_epoch,
+                            next,
+                        )
+                    }
                 }
-                CanonicalPageError::Visibility(error) => error,
-                _ => unreachable!("CPU dirty publication has no other failure mode"),
-            })?;
-        self.store_bytes(0, &bytes);
-        self.inner
-            .generation
-            .store(next_generation.get(), Ordering::Release);
-        Ok(())
+            };
+            self.ensure_backing()
+                .map_err(|_| VisibilityError::ResourceExhausted)?;
+            let request = CpuVisibilityRequest {
+                page: self.identity(),
+                size: self.size(),
+                device,
+                visible_at,
+            };
+            let writeback = coordinator.make_cpu_visible(request);
+            let mut state = self.lock_state();
+            if state.visibility_epoch != epoch {
+                match state.visibility {
+                    PageVisibility::Clean | PageVisibility::CpuNewer => return Ok(()),
+                    PageVisibility::GpuNewer { .. } => continue,
+                    PageVisibility::Conflicting => {
+                        return Err(VisibilityError::ConflictingAccess);
+                    }
+                    PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
+                }
+            }
+            let bytes = match writeback {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.publish_visibility(&mut state, PageVisibility::Invalid)?;
+                    return Err(VisibilityError::Coordinator(error));
+                }
+            };
+            if bytes.len() != self.size() {
+                let observed = bytes.len();
+                self.publish_visibility(&mut state, PageVisibility::Invalid)?;
+                return Err(VisibilityError::IncorrectWritebackSize {
+                    expected: self.size(),
+                    observed,
+                });
+            }
+
+            // Keep every direct alias inaccessible until canonical bytes and
+            // their cold revision have been committed. The final visibility
+            // publication is the only operation which may reopen host access.
+            self.store_bytes(0, &bytes);
+            self.inner
+                .generation
+                .store(next_generation.get(), Ordering::Release);
+            self.publish_cpu_dirty(&mut state)
+                .map_err(|error| match error {
+                    CanonicalPageError::CpuDirtyEpochExhausted => {
+                        VisibilityError::CpuDirtyEpochExhausted
+                    }
+                    CanonicalPageError::Visibility(error) => error,
+                    _ => unreachable!("CPU dirty publication has no other failure mode"),
+                })?;
+            self.publish_visibility(&mut state, PageVisibility::Clean)?;
+            return Ok(());
+        }
     }
 
     fn visibility_snapshot(visibility: &PageVisibility) -> VisibilityState {
@@ -922,22 +885,19 @@ impl CanonicalBackingPage {
         state: &mut CanonicalPageState,
         visibility: PageVisibility,
     ) -> Result<(), VisibilityError> {
-        self.disarm_direct_writes();
-        self.publish_direct_alias_protection_for(
-            state,
-            matches!(visibility, PageVisibility::Clean | PageVisibility::CpuNewer),
-        )
-        .map_err(|error| {
-            state.visibility = PageVisibility::Invalid;
-            VisibilityError::HostMemory(error.to_string().into_boxed_str())
-        })?;
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
             state.visibility = PageVisibility::Invalid;
             return Err(VisibilityError::VisibilityEpochExhausted);
         };
+        let cpu_visible = matches!(visibility, PageVisibility::Clean | PageVisibility::CpuNewer);
+        let cpu_writable = matches!(visibility, PageVisibility::CpuNewer);
+        self.publish_direct_alias_protection_for(state, cpu_visible, cpu_writable)
+            .map_err(|error| {
+                state.visibility = PageVisibility::Invalid;
+                VisibilityError::HostMemory(error.to_string().into_boxed_str())
+            })?;
         state.visibility = visibility;
         state.visibility_epoch = next_epoch;
-        state.direct_write_epoch = None;
         Ok(())
     }
 
@@ -953,11 +913,16 @@ impl CanonicalBackingPage {
         };
         state.cpu_dirty_observer_armed = false;
         self.inner.cpu_dirty_epoch.store(next, Ordering::Release);
+        self.publish_direct_alias_protection(state)
+            .map_err(|error| {
+                CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                    error.to_string().into_boxed_str(),
+                ))
+            })?;
         Ok(())
     }
 
     fn revoke_direct_access(&self, state: &mut CanonicalPageState) -> Result<(), VisibilityError> {
-        self.disarm_direct_writes();
         self.publish_direct_aliases_as(state, DirectProtection::None)
             .map_err(|error| {
                 state.visibility = PageVisibility::Invalid;
@@ -968,7 +933,6 @@ impl CanonicalBackingPage {
             return Err(VisibilityError::VisibilityEpochExhausted);
         };
         state.visibility_epoch = next_epoch;
-        state.direct_write_epoch = None;
         Ok(())
     }
 
@@ -982,6 +946,7 @@ impl CanonicalBackingPage {
                 state.visibility,
                 PageVisibility::Clean | PageVisibility::CpuNewer
             ),
+            matches!(state.visibility, PageVisibility::CpuNewer),
         )
     }
 
@@ -989,10 +954,9 @@ impl CanonicalBackingPage {
         &self,
         state: &mut CanonicalPageState,
         cpu_visible: bool,
+        cpu_writable: bool,
     ) -> Result<(), DirectMemoryError> {
-        let write_enabled = cpu_visible
-            && !state.cpu_dirty_observer_armed
-            && self.inner.direct_write_armed.load(Ordering::Acquire) != 0;
+        let write_enabled = cpu_visible && cpu_writable && !state.cpu_dirty_observer_armed;
         self.publish_direct_aliases(state, |alias| {
             match (cpu_visible, alias.maximum_protection) {
                 (false, _) => DirectProtection::None,
@@ -1057,110 +1021,32 @@ impl CanonicalBackingPage {
             output.fill(0);
             return;
         };
-        for (index, byte) in output.iter_mut().enumerate() {
-            let position = offset + index;
-            let word_address = backing.base() + (position & !7);
-            let word =
-                unsafe { AtomicU64::from_ptr(word_address as *mut u64) }.load(Ordering::Acquire);
-            *byte = (word >> ((position % 8) * 8)) as u8;
-        }
-    }
-
-    fn load_bytes_with_generation(&self, offset: usize, output: &mut [u8]) -> ContentGeneration {
-        let Some(backing) = self.inner.backing.get() else {
-            output.fill(0);
-            return self.content_generation();
-        };
-        loop {
-            let before = self.inner.write_sequence.load(Ordering::Acquire);
-            if before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            for (index, byte) in output.iter_mut().enumerate() {
-                let position = offset + index;
-                let word_address = backing.base() + (position & !7);
-                let word = unsafe { AtomicU64::from_ptr(word_address as *mut u64) }
-                    .load(Ordering::Acquire);
-                *byte = (word >> ((position % 8) * 8)) as u8;
-            }
-            let generation = self.content_generation();
-            if self.inner.write_sequence.load(Ordering::Acquire) == before {
-                return generation;
-            }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (backing.base() + offset) as *const u8,
+                output.as_mut_ptr(),
+                output.len(),
+            );
         }
     }
 
     fn store_bytes(&self, offset: usize, bytes: &[u8]) {
-        let writer = self.lock_writer();
-        self.store_bytes_locked(offset, bytes);
-        drop(writer);
+        self.copy_bytes(offset, bytes);
     }
 
-    fn lock_writer(&self) -> CanonicalWriter<'_> {
-        let mut sequence = self.inner.write_sequence.load(Ordering::Acquire);
-        loop {
-            if sequence & 1 != 0 {
-                std::hint::spin_loop();
-                sequence = self.inner.write_sequence.load(Ordering::Acquire);
-                continue;
-            }
-            match self.inner.write_sequence.compare_exchange_weak(
-                sequence,
-                sequence.wrapping_add(1),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => sequence = observed,
-            }
-        }
-        CanonicalWriter {
-            page: self,
-            sequence,
-        }
-    }
-
-    fn store_bytes_locked(&self, offset: usize, bytes: &[u8]) {
+    fn copy_bytes(&self, offset: usize, bytes: &[u8]) {
         let backing = self
             .inner
             .backing
             .get()
             .expect("canonical writes materialize host backing during preflight");
-        for (index, &byte) in bytes.iter().enumerate() {
-            let position = offset + index;
-            let word_address = backing.base() + (position & !7);
-            let word = unsafe { AtomicU64::from_ptr(word_address as *mut u64) };
-            let shift = (position % 8) * 8;
-            let mask = !(0xff_u64 << shift);
-            let mut observed = word.load(Ordering::Acquire);
-            loop {
-                let next = (observed & mask) | (u64::from(byte) << shift);
-                match word.compare_exchange_weak(
-                    observed,
-                    next,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(current) => observed = current,
-                }
-            }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (backing.base() + offset) as *mut u8,
+                bytes.len(),
+            );
         }
-    }
-
-    fn wait_for_direct_writer(&self) {
-        while self.inner.write_sequence.load(Ordering::Acquire) & 1 != 0 {
-            std::hint::spin_loop();
-        }
-    }
-
-    /// Prevents a store which observed the previous armed epoch from racing a
-    /// subsequent protection downgrade. Native writers validate the flag a
-    /// second time after acquiring this page's sequence.
-    fn disarm_direct_writes(&self) {
-        self.inner.direct_write_armed.store(0, Ordering::Release);
-        self.wait_for_direct_writer();
     }
 
     fn ensure_backing(&self) -> Result<(), CanonicalPageError> {
@@ -1188,6 +1074,7 @@ struct PendingCanonicalPageWrite {
     backing: CanonicalBackingPage,
     expected_generation: ContentGeneration,
     expected_visibility_epoch: u64,
+    expected_dirty_epoch: u64,
     bytes: Box<[u8]>,
     dirty_ranges: Vec<(u64, u64)>,
 }
@@ -1449,8 +1336,8 @@ impl CanonicalWriteBatch {
 
             // Acquire every involved store in stable identity order. Native
             // CPU writers are quiescent for the whole multi-page snapshot, so
-            // pages can revoke write publication without a per-page NONE/read
-            // protection round trip. Dropping these uncommitted guards
+            // pages can compose their final protection directly. Dropping
+            // these uncommitted guards
             // preserves the mapping epoch: staging changes no mapping or
             // guest byte.
             let mut stores = BTreeMap::new();
@@ -1485,15 +1372,16 @@ impl CanonicalWriteBatch {
                     let pending = match self.pages.entry(segment.page()) {
                         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::btree_map::Entry::Vacant(entry) => {
-                            let (page_bytes, generation, visibility_epoch) = segment
+                            let snapshot = segment
                                 .backing()
                                 .snapshot_cpu_write_quiescent()
                                 .map_err(CanonicalWriteBatchError::Page)?;
                             entry.insert(PendingCanonicalPageWrite {
                                 backing: segment.backing().clone(),
-                                expected_generation: generation,
-                                expected_visibility_epoch: visibility_epoch,
-                                bytes: page_bytes,
+                                expected_generation: snapshot.generation,
+                                expected_visibility_epoch: snapshot.visibility_epoch,
+                                expected_dirty_epoch: snapshot.dirty_epoch,
+                                bytes: snapshot.bytes,
                                 dirty_ranges: Vec::new(),
                             })
                         }
@@ -1534,6 +1422,7 @@ impl CanonicalWriteBatch {
         struct Write {
             expected_generation: ContentGeneration,
             expected_visibility_epoch: u64,
+            expected_dirty_epoch: u64,
             next_generation: ContentGeneration,
             next_visibility_epoch: u64,
             bytes: Option<Box<[u8]>>,
@@ -1571,6 +1460,7 @@ impl CanonicalWriteBatch {
             writes.push(Write {
                 expected_generation: pending.expected_generation,
                 expected_visibility_epoch: pending.expected_visibility_epoch,
+                expected_dirty_epoch: pending.expected_dirty_epoch,
                 next_generation,
                 next_visibility_epoch,
                 bytes: Some(pending.bytes),
@@ -1589,6 +1479,7 @@ impl CanonicalWriteBatch {
         for ((backing, state), write) in backings.iter().zip(&states).zip(&writes) {
             if backing.content_generation() != write.expected_generation
                 || state.visibility_epoch != write.expected_visibility_epoch
+                || backing.cpu_dirty_epoch() != write.expected_dirty_epoch
                 || !matches!(
                     state.visibility,
                     PageVisibility::Clean | PageVisibility::CpuNewer
@@ -1607,6 +1498,7 @@ impl CanonicalWriteBatch {
                 .bytes
                 .take()
                 .expect("prepared canonical batch write retains its bytes");
+            state.visibility = PageVisibility::CpuNewer;
             backing
                 .publish_cpu_dirty(state)
                 .expect("CPU dirty epochs were preflighted while page states are locked");
@@ -1615,9 +1507,7 @@ impl CanonicalWriteBatch {
                 .inner
                 .generation
                 .store(write.next_generation.get(), Ordering::Release);
-            state.visibility = PageVisibility::CpuNewer;
             state.visibility_epoch = write.next_visibility_epoch;
-            state.direct_write_epoch = None;
         }
         Ok(())
     }
@@ -2064,6 +1954,45 @@ mod tests {
         }
     }
 
+    struct BlockingDownloadCoordinator {
+        entered: Barrier,
+        release: Barrier,
+        downloads: std::sync::atomic::AtomicUsize,
+        writeback: Box<[u8]>,
+    }
+
+    impl BlockingDownloadCoordinator {
+        fn new(writeback: Vec<u8>) -> Self {
+            Self {
+                entered: Barrier::new(3),
+                release: Barrier::new(3),
+                downloads: std::sync::atomic::AtomicUsize::new(0),
+                writeback: writeback.into_boxed_slice(),
+            }
+        }
+    }
+
+    impl VisibilityCoordinator for BlockingDownloadCoordinator {
+        fn make_device_visible(
+            &self,
+            _request: DeviceVisibilityRequest,
+            _canonical_bytes: &[u8],
+        ) -> Result<(), VisibilityCoordinatorError> {
+            Ok(())
+        }
+
+        fn make_cpu_visible(
+            &self,
+            _request: CpuVisibilityRequest,
+        ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+            self.downloads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.entered.wait();
+            self.release.wait();
+            Ok(self.writeback.clone())
+        }
+    }
+
     #[test]
     fn retained_allocation_spans_pages_and_versions_written_contents() {
         let allocation = CanonicalAllocation::zeroed(0x1800, 0x1000).unwrap();
@@ -2216,6 +2145,67 @@ mod tests {
             Some(DirectProtection::ReadWrite)
         );
         assert!(!dependency.remains_current());
+    }
+
+    #[test]
+    fn concurrent_device_writeback_reconciliation_commits_one_page_revision() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let host = page.direct_backing().unwrap();
+        let arena = DirectArena::new(0x3000).unwrap();
+        arena
+            .map_pages(&[DirectMapRequest {
+                guest_address: 0x1000,
+                backing: &host,
+                protection: DirectProtection::Read,
+            }])
+            .unwrap();
+        page.register_direct_alias(&arena, 0x1000, DirectProtection::ReadWrite)
+            .unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let generation = page.content_generation();
+        let coordinator = Arc::new(BlockingDownloadCoordinator::new(vec![0xa5; 0x1000]));
+        let erased: Arc<dyn VisibilityCoordinator> = coordinator.clone();
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(11),
+            DeviceVisibilityPoint::new(50),
+            DeviceVisibilityPoint::new(51),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(declaration, Arc::clone(&erased))
+            .unwrap();
+        range.publish_device_write(declaration, erased).unwrap();
+
+        let workers = (0..2)
+            .map(|_| {
+                let page = page.clone();
+                thread::spawn(move || page.prepare_cpu_access())
+            })
+            .collect::<Vec<_>>();
+        coordinator.entered.wait();
+        assert_eq!(arena.protection_at(0x1000), Some(DirectProtection::None));
+        coordinator.release.wait();
+
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert_eq!(
+            coordinator
+                .downloads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(page.content_generation(), generation.next().unwrap());
+        assert_eq!(page.visibility_state(), VisibilityState::Clean);
+        assert_eq!(arena.protection_at(0x1000), Some(DirectProtection::Read));
+        assert!(!dependency.remains_current());
+        let mut observed = [0; 1];
+        page.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [0xa5]);
     }
 
     #[test]
@@ -2438,7 +2428,10 @@ mod tests {
         let mut committed = CanonicalWriteBatch::new();
         committed.stage(&range, 0, &[0x22]).unwrap();
         committed.commit().unwrap();
-        assert_eq!(arena.protection_at(0x1000), Some(DirectProtection::Read));
+        assert_eq!(
+            arena.protection_at(0x1000),
+            Some(DirectProtection::ReadWrite)
+        );
     }
 
     #[test]
@@ -2463,7 +2456,6 @@ mod tests {
                 .unwrap();
         }
         allocation.write(0, &[1]).unwrap();
-        assert!(page.arm_direct_writes().unwrap());
         assert_eq!(
             first.protection_at(0x1000),
             Some(DirectProtection::ReadWrite)
@@ -2543,78 +2535,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_protection_downgrade_waits_for_an_acquired_writer() {
-        let store = CanonicalBackingStore::allocate().unwrap();
-        let page = CanonicalBackingPage::zeroed(
-            &store,
-            GuestPhysicalPageId::new(1),
-            DIRECT_PAGE_SIZE,
-            ContentGeneration::INITIAL,
-        )
-        .unwrap();
-        let host = page.direct_backing().unwrap();
-        let arena = DirectArena::new(0x4000).unwrap();
-        arena
-            .map_pages(&[DirectMapRequest {
-                guest_address: 0x1000,
-                backing: &host,
-                protection: DirectProtection::Read,
-            }])
-            .unwrap();
-        page.register_direct_alias(&arena, 0x1000, DirectProtection::ReadWrite)
-            .unwrap();
-        page.write_preflighted(
-            0,
-            &[0x5a],
-            ContentGeneration::INITIAL,
-            ContentGeneration::new(1),
-        )
-        .unwrap();
-        assert!(page.arm_direct_writes().unwrap());
-        assert_eq!(
-            arena.protection_at(0x1000),
-            Some(DirectProtection::ReadWrite)
-        );
-
-        let acquired = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let writer_page = page.clone();
-        let writer_acquired = Arc::clone(&acquired);
-        let writer_release = Arc::clone(&release);
-        let writer = thread::spawn(move || {
-            let _writer = writer_page.lock_writer();
-            writer_acquired.wait();
-            writer_release.wait();
-        });
-        acquired.wait();
-
-        let disarm_page = page.clone();
-        let (completed, completion) = std::sync::mpsc::channel();
-        let disarmer = thread::spawn(move || {
-            let result = disarm_page.arm_cpu_dirty_observer_quiescent();
-            completed.send(result).unwrap();
-        });
-        while page.direct_write_is_armed() {
-            thread::yield_now();
-        }
-        assert!(matches!(
-            completion.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        assert_eq!(
-            arena.protection_at(0x1000),
-            Some(DirectProtection::ReadWrite),
-            "the alias cannot be downgraded while an acquired store may use it"
-        );
-
-        release.wait();
-        writer.join().unwrap();
-        completion.recv().unwrap().unwrap();
-        disarmer.join().unwrap();
-        assert_eq!(arena.protection_at(0x1000), Some(DirectProtection::Read));
-    }
-
-    #[test]
     fn canonical_write_batch_commits_across_distinct_stores() {
         let first_store = CanonicalBackingStore::allocate().unwrap();
         let second_store = CanonicalBackingStore::allocate().unwrap();
@@ -2680,6 +2600,29 @@ mod tests {
         allocation.read(0x1000, &mut second).unwrap();
         assert_eq!(first, [0]);
         assert_eq!(second, [0x55]);
+    }
+
+    #[test]
+    fn canonical_write_batch_rejects_a_native_cpu_write_after_its_snapshot() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        allocation.write(0, &[1]).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing();
+        let mut batch = CanonicalWriteBatch::new();
+        batch.stage(&range, 0, &[2]).unwrap();
+
+        assert!(page.resolve_direct_write_fault().unwrap());
+        page.write_cpu_prepared(0, &[3]).unwrap();
+
+        assert_eq!(
+            batch.commit(),
+            Err(CanonicalWriteBatchError::ConcurrentMutation)
+        );
+        let mut observed = [0];
+        allocation.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [3]);
     }
 
     #[test]

@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use crate::host_mapped::HostMappedBacking;
+use crate::host_mapped::{HostMappedBacking, host_atomic_128_supported};
 
 /// Guest page granule which the direct backend must represent exactly.
 pub const DIRECT_PAGE_SIZE: usize = 4096;
@@ -81,6 +81,7 @@ impl DirectHostCapabilities {
                 DirectMemoryError::unsupported(format!("Linux VMA limit is invalid: {error}"))
             })?;
         validate_host_limits(host_page_size, current_vma_count, max_vma_count)?;
+        validate_host_atomics(host_atomic_128_supported())?;
         probe_shared_file_views()?;
         Ok(Self {
             host_page_size,
@@ -103,6 +104,15 @@ impl DirectHostCapabilities {
     pub const fn max_vma_count(self) -> usize {
         self.max_vma_count
     }
+}
+
+fn validate_host_atomics(atomic_128_supported: bool) -> Result<(), DirectMemoryError> {
+    if !atomic_128_supported {
+        return Err(DirectMemoryError::unsupported(
+            "the direct backend requires native 128-bit host atomics",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_host_limits(
@@ -129,12 +139,6 @@ fn validate_host_limits(
 pub struct DirectAddressSpaceView {
     pub base: usize,
     pub address_space_size: usize,
-    /// Flat guest-page index of immutable store-publication controls.
-    ///
-    /// A zero entry means that direct stores are not eligible for that guest
-    /// page. The table contains no permission or visibility state; those are
-    /// represented exclusively by the data-arena protection.
-    pub store_controls: usize,
 }
 
 impl DirectAddressSpaceView {
@@ -147,20 +151,6 @@ impl DirectAddressSpaceView {
         }
         self.base.checked_add(guest)
     }
-}
-
-/// Immutable addresses used to publish one completed native CPU store.
-///
-/// One instance belongs to a canonical physical page and is shared by all of
-/// its writable virtual aliases. Generated code obtains its address through
-/// [`DirectAddressSpaceView::store_controls`]. None of these fields authorizes
-/// an access: semantic access is granted only by the host page protection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C)]
-pub struct DirectStoreControl {
-    pub write_sequence_address: usize,
-    pub generation_address: usize,
-    pub write_armed_address: usize,
 }
 
 /// One page requested for batched publication.
@@ -189,75 +179,13 @@ struct DirectArenaState {
     pages: BTreeMap<u64, DirectMappedPage>,
 }
 
-/// Zero-filled, sparsely committed store-control pointer table.
-///
-/// Keeping this table flat preserves one indexed load in generated stores. An
-/// anonymous `MAP_NORESERVE` mapping avoids allocating or touching metadata for
-/// the guest pages which a process never maps.
-struct DirectControlTable {
-    base: NonNull<AtomicUsize>,
-    entry_count: usize,
-    byte_size: usize,
-}
-
-impl DirectControlTable {
-    fn new(entry_count: usize) -> Result<Self, DirectMemoryError> {
-        let byte_size = entry_count
-            .checked_mul(std::mem::size_of::<AtomicUsize>())
-            .ok_or_else(|| DirectMemoryError::invalid("direct control table size overflows"))?;
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                byte_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if mapped == libc::MAP_FAILED {
-            return Err(DirectMemoryError::last(
-                "direct store-control reservation failed",
-            ));
-        }
-        Ok(Self {
-            base: NonNull::new(mapped.cast())
-                .expect("mmap never returns null on successful control reservation"),
-            entry_count,
-            byte_size,
-        })
-    }
-
-    fn as_ptr(&self) -> *const AtomicUsize {
-        self.base.as_ptr()
-    }
-
-    fn slot(&self, index: usize) -> &AtomicUsize {
-        debug_assert!(index < self.entry_count);
-        unsafe { &*self.base.as_ptr().add(index) }
-    }
-}
-
-unsafe impl Send for DirectControlTable {}
-unsafe impl Sync for DirectControlTable {}
-
-impl Drop for DirectControlTable {
-    fn drop(&mut self) {
-        let result = unsafe { libc::munmap(self.base.as_ptr().cast(), self.byte_size) };
-        debug_assert_eq!(result, 0, "direct store-control munmap failed");
-    }
-}
-
 struct DirectArenaInner {
     reservation: NonNull<u8>,
     reservation_size: usize,
     base: NonNull<u8>,
     address_space_size: usize,
-    store_controls: DirectControlTable,
     state: Mutex<DirectArenaState>,
     poisoned: AtomicBool,
-    #[cfg(test)]
-    fail_after_host_calls: std::sync::atomic::AtomicI64,
 }
 
 unsafe impl Send for DirectArenaInner {}
@@ -314,7 +242,6 @@ impl DirectArena {
         let reservation_size = address_space_size
             .checked_add(DIRECT_PAGE_SIZE * 2)
             .ok_or_else(|| DirectMemoryError::invalid("direct reservation size overflows"))?;
-        let store_controls = DirectControlTable::new(address_space_size / DIRECT_PAGE_SIZE)?;
         let reservation = reserve(reservation_size, "direct arena reservation failed")?;
         let base = unsafe { NonNull::new_unchecked(reservation.as_ptr().add(DIRECT_PAGE_SIZE)) };
         if base
@@ -334,13 +261,10 @@ impl DirectArena {
                 reservation_size,
                 base,
                 address_space_size,
-                store_controls,
                 state: Mutex::new(DirectArenaState {
                     pages: BTreeMap::new(),
                 }),
                 poisoned: AtomicBool::new(false),
-                #[cfg(test)]
-                fail_after_host_calls: std::sync::atomic::AtomicI64::new(-1),
             }),
         })
     }
@@ -350,26 +274,7 @@ impl DirectArena {
         DirectAddressSpaceView {
             base: self.inner.base.as_ptr().addr(),
             address_space_size: self.inner.address_space_size,
-            store_controls: self.inner.store_controls.as_ptr().addr(),
         }
-    }
-
-    /// Publishes or clears the immutable store control for one mapped page.
-    ///
-    /// Callers hold the exclusive execution transition while changing the
-    /// table, so native code never races a pointer lifetime transition.
-    pub(crate) fn publish_store_control(
-        &self,
-        guest_address: u64,
-        control: Option<&DirectStoreControl>,
-    ) -> Result<(), DirectMemoryError> {
-        self.validate_range(guest_address, DIRECT_PAGE_SIZE)?;
-        let index = guest_address as usize / DIRECT_PAGE_SIZE;
-        self.inner.store_controls.slot(index).store(
-            control.map_or(0, |control| std::ptr::from_ref(control).addr()),
-            Ordering::Release,
-        );
-        Ok(())
     }
 
     pub(crate) fn identity(&self) -> usize {
@@ -725,17 +630,12 @@ impl DirectArena {
             self.replace_run_with_none(request.guest_address, request.size)?;
             for page in pages(request.guest_address, request.size) {
                 state.pages.remove(&page);
-                self.inner
-                    .store_controls
-                    .slot(page as usize / DIRECT_PAGE_SIZE)
-                    .store(0, Ordering::Release);
             }
         }
         Ok(())
     }
 
     fn map_run(&self, first: &DirectMapRequest<'_>, size: usize) -> Result<(), DirectMemoryError> {
-        self.before_host_call()?;
         let destination = self.host_pointer(first.guest_address)?;
         let offset = libc::off_t::try_from(first.backing.offset())
             .map_err(|_| DirectMemoryError::invalid("direct backing offset exceeds off_t"))?;
@@ -761,7 +661,6 @@ impl DirectArena {
         size: usize,
         protection: DirectProtection,
     ) -> Result<(), DirectMemoryError> {
-        self.before_host_call()?;
         let destination = self.host_pointer(guest_address)?;
         if unsafe { libc::mprotect(destination.cast(), size, protection.native()) } != 0 {
             return self.host_failure("direct range mprotect failed");
@@ -774,7 +673,6 @@ impl DirectArena {
         guest_address: u64,
         size: usize,
     ) -> Result<(), DirectMemoryError> {
-        self.before_host_call()?;
         let destination = self.host_pointer(guest_address)?;
         let mapped = unsafe {
             libc::mmap(
@@ -851,33 +749,6 @@ impl DirectArena {
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    #[cfg(not(test))]
-    fn before_host_call(&self) -> Result<(), DirectMemoryError> {
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn before_host_call(&self) -> Result<(), DirectMemoryError> {
-        let remaining = self.inner.fail_after_host_calls.load(Ordering::Relaxed);
-        if remaining < 0 {
-            return Ok(());
-        }
-        if remaining == 0 {
-            return self.host_failure("injected direct host operation failed");
-        }
-        self.inner
-            .fail_after_host_calls
-            .fetch_sub(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn fail_after_host_calls(&self, successful_calls: i64) {
-        self.inner
-            .fail_after_host_calls
-            .store(successful_calls, Ordering::Relaxed);
     }
 }
 
@@ -1092,28 +963,18 @@ mod tests {
     }
 
     #[test]
-    fn thirty_nine_bit_control_table_is_sparse_and_keeps_one_index_lookup() {
-        const ADDRESS_SPACE_SIZE: usize = 1_usize << 39;
-        let arena = DirectArena::new(ADDRESS_SPACE_SIZE).unwrap();
-        let view = arena.view();
-        let first = unsafe { &*(view.store_controls as *const AtomicUsize) };
-        let last = unsafe {
-            &*(view.store_controls as *const AtomicUsize)
-                .add(ADDRESS_SPACE_SIZE / DIRECT_PAGE_SIZE - 1)
-        };
-
-        assert_eq!(first.load(Ordering::Relaxed), 0);
-        assert_eq!(last.load(Ordering::Relaxed), 0);
-        assert_eq!(arena.mapped_pages(), 0);
-    }
-
-    #[test]
     fn host_capability_validation_rejects_inexact_pages_and_low_vma_margin() {
         assert!(validate_host_limits(DIRECT_PAGE_SIZE, 100, 100 + MIN_DIRECT_VMA_MARGIN).is_ok());
         assert!(validate_host_limits(DIRECT_PAGE_SIZE * 4, 100, 100_000).is_err());
         assert!(
             validate_host_limits(DIRECT_PAGE_SIZE, 100, 100 + MIN_DIRECT_VMA_MARGIN - 1).is_err()
         );
+    }
+
+    #[test]
+    fn host_capability_validation_requires_native_128_bit_atomics() {
+        assert!(validate_host_atomics(true).is_ok());
+        assert!(validate_host_atomics(false).is_err());
     }
 
     #[test]
@@ -1196,32 +1057,5 @@ mod tests {
             .unwrap();
         assert_eq!(arena.protection_at(0x4000), Some(DirectProtection::Read));
         assert_eq!(arena.protection_at(0x8000), Some(DirectProtection::Read));
-    }
-
-    #[test]
-    fn failed_partial_publication_poisons_the_complete_arena() {
-        let store = CanonicalBackingStore::allocate().unwrap();
-        let first = page(&store, 1, 0x11);
-        let second = page(&store, 2, 0x22);
-        let first = first.direct_backing().unwrap();
-        let second = second.direct_backing().unwrap();
-        let arena = DirectArena::new(0x20_000).unwrap();
-        arena.fail_after_host_calls(1);
-        let error = arena
-            .map_pages(&[
-                DirectMapRequest {
-                    guest_address: 0x4000,
-                    backing: &first,
-                    protection: DirectProtection::Read,
-                },
-                DirectMapRequest {
-                    guest_address: 0x8000,
-                    backing: &second,
-                    protection: DirectProtection::Read,
-                },
-            ])
-            .unwrap_err();
-        assert!(error.to_string().contains("injected"));
-        assert!(arena.is_poisoned());
     }
 }

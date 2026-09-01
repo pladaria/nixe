@@ -13,17 +13,14 @@ use std::fmt::{Display, Formatter};
 use std::mem::offset_of;
 use std::mem::{ManuallyDrop, MaybeUninit, size_of};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use nixe_cpu::memory::{
     CpuMemory, DataAccessFault, DataAccessKind, DirectFaultResolution, MemoryAccess,
     MemoryAccessClass, MemoryAccessSize, MemoryOrdering, MemoryValue,
 };
-use nixe_memory::{
-    AddressSpaceId, DIRECT_PAGE_SIZE, DirectAddressSpaceView, DirectStoreControl,
-    GuestVirtualAddress,
-};
+use nixe_memory::{AddressSpaceId, DIRECT_PAGE_SIZE, DirectAddressSpaceView, GuestVirtualAddress};
 
 const MAX_WORKER_SLOTS: usize = 128;
 const MAX_UNCHANGED_RETRIES: usize = 8;
@@ -772,8 +769,8 @@ impl std::error::Error for DirectScalarAccessError {}
 ///
 /// Binding selects this object once for a LinuxDirect process. Accesses contain
 /// no page-table walk or permission test; host protection remains the access
-/// authority, while the compact store control publishes the temporary page
-/// generation required before the raw-store cutover.
+/// authority. Recoverable first-write and visibility faults retry the exact
+/// native load or store after the shared page transition completes.
 pub struct DirectScalarFrontend {
     worker: Option<WorkerFaultContext>,
     arena: DirectAddressSpaceView,
@@ -782,17 +779,17 @@ pub struct DirectScalarFrontend {
     batch_active: bool,
 }
 
-#[derive(Default)]
 struct ScalarDispatcherContext {
     current_call: AtomicPtr<StubCall>,
+    arena_base: usize,
+    address_space: AddressSpaceId,
 }
 
 impl DirectScalarFrontend {
     /// # Safety
     ///
-    /// The arena and every canonical object referenced by its store controls
-    /// must remain alive and unchanged for every call made through this
-    /// frontend. Higher-level CPU frontends validate the view against the
+    /// The arena must remain alive and unchanged for every call made through
+    /// this frontend. Higher-level CPU frontends validate the view against the
     /// currently borrowed `CpuMemory` before beginning each slice.
     pub unsafe fn new(
         arena: DirectAddressSpaceView,
@@ -802,7 +799,11 @@ impl DirectScalarFrontend {
             worker: None,
             arena,
             address_space,
-            dispatcher_context: ManuallyDrop::new(Box::new(ScalarDispatcherContext::default())),
+            dispatcher_context: ManuallyDrop::new(Box::new(ScalarDispatcherContext {
+                current_call: AtomicPtr::new(std::ptr::null_mut()),
+                arena_base: arena.base,
+                address_space,
+            })),
             batch_active: false,
         })
     }
@@ -843,7 +844,6 @@ impl DirectScalarFrontend {
     pub fn read(
         &mut self,
         memory: &dyn CpuMemory,
-        guest_pc: GuestVirtualAddress,
         address: GuestVirtualAddress,
         access: MemoryAccess,
     ) -> Result<MemoryValue, DirectScalarAccessError> {
@@ -854,16 +854,7 @@ impl DirectScalarFrontend {
                 .map(|result| result.value)
                 .map_err(DirectScalarAccessError::DataFault);
         };
-        let mut call = StubCall::new(
-            pointer,
-            0,
-            memory,
-            self.address_space,
-            guest_pc,
-            address,
-            access,
-            DataAccessKind::Read,
-        );
+        let mut call = StubCall::new(pointer, 0, memory);
         self.invoke(&mut call, scalar_stub(size, DataAccessKind::Read)?)?;
         call.finish()?;
         Ok(MemoryValue::from_bits(size, u128::from(call.output)))
@@ -872,22 +863,9 @@ impl DirectScalarFrontend {
     pub fn write(
         &mut self,
         memory: &dyn CpuMemory,
-        guest_pc: GuestVirtualAddress,
         address: GuestVirtualAddress,
         access: MemoryAccess,
         value: MemoryValue,
-    ) -> Result<(), DirectScalarAccessError> {
-        self.write_inner(memory, guest_pc, address, access, value, || {})
-    }
-
-    fn write_inner(
-        &mut self,
-        memory: &dyn CpuMemory,
-        guest_pc: GuestVirtualAddress,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-        value: MemoryValue,
-        before_invoke: impl FnOnce(),
     ) -> Result<(), DirectScalarAccessError> {
         let size = validate_scalar_access(access)?;
         if value.size() != size {
@@ -895,42 +873,14 @@ impl DirectScalarFrontend {
                 "direct scalar store value does not match its access width".into(),
             ));
         }
-        if self.direct_pointer(address, size).is_none() {
+        let Some(pointer) = self.direct_pointer(address, size) else {
             return memory
-                .complete_direct_write_fault(self.address_space, address, access, value)
+                .write(self.address_space, address, access, value)
                 .map(|_| ())
                 .map_err(DirectScalarAccessError::DataFault);
-        }
-        let publication = self.store_publication(address, size);
-        // A store which did not acquire publication ownership must fault even
-        // if another writer arms the real alias before this stub executes.
-        // The poison guard makes that earlier decision stable; registered
-        // write faults always complete exactly once through canonical memory.
-        let pointer = publication.as_ref().map_or_else(
-            || self.poison_page(),
-            |_| {
-                self.direct_pointer(address, size)
-                    .expect("a publication token proves a confined direct pointer")
-            },
-        );
-        let mut call = StubCall::new(
-            pointer,
-            value.bits() as u64,
-            memory,
-            self.address_space,
-            guest_pc,
-            address,
-            access,
-            DataAccessKind::Write,
-        );
-        before_invoke();
-        let invocation = self.invoke_raw(&mut call, scalar_stub(size, DataAccessKind::Write)?);
-        match (publication, &invocation) {
-            (Some(publication), Ok(InvocationOutcome::Returned)) => publication.commit(),
-            (Some(publication), _) => publication.abort(),
-            (None, _) => {}
-        }
-        invocation.map_err(DirectScalarAccessError::Runtime)?;
+        };
+        let mut call = StubCall::new(pointer, value.bits() as u64, memory);
+        self.invoke(&mut call, scalar_stub(size, DataAccessKind::Write)?)?;
         call.finish()
     }
 
@@ -949,8 +899,7 @@ impl DirectScalarFrontend {
         entry: usize,
     ) -> Result<InvocationOutcome, FaultRuntimeError> {
         // Complete every fallible preparation before publishing the stack-owned
-        // call to the dispatcher. A failed worker registration must not leave
-        // a dangling `current_call` behind.
+        // call to the dispatcher.
         let registry = if self.batch_active {
             None
         } else {
@@ -960,21 +909,9 @@ impl DirectScalarFrontend {
             self.worker()?;
         }
         let call_pointer = std::ptr::from_mut(call);
-        if self
-            .dispatcher_context
+        self.dispatcher_context
             .current_call
-            .compare_exchange(
-                std::ptr::null_mut(),
-                call_pointer,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return Err(FaultRuntimeError::new(
-                "direct scalar frontend already has an active call",
-            ));
-        }
+            .store(call_pointer, Ordering::Release);
         let outcome = if self.batch_active {
             let worker = self
                 .worker
@@ -1003,11 +940,11 @@ impl DirectScalarFrontend {
                     },
                 )
             }
-        }?;
+        };
         self.dispatcher_context
             .current_call
             .store(std::ptr::null_mut(), Ordering::Release);
-        Ok(outcome)
+        outcome
     }
 
     fn worker(&mut self) -> Result<&mut WorkerFaultContext, FaultRuntimeError> {
@@ -1034,36 +971,11 @@ impl DirectScalarFrontend {
         let bytes = size.bytes();
         let last = address.get().checked_add((bytes - 1) as u64)?;
         if last >= self.arena.address_space_size as u64
-            || !address.get().is_multiple_of(bytes as u64)
+            || address.get() / DIRECT_PAGE_SIZE as u64 != last / DIRECT_PAGE_SIZE as u64
         {
             return None;
         }
         self.arena.base.checked_add(address.get() as usize)
-    }
-
-    fn poison_page(&self) -> usize {
-        self.arena.base + self.arena.address_space_size
-    }
-
-    fn store_publication(
-        &self,
-        address: GuestVirtualAddress,
-        size: MemoryAccessSize,
-    ) -> Option<DirectStorePublication> {
-        self.direct_pointer(address, size)?;
-        let page = address.get() as usize / DIRECT_PAGE_SIZE;
-        let slot = unsafe { &*(self.arena.store_controls as *const AtomicUsize).add(page) };
-        let control = slot.load(Ordering::Acquire) as *const DirectStoreControl;
-        let control = unsafe { control.as_ref()? };
-        let armed = unsafe { atomic_at(control.write_armed_address) };
-        if armed.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let generation = unsafe { atomic_at(control.generation_address) };
-        if generation.load(Ordering::Acquire) == u64::MAX {
-            return None;
-        }
-        DirectStorePublication::acquire(*control)
     }
 }
 
@@ -1097,101 +1009,24 @@ fn validate_scalar_access(
     Ok(access.size)
 }
 
-unsafe fn atomic_at(address: usize) -> &'static AtomicU64 {
-    unsafe { &*(address as *const AtomicU64) }
-}
-
-struct DirectStorePublication {
-    control: DirectStoreControl,
-    sequence: u64,
-}
-
-impl DirectStorePublication {
-    fn acquire(control: DirectStoreControl) -> Option<Self> {
-        let sequence = unsafe { atomic_at(control.write_sequence_address) };
-        let mut observed = sequence.load(Ordering::Acquire);
-        loop {
-            if observed & 1 != 0 {
-                std::hint::spin_loop();
-                observed = sequence.load(Ordering::Acquire);
-                continue;
-            }
-            match sequence.compare_exchange_weak(
-                observed,
-                observed.wrapping_add(1),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(current) => observed = current,
-            }
-        }
-        let armed = unsafe { atomic_at(control.write_armed_address) };
-        let exhausted =
-            unsafe { atomic_at(control.generation_address) }.load(Ordering::Acquire) == u64::MAX;
-        if armed.load(Ordering::Acquire) == 0 || exhausted {
-            sequence.store(observed, Ordering::Release);
-            return None;
-        }
-        Some(Self {
-            control,
-            sequence: observed,
-        })
-    }
-
-    fn commit(self) {
-        unsafe { atomic_at(self.control.generation_address) }.fetch_add(1, Ordering::Release);
-        self.finish();
-    }
-
-    fn abort(self) {
-        self.finish();
-    }
-
-    fn finish(self) {
-        unsafe { atomic_at(self.control.write_sequence_address) }
-            .store(self.sequence.wrapping_add(2), Ordering::Release);
-    }
-}
-
 #[repr(C)]
 struct StubCall {
     pointer: usize,
     value: u64,
     output: u64,
     memory: *const dyn CpuMemory,
-    address_space: AddressSpaceId,
-    guest_pc: GuestVirtualAddress,
-    address: GuestVirtualAddress,
-    access: MemoryAccess,
-    kind: DataAccessKind,
     data_fault: Option<DataAccessFault>,
     backend_error: Option<Box<str>>,
 }
 
 impl StubCall {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        pointer: usize,
-        value: u64,
-        memory: &dyn CpuMemory,
-        address_space: AddressSpaceId,
-        guest_pc: GuestVirtualAddress,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-        kind: DataAccessKind,
-    ) -> Self {
+    fn new(pointer: usize, value: u64, memory: &dyn CpuMemory) -> Self {
         let memory = unsafe { std::mem::transmute::<&dyn CpuMemory, *const dyn CpuMemory>(memory) };
         Self {
             pointer,
             value,
             output: 0,
             memory,
-            address_space,
-            guest_pc,
-            address,
-            access,
-            kind,
             data_fault: None,
             backend_error: None,
         }
@@ -1226,41 +1061,31 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
         }
         let call = unsafe { &mut *call };
         let site = unsafe { &*fault }.site();
-        let expected_kind = match call.kind {
-            DataAccessKind::Read => NativeMemoryAccessKind::Read,
-            DataAccessKind::Write => NativeMemoryAccessKind::Write,
+        let size = match site.access.size {
+            1 => MemoryAccessSize::Byte,
+            2 => MemoryAccessSize::Halfword,
+            4 => MemoryAccessSize::Word,
+            8 => MemoryAccessSize::Doubleword,
+            _ => return FaultDisposition::Fatal,
         };
-        if site.access.kind != expected_kind
-            || site.access.size != call.access.size.bytes() as u8
-            || site.access.element_index != 0
-        {
+        if site.access.element_index != 0 {
             return FaultDisposition::Fatal;
         }
+        let kind = match site.access.kind {
+            NativeMemoryAccessKind::Read => DataAccessKind::Read,
+            NativeMemoryAccessKind::Write => DataAccessKind::Write,
+        };
         let memory = unsafe { &*call.memory };
+        let Some(guest_address) = call.pointer.checked_sub(context.arena_base) else {
+            return FaultDisposition::Fatal;
+        };
         match memory.resolve_direct_fault(
-            call.address_space,
-            call.address,
-            call.access.size,
-            call.kind,
+            context.address_space,
+            GuestVirtualAddress::new(guest_address as u64),
+            size,
+            kind,
         ) {
             DirectFaultResolution::Retry => FaultDisposition::Retry,
-            DirectFaultResolution::CheckedStore => {
-                if call.kind != DataAccessKind::Write {
-                    return FaultDisposition::Fatal;
-                }
-                match memory.complete_direct_write_fault(
-                    call.address_space,
-                    call.address,
-                    call.access,
-                    MemoryValue::from_bits(call.access.size, u128::from(call.value)),
-                ) {
-                    Ok(_) => {}
-                    Err(fault) => {
-                        call.data_fault = Some(fault);
-                    }
-                }
-                FaultDisposition::Escape
-            }
             DirectFaultResolution::Fault(fault) => {
                 call.data_fault = Some(fault);
                 FaultDisposition::Escape
@@ -3072,7 +2897,6 @@ mod tests {
         let value = frontend
             .read(
                 &memory,
-                GuestVirtualAddress::new(0x8000),
                 GuestVirtualAddress::new(address.get() + 9),
                 MemoryAccess::normal(MemoryAccessSize::Byte),
             )
@@ -3083,40 +2907,6 @@ mod tests {
             range.segments()[0].visibility_state(),
             VisibilityState::Clean
         );
-    }
-
-    #[test]
-    fn store_publication_revalidates_armed_after_acquiring_the_page_sequence() {
-        struct Controls {
-            sequence: AtomicU64,
-            generation: AtomicU64,
-            armed: AtomicU64,
-        }
-
-        let controls = Arc::new(Controls {
-            sequence: AtomicU64::new(1),
-            generation: AtomicU64::new(7),
-            armed: AtomicU64::new(1),
-        });
-        let control = DirectStoreControl {
-            write_sequence_address: std::ptr::from_ref(&controls.sequence).addr(),
-            generation_address: std::ptr::from_ref(&controls.generation).addr(),
-            write_armed_address: std::ptr::from_ref(&controls.armed).addr(),
-        };
-        let started = Arc::new(Barrier::new(2));
-        let worker_started = Arc::clone(&started);
-        let worker = std::thread::spawn(move || {
-            worker_started.wait();
-            DirectStorePublication::acquire(control).is_none()
-        });
-
-        started.wait();
-        controls.armed.store(0, Ordering::Release);
-        controls.sequence.store(0, Ordering::Release);
-
-        assert!(worker.join().unwrap());
-        assert_eq!(controls.sequence.load(Ordering::Acquire), 0);
-        assert_eq!(controls.generation.load(Ordering::Acquire), 7);
     }
 
     #[test]
@@ -3287,7 +3077,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_first_writers_each_complete_once_and_share_one_armed_page() {
+    fn concurrent_first_writers_make_progress_on_one_physical_page() {
         let mut memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(1);
         let address = GuestVirtualAddress::new(0x1000);
@@ -3303,7 +3093,7 @@ mod tests {
         let cpu_writes = nixe_memory::CanonicalCpuWriteDependency::capture(&range).unwrap();
         let view = memory.direct_address_space_view(space).unwrap();
         let memory = Arc::new(memory);
-        let barrier = Arc::new(Barrier::new(2));
+        let barrier = Arc::new(Barrier::new(3));
 
         let workers = [0x11_u8, 0x22]
             .into_iter()
@@ -3312,21 +3102,19 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     let mut direct = unsafe { DirectScalarFrontend::new(view, space) }.unwrap();
+                    barrier.wait();
                     direct
-                        .write_inner(
+                        .write(
                             memory.as_ref(),
-                            GuestVirtualAddress::new(0x8000),
                             address,
                             MemoryAccess::normal(MemoryAccessSize::Byte),
                             MemoryValue::U8(value),
-                            || {
-                                barrier.wait();
-                            },
                         )
                         .unwrap();
                 })
             })
             .collect::<Vec<_>>();
+        barrier.wait();
         for worker in workers {
             worker.join().unwrap();
         }
@@ -3340,11 +3128,6 @@ mod tests {
             unreachable!()
         };
         assert!(matches!(observed, 0x11 | 0x22));
-        let control_slot = unsafe {
-            &*(view.store_controls as *const AtomicUsize)
-                .add(address.get() as usize / DIRECT_PAGE_SIZE)
-        };
-        assert_ne!(control_slot.load(Ordering::Acquire), 0);
     }
 }
 

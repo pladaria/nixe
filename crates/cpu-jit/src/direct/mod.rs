@@ -171,7 +171,6 @@ struct NativeContext {
     address_space: u64,
     direct_base: usize,
     direct_size: usize,
-    direct_store_controls: usize,
     loader_return: u64,
     control_pending: usize,
     synchronization_counter: usize,
@@ -240,7 +239,6 @@ impl NativeContext {
             address_space: address_space.get(),
             direct_base: direct.map_or(0, |view| view.base),
             direct_size: direct.map_or(0, |view| view.address_space_size),
-            direct_store_controls: direct.map_or(0, |view| view.store_controls),
             loader_return: loader_return.map_or(u64::MAX, GuestVirtualAddress::get),
             control_pending: control.pending_word_address(),
             synchronization_counter: control.synchronization_counter_address(),
@@ -1232,14 +1230,6 @@ unsafe fn dispatch_direct_fault_inner(
     let address = GuestVirtualAddress::new(guest_address);
     match memory.resolve_direct_fault(site.access.address_space, address, size, kind) {
         DirectFaultResolution::Retry => FaultDisposition::Retry,
-        DirectFaultResolution::CheckedStore => {
-            unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
-            context.exit_pc = site.access.guest_pc.get();
-            context.exit_kind = EXIT_INTERNAL;
-            context.direct_fault_error =
-                Some("raw JIT fault reached the scalar-store-only checked path".into());
-            FaultDisposition::Escape
-        }
         DirectFaultResolution::Fault(data_fault) => {
             unsafe { &mut *context.state }.set_pc(site.access.guest_pc.get());
             context.exit_pc = site.access.guest_pc.get();

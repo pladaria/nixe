@@ -803,9 +803,6 @@ pub enum DirectFaultResolution {
     /// Host protection and page state have been repaired; retry the exact
     /// native instruction with its captured host context.
     Retry,
-    /// Temporary pre-cutover scalar store path which completes synchronously
-    /// from its explicit call inputs. Raw JIT sites never use this outcome.
-    CheckedStore,
     /// Guest-visible invalid access. The raw operation is not completed.
     Fault(DataAccessFault),
     /// A CPU-visible eligible mapping faulted despite its published host view.
@@ -889,18 +886,6 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
                 "memory backend cannot resolve a native direct fault".into(),
             ),
         ))
-    }
-
-    /// Completes one faulted native scalar store exactly once through the
-    /// canonical path and arms subsequent direct stores when eligible.
-    fn complete_direct_write_fault(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-        value: MemoryValue,
-    ) -> Result<DataWriteResult, DataAccessFault> {
-        self.write(address_space, address, access, value)
     }
 
     /// Performs one complete architectural read.
@@ -1103,6 +1088,7 @@ pub enum MemoryProtectionErrorReason {
     InvalidRange,
     Unmapped,
     WritableExecutable,
+    UnsupportedPermissions,
     PermissionLocked,
     GenerationExhausted,
 }
