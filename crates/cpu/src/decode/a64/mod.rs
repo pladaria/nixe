@@ -43,16 +43,16 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0001 | 0x0000_0002 | 0x0000_0004..=0x0000_000a | 0x0000_0044..=0x0000_0047 => {
             A64Instruction::Control(control::normalize(instruction_id, bits))
         }
-        0x0000_000b..=0x0000_000f => {
+        0x0000_000b..=0x0000_000f | 0x0000_001e => {
             A64Instruction::System(system::normalize(instruction_id, bits))
         }
         0x0000_0003 | 0x0000_0010..=0x0000_001d | 0x0000_0020..=0x0000_0021 => {
             A64Instruction::Integer(integer::normalize(instruction_id, bits))
         }
-        0x0000_0022..=0x0000_002f => {
+        0x0000_0022..=0x0000_002f | 0x0000_005e..=0x0000_005f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a0 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a1 => {
             A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),

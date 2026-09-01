@@ -182,7 +182,7 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
                 AllocationStatus::Allocated
             }
         }
-        0x0000_009c | 0x0000_009d => validate_a64_simd_float_vector(bits),
+        0x0000_009c | 0x0000_009d | 0x0000_00a1 => validate_a64_simd_float_vector(bits),
         0x0000_009e | 0x0000_009f => {
             let scale = ((bits >> 10) & 0x3f) as u8;
             if !sf && scale < 32 {
@@ -429,14 +429,14 @@ fn validate_a64_simd_single_structure(bits: u32) -> AllocationStatus {
     let s = bits & (1 << 12) != 0;
     let size = (bits >> 10) & 3;
     match opcode {
-        0 => AllocationStatus::Allocated,
-        2 if size & 1 == 0 => AllocationStatus::Allocated,
-        4 if size == 0 || (size == 1 && !s) => AllocationStatus::Allocated,
-        2 => AllocationStatus::Reserved("16-bit single-structure lane requires size<0> == 0"),
-        4 => AllocationStatus::Reserved("invalid 32-bit or 64-bit single-structure lane index"),
-        _ => AllocationStatus::Unallocated(
-            "opcode does not select an LD1 or ST1 single-structure lane transfer",
-        ),
+        0 | 1 => AllocationStatus::Allocated,
+        2 | 3 if size & 1 == 0 => AllocationStatus::Allocated,
+        4 | 5 if size == 0 || (size == 1 && !s) => AllocationStatus::Allocated,
+        2 | 3 => AllocationStatus::Reserved("16-bit single-structure lane requires size<0> == 0"),
+        4 | 5 => AllocationStatus::Reserved("invalid 32-bit or 64-bit single-structure lane index"),
+        6 | 7 if bits & (1 << 22) != 0 => AllocationStatus::Allocated,
+        6 | 7 => AllocationStatus::Unallocated("replicate single-structure operation is load-only"),
+        _ => unreachable!("single-structure opcode is a three-bit field"),
     }
 }
 

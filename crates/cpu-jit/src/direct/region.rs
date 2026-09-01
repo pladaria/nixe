@@ -90,6 +90,9 @@ pub(super) enum BlockTerminator {
         syndrome: Option<u64>,
     },
     Unsupported,
+    FpModeChange {
+        continuation: GuestVirtualAddress,
+    },
     Limit {
         continuation: GuestVirtualAddress,
     },
@@ -104,6 +107,7 @@ pub(super) enum ExternalExitKind {
     Indirect,
     Architectural,
     Unsupported,
+    FpModeChange,
     RegionLimit,
 }
 
@@ -208,6 +212,11 @@ pub(super) fn discover_region(
                     if !system_instruction_supported(cpu.platform(), instruction) =>
                 {
                     break BlockTerminator::Unsupported;
+                }
+                A64Instruction::System(system::Instruction::WriteRegister(fields))
+                    if fields.system_key == 0xd51b_4400 =>
+                {
+                    break BlockTerminator::FpModeChange { continuation: next };
                 }
                 A64Instruction::Control(control::Instruction::Nop(_))
                 | A64Instruction::Integer(_)
@@ -366,6 +375,13 @@ pub(super) fn discover_region(
                 target: None,
                 kind: ExternalExitKind::Unsupported,
             }),
+            BlockTerminator::FpModeChange { .. } => {
+                external_exits.push(ExternalExitRecord {
+                    source,
+                    target: None,
+                    kind: ExternalExitKind::FpModeChange,
+                });
+            }
             BlockTerminator::Limit { continuation } => {
                 external_exits.push(ExternalExitRecord {
                     source,
@@ -414,6 +430,7 @@ fn system_instruction_supported(
             fields.barrier_option,
         )
         .is_some(),
+        system::Instruction::ClearExclusive(_) => true,
         system::Instruction::System(_) => {
             nixe_cpu::semantics::a64::cache_maintenance_operation(fields.system_key).is_some()
         }

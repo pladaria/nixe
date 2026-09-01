@@ -13,6 +13,9 @@ use cranelift_module::{Linkage, Module, default_libcall_names};
 use nixe_cpu::decode::a64::{A64Instruction, control, fp_simd, integer, memory, system};
 use nixe_cpu::execution::CpuControl;
 use nixe_cpu::location::DecodedInstruction;
+use nixe_cpu::semantics::a64::{
+    SimdMemoryMode, simd_multiple_structure_shape, simd_single_structure_shape,
+};
 use nixe_cpu::semantics::conditions::Condition;
 use nixe_memory::CpuMemoryBackend;
 use nixe_memory::GuestVirtualAddress;
@@ -125,6 +128,7 @@ pub(super) struct DirectCompiler {
     context: cranelift_codegen::Context,
     function_builder: FunctionBuilderContext,
     gateway: NativeGateway,
+    cold_calls: ColdCallBoundaries,
     next_function: u32,
     native_bytes: usize,
     memory_backend: CpuMemoryBackend,
@@ -168,11 +172,14 @@ impl DirectCompiler {
         let mut context = module.make_context();
         let mut function_builder = FunctionBuilderContext::new();
         let gateway = compile_gateway(&mut module, &mut context, &mut function_builder)?;
+        let cold_calls =
+            compile_cold_call_boundaries(&mut module, &mut context, &mut function_builder)?;
         Ok(Self {
             module,
             context,
             function_builder,
             gateway,
+            cold_calls,
             next_function: 1,
             native_bytes: 0,
             memory_backend: CpuMemoryBackend::Checked,
@@ -226,6 +233,7 @@ impl DirectCompiler {
                 static_slots,
                 self.module.target_config().default_call_conv,
                 self.memory_backend == CpuMemoryBackend::LinuxDirect,
+                self.cold_calls,
             )?
             .translate(self.module.target_config())?
         };
@@ -323,6 +331,347 @@ fn compile_gateway(
     Ok(unsafe { std::mem::transmute::<*const u8, NativeGateway>(entry) })
 }
 
+#[derive(Clone, Copy)]
+struct ColdCallBoundaries {
+    general_0: usize,
+    general_1: usize,
+    general_2: usize,
+    general_3: usize,
+    general_5: usize,
+    fp_scalar: usize,
+    fp_unary: usize,
+    fp_binary: usize,
+    fp_fused: usize,
+    fp_compare: usize,
+    materialize_fp: usize,
+}
+
+impl ColdCallBoundaries {
+    fn general(self, arguments: usize) -> Result<usize, DirectJitError> {
+        match arguments {
+            0 => Ok(self.general_0),
+            1 => Ok(self.general_1),
+            2 => Ok(self.general_2),
+            3 => Ok(self.general_3),
+            5 => Ok(self.general_5),
+            _ => Err(DirectJitError::internal(
+                "direct JIT slow call has no typed cold boundary",
+            )),
+        }
+    }
+
+    fn fp(self, operands: usize, extra: usize) -> Result<usize, DirectJitError> {
+        match (operands, extra) {
+            (1, 0) => Ok(self.fp_scalar),
+            (2, 0) => Ok(self.fp_unary),
+            (4, 0) => Ok(self.fp_binary),
+            (3, 0) => Ok(self.fp_fused),
+            (2, 1) => Ok(self.fp_compare),
+            _ => Err(DirectJitError::internal(
+                "direct JIT exact FP call has no typed cold boundary",
+            )),
+        }
+    }
+}
+
+fn compile_cold_call_boundaries(
+    module: &mut JITModule,
+    context: &mut cranelift_codegen::Context,
+    function_builder: &mut FunctionBuilderContext,
+) -> Result<ColdCallBoundaries, DirectJitError> {
+    // These functions are compiled once with the runtime, not copied into each
+    // guest region. Their active check also covers FP state inherited through a
+    // native tail link from a preceding region.
+    let general_0 = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_call_0",
+        0,
+        None,
+    )?;
+    let general_1 = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_call_1",
+        1,
+        None,
+    )?;
+    let general_2 = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_call_2",
+        2,
+        None,
+    )?;
+    let general_3 = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_call_3",
+        3,
+        None,
+    )?;
+    let general_5 = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_call_5",
+        5,
+        None,
+    )?;
+    let fp_scalar = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_fp_scalar",
+        2,
+        Some(1),
+    )?;
+    let fp_unary = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_fp_unary",
+        3,
+        Some(2),
+    )?;
+    let fp_binary = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_fp_binary",
+        5,
+        Some(4),
+    )?;
+    let fp_fused = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_fp_fused",
+        4,
+        Some(3),
+    )?;
+    let fp_compare = compile_cold_call_boundary(
+        module,
+        context,
+        function_builder,
+        "direct_cold_fp_compare",
+        4,
+        Some(2),
+    )?;
+    let materialize_fp = compile_fp_materialize_boundary(module, context, function_builder)?;
+    module.finalize_definitions().map_err(module_error)?;
+    Ok(ColdCallBoundaries {
+        general_0: module.get_finalized_function(general_0) as usize,
+        general_1: module.get_finalized_function(general_1) as usize,
+        general_2: module.get_finalized_function(general_2) as usize,
+        general_3: module.get_finalized_function(general_3) as usize,
+        general_5: module.get_finalized_function(general_5) as usize,
+        fp_scalar: module.get_finalized_function(fp_scalar) as usize,
+        fp_unary: module.get_finalized_function(fp_unary) as usize,
+        fp_binary: module.get_finalized_function(fp_binary) as usize,
+        fp_fused: module.get_finalized_function(fp_fused) as usize,
+        fp_compare: module.get_finalized_function(fp_compare) as usize,
+        materialize_fp: module.get_finalized_function(materialize_fp) as usize,
+    })
+}
+
+fn compile_cold_call_boundary(
+    module: &mut JITModule,
+    context: &mut cranelift_codegen::Context,
+    function_builder: &mut FunctionBuilderContext,
+    name: &str,
+    argument_count: usize,
+    fp_insert_at: Option<usize>,
+) -> Result<cranelift_module::FuncId, DirectJitError> {
+    let call_conv = module.target_config().default_call_conv;
+    let mut boundary_signature = Signature::new(call_conv);
+    boundary_signature.params.push(AbiParam::new(types::I64));
+    boundary_signature.params.push(AbiParam::new(types::I64));
+    boundary_signature
+        .params
+        .extend((0..argument_count).map(|_| AbiParam::new(types::I64)));
+    boundary_signature.returns.push(AbiParam::new(types::I32));
+    let function = module
+        .declare_function(name, Linkage::Local, &boundary_signature)
+        .map_err(module_error)?;
+    context.func.signature = boundary_signature;
+    context.func.name = UserFuncName::user(0, function.as_u32());
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, function_builder);
+        let entry = builder.create_block();
+        let suspend = builder.create_block();
+        let invoke = builder.create_block();
+        let resume = builder.create_block();
+        let done = builder.create_block();
+        builder.set_cold_block(suspend);
+        builder.set_cold_block(resume);
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let parameters = builder.block_params(entry).to_vec();
+        let native_context = parameters[0];
+        let target = parameters[1];
+        let arguments = &parameters[2..];
+        let active = builder.ins().load(
+            types::I32,
+            trusted_flags(),
+            native_context,
+            context_offset(
+                offset_of!(NativeContext, host_fp) + offset_of!(super::fp_env::HostFpState, active),
+            )?,
+        );
+        let active = builder.ins().icmp_imm_s(IntCC::NotEqual, active, 0);
+        builder.ins().brif(active, suspend, &[], invoke, &[]);
+
+        builder.switch_to_block(suspend);
+        emit_context_leaf_call(
+            &mut builder,
+            call_conv,
+            native_context,
+            super::fp_env::suspend as *const () as usize,
+        );
+        builder.ins().jump(invoke, &[]);
+
+        builder.switch_to_block(invoke);
+        let mut semantic_arguments = Vec::with_capacity(argument_count + 3);
+        semantic_arguments.push(native_context);
+        if let Some(index) = fp_insert_at {
+            semantic_arguments.extend_from_slice(&arguments[..index]);
+            let fpcr = builder.ins().load(
+                types::I32,
+                trusted_flags(),
+                native_context,
+                context_offset(offset_of!(NativeContext, guest_fpcr))?,
+            );
+            let fpsr_pointer = builder.ins().load(
+                types::I64,
+                trusted_flags(),
+                native_context,
+                context_offset(offset_of!(NativeContext, fpsr))?,
+            );
+            let fpsr = builder
+                .ins()
+                .load(types::I32, trusted_flags(), fpsr_pointer, 0);
+            semantic_arguments.push(builder.ins().uextend(types::I64, fpcr));
+            semantic_arguments.push(builder.ins().uextend(types::I64, fpsr));
+            semantic_arguments.extend_from_slice(&arguments[index..]);
+        } else {
+            semantic_arguments.extend_from_slice(arguments);
+        }
+        let mut semantic_signature = Signature::new(call_conv);
+        semantic_signature
+            .params
+            .extend((0..semantic_arguments.len()).map(|_| AbiParam::new(types::I64)));
+        let semantic_signature = builder.import_signature(semantic_signature);
+        builder
+            .ins()
+            .call_indirect(semantic_signature, target, &semantic_arguments);
+        let status = builder.ins().load(
+            types::I32,
+            trusted_flags(),
+            native_context,
+            context_offset(offset_of!(NativeContext, slow_status))?,
+        );
+        let succeeded = builder.ins().icmp_imm_s(IntCC::Equal, status, 0);
+        let should_resume = builder.ins().band(active, succeeded);
+        builder.ins().brif(should_resume, resume, &[], done, &[]);
+
+        builder.switch_to_block(resume);
+        emit_context_leaf_call(
+            &mut builder,
+            call_conv,
+            native_context,
+            super::fp_env::resume as *const () as usize,
+        );
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(done);
+        builder.ins().return_(&[status]);
+        builder.seal_all_blocks();
+        builder.finalize(module.target_config());
+    }
+    module
+        .define_function(function, context)
+        .map_err(module_error)?;
+    module.clear_context(context);
+    Ok(function)
+}
+
+fn compile_fp_materialize_boundary(
+    module: &mut JITModule,
+    context: &mut cranelift_codegen::Context,
+    function_builder: &mut FunctionBuilderContext,
+) -> Result<cranelift_module::FuncId, DirectJitError> {
+    let call_conv = module.target_config().default_call_conv;
+    let mut signature = Signature::new(call_conv);
+    signature.params.push(AbiParam::new(types::I64));
+    let function = module
+        .declare_function("direct_materialize_fp", Linkage::Local, &signature)
+        .map_err(module_error)?;
+    context.func.signature = signature;
+    context.func.name = UserFuncName::user(0, function.as_u32());
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, function_builder);
+        let entry = builder.create_block();
+        let materialize = builder.create_block();
+        let done = builder.create_block();
+        builder.set_cold_block(materialize);
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let native_context = builder.block_params(entry)[0];
+        let active = builder.ins().load(
+            types::I32,
+            trusted_flags(),
+            native_context,
+            context_offset(
+                offset_of!(NativeContext, host_fp) + offset_of!(super::fp_env::HostFpState, active),
+            )?,
+        );
+        let active = builder.ins().icmp_imm_s(IntCC::NotEqual, active, 0);
+        builder.ins().brif(active, materialize, &[], done, &[]);
+        builder.switch_to_block(materialize);
+        emit_context_leaf_call(
+            &mut builder,
+            call_conv,
+            native_context,
+            super::fp_env::suspend as *const () as usize,
+        );
+        emit_context_leaf_call(
+            &mut builder,
+            call_conv,
+            native_context,
+            super::fp_env::resume as *const () as usize,
+        );
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(done);
+        builder.ins().return_(&[]);
+        builder.seal_all_blocks();
+        builder.finalize(module.target_config());
+    }
+    module
+        .define_function(function, context)
+        .map_err(module_error)?;
+    module.clear_context(context);
+    Ok(function)
+}
+
+fn emit_context_leaf_call(
+    builder: &mut FunctionBuilder<'_>,
+    call_conv: CallConv,
+    native_context: ir::Value,
+    function: usize,
+) {
+    let callee = builder.ins().iconst(types::I64, function as i64);
+    let mut signature = Signature::new(call_conv);
+    signature.params.push(AbiParam::new(types::I64));
+    let signature = builder.import_signature(signature);
+    builder
+        .ins()
+        .call_indirect(signature, callee, &[native_context]);
+}
+
 fn tail_signature() -> Signature {
     let mut signature = Signature::new(CallConv::Tail);
     signature.params.push(AbiParam::new(types::I64));
@@ -400,6 +749,7 @@ struct CraneliftTranslator<'a, 'region> {
     pc: ir::Value,
     nzcv: ir::Value,
     fpsr: ir::Value,
+    native_fp_enabled: ir::Value,
     direct_base: ir::Value,
     direct_size: ir::Value,
     loader_return: ir::Value,
@@ -417,8 +767,11 @@ struct CraneliftTranslator<'a, 'region> {
     block_dirty_stack_pointer: bool,
     block_dirty_vector_registers: [bool; 32],
     block_dirty_fpsr: bool,
+    fp_status_accessed: bool,
+    uses_native_fp: bool,
     call_conv: CallConv,
     direct_memory: bool,
+    cold_calls: ColdCallBoundaries,
     fault_sites: Vec<PendingFaultSite>,
 }
 
@@ -429,6 +782,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         static_slots: &[usize],
         call_conv: CallConv,
         direct_memory: bool,
+        cold_calls: ColdCallBoundaries,
     ) -> Result<Self, DirectJitError> {
         let expected_slots = region
             .external_exits
@@ -459,6 +813,8 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         let fpsr_state = builder.declare_var(types::I32);
         let dirty_at_entry = dirty_states_at_entry(region);
         let register_load_blocks = register_load_blocks(region, &dirty_at_entry);
+        let fp_status_accessed = fp_status_access(region).0;
+        let uses_native_fp = region_uses_native_fp(region);
         Ok(Self {
             builder,
             region,
@@ -479,6 +835,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             pc: placeholder,
             nzcv: placeholder,
             fpsr: placeholder,
+            native_fp_enabled: placeholder,
             direct_base: placeholder,
             direct_size: placeholder,
             loader_return: placeholder,
@@ -496,8 +853,11 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             block_dirty_stack_pointer: false,
             block_dirty_vector_registers: [false; 32],
             block_dirty_fpsr: false,
+            fp_status_accessed,
+            uses_native_fp,
             call_conv,
             direct_memory,
+            cold_calls,
             fault_sites: Vec::new(),
         })
     }
@@ -512,7 +872,11 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.sp = self.load_context_pointer(offset_of!(NativeContext, sp))?;
         self.pc = self.load_context_pointer(offset_of!(NativeContext, pc))?;
         self.nzcv = self.load_context_pointer(offset_of!(NativeContext, nzcv))?;
-        self.fpsr = self.load_context_pointer(offset_of!(NativeContext, fpsr))?;
+        if self.uses_native_fp {
+            let enabled =
+                self.load_context(types::I32, offset_of!(NativeContext, native_fp_enabled))?;
+            self.native_fp_enabled = self.builder.ins().icmp_imm_s(IntCC::NotEqual, enabled, 0);
+        }
         if self.direct_memory {
             self.direct_base =
                 self.load_context(types::I64, offset_of!(NativeContext, direct_base))?;
@@ -534,14 +898,14 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             .ins()
             .load(types::I32, trusted_flags(), self.nzcv, 0);
         self.builder.def_var(self.packed_flags, self.initial_flags);
-        let initial_fpsr = if fp_status_access(self.region).0 {
-            self.builder
+        if self.fp_status_accessed {
+            self.fpsr = self.load_context_pointer(offset_of!(NativeContext, fpsr))?;
+            let initial_fpsr = self
+                .builder
                 .ins()
-                .load(types::I32, trusted_flags(), self.fpsr, 0)
-        } else {
-            self.builder.ins().iconst(types::I32, 0)
-        };
-        self.builder.def_var(self.fpsr_state, initial_fpsr);
+                .load(types::I32, trusted_flags(), self.fpsr, 0);
+            self.builder.def_var(self.fpsr_state, initial_fpsr);
+        }
         let (read, written) = register_access(self.region);
         for index in 0..GENERAL_REGISTER_COUNT {
             if !read.x[index] && !written.x[index] {
@@ -629,6 +993,24 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder.switch_to_block(control_exit);
         self.finish_exit_value(EXIT_CONTROL, 0, entry_pc)?;
         self.builder.switch_to_block(dispatch);
+        if self.uses_native_fp {
+            let active = self.load_context(
+                types::I32,
+                offset_of!(NativeContext, host_fp) + offset_of!(super::fp_env::HostFpState, active),
+            )?;
+            let active = self.builder.ins().icmp_imm_s(IntCC::NotEqual, active, 0);
+            let uncommon_mode = self.invert_bit(self.native_fp_enabled);
+            let skip_activation = self.builder.ins().bor(active, uncommon_mode);
+            let ready = self.builder.create_block();
+            let activate = self.cold_block();
+            self.builder
+                .ins()
+                .brif(skip_activation, ready, &[], activate, &[]);
+            self.builder.switch_to_block(activate);
+            self.call_context_leaf(super::fp_env::ensure as *const () as usize);
+            self.builder.ins().jump(ready, &[]);
+            self.builder.switch_to_block(ready);
+        }
         let primary = self.block(self.region.key.start)?;
         self.builder.ins().jump(primary, &[]);
 
@@ -897,6 +1279,10 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 self.emit_exit(EXIT_ARCHITECTURAL, detail, source, &flags)
             }
             BlockTerminator::Unsupported => self.emit_exit(EXIT_UNSUPPORTED, 0, source, &flags),
+            BlockTerminator::FpModeChange { continuation } => {
+                self.commit_state(continuation, &flags)?;
+                self.finish_exit(EXIT_DISPATCH, 0, continuation)
+            }
             BlockTerminator::Limit { continuation } => self.emit_static_exit(continuation, &flags),
         }
     }
@@ -1789,7 +2175,9 @@ fn fp_status_access(region: &NativeRegion) -> (bool, bool) {
     for block in &region.blocks {
         for decoded in &block.instructions {
             match nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
-                A64Instruction::FpSimd(instruction) if fp_simd_uses_exact_status(instruction) => {
+                A64Instruction::FpSimd(instruction)
+                    if a64_fp_simd::fp_lowering_disposition(instruction).accesses_status() =>
+                {
                     accessed = true;
                     dirty = true;
                 }
@@ -1811,29 +2199,17 @@ fn fp_status_access(region: &NativeRegion) -> (bool, bool) {
     (accessed, dirty)
 }
 
-fn fp_simd_uses_exact_status(instruction: fp_simd::Instruction) -> bool {
-    matches!(
-        instruction,
-        fp_simd::Instruction::SignedIntToFloat(_)
-            | fp_simd::Instruction::UnsignedIntToFloat(_)
-            | fp_simd::Instruction::FloatToSignedInt(_)
-            | fp_simd::Instruction::FloatToUnsignedInt(_)
-            | fp_simd::Instruction::CompareRegister(_)
-            | fp_simd::Instruction::CompareZero(_)
-            | fp_simd::Instruction::ConditionalCompare(_)
-            | fp_simd::Instruction::VectorSignedIntToFloat(_)
-            | fp_simd::Instruction::VectorUnsignedIntToFloat(_)
-            | fp_simd::Instruction::ScalarVectorSignedIntToFloat(_)
-            | fp_simd::Instruction::ScalarVectorUnsignedIntToFloat(_)
-            | fp_simd::Instruction::VectorFloatDivide(_)
-            | fp_simd::Instruction::ScalarFloatConvert(_)
-            | fp_simd::Instruction::ScalarFloatDivide(_)
-            | fp_simd::Instruction::ScalarFloatRound(_)
-            | fp_simd::Instruction::ScalarFloatAdd(_)
-            | fp_simd::Instruction::ScalarFloatMultiply(_)
-            | fp_simd::Instruction::ScalarFloatFusedMultiplyAdd(_)
-            | fp_simd::Instruction::ScalarFloatSquareRoot(_)
-    )
+fn region_uses_native_fp(region: &NativeRegion) -> bool {
+    region.blocks.iter().any(|block| {
+        block.instructions.iter().any(|decoded| {
+            let A64Instruction::FpSimd(instruction) =
+                nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding)
+            else {
+                return false;
+            };
+            a64_fp_simd::fp_lowering_disposition(instruction).uses_native_status()
+        })
+    })
 }
 
 fn register_access_memory(
@@ -1889,9 +2265,18 @@ fn register_access_memory(
         memory::Instruction::LoadAcquire(_) | memory::Instruction::LoadExclusive(_) => {
             mark_write(accessed, dirty, fields.rt, false);
         }
+        memory::Instruction::LoadExclusivePair(_) => {
+            mark_write(accessed, dirty, fields.rt, false);
+            mark_write(accessed, dirty, fields.rt2, false);
+        }
         memory::Instruction::StoreRelease(_) => mark_read(accessed, fields.rt, false),
         memory::Instruction::StoreExclusive(_) => {
             mark_read(accessed, fields.rt, false);
+            mark_write(accessed, dirty, fields.rm, false);
+        }
+        memory::Instruction::StoreExclusivePair(_) => {
+            mark_read(accessed, fields.rt, false);
+            mark_read(accessed, fields.rt2, false);
             mark_write(accessed, dirty, fields.rm, false);
         }
         memory::Instruction::AtomicReadModifyWrite(_) => {
@@ -1928,6 +2313,7 @@ fn register_access_system(
         }
         system::Instruction::Hint(_)
         | system::Instruction::Barrier(_)
+        | system::Instruction::ClearExclusive(_)
         | system::Instruction::System(_) => {}
     }
 }
@@ -2032,15 +2418,14 @@ fn register_access_fp_simd_vector(
         }
         fp_simd::Instruction::MemoryMultipleStructures(_)
         | fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_) => {
-            let count = match fields.structure_opcode {
-                0b0010 => 4,
-                0b0110 => 3,
-                0b1010 => 2,
-                _ => 1,
-            };
-            for index in 0..count {
+            let shape = simd_multiple_structure_shape(fields)
+                .expect("allocation validated the SIMD multiple-structure shape");
+            for index in 0..shape.register_count() {
                 let register = fields.rd.wrapping_add(index) & 31;
                 if fields.load {
+                    if shape.structure_registers > 1 {
+                        read(accessed, register);
+                    }
                     write(accessed, dirty, register);
                 } else {
                     read(accessed, register);
@@ -2049,9 +2434,16 @@ fn register_access_fp_simd_vector(
         }
         fp_simd::Instruction::MemorySingleStructure(_)
         | fp_simd::Instruction::MemorySingleStructurePostIndex(_) => {
-            read(accessed, fields.rd);
-            if fields.load {
-                write(accessed, dirty, fields.rd);
+            let shape = simd_single_structure_shape(fields)
+                .expect("allocation validated the SIMD single-structure shape");
+            for index in 0..shape.register_count() {
+                let register = fields.rd.wrapping_add(index) & 31;
+                if !fields.load || matches!(shape.mode, SimdMemoryMode::Lane(_)) {
+                    read(accessed, register);
+                }
+                if fields.load {
+                    write(accessed, dirty, register);
+                }
             }
         }
         fp_simd::Instruction::MoveFromGeneral(_)
@@ -2102,6 +2494,7 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::VectorSignedShiftRegister(_)
         | fp_simd::Instruction::VectorUnsignedShiftRegister(_)
         | fp_simd::Instruction::VectorFloatDivide(_)
+        | fp_simd::Instruction::VectorFloatMultiplyElement(_)
         | fp_simd::Instruction::ScalarFloatDivide(_)
         | fp_simd::Instruction::ScalarFloatAdd(_)
         | fp_simd::Instruction::ScalarFloatMultiply(_)
@@ -2168,6 +2561,7 @@ fn merged_flag_entries(region: &NativeRegion) -> HashSet<GuestVirtualAddress> {
             | BlockTerminator::Indirect
             | BlockTerminator::Architectural { .. }
             | BlockTerminator::Unsupported
+            | BlockTerminator::FpModeChange { .. }
             | BlockTerminator::Limit { .. } => {}
         }
     }
@@ -2263,6 +2657,7 @@ fn block_dominators(
             | BlockTerminator::Indirect
             | BlockTerminator::Architectural { .. }
             | BlockTerminator::Unsupported
+            | BlockTerminator::FpModeChange { .. }
             | BlockTerminator::Limit { .. } => {}
         }
     }
@@ -2347,6 +2742,7 @@ fn dirty_states_at_entry(region: &NativeRegion) -> HashMap<GuestVirtualAddress, 
                 | BlockTerminator::Indirect
                 | BlockTerminator::Architectural { .. }
                 | BlockTerminator::Unsupported
+                | BlockTerminator::FpModeChange { .. }
                 | BlockTerminator::Limit { .. } => {}
             }
         }
@@ -2386,6 +2782,7 @@ fn conditionally_dirty_at_entry(
             | BlockTerminator::Indirect
             | BlockTerminator::Architectural { .. }
             | BlockTerminator::Unsupported
+            | BlockTerminator::FpModeChange { .. }
             | BlockTerminator::Limit { .. } => {}
         }
     }
@@ -2506,7 +2903,7 @@ fn block_register_access(
                     &mut vector_accessed,
                     &mut vector_dirty,
                 );
-                if fp_simd_uses_exact_status(instruction) {
+                if a64_fp_simd::fp_lowering_disposition(instruction).accesses_status() {
                     fpsr_read = true;
                     fpsr_dirty = true;
                 }

@@ -22,7 +22,7 @@ preferred_languages = ["Spanish", "AmericanEnglish"]
 # Relative paths are resolved from the directory containing this file.
 keys = "./keys/"
 # Initial mode reported to applications: "handheld" or "docked".
-initial_operation_mode = "handheld"
+initial_operation_mode = "docked"
 
 [system.time]
 # "realtime" anchors to the host clock at launch and advances monotonically.

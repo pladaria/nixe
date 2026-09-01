@@ -9,7 +9,6 @@
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-#[cfg(target_arch = "x86_64")]
 use std::mem::offset_of;
 use std::mem::{ManuallyDrop, MaybeUninit, size_of};
 use std::ptr::NonNull;
@@ -612,7 +611,7 @@ impl WorkerFaultContext {
     }
 
     /// Publishes one stable arena/registry/dispatcher snapshot for a batch of
-    /// fixed scalar accesses, normally one interpreter slice.
+    /// fixed direct accesses, normally one interpreter slice.
     ///
     /// # Safety
     ///
@@ -684,13 +683,13 @@ impl WorkerFaultContext {
         Ok(())
     }
 
-    /// Invokes one fixed scalar stub while a batch snapshot is active.
+    /// Invokes one fixed memory stub while a batch snapshot is active.
     ///
     /// # Safety
     ///
     /// `context` must point to the stub call layout and `entry` must be one of
     /// the immutable functions registered in the active registry.
-    pub unsafe fn invoke_scalar_in_batch(
+    pub unsafe fn invoke_stub_in_batch(
         &mut self,
         context: *mut libc::c_void,
         entry: usize,
@@ -698,11 +697,10 @@ impl WorkerFaultContext {
         let slot = unsafe { self.slot.as_ref() };
         if !slot.active.load(Ordering::Acquire) {
             return Err(FaultRuntimeError::new(
-                "native fault context scalar batch is not active",
+                "native fault context stub batch is not active",
             ));
         }
-        let escaped =
-            unsafe { nixe_direct_scalar_invoke(self.slot.as_ptr().cast(), context, entry) };
+        let escaped = unsafe { nixe_direct_stub_invoke(self.slot.as_ptr().cast(), context, entry) };
         Ok(invocation_outcome(escaped, slot))
     }
 }
@@ -747,23 +745,23 @@ pub enum InvocationOutcome {
 
 /// Failure returned by the fixed interpreter direct-memory frontend.
 #[derive(Debug)]
-pub enum DirectScalarAccessError {
+pub enum DirectMemoryAccessError {
     DataFault(DataAccessFault),
     Backend(Box<str>),
     Runtime(FaultRuntimeError),
 }
 
-impl Display for DirectScalarAccessError {
+impl Display for DirectMemoryAccessError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DataFault(fault) => write!(formatter, "direct scalar data fault: {fault:?}"),
+            Self::DataFault(fault) => write!(formatter, "direct memory data fault: {fault:?}"),
             Self::Backend(detail) => formatter.write_str(detail),
             Self::Runtime(error) => Display::fmt(error, formatter),
         }
     }
 }
 
-impl std::error::Error for DirectScalarAccessError {}
+impl std::error::Error for DirectMemoryAccessError {}
 
 /// Per-worker fixed-stub frontend used by the reference interpreter.
 ///
@@ -771,21 +769,21 @@ impl std::error::Error for DirectScalarAccessError {}
 /// no page-table walk or permission test; host protection remains the access
 /// authority. Recoverable first-write and visibility faults retry the exact
 /// native load or store after the shared page transition completes.
-pub struct DirectScalarFrontend {
+pub struct DirectMemoryFrontend {
     worker: Option<WorkerFaultContext>,
     arena: DirectAddressSpaceView,
     address_space: AddressSpaceId,
-    dispatcher_context: ManuallyDrop<Box<ScalarDispatcherContext>>,
+    dispatcher_context: ManuallyDrop<Box<MemoryDispatcherContext>>,
     batch_active: bool,
 }
 
-struct ScalarDispatcherContext {
+struct MemoryDispatcherContext {
     current_call: AtomicPtr<StubCall>,
     arena_base: usize,
     address_space: AddressSpaceId,
 }
 
-impl DirectScalarFrontend {
+impl DirectMemoryFrontend {
     /// # Safety
     ///
     /// The arena must remain alive and unchanged for every call made through
@@ -799,7 +797,7 @@ impl DirectScalarFrontend {
             worker: None,
             arena,
             address_space,
-            dispatcher_context: ManuallyDrop::new(Box::new(ScalarDispatcherContext {
+            dispatcher_context: ManuallyDrop::new(Box::new(MemoryDispatcherContext {
                 current_call: AtomicPtr::new(std::ptr::null_mut()),
                 arena_base: arena.base,
                 address_space,
@@ -812,16 +810,16 @@ impl DirectScalarFrontend {
     pub fn begin_slice(&mut self) -> Result<(), FaultRuntimeError> {
         if self.batch_active {
             return Err(FaultRuntimeError::new(
-                "direct scalar interpreter slice is already active",
+                "direct interpreter memory slice is already active",
             ));
         }
         let arena = self.arena;
-        let registry = scalar_stub_registry()?;
+        let registry = memory_stub_registry()?;
         let opaque = std::ptr::from_ref(self.dispatcher_context.as_ref())
             .cast_mut()
             .cast();
         let worker = self.worker()?;
-        unsafe { worker.begin_batch(arena, registry, dispatch_scalar_stub_fault, opaque) }?;
+        unsafe { worker.begin_batch(arena, registry, dispatch_memory_stub_fault, opaque) }?;
         self.batch_active = true;
         Ok(())
     }
@@ -830,12 +828,12 @@ impl DirectScalarFrontend {
     pub fn end_slice(&mut self) -> Result<(), FaultRuntimeError> {
         if !self.batch_active {
             return Err(FaultRuntimeError::new(
-                "direct scalar interpreter slice is not active",
+                "direct interpreter memory slice is not active",
             ));
         }
         self.worker
             .as_mut()
-            .expect("an active scalar slice owns a worker")
+            .expect("an active direct-memory slice owns a worker")
             .end_batch()?;
         self.batch_active = false;
         Ok(())
@@ -846,18 +844,18 @@ impl DirectScalarFrontend {
         memory: &dyn CpuMemory,
         address: GuestVirtualAddress,
         access: MemoryAccess,
-    ) -> Result<MemoryValue, DirectScalarAccessError> {
-        let size = validate_scalar_access(access)?;
+    ) -> Result<MemoryValue, DirectMemoryAccessError> {
+        let size = validate_direct_access(access)?;
         let Some(pointer) = self.direct_pointer(address, size) else {
             return memory
                 .read(self.address_space, address, access)
                 .map(|result| result.value)
-                .map_err(DirectScalarAccessError::DataFault);
+                .map_err(DirectMemoryAccessError::DataFault);
         };
         let mut call = StubCall::new(pointer, 0, memory);
-        self.invoke(&mut call, scalar_stub(size, DataAccessKind::Read)?)?;
+        self.invoke(&mut call, memory_stub(size, DataAccessKind::Read))?;
         call.finish()?;
-        Ok(MemoryValue::from_bits(size, u128::from(call.output)))
+        Ok(MemoryValue::from_bits(size, call.output))
     }
 
     pub fn write(
@@ -866,21 +864,21 @@ impl DirectScalarFrontend {
         address: GuestVirtualAddress,
         access: MemoryAccess,
         value: MemoryValue,
-    ) -> Result<(), DirectScalarAccessError> {
-        let size = validate_scalar_access(access)?;
+    ) -> Result<(), DirectMemoryAccessError> {
+        let size = validate_direct_access(access)?;
         if value.size() != size {
-            return Err(DirectScalarAccessError::Backend(
-                "direct scalar store value does not match its access width".into(),
+            return Err(DirectMemoryAccessError::Backend(
+                "direct store value does not match its access width".into(),
             ));
         }
         let Some(pointer) = self.direct_pointer(address, size) else {
             return memory
                 .write(self.address_space, address, access, value)
                 .map(|_| ())
-                .map_err(DirectScalarAccessError::DataFault);
+                .map_err(DirectMemoryAccessError::DataFault);
         };
-        let mut call = StubCall::new(pointer, value.bits() as u64, memory);
-        self.invoke(&mut call, scalar_stub(size, DataAccessKind::Write)?)?;
+        let mut call = StubCall::new(pointer, value.bits(), memory);
+        self.invoke(&mut call, memory_stub(size, DataAccessKind::Write))?;
         call.finish()
     }
 
@@ -888,9 +886,9 @@ impl DirectScalarFrontend {
         &mut self,
         call: &mut StubCall,
         entry: usize,
-    ) -> Result<InvocationOutcome, DirectScalarAccessError> {
+    ) -> Result<InvocationOutcome, DirectMemoryAccessError> {
         self.invoke_raw(call, entry)
-            .map_err(DirectScalarAccessError::Runtime)
+            .map_err(DirectMemoryAccessError::Runtime)
     }
 
     fn invoke_raw(
@@ -903,7 +901,7 @@ impl DirectScalarFrontend {
         let registry = if self.batch_active {
             None
         } else {
-            Some(scalar_stub_registry()?)
+            Some(memory_stub_registry()?)
         };
         if self.worker.is_none() {
             self.worker()?;
@@ -916,8 +914,8 @@ impl DirectScalarFrontend {
             let worker = self
                 .worker
                 .as_mut()
-                .expect("an active scalar slice owns a worker");
-            unsafe { worker.invoke_scalar_in_batch(call_pointer.cast(), entry) }
+                .expect("an active direct-memory slice owns a worker");
+            unsafe { worker.invoke_stub_in_batch(call_pointer.cast(), entry) }
         } else {
             let arena = self.arena;
             let opaque = std::ptr::from_ref(self.dispatcher_context.as_ref())
@@ -926,15 +924,15 @@ impl DirectScalarFrontend {
             let worker = self
                 .worker
                 .as_mut()
-                .expect("a prepared scalar call owns a worker");
+                .expect("a prepared direct-memory call owns a worker");
             unsafe {
                 worker.invoke(
                     arena,
-                    registry.expect("an unbatched scalar call prepared its registry"),
-                    dispatch_scalar_stub_fault,
+                    registry.expect("an unbatched direct-memory call prepared its registry"),
+                    dispatch_memory_stub_fault,
                     opaque,
                     NativeInvocation {
-                        gateway: scalar_stub_gateway,
+                        gateway: memory_stub_gateway,
                         context: call_pointer.cast(),
                         entry,
                     },
@@ -954,10 +952,10 @@ impl DirectScalarFrontend {
         let worker = self
             .worker
             .as_mut()
-            .expect("direct scalar worker was initialized");
+            .expect("direct-memory worker was initialized");
         if worker.registered_tid() != current_tid() {
             return Err(FaultRuntimeError::new(
-                "direct scalar frontend moved to a different host TID after first use",
+                "direct-memory frontend moved to a different host TID after first use",
             ));
         }
         Ok(worker)
@@ -968,18 +966,25 @@ impl DirectScalarFrontend {
         address: GuestVirtualAddress,
         size: MemoryAccessSize,
     ) -> Option<usize> {
+        let address = address.get();
         let bytes = size.bytes();
-        let last = address.get().checked_add((bytes - 1) as u64)?;
-        if last >= self.arena.address_space_size as u64
-            || address.get() / DIRECT_PAGE_SIZE as u64 != last / DIRECT_PAGE_SIZE as u64
-        {
+        if address >= self.arena.address_space_size as u64 {
             return None;
         }
-        self.arena.base.checked_add(address.get() as usize)
+        if bytes != 1 {
+            let last = address.checked_add((bytes - 1) as u64)?;
+            let page_offset = address & (DIRECT_PAGE_SIZE as u64 - 1);
+            if last >= self.arena.address_space_size as u64
+                || page_offset > (DIRECT_PAGE_SIZE - bytes) as u64
+            {
+                return None;
+            }
+        }
+        self.arena.base.checked_add(address as usize)
     }
 }
 
-impl Drop for DirectScalarFrontend {
+impl Drop for DirectMemoryFrontend {
     fn drop(&mut self) {
         if self.batch_active {
             let Some(worker) = self.worker.as_ref() else {
@@ -995,15 +1000,12 @@ impl Drop for DirectScalarFrontend {
     }
 }
 
-fn validate_scalar_access(
+fn validate_direct_access(
     access: MemoryAccess,
-) -> Result<MemoryAccessSize, DirectScalarAccessError> {
-    if access.ordering != MemoryOrdering::Relaxed
-        || access.class != MemoryAccessClass::Normal
-        || access.size == MemoryAccessSize::Quadword
-    {
-        return Err(DirectScalarAccessError::Backend(
-            "direct scalar stubs accept only relaxed ordinary 1/2/4/8-byte accesses".into(),
+) -> Result<MemoryAccessSize, DirectMemoryAccessError> {
+    if access.ordering != MemoryOrdering::Relaxed || access.class != MemoryAccessClass::Normal {
+        return Err(DirectMemoryAccessError::Backend(
+            "direct stubs accept only relaxed ordinary accesses".into(),
         ));
     }
     Ok(access.size)
@@ -1012,15 +1014,15 @@ fn validate_scalar_access(
 #[repr(C)]
 struct StubCall {
     pointer: usize,
-    value: u64,
-    output: u64,
+    value: u128,
+    output: u128,
     memory: *const dyn CpuMemory,
     data_fault: Option<DataAccessFault>,
     backend_error: Option<Box<str>>,
 }
 
 impl StubCall {
-    fn new(pointer: usize, value: u64, memory: &dyn CpuMemory) -> Self {
+    fn new(pointer: usize, value: u128, memory: &dyn CpuMemory) -> Self {
         let memory = unsafe { std::mem::transmute::<&dyn CpuMemory, *const dyn CpuMemory>(memory) };
         Self {
             pointer,
@@ -1032,29 +1034,29 @@ impl StubCall {
         }
     }
 
-    fn finish(&mut self) -> Result<(), DirectScalarAccessError> {
+    fn finish(&mut self) -> Result<(), DirectMemoryAccessError> {
         if let Some(fault) = self.data_fault.take() {
-            return Err(DirectScalarAccessError::DataFault(fault));
+            return Err(DirectMemoryAccessError::DataFault(fault));
         }
         if let Some(detail) = self.backend_error.take() {
-            return Err(DirectScalarAccessError::Backend(detail));
+            return Err(DirectMemoryAccessError::Backend(detail));
         }
         Ok(())
     }
 }
 
-unsafe extern "C" fn scalar_stub_gateway(context: *mut libc::c_void, entry: usize) {
+unsafe extern "C" fn memory_stub_gateway(context: *mut libc::c_void, entry: usize) {
     let stub =
         unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut libc::c_void)>(entry) };
     unsafe { stub(context) };
 }
 
-unsafe extern "C" fn dispatch_scalar_stub_fault(
+unsafe extern "C" fn dispatch_memory_stub_fault(
     opaque: *mut libc::c_void,
     fault: *mut CapturedFault,
 ) -> FaultDisposition {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let context = unsafe { &*opaque.cast::<ScalarDispatcherContext>() };
+        let context = unsafe { &*opaque.cast::<MemoryDispatcherContext>() };
         let call = context.current_call.load(Ordering::Acquire);
         if call.is_null() {
             return FaultDisposition::Fatal;
@@ -1066,6 +1068,7 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
             2 => MemoryAccessSize::Halfword,
             4 => MemoryAccessSize::Word,
             8 => MemoryAccessSize::Doubleword,
+            16 => MemoryAccessSize::Quadword,
             _ => return FaultDisposition::Fatal,
         };
         if site.access.element_index != 0 {
@@ -1099,11 +1102,8 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
     .unwrap_or(FaultDisposition::Fatal)
 }
 
-fn scalar_stub(
-    size: MemoryAccessSize,
-    kind: DataAccessKind,
-) -> Result<usize, DirectScalarAccessError> {
-    let entry = match (kind, size) {
+fn memory_stub(size: MemoryAccessSize, kind: DataAccessKind) -> usize {
+    match (kind, size) {
         (DataAccessKind::Read, MemoryAccessSize::Byte) => function_address(nixe_direct_stub_read_1),
         (DataAccessKind::Read, MemoryAccessSize::Halfword) => {
             function_address(nixe_direct_stub_read_2)
@@ -1111,6 +1111,9 @@ fn scalar_stub(
         (DataAccessKind::Read, MemoryAccessSize::Word) => function_address(nixe_direct_stub_read_4),
         (DataAccessKind::Read, MemoryAccessSize::Doubleword) => {
             function_address(nixe_direct_stub_read_8)
+        }
+        (DataAccessKind::Read, MemoryAccessSize::Quadword) => {
+            function_address(nixe_direct_stub_read_16)
         }
         (DataAccessKind::Write, MemoryAccessSize::Byte) => {
             function_address(nixe_direct_stub_write_1)
@@ -1124,26 +1127,23 @@ fn scalar_stub(
         (DataAccessKind::Write, MemoryAccessSize::Doubleword) => {
             function_address(nixe_direct_stub_write_8)
         }
-        (_, MemoryAccessSize::Quadword) => {
-            return Err(DirectScalarAccessError::Backend(
-                "direct scalar stubs do not support 128-bit accesses".into(),
-            ));
+        (DataAccessKind::Write, MemoryAccessSize::Quadword) => {
+            function_address(nixe_direct_stub_write_16)
         }
-    };
-    Ok(entry)
+    }
 }
 
 fn function_address(function: unsafe extern "C" fn(*mut libc::c_void)) -> usize {
     function as *const () as usize
 }
 
-fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRuntimeError> {
+fn memory_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRuntimeError> {
     static REGISTRY: OnceLock<Result<Arc<NativeFaultRegistry>, FaultRuntimeError>> =
         OnceLock::new();
     REGISTRY
         .get_or_init(|| {
             NativeFaultRegistry::new(vec![
-                scalar_stub_region(
+                memory_stub_region(
                     function_address(nixe_direct_stub_read_1),
                     std::ptr::addr_of!(nixe_direct_stub_read_1_end).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_read_1_fault).addr(),
@@ -1151,7 +1151,7 @@ fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
                     DataAccessKind::Read,
                     1,
                 ),
-                scalar_stub_region(
+                memory_stub_region(
                     function_address(nixe_direct_stub_read_2),
                     std::ptr::addr_of!(nixe_direct_stub_read_2_end).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_read_2_fault).addr(),
@@ -1159,7 +1159,7 @@ fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
                     DataAccessKind::Read,
                     2,
                 ),
-                scalar_stub_region(
+                memory_stub_region(
                     function_address(nixe_direct_stub_read_4),
                     std::ptr::addr_of!(nixe_direct_stub_read_4_end).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_read_4_fault).addr(),
@@ -1167,7 +1167,7 @@ fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
                     DataAccessKind::Read,
                     4,
                 ),
-                scalar_stub_region(
+                memory_stub_region(
                     function_address(nixe_direct_stub_read_8),
                     std::ptr::addr_of!(nixe_direct_stub_read_8_end).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_read_8_fault).addr(),
@@ -1175,7 +1175,15 @@ fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
                     DataAccessKind::Read,
                     8,
                 ),
-                scalar_stub_region(
+                memory_stub_region(
+                    function_address(nixe_direct_stub_read_16),
+                    std::ptr::addr_of!(nixe_direct_stub_read_16_end).addr(),
+                    std::ptr::addr_of!(nixe_direct_stub_read_16_fault).addr(),
+                    std::ptr::addr_of!(nixe_direct_stub_read_16_after).addr(),
+                    DataAccessKind::Read,
+                    16,
+                ),
+                memory_stub_region(
                     function_address(nixe_direct_stub_write_1),
                     std::ptr::addr_of!(nixe_direct_stub_write_1_end).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_write_1_fault).addr(),
@@ -1183,7 +1191,7 @@ fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
                     DataAccessKind::Write,
                     1,
                 ),
-                scalar_stub_region(
+                memory_stub_region(
                     function_address(nixe_direct_stub_write_2),
                     std::ptr::addr_of!(nixe_direct_stub_write_2_end).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_write_2_fault).addr(),
@@ -1191,7 +1199,7 @@ fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
                     DataAccessKind::Write,
                     2,
                 ),
-                scalar_stub_region(
+                memory_stub_region(
                     function_address(nixe_direct_stub_write_4),
                     std::ptr::addr_of!(nixe_direct_stub_write_4_end).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_write_4_fault).addr(),
@@ -1199,13 +1207,21 @@ fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
                     DataAccessKind::Write,
                     4,
                 ),
-                scalar_stub_region(
+                memory_stub_region(
                     function_address(nixe_direct_stub_write_8),
                     std::ptr::addr_of!(nixe_direct_stub_write_8_end).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_write_8_fault).addr(),
                     std::ptr::addr_of!(nixe_direct_stub_write_8_after).addr(),
                     DataAccessKind::Write,
                     8,
+                ),
+                memory_stub_region(
+                    function_address(nixe_direct_stub_write_16),
+                    std::ptr::addr_of!(nixe_direct_stub_write_16_end).addr(),
+                    std::ptr::addr_of!(nixe_direct_stub_write_16_fault).addr(),
+                    std::ptr::addr_of!(nixe_direct_stub_write_16_after).addr(),
+                    DataAccessKind::Write,
+                    16,
                 ),
             ])
             .map(Arc::new)
@@ -1214,7 +1230,7 @@ fn scalar_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
         .map_err(Clone::clone)
 }
 
-fn scalar_stub_region(
+fn memory_stub_region(
     native_start: usize,
     native_end: usize,
     site_start: usize,
@@ -1247,10 +1263,12 @@ unsafe extern "C" {
     fn nixe_direct_stub_read_2(call: *mut libc::c_void);
     fn nixe_direct_stub_read_4(call: *mut libc::c_void);
     fn nixe_direct_stub_read_8(call: *mut libc::c_void);
+    fn nixe_direct_stub_read_16(call: *mut libc::c_void);
     fn nixe_direct_stub_write_1(call: *mut libc::c_void);
     fn nixe_direct_stub_write_2(call: *mut libc::c_void);
     fn nixe_direct_stub_write_4(call: *mut libc::c_void);
     fn nixe_direct_stub_write_8(call: *mut libc::c_void);
+    fn nixe_direct_stub_write_16(call: *mut libc::c_void);
     static nixe_direct_stub_read_1_fault: u8;
     static nixe_direct_stub_read_1_after: u8;
     static nixe_direct_stub_read_1_end: u8;
@@ -1263,6 +1281,9 @@ unsafe extern "C" {
     static nixe_direct_stub_read_8_fault: u8;
     static nixe_direct_stub_read_8_after: u8;
     static nixe_direct_stub_read_8_end: u8;
+    static nixe_direct_stub_read_16_fault: u8;
+    static nixe_direct_stub_read_16_after: u8;
+    static nixe_direct_stub_read_16_end: u8;
     static nixe_direct_stub_write_1_fault: u8;
     static nixe_direct_stub_write_1_after: u8;
     static nixe_direct_stub_write_1_end: u8;
@@ -1275,6 +1296,9 @@ unsafe extern "C" {
     static nixe_direct_stub_write_8_fault: u8;
     static nixe_direct_stub_write_8_after: u8;
     static nixe_direct_stub_write_8_end: u8;
+    static nixe_direct_stub_write_16_fault: u8;
+    static nixe_direct_stub_write_16_after: u8;
+    static nixe_direct_stub_write_16_end: u8;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1305,7 +1329,7 @@ unsafe extern "C" {
         entry: usize,
         gateway: NativeGateway,
     ) -> u32;
-    fn nixe_direct_scalar_invoke(
+    fn nixe_direct_stub_invoke(
         slot: *mut libc::c_void,
         context: *mut libc::c_void,
         entry: usize,
@@ -1718,9 +1742,9 @@ nixe_direct_memory_invoke:
     ret
     .size nixe_direct_memory_invoke,.-nixe_direct_memory_invoke
 
-    .globl nixe_direct_scalar_invoke
-    .type nixe_direct_scalar_invoke,@function
-nixe_direct_scalar_invoke:
+    .globl nixe_direct_stub_invoke
+    .type nixe_direct_stub_invoke,@function
+nixe_direct_stub_invoke:
     push rbp
     mov rbp,rsp
     push rbx
@@ -1732,15 +1756,15 @@ nixe_direct_scalar_invoke:
     mov r12,rsi
     mov r13,rdx
     mov rsi,rsp
-    lea rdx,[rip+.Ldirect_scalar_escape]
+    lea rdx,[rip+.Ldirect_stub_escape]
     call nixe_direct_prepare_escape
     mov rdi,r12
     call r13
     xor eax,eax
-    jmp .Ldirect_scalar_return
-.Ldirect_scalar_escape:
+    jmp .Ldirect_stub_return
+.Ldirect_stub_escape:
     mov eax,1
-.Ldirect_scalar_return:
+.Ldirect_stub_return:
     add rsp,8
     pop r15
     pop r14
@@ -1749,7 +1773,7 @@ nixe_direct_scalar_invoke:
     pop rbx
     pop rbp
     ret
-    .size nixe_direct_scalar_invoke,.-nixe_direct_scalar_invoke
+    .size nixe_direct_stub_invoke,.-nixe_direct_stub_invoke
 
     .globl nixe_direct_fault_landing_pad
     .type nixe_direct_fault_landing_pad,@function
@@ -1835,7 +1859,9 @@ nixe_direct_stub_read_\name:
     mov rax,[rdi]
     .globl nixe_direct_stub_read_\name\()_fault
 nixe_direct_stub_read_\name\()_fault:
-    .if \name == 1
+    .if \name == 16
+    movdqu xmm0,xmmword ptr [rax]
+    .elseif \name == 1
     movzx eax,byte ptr [rax]
     .elseif \name == 2
     movzx eax,word ptr [rax]
@@ -1846,7 +1872,11 @@ nixe_direct_stub_read_\name\()_fault:
     .endif
     .globl nixe_direct_stub_read_\name\()_after
 nixe_direct_stub_read_\name\()_after:
-    mov [rdi+16],rax
+    .if \name == 16
+    movdqu xmmword ptr [rdi+{output}],xmm0
+    .else
+    mov [rdi+{output}],rax
+    .endif
     ret
     .globl nixe_direct_stub_read_\name\()_end
 nixe_direct_stub_read_\name\()_end:
@@ -1857,16 +1887,23 @@ nixe_direct_stub_read_\name\()_end:
     DIRECT_READ 2
     DIRECT_READ 4
     DIRECT_READ 8
+    DIRECT_READ 16
 
     .macro DIRECT_WRITE name
     .globl nixe_direct_stub_write_\name
     .type nixe_direct_stub_write_\name,@function
 nixe_direct_stub_write_\name:
     mov rax,[rdi]
-    mov rdx,[rdi+8]
+    .if \name == 16
+    movdqu xmm0,xmmword ptr [rdi+{value}]
+    .else
+    mov rdx,[rdi+{value}]
+    .endif
     .globl nixe_direct_stub_write_\name\()_fault
 nixe_direct_stub_write_\name\()_fault:
-    .if \name == 1
+    .if \name == 16
+    movdqu xmmword ptr [rax],xmm0
+    .elseif \name == 1
     mov byte ptr [rax],dl
     .elseif \name == 2
     mov word ptr [rax],dx
@@ -1887,7 +1924,10 @@ nixe_direct_stub_write_\name\()_end:
     DIRECT_WRITE 2
     DIRECT_WRITE 4
     DIRECT_WRITE 8
-"#
+    DIRECT_WRITE 16
+"#,
+    value = const offset_of!(StubCall, value),
+    output = const offset_of!(StubCall, output),
 );
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -2799,10 +2839,10 @@ mod tests {
     }
 
     #[test]
-    fn dropping_an_active_scalar_frontend_clears_its_worker_snapshot() {
+    fn dropping_an_active_direct_frontend_clears_its_worker_snapshot() {
         let (arena, _) = fixture();
         let mut frontend =
-            unsafe { DirectScalarFrontend::new(arena.view(), AddressSpaceId::new(7)) }.unwrap();
+            unsafe { DirectMemoryFrontend::new(arena.view(), AddressSpaceId::new(7)) }.unwrap();
         frontend.begin_slice().unwrap();
         let tid = frontend.worker.as_ref().unwrap().registered_tid();
 
@@ -2850,7 +2890,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_frontend_retries_the_faulting_stub_after_gpu_writeback() {
+    fn direct_frontend_retries_the_faulting_stub_after_gpu_writeback() {
         let mut memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(1);
         let address = GuestVirtualAddress::new(0x1000);
@@ -2891,7 +2931,7 @@ mod tests {
         ));
 
         let mut frontend = unsafe {
-            DirectScalarFrontend::new(memory.direct_address_space_view(space).unwrap(), space)
+            DirectMemoryFrontend::new(memory.direct_address_space_view(space).unwrap(), space)
         }
         .unwrap();
         let value = frontend
@@ -2906,6 +2946,94 @@ mod tests {
         assert_eq!(
             range.segments()[0].visibility_state(),
             VisibilityState::Clean
+        );
+    }
+
+    #[test]
+    fn direct_frontend_round_trips_one_native_quadword() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(1);
+        let address = GuestVirtualAddress::new(0x1010);
+        let page = GuestPhysicalPageId::new(1);
+        assert!(memory.add_ram_page(page));
+        assert!(memory.map_page(
+            space,
+            GuestVirtualAddress::new(0x1000),
+            page,
+            MemoryPermissions::READ_WRITE,
+        ));
+        memory
+            .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
+            .unwrap();
+        let mut frontend = unsafe {
+            DirectMemoryFrontend::new(memory.direct_address_space_view(space).unwrap(), space)
+        }
+        .unwrap();
+        let value = MemoryValue::U128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+
+        frontend
+            .write(
+                &memory,
+                address,
+                MemoryAccess::normal(MemoryAccessSize::Quadword),
+                value,
+            )
+            .unwrap();
+        assert_eq!(
+            frontend
+                .read(
+                    &memory,
+                    address,
+                    MemoryAccess::normal(MemoryAccessSize::Quadword),
+                )
+                .unwrap(),
+            value,
+        );
+    }
+
+    #[test]
+    fn direct_frontend_confines_each_native_stub_to_one_page() {
+        let (arena, _) = fixture();
+        let frontend =
+            unsafe { DirectMemoryFrontend::new(arena.view(), AddressSpaceId::new(1)) }.unwrap();
+        let page_end = DIRECT_PAGE_SIZE as u64;
+
+        assert!(
+            frontend
+                .direct_pointer(
+                    GuestVirtualAddress::new(page_end - 1),
+                    MemoryAccessSize::Byte,
+                )
+                .is_some()
+        );
+        assert!(
+            frontend
+                .direct_pointer(
+                    GuestVirtualAddress::new(page_end - 1),
+                    MemoryAccessSize::Halfword,
+                )
+                .is_none()
+        );
+        assert!(
+            frontend
+                .direct_pointer(
+                    GuestVirtualAddress::new(page_end - 16),
+                    MemoryAccessSize::Quadword,
+                )
+                .is_some()
+        );
+        assert!(
+            frontend
+                .direct_pointer(
+                    GuestVirtualAddress::new(page_end - 15),
+                    MemoryAccessSize::Quadword,
+                )
+                .is_none()
+        );
+        assert!(
+            frontend
+                .direct_pointer(GuestVirtualAddress::new(0x4000), MemoryAccessSize::Byte)
+                .is_none()
         );
     }
 
@@ -3101,7 +3229,7 @@ mod tests {
                 let memory = Arc::clone(&memory);
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
-                    let mut direct = unsafe { DirectScalarFrontend::new(view, space) }.unwrap();
+                    let mut direct = unsafe { DirectMemoryFrontend::new(view, space) }.unwrap();
                     barrier.wait();
                     direct
                         .write(
@@ -3170,9 +3298,9 @@ nixe_direct_memory_invoke:
     ret
     .size nixe_direct_memory_invoke,.-nixe_direct_memory_invoke
 
-    .globl nixe_direct_scalar_invoke
-    .type nixe_direct_scalar_invoke,%function
-nixe_direct_scalar_invoke:
+    .globl nixe_direct_stub_invoke
+    .type nixe_direct_stub_invoke,%function
+nixe_direct_stub_invoke:
     stp x29,x30,[sp,#-16]!
     mov x29,sp
     stp x19,x20,[sp,#-16]!
@@ -3183,15 +3311,15 @@ nixe_direct_scalar_invoke:
     mov x19,x1
     mov x20,x2
     mov x1,sp
-    adr x2,.Ldirect_scalar_escape
+    adr x2,.Ldirect_stub_escape
     bl nixe_direct_prepare_escape
     mov x0,x19
     blr x20
     mov w0,#0
-    b .Ldirect_scalar_return
-.Ldirect_scalar_escape:
+    b .Ldirect_stub_return
+.Ldirect_stub_escape:
     mov w0,#1
-.Ldirect_scalar_return:
+.Ldirect_stub_return:
     ldp x27,x28,[sp],#16
     ldp x25,x26,[sp],#16
     ldp x23,x24,[sp],#16
@@ -3199,7 +3327,7 @@ nixe_direct_scalar_invoke:
     ldp x19,x20,[sp],#16
     ldp x29,x30,[sp],#16
     ret
-    .size nixe_direct_scalar_invoke,.-nixe_direct_scalar_invoke
+    .size nixe_direct_stub_invoke,.-nixe_direct_stub_invoke
 
     .globl nixe_direct_fault_landing_pad
     .type nixe_direct_fault_landing_pad,%function
@@ -3242,7 +3370,11 @@ nixe_direct_stub_read_\name\()_fault:
     \instruction \result,[x9]
     .globl nixe_direct_stub_read_\name\()_after
 nixe_direct_stub_read_\name\()_after:
-    str x10,[x0,#16]
+    .if \name == 16
+    str q10,[x0,#{output}]
+    .else
+    str x10,[x0,#{output}]
+    .endif
     ret
     .globl nixe_direct_stub_read_\name\()_end
 nixe_direct_stub_read_\name\()_end:
@@ -3253,13 +3385,18 @@ nixe_direct_stub_read_\name\()_end:
     DIRECT_READ 2, ldrh, w10
     DIRECT_READ 4, ldr, w10
     DIRECT_READ 8, ldr, x10
+    DIRECT_READ 16, ldr, q10
 
     .macro DIRECT_WRITE name, instruction, source
     .globl nixe_direct_stub_write_\name
     .type nixe_direct_stub_write_\name,%function
 nixe_direct_stub_write_\name:
     ldr x9,[x0]
-    ldr x10,[x0,#8]
+    .if \name == 16
+    ldr q10,[x0,#{value}]
+    .else
+    ldr x10,[x0,#{value}]
+    .endif
     .globl nixe_direct_stub_write_\name\()_fault
 nixe_direct_stub_write_\name\()_fault:
     \instruction \source,[x9]
@@ -3275,5 +3412,8 @@ nixe_direct_stub_write_\name\()_end:
     DIRECT_WRITE 2, strh, w10
     DIRECT_WRITE 4, str, w10
     DIRECT_WRITE 8, str, x10
-"#
+    DIRECT_WRITE 16, str, q10
+"#,
+    value = const offset_of!(StubCall, value),
+    output = const offset_of!(StubCall, output),
 );

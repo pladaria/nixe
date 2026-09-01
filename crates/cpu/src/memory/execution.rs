@@ -3824,6 +3824,47 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_expected_value_model_accepts_change_and_restore_aba() {
+        let memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(12);
+        let address = GuestVirtualAddress::new(0xa000);
+        memory
+            .resize_zeroed_mapping(
+                space,
+                address,
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        let ordinary = MemoryAccess::normal(crate::memory::MemoryAccessSize::Word);
+        let exclusive = MemoryAccess::new(
+            crate::memory::MemoryAccessSize::Word,
+            MemoryAlignment::Natural,
+            crate::memory::MemoryOrdering::AcquireRelease,
+            MemoryAccessClass::Exclusive,
+        );
+        let original = MemoryValue::U32(0x1234_5678);
+        memory.write(space, address, ordinary, original).unwrap();
+        let (_, reservation) = memory.load_exclusive(space, address, exclusive).unwrap();
+        memory
+            .write(space, address, ordinary, MemoryValue::U32(0xdead_beef))
+            .unwrap();
+        memory.write(space, address, ordinary, original).unwrap();
+
+        let replacement = MemoryValue::U32(0xa5c3_9678);
+        let (_, stored) = memory
+            .store_exclusive(space, address, exclusive, replacement, reservation)
+            .unwrap();
+        assert!(stored);
+        assert_eq!(
+            memory.read(space, address, ordinary).unwrap().value,
+            replacement
+        );
+    }
+
+    #[test]
     fn sparse_page_table_allocates_only_populated_leaves() {
         let mut memory = ExecutionMemory::new();
         let low = GuestPhysicalPageId::new(1);

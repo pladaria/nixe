@@ -640,7 +640,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ST1--single-structure---Store-one-single-element-structure-from-one-lane-of-one-register-
     pattern(
         "simd-load-store-single-structure",
-        0xbfbf_0000,
+        0xbf9f_0000,
         0x0d00_0000,
         0x0000_0062,
         158,
@@ -649,7 +649,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     .fixture32(0x0d40_183d),
     pattern(
         "simd-load-store-single-structure-post-index",
-        0xbfa0_0000,
+        0xbf80_0000,
         0x0d80_0000,
         0x0000_0063,
         157,
@@ -707,6 +707,17 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         161,
         &[],
     ),
+    // FMUL (vector, by element) multiplies every active lane by one selected
+    // S/D element. This allocation is present in the application corpus.
+    pattern(
+        "simd-floating-point-multiply-by-element",
+        0xbf00_f400,
+        0x0f00_9000,
+        0x0000_00a1,
+        211,
+        &[],
+    )
+    .fixture32(0x4f96_93fb),
     // Arm A64 FMOV (scalar, immediate), including the optional half-precision
     // form, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--scalar--immediate---Floating-point-Move-immediate--scalar--
@@ -1131,6 +1142,7 @@ pub struct Operands {
     pub immediate_8: u8,
     pub cmode: u8,
     pub structure_opcode: u8,
+    pub structure_r: bool,
     pub bitwise_operation: Option<BitwiseOperation>,
     pub integer_comparison: Option<IntegerComparison>,
     pub pairwise_operation: Option<PairwiseOperation>,
@@ -1143,6 +1155,7 @@ pub struct Operands {
     pub condition: u8,
     pub element_size: u8,
     pub fp_immediate_8: u8,
+    pub fp_element_lane: u8,
     pub float_conversion: Option<FloatConversion>,
     pub float_to_integer_rounding: Option<FloatToIntegerRounding>,
     pub fixed_point_fraction_bits: Option<u8>,
@@ -1182,6 +1195,7 @@ impl Operands {
             immediate_8: 0,
             cmode: 0,
             structure_opcode: 0,
+            structure_r: false,
             bitwise_operation: None,
             integer_comparison: None,
             pairwise_operation: None,
@@ -1194,6 +1208,7 @@ impl Operands {
             condition: 0,
             element_size: 0,
             fp_immediate_8: 0,
+            fp_element_lane: 0,
             float_conversion: None,
             float_to_integer_rounding: None,
             fixed_point_fraction_bits: None,
@@ -1362,6 +1377,7 @@ instructions!(
     ScalarVectorSignedIntToFloat,
     ScalarVectorUnsignedIntToFloat,
     VectorFloatDivide,
+    VectorFloatMultiplyElement,
     VectorFloatImmediate,
     ScalarFloatImmediate,
     ScalarFloatConvert,
@@ -1381,7 +1397,11 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         rm: ((bits >> 16) & 0x1f) as u8,
         ra: ((bits >> 10) & 0x1f) as u8,
         size: (bits >> 30) as u8,
-        opc: ((bits >> 22) & 3) as u8,
+        opc: if instruction_id == 0x0000_00a1 {
+            ((bits >> 22) & 1) as u8
+        } else {
+            ((bits >> 22) & 3) as u8
+        },
         option: ((bits >> 13) & 7) as u8,
         immediate_9: ((bits >> 12) & 0x1ff) as u16,
         immediate_12: ((bits >> 10) & 0xfff) as u16,
@@ -1399,6 +1419,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
         cmode: ((bits >> 12) & 0xf) as u8,
         structure_opcode: ((bits >> 12) & 0xf) as u8,
+        structure_r: bits & (1 << 21) != 0,
         bitwise_operation: (instruction_id == 0x0000_0030).then(|| {
             bitwise_operation(bits)
                 .expect("the SIMD bitwise pattern only contains allocated operations")
@@ -1417,6 +1438,15 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         condition: ((bits >> 12) & 0xf) as u8,
         element_size: ((bits >> 10) & 3) as u8,
         fp_immediate_8: ((bits >> 13) & 0xff) as u8,
+        fp_element_lane: if instruction_id == 0x0000_00a1 {
+            if bits & (1 << 22) == 0 {
+                (((bits >> 21) & 1) | (((bits >> 11) & 1) << 1)) as u8
+            } else {
+                ((bits >> 11) & 1) as u8
+            }
+        } else {
+            0
+        },
         float_conversion: match instruction_id {
             0x0000_006f => Some(FloatConversion::SingleToDouble),
             0x0000_0070 => Some(FloatConversion::DoubleToSingle),
@@ -1522,6 +1552,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_008a => Instruction::ScalarVectorSignedIntToFloat(operands),
         0x0000_008b => Instruction::ScalarVectorUnsignedIntToFloat(operands),
         0x0000_006c => Instruction::VectorFloatDivide(operands),
+        0x0000_00a1 => Instruction::VectorFloatMultiplyElement(operands),
         0x0000_0086 => Instruction::VectorFloatImmediate(operands),
         0x0000_006d..=0x0000_006e => Instruction::ScalarFloatImmediate(operands),
         0x0000_006f..=0x0000_0070 => Instruction::ScalarFloatConvert(operands),

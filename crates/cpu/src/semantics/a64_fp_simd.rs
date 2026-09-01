@@ -250,6 +250,15 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             state.set_fpsr(state.fpsr() | fp_status_bits(status));
             Ok(())
         }
+        Instruction::VectorFloatMultiplyElement(_) => {
+            let (value, status) = vector_float_multiply_element(state, fields);
+            if fp_status_traps(status, state.fpcr()) {
+                return Err(A64FpSimdError::Trap);
+            }
+            assert!(state.set_vector(fields.rd, value));
+            state.set_fpsr(state.fpsr() | fp_status_bits(status));
+            Ok(())
+        }
         Instruction::VectorFloatImmediate(_) => {
             vector_float_immediate(state, fields);
             Ok(())
@@ -408,34 +417,42 @@ fn write(state: &mut A64State, index: u8, width: u8, register31_is_sp: bool, val
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum Binary32Operation {
-    Add,
-    Subtract,
-    Multiply,
+/// Explicit result returned by the exact FP value primitives shared by the
+/// interpreter and the JIT's typed cold ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactFpOutcome {
+    pub bits: u128,
+    pub status: FpStatus,
 }
 
-pub fn binary32(operation: Binary32Operation, lhs: u32, rhs: u32, control: u32) -> (u32, FpStatus) {
-    let outcome = match operation {
-        Binary32Operation::Add => add_ieee_lane(
-            u64::from(lhs),
-            u64::from(rhs),
-            FpFormat::Binary32,
-            control,
-            false,
-        ),
-        Binary32Operation::Subtract => add_ieee_lane(
-            u64::from(lhs),
-            u64::from(rhs),
-            FpFormat::Binary32,
-            control,
-            true,
-        ),
-        Binary32Operation::Multiply => {
-            multiply_ieee_lane(u64::from(lhs), u64::from(rhs), FpFormat::Binary32, control)
-        }
-    };
-    (outcome.bits as u32, outcome.status)
+/// Explicit result returned by an exact floating-point to integer conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactIntegerOutcome {
+    pub value: u64,
+    pub width: u8,
+    pub status: FpStatus,
+}
+
+/// Explicit result returned by an exact floating-point comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactCompareOutcome {
+    pub nzcv: u32,
+    pub status: FpStatus,
+}
+
+fn exact_value(outcome: FpLaneOutcome) -> ExactFpOutcome {
+    ExactFpOutcome {
+        bits: u128::from(outcome.bits),
+        status: outcome.status,
+    }
+}
+
+fn fp_format(bits: u8) -> FpFormat {
+    match bits {
+        32 => FpFormat::Binary32,
+        64 => FpFormat::Binary64,
+        _ => unreachable!("normalized exact FP precision is S or D"),
+    }
 }
 
 fn scalar_move(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
@@ -804,15 +821,33 @@ fn vector_integer_to_float(
 ) -> (u128, bool) {
     let lane_bits = if fields.opc == 0 { 32_u32 } else { 64_u32 };
     let vector_bits = if fields.vector_128 { 128_u32 } else { 64_u32 };
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized SIMD conversion source register");
+    exact_vector_integer_to_float(
+        source,
+        lane_bits as u8,
+        vector_bits as u8,
+        signed,
+        state.fpcr(),
+    )
+}
+
+pub fn exact_vector_integer_to_float(
+    source: u128,
+    lane_bits: u8,
+    vector_bits: u8,
+    signed: bool,
+    fpcr: u32,
+) -> (u128, bool) {
+    let lane_bits = u32::from(lane_bits);
+    let vector_bits = u32::from(vector_bits);
     let lane_mask = if lane_bits == 64 {
         u128::from(u64::MAX)
     } else {
         u128::from(u32::MAX)
     };
-    let rounding = fpcr_rounding_mode(state.fpcr());
-    let source = state
-        .vector(fields.rn)
-        .expect("normalized SIMD conversion source register");
+    let rounding = fpcr_rounding_mode(fpcr);
     let mut result = 0_u128;
     let mut any_inexact = false;
     for shift in (0..vector_bits).step_by(lane_bits as usize) {
@@ -847,13 +882,18 @@ fn scalar_vector_integer_to_float(
         .vector(fields.rn)
         .expect("normalized scalar SIMD conversion source register")
         & mask) as u64;
+    exact_scalar_vector_integer_to_float(source, lane_bits as u8, signed, state.fpcr())
+}
+
+pub fn exact_scalar_vector_integer_to_float(
+    source: u64,
+    lane_bits: u8,
+    signed: bool,
+    fpcr: u32,
+) -> (u64, bool) {
+    let lane_bits = u32::from(lane_bits);
     let (negative, magnitude) = integer_sign_and_magnitude(source, lane_bits, signed);
-    integer_magnitude_to_ieee(
-        magnitude,
-        negative,
-        lane_bits,
-        fpcr_rounding_mode(state.fpcr()),
-    )
+    integer_magnitude_to_ieee(magnitude, negative, lane_bits, fpcr_rounding_mode(fpcr))
 }
 
 // SCVTF and UCVTF scalar integer forms use FPCR.RMode, set FPSR.IXC for a
@@ -874,12 +914,30 @@ fn scalar_integer_to_float(
         _ => unreachable!("decoder only accepts scalar S/D conversion destinations"),
     };
     let source = read(state, fields.rn, source_bits as u8, false);
+    exact_scalar_integer_to_float(
+        source,
+        source_bits as u8,
+        destination_bits as u8,
+        signed,
+        state.fpcr(),
+    )
+}
+
+pub fn exact_scalar_integer_to_float(
+    source: u64,
+    source_bits: u8,
+    destination_bits: u8,
+    signed: bool,
+    fpcr: u32,
+) -> (u64, bool) {
+    let source_bits = u32::from(source_bits);
+    let destination_bits = u32::from(destination_bits);
     let (negative, magnitude) = integer_sign_and_magnitude(source, source_bits, signed);
     integer_magnitude_to_ieee(
         magnitude,
         negative,
         destination_bits,
-        fpcr_rounding_mode(state.fpcr()),
+        fpcr_rounding_mode(fpcr),
     )
 }
 
@@ -918,15 +976,45 @@ fn scalar_float_to_integer(
         .vector(fields.rn)
         .expect("normalized scalar floating-point conversion source") as u64
         & source_mask;
-    float_bits_to_integer(
+    let outcome = exact_float_to_integer(
         source,
-        format,
+        format.total_bits as u8,
         width,
         signed,
         rounding,
         fields.fixed_point_fraction_bits.unwrap_or(0),
         state.fpcr(),
-    )
+    );
+    IntegerConversionOutcome {
+        value: outcome.value,
+        width: outcome.width,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_float_to_integer(
+    source: u64,
+    source_bits: u8,
+    width: u8,
+    signed: bool,
+    rounding: FloatToIntegerRounding,
+    fractional_bits: u8,
+    fpcr: u32,
+) -> ExactIntegerOutcome {
+    let outcome = float_bits_to_integer(
+        source,
+        BinaryFormat::new(fp_format(source_bits)),
+        width,
+        signed,
+        rounding,
+        fractional_bits,
+        fpcr,
+    );
+    ExactIntegerOutcome {
+        value: outcome.value,
+        width: outcome.width,
+        status: outcome.status,
+    }
 }
 
 fn float_bits_to_integer(
@@ -1141,9 +1229,9 @@ fn scalar_float_convert(
     fields: crate::decode::a64::fp_simd::Operands,
     conversion: FloatConversion,
 ) -> FpLaneOutcome {
-    let (source_format, destination_format) = match conversion {
-        FloatConversion::SingleToDouble => (FpFormat::Binary32, FpFormat::Binary64),
-        FloatConversion::DoubleToSingle => (FpFormat::Binary64, FpFormat::Binary32),
+    let source_format = match conversion {
+        FloatConversion::SingleToDouble => FpFormat::Binary32,
+        FloatConversion::DoubleToSingle => FpFormat::Binary64,
     };
     let source_mask = match source_format {
         FpFormat::Binary32 => u64::from(u32::MAX),
@@ -1154,12 +1242,24 @@ fn scalar_float_convert(
         .vector(fields.rn)
         .expect("normalized scalar floating-point conversion source") as u64
         & source_mask;
-    convert_ieee_format(
+    let outcome = exact_float_convert(source, conversion, state.fpcr());
+    FpLaneOutcome {
+        bits: outcome.bits as u64,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_float_convert(source: u64, conversion: FloatConversion, fpcr: u32) -> ExactFpOutcome {
+    let (source_format, destination_format) = match conversion {
+        FloatConversion::SingleToDouble => (FpFormat::Binary32, FpFormat::Binary64),
+        FloatConversion::DoubleToSingle => (FpFormat::Binary64, FpFormat::Binary32),
+    };
+    exact_value(convert_ieee_format(
         source,
         source_format,
         destination_format,
-        FpConvertControl::from_fpcr(state.fpcr()),
-    )
+        FpConvertControl::from_fpcr(fpcr),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1378,20 +1478,34 @@ fn vector_float_divide(
     } else {
         FpFormat::Binary64
     };
-    let lane_bits = u32::from(format.bits());
     let vector_bits = if fields.vector_128 { 128_u32 } else { 64_u32 };
-    let lane_mask = if lane_bits == 64 {
-        u128::from(u64::MAX)
-    } else {
-        u128::from(u32::MAX)
-    };
     let lhs = state
         .vector(fields.rn)
         .expect("normalized SIMD first division operand");
     let rhs = state
         .vector(fields.rm)
         .expect("normalized SIMD second division operand");
-    let control = FpDivideControl::from_fpcr(state.fpcr());
+    let outcome =
+        exact_vector_float_divide(lhs, rhs, format.bits(), vector_bits as u8, state.fpcr());
+    (outcome.bits, outcome.status)
+}
+
+pub fn exact_vector_float_divide(
+    lhs: u128,
+    rhs: u128,
+    lane_bits: u8,
+    vector_bits: u8,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let format = fp_format(lane_bits);
+    let lane_bits = u32::from(lane_bits);
+    let vector_bits = u32::from(vector_bits);
+    let lane_mask = if lane_bits == 64 {
+        u128::from(u64::MAX)
+    } else {
+        u128::from(u32::MAX)
+    };
+    let control = FpDivideControl::from_fpcr(fpcr);
     let mut result = 0_u128;
     let mut status = FpStatus::default();
     for shift in (0..vector_bits).step_by(lane_bits as usize) {
@@ -1401,7 +1515,68 @@ fn vector_float_divide(
         result |= u128::from(outcome.bits) << shift;
         merge_fp_status(&mut status, outcome.status);
     }
-    (result, status)
+    ExactFpOutcome {
+        bits: result,
+        status,
+    }
+}
+
+fn vector_float_multiply_element(
+    state: &A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+) -> (u128, FpStatus) {
+    let format = if fields.opc == 0 {
+        FpFormat::Binary32
+    } else {
+        FpFormat::Binary64
+    };
+    let vector_bits = if fields.vector_128 { 128_u32 } else { 64_u32 };
+    let lhs = state
+        .vector(fields.rn)
+        .expect("normalized SIMD by-element multiplicand");
+    let rhs = state
+        .vector(fields.rm)
+        .expect("normalized SIMD by-element multiplier");
+    let outcome = exact_vector_float_multiply_element(
+        lhs,
+        rhs,
+        format.bits(),
+        vector_bits as u8,
+        fields.fp_element_lane,
+        state.fpcr(),
+    );
+    (outcome.bits, outcome.status)
+}
+
+pub fn exact_vector_float_multiply_element(
+    lhs: u128,
+    rhs: u128,
+    lane_bits: u8,
+    vector_bits: u8,
+    lane: u8,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let format = fp_format(lane_bits);
+    let lane_bits = u32::from(lane_bits);
+    let vector_bits = u32::from(vector_bits);
+    let lane_mask = if lane_bits == 64 {
+        u128::from(u64::MAX)
+    } else {
+        u128::from(u32::MAX)
+    };
+    let rhs = ((rhs >> (u32::from(lane) * lane_bits)) & lane_mask) as u64;
+    let mut result = 0_u128;
+    let mut status = FpStatus::default();
+    for shift in (0..vector_bits).step_by(lane_bits as usize) {
+        let lhs = ((lhs >> shift) & lane_mask) as u64;
+        let outcome = multiply_ieee_lane(lhs, rhs, format, fpcr);
+        result |= u128::from(outcome.bits) << shift;
+        merge_fp_status(&mut status, outcome.status);
+    }
+    ExactFpOutcome {
+        bits: result,
+        status,
+    }
 }
 
 // Scalar FDIV shares the exact integer-only IEEE lane implementation with
@@ -1430,7 +1605,20 @@ fn scalar_float_divide(
         .vector(fields.rm)
         .expect("normalized scalar second division operand") as u64
         & mask;
-    divide_ieee_lane(lhs, rhs, format, FpDivideControl::from_fpcr(state.fpcr()))
+    let outcome = exact_scalar_float_divide(lhs, rhs, format.bits(), state.fpcr());
+    FpLaneOutcome {
+        bits: outcome.bits as u64,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_scalar_float_divide(lhs: u64, rhs: u64, precision: u8, fpcr: u32) -> ExactFpOutcome {
+    exact_value(divide_ieee_lane(
+        lhs,
+        rhs,
+        fp_format(precision),
+        FpDivideControl::from_fpcr(fpcr),
+    ))
 }
 
 // FMUL and FNMUL share one exact integer-significand product. FNMUL negates
@@ -1462,11 +1650,27 @@ fn scalar_float_multiply(
         .vector(fields.rm)
         .expect("normalized scalar multiplication second operand") as u64
         & mask;
-    let mut outcome = multiply_ieee_lane(lhs, rhs, fp_format, state.fpcr());
+    let outcome = exact_scalar_float_multiply(lhs, rhs, fp_format.bits(), operation, state.fpcr());
+    FpLaneOutcome {
+        bits: outcome.bits as u64,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_scalar_float_multiply(
+    lhs: u64,
+    rhs: u64,
+    precision: u8,
+    operation: FloatMultiplyOperation,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let fp_format = fp_format(precision);
+    let format = BinaryFormat::new(fp_format);
+    let mut outcome = multiply_ieee_lane(lhs, rhs, fp_format, fpcr);
     if matches!(operation, FloatMultiplyOperation::NegatedMultiply) {
         outcome.bits ^= format.sign_mask();
     }
-    outcome
+    exact_value(outcome)
 }
 
 // FMADD/FMSUB/FNMADD/FNMSUB form the full product before adding the third
@@ -1493,27 +1697,44 @@ fn scalar_float_fused_multiply_add(
     } else {
         u64::MAX
     };
-    let mut multiplicand = DecodedFloat::new(
-        state
-            .vector(fields.rn)
-            .expect("normalized scalar FMA multiplicand") as u64
-            & mask,
-        format,
+    let multiplicand = state
+        .vector(fields.rn)
+        .expect("normalized scalar FMA multiplicand") as u64
+        & mask;
+    let multiplier = state
+        .vector(fields.rm)
+        .expect("normalized scalar FMA multiplier") as u64
+        & mask;
+    let addend = state
+        .vector(fields.ra)
+        .expect("normalized scalar FMA addend") as u64
+        & mask;
+    let outcome = exact_scalar_float_fused_multiply_add(
+        multiplicand,
+        multiplier,
+        addend,
+        fp_format.bits(),
+        operation,
+        state.fpcr(),
     );
-    let mut multiplier = DecodedFloat::new(
-        state
-            .vector(fields.rm)
-            .expect("normalized scalar FMA multiplier") as u64
-            & mask,
-        format,
-    );
-    let mut addend = DecodedFloat::new(
-        state
-            .vector(fields.ra)
-            .expect("normalized scalar FMA addend") as u64
-            & mask,
-        format,
-    );
+    FpLaneOutcome {
+        bits: outcome.bits as u64,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_scalar_float_fused_multiply_add(
+    multiplicand: u64,
+    multiplier: u64,
+    addend: u64,
+    precision: u8,
+    operation: FloatFusedMultiplyOperation,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let format = BinaryFormat::new(fp_format(precision));
+    let mut multiplicand = DecodedFloat::new(multiplicand, format);
+    let mut multiplier = DecodedFloat::new(multiplier, format);
+    let mut addend = DecodedFloat::new(addend, format);
     let negate_product = matches!(
         operation,
         FloatFusedMultiplyOperation::MultiplySubtract
@@ -1529,7 +1750,7 @@ fn scalar_float_fused_multiply_add(
         addend.sign = !addend.sign;
     }
 
-    let control = FpAddControl::from_fpcr(state.fpcr());
+    let control = FpAddControl::from_fpcr(fpcr);
     let mut status = FpStatus::default();
     let mut invalid_product = (multiplicand.is_infinite(format) && multiplier.is_zero())
         || (multiplier.is_infinite(format) && multiplicand.is_zero());
@@ -1545,7 +1766,10 @@ fn scalar_float_fused_multiply_add(
             format,
             control.default_nan,
         );
-        return FpLaneOutcome { bits, status };
+        return ExactFpOutcome {
+            bits: u128::from(bits),
+            status,
+        };
     }
 
     for operand in [&mut multiplicand, &mut multiplier, &mut addend] {
@@ -1559,8 +1783,8 @@ fn scalar_float_fused_multiply_add(
 
     if invalid_product {
         status.invalid_operation = true;
-        return FpLaneOutcome {
-            bits: format.default_nan(),
+        return ExactFpOutcome {
+            bits: u128::from(format.default_nan()),
             status,
         };
     }
@@ -1570,19 +1794,23 @@ fn scalar_float_fused_multiply_add(
     if product_is_infinite {
         if addend.is_infinite(format) && addend.sign != product_sign {
             status.invalid_operation = true;
-            return FpLaneOutcome {
-                bits: format.default_nan(),
+            return ExactFpOutcome {
+                bits: u128::from(format.default_nan()),
                 status,
             };
         }
-        return FpLaneOutcome {
-            bits: (u64::from(product_sign) << (format.total_bits - 1)) | format.exponent_mask(),
+        return ExactFpOutcome {
+            bits: u128::from(
+                (u64::from(product_sign) << (format.total_bits - 1)) | format.exponent_mask(),
+            ),
             status,
         };
     }
     if addend.is_infinite(format) {
-        return FpLaneOutcome {
-            bits: (u64::from(addend.sign) << (format.total_bits - 1)) | format.exponent_mask(),
+        return ExactFpOutcome {
+            bits: u128::from(
+                (u64::from(addend.sign) << (format.total_bits - 1)) | format.exponent_mask(),
+            ),
             status,
         };
     }
@@ -1596,8 +1824,8 @@ fn scalar_float_fused_multiply_add(
         } else {
             control.rounding == FpRoundingMode::TowardNegative
         };
-        return FpLaneOutcome {
-            bits: u64::from(sign) << (format.total_bits - 1),
+        return ExactFpOutcome {
+            bits: u128::from(u64::from(sign) << (format.total_bits - 1)),
             status,
         };
     }
@@ -1617,12 +1845,19 @@ fn scalar_float_fused_multiply_add(
         (addend.sign, aligned_addend - product)
     } else {
         let sign = control.rounding == FpRoundingMode::TowardNegative;
-        return FpLaneOutcome {
-            bits: u64::from(sign) << (format.total_bits - 1),
+        return ExactFpOutcome {
+            bits: u128::from(u64::from(sign) << (format.total_bits - 1)),
             status,
         };
     };
-    pack_float_sum(magnitude, common_scale, negative, format, control, status)
+    exact_value(pack_float_sum(
+        magnitude,
+        common_scale,
+        negative,
+        format,
+        control,
+        status,
+    ))
 }
 
 fn align_fused_operands(
@@ -1700,24 +1935,31 @@ fn scalar_float_square_root(
     } else {
         u64::MAX
     };
-    let mut source = DecodedFloat::new(
-        state
-            .vector(fields.rn)
-            .expect("normalized scalar FSQRT source") as u64
-            & mask,
-        format,
-    );
-    let control = FpAddControl::from_fpcr(state.fpcr());
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized scalar FSQRT source") as u64
+        & mask;
+    let outcome = exact_scalar_float_square_root(source, fp_format.bits(), state.fpcr());
+    FpLaneOutcome {
+        bits: outcome.bits as u64,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_scalar_float_square_root(source: u64, precision: u8, fpcr: u32) -> ExactFpOutcome {
+    let format = BinaryFormat::new(fp_format(precision));
+    let mut source = DecodedFloat::new(source, format);
+    let control = FpAddControl::from_fpcr(fpcr);
     let mut status = FpStatus::default();
 
     if source.is_nan(format) {
         status.invalid_operation = source.is_signaling_nan(format);
-        return FpLaneOutcome {
-            bits: if control.default_nan {
+        return ExactFpOutcome {
+            bits: u128::from(if control.default_nan {
                 format.default_nan()
             } else {
                 source.bits | format.quiet_nan_bit()
-            },
+            }),
             status,
         };
     }
@@ -1726,21 +1968,21 @@ fn scalar_float_square_root(
         source = DecodedFloat::new(source.bits & format.sign_mask(), format);
     }
     if source.is_zero() {
-        return FpLaneOutcome {
-            bits: source.bits,
+        return ExactFpOutcome {
+            bits: u128::from(source.bits),
             status,
         };
     }
     if source.sign {
         status.invalid_operation = true;
-        return FpLaneOutcome {
-            bits: format.default_nan(),
+        return ExactFpOutcome {
+            bits: u128::from(format.default_nan()),
             status,
         };
     }
     if source.is_infinite(format) {
-        return FpLaneOutcome {
-            bits: source.bits,
+        return ExactFpOutcome {
+            bits: u128::from(source.bits),
             status,
         };
     }
@@ -1760,14 +2002,14 @@ fn scalar_float_square_root(
     if remainder != 0 {
         root |= 1;
     }
-    pack_float_sum(
+    exact_value(pack_float_sum(
         root,
         scale / 2 - extra_root_bits as i32,
         false,
         format,
         control,
         status,
-    )
+    ))
 }
 
 fn integer_square_root(value: u128) -> (u128, u128) {
@@ -1925,13 +2167,27 @@ fn scalar_float_add(
         .vector(fields.rm)
         .expect("normalized scalar addition second operand") as u64
         & mask;
-    add_ieee_lane(
+    let outcome = exact_scalar_float_add(lhs, rhs, fp_format.bits(), operation, state.fpcr());
+    FpLaneOutcome {
+        bits: outcome.bits as u64,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_scalar_float_add(
+    lhs: u64,
+    rhs: u64,
+    precision: u8,
+    operation: FloatAddOperation,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    exact_value(add_ieee_lane(
         lhs,
         rhs,
-        fp_format,
-        state.fpcr(),
+        fp_format(precision),
+        fpcr,
         matches!(operation, FloatAddOperation::Subtract),
-    )
+    ))
 }
 
 fn add_ieee_lane(
@@ -2180,41 +2436,58 @@ fn scalar_float_round(
     } else {
         u64::MAX
     };
-    let source_bits = state
+    let source = state
         .vector(fields.rn)
         .expect("normalized scalar floating-point round source") as u64
         & mask;
-    let mut source = DecodedFloat::new(source_bits, format);
+    let outcome = exact_scalar_float_round(source, fp_format.bits(), operation, state.fpcr());
+    FpLaneOutcome {
+        bits: outcome.bits as u64,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_scalar_float_round(
+    source: u64,
+    precision: u8,
+    operation: FloatRoundOperation,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let format = BinaryFormat::new(fp_format(precision));
+    let mut source = DecodedFloat::new(source, format);
     let mut status = FpStatus::default();
 
     if source.is_nan(format) {
         status.invalid_operation = source.is_signaling_nan(format);
-        let bits = if state.fpcr() & (1 << 25) != 0 {
+        let bits = if fpcr & (1 << 25) != 0 {
             format.default_nan()
         } else {
             source.bits | format.quiet_nan_bit()
         };
-        return FpLaneOutcome { bits, status };
-    }
-    if source.is_infinite(format) || source.is_zero() {
-        return FpLaneOutcome {
-            bits: source.bits,
+        return ExactFpOutcome {
+            bits: u128::from(bits),
             status,
         };
     }
-    if state.fpcr() & (1 << 24) != 0 && source.is_subnormal() {
+    if source.is_infinite(format) || source.is_zero() {
+        return ExactFpOutcome {
+            bits: u128::from(source.bits),
+            status,
+        };
+    }
+    if fpcr & (1 << 24) != 0 && source.is_subnormal() {
         status.input_denormal = true;
         source = DecodedFloat::new(source.bits & format.sign_mask(), format);
-        return FpLaneOutcome {
-            bits: source.bits,
+        return ExactFpOutcome {
+            bits: u128::from(source.bits),
             status,
         };
     }
 
     let exponent = source.exponent_field as i32 - format.exponent_bias;
     if exponent >= format.fraction_bits as i32 {
-        return FpLaneOutcome {
-            bits: source.bits,
+        return ExactFpOutcome {
+            bits: u128::from(source.bits),
             status,
         };
     }
@@ -2225,8 +2498,8 @@ fn scalar_float_round(
         FloatRoundOperation::TowardNegative => (FpRoundingMode::TowardNegative, false),
         FloatRoundOperation::TowardZero => (FpRoundingMode::TowardZero, false),
         FloatRoundOperation::NearestAway => (FpRoundingMode::TiesAway, false),
-        FloatRoundOperation::Exact => (fpcr_rounding_mode(state.fpcr()), true),
-        FloatRoundOperation::CurrentMode => (fpcr_rounding_mode(state.fpcr()), false),
+        FloatRoundOperation::Exact => (fpcr_rounding_mode(fpcr), true),
+        FloatRoundOperation::CurrentMode => (fpcr_rounding_mode(fpcr), false),
     };
     let shift = (format.fraction_bits as i32 - exponent) as u32;
     let (magnitude, inexact) =
@@ -2237,7 +2510,10 @@ fn scalar_float_round(
     } else {
         integer_magnitude_to_ieee(magnitude, source.sign, format.total_bits, rounding).0
     };
-    FpLaneOutcome { bits, status }
+    ExactFpOutcome {
+        bits: u128::from(bits),
+        status,
+    }
 }
 
 fn round_integral_magnitude(
@@ -2297,37 +2573,53 @@ fn scalar_float_compare(
     } else {
         u64::MAX
     };
-    let mut lhs = DecodedFloat::new(
+    let lhs = state
+        .vector(fields.rn)
+        .expect("normalized scalar comparison first operand") as u64
+        & mask;
+    let rhs = if compare_with_zero {
+        0
+    } else {
         state
-            .vector(fields.rn)
-            .expect("normalized scalar comparison first operand") as u64
-            & mask,
-        format,
+            .vector(fields.rm)
+            .expect("normalized scalar comparison second operand") as u64
+            & mask
+    };
+    let outcome = exact_scalar_float_compare(
+        lhs,
+        rhs,
+        fp_format.bits(),
+        fields.signaling_compare,
+        state.fpcr(),
     );
-    let mut rhs = DecodedFloat::new(
-        if compare_with_zero {
-            0
-        } else {
-            state
-                .vector(fields.rm)
-                .expect("normalized scalar comparison second operand") as u64
-                & mask
-        },
-        format,
-    );
+    FpCompareOutcome {
+        nzcv: outcome.nzcv,
+        status: outcome.status,
+    }
+}
+
+pub fn exact_scalar_float_compare(
+    lhs: u64,
+    rhs: u64,
+    precision: u8,
+    signaling: bool,
+    fpcr: u32,
+) -> ExactCompareOutcome {
+    let format = BinaryFormat::new(fp_format(precision));
+    let mut lhs = DecodedFloat::new(lhs, format);
+    let mut rhs = DecodedFloat::new(rhs, format);
     let mut status = FpStatus::default();
 
     if lhs.is_nan(format) || rhs.is_nan(format) {
-        status.invalid_operation = fields.signaling_compare
-            || lhs.is_signaling_nan(format)
-            || rhs.is_signaling_nan(format);
-        return FpCompareOutcome {
+        status.invalid_operation =
+            signaling || lhs.is_signaling_nan(format) || rhs.is_signaling_nan(format);
+        return ExactCompareOutcome {
             nzcv: (1 << 29) | (1 << 28),
             status,
         };
     }
 
-    if state.fpcr() & (1 << 24) != 0 {
+    if fpcr & (1 << 24) != 0 {
         for operand in [&mut lhs, &mut rhs] {
             if operand.is_subnormal() {
                 status.input_denormal = true;
@@ -2353,7 +2645,7 @@ fn scalar_float_compare(
     } else {
         1 << 29
     };
-    FpCompareOutcome { nzcv, status }
+    ExactCompareOutcome { nzcv, status }
 }
 
 #[derive(Clone, Copy)]

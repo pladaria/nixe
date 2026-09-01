@@ -2,17 +2,25 @@ use nixe_cpu::{
     decode::{DecodedOpcode, a64::fp_simd::Instruction},
     location::DecodedInstruction,
     memory::{
-        CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
-        MemoryAlignment, MemoryOrdering, MemoryValue,
+        MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryOrdering,
+        MemoryValue,
+    },
+    semantics::a64::{
+        SimdMemoryMode, SimdMemoryShape, simd_memory_access_size, simd_multiple_structure_shape,
+        simd_pair_access_size, simd_single_structure_shape,
     },
     state::a64::A64State,
 };
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+use nixe_memory::GuestVirtualAddress;
 
-use super::{advance, read, register_offset_address, sign_extend};
+use super::{
+    advance,
+    memory::{MemoryStepError, ordinary_read, ordinary_write},
+    read, register_offset_address, sign_extend,
+};
 use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
 
-type MemoryStep = Result<(), DataAccessFault>;
+type MemoryStep = Result<(), MemoryStepError>;
 
 pub(super) fn execute(
     context: InterpreterContext<'_>,
@@ -41,9 +49,8 @@ pub(super) fn execute(
         | Instruction::MemoryUnscaled(_)
         | Instruction::MemoryPostIndex(_)
         | Instruction::MemoryPreIndex(_) => {
-            let memory = context.memory();
-            let address_space = context.process().address_space_id();
-            let size = vector_access_size(fields)?;
+            let size = simd_memory_access_size(fields.size, fields.opc)
+                .expect("allocation validation rejects invalid SIMD transfer sizes");
             let base = read(state, fields.rn, 64, true);
             let offset = match instruction {
                 Instruction::MemoryUnsigned(_) => {
@@ -62,8 +69,7 @@ pub(super) fn execute(
                 base.wrapping_add(offset)
             };
             let result = vector_transfer(
-                memory,
-                address_space,
+                context,
                 state,
                 fields,
                 GuestVirtualAddress::new(address),
@@ -79,18 +85,10 @@ pub(super) fn execute(
             }
             Some(result)
         }
-        Instruction::MemoryPair(_) => {
-            let memory = context.memory();
-            Some(vector_pair(
-                memory,
-                context.process().address_space_id(),
-                state,
-                fields,
-            ))
-        }
+        Instruction::MemoryPair(_) => Some(vector_pair(context, state, fields)),
         Instruction::MemoryRegister(_) => {
-            let memory = context.memory();
-            let size = vector_access_size(fields)?;
+            let size = simd_memory_access_size(fields.size, fields.opc)
+                .expect("allocation validation rejects invalid SIMD transfer sizes");
             let Some(address) = register_offset_address(
                 state,
                 fields.rn,
@@ -101,27 +99,18 @@ pub(super) fn execute(
             ) else {
                 return Err(super::super::unsupported(decoded));
             };
-            Some(vector_transfer(
-                memory,
-                context.process().address_space_id(),
-                state,
-                fields,
-                address,
-                size,
-            ))
+            Some(vector_transfer(context, state, fields, address, size))
         }
         Instruction::MemoryMultipleStructures(_)
         | Instruction::MemoryMultipleStructuresPostIndex(_) => {
-            let memory = context.memory();
-            let Some(register_count) = ld1_st1_register_count(fields.structure_opcode) else {
+            let Some(shape) = simd_multiple_structure_shape(fields) else {
                 return Err(super::super::unsupported(decoded));
             };
             Some(vector_multiple_structures(
-                memory,
-                context.process().address_space_id(),
+                context,
                 state,
                 fields,
-                register_count,
+                shape,
                 matches!(
                     instruction,
                     Instruction::MemoryMultipleStructuresPostIndex(_)
@@ -129,19 +118,29 @@ pub(super) fn execute(
             ))
         }
         Instruction::MemorySingleStructure(_) | Instruction::MemorySingleStructurePostIndex(_) => {
-            let memory = context.memory();
+            let Some(shape) = simd_single_structure_shape(fields) else {
+                return Err(super::super::unsupported(decoded));
+            };
             Some(vector_single_structure(
-                memory,
-                context.process().address_space_id(),
+                context,
                 state,
                 fields,
+                shape,
                 matches!(instruction, Instruction::MemorySingleStructurePostIndex(_)),
             ))
         }
         _ => return Err(super::super::unsupported(decoded)),
     };
-    if let Some(Err(fault)) = result {
-        return Ok(InstructionStep::data_fault(decoded.location, fault));
+    if let Some(Err(error)) = result {
+        return match error {
+            MemoryStepError::Data(fault) => {
+                Ok(InstructionStep::data_fault(decoded.location, fault))
+            }
+            MemoryStepError::Direct(detail) => Err(InterpreterError::DirectMemory {
+                source: decoded.location,
+                detail,
+            }),
+        };
     }
     advance(state);
     Ok(InstructionStep::Continue)
@@ -152,22 +151,13 @@ pub(super) fn execute(
 // clears the remaining destination bits, and leaves FPCR/FPSR unchanged. Arm
 // ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--register---Floating-point-Move-register--
-fn pair_access_size(size: u8) -> MemoryAccessSize {
-    match size {
-        0 => MemoryAccessSize::Word,
-        1 => MemoryAccessSize::Doubleword,
-        2 => MemoryAccessSize::Quadword,
-        _ => unreachable!("allocation validation rejects invalid SIMD pair sizes"),
-    }
-}
-
 fn vector_pair(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
 ) -> MemoryStep {
-    let size = pair_access_size(fields.size);
+    let size = simd_pair_access_size(fields.size)
+        .expect("allocation validation rejects invalid SIMD pair sizes");
     let base = read(state, fields.rn, 64, true);
     let offset = sign_extend(u64::from(fields.immediate_7), 7) * size.bytes() as i64;
     let transfer_base = if matches!(fields.mode, 2 | 3) {
@@ -178,13 +168,13 @@ fn vector_pair(
     let first = GuestVirtualAddress::new(transfer_base);
     let second = first.wrapping_add(size.bytes() as u64);
     if fields.load {
-        let first_value = read_vector(memory, address_space, first, size)?;
-        let second_value = read_vector(memory, address_space, second, size)?;
+        let first_value = read_vector(context, first, size)?;
+        let second_value = read_vector(context, second, size)?;
         assert!(state.set_vector(fields.rd, first_value));
         assert!(state.set_vector(fields.rt2, second_value));
     } else {
-        write_vector(memory, address_space, first, size, state, fields.rd)?;
-        write_vector(memory, address_space, second, size, state, fields.rt2)?;
+        write_vector(context, first, size, state, fields.rd)?;
+        write_vector(context, second, size, state, fields.rt2)?;
     }
     if matches!(fields.mode, 1 | 3) {
         super::write(state, fields.rn, 64, true, base.wrapping_add_signed(offset));
@@ -192,47 +182,64 @@ fn vector_pair(
     Ok(())
 }
 
-// LD1/ST1 multiple-structures register-list semantics, Arm ARM DDI 0602 (2025-12):
-// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--multiple-structures---Load-multiple-single-element-structures-to-one--two--three--or-four-registers-
-// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ST1--multiple-structures---Store-multiple-single-element-structures-from-one--two--three--or-four-registers-
-fn ld1_st1_register_count(opcode: u8) -> Option<u8> {
-    match opcode {
-        0b0010 => Some(4),
-        0b0110 => Some(3),
-        0b1010 => Some(2),
-        0b0111 => Some(1),
-        _ => None,
-    }
-}
-
 fn vector_multiple_structures(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
-    register_count: u8,
+    shape: SimdMemoryShape,
     post_index: bool,
 ) -> MemoryStep {
-    let size = if fields.vector_128 {
+    let vector_size = if shape.vector_bytes == 16 {
         MemoryAccessSize::Quadword
     } else {
         MemoryAccessSize::Doubleword
     };
     let base = read(state, fields.rn, 64, true);
     let mut address = GuestVirtualAddress::new(base);
-    for index in 0..register_count {
-        let register = fields.rd.wrapping_add(index) & 31;
-        if fields.load {
-            let value = read_vector(memory, address_space, address, size)?;
-            assert!(state.set_vector(register, value));
-        } else {
-            write_vector(memory, address_space, address, size, state, register)?;
+    if shape.structure_registers == 1 {
+        for repetition in 0..shape.repetitions {
+            let register = fields.rd.wrapping_add(repetition) & 31;
+            if fields.load {
+                let value = read_vector(context, address, vector_size)?;
+                assert!(state.set_vector(register, value));
+            } else {
+                write_vector(context, address, vector_size, state, register)?;
+            }
+            address = address.wrapping_add(u64::from(shape.vector_bytes));
         }
-        address = address.wrapping_add(size.bytes() as u64);
+    } else {
+        let lane_bits = shape.element_size.bytes() as u32 * 8;
+        for lane in 0..shape.elements_per_register {
+            for register_offset in 0..shape.structure_registers {
+                let register = fields.rd.wrapping_add(register_offset) & 31;
+                if fields.load {
+                    let value = read_vector(context, address, shape.element_size)?;
+                    insert_lane(state, register, lane, lane_bits, value);
+                } else {
+                    write_lane(
+                        context,
+                        address,
+                        shape.element_size,
+                        vector_lane(state, register, lane, lane_bits),
+                    )?;
+                }
+                address = address.wrapping_add(shape.element_size.bytes() as u64);
+            }
+        }
+        if !fields.vector_128 && fields.load {
+            for register_offset in 0..shape.structure_registers {
+                let register = fields.rd.wrapping_add(register_offset) & 31;
+                let value = state
+                    .vector(register)
+                    .expect("normalized multiple-structure destination register")
+                    & u128::from(u64::MAX);
+                assert!(state.set_vector(register, value));
+            }
+        }
     }
     if post_index {
         let offset = if fields.rm == 31 {
-            u64::from(register_count) * size.bytes() as u64
+            u64::from(shape.immediate_post_index)
         } else {
             read(state, fields.rm, 64, false)
         };
@@ -241,42 +248,59 @@ fn vector_multiple_structures(
     Ok(())
 }
 
-// LD1/ST1 transfer one element between memory and one vector lane. Loads
-// preserve every other lane, and post-index writeback occurs only after a
-// successful memory access. Arm ARM DDI 0602 (2025-12):
-// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--single-structure---Load-one-single-element-structure-to-one-lane-of-one-register-
-// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ST1--single-structure---Store-one-single-element-structure-from-one-lane-of-one-register-
 fn vector_single_structure(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    shape: SimdMemoryShape,
     post_index: bool,
 ) -> MemoryStep {
-    let (size, lane) = single_structure_shape(fields);
     let base = read(state, fields.rn, 64, true);
-    let address = GuestVirtualAddress::new(base);
-    if fields.load {
-        let value = read_vector(memory, address_space, address, size)?;
-        insert_lane(state, fields.rd, lane, size.bytes() as u32 * 8, value);
-    } else {
-        let vector = state
-            .vector(fields.rd)
-            .expect("normalized single-structure source register");
-        let lane_bits = size.bytes() as u32 * 8;
-        let lane_mask = (1_u128 << lane_bits) - 1;
-        let value = (vector >> (u32::from(lane) * lane_bits)) & lane_mask;
-        write_lane(memory, address_space, address, size, value)?;
+    let mut address = GuestVirtualAddress::new(base);
+    let lane_bits = shape.element_size.bytes() as u32 * 8;
+    for register_offset in 0..shape.structure_registers {
+        let register = fields.rd.wrapping_add(register_offset) & 31;
+        match shape.mode {
+            SimdMemoryMode::Lane(lane) if fields.load => {
+                let value = read_vector(context, address, shape.element_size)?;
+                insert_lane(state, register, lane, lane_bits, value);
+            }
+            SimdMemoryMode::Lane(lane) => {
+                write_lane(
+                    context,
+                    address,
+                    shape.element_size,
+                    vector_lane(state, register, lane, lane_bits),
+                )?;
+            }
+            SimdMemoryMode::Replicate => {
+                let value = read_vector(context, address, shape.element_size)?;
+                let mut vector = 0_u128;
+                for lane in 0..shape.elements_per_register {
+                    vector |= value << (u32::from(lane) * lane_bits);
+                }
+                assert!(state.set_vector(register, vector));
+            }
+            SimdMemoryMode::Multiple => unreachable!("single-structure shape has a single mode"),
+        }
+        address = address.wrapping_add(shape.element_size.bytes() as u64);
     }
     if post_index {
         let offset = if fields.rm == 31 {
-            size.bytes() as u64
+            u64::from(shape.immediate_post_index)
         } else {
             read(state, fields.rm, 64, false)
         };
         super::write(state, fields.rn, 64, true, base.wrapping_add(offset));
     }
     Ok(())
+}
+
+fn vector_lane(state: &A64State, register: u8, lane: u8, lane_bits: u32) -> u128 {
+    let vector = state
+        .vector(register)
+        .expect("normalized single-structure source register");
+    (vector >> (u32::from(lane) * lane_bits)) & ((1_u128 << lane_bits) - 1)
 }
 
 fn insert_lane(state: &mut A64State, register: u8, lane: u8, lane_bits: u32, value: u128) {
@@ -288,30 +312,8 @@ fn insert_lane(state: &mut A64State, register: u8, lane: u8, lane_bits: u32, val
     assert!(state.set_vector(register, (previous & !mask) | ((value << shift) & mask)));
 }
 
-fn single_structure_shape(
-    fields: nixe_cpu::decode::a64::fp_simd::Operands,
-) -> (MemoryAccessSize, u8) {
-    let opcode = fields.structure_opcode >> 1;
-    let s = fields.structure_opcode & 1;
-    let q = u8::from(fields.vector_128);
-    match opcode {
-        0 => (
-            MemoryAccessSize::Byte,
-            (q << 3) | (s << 2) | fields.element_size,
-        ),
-        2 => (
-            MemoryAccessSize::Halfword,
-            (q << 2) | (s << 1) | (fields.element_size >> 1),
-        ),
-        4 if fields.element_size == 0 => (MemoryAccessSize::Word, (q << 1) | s),
-        4 => (MemoryAccessSize::Doubleword, q),
-        _ => unreachable!("allocation validation rejects other single-structure opcodes"),
-    }
-}
-
 fn write_lane(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     value: u128,
@@ -323,50 +325,31 @@ fn write_lane(
         MemoryAccessSize::Doubleword => MemoryValue::U64(value as u64),
         MemoryAccessSize::Quadword => unreachable!("single-structure lanes are at most 64 bits"),
     };
-    memory
-        .write(address_space, address, vector_access(size), value)
-        .map(|_| ())
-}
-
-fn vector_access_size(
-    fields: nixe_cpu::decode::a64::fp_simd::Operands,
-) -> Result<MemoryAccessSize, InterpreterError> {
-    Ok(match fields.size + ((fields.opc & 2) << 1) {
-        0 => MemoryAccessSize::Byte,
-        1 => MemoryAccessSize::Halfword,
-        2 => MemoryAccessSize::Word,
-        3 => MemoryAccessSize::Doubleword,
-        4 => MemoryAccessSize::Quadword,
-        _ => unreachable!("allocation validation rejects invalid SIMD transfer sizes"),
-    })
+    ordinary_write(context, address, value, vector_access(size))
 }
 
 fn vector_transfer(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
 ) -> MemoryStep {
     if fields.load {
-        let value = read_vector(memory, address_space, address, size)?;
+        let value = read_vector(context, address, size)?;
         assert!(state.set_vector(fields.rd, value));
     } else {
-        write_vector(memory, address_space, address, size, state, fields.rd)?;
+        write_vector(context, address, size, state, fields.rd)?;
     }
     Ok(())
 }
 
 fn read_vector(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
-) -> Result<u128, DataAccessFault> {
-    let value = memory
-        .read(address_space, address, vector_access(size))?
-        .value;
+) -> Result<u128, MemoryStepError> {
+    let value = ordinary_read(context, address, vector_access(size))?;
     Ok(match value {
         MemoryValue::U8(value) => u128::from(value),
         MemoryValue::U16(value) => u128::from(value),
@@ -377,13 +360,12 @@ fn read_vector(
 }
 
 fn write_vector(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
+    context: InterpreterContext<'_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     state: &A64State,
     register: u8,
-) -> Result<(), DataAccessFault> {
+) -> Result<(), MemoryStepError> {
     let value = state.vector(register).expect("normalized vector register");
     let value = match size {
         MemoryAccessSize::Byte => MemoryValue::U8(value as u8),
@@ -392,9 +374,7 @@ fn write_vector(
         MemoryAccessSize::Doubleword => MemoryValue::U64(value as u64),
         MemoryAccessSize::Quadword => MemoryValue::U128(value),
     };
-    memory
-        .write(address_space, address, vector_access(size), value)
-        .map(|_| ())
+    ordinary_write(context, address, value, vector_access(size))
 }
 
 fn vector_access(size: MemoryAccessSize) -> MemoryAccess {

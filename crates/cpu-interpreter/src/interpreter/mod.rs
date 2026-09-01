@@ -67,7 +67,7 @@ pub struct InterpreterContext<'a> {
     exclusive_monitor: &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
     architectural_timer: &'a dyn ArchitecturalTimer,
     events: &'a VcpuEventState,
-    direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+    direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
 }
 
 impl<'a> InterpreterContext<'a> {
@@ -91,7 +91,7 @@ impl<'a> InterpreterContext<'a> {
 
     pub(crate) const fn with_direct_memory(
         mut self,
-        direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+        direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
     ) -> Self {
         self.direct_memory = direct_memory;
         self
@@ -127,7 +127,7 @@ impl<'a> InterpreterContext<'a> {
     #[must_use]
     pub(crate) const fn direct_memory(
         self,
-    ) -> Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>> {
+    ) -> Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>> {
         self.direct_memory
     }
 }

@@ -80,16 +80,16 @@ pub struct InterpreterThread {
     memory_backend: Option<InterpreterMemoryBackend>,
     exclusive_monitor: RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
     control: CpuControl,
-    direct_memory: Option<RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+    direct_memory: Option<RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
 }
 
 struct InterpreterDirectSlice<'a> {
-    frontend: Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+    frontend: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
 }
 
 impl<'a> InterpreterDirectSlice<'a> {
     fn begin(
-        frontend: Option<&'a RefCell<nixe_cpu_direct_memory::DirectScalarFrontend>>,
+        frontend: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
     ) -> Result<Self, nixe_cpu_direct_memory::FaultRuntimeError> {
         if let Some(frontend) = frontend {
             frontend.borrow_mut().begin_slice()?;
@@ -131,7 +131,7 @@ impl InterpreterThread {
                 address_space,
                 view,
             }) => Some(RefCell::new(
-                unsafe { nixe_cpu_direct_memory::DirectScalarFrontend::new(view, address_space) }
+                unsafe { nixe_cpu_direct_memory::DirectMemoryFrontend::new(view, address_space) }
                     .map_err(|error| backend_fault(error.to_string()))?,
             )),
             Some(InterpreterMemoryBackend::Checked) | None => None,

@@ -15,7 +15,17 @@ both platforms whenever technically appropriate.
 
 ## Project Status
 
-The project is currently in an early development and research phase.
+The project is in active development. Some homebrew applications run at up to 60 FPS, and gamepad input is
+supported through the emulated HID services.
+
+### Screenshots
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/es2gears.png" alt="ES2Gears"></td>
+    <td><img src="docs/screenshots/textured_cube.png" alt="Textured cube"></td>
+  </tr>
+</table>
 
 ## Testing
 

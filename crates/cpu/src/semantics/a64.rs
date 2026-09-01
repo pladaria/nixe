@@ -1,12 +1,153 @@
 //! Pure architectural decisions shared by A64 execution engines.
 
 use crate::{
+    decode::a64::fp_simd,
     memory::{
-        BarrierAccess, BarrierDomain, BarrierOperation, CacheMaintenanceKind, MemoryAccessSize,
+        AtomicRmwKind, BarrierAccess, BarrierDomain, BarrierOperation, CacheMaintenanceKind,
+        MemoryAccessSize, MemoryOrdering,
     },
     platform::TargetPlatform,
     semantics::shifts::ShiftKind,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SimdMemoryMode {
+    Multiple,
+    Lane(u8),
+    Replicate,
+}
+
+/// Compile-time architectural shape of one Advanced SIMD structure transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SimdMemoryShape {
+    pub element_size: MemoryAccessSize,
+    pub vector_bytes: u8,
+    pub repetitions: u8,
+    pub elements_per_register: u8,
+    pub structure_registers: u8,
+    pub mode: SimdMemoryMode,
+    pub transfer_bytes: u8,
+    pub immediate_post_index: u8,
+}
+
+impl SimdMemoryShape {
+    #[must_use]
+    pub const fn register_count(self) -> u8 {
+        self.repetitions * self.structure_registers
+    }
+}
+
+#[must_use]
+pub const fn simd_multiple_structure_shape(fields: fp_simd::Operands) -> Option<SimdMemoryShape> {
+    let (structure_registers, repetitions) = match fields.structure_opcode {
+        0 => (4, 1),
+        2 => (1, 4),
+        4 => (3, 1),
+        6 => (1, 3),
+        7 => (1, 1),
+        8 => (2, 1),
+        10 => (1, 2),
+        _ => return None,
+    };
+    let element_size = match fields.element_size {
+        0 => MemoryAccessSize::Byte,
+        1 => MemoryAccessSize::Halfword,
+        2 => MemoryAccessSize::Word,
+        3 => MemoryAccessSize::Doubleword,
+        _ => return None,
+    };
+    let vector_bytes = if fields.vector_128 { 16 } else { 8 };
+    let elements_per_register = vector_bytes / element_size.bytes() as u8;
+    let transfer_bytes = vector_bytes * structure_registers * repetitions;
+    Some(SimdMemoryShape {
+        element_size,
+        vector_bytes,
+        repetitions,
+        elements_per_register,
+        structure_registers,
+        mode: SimdMemoryMode::Multiple,
+        transfer_bytes,
+        immediate_post_index: transfer_bytes,
+    })
+}
+
+#[must_use]
+pub const fn simd_single_structure_shape(fields: fp_simd::Operands) -> Option<SimdMemoryShape> {
+    let opcode = fields.structure_opcode >> 1;
+    let structure_registers = 1 + fields.structure_r as u8 + 2 * (opcode & 1);
+    let vector_bytes = if fields.vector_128 { 16 } else { 8 };
+    let (element_size, mode) = match opcode {
+        0 | 1 => (
+            MemoryAccessSize::Byte,
+            SimdMemoryMode::Lane(
+                ((fields.vector_128 as u8) << 3)
+                    | ((fields.structure_opcode & 1) << 2)
+                    | fields.element_size,
+            ),
+        ),
+        2 | 3 if fields.element_size & 1 == 0 => (
+            MemoryAccessSize::Halfword,
+            SimdMemoryMode::Lane(
+                ((fields.vector_128 as u8) << 2)
+                    | ((fields.structure_opcode & 1) << 1)
+                    | (fields.element_size >> 1),
+            ),
+        ),
+        4 | 5 if fields.element_size == 0 => (
+            MemoryAccessSize::Word,
+            SimdMemoryMode::Lane(((fields.vector_128 as u8) << 1) | (fields.structure_opcode & 1)),
+        ),
+        4 | 5 if fields.element_size == 1 && fields.structure_opcode & 1 == 0 => (
+            MemoryAccessSize::Doubleword,
+            SimdMemoryMode::Lane(fields.vector_128 as u8),
+        ),
+        6 | 7 if fields.load => {
+            let element_size = match fields.element_size {
+                0 => MemoryAccessSize::Byte,
+                1 => MemoryAccessSize::Halfword,
+                2 => MemoryAccessSize::Word,
+                3 => MemoryAccessSize::Doubleword,
+                _ => return None,
+            };
+            (element_size, SimdMemoryMode::Replicate)
+        }
+        _ => return None,
+    };
+    let elements_per_register = vector_bytes / element_size.bytes() as u8;
+    let transfer_bytes = structure_registers * element_size.bytes() as u8;
+    Some(SimdMemoryShape {
+        element_size,
+        vector_bytes,
+        repetitions: 1,
+        elements_per_register,
+        structure_registers,
+        mode,
+        transfer_bytes,
+        immediate_post_index: transfer_bytes,
+    })
+}
+
+#[must_use]
+pub const fn simd_pair_access_size(size_bits: u8) -> Option<MemoryAccessSize> {
+    match size_bits {
+        0 => Some(MemoryAccessSize::Word),
+        1 => Some(MemoryAccessSize::Doubleword),
+        2 => Some(MemoryAccessSize::Quadword),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub const fn simd_memory_access_size(size_bits: u8, opcode: u8) -> Option<MemoryAccessSize> {
+    match size_bits + ((opcode & 2) << 1) {
+        0 => Some(MemoryAccessSize::Byte),
+        1 => Some(MemoryAccessSize::Halfword),
+        2 => Some(MemoryAccessSize::Word),
+        3 => Some(MemoryAccessSize::Doubleword),
+        4 => Some(MemoryAccessSize::Quadword),
+        _ => None,
+    }
+}
 
 /// Architecturally meaningful operations allocated in the A64 HINT space.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -231,6 +372,59 @@ pub const fn pair_transfer(size_bits: u8, load: bool) -> Option<(MemoryAccessSiz
 }
 
 #[must_use]
+pub const fn atomic_ordering(acquire: bool, release: bool) -> MemoryOrdering {
+    match (acquire, release) {
+        (false, false) => MemoryOrdering::Relaxed,
+        (true, false) => MemoryOrdering::Acquire,
+        (false, true) => MemoryOrdering::Release,
+        (true, true) => MemoryOrdering::AcquireRelease,
+    }
+}
+
+#[must_use]
+pub const fn atomic_rmw_kind(opcode: u8) -> Option<AtomicRmwKind> {
+    match opcode {
+        0 => Some(AtomicRmwKind::Add),
+        1 => Some(AtomicRmwKind::Clear),
+        2 => Some(AtomicRmwKind::Xor),
+        3 => Some(AtomicRmwKind::Set),
+        4 => Some(AtomicRmwKind::SignedMaximum),
+        5 => Some(AtomicRmwKind::SignedMinimum),
+        6 => Some(AtomicRmwKind::UnsignedMaximum),
+        7 => Some(AtomicRmwKind::UnsignedMinimum),
+        8 => Some(AtomicRmwKind::Swap),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub const fn compare_exchange_pair_sizes(
+    size_bits: u8,
+) -> Option<(MemoryAccessSize, MemoryAccessSize)> {
+    match size_bits {
+        0 => Some((MemoryAccessSize::Word, MemoryAccessSize::Doubleword)),
+        1 => Some((MemoryAccessSize::Doubleword, MemoryAccessSize::Quadword)),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub const fn exclusive_transfer_sizes(
+    size_bits: u8,
+    pair: bool,
+) -> Option<(MemoryAccessSize, MemoryAccessSize)> {
+    if !pair {
+        let size = memory_size(size_bits);
+        return Some((size, size));
+    }
+    match size_bits {
+        2 => Some((MemoryAccessSize::Word, MemoryAccessSize::Doubleword)),
+        3 => Some((MemoryAccessSize::Doubleword, MemoryAccessSize::Quadword)),
+        _ => None,
+    }
+}
+
+#[must_use]
 pub const fn shift_kind(encoded: u8, allow_rotate: bool) -> Option<ShiftKind> {
     match encoded {
         0 => Some(ShiftKind::LogicalLeft),
@@ -277,6 +471,110 @@ mod tests {
         ];
         for (opc, size, expected) in cases {
             assert_eq!(scalar_transfer(opc, size), expected);
+        }
+    }
+
+    #[test]
+    fn simd_access_size_tables_cover_the_complete_encoding_space() {
+        use MemoryAccessSize::{Byte, Doubleword, Halfword, Quadword, Word};
+
+        assert_eq!(simd_pair_access_size(0), Some(Word));
+        assert_eq!(simd_pair_access_size(1), Some(Doubleword));
+        assert_eq!(simd_pair_access_size(2), Some(Quadword));
+        assert_eq!(simd_pair_access_size(3), None);
+
+        for size_bits in 0..=3 {
+            for opcode in 0..=3 {
+                let encoded = size_bits + ((opcode & 2) << 1);
+                let expected = match encoded {
+                    0 => Some(Byte),
+                    1 => Some(Halfword),
+                    2 => Some(Word),
+                    3 => Some(Doubleword),
+                    4 => Some(Quadword),
+                    _ => None,
+                };
+                assert_eq!(simd_memory_access_size(size_bits, opcode), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn simd_structure_shapes_cover_every_allocated_normalized_form() {
+        for vector_128 in [false, true] {
+            for element_size in 0..=3 {
+                for structure_opcode in 0..=15 {
+                    let mut fields = fp_simd::Operands::empty();
+                    fields.vector_128 = vector_128;
+                    fields.element_size = element_size;
+                    fields.structure_opcode = structure_opcode;
+                    let shape = simd_multiple_structure_shape(fields);
+                    assert_eq!(
+                        shape.is_some(),
+                        matches!(structure_opcode, 0 | 2 | 4 | 6 | 7 | 8 | 10),
+                        "multiple structure opcode={structure_opcode} size={element_size} q={vector_128}"
+                    );
+                    if let Some(shape) = shape {
+                        assert_eq!(shape.mode, SimdMemoryMode::Multiple);
+                        assert_eq!(
+                            shape.transfer_bytes,
+                            shape.vector_bytes * shape.register_count()
+                        );
+                        assert_eq!(shape.immediate_post_index, shape.transfer_bytes);
+                        assert_eq!(
+                            shape.elements_per_register,
+                            shape.vector_bytes / shape.element_size.bytes() as u8
+                        );
+                    }
+                }
+            }
+        }
+
+        for load in [false, true] {
+            for vector_128 in [false, true] {
+                for structure_r in [false, true] {
+                    for opcode in 0..=7 {
+                        for s in 0..=1 {
+                            for element_size in 0..=3 {
+                                let mut fields = fp_simd::Operands::empty();
+                                fields.load = load;
+                                fields.vector_128 = vector_128;
+                                fields.structure_r = structure_r;
+                                fields.structure_opcode = (opcode << 1) | s;
+                                fields.element_size = element_size;
+                                let shape = simd_single_structure_shape(fields);
+                                let allocated = match opcode {
+                                    0 | 1 => true,
+                                    2 | 3 => element_size & 1 == 0,
+                                    4 | 5 => element_size == 0 || (element_size == 1 && s == 0),
+                                    6 | 7 => load,
+                                    _ => unreachable!(),
+                                };
+                                assert_eq!(
+                                    shape.is_some(),
+                                    allocated,
+                                    "single structure load={load} opcode={opcode} s={s} size={element_size} q={vector_128} r={structure_r}"
+                                );
+                                if let Some(shape) = shape {
+                                    assert!((1..=4).contains(&shape.register_count()));
+                                    assert_eq!(
+                                        shape.transfer_bytes,
+                                        shape.register_count() * shape.element_size.bytes() as u8
+                                    );
+                                    assert_eq!(shape.immediate_post_index, shape.transfer_bytes);
+                                    match shape.mode {
+                                        SimdMemoryMode::Lane(lane) => {
+                                            assert!(lane < shape.elements_per_register);
+                                        }
+                                        SimdMemoryMode::Replicate => assert!(load),
+                                        SimdMemoryMode::Multiple => unreachable!(),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
