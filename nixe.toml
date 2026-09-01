@@ -46,7 +46,7 @@ file_system_access_log = true
 # CPU backend: "jit" or "interpreter". Neither backend falls back to the other.
 backend = "jit"
 # Opt-in host-parallel vCPU execution. False keeps deterministic serialization.
-parallel_vcpus = false
+parallel_vcpus = true
 
 [gpu]
 # Maximum working set retained by each shader cache. Entries are evicted by
