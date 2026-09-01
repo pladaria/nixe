@@ -6,6 +6,15 @@ use super::pattern;
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern("hint", 0xffff_f01f, 0xd503_201f, 0x0000_000b, 190, &[]).fixture32(0xd503_203f),
+    pattern(
+        "clear-exclusive",
+        0xffff_f0ff,
+        0xd503_305f,
+        0x0000_001e,
+        191,
+        &[],
+    )
+    .fixture32(0xd503_3f5f),
     pattern("mrs", 0xfff0_0000, 0xd530_0000, 0x0000_000c, 70, &[]).fixture32(0xd53b_4200),
     pattern(
         "msr-register",
@@ -35,6 +44,7 @@ pub enum Instruction {
     ReadRegister(Operands),
     WriteRegister(Operands),
     Barrier(Operands),
+    ClearExclusive(Operands),
     System(Operands),
 }
 
@@ -46,6 +56,7 @@ impl Instruction {
             | Self::ReadRegister(value)
             | Self::WriteRegister(value)
             | Self::Barrier(value)
+            | Self::ClearExclusive(value)
             | Self::System(value) => value,
         }
     }
@@ -65,6 +76,7 @@ pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_000d => Instruction::WriteRegister(operands),
         0x0000_000e => Instruction::Barrier(operands),
         0x0000_000f => Instruction::System(operands),
+        0x0000_001e => Instruction::ClearExclusive(operands),
         _ => unreachable!("system semantic ID was routed to the wrong family"),
     }
 }

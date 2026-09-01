@@ -31,6 +31,12 @@ impl CraneliftTranslator<'_, '_> {
             Instruction::ReadRegister(_) => self.emit_mrs(source, fields, flags),
             Instruction::WriteRegister(_) => self.emit_msr(fields, flags),
             Instruction::Barrier(_) => self.emit_barrier(source, fields, flags),
+            Instruction::ClearExclusive(_) => self.call_slow(
+                slow::clear_exclusive as *const () as usize,
+                &[],
+                source,
+                flags,
+            ),
             Instruction::System(_) => self.emit_cache_maintenance(source, fields, flags),
         }
     }
@@ -111,6 +117,8 @@ impl CraneliftTranslator<'_, '_> {
             }
             0xd53b_4400 => self.load_state_u32(offset_of!(NativeContext, fpcr))?,
             0xd53b_4420 => {
+                self.materialize_native_fpsr();
+                self.reload_fpsr_state();
                 let value = self.builder.use_var(self.fpsr_state);
                 self.builder.ins().uextend(types::I64, value)
             }
@@ -155,8 +163,21 @@ impl CraneliftTranslator<'_, '_> {
                 let packed = self.builder.ins().ireduce(types::I32, value);
                 *flags = LazyFlags::Packed(packed);
             }
-            0xd51b_4400 => self.store_state_u32(offset_of!(NativeContext, fpcr), value)?,
+            0xd51b_4400 => {
+                self.end_native_fp_segment();
+                self.store_state_u32(offset_of!(NativeContext, fpcr), value)?;
+                let value = self.builder.ins().ireduce(types::I32, value);
+                self.store_context(value, offset_of!(NativeContext, guest_fpcr))?;
+                let unsupported = self
+                    .builder
+                    .ins()
+                    .band_imm_u(value, u64::from(!crate::direct::NATIVE_FPCR_MASK) as i64);
+                let fast = self.builder.ins().icmp_imm_s(IntCC::Equal, unsupported, 0);
+                let fast = self.builder.ins().uextend(types::I32, fast);
+                self.store_context(fast, offset_of!(NativeContext, native_fp_enabled))?;
+            }
             0xd51b_4420 => {
+                self.materialize_native_fpsr();
                 let value = self.builder.ins().ireduce(types::I32, value);
                 self.builder.def_var(self.fpsr_state, value);
                 self.block_dirty_fpsr = true;

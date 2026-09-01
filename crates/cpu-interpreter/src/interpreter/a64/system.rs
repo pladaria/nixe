@@ -30,6 +30,10 @@ pub(super) fn execute(
         Instruction::ReadRegister(_) => execute_mrs(context, state, fields),
         Instruction::WriteRegister(_) => execute_msr(state, fields),
         Instruction::Barrier(_) => execute_barrier(context, fields),
+        Instruction::ClearExclusive(_) => {
+            context.exclusive_monitor().borrow_mut().clear();
+            true
+        }
         Instruction::System(_) => match execute_system(context, state, fields) {
             Ok(executed) => executed,
             Err(fault) => {

@@ -95,6 +95,24 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         144,
         &[],
     ),
+    pattern(
+        "load-exclusive-pair",
+        0xbfe0_0000,
+        0x8860_0000,
+        0x0000_005e,
+        150,
+        &[],
+    )
+    .fixture32(0xc87f_0c20),
+    pattern(
+        "store-exclusive-pair",
+        0xbf20_0000,
+        0x8820_0000,
+        0x0000_005f,
+        149,
+        &[],
+    )
+    .fixture32(0xc822_0c20),
     // Armv8.1-A FEAT_LSE atomic memory operations. The generic RMW pattern is
     // narrowed to allocated operations by the architectural allocation pass.
     // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/LDADD--LDADDA--LDADDAL--LDADDL--Atomic-add-on-word-or-doubleword-in-memory-
@@ -177,6 +195,8 @@ instructions!(
     StoreRelease,
     LoadExclusive,
     StoreExclusive,
+    LoadExclusivePair,
+    StoreExclusivePair,
     AtomicReadModifyWrite,
     CompareAndSwap,
     CompareAndSwapPair,
@@ -223,6 +243,8 @@ pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_002d => Instruction::AtomicReadModifyWrite(operands),
         0x0000_002e => Instruction::CompareAndSwap(operands),
         0x0000_002f => Instruction::CompareAndSwapPair(operands),
+        0x0000_005e => Instruction::LoadExclusivePair(operands),
+        0x0000_005f => Instruction::StoreExclusivePair(operands),
         _ => unreachable!("memory semantic ID was routed to the wrong family"),
     }
 }

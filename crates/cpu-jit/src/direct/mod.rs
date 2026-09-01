@@ -1,4 +1,5 @@
 mod compiler;
+mod fp_env;
 mod lookup;
 mod region;
 mod slow;
@@ -180,12 +181,25 @@ struct NativeContext {
     slow_status: u32,
     slow_result_low: u64,
     slow_result_high: u64,
+    slow_result_flags: u64,
+    // Ephemeral native-invocation cache; canonical FPCR remains in `state`.
+    guest_fpcr: u32,
+    native_fp_enabled: u32,
+    host_fp: fp_env::HostFpState,
     native_lookup: *const NativeLookupSlot,
     invalidation_signal: *const AtomicU64,
     invalidation_cursor: u64,
     process_pending: *const AtomicU32,
     data_fault: Option<DataAccessFault>,
     direct_fault_error: Option<Box<str>>,
+}
+
+// Native S/D arithmetic can represent these FPCR controls directly. Any
+// other control (notably enabled guest traps) selects the exact typed path.
+const NATIVE_FPCR_MASK: u32 = (3 << 22) | (1 << 24) | (1 << 25);
+
+const fn native_fpcr_supported(fpcr: u32) -> bool {
+    fpcr & !NATIVE_FPCR_MASK == 0
 }
 
 impl NativeContext {
@@ -209,6 +223,7 @@ impl NativeContext {
         let sp = std::ptr::from_mut(state.stack_pointer_storage_mut());
         let pc = std::ptr::from_mut(state.program_counter_storage_mut());
         let nzcv = std::ptr::from_mut(state.nzcv_storage_mut());
+        let guest_fpcr = state.fpcr();
         let fpcr = std::ptr::from_mut(state.fpcr_storage_mut());
         let fpsr = std::ptr::from_mut(state.fpsr_storage_mut());
         let tpidr_el0 = std::ptr::from_mut(state.tpidr_el0_storage_mut());
@@ -248,6 +263,10 @@ impl NativeContext {
             slow_status: 0,
             slow_result_low: 0,
             slow_result_high: 0,
+            slow_result_flags: 0,
+            guest_fpcr,
+            native_fp_enabled: u32::from(native_fpcr_supported(guest_fpcr)),
+            host_fp: fp_env::HostFpState::default(),
             native_lookup,
             invalidation_signal,
             invalidation_cursor: MemoryInvalidationCursor::INITIAL.get(),
@@ -1163,7 +1182,8 @@ impl JitThread {
                         gateway,
                     )
                 };
-                unsafe {
+                let invocation = unsafe {
+                    fp_env::begin(&mut context);
                     worker.invoke(
                         arena,
                         &process.fault_registry,
@@ -1175,10 +1195,15 @@ impl JitThread {
                             entry,
                         },
                     )
-                }
-                .map_err(|error| DirectJitError::internal(error.to_string()))?;
+                };
+                unsafe { fp_env::finish(&mut context) };
+                invocation.map_err(|error| DirectJitError::internal(error.to_string()))?;
             } else {
-                unsafe { gateway(&mut context, entry) };
+                unsafe {
+                    fp_env::begin(&mut context);
+                    gateway(&mut context, entry);
+                    fp_env::finish(&mut context);
+                }
             }
             drop(native_lease);
             let exit = context.exit()?;

@@ -33,6 +33,82 @@ const CODE: u64 = 0x1000;
 const DATA: u64 = 0x8000;
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostFpSnapshot {
+    control: u64,
+    status: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_host_fp() -> HostFpSnapshot {
+    use core::arch::asm;
+
+    let mut mxcsr = 0_u32;
+    unsafe { asm!("stmxcsr [{value}]", value = in(reg) &mut mxcsr, options(nostack)) };
+    HostFpSnapshot {
+        control: u64::from(mxcsr & !0x3f),
+        status: u64::from(mxcsr & 0x3f),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_host_fp(snapshot: HostFpSnapshot) {
+    use core::arch::asm;
+
+    let mxcsr = (snapshot.control | snapshot.status) as u32;
+    unsafe { asm!("ldmxcsr [{value}]", value = in(reg) &mxcsr, options(nostack)) };
+}
+
+#[cfg(target_arch = "aarch64")]
+fn read_host_fp() -> HostFpSnapshot {
+    use core::arch::asm;
+
+    let control: u64;
+    let status: u64;
+    unsafe {
+        asm!("mrs {value}, fpcr", value = out(reg) control, options(nomem, nostack));
+        asm!("mrs {value}, fpsr", value = out(reg) status, options(nomem, nostack));
+    }
+    HostFpSnapshot { control, status }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn write_host_fp(snapshot: HostFpSnapshot) {
+    use core::arch::asm;
+
+    unsafe {
+        asm!("msr fpcr, {value}", value = in(reg) snapshot.control, options(nomem, nostack));
+        asm!("msr fpsr, {value}", value = in(reg) snapshot.status, options(nomem, nostack));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn distinct_host_fp(original: HostFpSnapshot, index: u32) -> HostFpSnapshot {
+    HostFpSnapshot {
+        control: (original.control & !(3 << 13)) | (u64::from(index & 3) << 13),
+        status: 1 << (index % 6),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn distinct_host_fp(original: HostFpSnapshot, index: u32) -> HostFpSnapshot {
+    HostFpSnapshot {
+        control: (original.control & !(3 << 22)) | (u64::from(index & 3) << 22),
+        status: (original.status & !0x9f) | (1 << (index % 5)),
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct RestoreHostFp(HostFpSnapshot);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl Drop for RestoreHostFp {
+    fn drop(&mut self) {
+        write_host_fp(self.0);
+    }
+}
+
 struct DeviceWriteback {
     bytes: Box<[u8]>,
 }
@@ -908,7 +984,7 @@ fn every_platform_fp_simd_catalog_entry_has_a_direct_or_exact_typed_lowering() {
                 pattern.decoder == DecodeSupport::Ready
                     && matches!(
                         pattern.coverage_id.get(),
-                        0x30..=0x43 | 0x48..=0x5d | 0x60..=0xa0
+                        0x30..=0x43 | 0x48..=0x5d | 0x60..=0xa1
                     )
             })
             .collect();
@@ -1139,7 +1215,7 @@ fn direct_simd_quadword_and_pair_memory_match_the_interpreter() {
 }
 
 #[test]
-fn direct_exact_fp_matches_normal_special_rounding_saturation_and_status_cases() {
+fn direct_fp_matches_normal_special_rounding_saturation_and_status_cases() {
     let mut normal = rich_state();
     assert!(normal.set_vector(1, u128::from(1.25_f64.to_bits())));
     assert!(normal.set_vector(2, u128::from(2.5_f64.to_bits())));
@@ -1177,43 +1253,833 @@ fn direct_exact_fp_matches_normal_special_rounding_saturation_and_status_cases()
         assert!(saturation.set_vector(1, u128::from(value.to_bits())));
         assert_matches_interpreter(0x9e79_0020, saturation); // FCVTZU X0,D1
     }
+
+    let single_lanes = [1.5_f32, -2.0, 4.0, 8.0]
+        .into_iter()
+        .enumerate()
+        .fold(0_u128, |bits, (lane, value)| {
+            bits | (u128::from(value.to_bits()) << (lane * 32))
+        });
+    let double_lanes = u128::from(1.5_f64.to_bits()) | (u128::from((-2.0_f64).to_bits()) << 64);
+    for (encoding, rn, rm, lanes) in [
+        (0x0f82_9020, 1, 2, single_lanes),   // FMUL V0.2S,V1.2S,V2.S[0]
+        (0x0fa5_9883, 4, 5, single_lanes),   // FMUL V3.2S,V4.2S,V5.S[3]
+        (0x4fa8_90e6, 7, 8, single_lanes),   // FMUL V6.4S,V7.4S,V8.S[1]
+        (0x4f8b_9949, 10, 11, single_lanes), // FMUL V9.4S,V10.4S,V11.S[2]
+        (0x4fce_91ac, 13, 14, double_lanes), // FMUL V12.2D,V13.2D,V14.D[0]
+        (0x4fd1_9a0f, 16, 17, double_lanes), // FMUL V15.2D,V16.2D,V17.D[1]
+        (0x4fa2_9821, 1, 2, single_lanes),   // FMUL V1.4S,V1.4S,V2.S[3]
+        (0x4fc4_9863, 3, 4, double_lanes),   // FMUL V3.2D,V3.2D,V4.D[1]
+        (0x4f96_93fb, 31, 22, single_lanes), // observed FMUL V27.4S,V31.4S,V22.S[0]
+    ] {
+        let mut by_element = rich_state();
+        assert!(by_element.set_vector(rn, lanes));
+        assert!(by_element.set_vector(rm, lanes));
+        assert_matches_interpreter(encoding, by_element);
+    }
+
+    let mut to_integer = rich_state();
+    assert!(to_integer.set_vector(1, u128::from((-3.75_f64).to_bits())));
+    assert_matches_interpreter(0x9e78_0020, to_integer); // FCVTZS X0,D1
+
+    let mut from_integer = rich_state();
+    write_register(&mut from_integer, 2, (1_u64 << 53) + 1);
+    assert_matches_interpreter(0x9e62_0043, from_integer); // SCVTF D3,X2
+
+    let mut precision = rich_state();
+    assert!(precision.set_vector(5, u128::from(1.25_f32.to_bits())));
+    assert_matches_interpreter(0x1e22_c0a4, precision); // FCVT D4,S5
+    let mut demote = rich_state();
+    assert!(demote.set_vector(7, u128::from((1.0_f64 + 2.0_f64.powi(-24)).to_bits())));
+    assert_matches_interpreter(0x1e62_40e6, demote); // FCVT S6,D7
+
+    let mut round = rich_state();
+    assert!(round.set_vector(9, u128::from(2.5_f64.to_bits())));
+    assert_matches_interpreter(0x1e64_4128, round); // FRINTN D8,D9
+
+    for encoding in [
+        0x4e21_dbfc_u32, // SCVTF V28.4S,V31.4S
+        0x2e21_d8e6,     // UCVTF V6.2S,V7.2S
+        0x6e61_d96a,     // UCVTF V10.2D,V11.2D
+        0x7e21_d9ad,     // UCVTF S13,S13
+        0x6e3e_ff9c,     // FDIV V28.4S,V28.4S,V30.4S
+    ] {
+        assert_matches_interpreter(encoding, rich_state());
+    }
+
+    let mut arithmetic = rich_state();
+    assert!(arithmetic.set_vector(1, u128::from(5.5_f32.to_bits())));
+    assert!(arithmetic.set_vector(2, u128::from(2.0_f32.to_bits())));
+    assert_matches_interpreter(0x1e22_3820, arithmetic); // FSUB S0,S1,S2
+
+    let mut multiply = rich_state();
+    assert!(multiply.set_vector(29, u128::from(1.5_f64.to_bits())));
+    assert!(multiply.set_vector(28, u128::from(2.0_f64.to_bits())));
+    assert_matches_interpreter(0x1e7c_0bbc, multiply); // FMUL D28,D29,D28
+
+    let mut negated_multiply = rich_state();
+    assert!(negated_multiply.set_vector(7, u128::from(2.0_f32.to_bits())));
+    assert!(negated_multiply.set_vector(8, u128::from((-3.0_f32).to_bits())));
+    assert_matches_interpreter(0x1e28_88e6, negated_multiply); // FNMUL S6,S7,S8
+
+    for encoding in [0x1f02_0c20, 0x1f02_8c20, 0x1f22_0c20, 0x1f22_8c20] {
+        let mut fused = rich_state();
+        assert!(fused.set_vector(1, u128::from(2.0_f32.to_bits())));
+        assert!(fused.set_vector(2, u128::from(3.0_f32.to_bits())));
+        assert!(fused.set_vector(3, u128::from(4.0_f32.to_bits())));
+        assert_matches_interpreter(encoding, fused);
+    }
+
+    let mut square_root = rich_state();
+    assert!(square_root.set_vector(1, u128::from(2.0_f64.to_bits())));
+    assert_matches_interpreter(0x1e61_c020, square_root); // FSQRT D0,D1
+
+    let mut signaling_compare = rich_state();
+    assert!(signaling_compare.set_vector(0, u128::from(0x7ff8_0000_0000_0001_u64)));
+    assert!(signaling_compare.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert_matches_interpreter(0x1e61_2010, signaling_compare); // FCMPE D0,D1
+
+    let mut conditional_compare = rich_state();
+    assert!(conditional_compare.set_vector(31, u128::from(1.0_f64.to_bits())));
+    assert!(conditional_compare.set_vector(30, u128::from(2.0_f64.to_bits())));
+    conditional_compare.set_nzcv(Nzcv::from_bits(0)); // NE holds.
+    assert_matches_interpreter(0x1e7e_17e4, conditional_compare); // FCCMP D31,D30,#4,NE
+
+    let mut signed_zero = rich_state();
+    signed_zero.set_fpcr(2 << 22); // round toward negative infinity
+    assert!(signed_zero.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(signed_zero.set_vector(2, u128::from((-1.0_f64).to_bits())));
+    assert_matches_interpreter(0x1e62_2820, signed_zero); // FADD D0,D1,D2
 }
 
 #[test]
-fn direct_exact_fp_enabled_exception_is_atomic() {
-    let encoding = 0x1e62_2820_u32; // FADD D0,D1,D2
-    let mut initial = rich_state();
-    initial.set_fpcr(1 << 8); // IOE
-    initial.set_fpsr(0x80);
-    assert!(initial.set_vector(0, u128::MAX));
-    assert!(initial.set_vector(1, u128::from(f64::INFINITY.to_bits())));
-    assert!(initial.set_vector(2, u128::from(f64::NEG_INFINITY.to_bits())));
+fn direct_fpcr_dn_fz_widths_and_vector_arrangements_match_the_interpreter() {
+    for (encoding, nan, one) in [
+        (
+            0x1e22_2820_u32, // FADD S0,S1,S2
+            u64::from(0x7fc1_2345_u32),
+            u64::from(1.0_f32.to_bits()),
+        ),
+        (
+            0x1e62_2820, // FADD D0,D1,D2
+            0x7ff8_0000_0000_1234,
+            1.0_f64.to_bits(),
+        ),
+    ] {
+        let mut state = rich_state();
+        state.set_fpcr(1 << 25); // DN
+        assert!(state.set_vector(1, u128::from(nan)));
+        assert!(state.set_vector(2, u128::from(one)));
+        assert_matches_interpreter(encoding, state);
+    }
 
-    let mut expected = initial.clone();
+    for (encoding, denormal, one) in [
+        (
+            0x1e22_0820_u32, // FMUL S0,S1,S2
+            1_u64,
+            u64::from(1.0_f32.to_bits()),
+        ),
+        (
+            0x1e62_0820, // FMUL D0,D1,D2
+            1_u64,
+            1.0_f64.to_bits(),
+        ),
+    ] {
+        let mut state = rich_state();
+        state.set_fpcr(1 << 24); // FZ
+        assert!(state.set_vector(1, u128::from(denormal)));
+        assert!(state.set_vector(2, u128::from(one)));
+        assert_matches_interpreter(encoding, state);
+    }
+
+    let v2s_numerator = u128::from(1.0_f32.to_bits()) | (u128::from((-1.0_f32).to_bits()) << 32);
+    let v2s_denominator = u128::from(3.0_f32.to_bits()) | (u128::from(3.0_f32.to_bits()) << 32);
+    let exact = nixe_cpu::semantics::a64_fp_simd::exact_vector_float_divide(
+        v2s_numerator,
+        v2s_denominator,
+        32,
+        64,
+        0,
+    );
+    assert_eq!(
+        nixe_cpu::semantics::a64_fp_simd::fp_status_bits(exact.status),
+        1 << 4
+    );
+    for rounding in 0_u32..=3 {
+        let mut state = rich_state();
+        state.set_fpcr(rounding << 22);
+        assert!(state.set_vector(1, v2s_numerator));
+        assert!(state.set_vector(2, v2s_denominator));
+        assert_matches_interpreter(0x2e22_fc20, state); // FDIV V0.2S,V1.2S,V2.2S
+    }
+
+    let mut v4s = rich_state();
+    let v4s_numerator = [1.0_f32, -1.0, 5.0, -5.0]
+        .into_iter()
+        .enumerate()
+        .fold(0_u128, |bits, (lane, value)| {
+            bits | (u128::from(value.to_bits()) << (lane * 32))
+        });
+    let v4s_denominator = [3.0_f32, 3.0, 2.0, 2.0]
+        .into_iter()
+        .enumerate()
+        .fold(0_u128, |bits, (lane, value)| {
+            bits | (u128::from(value.to_bits()) << (lane * 32))
+        });
+    assert!(v4s.set_vector(28, v4s_numerator));
+    assert!(v4s.set_vector(30, v4s_denominator));
+    assert_matches_interpreter(0x6e3e_ff9c, v4s); // FDIV V28.4S,V28.4S,V30.4S
+
+    let mut v2d = rich_state();
+    assert!(v2d.set_vector(
+        7,
+        u128::from(1.0_f64.to_bits()) | (u128::from((-6.0_f64).to_bits()) << 64)
+    ));
+    assert!(v2d.set_vector(
+        8,
+        u128::from(3.0_f64.to_bits()) | (u128::from(2.0_f64.to_bits()) << 64)
+    ));
+    assert_matches_interpreter(0x6e68_fce6, v2d); // FDIV V6.2D,V7.2D,V8.2D
+}
+
+#[test]
+fn direct_to_exact_fp_boundary_preserves_cumulative_status_and_traps() {
+    let cumulative_words = [
+        (0, 0x1e62_2820), // FADD D0,D1,D2: IXC
+        (4, 0x1e67_c083), // FRINTI D3,D4: IOC for signaling NaN
+        (8, 0xd53b_4425), // MRS X5,FPSR
+        (12, breakpoint(0)),
+    ];
+    let cumulative_memory = memory(&cumulative_words);
+    let mut expected = rich_state();
+    expected.set_fpsr(0x80);
+    assert!(expected.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(expected.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert!(expected.set_vector(4, u128::from(0x7ff0_0000_0000_0001_u64)));
+    for (_, encoding) in cumulative_words[..3].iter().copied() {
+        assert_eq!(
+            execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+    let mut actual = rich_state();
+    actual.set_fpsr(0x80);
+    assert!(actual.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(actual.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert!(actual.set_vector(4, u128::from(0x7ff0_0000_0000_0001_u64)));
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &cumulative_memory,
+            &mut actual,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(read_register(&actual, 5) & 0x91, 0x91);
+
+    let trap_words = [
+        (0, 0x1e62_2820), // FADD D0,D1,D2: IXC
+        (4, 0xd51b_4406), // MSR FPCR,X6: enable IOE and end the segment
+        (8, 0x1e67_c083), // FRINTI D3,D4: synchronous invalid-operation trap
+        (12, breakpoint(0)),
+    ];
+    let trap_memory = memory(&trap_words);
+    let mut expected = rich_state();
+    expected.set_fpsr(0x80);
+    write_register(&mut expected, 6, 1 << 8);
+    assert!(expected.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(expected.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert!(expected.set_vector(3, u128::from(0x0123_4567_89ab_cdef_u64)));
+    assert!(expected.set_vector(4, u128::from(0x7ff0_0000_0000_0001_u64)));
+    for (_, encoding) in trap_words[..2].iter().copied() {
+        assert_eq!(
+            execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
     assert!(matches!(
-        execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+        execute_one(&cpu().platform(), &mut expected, trap_words[2].1).unwrap(),
         InstructionStep::Exit(nixe_cpu::execution::CpuExit::ArchitecturalException {
             kind: nixe_cpu::exception::ExceptionKind::FloatingPoint,
             ..
         })
     ));
 
-    let mut actual = initial;
+    let mut actual = rich_state();
+    actual.set_fpsr(0x80);
+    write_register(&mut actual, 6, 1 << 8);
+    assert!(actual.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(actual.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert!(actual.set_vector(3, u128::from(0x0123_4567_89ab_cdef_u64)));
+    assert!(actual.set_vector(4, u128::from(0x7ff0_0000_0000_0001_u64)));
+    assert!(matches!(
+        JitThread::new().run(&JitProcess::new(cpu()).unwrap(), &trap_memory, &mut actual),
+        Ok(DirectExit::Architectural {
+            pc,
+            detail,
+            ..
+        }) if pc == GuestVirtualAddress::new(CODE + 8) && detail == 6 << 24
+    ));
+    assert_eq!(actual, expected);
+    assert_eq!(actual.fpsr() & 0x90, 0x90);
+}
+
+#[test]
+fn repeated_direct_fp_operations_do_not_duplicate_the_cold_protocol() {
+    let shape = |encoding, repetitions: usize| {
+        let destination = encoding & 0x1f;
+        // Give every guarded failure site the same dirty-destination publication
+        // obligation so the delta isolates the repeated FP lowering itself.
+        let mut words = vec![(0, 0x4f00_0400 | destination)]; // MOVI Vd.4S,#0
+        words.extend((0..repetitions).map(|index| (((index + 1) * 4) as u64, encoding)));
+        words.push((((repetitions + 1) * 4) as u64, breakpoint(0)));
+        let memory = memory(&words);
+        let process = JitProcess::new(cpu()).unwrap();
+        process.entry_for(&memory, location(CODE)).unwrap();
+        let state = process.state.lock().unwrap();
+        let region = state
+            .region_for(RegionKey::new(cpu(), location(CODE)))
+            .unwrap();
+        (region.clif_instructions, region.native_bytes)
+    };
+    for (name, encoding, expected_clif_delta, x86_native_limit, a64_native_limit) in [
+        ("FADD D", 0x1e62_2820, 75, 544, 336),
+        ("FDIV V.4S", 0x6e3e_ff9c, 95, 704, 400),
+        ("FMUL V.4S element", 0x4f96_93fb, 78, 544, 352),
+    ] {
+        let one = shape(encoding, 1);
+        let two = shape(encoding, 2);
+        let three = shape(encoding, 3);
+        let clif_deltas = [two.0 - one.0, three.0 - two.0];
+        let native_deltas = [two.1 - one.1, three.1 - two.1];
+        assert_eq!(
+            clif_deltas, [expected_clif_delta; 2],
+            "{name} changed its per-operation CLIF shape: one={one:?} two={two:?} three={three:?}"
+        );
+        let native_limit = if cfg!(target_arch = "x86_64") {
+            x86_native_limit
+        } else {
+            a64_native_limit
+        };
+        assert!(
+            native_deltas.into_iter().all(|delta| delta <= native_limit),
+            "{name} duplicated native boundary work: one={one:?} two={two:?} three={three:?}"
+        );
+        assert!(native_deltas[1] <= native_deltas[0]);
+        assert!(clif_deltas[0] < one.0 && native_deltas[0] < one.1);
+    }
+}
+
+#[test]
+fn repeated_exact_fp_operations_share_the_cold_boundary_protocol() {
+    let shape = |words: &[(u64, u32)]| {
+        let memory = memory(words);
+        let process = JitProcess::new(cpu()).unwrap();
+        process.entry_for(&memory, location(CODE)).unwrap();
+        let state = process.state.lock().unwrap();
+        let region = state
+            .region_for(RegionKey::new(cpu(), location(CODE)))
+            .unwrap();
+        (region.clif_instructions, region.native_bytes)
+    };
+    let one = shape(&[
+        // Equalize the minimum state publication required if either typed call
+        // fails; the measured delta then excludes an unrelated first dirty V0.
+        (0, 0x4f00_0400), // MOVI V0.4S,#0
+        (4, 0x1e67_c020), // FRINTI D0,D1
+        (8, breakpoint(0)),
+    ]);
+    let two = shape(&[
+        (0, 0x4f00_0400), // MOVI V0.4S,#0
+        (4, 0x1e67_c020), // FRINTI D0,D1
+        (8, 0x1e67_c020), // FRINTI D0,D1
+        (12, breakpoint(0)),
+    ]);
+    let three = shape(&[
+        (0, 0x4f00_0400),  // MOVI V0.4S,#0
+        (4, 0x1e67_c020),  // FRINTI D0,D1
+        (8, 0x1e67_c020),  // FRINTI D0,D1
+        (12, 0x1e67_c020), // FRINTI D0,D1
+        (16, breakpoint(0)),
+    ]);
+    let clif_deltas = [two.0 - one.0, three.0 - two.0];
+    let native_deltas = [two.1 - one.1, three.1 - two.1];
+    assert_eq!(
+        clif_deltas, [32; 2],
+        "exact FP changed its per-operation CLIF shape: one={one:?} two={two:?} three={three:?}"
+    );
+    let native_limit = if cfg!(target_arch = "x86_64") {
+        256
+    } else {
+        192
+    };
+    assert!(
+        native_deltas.into_iter().all(|delta| delta <= native_limit),
+        "repeated exact FP duplicated native boundary work: one={one:?} two={two:?} three={three:?}"
+    );
+    assert!(native_deltas[1] <= native_deltas[0]);
+    assert!(clif_deltas[0] < one.0 && native_deltas[0] < one.1);
+}
+
+#[test]
+fn direct_fp_rounding_and_conversion_matrix_matches_the_interpreter() {
+    for encoding in [
+        0x1e64_4020_u32, // FRINTN D0,D1
+        0x1e64_c020,     // FRINTP D0,D1
+        0x1e65_4020,     // FRINTM D0,D1
+        0x1e65_c020,     // FRINTZ D0,D1
+        0x1e66_4020,     // FRINTA D0,D1
+    ] {
+        let mut state = rich_state();
+        assert!(state.set_vector(1, u128::from(1.5_f64.to_bits())));
+        assert_matches_interpreter(encoding, state);
+    }
+
+    for fpcr in [0, 1 << 22, 2 << 22, 3 << 22] {
+        for encoding in [
+            0x1e67_4020_u32, // FRINTX D0,D1
+            0x1e67_c020,     // FRINTI D0,D1
+        ] {
+            let mut state = rich_state();
+            state.set_fpcr(fpcr);
+            assert!(state.set_vector(1, u128::from((-1.75_f64).to_bits())));
+            assert_matches_interpreter(encoding, state);
+        }
+    }
+
+    for encoding in [
+        0x1e20_0020_u32, // FCVTNS W0,S1
+        0x1e24_0020,     // FCVTAS W0,S1
+        0x1e28_0020,     // FCVTPS W0,S1
+        0x1e30_0020,     // FCVTMS W0,S1
+        0x1e38_0020,     // FCVTZS W0,S1
+        0x1e19_e020,     // FCVTZU W0,S1,#8
+        0x1e58_f820,     // FCVTZS W0,D1,#2
+        0x9e59_c020,     // FCVTZU X0,D1,#16
+    ] {
+        let mut state = rich_state();
+        assert!(state.set_vector(1, u128::from((-3.75_f64).to_bits())));
+        assert_matches_interpreter(encoding, state);
+    }
+
+    for (encoding, value) in [
+        (0x1e22_0020_u32, u64::from(u32::MAX)), // SCVTF S0,W1
+        (0x1e23_0020, u64::from(u32::MAX)),     // UCVTF S0,W1
+        (0x9e62_0020, (1_u64 << 53) + 1),       // SCVTF D0,X1
+        (0x9e63_0020, u64::MAX),                // UCVTF D0,X1
+    ] {
+        let mut state = rich_state();
+        write_register(&mut state, 1, value);
+        assert_matches_interpreter(encoding, state);
+    }
+}
+
+#[test]
+fn direct_native_fp_status_materializes_across_rust_and_mrs_boundaries() {
+    let words = [
+        (0, 0x1e62_2820), // FADD D0,D1,D2
+        (4, 0xd53b_e008), // MRS X8,CNTFRQ_EL0 (typed Rust boundary)
+        (8, 0xd53b_4424), // MRS X4,FPSR
+        (12, breakpoint(0)),
+    ];
+    let expected_memory = memory(&words);
+    let actual_memory = memory(&words);
+    let mut expected = rich_state();
+    assert!(expected.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(expected.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    for (_, encoding) in words[..3].iter().copied() {
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let mut actual = rich_state();
+    assert!(actual.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(actual.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_ne!(read_register(&actual, 4) & (1 << 4), 0);
+}
+
+#[test]
+fn linked_exact_region_preserves_inherited_native_fp_status() {
+    const EXACT: u64 = CODE + 0x100;
+    let encodings = [
+        0x1e62_2820, // FADD D0,D1,D2: IXC
+        branch(CODE + 4, EXACT),
+        0x1e67_c083, // FRINTI D3,D4
+        0xd53b_4425, // MRS X5,FPSR
+    ];
+    let memory = memory(&[
+        (0, encodings[0]),
+        (4, encodings[1]),
+        (0x100, encodings[2]),
+        (0x104, encodings[3]),
+        (0x108, breakpoint(0)),
+    ]);
+    let mut expected = rich_state();
+    assert!(expected.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(expected.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert!(expected.set_vector(4, u128::from(1.75_f64.to_bits())));
+    for encoding in encodings {
+        assert_eq!(
+            execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let process = JitProcess::new(cpu()).unwrap();
+    process.entry_for(&memory, location(EXACT)).unwrap();
+    let mut actual = rich_state();
+    assert!(actual.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(actual.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert!(actual.set_vector(4, u128::from(1.75_f64.to_bits())));
+    JitThread::new()
+        .run(&process, &memory, &mut actual)
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_ne!(read_register(&actual, 5) & (1 << 4), 0);
+}
+
+#[test]
+fn direct_native_fp_status_materializes_at_replacement_and_scheduler_boundaries() {
+    let words = [
+        (0, 0x1e62_2820),  // FADD D0,D1,D2: IXC
+        (4, 0x1e65_0883),  // FMUL D3,D4,D5: OFC | IXC
+        (8, 0xd53b_4426),  // MRS X6,FPSR
+        (12, 0xd51b_4427), // MSR FPSR,X7
+        (16, 0xd53b_4428), // MRS X8,FPSR
+        (20, breakpoint(0)),
+    ];
+    let actual_memory = memory(&words);
+    let mut expected = rich_state();
+    assert!(expected.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(expected.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert!(expected.set_vector(4, u128::from(f64::MAX.to_bits())));
+    assert!(expected.set_vector(5, u128::from(2.0_f64.to_bits())));
+    write_register(&mut expected, 7, 0x82);
+    for (_, encoding) in words[..5].iter().copied() {
+        assert_eq!(
+            execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let mut actual = rich_state();
+    assert!(actual.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(actual.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert!(actual.set_vector(4, u128::from(f64::MAX.to_bits())));
+    assert!(actual.set_vector(5, u128::from(2.0_f64.to_bits())));
+    write_register(&mut actual, 7, 0x82);
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(read_register(&actual, 6) & 0x1f, (1 << 2) | (1 << 4));
+    assert_eq!(read_register(&actual, 8), 0x82);
+
+    let schedule_memory = memory(&[
+        (0, 0x1e62_2820), // FADD
+        (4, 0xd503_205f), // WFE
+        (8, breakpoint(0)),
+    ]);
+    let mut scheduled = rich_state();
+    assert!(scheduled.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(scheduled.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
     assert_eq!(
         JitThread::new()
             .run(
                 &JitProcess::new(cpu()).unwrap(),
-                &memory(&[(0, encoding), (4, breakpoint(0))]),
-                &mut actual,
+                &schedule_memory,
+                &mut scheduled,
             )
             .unwrap(),
-        DirectExit::Architectural {
-            pc: GuestVirtualAddress::new(CODE),
-            detail: 6 << 24,
+        DirectExit::Scheduled {
+            pc: GuestVirtualAddress::new(CODE + 4),
+            request: nixe_cpu::execution::SchedulerRequest::WaitForEvent,
             progress: 1,
         }
     );
+    assert_eq!(scheduled.pc(), CODE + 8);
+    assert_ne!(scheduled.fpsr() & (1 << 4), 0);
+}
+
+#[test]
+fn direct_fpcr_write_ends_the_native_mode_segment() {
+    let words = [
+        (0, 0x1e62_2820),  // FADD D0,D1,D2
+        (4, 0xd51b_4405),  // MSR FPCR,X5
+        (8, 0x1e62_2823),  // FADD D3,D1,D2
+        (12, 0xd53b_4424), // MRS X4,FPSR
+        (16, breakpoint(0)),
+    ];
+    let actual_memory = memory(&words);
+    let mut expected = rich_state();
+    write_register(&mut expected, 5, 1 << 22); // round toward +infinity
+    assert!(expected.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(expected.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    for (_, encoding) in words[..4].iter().copied() {
+        assert_eq!(
+            execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let mut actual = rich_state();
+    write_register(&mut actual, 5, 1 << 22);
+    assert!(actual.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(actual.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+        )
+        .unwrap();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn direct_fpcr_write_updates_the_exact_boundary_mode_cache() {
+    let words = [
+        (0, 0xd51b_4405), // MSR FPCR,X5
+        (4, 0x1e67_c020), // FRINTI D0,D1
+        (8, breakpoint(0)),
+    ];
+    let actual_memory = memory(&words);
+    let mut expected = rich_state();
+    write_register(&mut expected, 5, 1 << 22); // round toward +infinity
+    assert!(expected.set_vector(1, u128::from((-1.75_f64).to_bits())));
+    for (_, encoding) in words[..2].iter().copied() {
+        assert_eq!(
+            execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let mut actual = rich_state();
+    write_register(&mut actual, 5, 1 << 22);
+    assert!(actual.set_vector(1, u128::from((-1.75_f64).to_bits())));
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
+fn direct_native_fp_environment_restores_the_calling_thread() {
+    let original = read_host_fp();
+    let _restore = RestoreHostFp(original);
+    let caller = distinct_host_fp(original, 1);
+    write_host_fp(caller);
+    let mut state = rich_state();
+    assert!(state.set_vector(1, u128::from(1.25_f64.to_bits())));
+    assert!(state.set_vector(2, u128::from(2.5_f64.to_bits())));
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &memory(&[(0, 0x1e62_2820), (4, breakpoint(0))]),
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(read_host_fp(), caller);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The x86 lowering for CLIF rounding can raise MXCSR.PE even though Arm's
+        // non-exact FRINT forms do not update FPSR. The JIT must therefore keep
+        // this operation off the native x86 status path and preserve a clean
+        // caller status word.
+        let caller = HostFpSnapshot {
+            control: original.control & !(3 << 13),
+            status: 0,
+        };
+        write_host_fp(caller);
+        let mut state = rich_state();
+        assert!(state.set_vector(9, u128::from(2.5_f64.to_bits())));
+        JitThread::new()
+            .run(
+                &JitProcess::new(cpu()).unwrap(),
+                &memory(&[(0, 0x1e64_4128), (4, breakpoint(0))]), // FRINTN D8,D9
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(read_host_fp(), caller);
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
+fn direct_native_fp_state_is_isolated_between_concurrent_vcpus() {
+    let memory = Arc::new(memory(&[
+        (0, 0x1e62_2820), // FADD D0,D1,D2
+        (4, 0xd53b_4424), // MRS X4,FPSR
+        (8, breakpoint(0)),
+    ]));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let ready = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+
+    for index in 0_u32..2 {
+        let memory = Arc::clone(&memory);
+        let process = Arc::clone(&process);
+        let ready = Arc::clone(&ready);
+        workers.push(std::thread::spawn(move || {
+            let original = read_host_fp();
+            let restore = RestoreHostFp(original);
+            let caller = distinct_host_fp(original, index + 1);
+            write_host_fp(caller);
+
+            let mut state = rich_state();
+            let initial_fpsr = if index == 0 { 0 } else { 1 << 1 };
+            state.set_fpsr(initial_fpsr);
+            assert!(state.set_vector(1, u128::from(1.0_f64.to_bits())));
+            let rhs = if index == 0 { 2.0_f64.powi(-53) } else { 1.0 };
+            assert!(state.set_vector(2, u128::from(rhs.to_bits())));
+
+            ready.wait();
+            let exit = JitThread::new().run(process.as_ref(), memory.as_ref(), &mut state);
+            let observed_host = read_host_fp();
+            drop(restore);
+            (exit, state, caller, observed_host, initial_fpsr)
+        }));
+    }
+
+    for worker in workers {
+        let (exit, state, caller, observed_host, initial_fpsr) = worker.join().unwrap();
+        assert!(matches!(exit.unwrap(), DirectExit::Architectural { .. }));
+        assert_eq!(observed_host, caller);
+        let expected_fpsr = if initial_fpsr == 0 {
+            1 << 4
+        } else {
+            initial_fpsr
+        };
+        assert_eq!(state.fpsr(), expected_fpsr);
+        assert_eq!(read_register(&state, 4), u64::from(expected_fpsr));
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
+fn direct_native_fp_state_survives_vcpu_host_thread_migration() {
+    let memory = Arc::new(memory(&[
+        (0, 0x1e62_2820),  // FADD D0,D1,D2
+        (4, 0xd503_205f),  // WFE
+        (8, 0x1e62_2823),  // FADD D3,D1,D2
+        (12, 0xd53b_4424), // MRS X4,FPSR
+        (16, breakpoint(0)),
+    ]));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let mut initial = rich_state();
+    assert!(initial.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(initial.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+
+    let first_memory = Arc::clone(&memory);
+    let first_process = Arc::clone(&process);
+    let first = std::thread::spawn(move || {
+        let original = read_host_fp();
+        let restore = RestoreHostFp(original);
+        let caller = distinct_host_fp(original, 1);
+        write_host_fp(caller);
+        let mut state = initial;
+        let exit = JitThread::new().run(first_process.as_ref(), first_memory.as_ref(), &mut state);
+        let observed_host = read_host_fp();
+        drop(restore);
+        (exit, state, caller, observed_host)
+    });
+    let (first_exit, scheduled, first_caller, first_observed) = first.join().unwrap();
+    assert_eq!(
+        first_exit.unwrap(),
+        DirectExit::Scheduled {
+            pc: GuestVirtualAddress::new(CODE + 4),
+            request: nixe_cpu::execution::SchedulerRequest::WaitForEvent,
+            progress: 1,
+        }
+    );
+    assert_eq!(first_observed, first_caller);
+    assert_eq!(scheduled.pc(), CODE + 8);
+    assert_eq!(scheduled.fpsr() & (1 << 4), 1 << 4);
+
+    let second_memory = Arc::clone(&memory);
+    let second_process = Arc::clone(&process);
+    let second = std::thread::spawn(move || {
+        let original = read_host_fp();
+        let restore = RestoreHostFp(original);
+        let caller = distinct_host_fp(original, 2);
+        write_host_fp(caller);
+        let mut state = scheduled;
+        let exit =
+            JitThread::new().run(second_process.as_ref(), second_memory.as_ref(), &mut state);
+        let observed_host = read_host_fp();
+        drop(restore);
+        (exit, state, caller, observed_host)
+    });
+    let (second_exit, completed, second_caller, second_observed) = second.join().unwrap();
+    assert!(matches!(
+        second_exit.unwrap(),
+        DirectExit::Architectural { .. }
+    ));
+    assert_eq!(second_observed, second_caller);
+    assert_eq!(completed.fpsr() & (1 << 4), 1 << 4);
+    assert_eq!(read_register(&completed, 4) & (1 << 4), 1 << 4);
+}
+
+#[test]
+fn direct_every_enabled_fp_exception_is_precise_and_atomic() {
+    let mut invalid = rich_state();
+    invalid.set_fpcr(1 << 8); // IOE
+    assert!(invalid.set_vector(1, u128::from(f64::INFINITY.to_bits())));
+    assert!(invalid.set_vector(2, u128::from(f64::NEG_INFINITY.to_bits())));
+    assert_fp_exception_matches_interpreter(0x1e62_2820, invalid); // FADD D0,D1,D2
+
+    let mut divide_by_zero = rich_state();
+    divide_by_zero.set_fpcr(1 << 9); // DZE
+    assert!(divide_by_zero.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(divide_by_zero.set_vector(2, 0));
+    assert_fp_exception_matches_interpreter(0x1e62_1820, divide_by_zero); // FDIV D0,D1,D2
+
+    let mut overflow = rich_state();
+    overflow.set_fpcr(1 << 10); // OFE
+    assert!(overflow.set_vector(1, u128::from(f64::MAX.to_bits())));
+    assert!(overflow.set_vector(2, u128::from(2.0_f64.to_bits())));
+    assert_fp_exception_matches_interpreter(0x1e62_0820, overflow); // FMUL D0,D1,D2
+
+    let mut underflow = rich_state();
+    underflow.set_fpcr(1 << 11); // UFE
+    assert!(underflow.set_vector(1, u128::from(0x0010_0000_0000_0000_u64)));
+    assert!(underflow.set_vector(2, u128::from(0x0010_0000_0000_0000_u64)));
+    assert_fp_exception_matches_interpreter(0x1e62_0820, underflow); // FMUL D0,D1,D2
+
+    let mut inexact = rich_state();
+    inexact.set_fpcr(1 << 12); // IXE
+    assert!(inexact.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(inexact.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+    assert_fp_exception_matches_interpreter(0x1e62_2820, inexact); // FADD D0,D1,D2
+
+    let mut input_denormal = rich_state();
+    input_denormal.set_fpcr((1 << 15) | (1 << 24)); // IDE | FZ
+    assert!(input_denormal.set_vector(1, 1));
+    assert!(input_denormal.set_vector(2, u128::from(1.0_f64.to_bits())));
+    assert_fp_exception_matches_interpreter(0x1e62_0820, input_denormal); // FMUL D0,D1,D2
 }
 
 #[test]
@@ -1229,18 +2095,244 @@ fn scalar_memory_addressing_and_transfer_forms_match_the_interpreter() {
         0x39c0_0020, // LDRSB W0,[X1]
         0xb980_0020, // LDRSW X0,[X1]
         0xf840_0020, // LDUR X0,[X1]
+        0xf800_0023, // STUR X3,[X1]
         0xf840_8420, // LDR X0,[X1],#8
+        0xf800_8423, // STR X3,[X1],#8
         0xf840_8c20, // LDR X0,[X1,#8]!
+        0xf800_8c23, // STR X3,[X1,#8]!
         0xf862_6820, // LDR X0,[X1,X2]
+        0xf822_6823, // STR X3,[X1,X2]
         0xa940_0c20, // LDP X0,X3,[X1]
         0xa900_0c20, // STP X0,X3,[X1]
+        0xa8c1_0c20, // LDP X0,X3,[X1],#16
+        0xa881_0c20, // STP X0,X3,[X1],#16
+        0xa9c1_0c20, // LDP X0,X3,[X1,#16]!
+        0xa981_0c20, // STP X0,X3,[X1,#16]!
         0x6940_0c20, // LDPSW X0,X3,[X1]
         0x5800_0040, // LDR X0,[PC,#8]
+        0x08df_fc20, // LDARB W0,[X1]
+        0x48df_fc20, // LDARH W0,[X1]
+        0x88df_fc20, // LDAR W0,[X1]
         0xc8df_fc20, // LDAR X0,[X1]
+        0x089f_fc23, // STLRB W3,[X1]
+        0x489f_fc23, // STLRH W3,[X1]
+        0x889f_fc23, // STLR W3,[X1]
         0xc89f_fc23, // STLR X3,[X1]
     ];
     for encoding in cases {
         assert_memory_matches_interpreter(encoding);
+    }
+}
+
+#[test]
+fn linux_direct_ordered_scalar_accesses_use_the_shared_arena() {
+    for (size, load, store, value) in [
+        (
+            MemoryAccessSize::Byte,
+            0x08df_fc20_u32,
+            0x089f_fc23_u32,
+            0xa5_u64,
+        ),
+        (MemoryAccessSize::Halfword, 0x48df_fc20, 0x489f_fc23, 0xa5c3),
+        (
+            MemoryAccessSize::Word,
+            0x88df_fc20,
+            0x889f_fc23,
+            0xa5c3_9678,
+        ),
+        (
+            MemoryAccessSize::Doubleword,
+            0xc8df_fc20,
+            0xc89f_fc23,
+            0xa5c3_9678_1234_fedc,
+        ),
+    ] {
+        let mut memory = execution_memory_with_data(store);
+        memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap();
+        let process = JitProcess::new(cpu()).unwrap();
+        let binding = MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: &memory,
+            mapping_epoch: memory.mapping_epoch().get(),
+            invalidation_cursor: memory.invalidation_cursor(),
+        };
+        process.bind_memory(binding).unwrap();
+        let mut thread = JitThread::new();
+        thread.synchronize_address_space(&process, binding).unwrap();
+        let mut state = memory_state();
+        write_register(&mut state, 3, value);
+        assert!(matches!(
+            thread.run(&process, &memory, &mut state).unwrap(),
+            DirectExit::Architectural { .. }
+        ));
+        assert_eq!(
+            memory
+                .read(
+                    SPACE,
+                    GuestVirtualAddress::new(DATA),
+                    MemoryAccess::normal(size)
+                )
+                .unwrap()
+                .value,
+            MemoryValue::from_bits(size, u128::from(value)),
+        );
+
+        let mut memory = execution_memory_with_data(load);
+        memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap();
+        let process = JitProcess::new(cpu()).unwrap();
+        let binding = MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: &memory,
+            mapping_epoch: memory.mapping_epoch().get(),
+            invalidation_cursor: memory.invalidation_cursor(),
+        };
+        process.bind_memory(binding).unwrap();
+        let mut thread = JitThread::new();
+        thread.synchronize_address_space(&process, binding).unwrap();
+        let mut state = memory_state();
+        assert!(matches!(
+            thread.run(&process, &memory, &mut state).unwrap(),
+            DirectExit::Architectural { .. }
+        ));
+        let expected = u64::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7])
+            & if size == MemoryAccessSize::Doubleword {
+                u64::MAX
+            } else {
+                (1_u64 << (size.bytes() * 8)) - 1
+            };
+        assert_eq!(read_register(&state, 0), expected);
+    }
+}
+
+#[test]
+fn linux_direct_ordered_access_rejects_misalignment_before_native_memory() {
+    let mut memory = execution_memory_with_data(0xc8df_fc20); // LDAR X0,[X1]
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+    write_register(&mut state, 1, DATA + 1);
+
+    let DirectExit::DataFault { fault, .. } = thread.run(&process, &memory, &mut state).unwrap()
+    else {
+        panic!("misaligned ordered load did not report a data fault");
+    };
+    assert_eq!(
+        fault.reason,
+        DataAccessFaultReason::Misaligned {
+            required_alignment: 8,
+        }
+    );
+}
+
+#[test]
+fn simd_structure_memory_shapes_match_the_interpreter() {
+    for encoding in [
+        0x4c40_7020, // LD1 {V0.16B},[X1]
+        0x0c40_7020, // LD1 {V0.8B},[X1]
+        0x0c40_7420, // LD1 {V0.4H},[X1]
+        0x0c40_7820, // LD1 {V0.2S},[X1]
+        0x0c40_7c20, // LD1 {V0.1D},[X1]
+        0x4c00_7020, // ST1 {V0.16B},[X1]
+        0x4c40_a020, // LD1 {V0.16B,V1.16B},[X1]
+        0x4c40_6020, // LD1 {V0.16B-V2.16B},[X1]
+        0x4c40_2020, // LD1 {V0.16B-V3.16B},[X1]
+        0x4c40_8020, // LD2 {V0.16B,V1.16B},[X1]
+        0x4c40_4020, // LD3 {V0.16B-V2.16B},[X1]
+        0x4c40_0020, // LD4 {V0.16B-V3.16B},[X1]
+        0x4c00_8020, // ST2 {V0.16B,V1.16B},[X1]
+        0x4c00_4020, // ST3 {V0.16B-V2.16B},[X1]
+        0x4c00_0020, // ST4 {V0.16B-V3.16B},[X1]
+        0x0d40_0c20, // LD1 {V0.B}[3],[X1]
+        0x0d60_0c20, // LD2 {V0.B,V1.B}[3],[X1]
+        0x0d40_2c20, // LD3 {V0.B-V2.B}[3],[X1]
+        0x0d60_2c20, // LD4 {V0.B-V3.B}[3],[X1]
+        0x0d00_0c20, // ST1 {V0.B}[3],[X1]
+        0x0d20_0c20, // ST2 {V0.B,V1.B}[3],[X1]
+        0x0d00_2c20, // ST3 {V0.B-V2.B}[3],[X1]
+        0x0d20_2c20, // ST4 {V0.B-V3.B}[3],[X1]
+        0x4d40_c020, // LD1R {V0.16B},[X1]
+        0x0d40_c020, // LD1R {V0.8B},[X1]
+        0x0d40_c420, // LD1R {V0.4H},[X1]
+        0x0d40_c820, // LD1R {V0.2S},[X1]
+        0x0d40_cc20, // LD1R {V0.1D},[X1]
+        0x4d60_c020, // LD2R {V0.16B,V1.16B},[X1]
+        0x4d40_e020, // LD3R {V0.16B-V2.16B},[X1]
+        0x4d60_e020, // LD4R {V0.16B-V3.16B},[X1]
+        0x4cdf_883e, // LD2 {V30.4S,V31.4S},[X1],#32
+        0x4c82_443f, // ST3 {V31.8H-V1.8H},[X1],X2
+        0x0dff_783e, // LD4 {V30.H-V1.H}[3],[X1],#8
+        0x0d40_8020, // LD1 {V0.S}[0],[X1]
+        0x0d40_8420, // LD1 {V0.D}[0],[X1]
+        0x4da2_843f, // ST2 {V31.D,V0.D}[1],[X1],X2
+        0x4ddf_e83f, // LD3R {V31.4S-V1.4S},[X1],#12
+        0x4de2_ec3e, // LD4R {V30.2D-V1.2D},[X1],X2
+    ] {
+        assert_memory_matches_interpreter(encoding);
+    }
+}
+
+#[test]
+fn linux_direct_scalar_indexed_faults_suppress_writeback() {
+    for (encoding, base) in [
+        (0xf840_8420_u32, DATA + DIRECT_PAGE_SIZE as u64), // LDR X0,[X1],#8
+        (
+            0xf840_8c20,
+            DATA + DIRECT_PAGE_SIZE as u64 - size_of::<u64>() as u64,
+        ), // LDR X0,[X1,#8]!
+    ] {
+        let expected_memory = memory_with_data(encoding);
+        let mut expected = memory_state();
+        write_register(&mut expected, 1, base);
+        let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+        let events = nixe_cpu::execution::VcpuEventState::default();
+        let context =
+            InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+        assert!(matches!(
+            execute_one_with_context(context, &mut expected, encoding).unwrap(),
+            InstructionStep::Exit(nixe_cpu::execution::CpuExit::DataFault { .. })
+        ));
+
+        let mut actual_memory = execution_memory_with_data(encoding);
+        actual_memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap();
+        let process = JitProcess::new(cpu()).unwrap();
+        let binding = MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: &actual_memory,
+            mapping_epoch: actual_memory.mapping_epoch().get(),
+            invalidation_cursor: actual_memory.invalidation_cursor(),
+        };
+        process.bind_memory(binding).unwrap();
+        let mut thread = JitThread::new();
+        thread.synchronize_address_space(&process, binding).unwrap();
+        let mut actual = memory_state();
+        write_register(&mut actual, 1, base);
+        assert!(matches!(
+            thread.run(&process, &actual_memory, &mut actual).unwrap(),
+            DirectExit::DataFault { .. }
+        ));
+        assert_eq!(actual, expected, "{encoding:#010x}");
+        assert_eq!(read_register(&actual, 1), base);
     }
 }
 
@@ -1728,6 +2820,55 @@ fn linux_direct_first_write_retries_then_stores_remain_native() {
 }
 
 #[test]
+fn linux_direct_fault_retry_preserves_pending_native_fpsr() {
+    let mut memory = execution_memory_with_words_and_data(&[
+        (0, 0x1e62_2820), // FADD D0,D1,D2: IXC remains in host status
+        (4, 0xf900_0023), // STR X3,[X1]: first write faults and retries
+        (8, 0xd53b_4424), // MRS X4,FPSR
+        (12, breakpoint(0)),
+    ]);
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+
+    let stored = 0xa5c3_9678_1234_fedc_u64;
+    let mut state = memory_state();
+    write_register(&mut state, 1, DATA);
+    write_register(&mut state, 3, stored);
+    assert!(state.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert!(state.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural { .. }
+    ));
+    assert_eq!(state.fpsr() & (1 << 4), 1 << 4);
+    assert_eq!(read_register(&state, 4) & (1 << 4), 1 << 4);
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(DATA),
+                MemoryAccess::normal(MemoryAccessSize::Doubleword),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::from_bits(MemoryAccessSize::Doubleword, u128::from(stored)),
+    );
+}
+
+#[test]
 fn linux_direct_scalar_pair_loads_remain_native() {
     let mut memory = execution_memory_with_data(0xa940_0c20); // LDP X0,X3,[X1]
     memory
@@ -1909,6 +3050,43 @@ fn linux_direct_simd_quadword_loads_and_stores_use_the_shared_arena() {
             .unwrap()
             .value,
         MemoryValue::U128(second),
+    );
+}
+
+#[test]
+fn linux_direct_interleaved_simd_structure_load_uses_the_shared_arena() {
+    let mut memory = execution_memory_with_data(0x4c40_8020); // LD2 {V0.16B,V1.16B},[X1]
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+
+    assert!(matches!(
+        thread.run(&process, &memory, &mut state).unwrap(),
+        DirectExit::Architectural { .. }
+    ));
+    assert_eq!(
+        state.vector(0),
+        Some(u128::from_le_bytes(std::array::from_fn(|lane| {
+            (lane * 2) as u8
+        })))
+    );
+    assert_eq!(
+        state.vector(1),
+        Some(u128::from_le_bytes(std::array::from_fn(|lane| {
+            (lane * 2 + 1) as u8
+        })))
     );
 }
 
@@ -2290,22 +3468,41 @@ fn linux_direct_raw_mmio_fault_does_not_invoke_the_device_handler() {
 }
 
 #[test]
-fn exclusive_load_store_round_trip_matches_the_interpreter() {
-    let words = [
-        (0, 0xc85f_7c20), // LDXR X0,[X1]
-        (4, 0xc800_7c23), // STXR W0,X3,[X1]
-        (8, breakpoint(0)),
-    ];
+fn scalar_and_pair_exclusive_forms_match_the_interpreter() {
+    let mut encodings = Vec::new();
+    for size in 0..=3 {
+        for acquire in [false, true] {
+            for release in [false, true] {
+                encodings.push(load_exclusive(size, acquire));
+                encodings.push(store_exclusive(size, release));
+            }
+        }
+    }
+    for size in 2..=3 {
+        for acquire in [false, true] {
+            for release in [false, true] {
+                encodings.push(load_exclusive_pair(size, acquire));
+                encodings.push(store_exclusive_pair(size, release));
+            }
+        }
+    }
+    let mut words: Vec<_> = encodings
+        .iter()
+        .enumerate()
+        .map(|(index, encoding)| ((index * 4) as u64, *encoding))
+        .collect();
+    words.push(((encodings.len() * 4) as u64, breakpoint(0)));
     let expected_memory = memory_with_words_and_data(&words);
     let actual_memory = memory_with_words_and_data(&words);
     let mut expected = memory_state();
     let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
     let events = nixe_cpu::execution::VcpuEventState::default();
     let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
-    for encoding in [0xc85f_7c20_u32, 0xc800_7c23] {
+    for encoding in encodings {
         assert_eq!(
             execute_one_with_context(context, &mut expected, encoding).unwrap(),
-            InstructionStep::Continue
+            InstructionStep::Continue,
+            "{encoding:#010x}"
         );
     }
     let mut actual = memory_state();
@@ -2317,7 +3514,375 @@ fn exclusive_load_store_round_trip_matches_the_interpreter() {
         )
         .unwrap();
     assert_eq!(actual, expected);
+    assert_eq!(read_register(&actual, 2), 0);
     assert_memory_prefix_equal(&actual_memory, &expected_memory, 16);
+}
+
+#[test]
+fn clear_exclusive_forces_the_next_store_exclusive_to_fail() {
+    let words = [
+        (0, load_exclusive(2, true)),
+        (4, 0xd503_3f5f), // CLREX
+        (8, store_exclusive(2, true)),
+        (12, breakpoint(0)),
+    ];
+    let expected_memory = memory_with_words_and_data(&words);
+    let actual_memory = memory_with_words_and_data(&words);
+    let mut expected = memory_state();
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    for encoding in [words[0].1, words[1].1, words[2].1] {
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let mut actual = memory_state();
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(read_register(&actual, 2), 1);
+    assert_memory_prefix_equal(&actual_memory, &expected_memory, 16);
+}
+
+#[test]
+fn pair_exclusive_reservation_uses_physical_alias_identity() {
+    let words = [
+        (0, load_exclusive_pair(3, true)),
+        (4, 0x9140_0421), // ADD X1,X1,#1,LSL #12
+        (8, store_exclusive_pair(3, true)),
+        (12, breakpoint(0)),
+    ];
+    let mut expected_memory = memory_with_words_and_data(&words);
+    let mut actual_memory = memory_with_words_and_data(&words);
+    for memory in [&mut expected_memory, &mut actual_memory] {
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(DATA + DIRECT_PAGE_SIZE as u64),
+            GuestPhysicalPageId::new(2),
+            MemoryPermissions::READ_WRITE,
+        ));
+    }
+
+    let mut expected = memory_state();
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    for encoding in [words[0].1, words[1].1, words[2].1] {
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let mut actual = memory_state();
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(read_register(&actual, 2), 0);
+    assert_memory_prefix_equal(&actual_memory, &expected_memory, 16);
+}
+
+#[test]
+fn linux_direct_lse_cas_and_casp_forms_match_the_interpreter() {
+    let mut encodings = Vec::new();
+    for size in 0..=3 {
+        for acquire in [false, true] {
+            for release in [false, true] {
+                for operation in 0..=8 {
+                    encodings.push(lse_rmw(size, acquire, release, operation));
+                }
+                encodings.push(compare_and_swap(size, acquire, release));
+            }
+        }
+    }
+    for size in 0..=1 {
+        for acquire in [false, true] {
+            for release in [false, true] {
+                encodings.push(compare_and_swap_pair(size, acquire, release));
+            }
+        }
+    }
+
+    let mut words: Vec<_> = encodings
+        .iter()
+        .enumerate()
+        .map(|(index, encoding)| ((index * 4) as u64, *encoding))
+        .collect();
+    words.push(((encodings.len() * 4) as u64, breakpoint(0)));
+    let expected_memory = memory_with_words_and_data(&words);
+    let mut actual_memory = execution_memory_with_words_and_data(&words);
+    actual_memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+
+    let mut expected = memory_state();
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    for encoding in encodings {
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding).unwrap(),
+            InstructionStep::Continue,
+            "{encoding:#010x}"
+        );
+    }
+
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &actual_memory,
+        mapping_epoch: actual_memory.mapping_epoch().get(),
+        invalidation_cursor: actual_memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut actual = memory_state();
+    assert!(matches!(
+        thread.run(&process, &actual_memory, &mut actual).unwrap(),
+        DirectExit::Architectural { .. }
+    ));
+
+    assert_eq!(actual, expected);
+    let mut expected_bytes = [0; 32];
+    let mut actual_bytes = [0; 32];
+    expected_memory
+        .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut expected_bytes)
+        .unwrap();
+    actual_memory
+        .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut actual_bytes)
+        .unwrap();
+    assert_eq!(actual_bytes, expected_bytes);
+}
+
+#[test]
+fn linux_direct_cas_and_casp_successfully_replace_every_width() {
+    let cases = [
+        (compare_and_swap(0, true, true), 0, 0),
+        (compare_and_swap(1, true, true), 0x0100, 0),
+        (compare_and_swap(2, true, true), 0x0302_0100, 0),
+        (compare_and_swap(3, true, true), 0x0706_0504_0302_0100, 0),
+        (
+            compare_and_swap_pair(0, true, true),
+            0x0302_0100,
+            0x0706_0504,
+        ),
+        (
+            compare_and_swap_pair(1, true, true),
+            0x0706_0504_0302_0100,
+            0x0f0e_0d0c_0b0a_0908,
+        ),
+    ];
+    for (encoding, expected_low, expected_high) in cases {
+        let expected_memory = memory_with_data(encoding);
+        let mut actual_memory = execution_memory_with_data(encoding);
+        actual_memory
+            .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+            .unwrap();
+        let mut initial = memory_state();
+        write_register(&mut initial, 2, expected_low);
+        write_register(&mut initial, 3, expected_high);
+        write_register(&mut initial, 4, 0x1122_3344_5566_7788);
+        write_register(&mut initial, 5, 0x99aa_bbcc_ddee_ff00);
+
+        let mut expected = initial.clone();
+        let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+        let events = nixe_cpu::execution::VcpuEventState::default();
+        let context =
+            InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+
+        let process = JitProcess::new(cpu()).unwrap();
+        let binding = MemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(0x1_0000),
+            memory: &actual_memory,
+            mapping_epoch: actual_memory.mapping_epoch().get(),
+            invalidation_cursor: actual_memory.invalidation_cursor(),
+        };
+        process.bind_memory(binding).unwrap();
+        let mut thread = JitThread::new();
+        thread.synchronize_address_space(&process, binding).unwrap();
+        let mut actual = initial;
+        thread.run(&process, &actual_memory, &mut actual).unwrap();
+        assert_eq!(actual, expected, "{encoding:#010x}");
+
+        let mut expected_bytes = [0; 16];
+        let mut actual_bytes = [0; 16];
+        expected_memory
+            .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut expected_bytes)
+            .unwrap();
+        actual_memory
+            .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut actual_bytes)
+            .unwrap();
+        assert_eq!(actual_bytes, expected_bytes, "{encoding:#010x}");
+    }
+}
+
+#[test]
+fn linux_direct_atomic_fault_retry_commits_once() {
+    let encoding = lse_rmw(2, true, true, 0); // LDADDAL W2,W3,[X1]
+    let mut memory = execution_memory_with_data(encoding);
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+    write_register(&mut state, 2, 1);
+
+    let initial = u32::from_le_bytes([0, 1, 2, 3]);
+    for increment in 1..=2 {
+        state.set_pc(CODE);
+        thread.run(&process, &memory, &mut state).unwrap();
+        assert_eq!(
+            memory
+                .read(
+                    SPACE,
+                    GuestVirtualAddress::new(DATA),
+                    MemoryAccess::normal(MemoryAccessSize::Word),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U32(initial + increment),
+        );
+    }
+}
+
+#[test]
+fn linux_direct_lse_updates_are_atomic_through_physical_aliases() {
+    const VCPUS: usize = 4;
+    const ITERATIONS: usize = 100;
+    let encoding = lse_rmw(2, true, true, 0); // LDADDAL W2,W3,[X1]
+    let mut memory = execution_memory_with_data(encoding);
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA + DIRECT_PAGE_SIZE as u64),
+        GuestPhysicalPageId::new(2),
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let memory = Arc::new(memory);
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: memory.as_ref(),
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+
+    let mut workers = Vec::new();
+    for vcpu in 0..VCPUS {
+        let memory = Arc::clone(&memory);
+        let process = Arc::clone(&process);
+        workers.push(std::thread::spawn(move || {
+            let binding = MemoryBinding {
+                address_space: SPACE,
+                end_exclusive: GuestVirtualAddress::new(0x1_0000),
+                memory: memory.as_ref(),
+                mapping_epoch: memory.mapping_epoch().get(),
+                invalidation_cursor: memory.invalidation_cursor(),
+            };
+            let mut thread = JitThread::new();
+            thread
+                .synchronize_address_space(process.as_ref(), binding)
+                .unwrap();
+            let mut state = memory_state();
+            write_register(
+                &mut state,
+                1,
+                DATA + (vcpu % 2) as u64 * DIRECT_PAGE_SIZE as u64,
+            );
+            write_register(&mut state, 2, 1);
+            for _ in 0..ITERATIONS {
+                state.set_pc(CODE);
+                thread
+                    .run(process.as_ref(), memory.as_ref(), &mut state)
+                    .unwrap();
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let initial = u32::from_le_bytes([0, 1, 2, 3]);
+    for address in [DATA, DATA + DIRECT_PAGE_SIZE as u64] {
+        assert_eq!(
+            memory
+                .read(
+                    SPACE,
+                    GuestVirtualAddress::new(address),
+                    MemoryAccess::normal(MemoryAccessSize::Word),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U32(initial + (VCPUS * ITERATIONS) as u32),
+        );
+    }
+}
+
+#[test]
+fn linux_direct_atomic_access_rejects_misalignment_before_native_memory() {
+    let encoding = compare_and_swap_pair(1, true, true); // CASPAL X2,X3,X4,X5,[X1]
+    let mut memory = execution_memory_with_data(encoding);
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let mut state = memory_state();
+    write_register(&mut state, 1, DATA + 8);
+
+    let DirectExit::DataFault { fault, .. } = thread.run(&process, &memory, &mut state).unwrap()
+    else {
+        panic!("misaligned CASP did not report a data fault");
+    };
+    assert_eq!(
+        fault.reason,
+        DataAccessFaultReason::Misaligned {
+            required_alignment: 16,
+        }
+    );
 }
 
 #[test]
@@ -2364,6 +3929,47 @@ fn exclusive_atomic_updates_are_indivisible_across_vcpus() {
         result,
         MemoryValue::U32(initial + (VCPUS * ITERATIONS) as u32)
     );
+}
+
+#[test]
+fn pair_exclusive_updates_are_indivisible_across_vcpus() {
+    const VCPUS: usize = 4;
+    const ITERATIONS: usize = 100;
+    let cpu = cpu();
+    let memory = Arc::new(memory_with_words_and_data(&[
+        (0x00, load_exclusive_pair(3, true)),
+        (0x04, 0x9100_0400), // ADD X0,X0,#1
+        (0x08, store_exclusive_pair(3, true)),
+        (0x0c, compare_branch(CODE + 0x0c, CODE, 2, true)),
+        (0x10, breakpoint(0)),
+    ]));
+    let process = Arc::new(JitProcess::new(cpu).unwrap());
+    let mut workers = Vec::new();
+    for _ in 0..VCPUS {
+        let memory = Arc::clone(&memory);
+        let process = Arc::clone(&process);
+        workers.push(std::thread::spawn(move || {
+            let thread = JitThread::new();
+            let mut state = memory_state();
+            for _ in 0..ITERATIONS {
+                state.set_pc(CODE);
+                let exit = thread.run(&process, memory.as_ref(), &mut state).unwrap();
+                assert!(matches!(exit, DirectExit::Architectural { .. }));
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let mut bytes = [0; 16];
+    memory
+        .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut bytes)
+        .unwrap();
+    let low = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let high = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+    assert_eq!(low, 0x0706_0504_0302_0100 + (VCPUS * ITERATIONS) as u64);
+    assert_eq!(high, 0x0f0e_0d0c_0b0a_0908);
 }
 
 #[test]
@@ -2569,8 +4175,8 @@ fn assert_memory_matches_interpreter(encoding: u32) {
         DirectExit::Architectural { progress: 1, .. }
     ));
     assert_eq!(actual_state, expected_state, "{encoding:#010x}");
-    let mut expected_bytes = [0_u8; 32];
-    let mut actual_bytes = [0_u8; 32];
+    let mut expected_bytes = [0_u8; 64];
+    let mut actual_bytes = [0_u8; 64];
     expected_memory
         .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut expected_bytes)
         .unwrap();
@@ -2638,6 +4244,32 @@ fn execution_memory_with_data(encoding: u32) -> ExecutionMemory {
     assert!(memory.add_ram_page(code_page));
     assert!(memory.initialize_ram(code_page, 0, &encoding.to_le_bytes()));
     assert!(memory.initialize_ram(code_page, 4, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    let data_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_ram_page(data_page));
+    let bytes: Vec<_> = (0_u8..=255).collect();
+    assert!(memory.initialize_ram(data_page, 0, &bytes));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+}
+
+fn execution_memory_with_words_and_data(words: &[(u64, u32)]) -> ExecutionMemory {
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(code_page));
+    for &(offset, encoding) in words {
+        assert!(memory.initialize_ram(code_page, offset as usize, &encoding.to_le_bytes()));
+    }
     assert!(memory.map_page(
         SPACE,
         GuestVirtualAddress::new(CODE),
@@ -3082,6 +4714,35 @@ fn assert_matches_interpreter(encoding: u32, initial: A64State) {
     assert_eq!(actual, expected, "{encoding:#010x}");
 }
 
+fn assert_fp_exception_matches_interpreter(encoding: u32, initial: A64State) {
+    let mut expected = initial.clone();
+    assert!(matches!(
+        execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+        InstructionStep::Exit(nixe_cpu::execution::CpuExit::ArchitecturalException {
+            kind: nixe_cpu::exception::ExceptionKind::FloatingPoint,
+            ..
+        })
+    ));
+
+    let mut actual = initial;
+    assert_eq!(
+        JitThread::new()
+            .run(
+                &JitProcess::new(cpu()).unwrap(),
+                &memory(&[(0, encoding), (4, breakpoint(0))]),
+                &mut actual,
+            )
+            .unwrap(),
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE),
+            detail: 6 << 24,
+            progress: 1,
+        },
+        "{encoding:#010x}"
+    );
+    assert_eq!(actual, expected, "{encoding:#010x}");
+}
+
 fn assert_control_matches_interpreter(encoding: u32, initial: A64State) {
     let mut expected = initial.clone();
     assert_eq!(
@@ -3166,6 +4827,66 @@ fn compare_branch(source: u64, target: u64, register: u8, nonzero: bool) -> u32 
         | (u32::from(nonzero) << 24)
         | ((((displacement >> 2) as u32) & 0x7ffff) << 5)
         | u32::from(register)
+}
+
+fn lse_rmw(size: u8, acquire: bool, release: bool, operation: u8) -> u32 {
+    0x3820_0000
+        | (u32::from(size) << 30)
+        | (u32::from(acquire) << 23)
+        | (u32::from(release) << 22)
+        | (u32::from(2_u8) << 16)
+        | (u32::from(operation) << 12)
+        | (u32::from(1_u8) << 5)
+        | u32::from(3_u8)
+}
+
+fn compare_and_swap(size: u8, acquire: bool, release: bool) -> u32 {
+    0x08a0_7c00
+        | (u32::from(size) << 30)
+        | (u32::from(acquire) << 22)
+        | (u32::from(release) << 15)
+        | (u32::from(2_u8) << 16)
+        | (u32::from(1_u8) << 5)
+        | u32::from(3_u8)
+}
+
+fn compare_and_swap_pair(size: u8, acquire: bool, release: bool) -> u32 {
+    0x0820_7c00
+        | (u32::from(size) << 30)
+        | (u32::from(acquire) << 22)
+        | (u32::from(release) << 15)
+        | (u32::from(2_u8) << 16)
+        | (u32::from(1_u8) << 5)
+        | u32::from(4_u8)
+}
+
+fn load_exclusive(size: u8, acquire: bool) -> u32 {
+    0x085f_7c00 | (u32::from(size) << 30) | (u32::from(acquire) << 15) | (u32::from(1_u8) << 5)
+}
+
+fn store_exclusive(size: u8, release: bool) -> u32 {
+    0x0800_7c00
+        | (u32::from(size) << 30)
+        | (u32::from(release) << 15)
+        | (u32::from(2_u8) << 16)
+        | (u32::from(1_u8) << 5)
+}
+
+fn load_exclusive_pair(size: u8, acquire: bool) -> u32 {
+    0x087f_0000
+        | (u32::from(size) << 30)
+        | (u32::from(acquire) << 15)
+        | (u32::from(3_u8) << 10)
+        | (u32::from(1_u8) << 5)
+}
+
+fn store_exclusive_pair(size: u8, release: bool) -> u32 {
+    0x0820_0000
+        | (u32::from(size) << 30)
+        | (u32::from(release) << 15)
+        | (u32::from(2_u8) << 16)
+        | (u32::from(3_u8) << 10)
+        | (u32::from(1_u8) << 5)
 }
 
 fn breakpoint(immediate: u16) -> u32 {

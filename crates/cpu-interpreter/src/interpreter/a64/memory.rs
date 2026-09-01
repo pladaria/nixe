@@ -5,11 +5,12 @@ use nixe_cpu::{
     },
     location::DecodedInstruction,
     memory::{
-        AtomicRmwKind, CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass,
-        MemoryAccessSize, MemoryAlignment, MemoryOrdering, MemoryValue,
+        CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
+        MemoryAlignment, MemoryOrdering, MemoryValue,
     },
     semantics::a64::{
-        LoadSpec, ScalarTransfer, literal_load, memory_size, pair_transfer, scalar_transfer,
+        LoadSpec, ScalarTransfer, atomic_ordering, atomic_rmw_kind, compare_exchange_pair_sizes,
+        exclusive_transfer_sizes, literal_load, memory_size, pair_transfer, scalar_transfer,
     },
     state::a64::A64State,
 };
@@ -18,7 +19,7 @@ use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use super::{advance, read, register_offset_address, sign_extend, write};
 use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
 
-enum MemoryStepError {
+pub(super) enum MemoryStepError {
     Data(DataAccessFault),
     Direct(Box<str>),
 }
@@ -29,10 +30,10 @@ impl From<DataAccessFault> for MemoryStepError {
     }
 }
 
-impl From<nixe_cpu_direct_memory::DirectScalarAccessError> for MemoryStepError {
-    fn from(error: nixe_cpu_direct_memory::DirectScalarAccessError) -> Self {
+impl From<nixe_cpu_direct_memory::DirectMemoryAccessError> for MemoryStepError {
+    fn from(error: nixe_cpu_direct_memory::DirectMemoryAccessError) -> Self {
         match error {
-            nixe_cpu_direct_memory::DirectScalarAccessError::DataFault(fault) => Self::Data(fault),
+            nixe_cpu_direct_memory::DirectMemoryAccessError::DataFault(fault) => Self::Data(fault),
             error => Self::Direct(error.to_string().into_boxed_str()),
         }
     }
@@ -56,11 +57,14 @@ pub(super) fn execute(
             indexed(context, address_space, state, fields, instruction)
         }
         Instruction::Register(_) => register_offset(context, address_space, state, fields),
-        Instruction::Pair(_) => pair(memory, address_space, state, fields),
+        Instruction::Pair(_) => pair(context, state, fields),
         Instruction::LoadAcquire(_) | Instruction::StoreRelease(_) => {
             acquire_release(memory, address_space, state, fields, instruction)
         }
-        Instruction::LoadExclusive(_) | Instruction::StoreExclusive(_) => {
+        Instruction::LoadExclusive(_)
+        | Instruction::StoreExclusive(_)
+        | Instruction::LoadExclusivePair(_)
+        | Instruction::StoreExclusivePair(_) => {
             exclusive(context, memory, address_space, state, fields, instruction)
         }
         Instruction::AtomicReadModifyWrite(_)
@@ -85,15 +89,6 @@ pub(super) fn execute(
     }
 }
 
-fn atomic_ordering(fields: Operands) -> MemoryOrdering {
-    match (fields.acquire, fields.release) {
-        (false, false) => MemoryOrdering::Relaxed,
-        (true, false) => MemoryOrdering::Acquire,
-        (false, true) => MemoryOrdering::Release,
-        (true, true) => MemoryOrdering::AcquireRelease,
-    }
-}
-
 fn atomic(
     memory: &dyn CpuMemory,
     address_space: AddressSpaceId,
@@ -102,20 +97,11 @@ fn atomic(
     instruction: Instruction,
 ) -> MemoryStep {
     let address = GuestVirtualAddress::new(read(state, fields.rn, 64, true));
-    let ordering = atomic_ordering(fields);
+    let ordering = atomic_ordering(fields.acquire, fields.release);
     match instruction {
         Instruction::AtomicReadModifyWrite(_) => {
-            let kind = match fields.atomic_opcode {
-                0 => AtomicRmwKind::Add,
-                1 => AtomicRmwKind::Clear,
-                2 => AtomicRmwKind::Xor,
-                3 => AtomicRmwKind::Set,
-                4 => AtomicRmwKind::SignedMaximum,
-                5 => AtomicRmwKind::SignedMinimum,
-                6 => AtomicRmwKind::UnsignedMaximum,
-                7 => AtomicRmwKind::UnsignedMinimum,
-                8 => AtomicRmwKind::Swap,
-                _ => return Ok(None),
+            let Some(kind) = atomic_rmw_kind(fields.atomic_opcode) else {
+                return Ok(None);
             };
             let size = memory_size(fields.size);
             let descriptor = MemoryAccess::new(
@@ -167,15 +153,8 @@ fn atomic(
             if fields.size > 1 || fields.rm & 1 != 0 || fields.rt & 1 != 0 {
                 return Ok(None);
             }
-            let element_size = if fields.size == 0 {
-                MemoryAccessSize::Word
-            } else {
-                MemoryAccessSize::Doubleword
-            };
-            let access_size = if fields.size == 0 {
-                MemoryAccessSize::Doubleword
-            } else {
-                MemoryAccessSize::Quadword
+            let Some((element_size, access_size)) = compare_exchange_pair_sizes(fields.size) else {
+                return Ok(None);
             };
             let descriptor = MemoryAccess::new(
                 access_size,
@@ -225,16 +204,25 @@ fn exclusive(
     instruction: Instruction,
 ) -> MemoryStep {
     let monitor = context.exclusive_monitor();
-    let size = memory_size(fields.size);
+    let pair = matches!(
+        instruction,
+        Instruction::LoadExclusivePair(_) | Instruction::StoreExclusivePair(_)
+    );
+    let Some((element_size, access_size)) = exclusive_transfer_sizes(fields.size, pair) else {
+        return Ok(None);
+    };
     let address = GuestVirtualAddress::new(read(state, fields.rn, 64, true));
-    let load = matches!(instruction, Instruction::LoadExclusive(_));
+    let load = matches!(
+        instruction,
+        Instruction::LoadExclusive(_) | Instruction::LoadExclusivePair(_)
+    );
     let ordering = match (load, fields.ordered) {
         (true, true) => MemoryOrdering::Acquire,
         (false, true) => MemoryOrdering::Release,
         (_, false) => MemoryOrdering::Relaxed,
     };
     let descriptor = MemoryAccess::new(
-        size,
+        access_size,
         MemoryAlignment::Natural,
         ordering,
         MemoryAccessClass::Exclusive,
@@ -242,25 +230,44 @@ fn exclusive(
     if load {
         let (value, reservation) = memory.load_exclusive(address_space, address, descriptor)?;
         monitor.borrow_mut().reserve(reservation);
-        write_loaded(
-            state,
-            fields.rt,
-            size,
-            LoadSpec::unsigned(size),
-            value.value,
-        );
+        if pair {
+            let bits = value.value.bits();
+            write(
+                state,
+                fields.rt,
+                element_size.bytes() as u8 * 8,
+                false,
+                bits as u64,
+            );
+            write(
+                state,
+                fields.rt2,
+                element_size.bytes() as u8 * 8,
+                false,
+                (bits >> (element_size.bytes() * 8)) as u64,
+            );
+        } else {
+            write_loaded(
+                state,
+                fields.rt,
+                element_size,
+                LoadSpec::unsigned(element_size),
+                value.value,
+            );
+        }
     } else {
         let reservation = monitor.borrow().reservation();
         monitor.borrow_mut().clear();
+        let value = if pair {
+            let low = register_value(state, fields.rt, element_size).bits();
+            let high = register_value(state, fields.rt2, element_size).bits();
+            MemoryValue::from_bits(access_size, low | (high << (element_size.bytes() * 8)))
+        } else {
+            register_value(state, fields.rt, element_size)
+        };
         let succeeded = if let Some(reservation) = reservation {
             memory
-                .store_exclusive(
-                    address_space,
-                    address,
-                    descriptor,
-                    register_value(state, fields.rt, size),
-                    reservation,
-                )?
+                .store_exclusive(address_space, address, descriptor, value, reservation)?
                 .1
         } else {
             false
@@ -297,7 +304,7 @@ fn literal(
         .location
         .pc
         .wrapping_offset(sign_extend(u64::from(fields.immediate_19), 19) << 2);
-    let value = scalar_read(
+    let value = ordinary_read(
         context,
         address,
         access(size, MemoryOrdering::Relaxed, false),
@@ -397,12 +404,7 @@ fn register_offset(
     )
 }
 
-fn pair(
-    memory: &dyn CpuMemory,
-    address_space: AddressSpaceId,
-    state: &mut A64State,
-    fields: Operands,
-) -> MemoryStep {
+fn pair(context: InterpreterContext<'_>, state: &mut A64State, fields: Operands) -> MemoryStep {
     let Some((size, load_spec)) = pair_transfer(fields.size, fields.load) else {
         return Ok(None);
     };
@@ -426,22 +428,22 @@ fn pair(
     if fields.load {
         // Delay register writes until both reads succeed, preserving precise
         // state for synthetic faults in the reference engine.
-        let first_value = memory.read(address_space, first, descriptor)?.value;
-        let second_value = memory.read(address_space, second, descriptor)?.value;
+        let first_value = ordinary_read(context, first, descriptor)?;
+        let second_value = ordinary_read(context, second, descriptor)?;
         write_loaded(state, fields.rt, size, load_spec, first_value);
         write_loaded(state, fields.rt2, size, load_spec, second_value);
     } else {
-        memory.write(
-            address_space,
+        ordinary_write(
+            context,
             first,
-            descriptor,
             register_value(state, fields.rt, size),
-        )?;
-        memory.write(
-            address_space,
-            second,
             descriptor,
+        )?;
+        ordinary_write(
+            context,
+            second,
             register_value(state, fields.rt2, size),
+            descriptor,
         )?;
     }
     if matches!(fields.mode, 1 | 3) {
@@ -491,7 +493,7 @@ fn transfer(
 ) -> MemoryStep {
     match scalar_transfer(fields.opc, size) {
         Some(ScalarTransfer::Store) => {
-            scalar_write(
+            ordinary_write(
                 context,
                 address,
                 register_value(state, fields.rt, size),
@@ -499,7 +501,7 @@ fn transfer(
             )?;
         }
         Some(ScalarTransfer::Load(load)) => {
-            let value = scalar_read(context, address, descriptor)?;
+            let value = ordinary_read(context, address, descriptor)?;
             write_loaded(state, fields.rt, size, load, value);
         }
         None => return Ok(None),
@@ -507,14 +509,13 @@ fn transfer(
     Ok(Some(()))
 }
 
-fn scalar_read(
+pub(super) fn ordinary_read(
     context: InterpreterContext<'_>,
     address: GuestVirtualAddress,
     descriptor: MemoryAccess,
 ) -> Result<MemoryValue, MemoryStepError> {
     if descriptor.ordering == MemoryOrdering::Relaxed
         && descriptor.class == MemoryAccessClass::Normal
-        && descriptor.size != MemoryAccessSize::Quadword
         && let Some(direct) = context.direct_memory()
     {
         return direct
@@ -528,7 +529,7 @@ fn scalar_read(
         .value)
 }
 
-fn scalar_write(
+pub(super) fn ordinary_write(
     context: InterpreterContext<'_>,
     address: GuestVirtualAddress,
     value: MemoryValue,
@@ -536,7 +537,6 @@ fn scalar_write(
 ) -> Result<(), MemoryStepError> {
     if descriptor.ordering == MemoryOrdering::Relaxed
         && descriptor.class == MemoryAccessClass::Normal
-        && descriptor.size != MemoryAccessSize::Quadword
         && let Some(direct) = context.direct_memory()
     {
         return direct

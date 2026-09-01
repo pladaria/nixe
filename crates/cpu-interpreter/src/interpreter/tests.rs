@@ -6,7 +6,8 @@ use nixe_cpu::{
     decode::table::DecodeSupport,
     location::LocationDescriptor,
     memory::{
-        CpuMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue, SyntheticMemory,
+        CpuMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue, ProcessMemory,
+        SyntheticMemory,
     },
     platform::TargetPlatform,
     profile::ProcessCpuContext,
@@ -3191,11 +3192,26 @@ fn a64_simd_ld1_st1_multiple_structures_transfer_consecutive_registers() {
         );
     }
 
-    let error = execute_one_with_context(context, &mut state, 0x4c40_8020_u32).unwrap_err(); // LD2 {V0.16B,V1.16B},[X1]
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    let interleaved: Vec<u8> = (0..32).collect();
+    memory
+        .write_bytes(SPACE, GuestVirtualAddress::new(0x1180), &interleaved)
+        .unwrap();
+    let a64 = &mut state;
+    a64.write_x(x(1), 0x1180);
+    execute_one_with_context(context, &mut state, 0x4c40_8020_u32).unwrap(); // LD2 {V0.16B,V1.16B},[X1]
+    let a64 = &state;
+    assert_eq!(
+        a64.vector(0),
+        Some(u128::from_le_bytes(std::array::from_fn(|lane| {
+            (lane * 2) as u8
+        })))
+    );
+    assert_eq!(
+        a64.vector(1),
+        Some(u128::from_le_bytes(std::array::from_fn(|lane| {
+            (lane * 2 + 1) as u8
+        })))
+    );
 }
 
 #[test]
