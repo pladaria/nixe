@@ -402,7 +402,6 @@ struct CraneliftTranslator<'a, 'region> {
     fpsr: ir::Value,
     direct_base: ir::Value,
     direct_size: ir::Value,
-    direct_store_controls: ir::Value,
     loader_return: ir::Value,
     control_pending: ir::Value,
     synchronization_counter: ir::Value,
@@ -482,7 +481,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             fpsr: placeholder,
             direct_base: placeholder,
             direct_size: placeholder,
-            direct_store_controls: placeholder,
             loader_return: placeholder,
             control_pending: placeholder,
             synchronization_counter: placeholder,
@@ -520,8 +518,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 self.load_context(types::I64, offset_of!(NativeContext, direct_base))?;
             self.direct_size =
                 self.load_context(types::I64, offset_of!(NativeContext, direct_size))?;
-            self.direct_store_controls =
-                self.load_context(types::I64, offset_of!(NativeContext, direct_store_controls))?;
         }
         self.loader_return =
             self.load_context(types::I64, offset_of!(NativeContext, loader_return))?;

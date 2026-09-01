@@ -3,8 +3,9 @@ use std::cell::RefCell;
 use nixe_cpu::exclusive::ExclusiveMonitorState;
 use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, CpuThreadId, MemoryBinding, TimerSnapshot};
 use nixe_cpu::memory::{
-    CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment,
-    MemoryOrdering, MemoryPermissions, MemoryValue, SyntheticMemory,
+    CpuMemory, DataAccessFaultReason, ExecutionMemory, MemoryAccess, MemoryAccessClass,
+    MemoryAccessSize, MemoryAlignment, MemoryOrdering, MemoryPermissions, MemoryValue,
+    SyntheticMemory,
 };
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -155,7 +156,7 @@ fn linux_direct_interpreter_reads_directly_mapped_values() {
 }
 
 #[test]
-fn linux_direct_interpreter_preserves_unaligned_ordinary_accesses() {
+fn linux_direct_interpreter_executes_same_page_unaligned_accesses_natively() {
     const DATA: u64 = 0x8000;
     let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, AddressSpaceId::new(1));
     let memory = direct_memory(0xf900_0020, DATA);
@@ -187,6 +188,61 @@ fn linux_direct_interpreter_preserves_unaligned_ordinary_accesses() {
             .unwrap()
             .value,
         MemoryValue::U64(value),
+    );
+}
+
+#[test]
+fn linux_direct_interpreter_cross_page_store_is_all_or_nothing() {
+    const DATA: u64 = 0x8000;
+    let space = AddressSpaceId::new(1);
+    let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, space);
+    let mut memory = ExecutionMemory::new();
+    for page in 1..=3 {
+        assert!(memory.add_ram_page(GuestPhysicalPageId::new(page)));
+    }
+    assert!(memory.initialize_ram(
+        GuestPhysicalPageId::new(1),
+        0,
+        &0xf900_0020_u32.to_le_bytes(),
+    ));
+    assert!(memory.map_page(
+        space,
+        GuestVirtualAddress::new(CODE),
+        GuestPhysicalPageId::new(1),
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert!(memory.map_page(
+        space,
+        GuestVirtualAddress::new(DATA),
+        GuestPhysicalPageId::new(2),
+        MemoryPermissions::READ_WRITE,
+    ));
+    assert!(memory.map_page(
+        space,
+        GuestVirtualAddress::new(DATA + 0x1000),
+        GuestPhysicalPageId::new(3),
+        MemoryPermissions::READ,
+    ));
+    memory
+        .bind_cpu_memory_backend(space, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let mut process = InterpreterProcess::new(cpu);
+    process.bind_memory(direct_binding(&memory)).unwrap();
+    let mut thread = process.create_thread(CpuThreadId::new(1)).unwrap();
+    let address = DATA + 0xffc;
+    let mut state = direct_state(address, 0xa5c3_9678_1234_fedc);
+
+    let report = thread
+        .run_slice(direct_request(&memory, &mut state))
+        .unwrap();
+    let CpuExit::DataFault { fault, .. } = report.stop else {
+        panic!("cross-page store did not report the second-page permission fault");
+    };
+    assert_eq!(fault.reason, DataAccessFaultReason::WritePermissionDenied);
+    assert_eq!(
+        read_value(&memory, address, MemoryAccessSize::Word),
+        0,
+        "the writable first-page fragment must remain untouched",
     );
 }
 

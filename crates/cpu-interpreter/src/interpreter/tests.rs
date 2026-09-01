@@ -3511,7 +3511,7 @@ fn a64_pair_offset_mode_applies_its_scaled_immediate_without_writeback() {
 }
 
 #[test]
-fn a64_exclusive_monitor_uses_physical_identity_and_generation() {
+fn a64_exclusive_monitor_uses_physical_identity_and_expected_value() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(46);
     const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(93);
     let profile = TargetPlatform::Switch1;

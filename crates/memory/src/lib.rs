@@ -32,7 +32,7 @@ pub use backing::{
 pub use direct::{
     CpuMemoryBackend, DIRECT_PAGE_SIZE, DirectAddressSpaceView, DirectArena, DirectBackendPolicy,
     DirectHostCapabilities, DirectMapRequest, DirectMemoryError, DirectProtectRequest,
-    DirectProtection, DirectStoreControl,
+    DirectProtection,
 };
 pub use execution_gate::{ExecutionGate, ExecutionSharedGuard, ExecutionTransitionGuard};
 pub use host_mapped::{HostMappedBacking, HostMappedError};

@@ -8,9 +8,9 @@ use nixe_cpu::decode::{self, DecodeResult, DecodeSupport};
 use nixe_cpu::execution::MemoryBinding;
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::{
-    CacheMaintenanceKind, CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessClass,
-    MemoryAccessSize, MemoryAlignment, MemoryAttributes, MemoryOrdering, MemoryPermissions,
-    MemoryValue, ProcessMemory, SyntheticMemory, SyntheticMmio,
+    CacheMaintenanceKind, CpuMemory, DataAccessFaultReason, ExecutionMemory, MemoryAccess,
+    MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryAttributes, MemoryOrdering,
+    MemoryPermissions, MemoryValue, ProcessMemory, SyntheticMemory, SyntheticMmio,
 };
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -1296,7 +1296,7 @@ fn linux_direct_uncached_ram_uses_the_same_native_alias() {
         .unwrap();
     assert_eq!(
         memory.direct_protection_at(SPACE, GuestVirtualAddress::new(DATA)),
-        Some(nixe_memory::DirectProtection::Read)
+        Some(nixe_memory::DirectProtection::ReadWrite)
     );
     let process = JitProcess::new(cpu()).unwrap();
     let binding = MemoryBinding {
@@ -1638,7 +1638,7 @@ fn linux_direct_fault_in_flight_survives_mapping_transition_and_jit_shutdown() {
 }
 
 #[test]
-fn linux_direct_scalar_stores_fault_once_then_publish_natively() {
+fn linux_direct_first_write_retries_then_stores_remain_native() {
     for (encoding, size, first, second) in [
         (0x3900_0020_u32, MemoryAccessSize::Byte, 0xa5_u64, 0x5a_u64),
         (0x7900_0020, MemoryAccessSize::Halfword, 0xa5c3, 0x5a3c),
@@ -1913,7 +1913,7 @@ fn linux_direct_simd_quadword_loads_and_stores_use_the_shared_arena() {
 }
 
 #[test]
-fn linux_direct_unaligned_scalar_accesses_complete_through_checked_memory() {
+fn linux_direct_same_page_unaligned_scalar_accesses_are_native() {
     let mut memory = ExecutionMemory::new();
     let code_page = GuestPhysicalPageId::new(1);
     let data_page = GuestPhysicalPageId::new(2);
@@ -1972,6 +1972,70 @@ fn linux_direct_unaligned_scalar_accesses_complete_through_checked_memory() {
 }
 
 #[test]
+fn linux_direct_cross_page_store_is_all_or_nothing() {
+    let mut memory = ExecutionMemory::new();
+    for page in 1..=3 {
+        assert!(memory.add_ram_page(GuestPhysicalPageId::new(page)));
+    }
+    assert!(memory.initialize_ram(
+        GuestPhysicalPageId::new(1),
+        0,
+        &0xf900_0020_u32.to_le_bytes(),
+    ));
+    assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 4, &breakpoint(0).to_le_bytes(),));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        GuestPhysicalPageId::new(1),
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        GuestPhysicalPageId::new(2),
+        MemoryPermissions::READ_WRITE,
+    ));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA + 0x1000),
+        GuestPhysicalPageId::new(3),
+        MemoryPermissions::READ,
+    ));
+    memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+    let address = GuestVirtualAddress::new(DATA + 0xffc);
+    let mut state = memory_state();
+    write_register(&mut state, 0, 0xa5c3_9678_1234_fedc);
+    write_register(&mut state, 1, address.get());
+
+    let DirectExit::DataFault { fault, .. } = thread.run(&process, &memory, &mut state).unwrap()
+    else {
+        panic!("cross-page store did not report the second-page permission fault");
+    };
+    assert_eq!(fault.reason, DataAccessFaultReason::WritePermissionDenied);
+    assert_eq!(
+        memory
+            .read(SPACE, address, MemoryAccess::normal(MemoryAccessSize::Word))
+            .unwrap()
+            .value,
+        MemoryValue::U32(0),
+        "the writable first-page fragment must remain untouched",
+    );
+}
+
+#[test]
 fn unmapped_memory_fault_matches_the_interpreter_at_the_faulting_pc() {
     let encoding = 0xf940_0020; // LDR X0,[X1]
     let expected_memory = memory(&[(0, encoding), (4, breakpoint(0))]);
@@ -2013,7 +2077,7 @@ fn unmapped_memory_fault_matches_the_interpreter_at_the_faulting_pc() {
 }
 
 #[test]
-fn linux_direct_poison_guard_preserves_the_unconfined_guest_address() {
+fn linux_direct_confinement_preserves_the_unconfined_guest_address() {
     let mut memory = ExecutionMemory::new();
     let code_page = GuestPhysicalPageId::new(1);
     assert!(memory.add_ram_page(code_page));

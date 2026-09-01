@@ -299,7 +299,6 @@ fn literal(
         .wrapping_offset(sign_extend(u64::from(fields.immediate_19), 19) << 2);
     let value = scalar_read(
         context,
-        state,
         address,
         access(size, MemoryOrdering::Relaxed, false),
     )?;
@@ -494,14 +493,13 @@ fn transfer(
         Some(ScalarTransfer::Store) => {
             scalar_write(
                 context,
-                state,
                 address,
                 register_value(state, fields.rt, size),
                 descriptor,
             )?;
         }
         Some(ScalarTransfer::Load(load)) => {
-            let value = scalar_read(context, state, address, descriptor)?;
+            let value = scalar_read(context, address, descriptor)?;
             write_loaded(state, fields.rt, size, load, value);
         }
         None => return Ok(None),
@@ -511,7 +509,6 @@ fn transfer(
 
 fn scalar_read(
     context: InterpreterContext<'_>,
-    state: &A64State,
     address: GuestVirtualAddress,
     descriptor: MemoryAccess,
 ) -> Result<MemoryValue, MemoryStepError> {
@@ -522,12 +519,7 @@ fn scalar_read(
     {
         return direct
             .borrow_mut()
-            .read(
-                context.memory(),
-                GuestVirtualAddress::new(state.pc()),
-                address,
-                descriptor,
-            )
+            .read(context.memory(), address, descriptor)
             .map_err(Into::into);
     }
     Ok(context
@@ -538,7 +530,6 @@ fn scalar_read(
 
 fn scalar_write(
     context: InterpreterContext<'_>,
-    state: &A64State,
     address: GuestVirtualAddress,
     value: MemoryValue,
     descriptor: MemoryAccess,
@@ -550,13 +541,7 @@ fn scalar_write(
     {
         return direct
             .borrow_mut()
-            .write(
-                context.memory(),
-                GuestVirtualAddress::new(state.pc()),
-                address,
-                descriptor,
-                value,
-            )
+            .write(context.memory(), address, descriptor, value)
             .map_err(Into::into);
     }
     context.memory().write(

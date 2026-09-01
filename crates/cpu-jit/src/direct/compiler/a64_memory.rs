@@ -1,17 +1,16 @@
-use std::mem::{offset_of, size_of};
+use std::mem::offset_of;
 
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp, Block, BlockArg, InstBuilder, MemFlagsData, Signature, Value,
-    condcodes::IntCC, types,
+    AbiParam, BlockArg, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
 };
 use nixe_cpu::decode::a64::memory::{Instruction, Operands};
 use nixe_cpu::memory::{AtomicRmwKind, MemoryAccessSize, MemoryOrdering};
 use nixe_cpu::semantics::a64::{
     LoadSpec, ScalarTransfer, literal_load, memory_size, pair_transfer, scalar_transfer,
 };
-use nixe_memory::{DIRECT_PAGE_SIZE, DirectStoreControl, GuestVirtualAddress};
+use nixe_memory::GuestVirtualAddress;
 
-use super::{CraneliftTranslator, LazyFlags, trusted_flags};
+use super::{CraneliftTranslator, LazyFlags};
 use crate::direct::slow;
 use crate::direct::{DirectJitError, NativeContext};
 
@@ -430,13 +429,17 @@ impl CraneliftTranslator<'_, '_> {
             .builder
             .ins()
             .icmp(IntCC::UnsignedLessThan, last, self.direct_size);
-        let alignment = self
+        let first_page = self.builder.ins().ushr_imm_u(
+            address,
+            nixe_memory::DIRECT_PAGE_SIZE.trailing_zeros() as i64,
+        );
+        let last_page = self
             .builder
             .ins()
-            .band_imm_u(address, (size.bytes() - 1) as i64);
-        let aligned = self.builder.ins().icmp_imm_s(IntCC::Equal, alignment, 0);
+            .ushr_imm_u(last, nixe_memory::DIRECT_PAGE_SIZE.trailing_zeros() as i64);
+        let same_page = self.builder.ins().icmp(IntCC::Equal, first_page, last_page);
         let eligible = self.builder.ins().band(no_wrap, in_arena);
-        let eligible = self.builder.ins().band(eligible, aligned);
+        let eligible = self.builder.ins().band(eligible, same_page);
         let native = self.builder.create_block();
         let checked = self.cold_block();
         let merged = self.builder.create_block();
@@ -499,7 +502,7 @@ impl CraneliftTranslator<'_, '_> {
             size,
             ordering,
             direct,
-            element_index: _,
+            element_index,
         } = operation;
         if ordering != MemoryOrdering::Relaxed || !self.direct_memory || !direct {
             return self.memory_write_slow(source, address, value, size, ordering, flags);
@@ -516,58 +519,37 @@ impl CraneliftTranslator<'_, '_> {
             .builder
             .ins()
             .icmp(IntCC::UnsignedLessThan, last, self.direct_size);
-        let alignment = self
+        let first_page = self.builder.ins().ushr_imm_u(
+            address,
+            nixe_memory::DIRECT_PAGE_SIZE.trailing_zeros() as i64,
+        );
+        let last_page = self
             .builder
             .ins()
-            .band_imm_u(address, (size.bytes() - 1) as i64);
-        let aligned = self.builder.ins().icmp_imm_s(IntCC::Equal, alignment, 0);
+            .ushr_imm_u(last, nixe_memory::DIRECT_PAGE_SIZE.trailing_zeros() as i64);
+        let same_page = self.builder.ins().icmp(IntCC::Equal, first_page, last_page);
         let eligible = self.builder.ins().band(no_wrap, in_arena);
-        let eligible = self.builder.ins().band(eligible, aligned);
+        let eligible = self.builder.ins().band(eligible, same_page);
 
-        let lookup = self.builder.create_block();
-        let check_armed = self.builder.create_block();
         let native = self.builder.create_block();
-        let fault = self.cold_block();
+        let checked = self.cold_block();
         let merged = self.builder.create_block();
-        self.builder.ins().brif(eligible, lookup, &[], fault, &[]);
+        self.builder.ins().brif(eligible, native, &[], checked, &[]);
 
-        self.builder.switch_to_block(lookup);
-        let guest_page = self
-            .builder
-            .ins()
-            .ushr_imm_u(address, DIRECT_PAGE_SIZE.trailing_zeros() as i64);
-        let control_offset = self
-            .builder
-            .ins()
-            .imul_imm_u(guest_page, size_of::<usize>() as i64);
-        let control_slot = self
-            .builder
-            .ins()
-            .iadd(self.direct_store_controls, control_offset);
-        let control = self
-            .builder
-            .ins()
-            .load(types::I64, trusted_flags(), control_slot, 0);
-        let has_control = self.builder.ins().icmp_imm_s(IntCC::NotEqual, control, 0);
-        self.builder
-            .ins()
-            .brif(has_control, check_armed, &[], fault, &[]);
-
-        self.builder.switch_to_block(check_armed);
-        let armed_address = self
-            .direct_control_field(control, offset_of!(DirectStoreControl, write_armed_address))?;
-        let armed = self
-            .builder
-            .ins()
-            .atomic_load(types::I64, trusted_flags(), armed_address);
-        let is_armed = self.builder.ins().icmp_imm_s(IntCC::NotEqual, armed, 0);
-        self.builder.ins().brif(is_armed, native, &[], fault, &[]);
+        self.builder.switch_to_block(checked);
+        self.memory_write_slow(source, address, value, size, ordering, flags)?;
+        self.builder.ins().jump(merged, &[]);
 
         self.builder.switch_to_block(native);
-        self.direct_tracked_store(address, control, armed_address, value, fault, merged)?;
-
-        self.builder.switch_to_block(fault);
-        self.memory_write_slow(source, address, value, size, ordering, flags)?;
+        self.record_direct_fault_state(
+            source,
+            size.bytes() as u8,
+            nixe_cpu_direct_memory::NativeMemoryAccessKind::Write,
+            element_index,
+        );
+        let pointer = self.builder.ins().iadd(self.direct_base, address);
+        let fault_flags = MemFlagsData::new().with_trap_code(Some(super::DIRECT_MEMORY_TRAP));
+        self.builder.ins().store(fault_flags, value, pointer, 0);
         self.builder.ins().jump(merged, &[]);
         self.builder.switch_to_block(merged);
         Ok(())
@@ -678,143 +660,6 @@ impl CraneliftTranslator<'_, '_> {
         };
         self.write_integer(register, false, value)
     }
-
-    fn direct_control_field(
-        &mut self,
-        control: Value,
-        field_offset: usize,
-    ) -> Result<Value, DirectJitError> {
-        Ok(self.builder.ins().load(
-            types::I64,
-            trusted_flags(),
-            control,
-            context_offset(field_offset)?,
-        ))
-    }
-
-    fn direct_tracked_store(
-        &mut self,
-        address: Value,
-        control: Value,
-        armed_address: Value,
-        value: Value,
-        fault: Block,
-        merged: Block,
-    ) -> Result<(), DirectJitError> {
-        let pointer = self.builder.ins().iadd(self.direct_base, address);
-        let sequence_address = self.direct_control_field(
-            control,
-            offset_of!(DirectStoreControl, write_sequence_address),
-        )?;
-        let generation_address =
-            self.direct_control_field(control, offset_of!(DirectStoreControl, generation_address))?;
-        let sequence = self.acquire_write_sequence(sequence_address);
-        let still_armed =
-            self.builder
-                .ins()
-                .atomic_load(types::I64, trusted_flags(), armed_address);
-        let still_armed = self
-            .builder
-            .ins()
-            .icmp_imm_s(IntCC::NotEqual, still_armed, 0);
-        let check_epochs = self.builder.create_block();
-        let publish = self.builder.create_block();
-        let reject = self.cold_block();
-        self.builder
-            .ins()
-            .brif(still_armed, check_epochs, &[], reject, &[]);
-
-        self.builder.switch_to_block(check_epochs);
-        // Epoch exhaustion is exceptional. Test it only after acquiring the
-        // page sequence so concurrent native writers cannot both observe
-        // MAX-1 and race through the final increment.
-        let current_generation =
-            self.builder
-                .ins()
-                .atomic_load(types::I64, trusted_flags(), generation_address);
-        let exhausted = self
-            .builder
-            .ins()
-            .icmp_imm_s(IntCC::Equal, current_generation, -1);
-        self.builder
-            .ins()
-            .brif(exhausted, reject, &[], publish, &[]);
-
-        self.builder.switch_to_block(publish);
-        let one = self.builder.ins().iconst(types::I64, 1);
-        if self.builder.func.dfg.value_type(value) == types::I128 {
-            self.builder.ins().store(trusted_flags(), value, pointer, 0);
-        } else {
-            self.builder
-                .ins()
-                .atomic_store(trusted_flags(), value, pointer);
-        }
-        self.builder.ins().atomic_rmw(
-            types::I64,
-            trusted_flags(),
-            AtomicRmwOp::Add,
-            generation_address,
-            one,
-        );
-        let completed = self.builder.ins().iadd_imm_s(sequence, 2);
-        self.builder
-            .ins()
-            .atomic_store(trusted_flags(), completed, sequence_address);
-        self.builder.ins().jump(merged, &[]);
-
-        self.builder.switch_to_block(reject);
-        self.builder
-            .ins()
-            .atomic_store(trusted_flags(), sequence, sequence_address);
-        self.builder.ins().jump(fault, &[]);
-        Ok(())
-    }
-
-    fn acquire_write_sequence(&mut self, address: Value) -> Value {
-        let retry = self.builder.create_block();
-        let attempt = self.builder.create_block();
-        let acquired = self.builder.create_block();
-        self.builder.append_block_param(retry, types::I64);
-        self.builder.append_block_param(attempt, types::I64);
-        self.builder.append_block_param(acquired, types::I64);
-        let observed = self
-            .builder
-            .ins()
-            .atomic_load(types::I64, trusted_flags(), address);
-        self.builder.ins().jump(retry, &[BlockArg::from(observed)]);
-        self.builder.switch_to_block(retry);
-        let observed = self.builder.block_params(retry)[0];
-        let busy = self.builder.ins().band_imm_u(observed, 1);
-        let is_busy = self.builder.ins().icmp_imm_s(IntCC::NotEqual, busy, 0);
-        let refreshed = self
-            .builder
-            .ins()
-            .atomic_load(types::I64, trusted_flags(), address);
-        self.builder.ins().brif(
-            is_busy,
-            retry,
-            &[BlockArg::from(refreshed)],
-            attempt,
-            &[BlockArg::from(observed)],
-        );
-        self.builder.switch_to_block(attempt);
-        let observed = self.builder.block_params(attempt)[0];
-        let writing = self.builder.ins().iadd_imm_s(observed, 1);
-        let previous = self
-            .builder
-            .ins()
-            .atomic_cas(trusted_flags(), address, observed, writing);
-        let success = self.builder.ins().icmp(IntCC::Equal, previous, observed);
-        self.builder.ins().brif(
-            success,
-            acquired,
-            &[BlockArg::from(observed)],
-            retry,
-            &[BlockArg::from(previous)],
-        );
-        self.builder.switch_to_block(acquired);
-        self.builder.block_params(acquired)[0]
-    }
 }
 
 fn memory_type(size: MemoryAccessSize) -> cranelift_codegen::ir::Type {
@@ -878,9 +723,4 @@ fn atomic_kind(opcode: u8) -> Result<AtomicRmwKind, DirectJitError> {
 
 const fn sign_extend(value: u64, bits: u8) -> i64 {
     ((value << (64 - bits)) as i64) >> (64 - bits)
-}
-
-fn context_offset(offset: usize) -> Result<i32, DirectJitError> {
-    i32::try_from(offset)
-        .map_err(|_| DirectJitError::internal("direct memory metadata offset exceeds i32"))
 }

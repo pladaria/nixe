@@ -224,6 +224,7 @@ impl HorizonSvcFault {
                     Some(HorizonKernelResult::INVALID_ADDRESS)
                 }
                 MemoryProtectionErrorReason::WritableExecutable
+                | MemoryProtectionErrorReason::UnsupportedPermissions
                 | MemoryProtectionErrorReason::PermissionLocked => {
                     Some(HorizonKernelResult::INVALID_STATE)
                 }
