@@ -27,6 +27,20 @@ supported through the emulated HID services.
   </tr>
 </table>
 
+## Running
+
+The default configuration is in [`nixe.toml`](nixe.toml). List available titles with:
+
+```bash
+cargo cli list
+```
+
+Run a title by its ID or name:
+
+```bash
+cargo cli run <id | name>
+```
+
 ## Testing
 
 Run
