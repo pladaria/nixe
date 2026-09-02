@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::mem::{offset_of, size_of};
+use std::mem::{align_of, offset_of, size_of};
+use std::sync::Mutex;
 
 use cranelift_codegen::ir::{
     self, AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, SourceLoc, TrapCode,
@@ -43,6 +44,59 @@ mod a64_system;
 
 pub(super) type NativeGateway = unsafe extern "C" fn(*mut NativeContext, usize);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CompilerPolicy {
+    opt_level: &'static str,
+    regalloc_algorithm: &'static str,
+}
+
+pub(super) const LCQ_COMPILER_POLICY: CompilerPolicy = CompilerPolicy {
+    opt_level: "none",
+    regalloc_algorithm: "single_pass",
+};
+
+pub(super) const HCQ_COMPILER_POLICY: CompilerPolicy = CompilerPolicy {
+    opt_level: "speed",
+    regalloc_algorithm: "backtracking",
+};
+
+#[derive(Clone, Copy)]
+pub(super) struct CompilerRuntimeAddresses {
+    gateway: NativeGateway,
+    cold_calls: ColdCallBoundaries,
+}
+
+pub(super) struct CompilerRuntime {
+    _module: Mutex<JITModule>,
+    addresses: CompilerRuntimeAddresses,
+}
+
+impl CompilerRuntime {
+    pub(super) fn new() -> Result<Self, DirectJitError> {
+        let mut module = create_module(HCQ_COMPILER_POLICY)?;
+        let mut context = module.make_context();
+        let mut function_builder = FunctionBuilderContext::new();
+        let gateway = compile_gateway(&mut module, &mut context, &mut function_builder)?;
+        let cold_calls =
+            compile_cold_call_boundaries(&mut module, &mut context, &mut function_builder)?;
+        Ok(Self {
+            _module: Mutex::new(module),
+            addresses: CompilerRuntimeAddresses {
+                gateway,
+                cold_calls,
+            },
+        })
+    }
+
+    pub(super) const fn addresses(&self) -> CompilerRuntimeAddresses {
+        self.addresses
+    }
+
+    pub(super) const fn gateway(&self) -> NativeGateway {
+        self.addresses.gateway
+    }
+}
+
 pub(super) struct CompiledRegion {
     pub(super) entry: usize,
     pub(super) native_bytes: usize,
@@ -53,6 +107,12 @@ pub(super) struct CompiledRegion {
     pub(super) deferred_register_loads: usize,
     #[cfg(test)]
     pub(super) exit_tail_count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Promotion {
+    pub(super) hotness_address: usize,
+    pub(super) node_address: usize,
 }
 
 pub(super) struct CompiledFaultSite {
@@ -127,69 +187,70 @@ pub(super) struct DirectCompiler {
     module: JITModule,
     context: cranelift_codegen::Context,
     function_builder: FunctionBuilderContext,
-    gateway: NativeGateway,
-    cold_calls: ColdCallBoundaries,
+    runtime: CompilerRuntimeAddresses,
     next_function: u32,
-    native_bytes: usize,
     memory_backend: CpuMemoryBackend,
 }
 
 impl DirectCompiler {
-    pub(super) fn new() -> Result<Self, DirectJitError> {
-        let isa_builder = cranelift_native::builder().map_err(|detail| {
-            DirectJitError::unsupported(format!("direct JIT host ISA is unavailable: {detail}"))
-        })?;
-        let mut flags = settings::builder();
-        for (name, value) in [
-            ("preserve_frame_pointers", "true"),
-            ("use_colocated_libcalls", "false"),
-            ("is_pic", "false"),
-            ("opt_level", "speed"),
-            ("regalloc_algorithm", "backtracking"),
-            (
-                "enable_verifier",
-                if cfg!(any(debug_assertions, test)) {
-                    "true"
-                } else {
-                    "false"
-                },
-            ),
-        ] {
-            flags.set(name, value).map_err(|error| {
-                DirectJitError::internal(format!(
-                    "direct JIT Cranelift setting {name}={value} failed: {error}"
-                ))
-            })?;
-        }
-        let isa = isa_builder
-            .finish(settings::Flags::new(flags))
-            .map_err(|error| {
-                DirectJitError::unsupported(format!(
-                    "direct JIT host ISA configuration failed: {error}"
-                ))
-            })?;
-        let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
-        let mut context = module.make_context();
-        let mut function_builder = FunctionBuilderContext::new();
-        let gateway = compile_gateway(&mut module, &mut context, &mut function_builder)?;
-        let cold_calls =
-            compile_cold_call_boundaries(&mut module, &mut context, &mut function_builder)?;
+    pub(super) fn new(
+        policy: CompilerPolicy,
+        runtime: CompilerRuntimeAddresses,
+    ) -> Result<Self, DirectJitError> {
+        let module = create_module(policy)?;
+        let context = module.make_context();
+        let function_builder = FunctionBuilderContext::new();
         Ok(Self {
             module,
             context,
             function_builder,
-            gateway,
-            cold_calls,
+            runtime,
             next_function: 1,
-            native_bytes: 0,
             memory_backend: CpuMemoryBackend::Checked,
         })
     }
+}
 
-    pub(super) const fn gateway(&self) -> NativeGateway {
-        self.gateway
+fn create_module(policy: CompilerPolicy) -> Result<JITModule, DirectJitError> {
+    let isa_builder = cranelift_native::builder().map_err(|detail| {
+        DirectJitError::unsupported(format!("direct JIT host ISA is unavailable: {detail}"))
+    })?;
+    let mut flags = settings::builder();
+    for (name, value) in [
+        ("preserve_frame_pointers", "true"),
+        ("use_colocated_libcalls", "false"),
+        ("is_pic", "false"),
+        ("opt_level", policy.opt_level),
+        ("regalloc_algorithm", policy.regalloc_algorithm),
+        (
+            "enable_verifier",
+            if cfg!(any(debug_assertions, test)) {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+    ] {
+        flags.set(name, value).map_err(|error| {
+            DirectJitError::internal(format!(
+                "direct JIT Cranelift setting {name}={value} failed: {error}"
+            ))
+        })?;
     }
+    let isa = isa_builder
+        .finish(settings::Flags::new(flags))
+        .map_err(|error| {
+            DirectJitError::unsupported(format!(
+                "direct JIT host ISA configuration failed: {error}"
+            ))
+        })?;
+    Ok(JITModule::new(JITBuilder::with_isa(
+        isa,
+        default_libcall_names(),
+    )))
+}
 
+impl DirectCompiler {
     pub(super) fn bind_memory_backend(
         &mut self,
         backend: CpuMemoryBackend,
@@ -206,7 +267,8 @@ impl DirectCompiler {
     pub(super) fn compile(
         &mut self,
         region: &NativeRegion,
-        static_slots: &[usize],
+        static_entry_cells: &[usize],
+        promotion: Option<Promotion>,
     ) -> Result<CompiledRegion, DirectJitError> {
         self.context.func.signature = tail_signature();
         self.context.func.name = UserFuncName::user(1, self.next_function);
@@ -230,10 +292,11 @@ impl DirectCompiler {
             CraneliftTranslator::new(
                 builder,
                 region,
-                static_slots,
+                static_entry_cells,
                 self.module.target_config().default_call_conv,
                 self.memory_backend == CpuMemoryBackend::LinuxDirect,
-                self.cold_calls,
+                self.runtime.cold_calls,
+                promotion,
             )?
             .translate(self.module.target_config())?
         };
@@ -260,7 +323,6 @@ impl DirectCompiler {
             .expect("defined direct JIT function retains compiled code")
             .code_buffer()
             .len();
-        self.native_bytes = self.native_bytes.saturating_add(native_bytes);
         self.module.finalize_definitions().map_err(module_error)?;
         let entry = self.module.get_finalized_function(function).addr();
         self.module.clear_context(&mut self.context);
@@ -288,10 +350,6 @@ impl DirectCompiler {
             #[cfg(test)]
             exit_tail_count: pending_direct.exit_tail_count,
         })
-    }
-
-    pub(super) const fn native_bytes(&self) -> usize {
-        self.native_bytes
     }
 }
 
@@ -737,7 +795,7 @@ struct CraneliftTranslator<'a, 'region> {
     merged_flag_entries: HashSet<GuestVirtualAddress>,
     dirty_at_entry: HashMap<GuestVirtualAddress, DirtyState>,
     register_load_blocks: RegisterLoadBlocks,
-    static_slots: VecDeque<(GuestVirtualAddress, usize)>,
+    static_entry_cells: VecDeque<(GuestVirtualAddress, usize)>,
     exit_tails: BTreeMap<(u32, u32), Block>,
     slow_failure_tail: Option<Block>,
     fp_failure_tail: Option<Block>,
@@ -772,6 +830,7 @@ struct CraneliftTranslator<'a, 'region> {
     call_conv: CallConv,
     direct_memory: bool,
     cold_calls: ColdCallBoundaries,
+    promotion: Option<Promotion>,
     fault_sites: Vec<PendingFaultSite>,
 }
 
@@ -779,26 +838,27 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
     fn new(
         mut builder: FunctionBuilder<'a>,
         region: &'region NativeRegion,
-        static_slots: &[usize],
+        static_entry_cells: &[usize],
         call_conv: CallConv,
         direct_memory: bool,
         cold_calls: ColdCallBoundaries,
+        promotion: Option<Promotion>,
     ) -> Result<Self, DirectJitError> {
-        let expected_slots = region
+        let expected_cells = region
             .external_exits
             .iter()
             .filter(|exit| exit.target.is_some())
             .count();
-        if static_slots.len() != expected_slots {
+        if static_entry_cells.len() != expected_cells {
             return Err(DirectJitError::internal(
-                "direct JIT static-link metadata disagrees with region exits",
+                "direct JIT static entry cells disagree with region exits",
             ));
         }
-        let static_slots = region
+        let static_entry_cells = region
             .external_exits
             .iter()
             .filter_map(|exit| exit.target)
-            .zip(static_slots.iter().copied())
+            .zip(static_entry_cells.iter().copied())
             .collect();
         let blocks = region
             .blocks
@@ -823,7 +883,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             merged_flag_entries: merged_flag_entries(region),
             dirty_at_entry,
             register_load_blocks,
-            static_slots,
+            static_entry_cells,
             exit_tails: BTreeMap::new(),
             slow_failure_tail: None,
             fp_failure_tail: None,
@@ -858,6 +918,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             call_conv,
             direct_memory,
             cold_calls,
+            promotion,
             fault_sites: Vec::new(),
         })
     }
@@ -1012,16 +1073,20 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             self.builder.switch_to_block(ready);
         }
         let primary = self.block(self.region.key.start)?;
-        self.builder.ins().jump(primary, &[]);
+        if let Some(promotion) = self.promotion {
+            self.emit_promotion_check(primary, promotion)?;
+        } else {
+            self.builder.ins().jump(primary, &[]);
+        }
 
         for block_index in 0..self.region.blocks.len() {
             self.translate_block(block_index)?;
         }
         self.emit_helper_failure_tails()?;
         self.emit_exit_tails()?;
-        if !self.static_slots.is_empty() {
+        if !self.static_entry_cells.is_empty() {
             return Err(DirectJitError::internal(
-                "direct JIT region left static-link slots unused",
+                "direct JIT region left static entry cells unused",
             ));
         }
         self.builder.seal_all_blocks();
@@ -1031,6 +1096,69 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             #[cfg(test)]
             exit_tail_count: self.exit_tails.len(),
         })
+    }
+
+    fn emit_promotion_check(
+        &mut self,
+        primary: Block,
+        promotion: Promotion,
+    ) -> Result<(), DirectJitError> {
+        if !promotion.hotness_address.is_multiple_of(align_of::<u32>()) {
+            return Err(DirectJitError::internal(
+                "direct JIT hotness counter is not naturally aligned",
+            ));
+        }
+        let pointer = self.builder.func.dfg.value_type(self.context);
+        let hotness = self
+            .builder
+            .ins()
+            .iconst(pointer, promotion.hotness_address as i64);
+
+        // This is the relaxed external access promised by
+        // `NativeLookupNode::hotness_address`. The memory operations cannot
+        // move and these aligned I32 accesses lower directly to the indivisible
+        // host word load/store on x86-64 and AArch64. Cranelift's `atomic_load`
+        // and `atomic_store` are sequentially consistent in 0.134; using them
+        // here would add ordering, including an x86 `mfence`, which this
+        // approximate counter neither needs nor permits on its hot path.
+        let count = self
+            .builder
+            .ins()
+            .load(types::I32, trusted_flags(), hotness, 0);
+        let expires = self.builder.ins().icmp_imm_u(IntCC::Equal, count, 1);
+        let decremented = self.builder.ins().iadd_imm_s(count, -1);
+        let zero = self.builder.ins().iconst(types::I32, 0);
+        let remaining = self.builder.ins().select(expires, zero, decremented);
+        self.builder
+            .ins()
+            .store(trusted_flags(), remaining, hotness, 0);
+        let promote = self.cold_block();
+        self.builder.ins().brif(expires, promote, &[], primary, &[]);
+
+        self.builder.switch_to_block(promote);
+        let scheduler = self.load_context_pointer(offset_of!(NativeContext, hcq_scheduler))?;
+        let invalidation_cursor =
+            self.load_context(types::I64, offset_of!(NativeContext, invalidation_cursor))?;
+        let node = self
+            .builder
+            .ins()
+            .iconst(pointer, promotion.node_address as i64);
+        let function = self
+            .builder
+            .ins()
+            .iconst(pointer, super::request_hcq as *const () as usize as i64);
+        let mut signature = Signature::new(self.call_conv);
+        signature.params.push(AbiParam::new(pointer));
+        signature.params.push(AbiParam::new(pointer));
+        signature.params.push(AbiParam::new(types::I64));
+        let signature = self.builder.import_signature(signature);
+        self.builder.ins().call_indirect(
+            signature,
+            function,
+            &[scheduler, node, invalidation_cursor],
+        );
+        self.builder.ins().jump(primary, &[]);
+        Ok(())
     }
 
     fn record_direct_fault_state(
@@ -1345,9 +1473,9 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         target_pc: GuestVirtualAddress,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
-        let Some((expected, slot)) = self.static_slots.pop_front() else {
+        let Some((expected, entry_cell)) = self.static_entry_cells.pop_front() else {
             return Err(DirectJitError::internal(
-                "direct JIT region is missing a static target slot",
+                "direct JIT region is missing a static target entry cell",
             ));
         };
         if expected != target_pc {
@@ -1356,7 +1484,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             )));
         }
         self.commit_state(target_pc, flags)?;
-        let cell = self.builder.ins().iconst(types::I64, slot as i64);
+        let cell = self.builder.ins().iconst(types::I64, entry_cell as i64);
         let target = self
             .builder
             .ins()
@@ -3140,13 +3268,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn release_policy_is_speed_with_backtracking() {
-        let compiler = DirectCompiler::new().unwrap();
-        let flags = compiler.module.isa().flags();
-        assert_eq!(flags.opt_level(), settings::OptLevel::Speed);
+    fn tier_policies_select_the_intended_cranelift_cost() {
+        let runtime = CompilerRuntime::new().unwrap();
+        let lcq = DirectCompiler::new(LCQ_COMPILER_POLICY, runtime.addresses()).unwrap();
+        let lcq_flags = lcq.module.isa().flags();
+        assert_eq!(lcq_flags.opt_level(), settings::OptLevel::None);
         assert_eq!(
-            flags.regalloc_algorithm(),
+            lcq_flags.regalloc_algorithm(),
+            settings::RegallocAlgorithm::SinglePass
+        );
+        assert!(lcq_flags.preserve_frame_pointers());
+
+        let hcq = DirectCompiler::new(HCQ_COMPILER_POLICY, runtime.addresses()).unwrap();
+        let hcq_flags = hcq.module.isa().flags();
+        assert_eq!(hcq_flags.opt_level(), settings::OptLevel::Speed);
+        assert_eq!(
+            hcq_flags.regalloc_algorithm(),
             settings::RegallocAlgorithm::Backtracking
         );
+        assert!(hcq_flags.preserve_frame_pointers());
     }
 }

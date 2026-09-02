@@ -3,12 +3,19 @@
 ## Project goal
 
 Nixe aims to run commercial Nintendo Switch software and, eventually, Switch 2 software. The production path
-must therefore be correct, simple, and highly optimized.
+must therefore be correct and competitive with high-performance emulators.
 
-Correctness is essential, but testing, diagnostics, and abstractions are means to that goal, not goals in
-themselves. Do not add layers, validation, state duplication, compatibility paths, or other runtime work merely
-to make testing easier. Keep the guest-visible path direct and efficient; put exhaustive checks in tests, debug
-builds, or dedicated tools when they are not required by emulation semantics.
+Correctness and execution performance take priority over implementation simplicity. Do not choose a simpler
+implementation if it adds overhead to a hot path, limits JIT optimization, or prevents the architecture needed
+to reach the performance target. Complex mechanisms are appropriate when they provide a real performance benefit
+or are required by emulation semantics.
+
+Testing, diagnostics, and abstractions are means to that goal, not goals in themselves. Do not add layers,
+validation, state duplication, compatibility paths, or other runtime work merely to make testing easier. Keep the
+guest-visible path direct and efficient; put exhaustive checks in tests, debug builds, or dedicated tools when
+they are not required by emulation semantics. Avoid quick wins and simplifications that create a less efficient
+design or defer the required architecture; simplicity means avoiding accidental complexity, not reducing the
+necessary implementation.
 
 ## Architecture
 
