@@ -301,6 +301,7 @@ impl ProcessBuilder {
                 self.memory_backend,
             )
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
+        let memory = std::sync::Arc::new(memory);
         let execution = execution::ProcessExecutionControl::new(
             execution::ProcessExecutionConfiguration {
                 virtual_clock: self.virtual_clock.clone(),
@@ -310,7 +311,7 @@ impl ProcessBuilder {
                     address_space.exclusive_limit(),
                 ),
             },
-            &memory,
+            std::sync::Arc::clone(&memory),
             cpu_process_id,
             &self.cpu_backend,
         )
@@ -324,7 +325,7 @@ impl ProcessBuilder {
             memory_layout,
             random_entropy,
             memory_accounting,
-            memory: std::sync::Arc::new(memory),
+            memory,
             modules: modules.into_boxed_slice(),
             entry_module,
             main_thread_id,

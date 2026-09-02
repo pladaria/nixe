@@ -8,14 +8,15 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::JoinHandle;
 
 use nixe_cpu::decode::{self, DecodeResult};
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::exclusive::ExclusiveMonitorState;
 use nixe_cpu::execution::{
-    ArchitecturalTimer, ControlRequest, CpuControl, CpuExit, CpuFault, CpuFaultKind,
+    ArchitecturalTimer, BoundMemory, ControlRequest, CpuControl, CpuExit, CpuFault, CpuFaultKind,
     ExecutionReport, MemoryBinding, RunRequest, SchedulerRequest, VcpuEventState,
 };
 use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
@@ -33,12 +34,29 @@ use nixe_memory::{
     MemoryInvalidationSource,
 };
 
-use self::compiler::{DirectCompiler, NativeGateway};
-use self::lookup::{NativeLookupSlot, RegionLookup};
-use self::region::{RegionKey, RegionLimits, discover_region};
+use self::compiler::{
+    CompilerRuntime, DirectCompiler, HCQ_COMPILER_POLICY, LCQ_COMPILER_POLICY, NativeGateway,
+    Promotion,
+};
+use self::lookup::{EntryState, NativeLookupNode, NativeLookupSlot, RegionLookup};
+use self::region::{
+    HCQ_MAX_REGION_INSTRUCTIONS, LCQ_MAX_REGION_INSTRUCTIONS, RegionKey, discover_region,
+};
 
 const DEFAULT_MAX_NATIVE_CODE_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_NATIVE_FAULT_REGIONS: usize = 262_144;
+const HCQ_PENDING_PER_WORKER: usize = 64;
+
+const fn hcq_worker_count(logical_processors: usize) -> usize {
+    let workers = logical_processors.saturating_sub(6) / 3;
+    if workers < 1 {
+        1
+    } else if workers > 4 {
+        4
+    } else {
+        workers
+    }
+}
 
 const EXIT_NONE: u32 = 0;
 const EXIT_DISPATCH: u32 = 1;
@@ -190,6 +208,7 @@ struct NativeContext {
     invalidation_signal: *const AtomicU64,
     invalidation_cursor: u64,
     process_pending: *const AtomicU32,
+    hcq_scheduler: *const HcqScheduler,
     data_fault: Option<DataAccessFault>,
     direct_fault_error: Option<Box<str>>,
 }
@@ -215,6 +234,7 @@ impl NativeContext {
         control: &CpuControl,
         native_lookup: *const NativeLookupSlot,
         process_pending: &AtomicU32,
+        hcq_scheduler: &HcqScheduler,
     ) -> Self {
         let direct = memory.direct_address_space_view(address_space);
         let state_pointer = std::ptr::from_mut(&mut *state);
@@ -271,6 +291,7 @@ impl NativeContext {
             invalidation_signal,
             invalidation_cursor: MemoryInvalidationCursor::INITIAL.get(),
             process_pending,
+            hcq_scheduler,
             data_fault: None,
             direct_fault_error: None,
         }
@@ -327,14 +348,9 @@ impl NativeContext {
     }
 }
 
-struct StaticLink {
-    target: RegionKey,
-    slot: Arc<AtomicUsize>,
-}
-
 struct PublishedRegion {
     key: RegionKey,
-    entry_keys: Box<[RegionKey]>,
+    #[cfg(test)]
     entry: usize,
     #[cfg(test)]
     native_bytes: usize,
@@ -346,7 +362,6 @@ struct PublishedRegion {
     exit_tail_count: usize,
     dependencies: Box<[CodePageDependency]>,
     mapping_dependencies: Box<[CodePageSpan]>,
-    links: Box<[StaticLink]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,33 +372,147 @@ struct BoundMemoryBackend {
     direct: Option<DirectAddressSpaceView>,
 }
 
+#[derive(Clone, Copy)]
+struct HcqRequest {
+    key: RegionKey,
+    generation: u64,
+    invalidation_cursor: MemoryInvalidationCursor,
+}
+
+#[derive(Default)]
+struct HcqStackState {
+    pending: Vec<HcqRequest>,
+    capacity: usize,
+    shutdown: bool,
+}
+
+struct HcqScheduler {
+    state: Mutex<HcqStackState>,
+    available: Condvar,
+    closed: AtomicBool,
+}
+
+impl HcqScheduler {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HcqStackState::default()),
+            available: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn configure(&self, worker_count: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .capacity = HCQ_PENDING_PER_WORKER * worker_count;
+    }
+
+    fn push(&self, request: HcqRequest) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire)
+            || state.shutdown
+            || state.pending.len() == state.capacity
+        {
+            return false;
+        }
+        state.pending.push(request);
+        drop(state);
+        self.available.notify_one();
+        true
+    }
+
+    fn pop(&self) -> Option<HcqRequest> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if state.shutdown || self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(request) = state.pending.pop() {
+                return Some(request);
+            }
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn close(&self) -> Vec<HcqRequest> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.closed.store(true, Ordering::Release);
+        let pending = std::mem::take(&mut state.pending);
+        drop(state);
+        self.available.notify_all();
+        pending
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.shutdown = true;
+        state.pending.clear();
+        drop(state);
+        self.available.notify_all();
+    }
+}
+
+unsafe extern "C" fn request_hcq(
+    scheduler: *const HcqScheduler,
+    node: *const NativeLookupNode,
+    invalidation_cursor: u64,
+) {
+    let scheduler = unsafe { &*scheduler };
+    let node = unsafe { &*node };
+    if scheduler.closed.load(Ordering::Acquire) {
+        node.disable_promotion();
+        return;
+    }
+    let Some(generation) = node.try_queue_hcq() else {
+        return;
+    };
+    let request = HcqRequest {
+        key: node.key(),
+        generation,
+        invalidation_cursor: MemoryInvalidationCursor::new(invalidation_cursor),
+    };
+    if !scheduler.push(request) {
+        node.restore_lcq(generation);
+    }
+}
+
 struct ProcessState {
-    compiler: DirectCompiler,
-    lookup: RegionLookup,
+    lookup: Arc<RegionLookup>,
     regions: HashMap<RegionKey, Arc<PublishedRegion>>,
-    incoming: HashMap<RegionKey, Vec<Arc<AtomicUsize>>>,
     physical_dependencies: HashMap<GuestPhysicalPageId, HashSet<RegionKey>>,
     retired: Vec<Arc<PublishedRegion>>,
     invalidation_cursor: MemoryInvalidationCursor,
     invalidations: Vec<MemoryInvalidation>,
     native_bytes: usize,
     memory_backend: Option<BoundMemoryBackend>,
+    memory_owner: Option<Arc<dyn BoundMemory>>,
+    failure: Option<DirectJitError>,
 }
 
 impl ProcessState {
     #[cfg(test)]
     fn region_for(&self, key: RegionKey) -> Option<&Arc<PublishedRegion>> {
-        let owner = self.lookup.get(key)?.owner;
-        self.regions.get(&owner)
+        self.regions.get(&key)
     }
 }
 
 pub struct JitProcess {
     cpu: ProcessCpuContext,
-    limits: RegionLimits,
     max_native_code_bytes: usize,
     pending: AtomicU32,
     fault_registry: Arc<NativeFaultRegistry>,
+    runtime: CompilerRuntime,
+    published: Condvar,
+    hcq: Arc<HcqScheduler>,
+    hcq_started: AtomicBool,
+    hcq_workers: Mutex<Vec<JoinHandle<()>>>,
     state: Mutex<ProcessState>,
 }
 
@@ -393,28 +522,55 @@ impl JitProcess {
             NativeFaultRegistry::with_capacity(MAX_NATIVE_FAULT_REGIONS)
                 .map_err(|error| DirectJitError::unsupported(error.to_string()))?,
         );
+        let runtime = CompilerRuntime::new()?;
         Ok(Self {
             cpu,
-            limits: RegionLimits::default(),
             max_native_code_bytes: DEFAULT_MAX_NATIVE_CODE_BYTES,
             pending: AtomicU32::new(0),
             fault_registry,
+            runtime,
+            published: Condvar::new(),
+            hcq: Arc::new(HcqScheduler::new()),
+            hcq_started: AtomicBool::new(false),
+            hcq_workers: Mutex::new(Vec::new()),
             state: Mutex::new(ProcessState {
-                compiler: DirectCompiler::new()?,
-                lookup: RegionLookup::new(),
+                lookup: Arc::new(RegionLookup::new()),
                 regions: HashMap::new(),
-                incoming: HashMap::new(),
                 physical_dependencies: HashMap::new(),
                 retired: Vec::new(),
                 invalidation_cursor: MemoryInvalidationCursor::INITIAL,
                 invalidations: Vec::new(),
                 native_bytes: 0,
                 memory_backend: None,
+                memory_owner: None,
+                failure: None,
             }),
         })
     }
 
     pub fn bind_memory(&self, binding: MemoryBinding<'_>) -> Result<(), DirectJitError> {
+        self.bind_memory_inner(binding, None)
+    }
+
+    pub fn bind_owned_memory(
+        self: &Arc<Self>,
+        binding: MemoryBinding<'_>,
+        owner: Arc<dyn BoundMemory>,
+    ) -> Result<(), DirectJitError> {
+        if !std::ptr::eq(binding.memory, owner.as_ref()) {
+            return Err(DirectJitError::invalid(
+                "JIT memory owner differs from the bound memory",
+            ));
+        }
+        self.bind_memory_inner(binding, Some(owner))?;
+        self.start_hcq_workers()
+    }
+
+    fn bind_memory_inner(
+        &self,
+        binding: MemoryBinding<'_>,
+        owner: Option<Arc<dyn BoundMemory>>,
+    ) -> Result<(), DirectJitError> {
         if binding.address_space != self.cpu.address_space_id() {
             return Err(DirectJitError::invalid(
                 "JIT memory binding uses a different process address space",
@@ -456,9 +612,20 @@ impl JitProcess {
                         "JIT process memory backend is immutable after binding",
                     ));
                 }
+                if let Some(owner) = owner {
+                    match &state.memory_owner {
+                        Some(bound_owner) if Arc::ptr_eq(bound_owner, &owner) => {}
+                        Some(_) => {
+                            return Err(DirectJitError::invalid(
+                                "JIT process memory owner is immutable after binding",
+                            ));
+                        }
+                        None => state.memory_owner = Some(owner),
+                    }
+                }
             } else {
-                state.compiler.bind_memory_backend(backend)?;
                 state.memory_backend = Some(requested);
+                state.memory_owner = owner;
             }
         }
         Ok(())
@@ -478,108 +645,151 @@ impl JitProcess {
             }))
     }
 
-    fn entry_for(
-        &self,
-        memory: &(impl CpuMemory + ?Sized),
-        location: LocationDescriptor,
-    ) -> Result<(NativeGateway, usize, u64), DirectJitError> {
-        let key = RegionKey::new(self.cpu, location);
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        reconcile_invalidations(&mut state, memory, key.address_space)?;
-        if self.pending.load(Ordering::Acquire) != 0 {
-            return Err(DirectJitError::shutdown());
+    fn start_hcq_workers(self: &Arc<Self>) -> Result<(), DirectJitError> {
+        if self
+            .hcq_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
         }
-        if let Some(entry) = state.lookup.get(key) {
-            return Ok((
-                state.compiler.gateway(),
-                entry.entry,
-                state.invalidation_cursor.get(),
-            ));
-        }
-        let (region, link_targets, slots, mut compiled) = loop {
-            let region = discover_region(self.cpu, memory, location, self.limits, |pc| {
-                state.lookup.get(key.at(pc)).is_some()
+        let worker_count = hcq_worker_count(
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        );
+        self.hcq.configure(worker_count);
+        let (memory, backend) = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let memory = state.memory_owner.as_ref().cloned().ok_or_else(|| {
+                DirectJitError::internal("HCQ workers require process-owned memory")
             })?;
-            let invalidated = reconcile_invalidations(&mut state, memory, key.address_space)?;
-            if invalidated.affects(&region) {
-                continue;
+            let backend = state
+                .memory_backend
+                .ok_or_else(|| DirectJitError::internal("HCQ workers require bound memory"))?
+                .backend;
+            (memory, backend)
+        };
+        let mut workers = self
+            .hcq_workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for index in 0..worker_count {
+            let process = Arc::downgrade(self);
+            let scheduler = Arc::clone(&self.hcq);
+            let memory = Arc::clone(&memory);
+            let runtime = self.runtime.addresses();
+            let worker = std::thread::Builder::new()
+                .name(format!("nixe-hcq-{index}"))
+                .spawn(move || {
+                    let mut compiler = match DirectCompiler::new(HCQ_COMPILER_POLICY, runtime) {
+                        Ok(compiler) => compiler,
+                        Err(error) => {
+                            if let Some(process) = process.upgrade() {
+                                process.fail_background(error);
+                            }
+                            return;
+                        }
+                    };
+                    if let Err(error) = compiler.bind_memory_backend(backend) {
+                        if let Some(process) = process.upgrade() {
+                            process.fail_background(error);
+                        }
+                        return;
+                    }
+                    while let Some(request) = scheduler.pop() {
+                        let Some(process) = process.upgrade() else {
+                            return;
+                        };
+                        if let Err(error) =
+                            process.compile_hcq(&mut compiler, memory.as_ref(), request)
+                        {
+                            if error.kind == DirectJitErrorKind::Capacity {
+                                process.close_hcq_after_capacity(request);
+                            } else {
+                                process.fail_background(error);
+                                return;
+                            }
+                        }
+                    }
+                })
+                .map_err(|error| {
+                    self.hcq.shutdown();
+                    DirectJitError::unsupported(format!(
+                        "could not start HCQ compilation worker: {error}"
+                    ))
+                })?;
+            workers.push(worker);
+        }
+        Ok(())
+    }
+
+    fn close_hcq_after_capacity(&self, current: HcqRequest) {
+        let pending = self.hcq.close();
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        for request in std::iter::once(current).chain(pending) {
+            if let Some(node) = state.lookup.get(request.key) {
+                node.restore_lcq_without_promotion(request.generation);
             }
-            let link_targets: Vec<_> = region
-                .external_exits
-                .iter()
-                .filter_map(|exit| exit.target.map(|target| key.at(target)))
-                .collect();
-            let slots: Vec<_> = link_targets
-                .iter()
-                .map(|_| Arc::new(AtomicUsize::new(0)))
-                .collect();
-            let slot_addresses: Vec<_> =
-                slots.iter().map(|slot| Arc::as_ptr(slot).addr()).collect();
-            let compiled = state.compiler.compile(&region, &slot_addresses)?;
-            state.native_bytes = state.compiler.native_bytes();
-            if state.native_bytes > self.max_native_code_bytes {
-                return Err(DirectJitError::capacity(format!(
-                    "direct JIT code arena exhausted: used={} limit={}",
-                    state.native_bytes, self.max_native_code_bytes,
-                )));
-            }
-            let invalidated = reconcile_invalidations(&mut state, memory, key.address_space)?;
-            if self.pending.load(Ordering::Acquire) != 0 {
-                return Err(DirectJitError::shutdown());
-            }
-            if !invalidated.affects(&region) {
-                break (region, link_targets, slots, compiled);
+        }
+        drop(state);
+        self.published.notify_all();
+    }
+
+    fn compile_hcq(
+        &self,
+        compiler: &mut DirectCompiler,
+        memory: &dyn CpuMemory,
+        request: HcqRequest,
+    ) -> Result<(), DirectJitError> {
+        let (lookup, node) = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let lookup = Arc::clone(&state.lookup);
+            let Some(node) = lookup.get(request.key) else {
+                return Ok(());
+            };
+            (lookup, node)
+        };
+        if node.generation() != request.generation
+            || node.state() != EntryState::HcqQueued
+            || node.entry() == 0
+        {
+            return Ok(());
+        }
+        let location = LocationDescriptor::new(request.key.start, self.cpu.profile_id());
+        let region = match discover_region(
+            self.cpu,
+            memory,
+            location,
+            HCQ_MAX_REGION_INSTRUCTIONS,
+            |_| false,
+        ) {
+            Ok(region) => region,
+            Err(error) => {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                reconcile_invalidations(&mut state, &lookup, memory, request.key.address_space)?;
+                if node.generation() != request.generation
+                    || node.state() != EntryState::HcqQueued
+                    || node.entry() == 0
+                {
+                    return Ok(());
+                }
+                return Err(error);
             }
         };
+        let entry_cells = region
+            .external_exits
+            .iter()
+            .filter_map(|exit| exit.target.map(|target| request.key.at(target)))
+            .map(|target| lookup.get_or_create(target).entry_address())
+            .collect::<Vec<_>>();
+        let mut compiled = compiler.compile(&region, &entry_cells, None)?;
+        let fault_metadata = native_fault_metadata(&mut compiled)?;
         let entry = compiled.entry;
-        // Only the requested primary entry is published. An address reached
-        // internally stays on the SSA edge; a later external request for that
-        // address discovers its own region instead of paying a dispatcher in
-        // every primary entry.
-        let entry_keys = vec![key];
-        let links: Vec<_> = link_targets
-            .into_iter()
-            .zip(slots)
-            .map(|(target, slot)| StaticLink { target, slot })
-            .collect();
-        if !compiled.fault_sites.is_empty() {
-            let native_end = entry.checked_add(compiled.native_bytes).ok_or_else(|| {
-                DirectJitError::internal("compiled native region address overflows")
-            })?;
-            let sites = std::mem::take(&mut compiled.fault_sites)
-                .into_vec()
-                .into_iter()
-                .map(|site| {
-                    let native_start =
-                        entry
-                            .checked_add(site.native_start as usize)
-                            .ok_or_else(|| {
-                                DirectJitError::internal("native fault-site start overflows")
-                            })?;
-                    let native_end =
-                        entry.checked_add(site.native_end as usize).ok_or_else(|| {
-                            DirectJitError::internal("native fault-site end overflows")
-                        })?;
-                    Ok(NativeFaultSite {
-                        native_start,
-                        native_end,
-                        access: site.access,
-                    })
-                })
-                .collect::<Result<Vec<_>, DirectJitError>>()?;
-            let metadata = Arc::new(NativeFaultRegion {
-                native_start: entry,
-                native_end,
-                sites: Arc::from(sites),
-            });
-            self.fault_registry
-                .publish(Arc::clone(&metadata))
-                .map_err(|error| DirectJitError::internal(error.to_string()))?;
-        }
         let published = Arc::new(PublishedRegion {
-            key,
-            entry_keys: entry_keys.into_boxed_slice(),
-            entry,
+            key: request.key,
+            #[cfg(test)]
+            entry: compiled.entry,
             #[cfg(test)]
             native_bytes: compiled.native_bytes,
             #[cfg(test)]
@@ -590,46 +800,81 @@ impl JitProcess {
             exit_tail_count: compiled.exit_tail_count,
             dependencies: region.dependencies,
             mapping_dependencies: region.mapping_dependencies,
-            links: links.into_boxed_slice(),
         });
-
-        for link in &published.links {
-            if let Some(target) = state.lookup.get(link.target) {
-                link.slot.store(target.entry, Ordering::Release);
-            }
-            state
-                .incoming
-                .entry(link.target)
-                .or_default()
-                .push(Arc::clone(&link.slot));
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.native_bytes = state
+            .native_bytes
+            .checked_add(compiled.native_bytes)
+            .ok_or_else(|| DirectJitError::capacity("direct JIT code size overflows"))?;
+        if state.native_bytes > self.max_native_code_bytes {
+            return Err(DirectJitError::capacity(format!(
+                "direct JIT code arena exhausted: used={} limit={}",
+                state.native_bytes, self.max_native_code_bytes,
+            )));
+        }
+        reconcile_invalidations(&mut state, &lookup, memory, request.key.address_space)?;
+        let invalidated = invalidations_since(
+            memory,
+            request.invalidation_cursor,
+            request.key.address_space,
+            &mut state.invalidations,
+        )?;
+        if self.pending.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        if node.generation() != request.generation
+            || node.state() != EntryState::HcqQueued
+            || node.entry() == 0
+        {
+            return Ok(());
+        }
+        if invalidated.affects_published(&published) {
+            node.restore_lcq(request.generation);
+            self.published.notify_all();
+            return Ok(());
+        }
+        if let Some(metadata) = fault_metadata {
+            self.fault_registry
+                .publish(metadata)
+                .map_err(|error| DirectJitError::internal(error.to_string()))?;
         }
         for dependency in &published.dependencies {
             state
                 .physical_dependencies
                 .entry(dependency.page)
                 .or_default()
-                .insert(key);
+                .insert(request.key);
         }
-        let previous = state.regions.insert(key, Arc::clone(&published));
-        assert!(
-            previous.is_none(),
-            "a native region owner is published once"
-        );
-        for &entry_key in &published.entry_keys {
-            state.lookup.insert(entry_key, key, entry);
-        }
-        for &entry_key in &published.entry_keys {
-            if let Some(incoming) = state.incoming.get(&entry_key) {
-                for slot in incoming {
-                    slot.store(entry, Ordering::Release);
-                }
+        let previous = state.regions.insert(request.key, Arc::clone(&published));
+        if !node.publish_hcq(request.generation, entry) {
+            if let Some(previous) = previous {
+                state.regions.insert(request.key, previous);
+            } else {
+                state.regions.remove(&request.key);
             }
+            return Ok(());
         }
-        Ok((
-            state.compiler.gateway(),
-            published.entry,
-            state.invalidation_cursor.get(),
-        ))
+        if let Some(previous) = previous {
+            state.retired.push(previous);
+        }
+        drop(state);
+        self.published.notify_all();
+        log::debug!(
+            "direct JIT replaced LCQ with HCQ: address-space={:#x} pc={:#018x}",
+            request.key.address_space.get(),
+            request.key.start.get(),
+        );
+        Ok(())
+    }
+
+    fn fail_background(&self, error: DirectJitError) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.failure.is_none() {
+            state.failure = Some(error);
+        }
+        self.pending.store(1, Ordering::Release);
+        drop(state);
+        self.published.notify_all();
     }
 
     /// Reconciles invalidations and returns an already-published entry without
@@ -644,22 +889,30 @@ impl JitProcess {
     ) -> Result<Option<(NativeGateway, usize, u64)>, DirectJitError> {
         let key = RegionKey::new(self.cpu, location);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        reconcile_invalidations(&mut state, memory, key.address_space)?;
+        let lookup = Arc::clone(&state.lookup);
+        reconcile_invalidations(&mut state, &lookup, memory, key.address_space)?;
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
         if self.pending.load(Ordering::Acquire) != 0 {
             return Err(DirectJitError::shutdown());
         }
-        Ok(state.lookup.get(key).map(|entry| {
-            (
-                state.compiler.gateway(),
-                entry.entry,
-                state.invalidation_cursor.get(),
-            )
+        Ok(lookup.get(key).and_then(|node| {
+            let entry = node.entry();
+            (entry != 0).then(|| {
+                (
+                    self.runtime.gateway(),
+                    entry,
+                    state.invalidation_cursor.get(),
+                )
+            })
         }))
     }
 
     fn reconcile(&self, memory: &(impl CpuMemory + ?Sized)) -> Result<(), DirectJitError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        reconcile_invalidations(&mut state, memory, self.cpu.address_space_id())?;
+        let lookup = Arc::clone(&state.lookup);
+        reconcile_invalidations(&mut state, &lookup, memory, self.cpu.address_space_id())?;
         Ok(())
     }
 
@@ -673,16 +926,73 @@ impl JitProcess {
 
     pub fn shutdown(&self) {
         self.pending.store(1, Ordering::Release);
+        self.hcq.shutdown();
+        let current = std::thread::current().id();
+        let workers = std::mem::take(
+            &mut *self
+                .hcq_workers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for worker in workers {
+            if worker.thread().id() != current {
+                let _ = worker.join();
+            }
+        }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let lookup = Arc::clone(&state.lookup);
         let keys: Vec<_> = state.regions.keys().copied().collect();
         for key in keys {
-            retire_region(&mut state, key);
+            retire_region(&mut state, &lookup, key);
         }
+        self.published.notify_all();
     }
 
     pub fn synchronize_address_space(&self, memory: &dyn CpuMemory) -> Result<(), DirectJitError> {
         self.reconcile(memory)
     }
+}
+
+impl Drop for JitProcess {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn native_fault_metadata(
+    compiled: &mut compiler::CompiledRegion,
+) -> Result<Option<Arc<NativeFaultRegion>>, DirectJitError> {
+    if compiled.fault_sites.is_empty() {
+        return Ok(None);
+    }
+    let native_end = compiled
+        .entry
+        .checked_add(compiled.native_bytes)
+        .ok_or_else(|| DirectJitError::internal("compiled native region address overflows"))?;
+    let sites = std::mem::take(&mut compiled.fault_sites)
+        .into_vec()
+        .into_iter()
+        .map(|site| {
+            let native_start = compiled
+                .entry
+                .checked_add(site.native_start as usize)
+                .ok_or_else(|| DirectJitError::internal("native fault-site start overflows"))?;
+            let native_end = compiled
+                .entry
+                .checked_add(site.native_end as usize)
+                .ok_or_else(|| DirectJitError::internal("native fault-site end overflows"))?;
+            Ok(NativeFaultSite {
+                native_start,
+                native_end,
+                access: site.access,
+            })
+        })
+        .collect::<Result<Vec<_>, DirectJitError>>()?;
+    Ok(Some(Arc::new(NativeFaultRegion {
+        native_start: compiled.entry,
+        native_end,
+        sites: Arc::from(sites),
+    })))
 }
 
 #[derive(Default)]
@@ -693,7 +1003,7 @@ struct InvalidationSummary {
 }
 
 impl InvalidationSummary {
-    fn affects(&self, region: &region::NativeRegion) -> bool {
+    fn affects_published(&self, region: &PublishedRegion) -> bool {
         self.all
             || self.mapping_ranges.iter().any(|&(start, size)| {
                 region
@@ -708,38 +1018,31 @@ impl InvalidationSummary {
     }
 }
 
-fn reconcile_invalidations(
-    state: &mut ProcessState,
+fn invalidations_since(
     memory: &(impl MemoryInvalidationSource + ?Sized),
+    cursor: MemoryInvalidationCursor,
     address_space: nixe_memory::AddressSpaceId,
+    records: &mut Vec<MemoryInvalidation>,
 ) -> Result<InvalidationSummary, DirectJitError> {
-    let mut records = std::mem::take(&mut state.invalidations);
     records.clear();
-    let cursor = match memory.read_invalidations_since(state.invalidation_cursor, &mut records) {
-        Ok(cursor) => cursor,
-        Err(MemoryInvalidationError::HistoryLost { latest, .. }) => {
-            state.invalidation_cursor = latest;
-            state.invalidations = records;
-            let keys: Vec<_> = state.regions.keys().copied().collect();
-            for key in keys {
-                retire_region(state, key);
-            }
-            return Ok(InvalidationSummary {
-                all: true,
-                ..InvalidationSummary::default()
-            });
-        }
-        Err(error) => {
-            state.invalidations = records;
-            return Err(DirectJitError::internal(format!(
-                "direct JIT could not consume memory invalidations: {error}"
-            )));
-        }
-    };
-    state.invalidation_cursor = cursor;
+    match memory.read_invalidations_since(cursor, records) {
+        Ok(_) => Ok(summarize_invalidations(records, address_space)),
+        Err(MemoryInvalidationError::HistoryLost { .. }) => Ok(InvalidationSummary {
+            all: true,
+            ..InvalidationSummary::default()
+        }),
+        Err(error) => Err(DirectJitError::internal(format!(
+            "direct JIT could not revalidate compiled code: {error}"
+        ))),
+    }
+}
 
+fn summarize_invalidations(
+    records: &[MemoryInvalidation],
+    address_space: nixe_memory::AddressSpaceId,
+) -> InvalidationSummary {
     let mut summary = InvalidationSummary::default();
-    for record in &records {
+    for record in records {
         match record.kind {
             MemoryInvalidationKind::Mapping {
                 address_space: changed,
@@ -757,6 +1060,41 @@ fn reconcile_invalidations(
             | MemoryInvalidationKind::InstructionCache { .. } => {}
         }
     }
+    summary
+}
+
+fn reconcile_invalidations(
+    state: &mut ProcessState,
+    lookup: &RegionLookup,
+    memory: &(impl MemoryInvalidationSource + ?Sized),
+    address_space: nixe_memory::AddressSpaceId,
+) -> Result<InvalidationSummary, DirectJitError> {
+    let mut records = std::mem::take(&mut state.invalidations);
+    records.clear();
+    let cursor = match memory.read_invalidations_since(state.invalidation_cursor, &mut records) {
+        Ok(cursor) => cursor,
+        Err(MemoryInvalidationError::HistoryLost { latest, .. }) => {
+            state.invalidation_cursor = latest;
+            state.invalidations = records;
+            let keys: Vec<_> = state.regions.keys().copied().collect();
+            for key in keys {
+                retire_region(state, lookup, key);
+            }
+            return Ok(InvalidationSummary {
+                all: true,
+                ..InvalidationSummary::default()
+            });
+        }
+        Err(error) => {
+            state.invalidations = records;
+            return Err(DirectJitError::internal(format!(
+                "direct JIT could not consume memory invalidations: {error}"
+            )));
+        }
+    };
+    state.invalidation_cursor = cursor;
+
+    let summary = summarize_invalidations(&records, address_space);
 
     let mut keys: HashSet<_> = if summary.all {
         state.regions.keys().copied().collect()
@@ -770,21 +1108,27 @@ fn reconcile_invalidations(
             .collect()
     };
     if !summary.all && !summary.mapping_ranges.is_empty() {
-        keys.extend(state.regions.values().filter_map(|region| {
-            summary
-                .mapping_ranges
-                .iter()
-                .any(|&(start, size)| {
-                    region
-                        .mapping_dependencies
+        keys.extend(
+            state
+                .regions
+                .values()
+                .chain(&state.retired)
+                .filter_map(|region| {
+                    summary
+                        .mapping_ranges
                         .iter()
-                        .any(|span| mapping_range_overlaps(*span, start, size))
-                })
-                .then_some(region.key)
-        }));
+                        .any(|&(start, size)| {
+                            region
+                                .mapping_dependencies
+                                .iter()
+                                .any(|span| mapping_range_overlaps(*span, start, size))
+                        })
+                        .then_some(region.key)
+                }),
+        );
     }
     for key in keys {
-        retire_region(state, key);
+        retire_region(state, lookup, key);
     }
     state.invalidations = records;
     Ok(summary)
@@ -803,46 +1147,19 @@ fn mapping_range_overlaps(span: CodePageSpan, start: GuestVirtualAddress, size: 
     changed_start < span_end && span_start < changed_end
 }
 
-fn retire_region(state: &mut ProcessState, key: RegionKey) {
-    let owner = state.lookup.get(key).map_or(key, |entry| entry.owner);
-    let Some(region) = state.regions.remove(&owner) else {
+fn retire_region(state: &mut ProcessState, lookup: &RegionLookup, key: RegionKey) {
+    let Some(region) = state.regions.remove(&key) else {
         return;
     };
-    for &entry_key in &region.entry_keys {
-        if let Some(incoming) = state.incoming.get(&entry_key) {
-            for slot in incoming {
-                slot.store(0, Ordering::Release);
-            }
-        }
-        state.lookup.remove(entry_key);
-    }
-    for dependency in &region.dependencies {
-        let remove_page = state
-            .physical_dependencies
-            .get_mut(&dependency.page)
-            .is_some_and(|keys| {
-                keys.remove(&owner);
-                keys.is_empty()
-            });
-        if remove_page {
-            state.physical_dependencies.remove(&dependency.page);
-        }
-    }
-    for link in &region.links {
-        link.slot.store(0, Ordering::Release);
-        let remove_target = state.incoming.get_mut(&link.target).is_some_and(|slots| {
-            slots.retain(|slot| !Arc::ptr_eq(slot, &link.slot));
-            slots.is_empty()
-        });
-        if remove_target {
-            state.incoming.remove(&link.target);
-        }
+    if let Some(node) = lookup.get(key) {
+        node.invalidate();
     }
     state.retired.push(region);
 }
 
 pub struct JitThread {
     control: CpuControl,
+    compiler: Mutex<Option<Box<DirectCompiler>>>,
     exclusive: Mutex<ExclusiveMonitorState>,
     fault_context: Mutex<Option<WorkerFaultContext>>,
     #[cfg(test)]
@@ -867,10 +1184,207 @@ impl JitThread {
     pub fn new() -> Self {
         Self {
             control: CpuControl::default(),
+            compiler: Mutex::new(None),
             exclusive: Mutex::new(ExclusiveMonitorState::default()),
             fault_context: Mutex::new(None),
             #[cfg(test)]
             events: VcpuEventState::default(),
+        }
+    }
+
+    fn entry_for(
+        &self,
+        process: &JitProcess,
+        memory: &(impl CpuMemory + ?Sized),
+        location: LocationDescriptor,
+    ) -> Result<(NativeGateway, usize, u64), DirectJitError> {
+        let key = RegionKey::new(process.cpu, location);
+        let lookup = Arc::clone(
+            &process
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .lookup,
+        );
+        let node = lookup.get_or_create(key);
+        loop {
+            let mut state = process.state.lock().unwrap_or_else(PoisonError::into_inner);
+            reconcile_invalidations(&mut state, &lookup, memory, key.address_space)?;
+            if let Some(error) = &state.failure {
+                return Err(error.clone());
+            }
+            if process.pending.load(Ordering::Acquire) != 0 {
+                return Err(DirectJitError::shutdown());
+            }
+            let entry = node.entry();
+            if entry != 0 {
+                return Ok((
+                    process.runtime.gateway(),
+                    entry,
+                    state.invalidation_cursor.get(),
+                ));
+            }
+            match node.state() {
+                EntryState::Empty => {
+                    let Some(generation) = node.try_begin_lcq() else {
+                        continue;
+                    };
+                    let cursor = state.invalidation_cursor;
+                    drop(state);
+                    let result = self.compile_lcq(
+                        process,
+                        memory,
+                        Arc::clone(&node),
+                        Arc::clone(&lookup),
+                        generation,
+                        cursor,
+                    );
+                    if result.is_err() {
+                        node.abort_lcq(generation);
+                        process.published.notify_all();
+                    }
+                    return result;
+                }
+                EntryState::CompilingLcq => {
+                    drop(
+                        process
+                            .published
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner),
+                    );
+                }
+                EntryState::Lcq | EntryState::HcqQueued | EntryState::Hcq => {
+                    return Err(DirectJitError::internal(
+                        "published JIT entry state has a null canonical cell",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn compile_lcq(
+        &self,
+        process: &JitProcess,
+        memory: &(impl CpuMemory + ?Sized),
+        node: Arc<lookup::NativeLookupNode>,
+        lookup: Arc<RegionLookup>,
+        generation: u64,
+        mut compile_cursor: MemoryInvalidationCursor,
+    ) -> Result<(NativeGateway, usize, u64), DirectJitError> {
+        let key = node.key();
+        let location = LocationDescriptor::new(key.start, process.cpu.profile_id());
+        let backend = process.bound_memory_backend()?.backend;
+        loop {
+            let region = discover_region(
+                process.cpu,
+                memory,
+                location,
+                LCQ_MAX_REGION_INSTRUCTIONS,
+                |pc| lookup.native_entry_lock_free(key.at(pc)) != 0,
+            )?;
+            let entry_cells = region
+                .external_exits
+                .iter()
+                .filter_map(|exit| exit.target.map(|target| key.at(target)))
+                .map(|target| lookup.get_or_create(target).entry_address())
+                .collect::<Vec<_>>();
+            let mut compiled = {
+                let mut compiler = self.compiler.lock().unwrap_or_else(PoisonError::into_inner);
+                if compiler.is_none() {
+                    *compiler = Some(Box::new(DirectCompiler::new(
+                        LCQ_COMPILER_POLICY,
+                        process.runtime.addresses(),
+                    )?));
+                }
+                let compiler = compiler
+                    .as_deref_mut()
+                    .expect("LCQ compiler was initialized");
+                compiler.bind_memory_backend(backend)?;
+                let promotion = process
+                    .hcq_started
+                    .load(Ordering::Acquire)
+                    .then_some(Promotion {
+                        hotness_address: node.hotness_address(),
+                        node_address: Arc::as_ptr(&node).addr(),
+                    });
+                compiler.compile(&region, &entry_cells, promotion)?
+            };
+            let fault_metadata = native_fault_metadata(&mut compiled)?;
+            let entry = compiled.entry;
+            let published = Arc::new(PublishedRegion {
+                key,
+                #[cfg(test)]
+                entry: compiled.entry,
+                #[cfg(test)]
+                native_bytes: compiled.native_bytes,
+                #[cfg(test)]
+                clif_instructions: compiled.clif_instructions,
+                #[cfg(test)]
+                deferred_register_loads: compiled.deferred_register_loads,
+                #[cfg(test)]
+                exit_tail_count: compiled.exit_tail_count,
+                dependencies: region.dependencies,
+                mapping_dependencies: region.mapping_dependencies,
+            });
+
+            let mut state = process.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.native_bytes = state
+                .native_bytes
+                .checked_add(compiled.native_bytes)
+                .ok_or_else(|| DirectJitError::capacity("direct JIT code size overflows"))?;
+            if state.native_bytes > process.max_native_code_bytes {
+                return Err(DirectJitError::capacity(format!(
+                    "direct JIT code arena exhausted: used={} limit={}",
+                    state.native_bytes, process.max_native_code_bytes,
+                )));
+            }
+            reconcile_invalidations(&mut state, &lookup, memory, key.address_space)?;
+            let invalidated = invalidations_since(
+                memory,
+                compile_cursor,
+                key.address_space,
+                &mut state.invalidations,
+            )?;
+            if process.pending.load(Ordering::Acquire) != 0 {
+                return Err(DirectJitError::shutdown());
+            }
+            if node.generation() != generation || node.state() != EntryState::CompilingLcq {
+                drop(state);
+                process.published.notify_all();
+                return self.entry_for(process, memory, location);
+            }
+            if invalidated.affects_published(&published) {
+                compile_cursor = state.invalidation_cursor;
+                continue;
+            }
+            if let Some(metadata) = fault_metadata {
+                process
+                    .fault_registry
+                    .publish(metadata)
+                    .map_err(|error| DirectJitError::internal(error.to_string()))?;
+            }
+            for dependency in &published.dependencies {
+                state
+                    .physical_dependencies
+                    .entry(dependency.page)
+                    .or_default()
+                    .insert(key);
+            }
+            let previous = state.regions.insert(key, Arc::clone(&published));
+            assert!(
+                previous.is_none(),
+                "a native region generation is published once"
+            );
+            if !node.publish_lcq(generation, entry) {
+                state.regions.remove(&key);
+                return Err(DirectJitError::internal(
+                    "LCQ publication lost canonical entry ownership",
+                ));
+            }
+            let cursor = state.invalidation_cursor.get();
+            drop(state);
+            process.published.notify_all();
+            return Ok((process.runtime.gateway(), entry, cursor));
         }
     }
 
@@ -1133,6 +1647,7 @@ impl JitThread {
             &self.control,
             native_lookup,
             &process.pending,
+            &process.hcq,
         );
         loop {
             let pc = GuestVirtualAddress::new(unsafe { *context.pc });
@@ -1146,7 +1661,7 @@ impl JitThread {
                 });
             }
             let location = LocationDescriptor::new(pc, process.cpu.profile_id());
-            let compiled_entry = process.entry_for(memory, location)?;
+            let compiled_entry = self.entry_for(process, memory, location)?;
             let native_lease = if backend.backend == CpuMemoryBackend::LinuxDirect {
                 let lease = memory.acquire_execution_lease().ok_or_else(|| {
                     DirectJitError::invalid(

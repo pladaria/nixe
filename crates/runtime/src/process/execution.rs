@@ -62,16 +62,24 @@ impl CpuBackend {
         }
     }
 
-    fn bind_memory(&mut self, binding: MemoryBinding<'_>) -> Result<(), CpuFault> {
+    fn bind_memory(
+        &mut self,
+        binding: MemoryBinding<'_>,
+        owner: Arc<ExecutionMemory>,
+    ) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(process) => process.bind_memory(binding),
-            Self::Jit(process) => process.bind_memory(binding).map_err(|error| CpuFault {
-                backend: "jit",
-                kind: CpuFaultKind::Unavailable,
-                progress: 0,
-                message: error.to_string().into_boxed_str(),
-                context: Box::new(ThreadCpuState::default().register_context()),
-            }),
+            Self::Jit(process) => {
+                process
+                    .bind_owned_memory(binding, owner)
+                    .map_err(|error| CpuFault {
+                        backend: "jit",
+                        kind: CpuFaultKind::Unavailable,
+                        progress: 0,
+                        message: error.to_string().into_boxed_str(),
+                        context: Box::new(ThreadCpuState::default().register_context()),
+                    })
+            }
         }
     }
 
@@ -376,7 +384,7 @@ pub(crate) struct ProcessExecutionConfiguration {
 impl ProcessExecutionControl {
     pub(crate) fn new(
         configuration: ProcessExecutionConfiguration,
-        memory: &ExecutionMemory,
+        memory: Arc<ExecutionMemory>,
         process_id: CpuProcessId,
         selection: &CpuBackendConfig,
     ) -> Result<Self, CpuFault> {
@@ -387,13 +395,16 @@ impl ProcessExecutionControl {
             address_space_end,
         } = configuration;
         let mut backend = CpuBackend::new(selection, process_id, cpu)?;
-        if let Err(fault) = backend.bind_memory(MemoryBinding {
-            address_space: cpu.address_space_id(),
-            end_exclusive: address_space_end,
-            memory,
-            mapping_epoch: memory.mapping_epoch().get(),
-            invalidation_cursor: memory.invalidation_cursor(),
-        }) {
+        if let Err(fault) = backend.bind_memory(
+            MemoryBinding {
+                address_space: cpu.address_space_id(),
+                end_exclusive: address_space_end,
+                memory: memory.as_ref(),
+                mapping_epoch: memory.mapping_epoch().get(),
+                invalidation_cursor: memory.invalidation_cursor(),
+            },
+            Arc::clone(&memory),
+        ) {
             let _ = backend.shutdown();
             return Err(fault);
         }

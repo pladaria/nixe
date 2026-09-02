@@ -1,16 +1,20 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::mem::size_of;
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use nixe_cpu::decode::{self, DecodeResult, DecodeSupport};
+use nixe_cpu::error::InstructionFetchFault;
 use nixe_cpu::execution::MemoryBinding;
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::{
-    CacheMaintenanceKind, CpuMemory, DataAccessFaultReason, ExecutionMemory, MemoryAccess,
-    MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryAttributes, MemoryOrdering,
-    MemoryPermissions, MemoryValue, ProcessMemory, SyntheticMemory, SyntheticMmio,
+    AtomicMemoryResult, AtomicRmwKind, CacheMaintenanceKind, CodePageSpan, CpuMemory,
+    DataAccessFault, DataAccessFaultReason, DataReadResult, DataWriteResult, ExecutionMemory,
+    FetchedCode, InstructionMemory, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
+    MemoryAlignment, MemoryAttributes, MemoryOrdering, MemoryPermissions, MemoryQueryResult,
+    MemoryValue, ProcessMemory, SyntheticMemory, SyntheticMmio,
 };
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -19,14 +23,16 @@ use nixe_cpu_interpreter::{
     InstructionStep, InterpreterContext, execute_one, execute_one_with_context,
 };
 use nixe_memory::{
-    AddressSpaceId, CanonicalRangeTranslator, CpuVisibilityRequest, DIRECT_PAGE_SIZE,
-    DeviceAccessDeclaration, DeviceVisibilityPoint, DeviceVisibilityRequest, DirectBackendPolicy,
-    GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationKind, MemoryInvalidationSource,
-    NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
+    AddressSpaceId, CanonicalBackingRange, CanonicalRangeTranslationError,
+    CanonicalRangeTranslator, CpuVisibilityRequest, DIRECT_PAGE_SIZE, DeviceAccessDeclaration,
+    DeviceVisibilityPoint, DeviceVisibilityRequest, DirectBackendPolicy, GuestPhysicalPageId,
+    GuestVirtualAddress, MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError,
+    MemoryInvalidationKind, MemoryInvalidationSource, NonCpuDeviceId, VisibilityCoordinator,
+    VisibilityCoordinatorError,
 };
 
 use super::lookup::{RegionLookup, index_for_pc, lookup_salt};
-use super::region::{RegionKey, RegionLimits, discover_region};
+use super::region::{LCQ_MAX_REGION_INSTRUCTIONS, RegionKey, discover_region};
 use super::*;
 
 const CODE: u64 = 0x1000;
@@ -155,6 +161,226 @@ impl VisibilityCoordinator for BlockingDeviceWriteback {
     }
 }
 
+#[derive(Default)]
+struct BlockingFetchState {
+    armed: bool,
+    entered: usize,
+}
+
+#[derive(Default)]
+struct BlockingFetchGate {
+    state: Mutex<BlockingFetchState>,
+    changed: Condvar,
+}
+
+impl BlockingFetchGate {
+    fn arm(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.armed = true;
+        state.entered = 0;
+    }
+
+    fn block_if_armed(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.entered += 1;
+        self.changed.notify_all();
+        while state.armed {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_for_entries(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = self.state.lock().unwrap();
+        while state.entered < expected {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "only {} of {expected} HCQ workers entered discovery",
+                state.entered,
+            );
+            let (next, timeout) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.entered >= expected,
+                "only {} of {expected} HCQ workers entered discovery",
+                state.entered,
+            );
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.armed = false;
+        drop(state);
+        self.changed.notify_all();
+    }
+}
+
+struct FetchGateRelease<'a>(&'a BlockingFetchGate);
+
+impl Drop for FetchGateRelease<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+struct BlockingCodeMemory {
+    inner: ExecutionMemory,
+    fetch_gate: BlockingFetchGate,
+    invalidate_on_revalidation: AtomicBool,
+}
+
+impl InstructionMemory for BlockingCodeMemory {
+    fn code_page_span(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Result<CodePageSpan, InstructionFetchFault> {
+        self.inner.code_page_span(address_space, address)
+    }
+
+    fn fetch32(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
+        self.fetch_gate.block_if_armed();
+        self.inner.fetch32(address_space, address)
+    }
+}
+
+impl MemoryInvalidationSource for BlockingCodeMemory {
+    fn invalidation_cursor(&self) -> MemoryInvalidationCursor {
+        self.inner.invalidation_cursor()
+    }
+
+    fn invalidation_signal(&self) -> &std::sync::atomic::AtomicU64 {
+        self.inner.invalidation_signal()
+    }
+
+    fn read_invalidations_since(
+        &self,
+        after: MemoryInvalidationCursor,
+        output: &mut Vec<MemoryInvalidation>,
+    ) -> Result<MemoryInvalidationCursor, MemoryInvalidationError> {
+        if self
+            .invalidate_on_revalidation
+            .swap(false, Ordering::AcqRel)
+        {
+            self.inner
+                .maintain_cache(
+                    SPACE,
+                    CacheMaintenanceKind::InstructionInvalidate,
+                    Some(GuestVirtualAddress::new(CODE)),
+                )
+                .expect("test publication invalidation must target executable RAM");
+        }
+        self.inner.read_invalidations_since(after, output)
+    }
+}
+
+impl CanonicalRangeTranslator for BlockingCodeMemory {
+    fn translate_canonical_range(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        size: u64,
+        required_permissions: MemoryPermissions,
+    ) -> Result<CanonicalBackingRange, CanonicalRangeTranslationError> {
+        self.inner
+            .translate_canonical_range(address_space, address, size, required_permissions)
+    }
+}
+
+impl CpuMemory for BlockingCodeMemory {
+    fn read(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+    ) -> Result<DataReadResult, DataAccessFault> {
+        self.inner.read(address_space, address, access)
+    }
+
+    fn write(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        value: MemoryValue,
+    ) -> Result<DataWriteResult, DataAccessFault> {
+        self.inner.write(address_space, address, access, value)
+    }
+
+    fn atomic_read_modify_write(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        kind: AtomicRmwKind,
+        operand: MemoryValue,
+    ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        self.inner
+            .atomic_read_modify_write(address_space, address, access, kind, operand)
+    }
+
+    fn atomic_compare_exchange(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        expected: MemoryValue,
+        replacement: MemoryValue,
+    ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        self.inner
+            .atomic_compare_exchange(address_space, address, access, expected, replacement)
+    }
+
+    fn maintain_cache(
+        &self,
+        address_space: AddressSpaceId,
+        kind: CacheMaintenanceKind,
+        address: Option<GuestVirtualAddress>,
+    ) -> Result<(), DataAccessFault> {
+        self.inner.maintain_cache(address_space, kind, address)
+    }
+
+    fn query_memory(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        end_exclusive: GuestVirtualAddress,
+    ) -> Option<MemoryQueryResult> {
+        self.inner
+            .query_memory(address_space, address, end_exclusive)
+    }
+
+    fn load_exclusive(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+    ) -> Result<(DataReadResult, nixe_cpu::exclusive::ExclusiveReservation), DataAccessFault> {
+        self.inner.load_exclusive(address_space, address, access)
+    }
+
+    fn store_exclusive(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        value: MemoryValue,
+        reservation: nixe_cpu::exclusive::ExclusiveReservation,
+    ) -> Result<(DataWriteResult, bool), DataAccessFault> {
+        self.inner
+            .store_exclusive(address_space, address, access, value, reservation)
+    }
+}
+
 #[test]
 fn normalized_multiblock_region_executes_without_nixe_ir() {
     let memory = memory(&[
@@ -169,7 +395,7 @@ fn normalized_multiblock_region_executes_without_nixe_ir() {
         cpu,
         &memory,
         location(CODE),
-        RegionLimits::default(),
+        LCQ_MAX_REGION_INSTRUCTIONS,
         |_| false,
     )
     .unwrap();
@@ -193,6 +419,97 @@ fn normalized_multiblock_region_executes_without_nixe_ir() {
 }
 
 #[test]
+fn lcq_discovery_uses_only_the_512_instruction_budget() {
+    let words = (0..=LCQ_MAX_REGION_INSTRUCTIONS)
+        .map(|index| ((index * 4) as u64, 0xd503_201f))
+        .collect::<Vec<_>>();
+    let memory = memory(&words);
+    let region = discover_region(
+        cpu(),
+        &memory,
+        location(CODE),
+        LCQ_MAX_REGION_INSTRUCTIONS,
+        |_| false,
+    )
+    .unwrap();
+
+    assert_eq!(region.instruction_count, LCQ_MAX_REGION_INSTRUCTIONS);
+    assert!(matches!(
+        region.blocks.last().unwrap().terminator,
+        region::BlockTerminator::Limit { continuation }
+            if continuation.get() == CODE + (LCQ_MAX_REGION_INSTRUCTIONS as u64 * 4)
+    ));
+}
+
+#[test]
+fn discovery_has_no_independent_block_or_dependency_cap() {
+    const BLOCKS: usize = 65;
+    let page_size = nixe_cpu::memory::SYNTHETIC_PAGE_SIZE as u64;
+    let words = (0..BLOCKS)
+        .map(|index| {
+            let pc = CODE + index as u64 * page_size;
+            let encoding = if index + 1 == BLOCKS {
+                breakpoint(0)
+            } else {
+                branch(pc, pc + page_size)
+            };
+            (pc - CODE, encoding)
+        })
+        .collect::<Vec<_>>();
+    let large_memory = paged_memory(&words);
+    let region = discover_region(
+        cpu(),
+        &large_memory,
+        location(CODE),
+        LCQ_MAX_REGION_INSTRUCTIONS,
+        |_| false,
+    )
+    .unwrap();
+
+    assert_eq!(region.instruction_count, BLOCKS);
+    assert_eq!(region.blocks.len(), BLOCKS);
+    assert_eq!(region.dependencies.len(), BLOCKS);
+}
+
+#[test]
+fn hcq_discovery_uses_2560_instructions_and_crosses_lcq_entries() {
+    let words = (0..=HCQ_MAX_REGION_INSTRUCTIONS)
+        .map(|index| ((index * 4) as u64, 0xd503_201f))
+        .collect::<Vec<_>>();
+    let large_memory = paged_memory(&words);
+    let region = discover_region(
+        cpu(),
+        &large_memory,
+        location(CODE),
+        HCQ_MAX_REGION_INSTRUCTIONS,
+        |_| false,
+    )
+    .unwrap();
+    assert_eq!(region.instruction_count, HCQ_MAX_REGION_INSTRUCTIONS);
+
+    let target = CODE + 0x100;
+    let memory = memory(&[(0, branch(CODE, target)), (0x100, breakpoint(0))]);
+    let lcq_shape = discover_region(
+        cpu(),
+        &memory,
+        location(CODE),
+        LCQ_MAX_REGION_INSTRUCTIONS,
+        |pc| pc == GuestVirtualAddress::new(target),
+    )
+    .unwrap();
+    let hcq_shape = discover_region(
+        cpu(),
+        &memory,
+        location(CODE),
+        HCQ_MAX_REGION_INSTRUCTIONS,
+        |_| false,
+    )
+    .unwrap();
+    assert_eq!(lcq_shape.blocks.len(), 1);
+    assert_eq!(hcq_shape.blocks.len(), 2);
+}
+
+#[test]
 fn secondary_entry_is_published_as_a_separate_region() {
     let memory = memory(&[
         (0x00, 0xd503_201f),
@@ -201,17 +518,20 @@ fn secondary_entry_is_published_as_a_separate_region() {
         (0x10, breakpoint(0x32)),
     ]);
     let process = JitProcess::new(cpu()).unwrap();
-    let primary = process.entry_for(&memory, location(CODE)).unwrap().1;
-    let secondary = process.entry_for(&memory, location(CODE + 0x0c)).unwrap().1;
+    let primary = JitThread::new()
+        .entry_for(&process, &memory, location(CODE))
+        .unwrap()
+        .1;
+    let secondary = JitThread::new()
+        .entry_for(&process, &memory, location(CODE + 0x0c))
+        .unwrap()
+        .1;
     assert_ne!(secondary, primary);
     {
         let state = process.state.lock().unwrap();
         assert_eq!(state.regions.len(), 2);
         let secondary_key = RegionKey::new(cpu(), location(CODE + 0x0c));
-        assert_eq!(
-            state.lookup.get(secondary_key).unwrap().owner,
-            secondary_key
-        );
+        assert_eq!(state.lookup.get(secondary_key).unwrap().entry(), secondary);
     }
 
     let mut state = state(CODE + 0x0c, 10);
@@ -237,19 +557,43 @@ fn discovery_stops_at_an_existing_secondary_region_entry() {
         (0x10c, breakpoint(4)),
     ]);
     let process = JitProcess::new(cpu()).unwrap();
-    let target_entry = process.entry_for(&memory, location(target)).unwrap().1;
-    let secondary_entry = process.entry_for(&memory, location(secondary)).unwrap().1;
+    let target_entry = JitThread::new()
+        .entry_for(&process, &memory, location(target))
+        .unwrap()
+        .1;
+    let secondary_entry = JitThread::new()
+        .entry_for(&process, &memory, location(secondary))
+        .unwrap()
+        .1;
     assert_ne!(secondary_entry, target_entry);
-    process.entry_for(&memory, location(CODE)).unwrap();
+    let secondary_cell = process
+        .state
+        .lock()
+        .unwrap()
+        .lookup
+        .get(RegionKey::new(cpu(), location(secondary)))
+        .unwrap()
+        .entry_address();
+    JitThread::new()
+        .entry_for(&process, &memory, location(CODE))
+        .unwrap();
 
     let state = process.state.lock().unwrap();
     assert_eq!(state.regions.len(), 3);
-    let source = state
-        .region_for(RegionKey::new(cpu(), location(CODE)))
-        .unwrap();
-    assert_eq!(source.entry_keys.len(), 1);
     assert_eq!(
-        source.links[0].slot.load(Ordering::Acquire),
+        state
+            .lookup
+            .get(RegionKey::new(cpu(), location(secondary)))
+            .unwrap()
+            .entry_address(),
+        secondary_cell
+    );
+    assert_eq!(
+        state
+            .lookup
+            .get(RegionKey::new(cpu(), location(secondary)))
+            .unwrap()
+            .entry(),
         secondary_entry
     );
 }
@@ -339,15 +683,17 @@ fn call_and_return_use_canonical_state_only_at_region_boundaries() {
     );
 
     let process_state = process.state.lock().unwrap();
-    let source = process_state
-        .region_for(RegionKey::new(cpu(), location(CODE)))
-        .unwrap();
     let target = process_state
         .lookup
         .get(RegionKey::new(cpu(), location(CODE + 0x10)))
         .unwrap();
-    assert_eq!(source.links.len(), 1);
-    assert_eq!(source.links[0].slot.load(Ordering::Acquire), target.entry);
+    assert_eq!(
+        target.entry(),
+        process_state
+            .region_for(RegionKey::new(cpu(), location(CODE + 0x10)))
+            .unwrap()
+            .entry
+    );
 }
 
 #[test]
@@ -379,7 +725,9 @@ fn indirect_branch_and_return_chain_through_the_native_lookup() {
     ));
     let process = JitProcess::new(cpu()).unwrap();
     for pc in [target, return_address, CODE] {
-        process.entry_for(&memory, location(pc)).unwrap();
+        JitThread::new()
+            .entry_for(&process, &memory, location(pc))
+            .unwrap();
     }
 
     let thread = JitThread::new();
@@ -469,16 +817,16 @@ fn periodic_native_backedge_exit_yields_to_the_runtime() {
 }
 
 #[test]
-fn one_process_lock_produces_one_synchronous_compilation_flight() {
-    let memory = Arc::new(memory(&[(0x00, breakpoint(0))]));
+fn same_entry_lcq_misses_share_one_synchronous_compilation() {
+    let memory = Arc::new(execution_memory_with_data(breakpoint(0)));
     let process = Arc::new(JitProcess::new(cpu()).unwrap());
     let mut joins = Vec::new();
     for _ in 0..4 {
         let memory = Arc::clone(&memory);
         let process = Arc::clone(&process);
         joins.push(std::thread::spawn(move || {
-            process
-                .entry_for(memory.as_ref(), location(CODE))
+            JitThread::new()
+                .entry_for(process.as_ref(), memory.as_ref(), location(CODE))
                 .unwrap()
                 .1
         }));
@@ -489,7 +837,665 @@ fn one_process_lock_produces_one_synchronous_compilation_flight() {
 }
 
 #[test]
-fn direct_lookup_uses_collision_fallback_without_replacing_primary_slot() {
+fn unrelated_lcq_misses_compile_on_independent_vcpu_compilers() {
+    let memory = Arc::new(execution_memory_with_words_and_data(&[
+        (0, breakpoint(1)),
+        (4, breakpoint(2)),
+    ]));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let joins = [CODE, CODE + 4].map(|pc| {
+        let memory = Arc::clone(&memory);
+        let process = Arc::clone(&process);
+        std::thread::spawn(move || {
+            JitThread::new()
+                .entry_for(process.as_ref(), memory.as_ref(), location(pc))
+                .unwrap()
+                .1
+        })
+    });
+
+    let entries = joins.map(|join| join.join().unwrap());
+    assert_ne!(entries[0], entries[1]);
+    assert_eq!(process.state.lock().unwrap().regions.len(), 2);
+}
+
+fn wait_for_hcq(process: &JitProcess, key: RegionKey) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut state = process.state.lock().unwrap();
+    while state.lookup.get(key).unwrap().state() != EntryState::Hcq {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "HCQ worker did not publish the hot entry"
+        );
+        let (next, timeout) = process.published.wait_timeout(state, remaining).unwrap();
+        state = next;
+        assert!(!timeout.timed_out() || state.lookup.get(key).unwrap().state() == EntryState::Hcq);
+    }
+}
+
+fn install_hcq_entries(process: &JitProcess, memory: &dyn CpuMemory, entries: &[u64]) {
+    let thread = JitThread::new();
+    for &pc in entries {
+        let location =
+            LocationDescriptor::new(GuestVirtualAddress::new(pc), process.cpu.profile_id());
+        thread
+            .entry_for(process, memory, location)
+            .unwrap_or_else(|error| panic!("LCQ installation at {pc:#018x} failed: {error}"));
+    }
+
+    let backend = process.bound_memory_backend().unwrap().backend;
+    let mut compiler = DirectCompiler::new(HCQ_COMPILER_POLICY, process.runtime.addresses())
+        .expect("HCQ compiler configuration must be valid");
+    compiler
+        .bind_memory_backend(backend)
+        .expect("HCQ compiler must accept the process memory backend");
+    for &pc in entries {
+        let location =
+            LocationDescriptor::new(GuestVirtualAddress::new(pc), process.cpu.profile_id());
+        let key = RegionKey::new(process.cpu, location);
+        let node = process.state.lock().unwrap().lookup.get(key).unwrap();
+        let generation = node
+            .try_queue_hcq()
+            .unwrap_or_else(|| panic!("LCQ at {pc:#018x} was not eligible for HCQ"));
+        process
+            .compile_hcq(
+                &mut compiler,
+                memory,
+                HcqRequest {
+                    key,
+                    generation,
+                    invalidation_cursor: memory.invalidation_cursor(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("HCQ publication at {pc:#018x} failed: {error}"));
+        assert_eq!(node.state(), EntryState::Hcq, "entry {pc:#018x}");
+        assert_ne!(node.entry(), 0, "entry {pc:#018x}");
+    }
+}
+
+fn blocking_code_memory(entry_count: usize) -> BlockingCodeMemory {
+    let mut memory = ExecutionMemory::new();
+    for index in 0..entry_count {
+        let page = GuestPhysicalPageId::new(index as u64 + 1);
+        let pc = GuestVirtualAddress::new(CODE + index as u64 * DIRECT_PAGE_SIZE as u64);
+        assert!(memory.add_ram_page(page));
+        assert!(memory.initialize_ram(page, 0, &breakpoint(index as u16).to_le_bytes()));
+        assert!(memory.map_page(SPACE, pc, page, MemoryPermissions::READ_EXECUTE));
+    }
+    BlockingCodeMemory {
+        inner: memory,
+        fetch_gate: BlockingFetchGate::default(),
+        invalidate_on_revalidation: AtomicBool::new(false),
+    }
+}
+
+fn run_primary_entries(
+    thread: &JitThread,
+    process: &JitProcess,
+    memory: &dyn CpuMemory,
+    pc: u64,
+    count: u32,
+) {
+    for _ in 0..count {
+        let mut guest = state(pc, 0);
+        assert!(matches!(
+            thread.run(process, memory, &mut guest).unwrap(),
+            DirectExit::Architectural { .. }
+        ));
+    }
+}
+
+#[test]
+fn busy_hcq_workers_accept_later_hot_work_and_keep_queued_lcq_callable() {
+    let expected_workers = hcq_worker_count(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    );
+    let roots = (0..=expected_workers)
+        .map(|index| CODE + index as u64 * DIRECT_PAGE_SIZE as u64)
+        .collect::<Vec<_>>();
+    let memory = Arc::new(blocking_code_memory(roots.len()));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: memory.as_ref(),
+        mapping_epoch: memory.inner.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process
+        .bind_owned_memory(
+            binding,
+            Arc::clone(&memory) as Arc<dyn nixe_cpu::execution::BoundMemory>,
+        )
+        .unwrap();
+    assert_eq!(process.hcq_workers.lock().unwrap().len(), expected_workers);
+
+    let thread = JitThread::new();
+    for &pc in &roots {
+        thread
+            .entry_for(process.as_ref(), memory.as_ref(), location(pc))
+            .unwrap();
+    }
+    memory.fetch_gate.arm();
+    let release = FetchGateRelease(&memory.fetch_gate);
+
+    for &pc in &roots[..expected_workers] {
+        run_primary_entries(
+            &thread,
+            process.as_ref(),
+            memory.as_ref(),
+            pc,
+            lookup::LCQ_PROMOTION_COUNTDOWN,
+        );
+    }
+    memory.fetch_gate.wait_for_entries(expected_workers);
+    assert!(process.hcq.state.lock().unwrap().pending.is_empty());
+
+    let compiling_pc = roots[0];
+    let compiling_key = RegionKey::new(cpu(), location(compiling_pc));
+    let compiling_node = process
+        .state
+        .lock()
+        .unwrap()
+        .lookup
+        .get(compiling_key)
+        .unwrap();
+    assert_eq!(compiling_node.state(), EntryState::HcqQueued);
+    run_primary_entries(&thread, process.as_ref(), memory.as_ref(), compiling_pc, 1);
+
+    let later_pc = *roots.last().unwrap();
+    run_primary_entries(
+        &thread,
+        process.as_ref(),
+        memory.as_ref(),
+        later_pc,
+        lookup::LCQ_PROMOTION_COUNTDOWN,
+    );
+    let later_key = RegionKey::new(cpu(), location(later_pc));
+    let later_node = process.state.lock().unwrap().lookup.get(later_key).unwrap();
+    assert_eq!(later_node.state(), EntryState::HcqQueued);
+    assert_eq!(process.hcq.state.lock().unwrap().pending.len(), 1);
+    run_primary_entries(&thread, process.as_ref(), memory.as_ref(), later_pc, 1);
+
+    memory.fetch_gate.release();
+    drop(release);
+    for &pc in &roots {
+        wait_for_hcq(process.as_ref(), RegionKey::new(cpu(), location(pc)));
+    }
+    process.shutdown();
+}
+
+#[test]
+fn queued_hcq_does_not_reenter_the_lcq_promotion_edge() {
+    let memory = Arc::new(execution_memory_with_data(breakpoint(0)));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    process.hcq.configure(1);
+    process.hcq_started.store(true, Ordering::Release);
+    let thread = JitThread::new();
+    let key = RegionKey::new(cpu(), location(CODE));
+
+    for _ in 0..lookup::LCQ_PROMOTION_COUNTDOWN {
+        let mut guest = state(CODE, 0);
+        thread
+            .run(process.as_ref(), memory.as_ref(), &mut guest)
+            .unwrap();
+    }
+
+    let node = process.state.lock().unwrap().lookup.get(key).unwrap();
+    assert_eq!(node.state(), EntryState::HcqQueued);
+    assert_eq!(process.hcq.state.lock().unwrap().pending.len(), 1);
+    assert_eq!(node.hotness(), 0);
+
+    let mut guest = state(CODE, 0);
+    thread
+        .run(process.as_ref(), memory.as_ref(), &mut guest)
+        .unwrap();
+
+    assert_eq!(node.state(), EntryState::HcqQueued);
+    assert_eq!(process.hcq.state.lock().unwrap().pending.len(), 1);
+    assert_eq!(node.hotness(), u32::MAX);
+
+    let runners = (0..4)
+        .map(|_| {
+            let process = Arc::clone(&process);
+            let memory = Arc::clone(&memory);
+            std::thread::spawn(move || {
+                let thread = JitThread::new();
+                for _ in 0..64 {
+                    let mut guest = state(CODE, 0);
+                    thread
+                        .run(process.as_ref(), memory.as_ref(), &mut guest)
+                        .unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for runner in runners {
+        runner.join().unwrap();
+    }
+
+    assert_eq!(node.state(), EntryState::HcqQueued);
+    assert_eq!(process.hcq.state.lock().unwrap().pending.len(), 1);
+    assert!(node.hotness() > 1);
+    process.shutdown();
+}
+
+#[test]
+fn hot_lcq_is_replaced_by_background_hcq_through_the_same_cell() {
+    let memory = Arc::new(execution_memory_with_data(breakpoint(0)));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: memory.as_ref(),
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process
+        .bind_owned_memory(
+            binding,
+            Arc::clone(&memory) as Arc<dyn nixe_cpu::execution::BoundMemory>,
+        )
+        .unwrap();
+    let thread = JitThread::new();
+    let key = RegionKey::new(cpu(), location(CODE));
+    let cell = {
+        JitThread::new()
+            .entry_for(process.as_ref(), memory.as_ref(), location(CODE))
+            .unwrap();
+        process
+            .state
+            .lock()
+            .unwrap()
+            .lookup
+            .get(key)
+            .unwrap()
+            .entry_address()
+    };
+
+    for _ in 0..lookup::LCQ_PROMOTION_COUNTDOWN {
+        let mut state = state(CODE, 0);
+        thread
+            .run(process.as_ref(), memory.as_ref(), &mut state)
+            .unwrap();
+    }
+
+    wait_for_hcq(process.as_ref(), key);
+    let process_state = process.state.lock().unwrap();
+    let node = process_state.lookup.get(key).unwrap();
+    assert_eq!(node.entry_address(), cell);
+    assert_ne!(node.entry(), 0);
+    assert_eq!(process_state.retired.len(), 1);
+    drop(process_state);
+
+    let mut hcq_state = state(CODE, 0);
+    assert_eq!(
+        thread
+            .run(process.as_ref(), memory.as_ref(), &mut hcq_state)
+            .unwrap(),
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE),
+            detail: 2 << 24,
+            progress: 1,
+        }
+    );
+    process.shutdown();
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
+fn hcq_preserves_native_fault_retry_and_fp_environment_contracts() {
+    let first_atomic = lse_rmw(2, true, true, 0); // LDADDAL W2,W3,[X1]
+    let second_atomic = (first_atomic & !(0x1f << 5)) | (6 << 5); // ...[X6]
+    let words = [
+        (0, 0x1e62_2820),   // FADD D0,D1,D2: IXC remains lazy
+        (4, first_atomic),  // successful side effect before the later fault
+        (8, second_atomic), // first access faults and retries this instruction
+        (12, 0xd53b_e008),  // MRS X8,CNTFRQ_EL0: typed Rust boundary
+        (16, 0x1e67_c020),  // FRINTI D0,D1: exact FP boundary
+        (20, 0xd53b_4424),  // MRS X4,FPSR
+        (24, breakpoint(0)),
+        (0x100, first_atomic), // prime only the first data page as writable
+        (0x104, breakpoint(1)),
+    ];
+    let second_data = GuestVirtualAddress::new(DATA + DIRECT_PAGE_SIZE as u64);
+    let second_page = GuestPhysicalPageId::new(3);
+    let initial = 0x0302_0100_u32;
+
+    let mut expected_memory = memory_with_words_and_data(&words);
+    assert!(expected_memory.initialize_ram(
+        GuestPhysicalPageId::new(2),
+        0,
+        &(initial + 1).to_le_bytes(),
+    ));
+    assert!(expected_memory.add_ram_page(second_page));
+    assert!(expected_memory.initialize_ram(second_page, 0, &initial.to_le_bytes()));
+    assert!(expected_memory.map_page(
+        SPACE,
+        second_data,
+        second_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+
+    let mut actual_memory = execution_memory_with_words_and_data(&words);
+    assert!(actual_memory.add_ram_page(second_page));
+    assert!(actual_memory.initialize_ram(second_page, 0, &initial.to_le_bytes()));
+    assert!(actual_memory.map_page(
+        SPACE,
+        second_data,
+        second_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    actual_memory
+        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
+        .unwrap();
+    let memory = actual_memory;
+    let process = JitProcess::new(cpu()).unwrap();
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: &memory,
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process.bind_memory(binding).unwrap();
+
+    let make_state = || {
+        let mut state = rich_state();
+        state.set_fpcr(1 << 22); // round toward positive infinity
+        assert!(state.set_vector(1, u128::from(1.25_f64.to_bits())));
+        assert!(state.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+        write_register(&mut state, 1, DATA);
+        write_register(&mut state, 6, second_data.get());
+        write_register(&mut state, 2, 1);
+        state
+    };
+    let mut thread = JitThread::new();
+    thread.synchronize_address_space(&process, binding).unwrap();
+
+    let mut prime = state(CODE + 0x100, 0);
+    write_register(&mut prime, 1, DATA);
+    write_register(&mut prime, 2, 1);
+    assert!(matches!(
+        thread.run(&process, &memory, &mut prime).unwrap(),
+        DirectExit::Architectural { .. }
+    ));
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(DATA),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U32(initial + 1),
+    );
+    install_hcq_entries(&process, &memory, &[CODE]);
+
+    let mut expected = make_state();
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    for (_, encoding) in words[..6].iter().copied() {
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let original = read_host_fp();
+    let _restore = RestoreHostFp(original);
+    let caller = distinct_host_fp(original, 2);
+    write_host_fp(caller);
+    let mut actual = make_state();
+    assert!(matches!(
+        thread.run(&process, &memory, &mut actual).unwrap(),
+        DirectExit::Architectural { .. }
+    ));
+
+    assert_eq!(actual, expected);
+    assert_eq!(read_host_fp(), caller);
+    assert_ne!(read_register(&actual, 4) & (1 << 4), 0);
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(DATA),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U32(initial + 2),
+    );
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                second_data,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U32(initial + 1),
+    );
+    process.shutdown();
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
+fn hcq_preserves_fpcr_fpsr_and_lazy_status_boundaries() {
+    let words = [
+        (0, 0x1e62_2820),  // FADD D0,D1,D2: IXC
+        (4, 0x1e65_0883),  // FMUL D3,D4,D5: OFC | IXC
+        (8, 0xd53b_4426),  // MRS X6,FPSR: materialize cumulative status
+        (12, 0xd51b_4427), // MSR FPSR,X7: replace cumulative status
+        (16, 0xd53b_4428), // MRS X8,FPSR: observe replacement
+        (20, 0xd51b_4409), // MSR FPCR,X9: terminate the native FP segment
+        (24, 0x1e67_c020), // FRINTI D0,D1: use the replacement FPCR
+        (28, 0xd53b_442a), // MRS X10,FPSR: observe the exact-operation delta
+        (32, breakpoint(0)),
+    ];
+    let memory = memory(&words);
+    let make_state = || {
+        let mut state = rich_state();
+        assert!(state.set_vector(1, u128::from(1.25_f64.to_bits())));
+        assert!(state.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+        assert!(state.set_vector(4, u128::from(f64::MAX.to_bits())));
+        assert!(state.set_vector(5, u128::from(2.0_f64.to_bits())));
+        write_register(&mut state, 7, 0x82);
+        write_register(&mut state, 9, 1 << 22); // round toward positive infinity
+        state
+    };
+
+    let mut expected = make_state();
+    for (_, encoding) in words[..8].iter().copied() {
+        assert_eq!(
+            execute_one(&cpu().platform(), &mut expected, encoding).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+
+    let process = JitProcess::new(cpu()).unwrap();
+    install_hcq_entries(&process, &memory, &[CODE, CODE + 24]);
+    let original = read_host_fp();
+    let _restore = RestoreHostFp(original);
+    let caller = distinct_host_fp(original, 3);
+    write_host_fp(caller);
+    let mut actual = make_state();
+    assert!(matches!(
+        JitThread::new()
+            .run(&process, &memory, &mut actual)
+            .unwrap(),
+        DirectExit::Architectural { .. }
+    ));
+
+    assert_eq!(actual, expected);
+    assert_eq!(read_host_fp(), caller);
+    assert_eq!(read_register(&actual, 6), read_register(&expected, 6));
+    assert_eq!(read_register(&actual, 8), 0x82);
+    assert_eq!(read_register(&actual, 10), read_register(&expected, 10));
+    assert_eq!(actual.vector(0).unwrap(), u128::from(2.0_f64.to_bits()));
+}
+
+#[test]
+fn background_compilation_retains_the_bound_memory_owner_until_process_drop() {
+    let memory = Arc::new(execution_memory_with_data(breakpoint(0)));
+    let retained = Arc::downgrade(&memory);
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: memory.as_ref(),
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process
+        .bind_owned_memory(
+            binding,
+            Arc::clone(&memory) as Arc<dyn nixe_cpu::execution::BoundMemory>,
+        )
+        .unwrap();
+    drop(memory);
+    assert!(retained.upgrade().is_some());
+    process.shutdown();
+    drop(process);
+    assert!(retained.upgrade().is_none());
+}
+
+#[test]
+fn hcq_scheduler_uses_the_fixed_worker_formula_and_bounded_lifo_stack() {
+    assert_eq!(hcq_worker_count(1), 1);
+    assert_eq!(hcq_worker_count(9), 1);
+    assert_eq!(hcq_worker_count(12), 2);
+    assert_eq!(hcq_worker_count(18), 4);
+    assert_eq!(hcq_worker_count(128), 4);
+
+    let scheduler = HcqScheduler::new();
+    scheduler.configure(1);
+    for index in 0..HCQ_PENDING_PER_WORKER {
+        assert!(scheduler.push(HcqRequest {
+            key: RegionKey::new(cpu(), location(CODE + index as u64 * 4)),
+            generation: index as u64,
+            invalidation_cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
+        }));
+    }
+    assert!(!scheduler.push(HcqRequest {
+        key: RegionKey::new(cpu(), location(DATA)),
+        generation: u64::MAX,
+        invalidation_cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
+    }));
+    let newest = scheduler.pop().unwrap();
+    assert_eq!(
+        newest.key.start,
+        GuestVirtualAddress::new(CODE + (HCQ_PENDING_PER_WORKER as u64 - 1) * 4)
+    );
+    assert!(scheduler.push(HcqRequest {
+        key: RegionKey::new(cpu(), location(DATA)),
+        generation: u64::MAX,
+        invalidation_cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
+    }));
+    assert_eq!(
+        scheduler.pop().unwrap().key.start,
+        GuestVirtualAddress::new(DATA)
+    );
+    let pending = scheduler.close();
+    assert_eq!(pending.len(), HCQ_PENDING_PER_WORKER - 1);
+    assert!(scheduler.pop().is_none());
+    scheduler.shutdown();
+}
+
+#[test]
+fn hcq_admission_uses_entry_state_for_deduplication_and_full_retry() {
+    let scheduler = HcqScheduler::new();
+    scheduler.configure(1);
+    let lookup = RegionLookup::new();
+    let first = lookup.get_or_create(RegionKey::new(cpu(), location(CODE)));
+    let generation = first.try_begin_lcq().unwrap();
+    assert!(first.publish_lcq(generation, 1));
+    unsafe {
+        request_hcq(&scheduler, Arc::as_ptr(&first), 7);
+        request_hcq(&scheduler, Arc::as_ptr(&first), 7);
+    }
+    assert_eq!(first.state(), EntryState::HcqQueued);
+    assert_eq!(scheduler.state.lock().unwrap().pending.len(), 1);
+
+    for index in 1..HCQ_PENDING_PER_WORKER {
+        assert!(scheduler.push(HcqRequest {
+            key: RegionKey::new(cpu(), location(CODE + index as u64 * 4)),
+            generation: index as u64,
+            invalidation_cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
+        }));
+    }
+    let saturated = lookup.get_or_create(RegionKey::new(cpu(), location(DATA)));
+    let generation = saturated.try_begin_lcq().unwrap();
+    assert!(saturated.publish_lcq(generation, 2));
+    unsafe { request_hcq(&scheduler, Arc::as_ptr(&saturated), 9) };
+    assert_eq!(saturated.state(), EntryState::Lcq);
+    assert_eq!(saturated.hotness(), lookup::LCQ_PROMOTION_COUNTDOWN);
+    assert_eq!(
+        scheduler.state.lock().unwrap().pending.len(),
+        HCQ_PENDING_PER_WORKER
+    );
+
+    let pending = scheduler.close();
+    assert_eq!(pending.len(), HCQ_PENDING_PER_WORKER);
+    let closed = lookup.get_or_create(RegionKey::new(cpu(), location(DATA + 4)));
+    let generation = closed.try_begin_lcq().unwrap();
+    assert!(closed.publish_lcq(generation, 3));
+    unsafe { request_hcq(&scheduler, Arc::as_ptr(&closed), 10) };
+    assert_eq!(closed.state(), EntryState::Lcq);
+    assert_eq!(closed.hotness(), u32::MAX);
+    scheduler.shutdown();
+}
+
+#[test]
+fn hcq_capacity_closure_drains_pending_work_and_disables_same_generation_retry() {
+    let process = JitProcess::new(cpu()).unwrap();
+    process.hcq.configure(1);
+    let lookup = Arc::clone(&process.state.lock().unwrap().lookup);
+    let keys = [CODE, CODE + 4, CODE + 8].map(|pc| RegionKey::new(cpu(), location(pc)));
+    let mut nodes = Vec::new();
+    for (index, key) in keys.into_iter().enumerate() {
+        let node = lookup.get_or_create(key);
+        let generation = node.try_begin_lcq().unwrap();
+        assert!(node.publish_lcq(generation, index + 1));
+        unsafe { request_hcq(Arc::as_ptr(&process.hcq), Arc::as_ptr(&node), index as u64) };
+        nodes.push(node);
+    }
+
+    let current = process.hcq.pop().unwrap();
+    let stale = &nodes[0];
+    stale.invalidate();
+    let replacement_generation = stale.try_begin_lcq().unwrap();
+    assert!(stale.publish_lcq(replacement_generation, 4));
+
+    process.close_hcq_after_capacity(current);
+
+    assert!(process.hcq.closed.load(Ordering::Acquire));
+    assert!(process.hcq.state.lock().unwrap().pending.is_empty());
+    assert!(process.hcq.pop().is_none());
+    assert_eq!(stale.state(), EntryState::Lcq);
+    assert_eq!(stale.entry(), 4);
+    assert_eq!(stale.hotness(), lookup::LCQ_PROMOTION_COUNTDOWN);
+    for node in &nodes[1..] {
+        assert_eq!(node.state(), EntryState::Lcq);
+        assert_eq!(node.hotness(), u32::MAX);
+    }
+
+    let closed = lookup.get_or_create(RegionKey::new(cpu(), location(CODE + 12)));
+    let generation = closed.try_begin_lcq().unwrap();
+    assert!(closed.publish_lcq(generation, 5));
+    unsafe { request_hcq(Arc::as_ptr(&process.hcq), Arc::as_ptr(&closed), 3) };
+    assert_eq!(closed.state(), EntryState::Lcq);
+    assert_eq!(closed.hotness(), u32::MAX);
+}
+
+#[test]
+fn direct_lookup_keeps_colliding_entry_cells_stable_and_independent() {
     let first = RegionKey::new(cpu(), location(CODE));
     let salt = lookup_salt(first);
     let first_slot = index_for_pc(first.start.get(), salt);
@@ -498,20 +1504,25 @@ fn direct_lookup_uses_collision_fallback_without_replacing_primary_slot() {
         .find(|pc| index_for_pc(*pc, salt) == first_slot)
         .unwrap();
     let second = RegionKey::new(cpu(), location(second_pc));
-    let mut lookup = RegionLookup::new();
-    lookup.insert(first, first, 1);
-    lookup.insert(second, second, 2);
-    assert_eq!(lookup.get(first).unwrap().entry, 1);
-    assert_eq!(lookup.get(second).unwrap().entry, 2);
-    assert_eq!(lookup.collision_count(), 1);
+    let lookup = RegionLookup::new();
+    let first_node = lookup.get_or_create(first);
+    let second_node = lookup.get_or_create(second);
+    let first_generation = first_node.try_begin_lcq().unwrap();
+    let second_generation = second_node.try_begin_lcq().unwrap();
+    assert!(first_node.publish_lcq(first_generation, 1));
+    assert!(second_node.publish_lcq(second_generation, 2));
+    let first_cell = first_node.entry_address();
+    assert_eq!(lookup.get(first).unwrap().entry(), 1);
+    assert_eq!(lookup.get(second).unwrap().entry(), 2);
     assert_eq!(lookup.native_entry(first), 1);
-    lookup.remove(first).unwrap();
+    first_node.invalidate();
     assert_eq!(lookup.native_entry(first), 0);
-    assert_eq!(lookup.get(second).unwrap().entry, 2);
+    assert_eq!(lookup.get_or_create(first).entry_address(), first_cell);
+    assert_eq!(lookup.get(second).unwrap().entry(), 2);
 }
 
 #[test]
-fn executable_invalidation_unlinks_the_target_and_keeps_native_code_allocated() {
+fn executable_invalidation_clears_the_target_cell_and_retains_native_code() {
     let target = CODE + 0x1000;
     let mut memory = SyntheticMemory::new();
     let source_page = GuestPhysicalPageId::new(1);
@@ -540,16 +1551,21 @@ fn executable_invalidation_unlinks_the_target_and_keeps_native_code_allocated() 
     ));
 
     let process = JitProcess::new(cpu()).unwrap();
-    process.entry_for(&memory, location(CODE)).unwrap();
-    process.entry_for(&memory, location(target)).unwrap();
+    JitThread::new()
+        .entry_for(&process, &memory, location(CODE))
+        .unwrap();
+    JitThread::new()
+        .entry_for(&process, &memory, location(target))
+        .unwrap();
     let source_key = RegionKey::new(cpu(), location(CODE));
     let target_key = RegionKey::new(cpu(), location(target));
-    let (old_target, source_link) = {
+    let (old_target, target_node, target_cell) = {
         let state = process.state.lock().unwrap();
-        let source = state.region_for(source_key).unwrap();
         let target = state.region_for(target_key).unwrap();
-        assert_eq!(source.links[0].slot.load(Ordering::Acquire), target.entry);
-        (Arc::clone(target), Arc::clone(&source.links[0].slot))
+        let target_node = state.lookup.get(target_key).unwrap();
+        assert_eq!(target_node.entry(), target.entry);
+        let target_cell = target_node.entry_address();
+        (Arc::clone(target), target_node, target_cell)
     };
 
     memory
@@ -563,8 +1579,8 @@ fn executable_invalidation_unlinks_the_target_and_keeps_native_code_allocated() 
     process.reconcile(&memory).unwrap();
     {
         let state = process.state.lock().unwrap();
-        assert!(state.lookup.get(source_key).is_some());
-        assert!(state.lookup.get(target_key).is_some());
+        assert_ne!(state.lookup.get(source_key).unwrap().entry(), 0);
+        assert_ne!(state.lookup.get(target_key).unwrap().entry(), 0);
         assert!(state.retired.is_empty());
     }
     memory
@@ -577,9 +1593,12 @@ fn executable_invalidation_unlinks_the_target_and_keeps_native_code_allocated() 
     process.reconcile(&memory).unwrap();
     {
         let state = process.state.lock().unwrap();
-        assert!(state.lookup.get(source_key).is_some());
-        assert!(state.lookup.get(target_key).is_none());
-        assert_eq!(source_link.load(Ordering::Acquire), 0);
+        assert_ne!(state.lookup.get(source_key).unwrap().entry(), 0);
+        assert_eq!(state.lookup.get(target_key).unwrap().entry(), 0);
+        assert_eq!(
+            state.lookup.get(target_key).unwrap().entry_address(),
+            target_cell
+        );
         assert!(
             state
                 .retired
@@ -588,9 +1607,140 @@ fn executable_invalidation_unlinks_the_target_and_keeps_native_code_allocated() 
         );
     }
 
-    let new_entry = process.entry_for(&memory, location(target)).unwrap().1;
+    let new_entry = JitThread::new()
+        .entry_for(&process, &memory, location(target))
+        .unwrap()
+        .1;
     assert_ne!(new_entry, old_target.entry);
-    assert_eq!(source_link.load(Ordering::Acquire), new_entry);
+    assert_eq!(target_node.entry(), new_entry);
+    assert_eq!(target_node.entry_address(), target_cell);
+}
+
+#[test]
+fn invalidation_during_hcq_discovery_rejects_the_stale_result() {
+    let memory = Arc::new(blocking_code_memory(1));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: memory.as_ref(),
+        mapping_epoch: memory.inner.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process
+        .bind_owned_memory(
+            binding,
+            Arc::clone(&memory) as Arc<dyn nixe_cpu::execution::BoundMemory>,
+        )
+        .unwrap();
+    let thread = JitThread::new();
+    thread
+        .entry_for(process.as_ref(), memory.as_ref(), location(CODE))
+        .unwrap();
+    let key = RegionKey::new(cpu(), location(CODE));
+    let node = process.state.lock().unwrap().lookup.get(key).unwrap();
+    let lcq_entry = node.entry();
+    memory.fetch_gate.arm();
+    let release = FetchGateRelease(&memory.fetch_gate);
+    run_primary_entries(
+        &thread,
+        process.as_ref(),
+        memory.as_ref(),
+        CODE,
+        lookup::LCQ_PROMOTION_COUNTDOWN,
+    );
+    memory.fetch_gate.wait_for_entries(1);
+    assert_eq!(node.state(), EntryState::HcqQueued);
+    assert_eq!(node.entry(), lcq_entry);
+
+    memory
+        .maintain_cache(
+            SPACE,
+            CacheMaintenanceKind::InstructionInvalidate,
+            Some(GuestVirtualAddress::new(CODE)),
+        )
+        .unwrap();
+    memory.fetch_gate.release();
+    drop(release);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while node.state() == EntryState::HcqQueued {
+        assert!(
+            Instant::now() < deadline,
+            "HCQ worker did not reject the invalidated discovery"
+        );
+        std::thread::yield_now();
+    }
+
+    let state = process.state.lock().unwrap();
+    assert!(state.failure.is_none());
+    assert!(!state.regions.contains_key(&key));
+    assert_eq!(node.entry(), 0);
+    assert_eq!(node.state(), EntryState::Empty);
+    drop(state);
+    process.shutdown();
+}
+
+#[test]
+fn invalidation_at_hcq_publication_revalidation_rejects_compiled_code() {
+    let memory = Arc::new(blocking_code_memory(1));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let binding = MemoryBinding {
+        address_space: SPACE,
+        end_exclusive: GuestVirtualAddress::new(0x1_0000),
+        memory: memory.as_ref(),
+        mapping_epoch: memory.inner.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
+    };
+    process
+        .bind_owned_memory(
+            binding,
+            Arc::clone(&memory) as Arc<dyn nixe_cpu::execution::BoundMemory>,
+        )
+        .unwrap();
+    let thread = JitThread::new();
+    thread
+        .entry_for(process.as_ref(), memory.as_ref(), location(CODE))
+        .unwrap();
+    let key = RegionKey::new(cpu(), location(CODE));
+    let node = process.state.lock().unwrap().lookup.get(key).unwrap();
+    let lcq_entry = node.entry();
+
+    memory.fetch_gate.arm();
+    let release = FetchGateRelease(&memory.fetch_gate);
+    run_primary_entries(
+        &thread,
+        process.as_ref(),
+        memory.as_ref(),
+        CODE,
+        lookup::LCQ_PROMOTION_COUNTDOWN,
+    );
+    memory.fetch_gate.wait_for_entries(1);
+    assert_eq!(node.state(), EntryState::HcqQueued);
+    assert_eq!(node.entry(), lcq_entry);
+
+    memory
+        .invalidate_on_revalidation
+        .store(true, Ordering::Release);
+    memory.fetch_gate.release();
+    drop(release);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while node.state() == EntryState::HcqQueued {
+        assert!(
+            Instant::now() < deadline,
+            "HCQ worker did not reject code invalidated at publication"
+        );
+        std::thread::yield_now();
+    }
+
+    let state = process.state.lock().unwrap();
+    assert!(state.failure.is_none());
+    assert!(!state.regions.contains_key(&key));
+    assert_eq!(node.entry(), 0);
+    assert_eq!(node.state(), EntryState::Empty);
+    drop(state);
+    process.shutdown();
 }
 
 #[test]
@@ -604,7 +1754,9 @@ fn host_write_to_an_executable_alias_invalidates_immediately() {
     ));
     let process = JitProcess::new(cpu()).unwrap();
     let key = RegionKey::new(cpu(), location(CODE));
-    process.entry_for(&memory, location(CODE)).unwrap();
+    JitThread::new()
+        .entry_for(&process, &memory, location(CODE))
+        .unwrap();
 
     memory
         .write_bytes(
@@ -616,12 +1768,12 @@ fn host_write_to_an_executable_alias_invalidates_immediately() {
     process.reconcile(&memory).unwrap();
 
     let state = process.state.lock().unwrap();
-    assert!(state.lookup.get(key).is_none());
+    assert_eq!(state.lookup.get(key).unwrap().entry(), 0);
     assert_eq!(state.retired.len(), 1);
 }
 
 #[test]
-fn invalidation_unpublishes_every_entry_of_one_native_region() {
+fn invalidation_clears_entries_without_recreating_their_cells() {
     let mut memory = memory(&[(0x00, branch(CODE, CODE + 0x0c)), (0x0c, breakpoint(1))]);
     assert!(memory.map_page(
         SPACE,
@@ -632,12 +1784,23 @@ fn invalidation_unpublishes_every_entry_of_one_native_region() {
     let process = JitProcess::new(cpu()).unwrap();
     let primary = RegionKey::new(cpu(), location(CODE));
     let secondary = RegionKey::new(cpu(), location(CODE + 0x0c));
-    process.entry_for(&memory, location(CODE)).unwrap();
-    process.entry_for(&memory, location(CODE + 0x0c)).unwrap();
+    JitThread::new()
+        .entry_for(&process, &memory, location(CODE))
+        .unwrap();
+    JitThread::new()
+        .entry_for(&process, &memory, location(CODE + 0x0c))
+        .unwrap();
+    let (primary_cell, secondary_cell) = {
+        let state = process.state.lock().unwrap();
+        (
+            state.lookup.get(primary).unwrap().entry_address(),
+            state.lookup.get(secondary).unwrap().entry_address(),
+        )
+    };
     {
         let state = process.state.lock().unwrap();
-        assert!(state.lookup.get(primary).is_some());
-        assert!(state.lookup.get(secondary).is_some());
+        assert_ne!(state.lookup.get(primary).unwrap().entry(), 0);
+        assert_ne!(state.lookup.get(secondary).unwrap().entry(), 0);
     }
 
     memory
@@ -650,8 +1813,16 @@ fn invalidation_unpublishes_every_entry_of_one_native_region() {
     process.reconcile(&memory).unwrap();
 
     let state = process.state.lock().unwrap();
-    assert!(state.lookup.get(primary).is_none());
-    assert!(state.lookup.get(secondary).is_none());
+    assert_eq!(state.lookup.get(primary).unwrap().entry(), 0);
+    assert_eq!(state.lookup.get(secondary).unwrap().entry(), 0);
+    assert_eq!(
+        state.lookup.get(primary).unwrap().entry_address(),
+        primary_cell
+    );
+    assert_eq!(
+        state.lookup.get(secondary).unwrap().entry_address(),
+        secondary_cell
+    );
     assert!(state.regions.is_empty());
     assert_eq!(state.retired.len(), 2);
 }
@@ -660,7 +1831,9 @@ fn invalidation_unpublishes_every_entry_of_one_native_region() {
 fn mapping_invalidation_retires_only_overlapping_code() {
     let mut memory = memory(&[(0, breakpoint(0))]);
     let process = JitProcess::new(cpu()).unwrap();
-    process.entry_for(&memory, location(CODE)).unwrap();
+    JitThread::new()
+        .entry_for(&process, &memory, location(CODE))
+        .unwrap();
     let key = RegionKey::new(cpu(), location(CODE));
     assert!(memory.add_ram_page(GuestPhysicalPageId::new(2)));
     assert!(memory.map_page(
@@ -685,7 +1858,7 @@ fn mapping_invalidation_retires_only_overlapping_code() {
         .unwrap();
     process.reconcile(&memory).unwrap();
     let state = process.state.lock().unwrap();
-    assert!(state.lookup.get(key).is_none());
+    assert_eq!(state.lookup.get(key).unwrap().entry(), 0);
     assert_eq!(state.retired.len(), 1);
 }
 
@@ -768,7 +1941,9 @@ fn running_native_backedge_observes_concurrent_executable_invalidation() {
     let timer = Arc::new(timer);
     let memory = Arc::new(memory);
     let process = Arc::new(JitProcess::new(cpu()).unwrap());
-    process.entry_for(memory.as_ref(), location(CODE)).unwrap();
+    JitThread::new()
+        .entry_for(process.as_ref(), memory.as_ref(), location(CODE))
+        .unwrap();
     let thread = Arc::new(JitThread::new());
     let worker_memory = Arc::clone(&memory);
     let worker_process = Arc::clone(&process);
@@ -818,14 +1993,16 @@ fn running_native_backedge_observes_concurrent_executable_invalidation() {
 }
 
 #[test]
-fn shutdown_unlinks_code_and_stops_a_running_native_backedge() {
+fn shutdown_clears_code_cells_and_stops_a_running_native_backedge() {
     let (memory, timer) = blocking_native_loop();
     let entered = Arc::clone(&timer.entered);
     let release = Arc::clone(&timer.release);
     let timer = Arc::new(timer);
     let memory = Arc::new(memory);
     let process = Arc::new(JitProcess::new(cpu()).unwrap());
-    process.entry_for(memory.as_ref(), location(CODE)).unwrap();
+    JitThread::new()
+        .entry_for(process.as_ref(), memory.as_ref(), location(CODE))
+        .unwrap();
     let thread = Arc::new(JitThread::new());
     let worker_memory = Arc::clone(&memory);
     let worker_process = Arc::clone(&process);
@@ -851,7 +2028,13 @@ fn shutdown_unlinks_code_and_stops_a_running_native_backedge() {
     assert_eq!(error.kind, DirectJitErrorKind::Shutdown);
     process.shutdown();
     let state = process.state.lock().unwrap();
-    assert!(state.lookup.keys().next().is_none());
+    assert!(
+        state
+            .lookup
+            .keys()
+            .into_iter()
+            .all(|key| state.lookup.get(key).unwrap().entry() == 0)
+    );
     assert_eq!(state.retired.len(), 1);
 }
 
@@ -905,9 +2088,9 @@ fn every_platform_scalar_control_catalog_entry_compiles_directly() {
                 result => panic!("{platform:?} rejected {encoding:#010x}: {result:?}"),
             };
             covered.insert(decoded.instruction.coverage_id().get());
-            JitProcess::new(cpu)
-                .unwrap()
-                .entry_for(&memory, location)
+            let process = JitProcess::new(cpu).unwrap();
+            JitThread::new()
+                .entry_for(&process, &memory, location)
                 .unwrap_or_else(|error| {
                     panic!("{platform:?} failed direct compilation of {encoding:#010x}: {error}")
                 });
@@ -957,9 +2140,9 @@ fn every_platform_memory_system_catalog_entry_compiles_directly() {
                 result => panic!("{platform:?} rejected {encoding:#010x}: {result:?}"),
             };
             covered.insert(decoded.instruction.coverage_id().get());
-            JitProcess::new(cpu)
-                .unwrap()
-                .entry_for(&memory, location)
+            let process = JitProcess::new(cpu).unwrap();
+            JitThread::new()
+                .entry_for(&process, &memory, location)
                 .unwrap_or_else(|error| {
                     panic!("{platform:?} failed direct compilation of {encoding:#010x}: {error}")
                 });
@@ -1002,12 +2185,12 @@ fn every_platform_fp_simd_catalog_entry_has_a_direct_or_exact_typed_lowering() {
                 result => panic!("{platform:?} rejected {encoding:#010x}: {result:?}"),
             };
             covered.insert(decoded.instruction.coverage_id().get());
-            JitProcess::new(cpu)
-                .unwrap()
-                .entry_for(&memory, location)
-                .unwrap_or_else(|error| {
-                    panic!("{platform:?} failed direct FP/SIMD compilation of {encoding:#010x}: {error}")
-                });
+            let process = JitProcess::new(cpu).unwrap();
+            JitThread::new().entry_for(&process, &memory, location).unwrap_or_else(|error| {
+                panic!(
+                    "{platform:?} failed direct FP/SIMD compilation of {encoding:#010x}: {error}"
+                )
+            });
         }
         assert_eq!(
             covered,
@@ -1525,7 +2708,7 @@ fn direct_to_exact_fp_boundary_preserves_cumulative_status_and_traps() {
 }
 
 #[test]
-fn repeated_direct_fp_operations_do_not_duplicate_the_cold_protocol() {
+fn repeated_direct_fp_operations_do_not_duplicate_cold_protocol_clif() {
     let shape = |encoding, repetitions: usize| {
         let destination = encoding & 0x1f;
         // Give every guarded failure site the same dirty-destination publication
@@ -1535,52 +2718,45 @@ fn repeated_direct_fp_operations_do_not_duplicate_the_cold_protocol() {
         words.push((((repetitions + 1) * 4) as u64, breakpoint(0)));
         let memory = memory(&words);
         let process = JitProcess::new(cpu()).unwrap();
-        process.entry_for(&memory, location(CODE)).unwrap();
+        JitThread::new()
+            .entry_for(&process, &memory, location(CODE))
+            .unwrap();
         let state = process.state.lock().unwrap();
         let region = state
             .region_for(RegionKey::new(cpu(), location(CODE)))
             .unwrap();
-        (region.clif_instructions, region.native_bytes)
+        region.clif_instructions
     };
-    for (name, encoding, expected_clif_delta, x86_native_limit, a64_native_limit) in [
-        ("FADD D", 0x1e62_2820, 75, 544, 336),
-        ("FDIV V.4S", 0x6e3e_ff9c, 95, 704, 400),
-        ("FMUL V.4S element", 0x4f96_93fb, 78, 544, 352),
+    for (name, encoding, expected_clif_delta) in [
+        ("FADD D", 0x1e62_2820, 75),
+        ("FDIV V.4S", 0x6e3e_ff9c, 95),
+        ("FMUL V.4S element", 0x4f96_93fb, 78),
     ] {
         let one = shape(encoding, 1);
         let two = shape(encoding, 2);
         let three = shape(encoding, 3);
-        let clif_deltas = [two.0 - one.0, three.0 - two.0];
-        let native_deltas = [two.1 - one.1, three.1 - two.1];
+        let clif_deltas = [two - one, three - two];
         assert_eq!(
             clif_deltas, [expected_clif_delta; 2],
             "{name} changed its per-operation CLIF shape: one={one:?} two={two:?} three={three:?}"
         );
-        let native_limit = if cfg!(target_arch = "x86_64") {
-            x86_native_limit
-        } else {
-            a64_native_limit
-        };
-        assert!(
-            native_deltas.into_iter().all(|delta| delta <= native_limit),
-            "{name} duplicated native boundary work: one={one:?} two={two:?} three={three:?}"
-        );
-        assert!(native_deltas[1] <= native_deltas[0]);
-        assert!(clif_deltas[0] < one.0 && native_deltas[0] < one.1);
+        assert!(clif_deltas[0] < one);
     }
 }
 
 #[test]
-fn repeated_exact_fp_operations_share_the_cold_boundary_protocol() {
+fn repeated_exact_fp_operations_share_the_cold_boundary_clif() {
     let shape = |words: &[(u64, u32)]| {
         let memory = memory(words);
         let process = JitProcess::new(cpu()).unwrap();
-        process.entry_for(&memory, location(CODE)).unwrap();
+        JitThread::new()
+            .entry_for(&process, &memory, location(CODE))
+            .unwrap();
         let state = process.state.lock().unwrap();
         let region = state
             .region_for(RegionKey::new(cpu(), location(CODE)))
             .unwrap();
-        (region.clif_instructions, region.native_bytes)
+        region.clif_instructions
     };
     let one = shape(&[
         // Equalize the minimum state publication required if either typed call
@@ -1602,23 +2778,12 @@ fn repeated_exact_fp_operations_share_the_cold_boundary_protocol() {
         (12, 0x1e67_c020), // FRINTI D0,D1
         (16, breakpoint(0)),
     ]);
-    let clif_deltas = [two.0 - one.0, three.0 - two.0];
-    let native_deltas = [two.1 - one.1, three.1 - two.1];
+    let clif_deltas = [two - one, three - two];
     assert_eq!(
         clif_deltas, [32; 2],
         "exact FP changed its per-operation CLIF shape: one={one:?} two={two:?} three={three:?}"
     );
-    let native_limit = if cfg!(target_arch = "x86_64") {
-        256
-    } else {
-        192
-    };
-    assert!(
-        native_deltas.into_iter().all(|delta| delta <= native_limit),
-        "repeated exact FP duplicated native boundary work: one={one:?} two={two:?} three={three:?}"
-    );
-    assert!(native_deltas[1] <= native_deltas[0]);
-    assert!(clif_deltas[0] < one.0 && native_deltas[0] < one.1);
+    assert!(clif_deltas[0] < one);
 }
 
 #[test]
@@ -1738,17 +2903,24 @@ fn linked_exact_region_preserves_inherited_native_fp_status() {
         );
     }
 
-    let process = JitProcess::new(cpu()).unwrap();
-    process.entry_for(&memory, location(EXACT)).unwrap();
-    let mut actual = rich_state();
-    assert!(actual.set_vector(1, u128::from(1.0_f64.to_bits())));
-    assert!(actual.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
-    assert!(actual.set_vector(4, u128::from(1.75_f64.to_bits())));
-    JitThread::new()
-        .run(&process, &memory, &mut actual)
-        .unwrap();
-    assert_eq!(actual, expected);
-    assert_ne!(read_register(&actual, 5) & (1 << 4), 0);
+    for hcq in [false, true] {
+        let process = JitProcess::new(cpu()).unwrap();
+        JitThread::new()
+            .entry_for(&process, &memory, location(EXACT))
+            .unwrap();
+        if hcq {
+            install_hcq_entries(&process, &memory, &[EXACT, CODE]);
+        }
+        let mut actual = rich_state();
+        assert!(actual.set_vector(1, u128::from(1.0_f64.to_bits())));
+        assert!(actual.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
+        assert!(actual.set_vector(4, u128::from(1.75_f64.to_bits())));
+        JitThread::new()
+            .run(&process, &memory, &mut actual)
+            .unwrap();
+        assert_eq!(actual, expected, "hcq={hcq}");
+        assert_ne!(read_register(&actual, 5) & (1 << 4), 0, "hcq={hcq}");
+    }
 }
 
 #[test]
@@ -1929,118 +3101,137 @@ fn direct_native_fp_environment_restores_the_calling_thread() {
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
-fn direct_native_fp_state_is_isolated_between_concurrent_vcpus() {
-    let memory = Arc::new(memory(&[
-        (0, 0x1e62_2820), // FADD D0,D1,D2
-        (4, 0xd53b_4424), // MRS X4,FPSR
-        (8, breakpoint(0)),
-    ]));
-    let process = Arc::new(JitProcess::new(cpu()).unwrap());
-    let ready = Arc::new(Barrier::new(2));
-    let mut workers = Vec::new();
+fn lcq_and_hcq_native_fp_state_are_isolated_between_concurrent_vcpus() {
+    for hcq in [false, true] {
+        let memory = Arc::new(memory(&[
+            (0, 0x1e62_2820), // FADD D0,D1,D2
+            (4, 0xd53b_4424), // MRS X4,FPSR
+            (8, breakpoint(0)),
+        ]));
+        let process = Arc::new(JitProcess::new(cpu()).unwrap());
+        if hcq {
+            install_hcq_entries(process.as_ref(), memory.as_ref(), &[CODE]);
+        }
+        let ready = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
 
-    for index in 0_u32..2 {
-        let memory = Arc::clone(&memory);
-        let process = Arc::clone(&process);
-        let ready = Arc::clone(&ready);
-        workers.push(std::thread::spawn(move || {
-            let original = read_host_fp();
-            let restore = RestoreHostFp(original);
-            let caller = distinct_host_fp(original, index + 1);
-            write_host_fp(caller);
+        for index in 0_u32..2 {
+            let memory = Arc::clone(&memory);
+            let process = Arc::clone(&process);
+            let ready = Arc::clone(&ready);
+            workers.push(std::thread::spawn(move || {
+                let original = read_host_fp();
+                let restore = RestoreHostFp(original);
+                let caller = distinct_host_fp(original, index + 1);
+                write_host_fp(caller);
 
-            let mut state = rich_state();
-            let initial_fpsr = if index == 0 { 0 } else { 1 << 1 };
-            state.set_fpsr(initial_fpsr);
-            assert!(state.set_vector(1, u128::from(1.0_f64.to_bits())));
-            let rhs = if index == 0 { 2.0_f64.powi(-53) } else { 1.0 };
-            assert!(state.set_vector(2, u128::from(rhs.to_bits())));
+                let mut state = rich_state();
+                let initial_fpsr = if index == 0 { 0 } else { 1 << 1 };
+                state.set_fpsr(initial_fpsr);
+                assert!(state.set_vector(1, u128::from(1.0_f64.to_bits())));
+                let rhs = if index == 0 { 2.0_f64.powi(-53) } else { 1.0 };
+                assert!(state.set_vector(2, u128::from(rhs.to_bits())));
 
-            ready.wait();
-            let exit = JitThread::new().run(process.as_ref(), memory.as_ref(), &mut state);
-            let observed_host = read_host_fp();
-            drop(restore);
-            (exit, state, caller, observed_host, initial_fpsr)
-        }));
-    }
+                ready.wait();
+                let exit = JitThread::new().run(process.as_ref(), memory.as_ref(), &mut state);
+                let observed_host = read_host_fp();
+                drop(restore);
+                (exit, state, caller, observed_host, initial_fpsr)
+            }));
+        }
 
-    for worker in workers {
-        let (exit, state, caller, observed_host, initial_fpsr) = worker.join().unwrap();
-        assert!(matches!(exit.unwrap(), DirectExit::Architectural { .. }));
-        assert_eq!(observed_host, caller);
-        let expected_fpsr = if initial_fpsr == 0 {
-            1 << 4
-        } else {
-            initial_fpsr
-        };
-        assert_eq!(state.fpsr(), expected_fpsr);
-        assert_eq!(read_register(&state, 4), u64::from(expected_fpsr));
+        for worker in workers {
+            let (exit, state, caller, observed_host, initial_fpsr) = worker.join().unwrap();
+            assert!(
+                matches!(exit.unwrap(), DirectExit::Architectural { .. }),
+                "hcq={hcq}"
+            );
+            assert_eq!(observed_host, caller, "hcq={hcq}");
+            let expected_fpsr = if initial_fpsr == 0 {
+                1 << 4
+            } else {
+                initial_fpsr
+            };
+            assert_eq!(state.fpsr(), expected_fpsr, "hcq={hcq}");
+            assert_eq!(
+                read_register(&state, 4),
+                u64::from(expected_fpsr),
+                "hcq={hcq}"
+            );
+        }
     }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
-fn direct_native_fp_state_survives_vcpu_host_thread_migration() {
-    let memory = Arc::new(memory(&[
-        (0, 0x1e62_2820),  // FADD D0,D1,D2
-        (4, 0xd503_205f),  // WFE
-        (8, 0x1e62_2823),  // FADD D3,D1,D2
-        (12, 0xd53b_4424), // MRS X4,FPSR
-        (16, breakpoint(0)),
-    ]));
-    let process = Arc::new(JitProcess::new(cpu()).unwrap());
-    let mut initial = rich_state();
-    assert!(initial.set_vector(1, u128::from(1.0_f64.to_bits())));
-    assert!(initial.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
-
-    let first_memory = Arc::clone(&memory);
-    let first_process = Arc::clone(&process);
-    let first = std::thread::spawn(move || {
-        let original = read_host_fp();
-        let restore = RestoreHostFp(original);
-        let caller = distinct_host_fp(original, 1);
-        write_host_fp(caller);
-        let mut state = initial;
-        let exit = JitThread::new().run(first_process.as_ref(), first_memory.as_ref(), &mut state);
-        let observed_host = read_host_fp();
-        drop(restore);
-        (exit, state, caller, observed_host)
-    });
-    let (first_exit, scheduled, first_caller, first_observed) = first.join().unwrap();
-    assert_eq!(
-        first_exit.unwrap(),
-        DirectExit::Scheduled {
-            pc: GuestVirtualAddress::new(CODE + 4),
-            request: nixe_cpu::execution::SchedulerRequest::WaitForEvent,
-            progress: 1,
+fn lcq_and_hcq_native_fp_state_survives_vcpu_host_thread_migration() {
+    for hcq in [false, true] {
+        let memory = Arc::new(memory(&[
+            (0, 0x1e62_2820),  // FADD D0,D1,D2
+            (4, 0xd503_205f),  // WFE
+            (8, 0x1e62_2823),  // FADD D3,D1,D2
+            (12, 0xd53b_4424), // MRS X4,FPSR
+            (16, breakpoint(0)),
+        ]));
+        let process = Arc::new(JitProcess::new(cpu()).unwrap());
+        if hcq {
+            install_hcq_entries(process.as_ref(), memory.as_ref(), &[CODE, CODE + 8]);
         }
-    );
-    assert_eq!(first_observed, first_caller);
-    assert_eq!(scheduled.pc(), CODE + 8);
-    assert_eq!(scheduled.fpsr() & (1 << 4), 1 << 4);
+        let mut initial = rich_state();
+        assert!(initial.set_vector(1, u128::from(1.0_f64.to_bits())));
+        assert!(initial.set_vector(2, u128::from((2.0_f64.powi(-53)).to_bits())));
 
-    let second_memory = Arc::clone(&memory);
-    let second_process = Arc::clone(&process);
-    let second = std::thread::spawn(move || {
-        let original = read_host_fp();
-        let restore = RestoreHostFp(original);
-        let caller = distinct_host_fp(original, 2);
-        write_host_fp(caller);
-        let mut state = scheduled;
-        let exit =
-            JitThread::new().run(second_process.as_ref(), second_memory.as_ref(), &mut state);
-        let observed_host = read_host_fp();
-        drop(restore);
-        (exit, state, caller, observed_host)
-    });
-    let (second_exit, completed, second_caller, second_observed) = second.join().unwrap();
-    assert!(matches!(
-        second_exit.unwrap(),
-        DirectExit::Architectural { .. }
-    ));
-    assert_eq!(second_observed, second_caller);
-    assert_eq!(completed.fpsr() & (1 << 4), 1 << 4);
-    assert_eq!(read_register(&completed, 4) & (1 << 4), 1 << 4);
+        let first_memory = Arc::clone(&memory);
+        let first_process = Arc::clone(&process);
+        let first = std::thread::spawn(move || {
+            let original = read_host_fp();
+            let restore = RestoreHostFp(original);
+            let caller = distinct_host_fp(original, 1);
+            write_host_fp(caller);
+            let mut state = initial;
+            let exit =
+                JitThread::new().run(first_process.as_ref(), first_memory.as_ref(), &mut state);
+            let observed_host = read_host_fp();
+            drop(restore);
+            (exit, state, caller, observed_host)
+        });
+        let (first_exit, scheduled, first_caller, first_observed) = first.join().unwrap();
+        assert_eq!(
+            first_exit.unwrap(),
+            DirectExit::Scheduled {
+                pc: GuestVirtualAddress::new(CODE + 4),
+                request: nixe_cpu::execution::SchedulerRequest::WaitForEvent,
+                progress: 1,
+            },
+            "hcq={hcq}"
+        );
+        assert_eq!(first_observed, first_caller, "hcq={hcq}");
+        assert_eq!(scheduled.pc(), CODE + 8, "hcq={hcq}");
+        assert_eq!(scheduled.fpsr() & (1 << 4), 1 << 4, "hcq={hcq}");
+
+        let second_memory = Arc::clone(&memory);
+        let second_process = Arc::clone(&process);
+        let second = std::thread::spawn(move || {
+            let original = read_host_fp();
+            let restore = RestoreHostFp(original);
+            let caller = distinct_host_fp(original, 2);
+            write_host_fp(caller);
+            let mut state = scheduled;
+            let exit =
+                JitThread::new().run(second_process.as_ref(), second_memory.as_ref(), &mut state);
+            let observed_host = read_host_fp();
+            drop(restore);
+            (exit, state, caller, observed_host)
+        });
+        let (second_exit, completed, second_caller, second_observed) = second.join().unwrap();
+        assert!(
+            matches!(second_exit.unwrap(), DirectExit::Architectural { .. }),
+            "hcq={hcq}"
+        );
+        assert_eq!(second_observed, second_caller, "hcq={hcq}");
+        assert_eq!(completed.fpsr() & (1 << 4), 1 << 4, "hcq={hcq}");
+        assert_eq!(read_register(&completed, 4) & (1 << 4), 1 << 4, "hcq={hcq}");
+    }
 }
 
 #[test]
@@ -4506,7 +5697,9 @@ fn straight_line_nops_add_no_per_instruction_scaffolding() {
         words.push(((nop_count * 4) as u64, breakpoint(0)));
         let memory = memory(&words);
         let process = JitProcess::new(cpu()).unwrap();
-        process.entry_for(&memory, location(CODE)).unwrap();
+        JitThread::new()
+            .entry_for(&process, &memory, location(CODE))
+            .unwrap();
         let state = process.state.lock().unwrap();
         let region = state
             .region_for(RegionKey::new(cpu(), location(CODE)))
@@ -4532,17 +5725,24 @@ fn direct_fault_metadata_has_no_trap_code_site_cap() {
         cpu(),
         &memory,
         location(CODE),
-        RegionLimits::default(),
+        LCQ_MAX_REGION_INSTRUCTIONS,
         |_| false,
     )
     .unwrap();
-    let mut compiler = super::compiler::DirectCompiler::new().unwrap();
-    compiler
-        .bind_memory_backend(nixe_memory::CpuMemoryBackend::LinuxDirect)
-        .unwrap();
-    let compiled = compiler.compile(&region, &[]).unwrap();
+    let runtime = super::compiler::CompilerRuntime::new().unwrap();
+    for policy in [
+        super::compiler::LCQ_COMPILER_POLICY,
+        super::compiler::HCQ_COMPILER_POLICY,
+    ] {
+        let mut compiler =
+            super::compiler::DirectCompiler::new(policy, runtime.addresses()).unwrap();
+        compiler
+            .bind_memory_backend(nixe_memory::CpuMemoryBackend::LinuxDirect)
+            .unwrap();
+        let compiled = compiler.compile(&region, &[], None).unwrap();
 
-    assert_eq!(compiled.fault_sites.len(), LOAD_COUNT);
+        assert_eq!(compiled.fault_sites.len(), LOAD_COUNT);
+    }
 }
 
 #[test]
@@ -4555,7 +5755,9 @@ fn branch_local_read_is_loaded_after_the_primary_branch() {
         (0x10, breakpoint(0)),
     ]);
     let process = JitProcess::new(cpu()).unwrap();
-    process.entry_for(&memory, location(CODE)).unwrap();
+    JitThread::new()
+        .entry_for(&process, &memory, location(CODE))
+        .unwrap();
     let state = process.state.lock().unwrap();
     let region = state
         .region_for(RegionKey::new(cpu(), location(CODE)))
@@ -4619,7 +5821,9 @@ fn equivalent_exits_share_one_cold_epilogue() {
         (0x08, breakpoint(7)),
     ]);
     let process = JitProcess::new(cpu()).unwrap();
-    process.entry_for(&memory, location(CODE)).unwrap();
+    JitThread::new()
+        .entry_for(&process, &memory, location(CODE))
+        .unwrap();
     let state = process.state.lock().unwrap();
     let region = state
         .region_for(RegionKey::new(cpu(), location(CODE)))
@@ -4633,7 +5837,9 @@ fn switch_1_pointer_authentication_hints_add_no_clif_over_nop() {
     let shape = |encoding| {
         let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
         let process = JitProcess::new(cpu()).unwrap();
-        process.entry_for(&memory, location(CODE)).unwrap();
+        JitThread::new()
+            .entry_for(&process, &memory, location(CODE))
+            .unwrap();
         let state = process.state.lock().unwrap();
         let region = state
             .region_for(RegionKey::new(cpu(), location(CODE)))
@@ -4724,23 +5930,26 @@ fn assert_fp_exception_matches_interpreter(encoding: u32, initial: A64State) {
         })
     ));
 
-    let mut actual = initial;
-    assert_eq!(
-        JitThread::new()
-            .run(
-                &JitProcess::new(cpu()).unwrap(),
-                &memory(&[(0, encoding), (4, breakpoint(0))]),
-                &mut actual,
-            )
-            .unwrap(),
-        DirectExit::Architectural {
-            pc: GuestVirtualAddress::new(CODE),
-            detail: 6 << 24,
-            progress: 1,
-        },
-        "{encoding:#010x}"
-    );
-    assert_eq!(actual, expected, "{encoding:#010x}");
+    for hcq in [false, true] {
+        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+        let process = JitProcess::new(cpu()).unwrap();
+        if hcq {
+            install_hcq_entries(&process, &memory, &[CODE]);
+        }
+        let mut actual = initial.clone();
+        assert_eq!(
+            JitThread::new()
+                .run(&process, &memory, &mut actual)
+                .unwrap(),
+            DirectExit::Architectural {
+                pc: GuestVirtualAddress::new(CODE),
+                detail: 6 << 24,
+                progress: 1,
+            },
+            "encoding={encoding:#010x} hcq={hcq}"
+        );
+        assert_eq!(actual, expected, "encoding={encoding:#010x} hcq={hcq}");
+    }
 }
 
 fn assert_control_matches_interpreter(encoding: u32, initial: A64State) {
@@ -4796,6 +6005,36 @@ fn memory(words: &[(u64, u32)]) -> SyntheticMemory {
         page,
         MemoryPermissions::READ_EXECUTE,
     ));
+    memory
+}
+
+fn paged_memory(words: &[(u64, u32)]) -> SyntheticMemory {
+    let mut memory = SyntheticMemory::new();
+    let page_size = nixe_cpu::memory::SYNTHETIC_PAGE_SIZE as u64;
+    let page_count = words
+        .iter()
+        .map(|(offset, _)| offset / page_size)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    for page_index in 0..page_count {
+        let page = GuestPhysicalPageId::new(page_index + 1);
+        assert!(memory.add_ram_page(page));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(CODE + page_index * page_size),
+            page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+    }
+    for &(offset, encoding) in words {
+        let page_index = offset / page_size;
+        assert!(memory.initialize_ram(
+            GuestPhysicalPageId::new(page_index + 1),
+            (offset % page_size) as usize,
+            &encoding.to_le_bytes(),
+        ));
+    }
     memory
 }
 

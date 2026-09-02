@@ -10,9 +10,8 @@ use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use super::DirectJitError;
 
-pub(super) const DEFAULT_MAX_REGION_INSTRUCTIONS: usize = 256;
-pub(super) const DEFAULT_MAX_REGION_BLOCKS: usize = 64;
-pub(super) const DEFAULT_MAX_CODE_DEPENDENCIES: usize = 64;
+pub(super) const LCQ_MAX_REGION_INSTRUCTIONS: usize = 512;
+pub(super) const HCQ_MAX_REGION_INSTRUCTIONS: usize = 2560;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RegionKey {
@@ -34,23 +33,6 @@ impl RegionKey {
         Self {
             start: target,
             ..self
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct RegionLimits {
-    pub(super) instructions: usize,
-    pub(super) blocks: usize,
-    pub(super) dependencies: usize,
-}
-
-impl Default for RegionLimits {
-    fn default() -> Self {
-        Self {
-            instructions: DEFAULT_MAX_REGION_INSTRUCTIONS,
-            blocks: DEFAULT_MAX_REGION_BLOCKS,
-            dependencies: DEFAULT_MAX_CODE_DEPENDENCIES,
         }
     }
 }
@@ -122,12 +104,12 @@ pub(super) fn discover_region(
     cpu: ProcessCpuContext,
     memory: &(impl InstructionMemory + ?Sized),
     start: LocationDescriptor,
-    limits: RegionLimits,
+    max_instructions: usize,
     published_entry: impl Fn(GuestVirtualAddress) -> bool,
 ) -> Result<NativeRegion, DirectJitError> {
-    if limits.instructions == 0 || limits.blocks == 0 || limits.dependencies == 0 {
+    if max_instructions == 0 {
         return Err(DirectJitError::internal(
-            "direct JIT region limits must be non-zero",
+            "direct JIT instruction limit must be non-zero",
         ));
     }
     let key = RegionKey::new(cpu, start);
@@ -135,18 +117,21 @@ pub(super) fn discover_region(
     let mut scheduled = HashSet::from([start.pc]);
     let mut blocks = Vec::new();
     let mut dependencies = Vec::new();
+    let mut dependency_set = HashSet::new();
     let mut mapping_dependencies = Vec::new();
+    let mut mapping_dependency_set = HashSet::new();
+    let mut last_mapping_dependency: Option<CodePageSpan> = None;
     let mut instruction_count = 0;
 
     while let Some(block_start) = pending.pop_front() {
-        if blocks.len() == limits.blocks || instruction_count == limits.instructions {
+        if instruction_count == max_instructions {
             break;
         }
         let block_location = LocationDescriptor::new(block_start, cpu.profile_id());
         let mut pc = block_start;
         let mut instructions = Vec::new();
         let terminator = loop {
-            if instruction_count == limits.instructions {
+            if instruction_count == max_instructions {
                 break BlockTerminator::Limit { continuation: pc };
             }
             if pc != block_start && published_entry(pc) {
@@ -158,30 +143,22 @@ pub(super) fn discover_region(
             let location = LocationDescriptor::new(pc, cpu.profile_id());
             let (encoding, fetched_dependencies) = fetch(memory, key.address_space, location)?;
             for dependency in fetched_dependencies.iter() {
-                if !dependencies.contains(&dependency) {
-                    if dependencies.len() == limits.dependencies {
-                        break;
-                    }
+                if dependency_set.insert(dependency) {
                     dependencies.push(dependency);
                 }
             }
-            if fetched_dependencies
-                .iter()
-                .any(|dependency| !dependencies.contains(&dependency))
-            {
-                break BlockTerminator::Limit { continuation: pc };
-            }
-            if !mapping_dependencies
-                .iter()
-                .any(|span: &CodePageSpan| span.contains(pc))
-            {
-                mapping_dependencies.push(memory.code_page_span(key.address_space, pc).map_err(
-                    |fault| {
+            if !last_mapping_dependency.is_some_and(|span| span.contains(pc)) {
+                let span = memory
+                    .code_page_span(key.address_space, pc)
+                    .map_err(|fault| {
                         DirectJitError::invalid(format!(
                             "direct JIT code-page query failed: {fault}"
                         ))
-                    },
-                )?);
+                    })?;
+                if mapping_dependency_set.insert(span) {
+                    mapping_dependencies.push(span);
+                }
+                last_mapping_dependency = Some(span);
             }
             let decoded = match decode::decode(cpu.decoder(), location, encoding) {
                 DecodeResult::Decoded(decoded) => decoded,
@@ -225,70 +202,28 @@ pub(super) fn discover_region(
                 | A64Instruction::FpSimd(_) => pc = next,
                 A64Instruction::Control(control::Instruction::BranchImmediate(fields)) => {
                     let target = branch_target(pc, fields.immediate_26, 26);
-                    schedule(
-                        target,
-                        limits.blocks,
-                        &published_entry,
-                        &mut scheduled,
-                        &mut pending,
-                    );
+                    schedule(target, &published_entry, &mut scheduled, &mut pending);
                     break BlockTerminator::Direct { target };
                 }
                 A64Instruction::Control(control::Instruction::ConditionalBranch(fields)) => {
                     let taken = branch_target(pc, fields.immediate_19, 19);
                     let not_taken = next;
-                    schedule(
-                        taken,
-                        limits.blocks,
-                        &published_entry,
-                        &mut scheduled,
-                        &mut pending,
-                    );
-                    schedule(
-                        not_taken,
-                        limits.blocks,
-                        &published_entry,
-                        &mut scheduled,
-                        &mut pending,
-                    );
+                    schedule(taken, &published_entry, &mut scheduled, &mut pending);
+                    schedule(not_taken, &published_entry, &mut scheduled, &mut pending);
                     break BlockTerminator::Conditional { taken, not_taken };
                 }
                 A64Instruction::Control(control::Instruction::CompareBranch(fields)) => {
                     let taken = branch_target(pc, fields.immediate_19, 19);
                     let not_taken = next;
-                    schedule(
-                        taken,
-                        limits.blocks,
-                        &published_entry,
-                        &mut scheduled,
-                        &mut pending,
-                    );
-                    schedule(
-                        not_taken,
-                        limits.blocks,
-                        &published_entry,
-                        &mut scheduled,
-                        &mut pending,
-                    );
+                    schedule(taken, &published_entry, &mut scheduled, &mut pending);
+                    schedule(not_taken, &published_entry, &mut scheduled, &mut pending);
                     break BlockTerminator::Conditional { taken, not_taken };
                 }
                 A64Instruction::Control(control::Instruction::TestBranch(fields)) => {
                     let taken = branch_target(pc, fields.immediate_14, 14);
                     let not_taken = next;
-                    schedule(
-                        taken,
-                        limits.blocks,
-                        &published_entry,
-                        &mut scheduled,
-                        &mut pending,
-                    );
-                    schedule(
-                        not_taken,
-                        limits.blocks,
-                        &published_entry,
-                        &mut scheduled,
-                        &mut pending,
-                    );
+                    schedule(taken, &published_entry, &mut scheduled, &mut pending);
+                    schedule(not_taken, &published_entry, &mut scheduled, &mut pending);
                     break BlockTerminator::Conditional { taken, not_taken };
                 }
                 A64Instruction::Control(control::Instruction::BranchLinkImmediate(fields)) => {
@@ -439,12 +374,11 @@ fn system_instruction_supported(
 
 fn schedule(
     target: GuestVirtualAddress,
-    block_limit: usize,
     published_entry: &impl Fn(GuestVirtualAddress) -> bool,
     scheduled: &mut HashSet<GuestVirtualAddress>,
     pending: &mut VecDeque<GuestVirtualAddress>,
 ) {
-    if !published_entry(target) && scheduled.len() < block_limit && scheduled.insert(target) {
+    if !published_entry(target) && scheduled.insert(target) {
         pending.push_back(target);
     }
 }
