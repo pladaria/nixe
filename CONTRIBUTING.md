@@ -19,8 +19,11 @@ necessary implementation.
 
 ## Architecture
 
-The current module and crate boundaries are provisional. Change or remove them when the target architecture or
-performance requires it. Do not preserve temporary boundaries or legacy implementations merely because they work.
+The current architecture, module structure, and crate boundaries are not constraints. Large architectural
+changes, including substantial rewrites or migrations, are acceptable when they move the project towards its
+goal: a highly efficient Switch 1 emulator, eventually extended to Switch 2, with a very fast JIT. Change or
+remove boundaries whenever the target architecture or performance requires it. Do not preserve temporary
+boundaries or legacy implementations merely because they work.
 
 An architectural change, migration, refactor, or replacement is complete only when the superseded implementation
 and its obsolete adapters, branches, abstractions, and tests have been removed. Keep multiple paths only when
@@ -28,6 +31,11 @@ they represent genuinely distinct guest-visible behavior or supported host backe
 
 Keep platform-independent code separate from console-specific behavior. Share code across platforms only when
 the abstraction is supported by verified technical knowledge.
+
+The code is the source of truth for the current behavior and architecture. The implementation plan for the
+current task defines the intended work in progress. Other documents and notes are historical context only and
+may not reflect the current design, implementation, or project intent; do not treat them as requirements without
+confirming them against the code or the active plan.
 
 ## Correctness and failure handling
 
