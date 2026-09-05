@@ -42,6 +42,7 @@ use self::lookup::{EntryState, NativeLookupNode, NativeLookupSlot, RegionLookup}
 use self::region::{
     HCQ_MAX_REGION_INSTRUCTIONS, LCQ_MAX_REGION_INSTRUCTIONS, RegionKey, discover_region,
 };
+use crate::abi::NativeExitReason;
 
 const DEFAULT_MAX_NATIVE_CODE_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_NATIVE_FAULT_REGIONS: usize = 262_144;
@@ -58,15 +59,15 @@ const fn hcq_worker_count(logical_processors: usize) -> usize {
     }
 }
 
-const EXIT_NONE: u32 = 0;
-const EXIT_DISPATCH: u32 = 1;
-const EXIT_CONTROL: u32 = 3;
-const EXIT_ARCHITECTURAL: u32 = 4;
-const EXIT_UNSUPPORTED: u32 = 5;
-const EXIT_DATA_FAULT: u32 = 6;
-const EXIT_SCHEDULED: u32 = 7;
-const EXIT_INTERNAL: u32 = 8;
-const EXIT_RECONCILE: u32 = 9;
+const EXIT_NONE: u32 = NativeExitReason::None as u32;
+const EXIT_DISPATCH: u32 = NativeExitReason::Dispatch as u32;
+const EXIT_CONTROL: u32 = NativeExitReason::Control as u32;
+const EXIT_ARCHITECTURAL: u32 = NativeExitReason::Architectural as u32;
+const EXIT_UNSUPPORTED: u32 = NativeExitReason::Unsupported as u32;
+const EXIT_DATA_FAULT: u32 = NativeExitReason::DataFault as u32;
+const EXIT_SCHEDULED: u32 = NativeExitReason::Scheduled as u32;
+const EXIT_INTERNAL: u32 = NativeExitReason::Internal as u32;
+const EXIT_RECONCILE: u32 = NativeExitReason::Reconcile as u32;
 
 const COARSE_PROGRESS: u64 = 1;
 

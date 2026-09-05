@@ -6,15 +6,7 @@
 
 use super::NativeContext;
 
-#[repr(C)]
-#[derive(Default)]
-pub(super) struct HostFpState {
-    saved_control: u64,
-    saved_status: u64,
-    pub(super) active: u32,
-    saved: u32,
-    suspended: u32,
-}
+pub(super) use crate::abi::HostFpState;
 
 /// Resets the lazy environment owner for a new native invocation.
 ///

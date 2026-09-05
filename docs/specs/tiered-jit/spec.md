@@ -2,6 +2,15 @@
 
 ## Status and authority
 
+This is a living specification of the intended design, governed by
+[CONTRIBUTING.md](../../../CONTRIBUTING.md). Update the affected sections when
+agreed architectural decisions, contracts or task scope change during
+implementation. Replace obsolete text rather than appending a changelog; Git
+preserves the history. Internal implementation details need not be documented
+unless they affect those contracts. The code remains the source of truth for
+current behavior: a requirement written here is not evidence of implementation
+or verification.
+
 This document is the sole normative specification and implementation sequence
 for Nixe's in-memory JIT architecture. Other documents may link to it, but they
 neither schedule nor constrain its design, work order or acceptance criteria.
