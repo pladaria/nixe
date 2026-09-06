@@ -1,6 +1,14 @@
 //! Shared FP lowering/status policy for both compiler tiers.
 use nixe_cpu::decode::a64::fp_simd::{FloatRoundOperation, FloatToIntegerRounding, Instruction};
 
+// Native S/D arithmetic supports these controls. Other modes (including guest
+// exception enables) require the exact typed semantics, not a masked fallback.
+pub(crate) const NATIVE_FPCR_MASK: u32 = (3 << 22) | (1 << 24) | (1 << 25);
+
+pub(crate) const fn native_fpcr_supported(fpcr: u32) -> bool {
+    fpcr & !NATIVE_FPCR_MASK == 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FpLoweringDisposition {
     Direct,

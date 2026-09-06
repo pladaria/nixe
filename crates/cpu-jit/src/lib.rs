@@ -10,6 +10,8 @@ compile_error!("nixe-cpu-jit requires Linux direct-memory support");
 pub mod abi;
 pub mod analysis;
 mod direct;
+mod fp_env;
 mod fp_policy;
+pub mod native;
 
 pub use direct::{JitProcess, JitThread};
