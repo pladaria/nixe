@@ -109,7 +109,7 @@ commit as changes accumulate. On another machine, use a clone of the same fork
 and its `nixe` branch; the local path is not a build dependency.
 
 The release commit identifies the upstream base; the tested commit on `nixe`
-identifies the evolving Nixe backend. Pin Nixe's Cargo patches to that exact
+identifies the evolving Nixe backend. Pin Nixe's Cargo dependencies to that exact
 fork commit using `rev`, and update `Cargo.lock` with dependency changes. Do
 not use a floating branch dependency or commit a machine-local path override.
 The backend changes required by Task 1 are made in this fork.
@@ -427,6 +427,13 @@ second executable lookup table.
 
 ## Native fast-chain ABI
 
+The x86-64 ABI requires LAHF/SAHF in 64-bit mode, as documented in
+[host requirements](../../host-requirements.md). Check CPUID support during JIT
+process initialization, not in invocations or links. Unsupported hosts fail
+initialization; no alternate flag ABI is maintained for them. SAHF installs
+SF/ZF/CF from packed guest NZCV; establish OF separately and preserve borrowed
+RAX in the fixed transfer area. This conversion does not use the host stack.
+
 ### Gateway and fast mode
 
 The system-ABI gateway is entered once per native invocation. It:
@@ -475,7 +482,7 @@ cannot overlap NativeFrame storage.
 
 Stock Cranelift exposes only one pinned register and does not provide
 prologue-free multi-entry blocks, link patchpoints or semantic block-label
-offsets. The implementation therefore uses a maintained Cargo patch of the
+offsets. The implementation therefore uses a maintained fork of the
 pinned Cranelift revision rather than weakening this ABI. If the Task 1 proof
 shows that the required hooks cannot be maintained without replacing
 Cranelift's allocator or machine backend, implementation stops and this

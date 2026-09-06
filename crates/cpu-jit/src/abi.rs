@@ -3,6 +3,7 @@
 //! are meaningful only while the caller protects the owning execution epoch.
 
 use crate::analysis::StateSet;
+pub use crate::fp_env::UnsupportedFpControl;
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::{CpuProfileId, ProcessCpuContext};
 use nixe_cpu::state::a64::{A64State, Nzcv};
@@ -406,6 +407,9 @@ pub struct NativeFrame<'a> {
     pub exit_source_version: u64,
     pub exit_state_map: u32,
     pub exit_reason: u32,
+    /// Invocation-local assembly continuation, installed by the native gateway.
+    /// Never an inter-unit link or a host return address used by guest units.
+    pub(crate) gateway_exit: usize,
     state_borrow: PhantomData<&'a mut A64State>,
 }
 impl<'a> NativeFrame<'a> {
@@ -422,6 +426,7 @@ impl<'a> NativeFrame<'a> {
             exit_source_version: 0,
             exit_state_map: 0,
             exit_reason: 0,
+            gateway_exit: 0,
             state_borrow: PhantomData,
         }
     }
@@ -716,7 +721,7 @@ fn validate_nzcv(abi: HostAbi, bits: u8, location: &NzcvLocation) -> Result<(), 
     Ok(())
 }
 
-fn locations_overlap(a: ValueLocation, b: ValueLocation) -> bool {
+pub(crate) fn locations_overlap(a: ValueLocation, b: ValueLocation) -> bool {
     match (a, b) {
         (
             ValueLocation::Register {

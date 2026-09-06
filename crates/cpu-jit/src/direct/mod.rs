@@ -43,6 +43,7 @@ use self::region::{
     HCQ_MAX_REGION_INSTRUCTIONS, LCQ_MAX_REGION_INSTRUCTIONS, RegionKey, discover_region,
 };
 use crate::abi::NativeExitReason;
+use crate::fp_policy::{NATIVE_FPCR_MASK, native_fpcr_supported};
 
 const DEFAULT_MAX_NATIVE_CODE_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_NATIVE_FAULT_REGIONS: usize = 262_144;
@@ -212,14 +213,6 @@ struct NativeContext {
     hcq_scheduler: *const HcqScheduler,
     data_fault: Option<DataAccessFault>,
     direct_fault_error: Option<Box<str>>,
-}
-
-// Native S/D arithmetic can represent these FPCR controls directly. Any
-// other control (notably enabled guest traps) selects the exact typed path.
-const NATIVE_FPCR_MASK: u32 = (3 << 22) | (1 << 24) | (1 << 25);
-
-const fn native_fpcr_supported(fpcr: u32) -> bool {
-    fpcr & !NATIVE_FPCR_MASK == 0
 }
 
 impl NativeContext {
@@ -519,6 +512,7 @@ pub struct JitProcess {
 
 impl JitProcess {
     pub fn new(cpu: ProcessCpuContext) -> Result<Self, DirectJitError> {
+        crate::native::check_host().map_err(DirectJitError::unsupported)?;
         let fault_registry = Arc::new(
             NativeFaultRegistry::with_capacity(MAX_NATIVE_FAULT_REGIONS)
                 .map_err(|error| DirectJitError::unsupported(error.to_string()))?,
