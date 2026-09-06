@@ -868,8 +868,10 @@ mod tests {
                 assert_eq!(condition_flags(condition) & bit != 0, changes);
             }
         }
-        let mut live = StateSet::default();
-        live.nzcv = C | V;
+        let live = StateSet {
+            nzcv: C | V,
+            ..StateSet::default()
+        };
         // Poll/bridge arithmetic changes HOST flags, not guest NZCV; it has no
         // architectural NZCV def and must preserve the live producer.
         assert_eq!(InstructionEffects::default().live_before(live).nzcv, C | V);

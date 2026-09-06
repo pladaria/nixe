@@ -1028,9 +1028,11 @@ mod tests {
 
     #[test]
     fn exit_maps_preserve_lazy_flags_and_host_sticky_status() {
-        let mut required = StateSet::default();
-        required.nzcv = crate::analysis::C;
-        required.fpsr = true;
+        let required = StateSet {
+            nzcv: crate::analysis::C,
+            fpsr: true,
+            ..StateSet::default()
+        };
         let mut exit = ExitStateMap {
             site: ExitSiteKey {
                 source: CodeVersion::new(3).unwrap(),

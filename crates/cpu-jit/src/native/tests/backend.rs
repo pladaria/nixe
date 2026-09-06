@@ -12,6 +12,8 @@ use cranelift_codegen::{
 };
 use nixe_cpu::state::a64::{A64State, Nzcv};
 
+mod arithmetic;
+
 fn compile(abi: HostAbi, allocator: &str, mut function: ir::Function) -> CompiledCode {
     let mut flags = settings::builder();
     for (name, value) in [
@@ -43,8 +45,10 @@ fn compile(abi: HostAbi, allocator: &str, mut function: ir::Function) -> Compile
         builder.set("use_bti", "true").unwrap();
     }
     let target = builder.finish(settings::Flags::new(flags)).unwrap();
-    let entry = function.layout.entry_block().unwrap();
-    cranelift_codegen::nixe::set_entries(&mut function, &[entry]).unwrap();
+    if function.nixe_entries.is_empty() {
+        let entry = function.layout.entry_block().unwrap();
+        cranelift_codegen::nixe::set_entries(&mut function, &[entry]).unwrap();
+    }
     let mut context = Context::for_function(function);
     context.set_disasm(true);
     context
@@ -77,6 +81,32 @@ fn operands(count: u8) -> Vec<(GuestValue, usize)> {
     operands
 }
 
+fn signature(operands: &[(GuestValue, usize)]) -> ir::Signature {
+    let mut signature = ir::Signature::new(CallConv::SystemV);
+    signature.returns = operands
+        .iter()
+        .map(|(value, _)| {
+            ir::AbiParam::new(match value {
+                GuestValue::Vector(_) => types::I8X16,
+                GuestValue::Fpsr => types::I32,
+                _ => types::I64,
+            })
+        })
+        .chain([ir::AbiParam::new(types::I32)])
+        .collect();
+    signature
+}
+
+fn constraints(locations: &[Location]) -> Vec<EntryConstraint> {
+    locations
+        .iter()
+        .map(|location| match *location {
+            Location::Register { index, vector } => EntryConstraint::Register { index, vector },
+            _ => panic!("small link fixture must fit in registers"),
+        })
+        .collect()
+}
+
 fn live(operands: &[(GuestValue, usize)]) -> StateSet {
     operands.iter().fold(
         StateSet {
@@ -95,32 +125,11 @@ fn fragment(
     let mut function = ir::Function::new();
     let block = function.dfg.make_block();
     function.layout.append_block(block);
-    let mut signature = ir::Signature::new(CallConv::SystemV);
-    signature.returns = operands
-        .iter()
-        .map(|(value, _)| {
-            ir::AbiParam::new(match value {
-                GuestValue::Vector(_) => types::I8X16,
-                GuestValue::Fpsr => types::I32,
-                _ => types::I64,
-            })
-        })
-        .chain([ir::AbiParam::new(types::I32)])
-        .collect();
-    let signature = function.import_signature(signature);
+    let signature = function.import_signature(signature(operands));
     if let Some(ingress) = ingress {
-        function.nixe_entry_constraints.insert(
-            10,
-            ingress
-                .iter()
-                .map(|location| match *location {
-                    Location::Register { index, vector } => {
-                        EntryConstraint::Register { index, vector }
-                    }
-                    _ => panic!("small link fixture must fit in registers"),
-                })
-                .collect(),
-        );
+        function
+            .nixe_entry_constraints
+            .insert(10, constraints(ingress));
     }
     let mut cursor = FuncCursor::new(&mut function).at_bottom(block);
     let entry = cursor.ins().nixe_entry(signature, 10);
@@ -264,6 +273,7 @@ fn canonical_ingress(
     fast: usize,
 ) -> usize {
     let mut ingress = gateway::landing(abi);
+    ingress.extend(capture_sp(abi, 1064));
     ingress.extend(emit_canonical_entry(contract).unwrap());
     let jump = reserve_branch(abi, &mut ingress);
     let offset = append(bytes, &ingress);
@@ -271,7 +281,53 @@ fn canonical_ingress(
     offset
 }
 
-fn execute(abi: HostAbi, bytes: &[u8], address_offset: usize, count: u8, increments: u64) {
+fn capture_sp(abi: HostAbi, offset: u32) -> Vec<u8> {
+    let mut bytes = match abi {
+        HostAbi::X86_64 => vec![0x49, 0x89, 0xe3], // MOV r11,rsp
+        HostAbi::Aarch64 => 0x910003f0u32.to_le_bytes().to_vec(), // MOV x16,sp
+    };
+    let mut emitter = moves::Emitter::new(abi);
+    emitter.memory(
+        false,
+        RegisterClass::Integer,
+        abi.reserved().link_scratch[0],
+        offset,
+        8,
+    );
+    bytes.extend(emitter.finish());
+    bytes
+}
+
+fn append_exit(bytes: &mut Vec<u8>, state: &ExitStateMap) -> usize {
+    let mut emitter = moves::Emitter::new(state.abi);
+    for (reg, offset) in [
+        (state.abi.reserved().arena, 1024),
+        (state.abi.reserved().poll, 1032),
+        (state.abi.reserved().frame, 1040),
+    ] {
+        emitter.memory(false, RegisterClass::Integer, reg, offset, 8);
+    }
+    let mut exit = emitter.finish();
+    exit.extend(capture_sp(state.abi, 1056));
+    exit.extend(
+        emit_canonical_exit(
+            state,
+            ValueLocation::Constant(0x12345678),
+            NativeExitReason::Dispatch,
+        )
+        .unwrap(),
+    );
+    append(bytes, &exit)
+}
+
+fn run(
+    abi: HostAbi,
+    bytes: &[u8],
+    address_offset: usize,
+    state: &mut A64State,
+    identity: (u64, u32),
+    frame_extent: u32,
+) {
     if !canonical::native(abi) {
         return;
     }
@@ -289,30 +345,9 @@ fn execute(abi: HostAbi, bytes: &[u8], address_offset: usize, count: u8, increme
     // can be applied BEFORE finalization makes this memory executable.
     owner.define_function_bytes(id, 16, bytes, &[]).unwrap();
     owner.finalize_definitions().unwrap();
-    let mut state = A64State::default();
-    for (index, value) in state.general_register_storage_mut().iter_mut().enumerate() {
-        *value = 100 + index as u64;
-    }
-    state.general_register_storage_mut()[0] = 0u64.wrapping_sub(increments);
-    for (index, value) in state.vector_register_storage_mut().iter_mut().enumerate() {
-        *value = (0x123456789abcdef0u128 << 64) | (index as u128 + 123);
-    }
-    state.vector_register_storage_mut()[0] =
-        (0x123456789abcdef0u128 << 64) | u128::from(1.0f64.to_bits());
-    state.set_nzcv(Nzcv::from_bits(0xb0000000));
-    state.set_fpsr(1 << 27);
-    state.set_tpidr_el0(0xaabbccdd);
-    let mut expected = state.clone();
-    for value in &mut expected.general_register_storage_mut()[..usize::from(count)] {
-        *value = value.wrapping_add(increments);
-    }
-    expected.vector_register_storage_mut()[0] =
-        (0x123456789abcdef0u128 << 64) | u128::from(f64::INFINITY.to_bits());
-    expected.set_nzcv(Nzcv::from_bits(Nzcv::Z));
-    expected.set_fpsr((1 << 27) | 2);
-    expected.set_pc(0x12345678);
     {
-        let mut frame = NativeFrame::new(&mut state, PollBudget::new(17, 23).unwrap());
+        let mut frame = NativeFrame::new(state, PollBudget::new(17, 23).unwrap());
+        frame.spill.fill(MaybeUninit::new(0xa5));
         unsafe { frame.begin_fp() };
         // Test-only invocation protection, not Task 2's publication protocol.
         frame.execution_epoch = 7;
@@ -323,7 +358,7 @@ fn execute(abi: HostAbi, bytes: &[u8], address_offset: usize, count: u8, increme
         }
         .unwrap();
         assert_eq!(result.reason, NativeExitReason::Dispatch);
-        assert_eq!((frame.exit_source_version, frame.exit_state_map), (2, 20));
+        assert_eq!((frame.exit_source_version, frame.exit_state_map), identity);
         assert_eq!(
             (frame.budget.sample_remaining, frame.budget.slice_remaining),
             (17, 23)
@@ -346,11 +381,223 @@ fn execute(abi: HostAbi, bytes: &[u8], address_offset: usize, count: u8, increme
             (caller.saved_control, caller.saved_status),
             (frame.host_fp.saved_control, frame.host_fp.saved_status)
         );
+        let word = |offset: usize| {
+            u64::from_le_bytes(std::array::from_fn(|i| unsafe {
+                frame.spill[offset + i].assume_init()
+            }))
+        };
+        assert_eq!(word(1024), 1, "arena pin changed");
+        assert_eq!(word(1032), 17, "poll pin changed");
+        assert_eq!(word(1040), &raw const frame as u64, "frame pin changed");
+        assert_eq!(
+            word(1056),
+            word(1064),
+            "SP changed between ingress and exit"
+        );
+        assert_eq!(word(1056) % 16, 0);
+        // These fixtures use at most 64 bytes for cycle scratch. The rest of
+        // this range is neither adapter scratch nor backend-owned storage.
+        assert!(
+            frame.spill[64..1024]
+                .iter()
+                .all(|byte| unsafe { byte.assume_init() } == 0xa5),
+            "backend or bridge overwrote the reserved transfer partition"
+        );
+        assert!(
+            frame.spill[frame_extent as usize..]
+                .iter()
+                .all(|byte| unsafe { byte.assume_init() } == 0xa5),
+            "backend wrote beyond its reported extent"
+        );
         frame.execution_epoch = 0;
         assert_eq!(frame.execution_epoch, 0);
     }
-    assert_eq!(state, expected);
     unsafe { owner.free_memory() };
+}
+
+fn execute(
+    abi: HostAbi,
+    bytes: &[u8],
+    address_offset: usize,
+    count: u8,
+    increments: u64,
+    frame_extent: u32,
+) {
+    if !canonical::native(abi) {
+        return;
+    }
+    let mut state = A64State::default();
+    for (index, value) in state.general_register_storage_mut().iter_mut().enumerate() {
+        *value = 100 + index as u64;
+    }
+    state.general_register_storage_mut()[0] = 0u64.wrapping_sub(increments);
+    for (index, value) in state.vector_register_storage_mut().iter_mut().enumerate() {
+        *value = (0x123456789abcdef0u128 << 64) | (index as u128 + 123);
+    }
+    state.vector_register_storage_mut()[0] =
+        (0x123456789abcdef0u128 << 64) | u128::from(1.0f64.to_bits());
+    state.set_nzcv(Nzcv::from_bits(0xb0000000));
+    state.set_fpsr(1 << 27);
+    state.set_tpidr_el0(0xaabbccdd);
+    let mut expected = state.clone();
+    for value in &mut expected.general_register_storage_mut()[..usize::from(count)] {
+        *value = value.wrapping_add(increments);
+    }
+    expected.vector_register_storage_mut()[0] =
+        (0x123456789abcdef0u128 << 64) | u128::from(f64::INFINITY.to_bits());
+    expected.set_nzcv(Nzcv::from_bits(Nzcv::Z));
+    expected.set_fpsr((1 << 27) | 2);
+    expected.set_pc(0x12345678);
+    run(
+        abi,
+        bytes,
+        address_offset,
+        &mut state,
+        (2, 20),
+        frame_extent,
+    );
+    assert_eq!(state, expected);
+}
+
+fn extent(code: &CompiledCode) -> u32 {
+    code.buffer.frame_layout().unwrap().nixe_frame_size.unwrap()
+}
+
+#[test]
+fn one_gateway_crosses_empty_then_cyclic_edges_between_two_compiled_units() {
+    let operands = operands(3);
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        for a_allocator in ["single_pass", "backtracking"] {
+            for b_allocator in ["single_pass", "backtracking"] {
+                // A has two external labels. A:first -> B -> A:second crosses
+                // both edge shapes without another gateway or canonical load.
+                let mut function = ir::Function::new();
+                let sig = function.import_signature(signature(&operands));
+                let mut entries = Vec::new();
+                for (entry_id, exit_id, registers) in [(10, 40, [0, 1, 2]), (30, 20, [1, 2, 0])] {
+                    let block = function.dfg.make_block();
+                    function.layout.append_block(block);
+                    entries.push(block);
+                    let mut locations = Vec::new();
+                    for index in registers {
+                        locations.push(Location::Register {
+                            index,
+                            vector: false,
+                        });
+                        locations.push(Location::Register {
+                            index,
+                            vector: true,
+                        });
+                    }
+                    locations.extend([
+                        Location::Register {
+                            index: 3,
+                            vector: false,
+                        },
+                        Location::Register {
+                            index: 6,
+                            vector: false,
+                        },
+                    ]);
+                    function
+                        .nixe_entry_constraints
+                        .insert(entry_id, constraints(&locations));
+                    let mut cursor = FuncCursor::new(&mut function).at_bottom(block);
+                    let entry = cursor.ins().nixe_entry(sig, entry_id as i64);
+                    let values = cursor.func.dfg.inst_results(entry).to_vec();
+                    cursor.ins().nixe_exit(exit_id, &values);
+                }
+                cranelift_codegen::nixe::set_entries(&mut function, &entries).unwrap();
+                let a = compile(abi, a_allocator, function.clone());
+                let a_link_map = boundary(abi, &a, 40);
+                let locations: Vec<_> = a_link_map
+                    .map
+                    .values
+                    .iter()
+                    .map(|value| value.location)
+                    .collect();
+                let b = compile(
+                    abi,
+                    b_allocator,
+                    fragment(&operands, Some(&locations), true),
+                );
+                let b_entry = entry(abi, &boundary(abi, &b, 10), &operands);
+                let b_map = boundary(abi, &b, 20);
+                let b_source = exit(abi, &b_map, &operands, 1, false);
+                // Select the return contract from B's FINAL output, not a
+                // guess that arithmetic reuses its input registers. Recompile
+                // A and verify its independent first entry still matches B.
+                let mut locations: Vec<_> = b_map
+                    .map
+                    .values
+                    .iter()
+                    .map(|value| value.location)
+                    .collect();
+                locations.swap(0, 2);
+                locations.swap(2, 4);
+                locations.swap(1, 3);
+                locations.swap(3, 5);
+                function
+                    .nixe_entry_constraints
+                    .insert(30, constraints(&locations));
+                let a = compile(abi, a_allocator, function);
+                let a_first = entry(abi, &boundary(abi, &a, 10), &operands);
+                let a_second = entry(abi, &boundary(abi, &a, 30), &operands);
+                let a_link_map = boundary(abi, &a, 40);
+                let a_source = exit(abi, &a_link_map, &operands, 2, false);
+                assert!(emit_fast_transfer(&a_source, &b_entry).unwrap().is_empty());
+                for i in 0..3 {
+                    assert_eq!(
+                        a_second.bindings[i * 2].location,
+                        b_source.bindings[((i + 1) % 3) * 2].location,
+                        "expected an actual three-GPR cycle"
+                    );
+                }
+                let mut bridge = emit_fast_transfer(&b_source, &a_second).unwrap();
+                assert!(!bridge.is_empty());
+                let jump = reserve_branch(abi, &mut bridge);
+                let mut bytes = a.code_buffer().to_vec();
+                let b_offset = append(&mut bytes, b.code_buffer());
+                a_link_map
+                    .map
+                    .patch_exit(
+                        &mut bytes,
+                        0,
+                        (b_offset + boundary(abi, &b, 10).map.offset as usize) as u64,
+                    )
+                    .unwrap();
+                let bridge_offset = append(&mut bytes, &bridge);
+                branch(
+                    abi,
+                    &mut bytes,
+                    bridge_offset + jump,
+                    boundary(abi, &a, 30).map.offset as usize,
+                );
+                b_map
+                    .map
+                    .patch_exit(
+                        &mut bytes[b_offset..],
+                        b_offset as u64,
+                        bridge_offset as u64,
+                    )
+                    .unwrap();
+                let final_map = boundary(abi, &a, 20);
+                let final_state = exit(abi, &final_map, &operands, 2, true);
+                let exit_offset = append_exit(&mut bytes, &final_state);
+                final_map
+                    .map
+                    .patch_exit(&mut bytes, 0, exit_offset as u64)
+                    .unwrap();
+                let start = canonical_ingress(
+                    abi,
+                    &mut bytes,
+                    &a_first,
+                    boundary(abi, &a, 10).map.offset as usize,
+                );
+                execute(abi, &bytes, start, 3, 1, extent(&a).max(extent(&b)));
+            }
+        }
+    }
 }
 
 #[test]
@@ -388,15 +635,7 @@ fn final_allocations_drive_empty_and_cyclic_links_through_nixe_gateway() {
                     assert_eq!(transfer.is_empty(), !cycle);
                     let mut bytes = a.code_buffer().to_vec();
                     let b_offset = append(&mut bytes, b.code_buffer());
-                    let exit_offset = append(
-                        &mut bytes,
-                        &emit_canonical_exit(
-                            &b_exit,
-                            ValueLocation::Constant(0x12345678),
-                            NativeExitReason::Dispatch,
-                        )
-                        .unwrap(),
-                    );
+                    let exit_offset = append_exit(&mut bytes, &b_exit);
                     b_map
                         .map
                         .patch_exit(&mut bytes[b_offset..], b_offset as u64, exit_offset as u64)
@@ -418,7 +657,14 @@ fn final_allocations_drive_empty_and_cyclic_links_through_nixe_gateway() {
                         &a_entry,
                         boundary(abi, &a, 10).map.offset as usize,
                     );
-                    execute(abi, &bytes, address_offset, 3, 2);
+                    execute(
+                        abi,
+                        &bytes,
+                        address_offset,
+                        3,
+                        2,
+                        extent(&a).max(extent(&b)),
+                    );
                 }
             }
         }
@@ -426,42 +672,94 @@ fn final_allocations_drive_empty_and_cyclic_links_through_nixe_gateway() {
 }
 
 #[test]
-fn allocation_chosen_entry_and_exit_spills_use_nixe_canonical_adapters() {
-    let operands = operands(31);
+fn randomized_final_maps_reconstruct_live_state_with_bounded_spills() {
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         for allocator in ["single_pass", "backtracking"] {
-            let code = compile(abi, allocator, fragment(&operands, None, true));
-            let input = boundary(abi, &code, 10);
-            let output = boundary(abi, &code, 20);
-            for map in [&input, &output] {
-                assert!(
-                    map.map
-                        .values
-                        .iter()
-                        .any(|value| matches!(value.location, Location::Spill { .. }))
-                );
+            for (case, count) in [3, 9, 17, 23, 31, 31, 31, 31].into_iter().enumerate() {
+                let mut seed = 0x12345678u64 + case as u64;
+                let mut operands = operands(count);
+                // Keep X0/V0 (the lazy producer and FP operation) first; vary the
+                // simultaneous definitions and allocation order of all other data.
+                for index in (3..operands.len() - 1).rev() {
+                    operands.swap(index, 2 + next(&mut seed) as usize % (index - 1));
+                }
+                for (index, operand) in operands.iter_mut().enumerate() {
+                    operand.1 = index;
+                }
+                let mut function = fragment(&operands, None, true);
+                let slot_bytes = if case >= 4 { 12 * 1024 } else { 0 };
+                if slot_bytes != 0 {
+                    // An explicit slot reserves real frame space ahead of regalloc
+                    // spills; this pushes their final offsets close to the limit.
+                    function.create_sized_stack_slot(ir::StackSlotData::new(
+                        ir::StackSlotKind::ExplicitSlot,
+                        slot_bytes,
+                        4,
+                    ));
+                }
+                let code = compile(abi, allocator, function);
+                assert!((TRANSFER_BYTES + slot_bytes..=SPILL_BYTES).contains(&extent(&code)));
+                let input = boundary(abi, &code, 10);
+                let output = boundary(abi, &code, 20);
+                for map in [&input, &output] {
+                    if count == 31 {
+                        assert!(
+                            map.map
+                                .values
+                                .iter()
+                                .any(|value| matches!(value.location, Location::Spill { .. }))
+                        );
+                    }
+                }
+                let contract = entry(abi, &input, &operands);
+                let mut state = exit(abi, &output, &operands, 2, true);
+                // Require physical reconstruction of EVERY live vector here;
+                // leaving the unchanged vectors canonical would hide bad spills.
+                state.dirty_live.vector = state.live.vector;
+                let mut bytes = code.code_buffer().to_vec();
+                let exit_offset = append_exit(&mut bytes, &state);
+                output
+                    .map
+                    .patch_exit(&mut bytes, 0, exit_offset as u64)
+                    .unwrap();
+                let start =
+                    canonical_ingress(abi, &mut bytes, &contract, input.map.offset as usize);
+                if !canonical::native(abi) {
+                    continue;
+                }
+                let mut actual = A64State::default();
+                for value in actual.general_register_storage_mut() {
+                    *value = next(&mut seed);
+                }
+                actual.general_register_storage_mut()[0] =
+                    [u64::MAX, 0, i64::MAX as u64, i64::MIN as u64][case % 4];
+                for value in actual.vector_register_storage_mut() {
+                    *value = u128::from(next(&mut seed)) << 64 | u128::from(next(&mut seed));
+                }
+                let high = actual.vector_register_storage_mut()[0] & (u128::from(u64::MAX) << 64);
+                actual.vector_register_storage_mut()[0] = high | u128::from(1.0f64.to_bits());
+                actual.set_nzcv(Nzcv::from_bits(next(&mut seed) as u32));
+                actual.set_fpsr(1 << 27);
+                actual.set_tpidr_el0(next(&mut seed));
+                let mut expected = actual.clone();
+                for value in &mut expected.general_register_storage_mut()[..usize::from(count)] {
+                    *value = value.wrapping_add(1);
+                }
+                let result = expected.general_register_storage_mut()[0];
+                expected.set_nzcv(Nzcv::from_bits(if result == 0 {
+                    Nzcv::Z
+                } else if result >> 63 != 0 {
+                    Nzcv::N
+                } else {
+                    0
+                }));
+                expected.vector_register_storage_mut()[0] =
+                    high | u128::from(f64::INFINITY.to_bits());
+                expected.set_fpsr((1 << 27) | 2);
+                expected.set_pc(0x12345678);
+                run(abi, &bytes, start, &mut actual, (2, 20), extent(&code));
+                assert_eq!(actual, expected, "{abi:?}/{allocator}/case={case}");
             }
-            let contract = entry(abi, &input, &operands);
-            let mut state = exit(abi, &output, &operands, 2, true);
-            // Require physical reconstruction of EVERY live vector here;
-            // leaving the unchanged vectors canonical would hide bad spills.
-            state.dirty_live.vector = state.live.vector;
-            let mut bytes = code.code_buffer().to_vec();
-            let exit_offset = append(
-                &mut bytes,
-                &emit_canonical_exit(
-                    &state,
-                    ValueLocation::Constant(0x12345678),
-                    NativeExitReason::Dispatch,
-                )
-                .unwrap(),
-            );
-            output
-                .map
-                .patch_exit(&mut bytes, 0, exit_offset as u64)
-                .unwrap();
-            let start = canonical_ingress(abi, &mut bytes, &contract, input.map.offset as usize);
-            execute(abi, &bytes, start, 31, 1);
         }
     }
 }
