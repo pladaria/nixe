@@ -29,6 +29,8 @@ supported through the emulated HID services.
 
 ## Running
 
+See [host requirements](docs/host-requirements.md) for the required CPU capabilities.
+
 The default configuration is in [`nixe.toml`](nixe.toml). List available titles with:
 
 ```bash
