@@ -1,23 +1,30 @@
 //! Concrete Cranelift JIT backend.
 //!
-//! Normalized A64 instructions lower directly to CLIF. The execution frame,
-//! compiler, native lookup table, and slow paths remain private to the backend.
-//! Both tiers share the architectural analysis and native ABI contracts.
+//! Demanded straight-line A64 fragments lower to CLIF and execute through the
+//! bounded code cache and epoch-safe native gateway. Linking and functional
+//! HCQ promotion are not yet enabled.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("nixe-cpu-jit requires Linux direct-memory support");
 
 pub mod abi;
 pub mod analysis;
-mod direct;
+mod engine;
 mod fp_env;
+mod fp_lowering;
 mod fp_policy;
-// Task 2 builds this owner before Task 3 replaces the legacy production path.
+mod jit_error;
+mod lcq;
+mod lowering;
+mod memory_lowering;
+mod simd_lowering;
+// Link/tier maintenance contracts become production consumers in Tasks 4–8.
 #[allow(dead_code)]
 mod lifetime;
-// Storage is assembled into published CodeUnits in Task 2, then used by Task 3.
+// Includes bounded bridge/HCQ storage contracts used by later tasks.
 #[allow(dead_code)]
 mod executable;
 pub mod native;
 
-pub use direct::{JitProcess, JitThread};
+pub use engine::{JitProcess, JitThread};
+pub use jit_error::Error as JitError;

@@ -58,10 +58,27 @@ cargo test --offline --locked -p nixe-cpu-jit --lib \
   --target aarch64-unknown-linux-gnu \
   --config 'target.aarch64-unknown-linux-gnu.linker="aarch64-linux-gnu-gcc"' \
   --config 'target.aarch64-unknown-linux-gnu.runner=["/usr/local/bin/qemu-aarch64", "-cpu", "max", "-L", "/usr/aarch64-linux-gnu"]' \
-  --quiet -- --skip direct::
+  --quiet -- --skip lcq::invocation::tests::lcq_dispatcher_rejects_an_arena_access_without_native_pc_metadata
 ```
 
 Without installation, replace the runner path with the built binary's absolute
-path. `--skip direct::` excludes the legacy JIT tests, not the new foundation.
+path. The skipped subprocess-supervisor case needs the explicit child launch
+described below; all other JIT library tests run through Cargo's runner.
 QEMU execution does not validate native Arm cache-coherence or memory-ordering
 behavior; native AArch64 hardware testing remains necessary.
+
+Cargo's runner applies only to the process Cargo starts. Tests that re-execute
+their own AArch64 binary use the system's `binfmt_misc` interpreter, which may
+still be an older QEMU and may lack the sysroot path. For the shared fault
+runtime's fatal-signal scenarios, run the compiled test binary directly through
+QEMU 11.1.1 with `--exact tests::fatal_fault_subprocess_entry`, selecting the
+existing `NIXE_DIRECT_FATAL_CASE` scenario. This avoids changing system binfmt
+registration or accidentally validating a mixture of QEMU versions. Disable
+core files with `ulimit -c 0` when running these intentional fatal-signal tests.
+
+The JIT's LCQ attribution test has the same restriction: run its test binary
+with `--exact lcq::invocation::tests::unattributed_fault_subprocess_entry
+--nocapture` and `NIXE_LCQ_UNATTRIBUTED_FAULT=1`. It must terminate with SIGSEGV
+and print `reason=unattributed-native-pc`. Exclude the subprocess supervisor
+`lcq_dispatcher_rejects_an_arena_access_without_native_pc_metadata` when running
+the ordinary Arm suite through Cargo's runner; verify the child directly.

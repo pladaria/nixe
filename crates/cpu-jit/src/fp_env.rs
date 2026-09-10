@@ -4,6 +4,36 @@
 use crate::abi::{HostFpState, NativeFrame};
 use crate::fp_policy::native_fpcr_supported;
 
+/// Translate either live or captured host sticky status with identical rules.
+pub(crate) fn guest_status_from_host(abi: crate::abi::HostAbi, status: u64) -> u32 {
+    let status = status as u32;
+    match abi {
+        crate::abi::HostAbi::Aarch64 => status & 0x0800_009f,
+        crate::abi::HostAbi::X86_64 => {
+            (status & 1)
+                | ((status & (1 << 2)) >> 1)
+                | ((status & (1 << 3)) >> 1)
+                | ((status & (1 << 4)) >> 1)
+                | ((status & (1 << 5)) >> 1)
+                | ((status & (1 << 1)) << 6)
+        }
+    }
+}
+
+/// One encoding authority for the Rust FP owner and generated activation.
+/// Call only after `native_fpcr_supported`; generated veneers embed the sixteen
+/// supported encodings rather than reimplementing host control translation.
+pub(crate) const fn native_control(abi: crate::abi::HostAbi, fpcr: u32) -> u32 {
+    match abi {
+        crate::abi::HostAbi::Aarch64 => fpcr & crate::fp_policy::NATIVE_FPCR_MASK,
+        crate::abi::HostAbi::X86_64 => {
+            let rounding = (fpcr >> 22) & 3;
+            let rounding = ((rounding & 1) << 1) | ((rounding & 2) >> 1);
+            0x1f80 | (rounding << 13) | if fpcr & (1 << 24) != 0 { 0x8040 } else { 0 }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -183,10 +213,6 @@ mod host {
     use core::arch::asm;
 
     const STATUS_MASK: u32 = 0x3f;
-    const DENORMALS_ARE_ZERO: u32 = 1 << 6;
-    const EXCEPTION_MASKS: u32 = 0x1f80;
-    const ROUNDING_MASK: u32 = 3 << 13;
-    const FLUSH_TO_ZERO: u32 = 1 << 15;
 
     pub(super) fn read() -> (u64, u64) {
         let mxcsr = read_mxcsr();
@@ -197,36 +223,11 @@ mod host {
     }
 
     pub(super) fn install_guest(fpcr: u32) {
-        let current = read_mxcsr();
-        let arm_rounding = (fpcr >> 22) & 3;
-        let host_rounding = match arm_rounding {
-            0 => 0,
-            1 => 2,
-            2 => 1,
-            3 => 3,
-            _ => unreachable!(),
-        };
-        let flush = if fpcr & (1 << 24) != 0 {
-            DENORMALS_ARE_ZERO | FLUSH_TO_ZERO
-        } else {
-            0
-        };
-        let guest = (current & !(STATUS_MASK | DENORMALS_ARE_ZERO | ROUNDING_MASK | FLUSH_TO_ZERO))
-            | EXCEPTION_MASKS
-            | (host_rounding << 13)
-            | flush;
-        write_mxcsr(guest);
+        write_mxcsr(super::native_control(crate::abi::HostAbi::X86_64, fpcr));
     }
 
     pub(super) fn guest_status() -> u32 {
-        let status = read_mxcsr() & STATUS_MASK;
-        // x86: IE, DE, ZE, OE, UE, PE. Arm: IOC, DZC, OFC, UFC, IXC, IDC.
-        (status & 1)
-            | ((status & (1 << 2)) >> 1)
-            | ((status & (1 << 3)) >> 1)
-            | ((status & (1 << 4)) >> 1)
-            | ((status & (1 << 5)) >> 1)
-            | ((status & (1 << 1)) << 6)
+        super::guest_status_from_host(crate::abi::HostAbi::X86_64, u64::from(read_mxcsr()))
     }
 
     pub(super) fn restore(control: u64, status: u64) {
@@ -248,8 +249,6 @@ mod host {
 mod host {
     use core::arch::asm;
 
-    const GUEST_STATUS_MASK: u64 = 0x0800_009f;
-
     pub(super) fn read() -> (u64, u64) {
         let control: u64;
         let status: u64;
@@ -261,7 +260,7 @@ mod host {
     }
 
     pub(super) fn install_guest(fpcr: u32) {
-        let guest = u64::from(fpcr & crate::fp_policy::NATIVE_FPCR_MASK);
+        let guest = u64::from(super::native_control(crate::abi::HostAbi::Aarch64, fpcr));
         unsafe {
             asm!("msr fpcr, {guest}", guest = in(reg) guest, options(nomem, nostack));
             asm!("msr fpsr, xzr", options(nomem, nostack));
@@ -271,7 +270,7 @@ mod host {
     pub(super) fn guest_status() -> u32 {
         let status: u64;
         unsafe { asm!("mrs {status}, fpsr", status = out(reg) status, options(nomem, nostack)) };
-        (status & GUEST_STATUS_MASK) as u32
+        super::guest_status_from_host(crate::abi::HostAbi::Aarch64, status)
     }
 
     pub(super) fn restore(control: u64, status: u64) {

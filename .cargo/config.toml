@@ -9,9 +9,9 @@ test-all = ["test", "--workspace"]
 test-diff = [
     "test",
     "--package",
-    "nixe-cpu-engine-interpreter",
+    "nixe-cpu-interpreter",
     "--test",
-    "ir_differential",
+    "differential",
     "--test",
     "qemu_differential",
     "--",
@@ -21,7 +21,7 @@ test-diff = [
 test-diff-a64 = [
     "test",
     "--package",
-    "nixe-cpu-engine-interpreter",
+    "nixe-cpu-interpreter",
     "--test",
     "qemu_differential",
     "qemu_a64_matches_every_register_semantic_family",

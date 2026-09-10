@@ -20,7 +20,14 @@ no alternate JIT path for CPUs lacking this feature. Virtual machines must
 expose the feature to the guest OS. There is no CPUID check per invocation,
 fragment or link.
 
+The tiered JIT's 128-bit guest CASP and STXP/STLXP X additionally require
+**CMPXCHG16B**.
+Compilation reports the missing capability explicitly on an incompatible x86
+target; it does not split the atomic transaction or call a RAM helper.
+
 ## AArch64
 
 SAHF is an x86 instruction and imposes no requirement on AArch64 hosts. Their
 native boundary reads and writes the architecture's NZCV register directly.
+128-bit atomics do not require LSE: the JIT uses CASPAL when available and a
+validated LDAXP/STLXP loop otherwise.

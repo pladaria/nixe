@@ -235,7 +235,7 @@ pub(super) fn synthetic(
     let (body, fault_bytes) = body;
     bytes.extend(body);
     let offset = bytes.len() as u32;
-    bytes.extend(emit_canonical_exit(&exit, pc, reason).unwrap());
+    bytes.extend(emit_canonical_exit(&exit, pc, reason, 0).unwrap());
     let code = cache
         .install(
             Output {
@@ -250,14 +250,16 @@ pub(super) fn synthetic(
                         offset,
                         entry: false,
                         patch_bytes: 0,
+                        fault_bytes: 0,
                         values: vec![],
                     }]),
                     faults: fault_bytes
-                        .map(|_| cranelift_codegen::nixe::StateMap {
+                        .map(|bytes| cranelift_codegen::nixe::StateMap {
                             id: 1,
                             offset: fault_offset,
                             entry: false,
                             patch_bytes: 0,
+                            fault_bytes: bytes,
                             values: vec![],
                         })
                         .into_iter()
@@ -271,6 +273,7 @@ pub(super) fn synthetic(
         )
         .unwrap();
     let mut states = vec![StateRecord {
+        exit: None,
         native_offset: offset,
         state: exit.clone(),
     }];
@@ -278,6 +281,7 @@ pub(super) fn synthetic(
         .map(|length| {
             exit.site.state_map = 1;
             states.push(StateRecord {
+                exit: None,
                 native_offset: fault_offset,
                 state: exit,
             });
@@ -289,6 +293,7 @@ pub(super) fn synthetic(
                 bytes: 8,
                 subaccess: 0,
                 commit_stage: 0,
+                completed_read: None,
                 state_map: 1,
             }
         })

@@ -303,6 +303,36 @@ fn abandoned_transition_and_batch_do_not_acknowledge_or_reopen() {
 }
 
 #[test]
+fn shutdown_progress_does_not_steal_an_owner_or_confuse_unmapping_with_acknowledgement() {
+    let process = new_process();
+    process.request_shutdown().unwrap();
+    let mut transition = process.try_transition().unwrap().unwrap();
+    assert!(!process.try_shutdown().unwrap());
+    transition.wait_closed().unwrap();
+    assert!(transition.try_finish_shutdown().unwrap());
+    // Mappings/indexes are gone, but the unfinished batch must still be
+    // acknowledged by a coordinator owner before reporting completion.
+    assert!(!process.try_shutdown().unwrap());
+    drop(transition);
+    assert!(process.try_shutdown().unwrap());
+    assert!(process.lock().pending.iter().all(Option::is_none));
+    assert!(!process.lock().transition_owned);
+    assert!(process.try_shutdown().unwrap());
+}
+
+#[test]
+fn shutdown_progress_waits_for_a_memory_authority_hold_without_deadlocking_its_owner() {
+    use nixe_memory::ExecutionMutationObserver;
+    let process = Arc::new(new_process());
+    let hold = process.clone().begin(&[]).unwrap();
+    assert!(!process.try_shutdown().unwrap());
+    assert_eq!(process.lock().memory_mutations, 1);
+    drop(hold);
+    assert!(process.try_shutdown().unwrap());
+    assert_eq!(process.lock().memory_mutations, 0);
+}
+
+#[test]
 fn completed_transition_cannot_clear_a_new_owners_claim() {
     let process = new_process();
     process.request(Reason::Eviction).unwrap();

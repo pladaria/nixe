@@ -12,6 +12,86 @@ fn drain(process: &Lifetime) {
 }
 
 #[test]
+fn cold_pressure_waits_for_memory_authority_without_owning_its_transition() {
+    use nixe_memory::ExecutionMutationObserver;
+    for stop in [false, true] {
+        let process = process();
+        let hold = process.clone().begin(&[]).unwrap();
+        let worker_process = process.clone();
+        let worker = std::thread::spawn(move || worker_process.recover_capacity());
+        {
+            let mut state = process.lock();
+            while state.pending[Reason::Eviction as usize].is_none() {
+                state = process.changed.wait(state).unwrap();
+            }
+            assert!(!state.transition_owned);
+            assert!(!worker.is_finished());
+        }
+        if stop {
+            process.request_shutdown().unwrap();
+            assert_eq!(worker.join().unwrap(), Err(Error::Shutdown));
+            drop(hold);
+            assert!(process.try_shutdown().unwrap());
+        } else {
+            drop(hold);
+            worker.join().unwrap().unwrap();
+            assert_eq!(process.lock().phase, Phase::Open);
+            assert!(process.lock().pending.iter().all(Option::is_none));
+        }
+    }
+}
+
+#[test]
+fn faultless_unit_directory_borrow_survives_detachment_and_span_reuse() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let mut candidate = input(&process, &[0], Tier::Lcq);
+    candidate.faults = Box::new([]);
+    candidate.states = Box::new([]);
+    candidate.code.metadata.faults = Box::new([]);
+    let address = candidate.code.allocation.address();
+    let old = process
+        .prepare_unit(&[process.reserve(key(0)).unwrap()], candidate, &cursor)
+        .unwrap()
+        .publish()
+        .unwrap();
+    // Keep another span resident so reuse exercises this same segment table.
+    publish(&process, &cursor, &[4], Tier::Lcq);
+    process.retire_unit(old).unwrap();
+    drain(&process);
+    let mut reader = process.register().unwrap();
+    let mut cpu = A64State::default();
+    let mut frame = frame(&mut cpu);
+    let mut invocation = unsafe { reader.admit(&mut frame, key(4)) }
+        .unwrap()
+        .unwrap();
+    let (_, lookup) = invocation.frame_and_faults();
+    let unit = lookup.unit(address).unwrap();
+    let id = unit.id;
+    assert!(unit.faults.is_empty());
+    assert!(lookup.find(address + 12).is_none());
+    assert_eq!(process.reclaim_units().unwrap(), 0);
+    assert!(lookup.unit(address).is_none());
+    assert_eq!(unit.id, id); // Detached metadata remains protected by this epoch.
+    drop(invocation);
+    assert_eq!(process.reclaim_units().unwrap(), 1);
+    let new = publish(&process, &cursor, &[0], Tier::Lcq);
+    assert_eq!(
+        process.snapshot(new).unwrap().code.allocation.address(),
+        address
+    );
+    let mut invocation = unsafe { reader.admit(&mut frame, key(0)) }
+        .unwrap()
+        .unwrap();
+    let (_, lookup) = invocation.frame_and_faults();
+    assert_ne!(lookup.unit(address).unwrap().id, id);
+    assert_eq!(
+        lookup.find(address + 12).unwrap().unit.id,
+        lookup.unit(address).unwrap().id
+    );
+}
+
+#[test]
 fn snapshots_pin_actual_code_dependencies_and_slots_until_last_release() {
     let process = process();
     let cursor = AtomicU64::new(0);
@@ -214,6 +294,52 @@ fn lcq_cutover_cannot_be_acknowledged_without_draining_exact_old_owner() {
     assert!(transition.try_reopen().unwrap());
     assert!(matches!(process.snapshot(old), Err(Error::StaleUnit)));
     assert!(process.snapshot(new).is_ok());
+}
+
+#[test]
+fn cancelled_partial_cutover_can_be_queued_again_for_eviction() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let old = publish(&process, &cursor, &[0, 4], Tier::Lcq);
+    let replacement = publish(&process, &cursor, &[0], Tier::Lcq);
+    let mut transition = process.try_transition().unwrap().unwrap();
+    transition.wait_closed().unwrap();
+    assert_eq!(process.lock().units.retirements.next(), Some(old.0));
+    // The old unit still owns PC 4, so this cutover cancels rather than unlinks.
+    assert_eq!(transition.unlink_next().unwrap(), Some(false));
+    assert_eq!(transition.unlink_next().unwrap(), None);
+    let eviction = process.retire_unit(old).unwrap();
+    assert_eq!(process.lock().units.retirements.next(), Some(old.0));
+    assert_eq!(transition.drain_retirements().unwrap(), 1);
+    transition.batch().unwrap().complete().unwrap();
+    assert!(transition.try_reopen().unwrap());
+    assert!(eviction.is_complete().unwrap());
+    assert!(process.snapshot(replacement).is_ok());
+    assert_eq!(process.reclaim_units().unwrap(), 1);
+}
+
+#[test]
+fn newly_queued_hcq_is_drained_before_pending_baselines() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let baseline = publish(&process, &cursor, &[0], Tier::Lcq);
+    let hcq = publish(&process, &cursor, &[0], Tier::Hcq);
+    let unrelated = publish(&process, &cursor, &[4], Tier::Lcq);
+    process.retire_unit(unrelated).unwrap();
+    let mut transition = process.try_transition().unwrap().unwrap();
+    transition.wait_closed().unwrap();
+    assert_eq!(transition.unlink_next().unwrap(), Some(true));
+
+    // New work can arrive between unlinks; selection must recheck HCQ every
+    // time, even though the older baseline precedes its family in the registry.
+    process.invalidate_all_memory().unwrap();
+    assert_eq!(process.lock().units.retirements.next(), Some(hcq.0));
+    assert_eq!(transition.unlink_next().unwrap(), Some(true));
+    assert_eq!(process.lock().units.retirements.next(), Some(baseline.0));
+    assert_eq!(transition.drain_retirements().unwrap(), 1);
+    transition.batch().unwrap().complete().unwrap();
+    assert!(transition.try_reopen().unwrap());
+    assert_eq!(process.reclaim_units().unwrap(), 3);
 }
 
 #[test]

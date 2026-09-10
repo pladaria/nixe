@@ -146,18 +146,18 @@ pub struct CanonicalCpuWriteDependency {
 
 impl CanonicalCpuWriteDependency {
     /// Captures and arms every distinct physical page in one range.
-    #[must_use]
-    pub fn capture(range: &CanonicalBackingRange) -> Option<Self> {
+    /// Call without a native epoch, memory lease or cache lock.
+    pub fn capture(range: &CanonicalBackingRange) -> Result<Self, CanonicalRangeAccessError> {
         Self::capture_ranges([range])
     }
 
     /// Captures several ranges as one page-granular dependency domain.
     /// Restrictive protections are established while every affected backing
-    /// store is quiescent under its exclusive execution transition.
-    #[must_use]
+    /// store and its bound engine are quiescent. No native epoch, memory lease
+    /// or cache lock may survive into this operation. Empty input is an error.
     pub fn capture_ranges<'a>(
         ranges: impl IntoIterator<Item = &'a CanonicalBackingRange>,
-    ) -> Option<Self> {
+    ) -> Result<Self, CanonicalRangeAccessError> {
         let mut execution_stores = BTreeMap::new();
         let mut pages = BTreeMap::new();
         for range in ranges {
@@ -171,28 +171,31 @@ impl CanonicalCpuWriteDependency {
             }
         }
         if pages.is_empty() {
-            return None;
+            return Err(CanonicalRangeAccessError::IncompleteRange);
         }
         let execution_stores = execution_stores.into_values().collect::<Vec<_>>();
         let mut transitions = execution_stores
             .iter()
-            .map(|store| store.execution_gate().acquire_exclusive())
-            .collect::<Vec<_>>();
+            .map(|store| store.execution_gate().acquire_mutation(&[]))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CanonicalRangeAccessError::Mutation)?;
         for transition in &mut transitions {
             transition.commit();
         }
         let pages = pages
             .into_values()
             .map(|page| {
-                let observed_epoch = page.arm_cpu_dirty_observer_quiescent().ok()?;
-                Some(CpuWriteDependencyPage {
+                let observed_epoch = page
+                    .arm_cpu_dirty_observer_quiescent()
+                    .map_err(CanonicalRangeAccessError::Backing)?;
+                Ok(CpuWriteDependencyPage {
                     page,
                     observed_epoch: AtomicU64::new(observed_epoch),
                 })
             })
-            .collect::<Option<Vec<_>>>()?
+            .collect::<Result<Vec<_>, CanonicalRangeAccessError>>()?
             .into_boxed_slice();
-        Some(Self {
+        Ok(Self {
             inner: Arc::new(CanonicalCpuWriteDependencyInner {
                 pages,
                 consecutive_dirty: AtomicU8::new(0),
@@ -220,11 +223,12 @@ impl CanonicalCpuWriteDependency {
     /// Rearms the captured pages after their consumer has incorporated the
     /// latest bytes. Five consecutive dirty/rearm cycles make this dependency
     /// permanently conservative so frequently written pages stop faulting on
-    /// its behalf.
-    #[must_use]
-    pub fn rearm(&self) -> bool {
+    /// its behalf. Call outside native execution and without an execution
+    /// lease: restrictive protection changes must rendezvous with the engine.
+    /// False means volatile, not a failed memory/coordinator operation.
+    pub fn rearm(&self) -> Result<bool, CanonicalRangeAccessError> {
         if self.inner.volatile.load(Ordering::Acquire) {
-            return false;
+            return Ok(false);
         }
         let mut stores = BTreeMap::new();
         for page in &self.inner.pages {
@@ -235,8 +239,11 @@ impl CanonicalCpuWriteDependency {
         let stores = stores.into_values().collect::<Vec<_>>();
         let mut transitions = stores
             .iter()
-            .map(|store| store.execution_gate().acquire_exclusive())
-            .collect::<Vec<_>>();
+            // Tracking changes permissions, not executable content. An empty
+            // target set stops readers without retiring otherwise valid code.
+            .map(|store| store.execution_gate().acquire_mutation(&[]))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CanonicalRangeAccessError::Mutation)?;
         for transition in &mut transitions {
             transition.commit();
         }
@@ -244,11 +251,12 @@ impl CanonicalCpuWriteDependency {
             self.inner.pages.iter().any(|page| {
                 page.page.cpu_dirty_epoch() != page.observed_epoch.load(Ordering::Acquire)
             });
-        self.rearm_quiescent(dirty).unwrap_or(false)
+        self.rearm_quiescent(dirty)
     }
 
     /// Copies every dirty page intersection and establishes the next clean
     /// baseline before direct CPU execution resumes.
+    /// Call outside native execution and without a memory lease or cache lock.
     ///
     /// Returned offsets are logical offsets within `range`. Ranges are
     /// expanded to `alignment` where possible so device backends can satisfy
@@ -264,6 +272,7 @@ impl CanonicalCpuWriteDependency {
     /// Copies the complete range only when at least one represented page is
     /// dirty, then establishes the next clean baseline atomically with that
     /// snapshot.
+    /// Call outside native execution and without a memory lease or cache lock.
     pub fn snapshot_whole_if_dirty(
         &self,
         range: &CanonicalBackingRange,
@@ -275,6 +284,7 @@ impl CanonicalCpuWriteDependency {
 
     /// Copies the complete range and establishes the next clean baseline
     /// atomically with that snapshot.
+    /// Call outside native execution and without a memory lease or cache lock.
     pub fn snapshot_all(
         &self,
         range: &CanonicalBackingRange,
@@ -310,12 +320,19 @@ impl CanonicalCpuWriteDependency {
             return Err(CanonicalRangeAccessError::DependencyMismatch);
         }
 
+        // A clean query observes the dirty epochs only; it changes no backing
+        // protection and need not close engine admission. A later CPU write
+        // remains visible to the next query.
+        if selection != CpuWriteSnapshotSelection::All && self.remains_current() {
+            return Ok(Vec::new());
+        }
         loop {
             let stores = range.execution_stores();
-            let transitions = stores
+            let mut transitions = stores
                 .iter()
-                .map(|store| store.execution_gate().acquire_exclusive())
-                .collect::<Vec<_>>();
+                .map(|store| store.execution_gate().acquire_mutation(&[]))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CanonicalRangeAccessError::Mutation)?;
             let volatile = self.inner.volatile.load(Ordering::Acquire);
             let dirty_pages = self
                 .inner
@@ -392,6 +409,9 @@ impl CanonicalCpuWriteDependency {
 
             if !volatile {
                 self.rearm_quiescent(dirty)?;
+                for transition in &mut transitions {
+                    transition.commit();
+                }
             }
             return Ok(snapshots);
         }
@@ -495,6 +515,40 @@ impl PartialEq for CanonicalCpuWriteDependency {
 impl Eq for CanonicalCpuWriteDependency {}
 
 impl CanonicalBackingRange {
+    /// Retained physical identity is the authority for device ranges, even
+    /// after their original virtual mapping has changed. Register all pages
+    /// before closing the gate: a compiler can publish between discovery and
+    /// closure, and its newly captured page must be included too. Reads also
+    /// change visibility authority and can leave a page Invalid on failure;
+    /// no code derived from that page may survive the transition in that case.
+    fn begin_device_transition<'a>(
+        &self,
+        stores: &'a [crate::CanonicalBackingStore],
+    ) -> Result<Vec<crate::ExecutionMutationGuard<'a>>, VisibilityError> {
+        let mut transitions = Vec::with_capacity(stores.len());
+        for store in stores {
+            let changes = self
+                .segments
+                .iter()
+                .map(CanonicalBackingSegment::page)
+                .filter(|page| page.store() == store.identity())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|page| crate::MemoryInvalidationKind::ExecutableContent {
+                    first: page.page(),
+                    second: None,
+                })
+                .collect::<Vec<_>>();
+            transitions.push(
+                store
+                    .execution_gate()
+                    .acquire_mutation(&changes)
+                    .map_err(VisibilityError::ExecutionMutation)?,
+            );
+        }
+        Ok(transitions)
+    }
+
     fn execution_stores(&self) -> Vec<crate::CanonicalBackingStore> {
         let mut stores = BTreeMap::new();
         for segment in self.segments.iter() {
@@ -736,10 +790,7 @@ impl CanonicalBackingRange {
         coordinator: Arc<dyn VisibilityCoordinator>,
     ) -> Result<(), VisibilityError> {
         let stores = self.execution_stores();
-        let mut transitions = stores
-            .iter()
-            .map(|store| store.execution_gate().acquire_exclusive())
-            .collect::<Vec<_>>();
+        let mut transitions = self.begin_device_transition(&stores)?;
         for transition in &mut transitions {
             transition.commit();
         }
@@ -766,10 +817,7 @@ impl CanonicalBackingRange {
         coordinator: Arc<dyn VisibilityCoordinator>,
     ) -> Result<(), VisibilityError> {
         let stores = self.execution_stores();
-        let mut transitions = stores
-            .iter()
-            .map(|store| store.execution_gate().acquire_exclusive())
-            .collect::<Vec<_>>();
+        let mut transitions = self.begin_device_transition(&stores)?;
         for transition in &mut transitions {
             transition.commit();
         }
@@ -816,10 +864,7 @@ impl CanonicalBackingRange {
             return Err(VisibilityError::DeclarationDoesNotWrite);
         }
         let stores = self.execution_stores();
-        let mut transitions = stores
-            .iter()
-            .map(|store| store.execution_gate().acquire_exclusive())
-            .collect::<Vec<_>>();
+        let mut transitions = self.begin_device_transition(&stores)?;
         for transition in &mut transitions {
             transition.commit();
         }
@@ -838,10 +883,7 @@ impl CanonicalBackingRange {
     /// visibility failure.
     pub fn invalidate_visibility(&self) -> Result<(), VisibilityError> {
         let stores = self.execution_stores();
-        let mut transitions = stores
-            .iter()
-            .map(|store| store.execution_gate().acquire_exclusive())
-            .collect::<Vec<_>>();
+        let mut transitions = self.begin_device_transition(&stores)?;
         for transition in &mut transitions {
             transition.commit();
         }
@@ -893,6 +935,7 @@ pub enum CanonicalRangeAccessError {
     },
     IncompleteRange,
     Backing(CanonicalPageError),
+    Mutation(crate::ExecutionMutationError),
 }
 
 impl Display for CanonicalRangeAccessError {
@@ -919,6 +962,7 @@ impl Display for CanonicalRangeAccessError {
                 formatter.write_str("canonical range segments do not cover the requested bytes")
             }
             Self::Backing(error) => write!(formatter, "canonical backing access failed: {error}"),
+            Self::Mutation(error) => error.fmt(formatter),
         }
     }
 }
@@ -1263,11 +1307,11 @@ mod tests {
         for cycle in 1..=5 {
             allocation.write(0, &[cycle]).unwrap();
             assert!(!dependency.remains_current());
-            assert_eq!(dependency.rearm(), cycle < 5);
+            assert_eq!(dependency.rearm().unwrap(), cycle < 5);
         }
         assert!(dependency.is_volatile());
         assert!(!dependency.remains_current());
-        assert!(!dependency.rearm());
+        assert!(!dependency.rearm().unwrap());
     }
 
     #[test]
@@ -1281,10 +1325,130 @@ mod tests {
         for cycle in 0..8 {
             allocation.write(0, &[cycle]).unwrap();
             assert!(!dependency.remains_current());
-            assert!(dependency.rearm());
+            assert!(dependency.rearm().unwrap());
             assert!(dependency.remains_current());
         }
         assert!(!dependency.is_volatile());
+    }
+
+    #[test]
+    fn rearm_reports_invalid_backing_instead_of_a_volatile_dependency() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        range.invalidate_visibility().unwrap();
+        assert_eq!(
+            dependency.rearm(),
+            Err(CanonicalRangeAccessError::Backing(
+                CanonicalPageError::Visibility(VisibilityError::InvalidState),
+            ))
+        );
+        assert!(!dependency.is_volatile());
+    }
+
+    #[test]
+    fn initial_tracking_capture_preserves_empty_and_invalid_backing_errors() {
+        assert_eq!(
+            CanonicalCpuWriteDependency::capture_ranges([]).unwrap_err(),
+            CanonicalRangeAccessError::IncompleteRange
+        );
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        range.invalidate_visibility().unwrap();
+        assert_eq!(
+            CanonicalCpuWriteDependency::capture(&range).unwrap_err(),
+            CanonicalRangeAccessError::Backing(CanonicalPageError::Visibility(
+                VisibilityError::InvalidState
+            ))
+        );
+    }
+
+    #[test]
+    fn multi_store_capture_rejection_releases_prior_holds_before_arming_any_page() {
+        use crate::{ExecutionMutation, ExecutionMutationError, ExecutionMutationObserver};
+        struct Hold(Arc<AtomicBool>);
+        impl ExecutionMutation for Hold {}
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        struct Owner {
+            active: Arc<AtomicBool>,
+            reject: bool,
+        }
+        impl ExecutionMutationObserver for Owner {
+            fn begin(
+                self: Arc<Self>,
+                changes: &[crate::MemoryInvalidationKind],
+            ) -> Result<Box<dyn ExecutionMutation>, ExecutionMutationError> {
+                assert!(changes.is_empty());
+                if self.reject {
+                    assert!(self.active.load(Ordering::Acquire));
+                    return Err(ExecutionMutationError(
+                        "second tracking owner rejected".into(),
+                    ));
+                }
+                self.active.store(true, Ordering::Release);
+                Ok(Box::new(Hold(self.active.clone())))
+            }
+        }
+        let stores = [
+            CanonicalBackingStore::allocate().unwrap(),
+            CanonicalBackingStore::allocate().unwrap(),
+        ];
+        let active = Arc::new(AtomicBool::new(false));
+        let mut pages = Vec::new();
+        let mut ranges = Vec::new();
+        for (index, store) in stores.iter().enumerate() {
+            store
+                .execution_gate()
+                .set_mutation_observer(Arc::new(Owner {
+                    active: active.clone(),
+                    reject: index == 1,
+                }))
+                .unwrap();
+            let page = CanonicalBackingPage::zeroed(
+                store,
+                GuestPhysicalPageId::new(index as u64),
+                4096,
+                ContentGeneration::INITIAL,
+            )
+            .unwrap();
+            ranges.push(
+                CanonicalBackingRange::new(vec![
+                    CanonicalBackingSegment::new(
+                        page.clone(),
+                        0,
+                        4096,
+                        MemoryPermissions::READ_WRITE,
+                        MappingGeneration::new(1),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            );
+            pages.push(page);
+        }
+        // Reverse input order; acquisition still follows stable store identity.
+        assert_eq!(
+            CanonicalCpuWriteDependency::capture_ranges([&ranges[1], &ranges[0]]).unwrap_err(),
+            CanonicalRangeAccessError::Mutation(ExecutionMutationError(
+                "second tracking owner rejected".into()
+            ))
+        );
+        assert!(!active.load(Ordering::Acquire));
+        for (store, page) in stores.iter().zip(&pages) {
+            assert!(!store.execution_gate().transition_pending());
+            assert_eq!(store.execution_gate().epoch(), 1);
+            let epoch = page.cpu_dirty_epoch();
+            page.prepare_cpu_write().unwrap();
+            assert_eq!(page.cpu_dirty_epoch(), epoch); // No observer was armed.
+        }
     }
 
     #[test]

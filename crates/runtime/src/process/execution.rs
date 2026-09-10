@@ -50,63 +50,59 @@ enum CpuBackend {
 impl CpuBackend {
     fn new(
         selection: &CpuBackendConfig,
-        _id: CpuProcessId,
         cpu: ProcessCpuContext,
+        memory: Arc<ExecutionMemory>,
+        end_exclusive: GuestVirtualAddress,
     ) -> Result<Self, CpuFault> {
         match selection {
-            CpuBackendConfig::Interpreter => Ok(Self::Interpreter(InterpreterProcess::new(cpu))),
-            CpuBackendConfig::Jit => JitProcess::new(cpu)
+            CpuBackendConfig::Interpreter => {
+                let mut process = InterpreterProcess::new(cpu);
+                process.bind_memory(MemoryBinding {
+                    address_space: cpu.address_space_id(),
+                    end_exclusive,
+                    memory: memory.as_ref(),
+                    mapping_epoch: memory.mapping_epoch().get(),
+                    invalidation_cursor: memory.invalidation_cursor(),
+                })?;
+                Ok(Self::Interpreter(process))
+            }
+            CpuBackendConfig::Jit => JitProcess::new(cpu, memory)
                 .map(Arc::new)
                 .map(Self::Jit)
                 .map_err(|error| runtime_fault(cpu, CpuFaultKind::Unavailable, error.to_string())),
         }
     }
 
-    fn bind_memory(
-        &mut self,
-        binding: MemoryBinding<'_>,
-        owner: Arc<ExecutionMemory>,
-    ) -> Result<(), CpuFault> {
-        match self {
-            Self::Interpreter(process) => process.bind_memory(binding),
-            Self::Jit(process) => {
-                process
-                    .bind_owned_memory(binding, owner)
-                    .map_err(|error| CpuFault {
-                        backend: "jit",
-                        kind: CpuFaultKind::Unavailable,
-                        progress: 0,
-                        message: error.to_string().into_boxed_str(),
-                        context: Box::new(ThreadCpuState::default().register_context()),
-                    })
-            }
-        }
-    }
-
     fn create_thread(&mut self, id: CpuThreadId) -> Result<CpuThread, CpuFault> {
         match self {
             Self::Interpreter(process) => process.create_thread(id).map(CpuThread::Interpreter),
-            Self::Jit(process) => Ok(CpuThread::Jit {
-                process: Arc::clone(process),
-                thread: JitThread::new(),
-            }),
+            Self::Jit(process) => JitThread::new(Arc::clone(process))
+                .map(Box::new)
+                .map(CpuThread::Jit)
+                .map_err(|error| jit_boundary_fault(error, &ThreadCpuState::default())),
         }
     }
 
     fn request_stop(&mut self) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(process) => process.request_stop(),
-            Self::Jit(_) => Ok(()),
+            Self::Jit(process) => process
+                .request_stop()
+                .map_err(|error| jit_boundary_fault(error, &ThreadCpuState::default())),
         }
     }
 
     fn shutdown(&mut self) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(process) => process.shutdown(),
-            Self::Jit(process) => {
-                process.shutdown();
-                Ok(())
-            }
+            Self::Jit(process) => match process.try_shutdown() {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(jit_boundary_fault(
+                    "LCQ shutdown still has outstanding execution or compilation owners",
+                    &ThreadCpuState::default(),
+                )),
+                Err(error) => Err(jit_boundary_fault(error, &ThreadCpuState::default())),
+            },
         }
     }
 
@@ -120,15 +116,14 @@ impl CpuBackend {
 
 pub(crate) enum CpuThread {
     Interpreter(InterpreterThread),
-    Jit {
-        process: Arc<JitProcess>,
-        thread: JitThread,
-    },
+    // Keep the Cranelift compiler out of every scheduler command's inline size.
+    Jit(Box<JitThread>),
 }
 
 impl CpuThread {
     pub(crate) fn run_slice(
         &mut self,
+        worker: &mut nixe_cpu_direct_memory::NativeWorker,
         request: RunRequest<'_>,
     ) -> Result<ExecutionReport, CpuFault> {
         match self {
@@ -143,28 +138,45 @@ impl CpuThread {
                     events,
                     ..
                 } = request;
-                thread.run_slice(InterpreterRunRequest {
-                    memory,
-                    memory_lease,
-                    state,
-                    instruction_budget,
-                    loader_return,
-                    timer,
-                    events,
-                })
+                thread.run_slice(
+                    worker,
+                    InterpreterRunRequest {
+                        memory,
+                        memory_lease,
+                        state,
+                        instruction_budget,
+                        loader_return,
+                        timer,
+                        events,
+                    },
+                )
             }
-            Self::Jit { process, thread } => thread.run_slice(process, request),
+            Self::Jit(thread) => {
+                // The JIT takes its own short-lived leases around capture and
+                // native entry. Never carry a caller lease into its cold loop.
+                drop(request.memory_lease);
+                thread.run_slice(
+                    worker,
+                    request.state,
+                    request.instruction_budget,
+                    request.loader_return,
+                    request.timer,
+                    &request.events,
+                )
+            }
         }
     }
 
     pub(crate) fn synchronize_address_space(
         &mut self,
         binding: MemoryBinding<'_>,
-        _state: &ThreadCpuState,
+        state: &ThreadCpuState,
     ) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(thread) => thread.synchronize_address_space(binding),
-            Self::Jit { process, thread } => thread.synchronize_address_space(process, binding),
+            Self::Jit(thread) => thread
+                .synchronize_address_space(binding)
+                .map_err(|error| jit_boundary_fault(error, state)),
         }
     }
 
@@ -172,25 +184,31 @@ impl CpuThread {
     pub(crate) fn control(&self) -> CpuControl {
         match self {
             Self::Interpreter(thread) => thread.control(),
-            Self::Jit { thread, .. } => thread.control(),
+            Self::Jit(thread) => thread.control(),
         }
     }
 
     pub(crate) fn prepare_shutdown(
         &mut self,
         binding: MemoryBinding<'_>,
-        _state: &ThreadCpuState,
+        state: &ThreadCpuState,
     ) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(thread) => thread.prepare_shutdown(binding),
-            Self::Jit { process, thread } => thread.prepare_shutdown(process, binding),
+            Self::Jit(thread) => {
+                thread
+                    .synchronize_address_space(binding)
+                    .map_err(|error| jit_boundary_fault(error, state))?;
+                thread.clear_local_exclusive_reservation();
+                Ok(())
+            }
         }
     }
 
     pub(crate) fn clear_local_exclusive_reservation(&mut self) {
         match self {
             Self::Interpreter(thread) => thread.clear_local_exclusive_reservation(),
-            Self::Jit { thread, .. } => thread.clear_local_exclusive_reservation(),
+            Self::Jit(thread) => thread.clear_local_exclusive_reservation(),
         }
     }
 }
@@ -314,7 +332,7 @@ pub(crate) struct ProcessExecutionControl {
     virtual_clock: VirtualClock,
     architectural_timer_frequency: u64,
     address_space_end: GuestVirtualAddress,
-    shutdown_result: Option<Result<(), CpuFault>>,
+    shutdown_complete: bool,
     stopping: bool,
     pending_safepoint: AtomicBool,
     transition_safepoints: Arc<TransitionSafepoints>,
@@ -394,20 +412,7 @@ impl ProcessExecutionControl {
             cpu,
             address_space_end,
         } = configuration;
-        let mut backend = CpuBackend::new(selection, process_id, cpu)?;
-        if let Err(fault) = backend.bind_memory(
-            MemoryBinding {
-                address_space: cpu.address_space_id(),
-                end_exclusive: address_space_end,
-                memory: memory.as_ref(),
-                mapping_epoch: memory.mapping_epoch().get(),
-                invalidation_cursor: memory.invalidation_cursor(),
-            },
-            Arc::clone(&memory),
-        ) {
-            let _ = backend.shutdown();
-            return Err(fault);
-        }
+        let backend = CpuBackend::new(selection, cpu, Arc::clone(&memory), address_space_end)?;
         let transition_safepoints = Arc::new(TransitionSafepoints::default());
         let weak_safepoints = Arc::downgrade(&transition_safepoints);
         memory.set_transition_notifier(Some(Arc::new(move || {
@@ -423,7 +428,7 @@ impl ProcessExecutionControl {
             virtual_clock,
             architectural_timer_frequency: timer_frequency,
             address_space_end,
-            shutdown_result: None,
+            shutdown_complete: false,
             stopping: false,
             pending_safepoint: AtomicBool::new(false),
             transition_safepoints,
@@ -457,12 +462,14 @@ impl ProcessExecutionControl {
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), CpuFault> {
-        if let Some(result) = &self.shutdown_result {
-            return result.clone();
+        if self.shutdown_complete {
+            return Ok(());
         }
         self.request_stop()?;
         let result = self.backend.shutdown();
-        self.shutdown_result = Some(result.clone());
+        if result.is_ok() {
+            self.shutdown_complete = true;
+        }
         result
     }
 
@@ -566,7 +573,7 @@ impl ProcessExecutionControl {
 
 impl Drop for ProcessExecutionControl {
     fn drop(&mut self) {
-        if self.shutdown_result.is_none() {
+        if !self.shutdown_complete {
             let _ = self.shutdown();
         }
     }
@@ -578,6 +585,16 @@ impl crate::exception_dispatch::MemoryMutationControl for ProcessExecutionContro
     }
     fn publish_memory_invalidation(&self, cursor: nixe_memory::MemoryInvalidationCursor) {
         Self::publish_memory_invalidation(self, cursor);
+    }
+}
+
+fn jit_boundary_fault(message: impl ToString, state: &ThreadCpuState) -> CpuFault {
+    CpuFault {
+        backend: "jit",
+        kind: CpuFaultKind::Internal,
+        progress: 0,
+        message: message.to_string().into_boxed_str(),
+        context: Box::new(state.register_context()),
     }
 }
 
@@ -615,9 +632,11 @@ pub(crate) struct VcpuExecutionState {
 impl VcpuExecutionState {
     pub(crate) fn run(
         &mut self,
+        worker: &mut nixe_cpu_direct_memory::NativeWorker,
         thread: &mut CpuThread,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
-        let memory_lease = self.memory.acquire_execution_lease();
+        let memory_lease = matches!(thread, CpuThread::Interpreter(_))
+            .then(|| self.memory.acquire_execution_lease());
         if let Some(error) = self.memory.direct_backend_failure() {
             return Err(ProcessExecutionError::Cpu {
                 fault: runtime_fault(self.cpu, CpuFaultKind::Internal, error),
@@ -629,7 +648,10 @@ impl VcpuExecutionState {
                     address_space: self.cpu.address_space_id(),
                     end_exclusive: self.address_space_end,
                     memory: self.memory.as_ref(),
-                    mapping_epoch: memory_lease.epoch().get(),
+                    mapping_epoch: memory_lease.as_ref().map_or_else(
+                        || self.memory.mapping_epoch().get(),
+                        |lease| lease.epoch().get(),
+                    ),
                     invalidation_cursor: self.memory.invalidation_cursor(),
                 },
                 &self.thread,
@@ -642,16 +664,19 @@ impl VcpuExecutionState {
         let control = thread.control();
         let _execution = control.enter_execution();
         thread
-            .run_slice(RunRequest {
-                cpu: self.cpu,
-                memory: self.memory.as_ref(),
-                memory_lease: Some(memory_lease),
-                state: &mut self.thread,
-                instruction_budget: self.instruction_budget,
-                loader_return: self.loader_return,
-                timer: &timer,
-                events: self.events.clone(),
-            })
+            .run_slice(
+                worker,
+                RunRequest {
+                    cpu: self.cpu,
+                    memory: self.memory.as_ref(),
+                    memory_lease,
+                    state: &mut self.thread,
+                    instruction_budget: self.instruction_budget,
+                    loader_return: self.loader_return,
+                    timer: &timer,
+                    events: self.events.clone(),
+                },
+            )
             .map_err(|fault| ProcessExecutionError::Cpu { fault })
     }
 }

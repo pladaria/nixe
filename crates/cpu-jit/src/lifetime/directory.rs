@@ -1,4 +1,4 @@
-//! Signal-time attribution. Ownership and all mutations belong to JIT state;
+//! Native-PC attribution. Ownership and all mutations belong to JIT state;
 //! a reader MUST already protect an invocation epoch before touching a slot.
 
 use super::unit::{CodeUnit, FaultRecord};
@@ -11,7 +11,6 @@ pub(super) struct Interval {
     pub start: usize,
     pub end: usize,
     pub unit: *const CodeUnit,
-    pub fault: usize,
 }
 // Raw pointers name immutable units retained by the unit registry. Copying an
 // interval during table preparation never dereferences it. Dereferencing is
@@ -51,7 +50,7 @@ impl Directory {
     ///
     /// Bounds plus one atomic load and a binary search: no mutable registry,
     /// reference counting, allocation, lock, or unbounded signal-time scan.
-    pub unsafe fn lookup(&self, pc: usize) -> Option<Fault<'_>> {
+    pub unsafe fn unit(&self, pc: usize) -> Option<&CodeUnit> {
         let offset = pc.checked_sub(self.base)?;
         if offset >= WINDOW_BYTES {
             return None;
@@ -71,10 +70,27 @@ impl Directory {
         if unit.code.allocation.generation != table.generation {
             return None;
         }
-        Some(Fault {
-            unit,
-            record: &unit.faults[interval.fault],
-        })
+        Some(unit)
+    }
+
+    /// Resolve an exact fault interval inside the owning unit. The outer table
+    /// stores one span per unit (including units without fault sites); sorted
+    /// immutable fault records already live in CodeUnit. Neither lookup locks
+    /// or creates another metadata owner.
+    ///
+    /// # Safety
+    /// Same already-announced epoch requirements as `unit`.
+    pub unsafe fn lookup(&self, pc: usize) -> Option<Fault<'_>> {
+        let unit = unsafe { self.unit(pc)? };
+        let offset = pc.checked_sub(unit.code.allocation.address())?;
+        let index = unit
+            .faults
+            .partition_point(|fault| fault.native_start as usize <= offset);
+        let record = unit.faults.get(index.checked_sub(1)?)?;
+        if offset >= record.native_end as usize {
+            return None;
+        }
+        Some(Fault { unit, record })
     }
 }
 

@@ -4,11 +4,13 @@
 //! traits. They never consume loader images or file storage; retained direct
 //! backing addresses remain canonical-memory acceleration facts.
 
+mod capture;
 mod common;
 mod contracts;
 mod execution;
 mod synthetic;
 
+pub use capture::{ExecutableMemory, InstructionImage};
 pub use contracts::*;
 pub use execution::{CpuMemoryBackendError, ExecutionMemory, ExecutionMemoryLease, MappingEpoch};
 pub use synthetic::SyntheticMemory;

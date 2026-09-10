@@ -3,7 +3,7 @@
 //! destination before defining the new value. W and scalar SIMD writes that
 //! zero the upper bits define the whole register. NZCV is tracked per bit.
 //! PC is supplied by the instruction/exit identity, not treated as a cached SSA
-//! register. Exclusive-monitor and memory state remain canonical runtime state.
+//! register. Exclusive-monitor and memory state are not register-SSA values.
 
 use crate::fp_policy::fp_lowering_disposition;
 use nixe_cpu::decode::a64::{A64Instruction, control, fp_simd, integer, memory, system};
@@ -16,6 +16,39 @@ use nixe_cpu::semantics::a64::{
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions
 
 const GENERAL_REGISTER_COUNT: usize = 31;
+
+pub(crate) fn system_instruction_supported(
+    platform: nixe_cpu::platform::TargetPlatform,
+    instruction: system::Instruction,
+) -> bool {
+    let fields = instruction.operands();
+    match instruction {
+        system::Instruction::Hint(_) => {
+            nixe_cpu::semantics::a64::hint_operation(platform, fields.hint).is_some()
+                || matches!(fields.hint, 32 | 34 | 36 | 38)
+        }
+        system::Instruction::ReadRegister(_) => {
+            matches!(
+                fields.system_key,
+                0xd53b_4200 | 0xd53b_4400 | 0xd53b_4420 | 0xd53b_d040 | 0xd53b_d060
+            ) || nixe_cpu::semantics::a64::runtime_register_read(platform, fields.system_key)
+                .is_some()
+        }
+        system::Instruction::WriteRegister(_) => matches!(
+            fields.system_key,
+            0xd51b_4200 | 0xd51b_4400 | 0xd51b_4420 | 0xd51b_d040
+        ),
+        system::Instruction::Barrier(_) => nixe_cpu::semantics::a64::barrier_operation(
+            fields.barrier_opcode,
+            fields.barrier_option,
+        )
+        .is_some(),
+        system::Instruction::ClearExclusive(_) => true,
+        system::Instruction::System(_) => {
+            nixe_cpu::semantics::a64::cache_maintenance_operation(fields.system_key).is_some()
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IntegerRegisterSet {
@@ -556,7 +589,7 @@ fn register_access_fp_simd_vector(
             for index in 0..shape.register_count() {
                 let register = fields.rd.wrapping_add(index) & 31;
                 if fields.load {
-                    if shape.structure_registers > 1 {
+                    if shape.elements_per_register > 1 {
                         read(accessed, register);
                     }
                     write(accessed, dirty, register);

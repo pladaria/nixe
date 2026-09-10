@@ -18,7 +18,7 @@ pub(super) struct Copy {
 
 pub(super) struct Emitter {
     pub(super) abi: HostAbi,
-    code: Vec<u8>,
+    pub(super) code: Vec<u8>,
 }
 
 impl Emitter {

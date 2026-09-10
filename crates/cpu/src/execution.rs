@@ -266,8 +266,9 @@ impl Display for CpuExit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionReport {
-    /// Backend-defined coarse forward progress. The interpreter reports exact
-    /// instructions; the normal JIT reports completed native boundaries.
+    /// Completed guest instructions. The interpreter checks its budget after
+    /// each instruction; the JIT accounts at block/observation boundaries and
+    /// may overshoot a slice budget by the remaining work in a bounded block.
     pub progress: u64,
     pub stop: CpuExit,
     /// Exact architectural state at the reported stop, when the frontend can

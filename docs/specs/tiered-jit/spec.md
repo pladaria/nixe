@@ -417,8 +417,11 @@ The runtime has the following authorities; none is append-only:
   family/build generation;
 - the link graph stores incoming roots and outgoing patch records by source and
   target CodeVersion; and
-- the native-PC directory derives a segment slot from the fault address and
-  acquire-loads that segment generation's immutable sorted fault table.
+- the native-PC directory derives a segment slot from the native address and
+  acquire-loads that segment generation's immutable sorted unit-span table.
+  Each unit owns sorted exact fault intervals; lookup first selects the unit,
+  then its fault record. Canonical entries can also resolve their protected
+  unit metadata, including units without fault sites, through the same table.
 
 The native-PC directory has 128 fixed slots: 127 full 16 MiB segments and one
 final 15 MiB segment in the 2047 MiB executable reservation. It is safe for
@@ -595,6 +598,14 @@ Guest FPCR/FPSR and host FP ownership retain one implementation for both tiers:
 - a general Rust helper suspends the guest FP segment and restores it only on a
   successful continuation.
 
+Both tiers enable the fork's `Function::nixe_observable_fp` contract before
+optimization. Native FP arithmetic, comparisons, rounding and conversions have
+observable environment effects even when their values are discarded; they
+must not be eliminated, merged or rewritten under fixed-rounding assumptions,
+or moved across FP ownership/status boundaries. Pure bit operations remain
+optimizable. The frontend still guards the operand/FPCR domain where each
+backend expansion implements the guest operation exactly.
+
 ### Control budget and functional sampling
 
 Exact instruction observability is not part of the production JIT. Each vCPU
@@ -698,6 +709,16 @@ single_pass register allocation. An exact-key state CAS allows one compiler for
 that generation. A competing vCPU may wait only for the same BlockKey
 publication; unrelated LCQ compilation uses vCPU-local compiler state and
 continues concurrently.
+
+Instruction capture first reads under memory exclusion with already-armed
+dirty tracking. If a demanded page needs arming/rearming, discard that partial
+copy, release memory locks and retry under the Closed tracking transition;
+unchanged code remains resident. Already-armed captures do not close JIT
+admission or cancel other compilers. A tracking stop can cancel the initial
+LCQ claim: before reserving a unit identity or emitting code, compete for a
+new exact-key claim and revalidate the complete owned image against it. If
+another compiler won, admission is closed or the image changed, discard the
+work. Never renew a reservation after native emission.
 
 LCQ never invokes HCQ discovery, a CFG breadth-first search or a function
 scanner. Rare overlap caused by an indirect entry into the middle of an
@@ -993,10 +1014,21 @@ short and occurs before backend work. A stale or losing candidate releases only
 its exact reservations.
 
 Instruction bytes are copied through the versioned executable-content snapshot
-defined above. Worker lowering never reads live guest memory. A code
-or mapping change after capture makes the candidate stale. Backend output
-remains in a worker-owned nonexecutable staging buffer until it has a final
-size and relocation set.
+defined above. Worker lowering never reads live guest memory. Changes detected
+by the final image validation reject the candidate. Guest CPU stores, including
+atomics, dirty that observation without publishing a new instruction-cache
+version on every store. A store after the final image validation may therefore
+leave the captured pre-IC code publishable and executable until instruction-cache
+invalidation. This is not permission to ignore an intervening IC: IC closes
+admission and cancels old candidates, or retires their already-published units,
+before completing. No pre-IC candidate can publish after that closure/reopen.
+
+Host/device executable-content publication and mapping/permission changes use
+the same coordinator before becoming visible; they do not wait for guest IC.
+The admission epoch and memory cursor close the gap between image validation
+and dispatch publication without nesting memory locks under JIT state or
+adding per-store checks. Backend output remains in a worker-owned nonexecutable
+staging buffer until it has a final size and relocation set.
 
 After final allocation and relocation, publication uses one short JIT-state
 mutex:
@@ -1177,14 +1209,69 @@ prefault physical state map, architectural commit stage and required deferred
 NZCV/FP state. The fixed native-PC segment directory locates this record without
 a lock, allocation or mutable tree walk.
 
+For a pair load, the second-access map also locates the first result's raw bits
+without committing either destination. Cold completion must consume that retained
+result rather than replaying the first read; a guest fault preserves PRE registers.
+For a pair store, the second-access record marks the first store as committed.
+
+Single-structure SIMD lane/replicate transfers and multiple-structure
+LD1/2/3/4–ST1/2/3/4 instead commit each successful element before the next
+access. Contiguous LD1/ST1 finishes a register before the next. Interleaved
+transfers visit each register in a lane before advancing to the next lane;
+64-bit loads clear a destination's upper half at its first successful element,
+not at instruction completion. Their maps retain that completed prefix, with
+base writeback deferred until completion. Cold resolution must start at the
+named subaccess, not repeat earlier reads or stores.
+
+Contiguous LD1/ST1 may group each register into one 8/16-byte native access
+when the complete list lies in one guest page. A single page-offset guard
+selects this path; the execution lease prevents a mapping/visibility change
+inside a group. Its fault map names the first element and PRE destination of
+that group. Cross-page lists remain element-wise, and cold completion always
+uses element-sized accesses, including for MMIO. No base writeback occurs
+until the whole instruction completes. Partial loads keep the previous vector
+live; eight-byte destinations clear their upper half after the first successful
+element.
+
+Ordered scalar accesses preserve guest natural alignment and RCsc ordering on
+both hosts. Misaligned ordered addresses are confined to the guard before any
+access; the resolver checks original-address alignment before mapping repair
+and reports the guest alignment fault instead of retrying that guard access.
+
+CAS (including CASP) requires read and write permission even on comparison mismatch;
+scalar atomic RMW requires both even when the operation leaves memory unchanged
+or discards its result. Both use natural-alignment confinement. Native atomics
+may conservatively strengthen guest ordering to RCsc; typed cold completion
+preserves the instruction's ordering (RMW acquire is suppressed for Rt=XZR).
+Every fault site of a host exclusive loop names the same uncommitted atomic
+operation and PRE guest state, not a completed architectural subaccess. Cold
+completion performs one typed atomic transaction; device atomics must not be
+decomposed into ordinary reads and writes.
+For 128-bit CAS, an Arm LDAXP observation must be validated by a successful
+STLXP even on comparison mismatch; that path writes back the observed pair.
+Neither native execution nor canonical-memory atomics may return an unvalidated
+pair or replace the transaction with two scalar CAS operations.
+
 The signal handler performs only bounded async-signal-safe capture and redirects
-to the preallocated landing stack. The normal-stack resolver either:
+to the preallocated landing stack. Before entering Rust, the landing leaf
+restores the invocation owner's saved caller FP environment. The captured guest
+FP/register image remains untouched for retry; dispatch does not commit FPSR or
+change native FP ownership merely to inspect a fault. The normal-stack resolver either:
 
 - repairs a recoverable valid-RAM tracking/reconciliation condition and resumes
   at the identical native instruction with the captured machine and FP state;
 - reconstructs the architecturally correct prefault state from captured host
-  registers and fixed spills, then reports a guest data fault; or
+  registers and fixed spills, then reports a guest data fault;
+- requests typed cold completion for a valid non-RAM access without executing
+  that access during classification; the owner escapes before reconstructing
+  state and completing the named subaccess and remaining instruction effects; or
 - terminates through the precise internal-fault path.
+
+Terminal capture/dispatcher failures report a bounded best-effort diagnostic
+with the cause, native PC and fault address, then preserve fatal termination.
+Diagnostics must not allocate, lock or dereference guest/code metadata; failure
+to write them must not replace the original fatal signal. Unattributed PCs
+must never be used to fabricate guest state or a guest data abort.
 
 Retry never replays an earlier guest instruction. Code and fault metadata remain
 epoch-live for the complete retry. No eager state checkpoint, per-access
@@ -1197,8 +1284,10 @@ above. A repeated fault at the same native PC and unchanged page generation is
 a fatal resolver/livelock error, not an unbounded retry loop.
 
 The semantic lowering fixes the order of compound guest accesses. Native
-operations cannot be reordered or fused across guest instruction/commit
-boundaries. A multi-access instruction is decomposed only when Arm semantics
+operations cannot be reordered or fused across guest instruction boundaries
+or discard observable partial effects. The single-page structure grouping
+above is permitted because no guest fault can split one grouped access.
+A multi-access instruction is decomposed only when Arm semantics
 permit its already-completed effects to remain visible and the metadata names
 the exact subaccess/commit stage. When the architecture requires all-or-nothing
 behavior, lowering uses one native atomic operation or a typed cold preflight

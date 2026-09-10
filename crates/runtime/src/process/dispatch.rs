@@ -107,7 +107,11 @@ impl RunnableProcess {
         let events = nixe_cpu::execution::VcpuEventState::default();
         let mut execution =
             self.begin_thread_execution(self.main_thread_id, vcpu, instruction_budget, events)?;
-        let result = execution.run(thread);
+        let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
+        let result = execution.run(&mut worker, thread);
+        worker
+            .finish()
+            .expect("test execution worker restores its signal stack");
         self.finish_thread_execution(self.main_thread_id, vcpu, execution, result)
     }
 

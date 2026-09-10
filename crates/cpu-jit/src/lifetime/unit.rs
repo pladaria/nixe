@@ -19,6 +19,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+mod invalidation;
 mod reclaim;
 pub(crate) use reclaim::Snapshot;
 #[cfg(test)]
@@ -41,6 +42,44 @@ pub(crate) struct Entry {
 pub(crate) struct StateRecord {
     pub native_offset: u32,
     pub state: ExitStateMap,
+    pub exit: Option<GuestExit>,
+}
+
+/// Source identity and edge semantics, retained with the physical exit map.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GuestExit {
+    pub pc: nixe_memory::GuestVirtualAddress,
+    pub kind: EdgeKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EdgeKind {
+    Static,
+    Taken,
+    NotTaken,
+    Call,
+    Indirect,
+    Return,
+    SupervisorCall(u16),
+    Breakpoint(u16),
+    FpSystem(crate::abi::FpSystemOperation),
+    FpCompare(crate::abi::FpCompareOperation),
+    FpRound(crate::abi::FpRoundOperation),
+    FpAdd(crate::abi::FpAddOperation),
+    FpDivide(crate::abi::FpDivideOperation),
+    VectorFpDivide(crate::abi::VectorFpDivideOperation),
+    VectorFpMultiplyElement(crate::abi::VectorFpMultiplyElementOperation),
+    FpMultiply(crate::abi::FpMultiplyOperation),
+    FpFused(crate::abi::FpFusedOperation),
+    FpUnary(crate::abi::FpUnaryOperation),
+    FpToInteger(crate::abi::FpToIntegerOperation),
+    IntegerToFp(crate::abi::IntegerToFpOperation),
+    VectorIntegerToFp(crate::abi::VectorIntegerToFpOperation),
+    RuntimeSystem(crate::abi::RuntimeSystemOperation),
+    ExclusiveStore(crate::abi::ExclusiveStoreOperation),
+    Unsupported,
+    InvalidInstruction,
+    FragmentLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +100,10 @@ pub(crate) struct FaultRecord {
     pub subaccess: u16,
     /// Semantic lowering's architectural commit stage, not a native-op count.
     pub commit_stage: u16,
+    /// Raw first-element bits at the second access of a pair load (width is
+    /// `bytes`). Not an architectural register update: cold completion uses
+    /// this value without replaying the read; a guest fault keeps PRE registers.
+    pub completed_read: Option<ValueLocation>,
     /// Index in CodeUnit.states; includes deferred NZCV and pending host FPSR.
     pub state_map: u32,
 }
@@ -137,8 +180,50 @@ struct UnitRecord {
     slots: Accounted<Box<[Handle<DispatchSlot>]>>,
     family: Option<Handle<Arc<Accounted<Family>>>>,
     retirement: Option<(Reason, MaintenanceSequence)>,
+    retirement_next: Option<Handle<UnitRecord>>,
+    // Memory safety work may join an already queued eviction/tier cutover.
+    // Keep both acknowledgements tied to this exact unit until unlink.
+    invalidation: Option<MaintenanceSequence>,
     detached_epoch: Option<ExecutionEpoch>,
     detached_table: Option<Arc<Accounted<Table>>>,
+}
+
+/// Intrusive pending-only lists: membership is exactly `retirement.is_some()`.
+/// Links live in the accounted registry slots, so queuing never allocates and
+/// draining never searches resident units or holes left by reclaimed units.
+#[derive(Default)]
+struct Retirements {
+    lcq: Option<Handle<UnitRecord>>,
+    hcq: Option<Handle<UnitRecord>>,
+}
+impl Retirements {
+    fn head_mut(&mut self, tier: Tier) -> &mut Option<Handle<UnitRecord>> {
+        match tier {
+            Tier::Lcq => &mut self.lcq,
+            Tier::Hcq => &mut self.hcq,
+        }
+    }
+
+    fn next(&self) -> Option<Handle<UnitRecord>> {
+        // Release active HCQ baseline promises before selecting LCQ.
+        self.hcq.or(self.lcq)
+    }
+}
+impl UnitRecord {
+    fn queue_retirement(
+        &mut self,
+        handle: Handle<UnitRecord>,
+        pending: &mut Retirements,
+        reason: Reason,
+        sequence: MaintenanceSequence,
+    ) {
+        if self.retirement.is_none() {
+            let head = pending.head_mut(self.code.tier);
+            self.retirement_next = *head;
+            *head = Some(handle);
+        }
+        self.retirement = Some((reason, sequence));
+    }
 }
 
 struct Family {
@@ -215,6 +300,7 @@ struct RetiredTable {
 
 pub(super) struct Units {
     records: Registry<UnitRecord>,
+    retirements: Retirements,
     families: Registry<Arc<Accounted<Family>>>,
     ids: CheckedCounter<CodeUnitId>,
     versions: CheckedCounter<CodeVersion>,
@@ -236,6 +322,7 @@ impl Default for Units {
     fn default() -> Self {
         Self {
             records: Registry::default(),
+            retirements: Retirements::default(),
             families: Registry::default(),
             ids: CheckedCounter::default(),
             versions: CheckedCounter::default(),
@@ -256,19 +343,47 @@ impl Default for Units {
     }
 }
 impl Units {
+    // O(pending units), O(1) when empty. Sequences need not follow list order:
+    // repeated requests retain old invalidation work alongside another reason.
     pub(super) fn pending_retirement(&self, reason: Reason, sequence: MaintenanceSequence) -> bool {
         (reason == Reason::Shutdown && !self.shutdown_finished)
-            || self.records.values().any(|record| {
-                record
-                    .retirement
-                    .is_some_and(|(kind, pending)| kind == reason && pending <= sequence)
-            })
+            || [self.retirements.hcq, self.retirements.lcq]
+                .into_iter()
+                .any(|mut next| {
+                    while let Some(handle) = next {
+                        let record = self.records.get(handle).unwrap();
+                        if (reason == Reason::MappingChange
+                            && record
+                                .invalidation
+                                .is_some_and(|pending| pending <= sequence))
+                            || record.retirement.is_some_and(|(kind, pending)| {
+                                kind == reason && pending <= sequence
+                            })
+                        {
+                            return true;
+                        }
+                        next = record.retirement_next;
+                    }
+                    false
+                })
     }
+
+    // Selection and removal hold the same state lock. Failed unlinks leave
+    // the head queued; cancellation/success removes it before slot reclamation.
+    fn finish_retirement(&mut self, handle: Handle<UnitRecord>) {
+        let record = self.records.get_mut(handle).unwrap();
+        let head = self.retirements.head_mut(record.code.tier);
+        debug_assert_eq!(*head, Some(handle));
+        *head = record.retirement_next.take();
+        record.retirement = None;
+        record.invalidation = None;
+    }
+
     pub(super) fn mark_shutdown(&mut self, sequence: MaintenanceSequence) {
-        for record in self.records.values_mut() {
+        for (handle, record) in self.records.iter_mut() {
             if !matches!(record.lifecycle, Lifecycle::Retired(_)) {
                 record.lifecycle = Lifecycle::Invalidating;
-                record.retirement = Some((Reason::Shutdown, sequence));
+                record.queue_retirement(handle, &mut self.retirements, Reason::Shutdown, sequence);
             }
         }
     }
@@ -440,16 +555,24 @@ impl Input {
                 .states
                 .get(fault.state_map as usize)
                 .ok_or(fail("missing prefault state map"))?;
+            if let Some(location) = fault.completed_read
+                && (fault.access != Access::Read
+                    || fault.subaccess != 1
+                    || fault.commit_stage != 0
+                    || !matches!(fault.bytes, 4 | 8 | 16)
+                    || !location.valid(self.code.metadata.abi, fault.bytes))
+            {
+                return Err(fail("invalid retained pair-read location or stage"));
+            }
             if map.native_offset != fault.native_start
-                || !self
-                    .code
-                    .metadata
-                    .faults
-                    .iter()
-                    .any(|map| map.offset == fault.native_start)
+                || !self.code.metadata.faults.iter().any(|map| {
+                    map.offset == fault.native_start
+                        && map.offset.checked_add(u32::from(map.fault_bytes))
+                            == Some(fault.native_end)
+                })
             {
                 return Err(fail(
-                    "prefault map does not name the final faulting instruction",
+                    "prefault map does not name the exact final faulting instruction",
                 ));
             }
             if self.code.metadata.abi == HostAbi::Aarch64
@@ -665,18 +788,15 @@ impl Lifetime {
         let mut intervals = table
             .as_ref()
             .map_or_else(Vec::new, |old| old.intervals.to_vec());
-        for (fault, record) in unit.faults.iter().enumerate() {
-            intervals.push(Interval {
-                start: unit.code.allocation.address() + record.native_start as usize,
-                end: unit.code.allocation.address() + record.native_end as usize,
-                unit: &unit.value,
-                fault,
-            });
-        }
+        intervals.push(Interval {
+            start: unit.code.allocation.address(),
+            end: unit.code.allocation.address() + unit.code.allocation.len(),
+            unit: &unit.value,
+        });
         intervals.sort_unstable_by_key(|interval| interval.start);
         if intervals.windows(2).any(|pair| pair[0].end > pair[1].start) {
             return Err(Error::InvalidUnit(
-                "native fault intervals overlap published code",
+                "native unit intervals overlap published code",
             ));
         }
         let bytes = size_of::<Accounted<Table>>()
@@ -980,6 +1100,8 @@ impl PreparedUnit<'_> {
             slots: self.slots.take().unwrap(),
             family: None,
             retirement: None,
+            retirement_next: None,
+            invalidation: None,
             detached_epoch: None,
             detached_table: None,
         };
@@ -1027,12 +1149,19 @@ impl PreparedUnit<'_> {
                     .records
                     .find(|record| record.code.id == old.unit && record.code.version == old.version)
             {
-                let record = state.units.records.get_mut(handle).unwrap();
+                let units = &mut state.units;
+                let record = units.records.get_mut(handle).unwrap();
                 record.lifecycle = Lifecycle::Superseded;
-                record.retirement = Some((Reason::TierCutover, sequence));
+                record.queue_retirement(
+                    handle,
+                    &mut units.retirements,
+                    Reason::TierCutover,
+                    sequence,
+                );
             }
             *payload = Some(old);
         }
+        process.changed.notify_all();
         // No publication can fail here. Old payload owners drop only
         // after unlocking state; the unit registry now owns all executable bytes.
         drop(state);

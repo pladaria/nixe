@@ -42,7 +42,7 @@ impl From<nixe_cpu_direct_memory::DirectMemoryAccessError> for MemoryStepError {
 type MemoryStep = Result<Option<()>, MemoryStepError>;
 
 pub(super) fn execute(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
@@ -196,7 +196,7 @@ fn atomic(
 }
 
 fn exclusive(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     memory: &dyn CpuMemory,
     address_space: AddressSpaceId,
     state: &mut A64State,
@@ -291,7 +291,7 @@ fn access(size: MemoryAccessSize, ordering: MemoryOrdering, aligned: bool) -> Me
 }
 
 fn literal(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     _address_space: AddressSpaceId,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
@@ -314,7 +314,7 @@ fn literal(
 }
 
 fn unsigned(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -336,7 +336,7 @@ fn unsigned(
 }
 
 fn indexed(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -377,7 +377,7 @@ fn indexed(
 }
 
 fn register_offset(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -404,7 +404,7 @@ fn register_offset(
     )
 }
 
-fn pair(context: InterpreterContext<'_>, state: &mut A64State, fields: Operands) -> MemoryStep {
+fn pair(context: InterpreterContext<'_, '_>, state: &mut A64State, fields: Operands) -> MemoryStep {
     let Some((size, load_spec)) = pair_transfer(fields.size, fields.load) else {
         return Ok(None);
     };
@@ -417,10 +417,12 @@ fn pair(context: InterpreterContext<'_>, state: &mut A64State, fields: Operands)
     }
     let base = read(state, fields.rn, 64, true);
     let offset = sign_extend(u64::from(fields.immediate_7), 7) * size.bytes() as i64;
-    let transfer_base = if matches!(fields.mode, 2 | 3) {
-        base.wrapping_add_signed(offset)
-    } else {
+    // LDNP/STNP (mode 0) apply the offset too; only post-index defers it.
+    // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab#page=910
+    let transfer_base = if fields.mode == 1 {
         base
+    } else {
+        base.wrapping_add_signed(offset)
     };
     let first = GuestVirtualAddress::new(transfer_base);
     let second = first.wrapping_add(size.bytes() as u64);
@@ -483,7 +485,7 @@ fn acquire_release(
 }
 
 fn transfer(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     _address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -510,7 +512,7 @@ fn transfer(
 }
 
 pub(super) fn ordinary_read(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     address: GuestVirtualAddress,
     descriptor: MemoryAccess,
 ) -> Result<MemoryValue, MemoryStepError> {
@@ -530,7 +532,7 @@ pub(super) fn ordinary_read(
 }
 
 pub(super) fn ordinary_write(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     address: GuestVirtualAddress,
     value: MemoryValue,
     descriptor: MemoryAccess,

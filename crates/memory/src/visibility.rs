@@ -91,6 +91,7 @@ impl std::error::Error for VisibilityCoordinatorError {}
 /// Failure to establish or publish a canonical visibility transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VisibilityError {
+    ExecutionMutation(crate::ExecutionMutationError),
     DeclarationDoesNotWrite,
     ConflictingAccess,
     InvalidState,
@@ -107,6 +108,9 @@ pub enum VisibilityError {
 impl Display for VisibilityError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ExecutionMutation(error) => {
+                write!(formatter, "execution coordination failed: {error}")
+            }
             Self::DeclarationDoesNotWrite => {
                 formatter.write_str("device access declaration does not write")
             }

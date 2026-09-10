@@ -8,6 +8,7 @@ license.workspace = true
 getrandom.workspace = true
 log.workspace = true
 nixe-cpu.workspace = true
+nixe-cpu-direct-memory.workspace = true
 nixe-cpu-interpreter.workspace = true
 nixe-cpu-jit.workspace = true
 nixe-loader-executable.workspace = true

@@ -148,6 +148,18 @@ Added `nixe_fault_start` / `nixe_fault_end` around ordinary trapping CLIF memory
 operations. Their operands stay live at the machine instructions that can
 fault, and `nixe_faults` exports the final locations at each actual trap PC,
 including multiple trapping instructions in compound atomic lowering.
+The local fork also exports `StateMap::fault_bytes`: the exact native instruction
+length, zero for non-fault maps. x86-64 records completion of each individual
+assembler instruction, including its prefixes; AArch64 records four bytes per
+instruction. Compound sequences do not share an approximate interval. Nixe
+preserves these extents in owned output and checks semantic fault intervals
+against them before publication. This addition still requires the local override.
+The local `nixe_arena_addr` operation adds a confined I64 offset directly to
+the pinned arena base (r13/x19), as one LEA/ADD without altering flags. x86
+emission bypasses the general arithmetic LEA-to-ADD optimization. The operation
+does not itself validate the offset: LCQ emits confinement using the fixed
+process arena size before consuming it. Non-Nixe functions cannot use this
+operation. No extra base-register copy or NativeFrame load is emitted.
 The x86 assembler generator now exposes memory-trap annotations for this
 tracking. Invalid spans, such as nested spans or `notrap` memory operations,
 are rejected.
@@ -176,6 +188,66 @@ the JIT depends.
 
 Implementation: `cranelift/codegen/src/{ir,verifier,write.rs,nixe.rs,nixe/}`,
 `cranelift/reader/src/parser.rs`, and `cranelift/jit/tests/nixe_faults.rs`.
+
+## Local Task 3 change awaiting a pinned commit: observable FP effects
+
+`Function::nixe_observable_fp` opts a function into ordered, observable native
+FP control/status effects, independently of its calling convention. Nixe sets
+it in the production LCQ compiler. Without it, ordinary CLIF
+semantics allow dropping an unused conversion and losing guest FPSR updates.
+
+The optimizer keeps FP arithmetic/comparisons/rounding/conversions opaque to
+constant folding, CSE and consumer rewrites. Machine lowering retains dead
+results' effects and prevents consumer patterns from absorbing these operations.
+Pure integer/bit operations remain optimizable. NaN canonicalization and
+inlining across differing FP contracts are rejected; CLIF text round-trips
+the declaration. This adds no per-operation runtime bookkeeping. Frontend
+guards remain responsible for differences between guest semantics and the
+host backend's native expansions.
+
+For observable-FP functions, the x86 unsigned I64X2→F64X2 bias expansion and
+its widened-I32 specialization clear the result sign with an integer mask.
+Their exact intermediate cancellation otherwise produces `-0.0` for integer
+zero under round-down, unlike SCVTF/UCVTF. Nonzero unsigned results are always
+positive; clearing the sign preserves their rounding and status. This keeps
+packed conversion native and leaves ordinary fixed-rounding CLIF unchanged.
+The correction is in `isa/x64/{inst.isle,lower.isle,lower/isle.rs}`; an encoder
+regression checks both allocators and both bias sequences, and Nixe executes
+the zero case plus active-lane/rounding/status comparisons on both targets.
+
+Implementation: `cranelift/codegen/src/{ir/function.rs,inst_predicates.rs,
+egraph/mod.rs,opts.rs,isle_prelude.rs,machinst/{isle,lower}.rs,context.rs,inline.rs,write.rs}` and
+`cranelift/reader/src/parser.rs`. Regression coverage includes both allocators,
+both encoders, optimized constant inputs and discarded-result FPSR execution
+in Nixe on x86-64 and AArch64/QEMU. These edits are local to branch `nixe`;
+the manifest still pins the earlier commit listed above.
+
+## Local Task 3 atomic changes awaiting a pinned commit
+
+The local Task 3 CAS work also changes AArch64's non-LSE `AtomicCASLoop`:
+Nixe mode attempts an exclusive store of the observed value on comparison
+mismatch, so guest write-permission faults cannot be bypassed. This emits three
+exact fault sites (one load, two alternative stores) with the same PRE map; no
+extra guest-state checkpoint or scratch register is added. Ordinary ABI loops
+retain their early mismatch exit. I32 comparisons now use W registers, since
+the expected operand's upper bits can be undefined after `ireduce`.
+The RMW increment similarly fixes I8/I16 unsigned min/max loops: their compare
+uses UXTB/UXTH on the source operand instead of consuming undefined high bits.
+This does not add instructions, scratch registers or fault sites. A missing
+LSE lowering rule now selects SWPAL for CLIF atomic exchange, retaining the
+exclusive-loop fallback on non-LSE hosts. Regression tests independently decode
+the narrow comparisons and single-instruction exchange with both allocators;
+Nixe's execution tests exercise all RMW kinds/widths under both Arm host profiles.
+These changes remain in the local override, not the pinned revision above.
+
+CASP X adds AArch64 lowering for CLIF `atomic_cas.i128`: CASPAL with LSE,
+otherwise a validating LDAXP/STLXP loop, including an observed-pair store on
+mismatch. Fixed even pairs and explicit clobbers preserve allocator constraints;
+fault operands stay live through the entire sequence, with exact four-byte
+intervals for its load and alternative stores. The larger operand record is
+boxed only for this pseudo-instruction, preserving the 32-byte `Inst` size.
+Both allocators are tested under register pressure. Nixe's ordinary RAM path
+uses this lowering directly, without a helper or split transaction.
 
 ## Existing APIs reused and integration status
 

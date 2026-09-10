@@ -42,6 +42,12 @@ Nixe uses a modified [Cranelift](https://cranelift.dev/) compiler to translate c
 
 See [Cranelift modifications](docs/cranelift-modifications.md) for implementation details.
 
+The production JIT currently uses synchronous, straight-line LCQ compilation
+with the bounded cache and fault-aware native gateway. Inter-block native
+linking and HCQ promotion are not enabled yet; the backend hooks above support
+those later stages. Task 3 development still requires the local Cranelift
+override described in [Cranelift modifications](docs/cranelift-modifications.md).
+
 ## Running
 
 See [host requirements](docs/host-requirements.md) for the required CPU capabilities.

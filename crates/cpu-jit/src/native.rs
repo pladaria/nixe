@@ -6,11 +6,13 @@
 mod backend;
 mod canonical;
 mod flags;
+mod fp;
 mod gateway;
 mod moves;
 
 pub use backend::AllocatedBoundary;
 pub use canonical::{emit_canonical_entry, emit_canonical_exit, emit_canonical_writeback};
+pub(crate) use fp::emit_fp_activation;
 pub use gateway::{NativeReturn, NativeReturnError, check_host, enter_protected};
 
 use crate::abi::{EntryContract, ExitStateMap, GuestValue, NzcvLocation, ValueLocation};
@@ -135,6 +137,18 @@ pub fn emit_fast_transfer(
             _ => unreachable!("validated live NZCV ingress is packed or host flags"),
         }
     }
+    emit_copies(&mut emitter, source.abi, copies)?;
+    if let Some(carry_inverted) = install_host {
+        flags::install_host(&mut emitter, carry_inverted);
+    }
+    Ok(emitter.finish())
+}
+
+fn emit_copies(
+    emitter: &mut Emitter,
+    abi: crate::abi::HostAbi,
+    mut copies: Vec<Copy>,
+) -> Result<(), TransferError> {
     copies.retain(|copy| copy.source != copy.destination);
     let mut temporary_end = 0;
     while !copies.is_empty() {
@@ -148,7 +162,7 @@ pub fn emit_fast_transfer(
             emitter.copy(copies.remove(index));
             continue;
         }
-        if emit_integer_cycle(&mut copies, &mut emitter, source.abi) {
+        if emit_integer_cycle(&mut copies, emitter, abi) {
             continue;
         }
         // Break the cycle by saving every input touched by one blocked write.
@@ -180,9 +194,37 @@ pub fn emit_fast_transfer(
             }
         }
     }
-    if let Some(carry_inverted) = install_host {
-        flags::install_host(&mut emitter, carry_inverted);
+    Ok(())
+}
+
+/// Internal SSA continuation transfers use the same cycle-safe engine as
+/// architectural fast links. No canonical state or guest names are involved.
+pub(crate) fn emit_operand_transfer(
+    abi: crate::abi::HostAbi,
+    operands: &[(ValueLocation, ValueLocation, u8)],
+) -> Result<Vec<u8>, TransferError> {
+    let mut copies = Vec::new();
+    for &(source, destination, bytes) in operands {
+        if !matches!(bytes, 4 | 8 | 16)
+            || !source.valid(abi, bytes)
+            || !destination.valid(abi, bytes)
+            || matches!(destination, ValueLocation::Constant(_))
+            || copies
+                .iter()
+                .any(|other: &Copy| crate::abi::locations_overlap(other.destination, destination))
+        {
+            return Err(TransferError::InvalidContract(
+                "invalid SSA continuation transfer",
+            ));
+        }
+        copies.push(Copy {
+            source,
+            destination,
+            bytes,
+        });
     }
+    let mut emitter = Emitter::new(abi);
+    emit_copies(&mut emitter, abi, copies)?;
     Ok(emitter.finish())
 }
 

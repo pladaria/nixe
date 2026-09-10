@@ -416,6 +416,9 @@ nixe_memory_compare_exchange_128:
 "#
 );
 
+// LDAXP may observe the two words separately. Even mismatch must complete
+// an exclusive store before returning the pair as an atomic observation.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85#page=103
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     r#"
@@ -433,7 +436,8 @@ nixe_memory_compare_exchange_128:
     mov w0,#1
     b 3f
 2:
-    clrex
+    stlxp w8,x6,x7,[x0]
+    cbnz w8,1b
     mov w0,#0
 3:
     stp x6,x7,[x5]
@@ -462,6 +466,37 @@ fn reserve(size: usize, operation: &str) -> Result<NonNull<u8>, HostMappedError>
 #[cfg(test)]
 mod tests {
     use super::HostMappedStore;
+
+    #[test]
+    fn canonical_atomic_128_reads_and_mismatches_never_return_a_torn_pair() {
+        let store = HostMappedStore::new().unwrap();
+        let backing = store.allocate(4096, None).unwrap();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                let mut previous = 0;
+                for _ in 0..10_000 {
+                    let next = !previous;
+                    assert_eq!(
+                        backing
+                            .atomic_compare_exchange(0, 16, previous, next)
+                            .unwrap(),
+                        (previous, true)
+                    );
+                    previous = next;
+                }
+            });
+            start.wait();
+            for _ in 0..10_000 {
+                let loaded = backing.atomic_load(0, 16).unwrap();
+                assert!(loaded == 0 || loaded == u128::MAX);
+                let (observed, stored) = backing.atomic_compare_exchange(0, 16, 1, 2).unwrap();
+                assert!(!stored);
+                assert!(observed == 0 || observed == u128::MAX);
+            }
+        });
+    }
 
     #[test]
     fn canonical_host_atomics_cover_every_architectural_width() {
