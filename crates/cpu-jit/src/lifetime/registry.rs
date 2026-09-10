@@ -188,8 +188,18 @@ impl<T> Registry<T> {
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.slots.iter().filter_map(|slot| slot.value.as_ref())
     }
-    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.slots.iter_mut().filter_map(|slot| slot.value.as_mut())
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
+        self.slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let handle = Handle {
+                    index,
+                    generation: slot.generation,
+                    marker: PhantomData,
+                };
+                slot.value.as_mut().map(|value| (handle, value))
+            })
     }
 
     pub fn find(&self, mut predicate: impl FnMut(&T) -> bool) -> Option<Handle<T>> {

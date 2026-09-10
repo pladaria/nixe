@@ -22,10 +22,6 @@ impl FpLoweringDisposition {
         !matches!(self, Self::Direct)
     }
 
-    pub(crate) const fn uses_native_status(self) -> bool {
-        matches!(self, Self::GuardedNative)
-    }
-
     pub(crate) const fn is_exact(self) -> bool {
         matches!(self, Self::Exact)
     }
@@ -42,6 +38,31 @@ impl FpLoweringDisposition {
 /// Every normalized variant is named so extending the decoder requires a
 /// deliberate lowering decision instead of inheriting a permissive default.
 pub(crate) fn fp_lowering_disposition(instruction: Instruction) -> FpLoweringDisposition {
+    // Match Cranelift x64's use_fma predicate. On a host without native FMA,
+    // demanded capture stops at the exact boundary instead of fetching a
+    // successor for an operation that would require a backend libcall.
+    #[cfg(target_arch = "x86_64")]
+    if matches!(instruction, Instruction::ScalarFloatFusedMultiplyAdd(_))
+        && !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma"))
+    {
+        return FpLoweringDisposition::Exact;
+    }
+    fp_lowering_for_host(
+        instruction,
+        if cfg!(target_arch = "x86_64") {
+            crate::abi::HostAbi::X86_64
+        } else {
+            crate::abi::HostAbi::Aarch64
+        },
+    )
+}
+
+/// Use the selected emission ISA, not the compiler process's ISA, when checking
+/// foreign-target output. The production compiler uses the native host.
+pub(crate) fn fp_lowering_for_host(
+    instruction: Instruction,
+    host: crate::abi::HostAbi,
+) -> FpLoweringDisposition {
     let fields = instruction.operands();
     match instruction {
         Instruction::SignedIntToFloat(_) | Instruction::UnsignedIntToFloat(_) => {
@@ -72,7 +93,7 @@ pub(crate) fn fp_lowering_disposition(instruction: Instruction) -> FpLoweringDis
             FpLoweringDisposition::GuardedExact
         }
         Instruction::ScalarFloatRound(_)
-            if !cfg!(target_arch = "x86_64")
+            if host == crate::abi::HostAbi::Aarch64
                 && !matches!(
                     fields.float_round_operation,
                     Some(

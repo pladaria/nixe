@@ -2,7 +2,10 @@
 //! storage and coupled CodeUnits share its publication/reader protocol;
 //! this protocol does not delegate lifetime to the legacy JITModule path.
 
+pub(crate) mod compile;
 mod directory;
+mod memory;
+pub(crate) use directory::Fault;
 mod registry;
 #[cfg(test)]
 mod tests;
@@ -24,6 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
+    MemoryInvalidation(nixe_memory::MemoryInvalidationError),
     Exhausted(IdentityExhausted),
     Poisoned,
     Closed,
@@ -42,6 +46,7 @@ pub(crate) enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MemoryInvalidation(error) => error.fmt(f),
             Self::UnsupportedHost(detail) => f.write_str(detail),
             Self::Exhausted(error) => error.fmt(f),
             Self::Poisoned => f.write_str("JIT lifetime state poisoned; admission is disabled"),
@@ -113,6 +118,7 @@ struct DispatchSlot {
     payload: AtomicPtr<Accounted<DispatchPayload>>,
     retired: Option<ExecutionEpoch>,
     units: usize,
+    compile: Option<compile::Identity>,
 }
 impl DispatchSlot {
     /// Withdraw and republish the uniquely owned payload during Closed. Readers
@@ -130,6 +136,7 @@ impl DispatchSlot {
             payload: AtomicPtr::new(Box::into_raw(payload)),
             retired: None,
             units: 0,
+            compile: None,
         }
     }
 
@@ -254,6 +261,10 @@ struct State {
     pending: [Option<MaintenanceSequence>; 5],
     completed: [Option<MaintenanceSequence>; 5],
     transition_owned: bool,
+    memory_mutations: usize,
+    // Cold claims can outlive their dispatch reservation after closure/eviction.
+    // Shutdown must drain those compilers before releasing the cache/indexes.
+    compilers: usize,
     shutdown: bool,
     failure: Option<Error>,
     dispatch: Registry<DispatchSlot>,
@@ -352,6 +363,8 @@ impl Lifetime {
                 pending: [None; 5],
                 completed: [None; 5],
                 transition_owned: false,
+                memory_mutations: 0,
+                compilers: 0,
                 shutdown: false,
                 failure: None,
                 dispatch: Registry::default(),
@@ -412,6 +425,10 @@ impl Lifetime {
 
     pub(crate) fn control_word(&self) -> &AtomicU32 {
         &self.pending
+    }
+
+    pub(crate) fn executable_cache(&self) -> &Arc<Cache> {
+        &self.cache
     }
 
     pub(crate) fn register(self: &Arc<Self>) -> Result<Reader, Error> {
@@ -564,6 +581,7 @@ impl Lifetime {
                 .replace(payload)
         };
         drop(old);
+        self.changed.notify_all();
         Ok(version)
     }
 
@@ -616,6 +634,49 @@ impl Lifetime {
     pub(crate) fn request(&self, reason: Reason) -> Result<Ticket<'_>, Error> {
         let mut state = self.lock();
         self.request_locked(&mut state, reason)
+    }
+
+    /// Idempotent terminal admission closure. Wakes exact-key compile waiters;
+    /// the executing workers finish their current bounded native fragment.
+    pub(crate) fn request_shutdown(&self) -> Result<(), Error> {
+        let mut state = self.lock();
+        state.healthy()?;
+        if !state.shutdown {
+            self.request_locked(&mut state, Reason::Shutdown)?;
+        }
+        Ok(())
+    }
+
+    /// One cold shutdown pass, with no own invocation or memory lease. False
+    /// means workers, compilers, memory mutations or retained outputs still need
+    /// to drain. The caller retries after releasing/joining those owners, never
+    /// by spinning here or treating a pending shutdown as successful.
+    pub(crate) fn try_shutdown(&self) -> Result<bool, Error> {
+        self.request_shutdown()?;
+        {
+            let state = self.lock();
+            state.healthy()?;
+            if state.completed[Reason::Shutdown as usize].is_some()
+                && !state.transition_owned
+                && state.pending.iter().all(Option::is_none)
+            {
+                return Ok(true);
+            }
+        }
+        let Some(mut transition) = self.try_transition()? else {
+            return Ok(false);
+        };
+        if !self.lock().idle() {
+            return Ok(false);
+        }
+        // Terminal admission is already closed: no new reader can enter after
+        // the idle check, so this establishes Closed without waiting.
+        transition.wait_closed()?;
+        if !transition.try_finish_shutdown()? {
+            return Ok(false);
+        }
+        transition.batch()?.complete()?;
+        transition.try_reopen()
     }
 
     fn request_locked(&self, state: &mut State, reason: Reason) -> Result<Ticket<'_>, Error> {
@@ -772,7 +833,34 @@ pub(crate) struct Invocation<'r, 'f, 's> {
     // reader registration can migrate between threads.
     thread: PhantomData<Rc<()>>,
 }
+
+/// A borrow of an active invocation, not ownership of a metadata snapshot.
+/// It cannot survive epoch quiescence and creates no second fault registry.
+pub(crate) struct FaultLookup<'a> {
+    directory: &'a directory::Directory,
+}
+impl FaultLookup<'_> {
+    /// Borrow immutable unit metadata while the same invocation epoch used for
+    /// fault lookup is active, including units with no faultable instructions.
+    pub(crate) fn unit(&self, pc: usize) -> Option<&unit::CodeUnit> {
+        unsafe { self.directory.unit(pc) }
+    }
+    pub(crate) fn find(&self, pc: usize) -> Option<directory::Fault<'_>> {
+        unsafe { self.directory.lookup(pc) }
+    }
+}
+
 impl<'s> Invocation<'_, '_, 's> {
+    /// Split native mutation of the frame from read-only fault attribution.
+    /// Both borrows keep this invocation and its epoch active through dispatch.
+    pub(crate) fn frame_and_faults(&mut self) -> (&mut NativeFrame<'s>, FaultLookup<'_>) {
+        (
+            self.frame,
+            FaultLookup {
+                directory: &self.reader.process.directory,
+            },
+        )
+    }
     /// The borrow prevents normal-stack fault dispatch from outliving this
     /// invocation's epoch. No lock, allocation or Arc operation occurs here.
     pub(crate) fn fault(&self, pc: usize) -> Option<directory::Fault<'_>> {
@@ -831,6 +919,7 @@ impl<'p> Transition<'p> {
             state.healthy()?;
             if state.idle() {
                 state.phase = Phase::Closed;
+                self.process.changed.notify_all();
                 return Ok(());
             }
             state = self.process.recover(self.process.changed.wait(state));
@@ -932,6 +1021,9 @@ impl Batch<'_, '_> {
     fn acknowledge(self, defer_links: bool) -> Result<(), Error> {
         let mut state = self.transition.process.lock();
         state.healthy()?;
+        if self.sequences[Reason::MappingChange as usize].is_some() && state.memory_mutations != 0 {
+            return Err(Error::MaintenancePending);
+        }
         if self.sequences.iter().enumerate().any(|(index, sequence)| {
             sequence
                 .is_some_and(|sequence| state.units.pending_retirement(REASONS[index], sequence))

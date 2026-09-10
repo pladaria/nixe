@@ -294,7 +294,7 @@ impl SharedMemoryObject {
 }
 
 /// Deterministic process handle-table failure.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum HandleError {
     Exhausted,
     AllocationFailed,
@@ -302,6 +302,7 @@ pub enum HandleError {
     ObjectTooLarge(usize),
     InvalidRange,
     BackingAccess,
+    MemoryWrite(Box<str>),
 }
 
 impl Display for HandleError {
@@ -318,6 +319,7 @@ impl Display for HandleError {
             Self::BackingAccess => {
                 formatter.write_str("canonical object backing could not complete the access")
             }
+            Self::MemoryWrite(error) => formatter.write_str(error),
         }
     }
 }

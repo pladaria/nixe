@@ -4,6 +4,11 @@
 
 use crate::analysis::StateSet;
 pub use crate::fp_env::UnsupportedFpControl;
+use nixe_cpu::exclusive::{ExclusiveMonitorState, ExclusiveReservation};
+use nixe_cpu::memory::{
+    CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccessSize,
+    MemoryValue,
+};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::{CpuProfileId, ProcessCpuContext};
 use nixe_cpu::state::a64::{A64State, Nzcv};
@@ -56,6 +61,78 @@ pub enum LazyFlags<Value> {
 }
 
 impl<Value> LazyFlags<Value> {
+    /// Preserve the recipe while translating SSA operands to final locations.
+    pub fn try_map<T, E>(
+        &self,
+        map: &mut impl FnMut(&Value) -> Result<T, E>,
+    ) -> Result<LazyFlags<T>, E> {
+        Ok(match self {
+            Self::Canonical(value) => LazyFlags::Canonical(map(value)?),
+            Self::Packed(value) => LazyFlags::Packed(map(value)?),
+            Self::Add {
+                lhs,
+                rhs,
+                result,
+                width,
+            } => LazyFlags::Add {
+                lhs: map(lhs)?,
+                rhs: map(rhs)?,
+                result: map(result)?,
+                width: *width,
+            },
+            Self::Subtract {
+                lhs,
+                rhs,
+                result,
+                width,
+            } => LazyFlags::Subtract {
+                lhs: map(lhs)?,
+                rhs: map(rhs)?,
+                result: map(result)?,
+                width: *width,
+            },
+            Self::AddCarry {
+                lhs,
+                rhs,
+                carry,
+                result,
+                width,
+            } => LazyFlags::AddCarry {
+                lhs: map(lhs)?,
+                rhs: map(rhs)?,
+                carry: map(carry)?,
+                result: map(result)?,
+                width: *width,
+            },
+            Self::SubtractCarry {
+                lhs,
+                rhs,
+                carry,
+                result,
+                width,
+            } => LazyFlags::SubtractCarry {
+                lhs: map(lhs)?,
+                rhs: map(rhs)?,
+                carry: map(carry)?,
+                result: map(result)?,
+                width: *width,
+            },
+            Self::Logical { result, width } => LazyFlags::Logical {
+                result: map(result)?,
+                width: *width,
+            },
+            Self::Conditional {
+                predicate,
+                when_true,
+                when_false,
+            } => LazyFlags::Conditional {
+                predicate: map(predicate)?,
+                when_true: Box::new(when_true.try_map(map)?),
+                when_false: *when_false,
+            },
+        })
+    }
+
     pub const fn dirty(&self) -> bool {
         !matches!(self, Self::Canonical(_))
     }
@@ -304,7 +381,7 @@ impl TryFrom<u32> for NativeExitReason {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct PollBudget {
     pub sample_remaining: i64,
     pub slice_remaining: i64,
@@ -432,8 +509,70 @@ pub struct NativeFrame<'a> {
     /// Invocation-local assembly continuation, installed by the native gateway.
     /// Never an inter-unit link or a host return address used by guest units.
     pub(crate) gateway_exit: usize,
+    pub(crate) exclusive_load: PendingExclusiveLoad,
     state_borrow: PhantomData<&'a mut A64State>,
 }
+
+/// A completed native load whose physical identity is resolved at the exit,
+/// before releasing mapping protection. Zero bytes means no monitor update.
+/// Generated code writes the address/value first and the width last, only
+/// after the guest load succeeds. A faulting load leaves the preceding record.
+/// The high bit marks a consumed reservation; a subsequent store fails without
+/// touching memory, and exit handoff clears the persistent thread monitor.
+#[derive(Default)]
+#[repr(C)]
+pub(crate) struct PendingExclusiveLoad {
+    pub address: u64,
+    pub value: [u64; 2],
+    pub bytes: u64,
+}
+
+impl PendingExclusiveLoad {
+    /// A native store consumes the monitor before its faultable CAS, retaining
+    /// the load's address/value/width for retry.
+    pub const CONSUMED: u64 = 1 << 63;
+
+    fn reservation(
+        &self,
+        memory: &dyn CpuMemory,
+        space: AddressSpaceId,
+    ) -> Result<ExclusiveReservation, DataAccessFault> {
+        let size = match self.bytes & !Self::CONSUMED {
+            1 => MemoryAccessSize::Byte,
+            2 => MemoryAccessSize::Halfword,
+            4 => MemoryAccessSize::Word,
+            8 => MemoryAccessSize::Doubleword,
+            16 => MemoryAccessSize::Quadword,
+            _ => {
+                return Err(DataAccessFault::new(
+                    space,
+                    GuestVirtualAddress::new(self.address),
+                    DataAccessKind::Read,
+                    DataAccessFaultReason::ValueSizeMismatch,
+                ));
+            }
+        };
+        let value = u128::from(self.value[0]) | (u128::from(self.value[1]) << 64);
+        memory.resolve_exclusive_load(
+            space,
+            GuestVirtualAddress::new(self.address),
+            MemoryValue::from_bits(size, value),
+        )
+    }
+}
+
+/// An exclusive store whose reservation needs physical-identity
+/// resolution (a different virtual alias or a preceding invocation).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExclusiveStoreOperation {
+    pub address: u8,
+    pub source: u8,
+    pub second: Option<u8>,
+    pub status: u8,
+    pub size: MemoryAccessSize,
+    pub release: bool,
+}
+
 impl<'a> NativeFrame<'a> {
     pub fn new(state: &'a mut A64State, budget: PollBudget) -> Self {
         Self {
@@ -449,8 +588,34 @@ impl<'a> NativeFrame<'a> {
             exit_state_map: 0,
             exit_reason: 0,
             gateway_exit: 0,
+            exclusive_load: PendingExclusiveLoad::default(),
             state_borrow: PhantomData,
         }
+    }
+
+    /// Transfer the last successful native exclusive load to the persistent
+    /// thread monitor, on normal exits and nonretry fault exits alike. Call
+    /// after native execution stops, before releasing its memory execution
+    /// lease, and before executing cold memory/system operations (e.g. CLREX).
+    /// Retry keeps the record in this same unmoved frame instead.
+    /// With no completed load the existing thread reservation is unchanged.
+    /// A native store clears it, including on nonretry faults.
+    pub fn finish_exclusive_load(
+        &mut self,
+        memory: &dyn CpuMemory,
+        space: AddressSpaceId,
+        monitor: &mut ExclusiveMonitorState,
+    ) -> Result<(), DataAccessFault> {
+        if self.exclusive_load.bytes == 0 {
+            return Ok(());
+        }
+        if self.exclusive_load.bytes & PendingExclusiveLoad::CONSUMED != 0 {
+            monitor.clear();
+        } else {
+            monitor.reserve(self.exclusive_load.reservation(memory, space)?);
+        }
+        self.exclusive_load.bytes = 0;
+        Ok(())
     }
 }
 const _: () = assert!(offset_of!(NativeFrame<'static>, spill) == 0);
@@ -554,6 +719,163 @@ impl ValueLocation {
             },
         }
     }
+}
+
+/// A canonical FP-system boundary completed after the gateway ends FP ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FpSystemOperation {
+    ReadStatus { rt: u8 },
+    WriteControl { rt: u8 },
+    WriteStatus { rt: u8 },
+}
+
+/// Typed scalar FP comparison at a cold exact-semantics exit. Registers refer
+/// to the canonical PRE-state, not live guest bytes or a legacy native context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpCompareOperation {
+    pub rn: u8,
+    pub rm: Option<u8>,
+    pub width_64: bool,
+    pub signaling: bool,
+    pub condition: Option<(nixe_cpu::semantics::conditions::Condition, u8)>,
+}
+
+/// Exact unary helper identity, retaining the decoder's conversion semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FpUnaryKind {
+    SquareRoot { width_64: bool },
+    Convert(nixe_cpu::decode::a64::fp_simd::FloatConversion),
+}
+
+/// Typed scalar FP unary completion over canonical PRE-state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpUnaryOperation {
+    pub rn: u8,
+    pub rd: u8,
+    pub kind: FpUnaryKind,
+}
+
+/// Typed exact scalar FADD/FSUB over canonical PRE-state operands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpAddOperation {
+    pub rn: u8,
+    pub rm: u8,
+    pub rd: u8,
+    pub width_64: bool,
+    pub operation: nixe_cpu::decode::a64::fp_simd::FloatAddOperation,
+}
+
+/// Typed exact scalar FDIV over canonical PRE-state operands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpDivideOperation {
+    pub rn: u8,
+    pub rm: u8,
+    pub rd: u8,
+    pub width_64: bool,
+}
+
+/// Packed FDIV over canonical vectors; only 2S, 4S and 2D are valid shapes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VectorFpDivideOperation {
+    pub rn: u8,
+    pub rm: u8,
+    pub rd: u8,
+    pub lane_64: bool,
+    pub vector_128: bool,
+}
+
+/// Packed FMUL by one selected element of the full source vector, even for 2S.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VectorFpMultiplyElementOperation {
+    pub rn: u8,
+    pub rm: u8,
+    pub rd: u8,
+    pub lane_64: bool,
+    pub vector_128: bool,
+    pub lane: u8,
+}
+
+/// Typed exact scalar FMUL/FNMUL over canonical PRE-state operands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpMultiplyOperation {
+    pub rn: u8,
+    pub rm: u8,
+    pub rd: u8,
+    pub width_64: bool,
+    pub operation: nixe_cpu::decode::a64::fp_simd::FloatMultiplyOperation,
+}
+
+/// Exact fused scalar operation over three canonical PRE-state operands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpFusedOperation {
+    pub rn: u8,
+    pub rm: u8,
+    pub ra: u8,
+    pub rd: u8,
+    pub width_64: bool,
+    pub operation: nixe_cpu::decode::a64::fp_simd::FloatFusedMultiplyOperation,
+}
+
+/// Typed FRINT completion over the scalar S/D source in canonical PRE-state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpRoundOperation {
+    pub rn: u8,
+    pub rd: u8,
+    pub width_64: bool,
+    pub rounding: nixe_cpu::decode::a64::fp_simd::FloatRoundOperation,
+}
+
+/// Exact SCVTF/UCVTF over a canonical W/X source and scalar S/D destination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntegerToFpOperation {
+    pub rn: u8,
+    pub rd: u8,
+    pub source_64: bool,
+    pub destination_64: bool,
+    pub signed: bool,
+}
+
+/// Advanced SIMD SCVTF/UCVTF, including the one-element scalar encodings.
+/// Only the low `vector_bits` participate; every higher destination bit clears.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VectorIntegerToFpOperation {
+    pub rn: u8,
+    pub rd: u8,
+    pub lane_64: bool,
+    pub vector_bits: u8,
+    pub signed: bool,
+}
+
+/// Exact FCVT-to-GPR operands. XZR/WZR discards only the integer result, not
+/// status or exceptions; the source is always a scalar vector register.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpToIntegerOperation {
+    pub rn: u8,
+    pub rd: u8,
+    pub source_64: bool,
+    pub destination_64: bool,
+    pub signed: bool,
+    pub rounding: nixe_cpu::decode::a64::fp_simd::FloatToIntegerRounding,
+    pub fractional_bits: u8,
+}
+
+/// Typed stateful system work consumed outside native execution. Source PC is
+/// retained by the owning exit record; operands refer to canonical registers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeSystemOperation {
+    TimerCounter {
+        rt: u8,
+    },
+    TimerFrequency {
+        rt: u8,
+    },
+    Hint(nixe_cpu::semantics::a64::HintOperation),
+    Barrier(nixe_cpu::memory::BarrierOperation),
+    ClearExclusive,
+    Cache {
+        kind: nixe_cpu::memory::CacheMaintenanceKind,
+        address_register: Option<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

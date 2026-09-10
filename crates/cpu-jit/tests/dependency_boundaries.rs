@@ -12,8 +12,6 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
     for required in [
         "cranelift-codegen = ",
         "cranelift-frontend = ",
-        "cranelift-jit = ",
-        "cranelift-module = ",
         "cranelift-native = ",
         "nixe-cpu.workspace = true",
         "nixe-memory.workspace = true",
@@ -24,6 +22,8 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
         );
     }
     for forbidden in [
+        "cranelift-jit = ",
+        "cranelift-module = ",
         "nixe-cpu-interpreter.workspace",
         "nixe-runtime.workspace",
         "nixe-horizon.workspace",
@@ -51,7 +51,8 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
     }
 
     let library = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    assert!(library.contains("pub use direct::{JitProcess, JitThread};"));
+    assert!(library.contains("pub use engine::{JitProcess, JitThread};"));
+    assert!(!library.contains("mod direct;"));
 }
 
 #[test]

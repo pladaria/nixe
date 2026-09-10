@@ -155,11 +155,20 @@ pub fn emit_canonical_writeback(source: &ExitStateMap) -> Result<Vec<u8>, Transf
 /// No host call, RET or SP adjustment is emitted. After data writeback no guest
 /// register remains live, so the epilogue may use RAX/X0 without saving it.
 /// Lazy or host NZCV is materialized by the writeback adapter before publication.
+/// `completed` is the uncharged work on this path (at most one 2048-instruction
+/// unit). Charge it once without changing host flags; PRE helper/fault exits
+/// exclude the instruction still awaiting completion.
 pub fn emit_canonical_exit(
     source: &ExitStateMap,
     pc: ValueLocation,
     reason: NativeExitReason,
+    completed: u16,
 ) -> Result<Vec<u8>, TransferError> {
+    if completed > 2048 {
+        return Err(TransferError::InvalidContract(
+            "exit work exceeds unit bound",
+        ));
+    }
     if !pc.valid(source.abi, 8) {
         return Err(TransferError::InvalidContract("invalid exit PC location"));
     }
@@ -194,6 +203,28 @@ pub fn emit_canonical_exit(
         8,
     );
     emitter.memory_at(false, RegisterClass::Integer, 0, scratch, 0, 8);
+    if completed != 0 {
+        let poll = source.abi.reserved().poll;
+        if source.abi == HostAbi::X86_64 {
+            // LEA r14,[r14-completed]: no flags, guest registers or memory touched.
+            emitter.x64(
+                &[],
+                true,
+                &[0x8d],
+                poll,
+                poll,
+                Some((-i32::from(completed)) as u32),
+            );
+        } else {
+            // SUB x20,x20,#completed (not SUBS).
+            emitter.word(
+                0xd1000000
+                    | (u32::from(completed) << 10)
+                    | (u32::from(poll) << 5)
+                    | u32::from(poll),
+            );
+        }
+    }
     emitter.constant(scratch, source.site.source.get(), 8);
     emitter.memory(
         false,

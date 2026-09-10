@@ -58,8 +58,13 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                 };
                 let mut second = landing(abi);
                 second.extend(
-                    emit_canonical_exit(&exit, ValueLocation::Constant(0xfedcba9876543210), reason)
-                        .unwrap(),
+                    emit_canonical_exit(
+                        &exit,
+                        ValueLocation::Constant(0xfedcba9876543210),
+                        reason,
+                        0,
+                    )
+                    .unwrap(),
                 );
                 let transfer = emit_fast_transfer(&source, &target).unwrap();
                 assert_eq!(transfer.is_empty(), !cycle);
@@ -228,11 +233,16 @@ fn canonical_exit_validates_pc_and_reason() {
             spill(0, 8),
             ValueLocation::Constant(u128::MAX),
         ] {
-            assert!(emit_canonical_exit(&source, pc, NativeExitReason::Dispatch).is_err());
+            assert!(emit_canonical_exit(&source, pc, NativeExitReason::Dispatch, 0).is_err());
         }
         assert!(
-            emit_canonical_exit(&source, ValueLocation::Constant(0), NativeExitReason::None)
-                .is_err()
+            emit_canonical_exit(
+                &source,
+                ValueLocation::Constant(0),
+                NativeExitReason::None,
+                0
+            )
+            .is_err()
         );
     }
 }
@@ -253,7 +263,7 @@ fn canonical_exit_preserves_dynamic_pc_until_writeback_finishes() {
                 code.extend(emit_canonical_entry(&entry).unwrap());
             }
             source.dirty_live = source.live;
-            code.extend(emit_canonical_exit(&source, pc, NativeExitReason::Control).unwrap());
+            code.extend(emit_canonical_exit(&source, pc, NativeExitReason::Control, 0).unwrap());
             if !native(abi) {
                 continue;
             }
@@ -321,6 +331,7 @@ fn invalid_native_budget_restores_fp_without_announcing_quiescence() {
                 &source,
                 ValueLocation::Constant(4),
                 NativeExitReason::Internal,
+                0,
             )
             .unwrap(),
         );

@@ -56,6 +56,7 @@ fn publish_unlinked(
             dependencies: Box::new([]),
             cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
             states: Box::new([StateRecord {
+                exit: None,
                 native_offset: output.offset,
                 state,
             }]),
@@ -367,6 +368,7 @@ fn branch(abi: HostAbi, bytes: &mut [u8], from: usize, to: usize) {
         offset: from.try_into().unwrap(),
         entry: false,
         patch_bytes: if abi == HostAbi::X86_64 { 8 } else { 4 },
+        fault_bytes: 0,
         values: vec![],
     }
     .patch_exit(bytes, 0, to as u64)
@@ -433,6 +435,7 @@ fn append_exit(bytes: &mut Vec<u8>, state: &ExitStateMap) -> usize {
             state,
             ValueLocation::Constant(0x12345678),
             NativeExitReason::Dispatch,
+            0,
         )
         .unwrap(),
     );

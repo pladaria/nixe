@@ -281,7 +281,7 @@ pub struct MaxwellThreeDResolvedImage {
     view: ImageView,
     source: MaxwellResolvedRange,
     mappings: Arc<[MaxwellThreeDMappingReference]>,
-    cpu_writes: Option<CanonicalCpuWriteDependency>,
+    cpu_writes: CanonicalCpuWriteDependency,
     guest_layout: MaxwellThreeDPreservedImageLayout,
     guest_format: MaxwellThreeDGuestImageFormat,
 }
@@ -318,8 +318,8 @@ impl MaxwellThreeDResolvedImage {
     pub(super) fn shared_mappings(&self) -> Arc<[MaxwellThreeDMappingReference]> {
         Arc::clone(&self.mappings)
     }
-    pub(super) fn cpu_write_dependency(&self) -> Option<&CanonicalCpuWriteDependency> {
-        self.cpu_writes.as_ref()
+    pub(super) fn cpu_write_dependency(&self) -> &CanonicalCpuWriteDependency {
+        &self.cpu_writes
     }
     #[must_use]
     pub const fn guest_layout(&self) -> MaxwellThreeDPreservedImageLayout {
@@ -515,10 +515,7 @@ impl MaxwellThreeDResolvedResources {
             MaxwellThreeDResolvedResource::Image(image)
                 if image.guest_layout.requires_materialization() =>
             {
-                image
-                    .cpu_writes
-                    .as_ref()
-                    .is_some_and(CanonicalCpuWriteDependency::remains_current)
+                image.cpu_writes.remains_current()
             }
             MaxwellThreeDResolvedResource::Image(_) => true,
         })
@@ -779,7 +776,7 @@ struct MaxwellThreeDDescriptorRead {
     range: CanonicalBackingRange,
     bytes: [u8; 32],
     size: u8,
-    cpu_writes: Option<CanonicalCpuWriteDependency>,
+    cpu_writes: CanonicalCpuWriteDependency,
 }
 
 impl MaxwellThreeDDescriptorRead {
@@ -787,11 +784,7 @@ impl MaxwellThreeDDescriptorRead {
         &self,
         staged_writes: Option<&CanonicalWriteBatch>,
     ) -> Result<bool, MaxwellThreeDResourceError> {
-        if !self
-            .cpu_writes
-            .as_ref()
-            .is_some_and(CanonicalCpuWriteDependency::remains_current)
-        {
+        if !self.cpu_writes.remains_current() {
             return Ok(false);
         }
         let Some(staged_writes) = staged_writes else {
@@ -1004,20 +997,12 @@ impl MaxwellThreeDRetainedBackingCache {
         let key = RetainedBackingKey::from(source);
         if let Some(entry) = self.entries.get(&key)
             && entry.source == *source
-            && entry
-                .retained
-                .cpu_writes
-                .as_ref()
-                .is_some_and(CanonicalCpuWriteDependency::remains_current)
+            && entry.retained.cpu_writes.remains_current()
         {
             return Ok(entry.retained.clone());
         }
 
         let retained = retained_backing(source, role)?;
-        if retained.cpu_writes.is_none() {
-            self.entries.remove(&key);
-            return Ok(retained);
-        }
         self.entries.insert(
             key,
             Arc::new(RetainedBackingCacheEntry {
@@ -1034,7 +1019,7 @@ struct RetainedResourceBacking {
     backing: BackingView,
     allocation_description: GpuAllocationDescription,
     mappings: Arc<[MaxwellThreeDMappingReference]>,
-    cpu_writes: Option<CanonicalCpuWriteDependency>,
+    cpu_writes: CanonicalCpuWriteDependency,
 }
 
 struct MaxwellImageDescriptionRequest {
@@ -1158,9 +1143,13 @@ impl<'a> ResourceBuilder<'a> {
             .range()
             .snapshot_subrange(offset, MAXWELL_DESCRIPTOR_SIZE)
             .map_err(MaxwellThreeDResourceError::Canonical)?;
+        // Arm before reading: a CPU write between the read and arming must not
+        // become the clean baseline for already-stale descriptor bytes.
+        let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
+            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
         let bytes = read_descriptor_bytes(&range, 0, self.staged_writes)?;
         self.descriptor_reads.push(MaxwellThreeDDescriptorRead {
-            cpu_writes: CanonicalCpuWriteDependency::capture(&range),
+            cpu_writes,
             range,
             bytes,
             size: MAXWELL_DESCRIPTOR_SIZE as u8,
@@ -1239,12 +1228,14 @@ impl<'a> ResourceBuilder<'a> {
             .range()
             .snapshot_subrange(u64::from(texture_reference.byte_offset), 4)
             .map_err(MaxwellThreeDResourceError::Canonical)?;
+        let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
+            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
         let mut bytes = [0_u8; 4];
         read_backing_bytes(&range, 0, &mut bytes, self.staged_writes)?;
         let mut expected = [0; 32];
         expected[..4].copy_from_slice(&bytes);
         self.descriptor_reads.push(MaxwellThreeDDescriptorRead {
-            cpu_writes: CanonicalCpuWriteDependency::capture(&range),
+            cpu_writes,
             range,
             bytes: expected,
             size: 4,
@@ -1979,7 +1970,8 @@ fn retained_backing(
     }
     let range =
         CanonicalBackingRange::new(canonical).map_err(MaxwellThreeDResourceError::Canonical)?;
-    let cpu_writes = CanonicalCpuWriteDependency::capture(&range);
+    let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
+        .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
     let allocation_description = GpuAllocationDescription::new(allocation_size(source)?, 1)
         .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
     let backing = BackingView::new(
@@ -2847,6 +2839,22 @@ mod tests {
         assert!(!Arc::ptr_eq(
             &after_overlapping_write.mappings,
             &after_remap.mappings
+        ));
+
+        // Failure to arm is not a usable resource without a dependency.
+        first.backing.range().invalidate_visibility().unwrap();
+        let error = MaxwellThreeDRetainedBackingCache::default()
+            .retain(&source, role)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MaxwellThreeDResourceError::CanonicalAccess(
+                nixe_memory::CanonicalRangeAccessError::Backing(
+                    nixe_memory::CanonicalPageError::Visibility(
+                        nixe_memory::VisibilityError::InvalidState
+                    )
+                )
+            )
         ));
     }
 }

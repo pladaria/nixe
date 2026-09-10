@@ -38,6 +38,51 @@ impl Drop for Collector<'_> {
 }
 
 impl Lifetime {
+    /// One synchronous cold LCQ pressure pass over existing charges. No own
+    /// reader/lease/compile claim may be retained here. The caller must retry
+    /// allocation from a fresh capture: this neither reserves bytes nor promises
+    /// that another compiler cannot consume the recovered headroom.
+    pub(crate) fn recover_capacity(&self) -> Result<(), Error> {
+        let ticket = self.request(Reason::Eviction)?;
+        loop {
+            {
+                let mut state = self.lock();
+                state.healthy()?;
+                if state.shutdown {
+                    return Err(Error::Shutdown);
+                }
+                if state.phase == Phase::Open
+                    && state.completed[Reason::Eviction as usize]
+                        .is_some_and(|sequence| sequence >= ticket.sequence)
+                {
+                    return Ok(());
+                }
+                // Release ownership while memory changes are in flight; their
+                // producer must be able to complete the same coordinator stop.
+                if state.transition_owned || state.memory_mutations != 0 {
+                    state = self.recover(self.changed.wait(state));
+                    drop(state);
+                    continue;
+                }
+            }
+            let Some(mut transition) = self.try_transition()? else {
+                continue;
+            };
+            transition.wait_closed()?;
+            transition.relieve_pressure(0, Tier::Lcq)?;
+            match transition.batch()?.complete() {
+                Ok(()) => {}
+                // A concurrent mutation/retirement joined this stop. Drop the
+                // transition and let its owner finish before the next pass.
+                Err(Error::MaintenancePending) => continue,
+                Err(error) => return Err(error),
+            }
+            if transition.try_reopen()? {
+                return Ok(());
+            }
+        }
+    }
+
     /// Acquire compiler/link ownership while the exact version is still
     /// eligible. A retired/invalidating unit cannot gain a new snapshot from
     /// an index; an existing snapshot may clone its own strong reference.
@@ -79,9 +124,15 @@ impl Lifetime {
             return Err(Error::PinnedBaseline);
         }
         let ticket = self.request_locked(&mut state, Reason::Eviction)?;
-        let record = state.units.records.get_mut(handle.0).unwrap();
+        let units = &mut state.units;
+        let record = units.records.get_mut(handle.0).unwrap();
         record.lifecycle = Lifecycle::Invalidating;
-        record.retirement = Some((Reason::Eviction, ticket.sequence));
+        record.queue_retirement(
+            handle.0,
+            &mut units.retirements,
+            Reason::Eviction,
+            ticket.sequence,
+        );
         Ok(ticket)
     }
 
@@ -122,7 +173,7 @@ impl Lifetime {
             let Some((handle, code, table)) = candidate else {
                 break;
             };
-            if !self.detach_faults(handle, &code, table)? {
+            if !self.detach_directory(handle, &code, table)? {
                 break;
             }
         }
@@ -200,7 +251,7 @@ impl Lifetime {
         }
     }
 
-    fn detach_faults(
+    fn detach_directory(
         &self,
         handle: Handle<UnitRecord>,
         code: &Arc<Accounted<CodeUnit>>,
@@ -467,6 +518,9 @@ impl Transition<'_> {
             if state.units.shutdown_finished {
                 return Ok(true);
             }
+            if state.compilers != 0 || state.memory_mutations != 0 {
+                return Ok(false);
+            }
         }
         self.drain_retirements()?;
         self.process.reclaim_units()?;
@@ -509,27 +563,11 @@ impl Transition<'_> {
     /// Newly arriving requests remain in records and are drained in this stop.
     pub(crate) fn drain_retirements(&mut self) -> Result<usize, Error> {
         let mut count = 0;
-        loop {
-            let handle = {
-                let state = self.process.lock();
-                self.require_closed(&state)?;
-                // Release active HCQ baseline promises before selecting LCQ.
-                state
-                    .units
-                    .records
-                    .find(|record| record.retirement.is_some() && record.code.tier == Tier::Hcq)
-                    .or_else(|| {
-                        state
-                            .units
-                            .records
-                            .find(|record| record.retirement.is_some())
-                    })
-            };
-            let Some(handle) = handle else {
-                return Ok(count);
-            };
-            count += usize::from(self.unlink(handle)?);
+        while let Some(unlinked) = self.unlink_next()? {
+            count += usize::from(unlinked);
         }
+        self.process.changed.notify_all();
+        Ok(count)
     }
 
     fn require_closed(&self, state: &crate::lifetime::State) -> Result<(), Error> {
@@ -540,18 +578,22 @@ impl Transition<'_> {
         Ok(())
     }
 
-    fn unlink(&mut self, handle: Handle<UnitRecord>) -> Result<bool, Error> {
+    fn unlink_next(&mut self) -> Result<Option<bool>, Error> {
         let removed_family = {
             let mut state = self.process.lock();
             self.require_closed(&state)?;
+            let Some(handle) = state.units.retirements.next() else {
+                return Ok(None);
+            };
             let record = state.units.records.get(handle).ok_or(Error::StaleUnit)?;
             let (reason, _) = record.retirement.ok_or(Error::StaleUnit)?;
             if reason == Reason::TierCutover
+                && record.invalidation.is_none()
                 && (rooted(&state, record)
                     || record.code.baseline_pins.load(Ordering::Relaxed) != 0)
             {
-                state.units.records.get_mut(handle).unwrap().retirement = None;
-                return Ok(false);
+                state.units.finish_retirement(handle);
+                return Ok(Some(false));
             }
             if !state.shutdown && record.code.baseline_pins.load(Ordering::Relaxed) != 0 {
                 return Err(Error::PinnedBaseline);
@@ -601,14 +643,14 @@ impl Transition<'_> {
             let record = state.units.records.get_mut(handle).unwrap();
             record.lifecycle = Lifecycle::Unlinked;
             record.lifecycle = Lifecycle::Retired(retired);
-            record.retirement = None;
             let family = record.family;
+            state.units.finish_retirement(handle);
             state.execution = next;
             family.map(|family| state.units.families.take_held(family).unwrap())
         };
         // Last-family destruction releases baseline pins outside state. Its
         // registry slot remains held until the HCQ unit's span is actually freed.
         drop(removed_family);
-        Ok(true)
+        Ok(Some(true))
     }
 }

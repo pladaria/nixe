@@ -856,8 +856,13 @@ impl<'a> MaxwellShaderMemoryView<'a> {
         let snapshot = CanonicalBackingRange::new(canonical_segments).map_err(|_| {
             MaxwellShaderTranslationError::SourceChangedDuringRead { stage, address }
         })?;
-        let cpu_writes = CanonicalCpuWriteDependency::capture(&snapshot)
-            .ok_or(MaxwellShaderTranslationError::SourceChangedDuringRead { stage, address })?;
+        let cpu_writes = CanonicalCpuWriteDependency::capture(&snapshot).map_err(|error| {
+            MaxwellShaderTranslationError::Memory {
+                stage,
+                address,
+                error: MaxwellGpuAccessError::Backing(error),
+            }
+        })?;
         let mut bytes = cpu_writes
             .snapshot_all(&snapshot)
             .map_err(|error| MaxwellShaderTranslationError::Memory {

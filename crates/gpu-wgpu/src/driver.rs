@@ -3976,8 +3976,10 @@ fn image_subresources_overlap(left: ImageSubresourceRange, right: ImageSubresour
 fn capture_cpu_writes(
     range: &nixe_memory::CanonicalBackingRange,
 ) -> Result<CanonicalCpuWriteDependency, BackendDriverError> {
-    CanonicalCpuWriteDependency::capture(range).ok_or_else(|| {
-        BackendDriverError::failure("failed to establish canonical CPU-write dependency")
+    CanonicalCpuWriteDependency::capture(range).map_err(|error| {
+        BackendDriverError::failure(format!(
+            "failed to establish canonical CPU-write dependency: {error}"
+        ))
     })
 }
 
@@ -4505,6 +4507,20 @@ mod tests {
         let records = HashMap::from([(11_u32, 40_u64), (22, 10), (33, 30)]);
 
         assert_eq!(least_recent_key(&records, |last_used| *last_used), Some(22));
+    }
+
+    #[test]
+    fn cpu_write_capture_preserves_the_backing_failure_diagnostic() {
+        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        range.invalidate_visibility().unwrap();
+        let expected = nixe_memory::CanonicalRangeAccessError::Backing(
+            nixe_memory::CanonicalPageError::Visibility(nixe_memory::VisibilityError::InvalidState),
+        );
+        let error = super::capture_cpu_writes(&range).unwrap_err();
+        assert!(error.to_string().contains(&expected.to_string()));
     }
 
     #[test]

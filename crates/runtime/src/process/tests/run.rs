@@ -1,6 +1,75 @@
 use super::*;
 
 #[test]
+fn production_lcq_uses_block_budgets_recompiles_mutated_code_and_retires() {
+    let (_directory, plan) = plan();
+    let mut process = ProcessBuilder::default()
+        .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
+        .build(&plan)
+        .unwrap();
+    let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
+    let space = process.cpu.address_space_id();
+    let mut words = vec![0x91000400_u32; 17]; // ADD X0,X0,#1.
+    words.push(0x17ffffef); // B entry: -17 instructions.
+    process
+        .memory
+        .overwrite_mapped_ram(
+            space,
+            entry,
+            &words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    process
+        .main_thread_mut()
+        .state_mut()
+        .write_x(A64Register::General(a64_register(0)), 0);
+    let mut thread = process
+        .execution
+        .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
+        .unwrap();
+    let zero = process.run_with_cpu_thread(&mut thread, 0).unwrap();
+    assert_eq!(zero.progress, 0);
+    assert_eq!(zero.stop, crate::ExecutionStop::BudgetExhausted);
+    let first = process.run_with_cpu_thread(&mut thread, 1).unwrap();
+    assert_eq!(first.progress, 18);
+    assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
+    assert_eq!(process.main_thread().state().pc(), entry.get());
+    assert_eq!(
+        process
+            .main_thread()
+            .state()
+            .read_x(A64Register::General(a64_register(0))),
+        17
+    );
+
+    process
+        .memory
+        .overwrite_mapped_ram(space, entry, &0x91002400_u32.to_le_bytes())
+        .unwrap(); // ADD #9.
+    let second = process.run_with_cpu_thread(&mut thread, 1).unwrap();
+    assert_eq!(second.progress, 18);
+    assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
+    assert_eq!(
+        process
+            .main_thread()
+            .state()
+            .read_x(A64Register::General(a64_register(0))),
+        42
+    );
+    process.request_execution_stop().unwrap();
+    process
+        .cpu_thread_teardown_state()
+        .prepare(&mut thread)
+        .unwrap();
+    drop(thread);
+    process.complete_cpu_thread_retirement().unwrap();
+    process.try_teardown().unwrap();
+}
+
+#[test]
 fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
     let (_directory, plan) = plan();
     let mut process = reference_process_builder().build(&plan).unwrap();

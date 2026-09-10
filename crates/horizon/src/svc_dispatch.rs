@@ -228,7 +228,8 @@ impl HorizonSvcFault {
                 | MemoryProtectionErrorReason::PermissionLocked => {
                     Some(HorizonKernelResult::INVALID_STATE)
                 }
-                MemoryProtectionErrorReason::GenerationExhausted => None,
+                MemoryProtectionErrorReason::GenerationExhausted
+                | MemoryProtectionErrorReason::ExecutionMutation(_) => None,
             },
             Self::MemoryMapping { fault } => match fault.reason {
                 MemoryMappingErrorReason::InvalidRange
@@ -242,7 +243,8 @@ impl HorizonSvcFault {
                 MemoryMappingErrorReason::ResourceExhausted => {
                     Some(HorizonKernelResult::RESOURCE_LIMIT)
                 }
-                MemoryMappingErrorReason::GenerationExhausted => None,
+                MemoryMappingErrorReason::GenerationExhausted
+                | MemoryMappingErrorReason::ExecutionMutation(_) => None,
             },
             Self::MemoryAlias { fault } => match fault.reason {
                 MemoryAliasErrorReason::InvalidRange
@@ -256,7 +258,8 @@ impl HorizonSvcFault {
                 MemoryAliasErrorReason::ResourceExhausted => {
                     Some(HorizonKernelResult::OUT_OF_RESOURCE)
                 }
-                MemoryAliasErrorReason::GenerationExhausted => None,
+                MemoryAliasErrorReason::GenerationExhausted
+                | MemoryAliasErrorReason::ExecutionMutation(_) => None,
             },
             Self::CanonicalMemory { .. } | Self::Ipc { .. } | Self::InternalRuntime { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
@@ -1947,6 +1950,40 @@ mod tests {
 
         for fault in faults {
             assert_eq!(fault.guest_result(), None);
+        }
+    }
+
+    #[test]
+    fn engine_mutation_failures_remain_terminal_and_preserve_the_diagnostic() {
+        let address_space = AddressSpaceId::new(1);
+        let address = GuestVirtualAddress::new(0x1000);
+        let cause = || nixe_memory::ExecutionMutationError("JIT admission is disabled".into());
+        let faults = [
+            HorizonSvcFault::MemoryProtection {
+                fault: MemoryProtectionError {
+                    address_space,
+                    address,
+                    reason: MemoryProtectionErrorReason::ExecutionMutation(cause()),
+                },
+            },
+            HorizonSvcFault::MemoryMapping {
+                fault: MemoryMappingError {
+                    address_space,
+                    address,
+                    reason: MemoryMappingErrorReason::ExecutionMutation(cause()),
+                },
+            },
+            HorizonSvcFault::MemoryAlias {
+                fault: MemoryAliasError {
+                    address_space,
+                    address,
+                    reason: MemoryAliasErrorReason::ExecutionMutation(cause()),
+                },
+            },
+        ];
+        for fault in faults {
+            assert_eq!(fault.guest_result(), None);
+            assert!(fault.to_string().contains("JIT admission is disabled"));
         }
     }
 

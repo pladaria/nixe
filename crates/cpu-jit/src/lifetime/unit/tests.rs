@@ -65,6 +65,7 @@ pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
                         offset: 12,
                         entry: false,
                         patch_bytes: 0,
+                        fault_bytes: (end - 12) as u8,
                         values: vec![],
                     }]),
                     traps: Box::new([]),
@@ -106,6 +107,7 @@ pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
         }]),
         cursor: MemoryInvalidationCursor::INITIAL,
         states: Box::new([StateRecord {
+            exit: None,
             native_offset: 12,
             state: ExitStateMap {
                 site: ExitSiteKey {
@@ -128,6 +130,7 @@ pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
             bytes: 8,
             subaccess: 0,
             commit_stage: 0,
+            completed_read: None,
             state_map: 0,
         }]),
     }
@@ -172,6 +175,17 @@ fn metadata_and_exact_faults_are_live_before_multi_entry_dispatch() {
         assert_eq!((entry.unit, entry.version), (owner.id, owner.version));
         assert_eq!(owner.abi_version, NATIVE_ABI_VERSION);
         let fault = invocation.fault(base + 12).unwrap();
+        // Unit ownership includes nonfaulting code, but that must not turn
+        // arbitrary native PCs into attributed guest memory accesses.
+        assert_eq!(
+            unsafe { process.directory.unit(base) }.unwrap().id,
+            owner.id
+        );
+        assert_eq!(
+            unsafe { process.directory.unit(base + 11) }.unwrap().id,
+            owner.id
+        );
+        assert!(unsafe { process.directory.unit(base + 16) }.is_none());
         assert_eq!(fault.unit.id, owner.id);
         assert_eq!(fault.record.access, Access::Read);
         assert_eq!(
@@ -219,6 +233,7 @@ fn uncommitted_units_never_appear_in_dispatch_or_fault_directory() {
         .unwrap()
         .unwrap();
     assert!(invocation.fault(address + 12).is_none());
+    assert!(unsafe { process.directory.unit(address) }.is_none());
     {
         let state = process.lock();
         let slot = *state.keys.get(&key(4)).unwrap();
@@ -532,7 +547,7 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
     let process = process();
     let cursor = AtomicU64::new(0);
     let publication = process.reserve(key(0)).unwrap();
-    for case in 0..8 {
+    for case in 0..14 {
         let mut candidate = input(&process, &[0], Tier::Lcq);
         match case {
             0 => candidate.entries[0].fast_offset = 16,
@@ -543,6 +558,21 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
             5 => candidate.tier = Tier::Hcq,
             6 => candidate.instructions[0].key = InstructionKey::new(key(8)).unwrap(),
             7 => candidate.states[0].state.site.source = CodeVersion::new(u64::MAX).unwrap(),
+            8 => candidate.faults[0].native_end -= 1,
+            9 => candidate.code.metadata.faults[0].fault_bytes = 0,
+            10 => candidate.faults[0].native_end += 1,
+            11 => candidate.faults[0].completed_read = Some(ValueLocation::Constant(0)),
+            12 | 13 => {
+                candidate.faults[0].subaccess = 1;
+                candidate.faults[0].completed_read = Some(ValueLocation::Register {
+                    class: crate::abi::RegisterClass::Integer,
+                    index: candidate.code.metadata.abi.reserved().frame,
+                });
+                if case == 13 {
+                    candidate.faults[0].completed_read = Some(ValueLocation::Constant(0));
+                    candidate.faults[0].commit_stage = 1;
+                }
+            }
             _ => unreachable!(),
         }
         assert!(matches!(

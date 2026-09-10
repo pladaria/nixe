@@ -515,6 +515,9 @@ fn dispatch_binder_relay(
                         crate::graphics::FramebufferError::Backend(reason) => {
                             IpcWireError::GraphicsBackend(reason)
                         }
+                        crate::graphics::FramebufferError::Memory(error) => {
+                            IpcWireError::GraphicsBackend(error.to_string().into())
+                        }
                         crate::graphics::FramebufferError::NvMap(_) => {
                             IpcWireError::Malformed("queued graphic-buffer image view is invalid")
                         }

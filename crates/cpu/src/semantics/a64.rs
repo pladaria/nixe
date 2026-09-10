@@ -35,6 +35,20 @@ impl SimdMemoryShape {
     pub const fn register_count(self) -> u8 {
         self.repetitions * self.structure_registers
     }
+
+    /// Register offset and lane in Arm's repetition/element/structure order.
+    /// LD1 finishes a register before the next; LD2/3/4 interleave registers.
+    /// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85#page=1544
+    #[must_use]
+    pub const fn multiple_element(self, index: u8) -> (u8, u8) {
+        let per_repetition = self.elements_per_register * self.structure_registers;
+        let repetition = index / per_repetition;
+        let element = index % per_repetition;
+        (
+            repetition + element % self.structure_registers,
+            element / self.structure_registers,
+        )
+    }
 }
 
 #[must_use]
@@ -56,6 +70,11 @@ pub const fn simd_multiple_structure_shape(fields: fp_simd::Operands) -> Option<
         3 => MemoryAccessSize::Doubleword,
         _ => return None,
     };
+    // The .1D arrangement is allocated only for LD1/ST1, not LD2/3/4 or ST2/3/4.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85#page=1573
+    if !fields.vector_128 && fields.element_size == 3 && structure_registers != 1 {
+        return None;
+    }
     let vector_bytes = if fields.vector_128 { 16 } else { 8 };
     let elements_per_register = vector_bytes / element_size.bytes() as u8;
     let transfer_bytes = vector_bytes * structure_registers * repetitions;
@@ -511,7 +530,10 @@ mod tests {
                     let shape = simd_multiple_structure_shape(fields);
                     assert_eq!(
                         shape.is_some(),
-                        matches!(structure_opcode, 0 | 2 | 4 | 6 | 7 | 8 | 10),
+                        matches!(structure_opcode, 0 | 2 | 4 | 6 | 7 | 8 | 10)
+                            && (vector_128
+                                || element_size != 3
+                                || matches!(structure_opcode, 2 | 6 | 7 | 10)),
                         "multiple structure opcode={structure_opcode} size={element_size} q={vector_128}"
                     );
                     if let Some(shape) = shape {
