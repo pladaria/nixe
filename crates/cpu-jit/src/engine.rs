@@ -13,7 +13,7 @@ use crate::lifetime::{self, Lifetime, Reader, compile::Request};
 use nixe_cpu::{
     error::{InstructionFetchFault, InstructionFetchFaultReason},
     exclusive::ExclusiveMonitorState,
-    execution::CpuControl,
+    execution::{CpuControl, VcpuEventState},
     memory::ExecutionMemory,
     profile::ProcessCpuContext,
     state::a64::A64State,
@@ -203,13 +203,15 @@ impl JitThread {
         }
     }
 
-    /// One unlinked fragment, returning owned output for completion after
+    /// One native invocation (possibly a chain), returning owned output after
     /// native protections are gone, together with the reconciled budget.
     pub(crate) fn invoke(
         &mut self,
+        returns: &mut crate::ReturnStack,
         worker: &mut NativeWorker,
         state: &mut A64State,
         budget: PollBudget,
+        events: &VcpuEventState,
     ) -> Result<(Option<invocation::Exit>, PollBudget), invocation::Error> {
         if budget.slice_remaining <= 0 {
             return Err(invocation::Error::Native(
@@ -220,10 +222,15 @@ impl JitThread {
             return Ok((None, budget)); // Demand reports the precise fetch fault.
         };
         let faults = worker.faults().map_err(invocation::Error::Runtime)?;
-        let mut frame = NativeFrame::new(state, budget);
+        returns.prepare(key);
+        let mut frame = NativeFrame::new(state, budget).with_return_stack(returns);
+        // The process is bound by Reader::admit. These Arc-backed request words
+        // remain alive throughout run; native cold polls only acquire-read them.
+        frame.poll_requests[1] = self.control.pending_word_address() as *const _;
+        frame.poll_requests[2] = events.pending_interrupts_address() as *const _;
         // SAFETY: this process fixes memory/platform/arena; this vCPU owns its
-        // reader, compiler and monitor. Only this host's unlinked LCQ output
-        // is published. Prior invocation FP restoration precedes the fresh frame.
+        // reader, compiler and monitor. Only this host's LCQ output and protected
+        // static/PIC bridges are published. Prior FP restoration precedes entry.
         let result = unsafe {
             invocation::run(
                 &mut self.reader,

@@ -64,6 +64,7 @@ enum PairKind {
 #[derive(Clone, Copy)]
 enum Operation {
     Load,
+    CacheProbe,
     Store(ir::Value),
     Rmw {
         operation: ir::AtomicRmwOp,
@@ -76,6 +77,30 @@ enum Operation {
 }
 
 impl Translator<'_> {
+    /// A successful confined byte read proves mapped, CPU-visible RAM under
+    /// the invocation lease. No bytes, dirty epochs or guest registers change.
+    /// Protection faults complete CIVAC only after releasing native ownership;
+    /// they must never become guest loads, MMIO reads or ordinary read repairs.
+    /// Keep the load trapping even though its value is unused, and retain PRE
+    /// operands in the existing fault span on both host backends.
+    /// https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/DC-CIVAC--Data-or-unified-Cache-line-Clean-and-Invalidate-by-VA-to-PoC
+    pub(super) fn cache_probe(
+        &mut self,
+        pc: GuestVirtualAddress,
+        rt: u8,
+        flags: &LazyFlags<ir::Value>,
+    ) -> Result<(), Error> {
+        let address = self.read_register(rt, false)?;
+        self.memory_access(
+            Site::first(pc),
+            address,
+            types::I8,
+            Operation::CacheProbe,
+            flags,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn memory(
         &mut self,
         pc: GuestVirtualAddress,
@@ -932,6 +957,7 @@ impl Translator<'_> {
             pc: site.pc,
             access: match operation {
                 Operation::Load => Access::Read,
+                Operation::CacheProbe => Access::CacheProbe,
                 Operation::Store(_) => Access::Write,
                 Operation::CompareExchange { .. } | Operation::Rmw { .. } => Access::Atomic,
             },
@@ -972,6 +998,7 @@ pub(super) fn records(
             native_offset: map.offset,
             state,
             exit: None,
+            transfer: None,
         });
         faults.push(FaultRecord {
             native_start: map.offset,

@@ -31,10 +31,10 @@ fn cold_miss_reclaims_live_lcq_then_recaptures_without_charging_guest_work() {
     state.set_pc(PC.get() + 4);
     let report = thread
         .run_slice(
+            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             10,
-            None,
             &Timer,
             &VcpuEventState::default(),
         )
@@ -52,7 +52,13 @@ fn cold_miss_reclaims_live_lcq_then_recaptures_without_charging_guest_work() {
     state.set_pc(PC.get());
     assert!(
         thread
-            .invoke(&mut worker, &mut state, PollBudget::new(4096, 1).unwrap())
+            .invoke(
+                &mut crate::ReturnStack::default(),
+                &mut worker,
+                &mut state,
+                PollBudget::new(4096, 1).unwrap(),
+                &VcpuEventState::default()
+            )
             .unwrap()
             .0
             .is_none()
@@ -76,7 +82,14 @@ fn unsatisfied_capacity_stops_once_with_exact_state_and_does_not_poison_the_cach
     let before = state.clone();
     let events = VcpuEventState::default();
     let error = thread
-        .run_slice(&mut worker, &mut state, 10, None, &Timer, &events)
+        .run_slice(
+            &mut crate::ReturnStack::default(),
+            &mut worker,
+            &mut state,
+            10,
+            &Timer,
+            &events,
+        )
         .unwrap_err();
     assert_eq!(error.kind, CpuFaultKind::Unavailable);
     assert!(error.message.contains("LCQ capacity at"));
@@ -89,7 +102,14 @@ fn unsatisfied_capacity_stops_once_with_exact_state_and_does_not_poison_the_cach
     // Allocation authority remains usable after the external owner releases
     // its charge. No poisoned cache, stranded closure or legacy fallback.
     let report = thread
-        .run_slice(&mut worker, &mut state, 10, None, &Timer, &events)
+        .run_slice(
+            &mut crate::ReturnStack::default(),
+            &mut worker,
+            &mut state,
+            10,
+            &Timer,
+            &events,
+        )
         .unwrap();
     assert!(matches!(
         report.stop,

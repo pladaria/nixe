@@ -1,8 +1,9 @@
 //! Concrete Cranelift JIT backend.
 //!
 //! Demanded straight-line A64 fragments lower to CLIF and execute through the
-//! bounded code cache and epoch-safe native gateway. Linking and functional
-//! HCQ promotion are not yet enabled.
+//! bounded code cache and epoch-safe native gateway, with static links and
+//! per-vCPU indirect PICs and guest-thread return prediction. Functional HCQ
+//! promotion is not yet enabled.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("nixe-cpu-jit requires Linux direct-memory support");
@@ -17,6 +18,7 @@ mod jit_error;
 mod lcq;
 mod lowering;
 mod memory_lowering;
+mod rsb;
 mod simd_lowering;
 // Link/tier maintenance contracts become production consumers in Tasks 4–8.
 #[allow(dead_code)]
@@ -28,3 +30,4 @@ pub mod native;
 
 pub use engine::{JitProcess, JitThread};
 pub use jit_error::Error as JitError;
+pub use rsb::ReturnStack;

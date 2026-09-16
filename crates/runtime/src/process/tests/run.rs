@@ -1,6 +1,240 @@
 use super::*;
 
 #[test]
+fn return_stack_moves_with_guest_execution_across_vcpus_and_abort() {
+    for backend in [
+        crate::CpuBackendConfig::Interpreter,
+        crate::CpuBackendConfig::Jit,
+    ] {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::default()
+            .with_cpu_backend(backend.clone())
+            .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
+            .build(&plan)
+            .unwrap();
+        let thread_id = process.main_thread_id();
+        let identity = process
+            .main_thread()
+            .jit_returns
+            .as_deref()
+            .map(std::ptr::from_ref);
+        assert_eq!(
+            identity.is_some(),
+            matches!(backend, crate::CpuBackendConfig::Jit)
+        );
+        let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
+        for id in [0, 1, 0] {
+            let vcpu = nixe_scheduler::VirtualCpuId::new(id);
+            let mut cpu = process.create_worker_cpu_thread(vcpu).unwrap();
+            let mut execution = process
+                .begin_thread_execution(
+                    thread_id,
+                    vcpu,
+                    0,
+                    nixe_cpu::execution::VcpuEventState::default(),
+                )
+                .unwrap();
+            // The table cannot retain a second owner while this guest lease runs.
+            assert!(process.main_thread().state.is_none());
+            assert!(process.main_thread().jit_returns.is_none());
+            assert_eq!(
+                execution.jit_returns.as_deref().map(std::ptr::from_ref),
+                identity
+            );
+            let result = execution.run(&mut worker, &mut cpu);
+            let report = process
+                .finish_thread_execution(thread_id, vcpu, execution, result)
+                .unwrap();
+            assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
+            assert_eq!(
+                process
+                    .main_thread()
+                    .jit_returns
+                    .as_deref()
+                    .map(std::ptr::from_ref),
+                identity
+            );
+        }
+        let vcpu = nixe_scheduler::VirtualCpuId::new(1);
+        let execution = process
+            .begin_thread_execution(
+                thread_id,
+                vcpu,
+                0,
+                nixe_cpu::execution::VcpuEventState::default(),
+            )
+            .unwrap();
+        process.abort_thread_execution(thread_id, vcpu, execution);
+        assert!(process.main_thread().state.is_some());
+        assert_eq!(
+            process
+                .main_thread()
+                .jit_returns
+                .as_deref()
+                .map(std::ptr::from_ref),
+            identity
+        );
+        worker.finish().unwrap();
+    }
+}
+
+#[test]
+fn loader_stub_executes_before_runtime_termination_on_both_backends() {
+    for backend in [
+        crate::CpuBackendConfig::Interpreter,
+        crate::CpuBackendConfig::Jit,
+    ] {
+        for split in [false, true] {
+            let (_directory, plan) = plan();
+            let mut process = ProcessBuilder::default()
+                .with_cpu_backend(backend.clone())
+                .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
+                .build(&plan)
+                .unwrap();
+            let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
+            let stub = process.main_thread().loader_return.unwrap();
+            process
+                .memory
+                .overwrite_mapped_ram(
+                    process.cpu.address_space_id(),
+                    entry,
+                    &0xd65f03c0_u32.to_le_bytes(),
+                )
+                .unwrap(); // RET X30 to the real mapped loader stub.
+            let result = 0x8123_4567_89ab_cdef;
+            process
+                .main_thread_mut()
+                .state_mut()
+                .write_x(A64Register::General(a64_register(0)), result);
+            let mut cpu_thread = process
+                .execution
+                .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
+                .unwrap();
+
+            if split {
+                let returned = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
+                assert_eq!(returned.stop, crate::ExecutionStop::BudgetExhausted);
+                assert_eq!(returned.progress, 1);
+                assert_eq!(process.main_thread().state().pc(), stub.get());
+                assert!(process.exit().is_none());
+                let zero = process.run_with_cpu_thread(&mut cpu_thread, 0).unwrap();
+                assert_eq!(zero.stop, crate::ExecutionStop::BudgetExhausted);
+                assert_eq!(zero.progress, 0);
+                cpu_thread
+                    .control()
+                    .request(nixe_cpu::execution::ControlRequest::Preempt);
+                let paused = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
+                assert_eq!(paused.stop, crate::ExecutionStop::Safepoint);
+                assert_eq!(paused.progress, 0);
+                assert_eq!(process.main_thread().state().pc(), stub.get());
+                assert!(process.exit().is_none());
+            }
+            let report = process.run_with_cpu_thread(&mut cpu_thread, 16).unwrap();
+            assert!(matches!(report.stop,
+                crate::ExecutionStop::LoaderReturn { source, result_code }
+                    if source.pc == stub && result_code == result));
+            assert_eq!(report.progress, if split { 1 } else { 2 }); // RET, then SVC.
+            assert_eq!(process.main_thread().state().pc(), stub.get());
+            assert_eq!(
+                report.context,
+                Some(process.main_thread().state().register_context())
+            );
+            assert_eq!(
+                process.lifecycle(),
+                nixe_scheduler::ProcessLifecycle::Exited
+            );
+            let exit = process.exit().unwrap();
+            assert_eq!(exit.cause, ProcessExitCause::LoaderReturned);
+            assert_eq!(exit.exit_code, result);
+            assert_eq!(exit.source.unwrap().pc, stub);
+            assert_eq!(exit.context.as_deref(), report.context.as_ref());
+            assert_eq!(
+                process.main_thread().exit.as_ref().unwrap().exit_code,
+                result
+            );
+
+            process.request_execution_stop().unwrap();
+            process
+                .cpu_thread_teardown_state()
+                .prepare(&mut cpu_thread)
+                .unwrap();
+            drop(cpu_thread);
+            process.complete_cpu_thread_retirement().unwrap();
+            process.try_teardown().unwrap();
+        }
+    }
+}
+
+#[test]
+fn loader_stub_recognition_requires_the_thread_address_and_exit_svc() {
+    for backend in [
+        crate::CpuBackendConfig::Interpreter,
+        crate::CpuBackendConfig::Jit,
+    ] {
+        // Same SVC elsewhere, same stub without this thread's registration,
+        // and another SVC at the registered address must remain ordinary calls.
+        for case in 0..3 {
+            let (_directory, plan) = plan();
+            let mut process = ProcessBuilder::default()
+                .with_cpu_backend(backend.clone())
+                .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
+                .build(&plan)
+                .unwrap();
+            let stub = process.main_thread().loader_return.unwrap();
+            let pc = if case == 0 {
+                GuestVirtualAddress::new(process.entry_module().entry_address())
+            } else {
+                stub
+            };
+            let (instruction, immediate) = if case == 2 {
+                (0xd4000841_u32, 0x42)
+            } else {
+                (HOME_BREW_EXIT_PROCESS_INSTRUCTION, 7)
+            };
+            process
+                .memory
+                .overwrite_mapped_ram(
+                    process.cpu.address_space_id(),
+                    pc,
+                    &instruction.to_le_bytes(),
+                )
+                .unwrap();
+            if case == 1 {
+                process.main_thread_mut().loader_return = None;
+            }
+            process.main_thread_mut().state_mut().set_pc(pc.get());
+            let mut cpu_thread = process
+                .execution
+                .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
+                .unwrap();
+            let report = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
+            assert!(matches!(report.stop,
+                crate::ExecutionStop::SupervisorCall { source, immediate: observed }
+                    if source.pc == pc && observed == immediate));
+            assert_eq!(report.progress, 1);
+            assert_eq!(process.main_thread().state().pc(), pc.get());
+            assert_eq!(
+                report.context,
+                Some(process.main_thread().state().register_context())
+            );
+            assert!(process.exit().is_none());
+            assert_eq!(
+                process.lifecycle(),
+                nixe_scheduler::ProcessLifecycle::Running
+            );
+            process.request_execution_stop().unwrap();
+            process
+                .cpu_thread_teardown_state()
+                .prepare(&mut cpu_thread)
+                .unwrap();
+            drop(cpu_thread);
+            process.complete_cpu_thread_retirement().unwrap();
+            process.try_teardown().unwrap();
+        }
+    }
+}
+
+#[test]
 fn production_lcq_uses_block_budgets_recompiles_mutated_code_and_retires() {
     let (_directory, plan) = plan();
     let mut process = ProcessBuilder::default()

@@ -251,6 +251,7 @@ pub(super) fn synthetic(
                         entry: false,
                         patch_bytes: 0,
                         fault_bytes: 0,
+                        poll: None,
                         values: vec![],
                     }]),
                     faults: fault_bytes
@@ -260,6 +261,7 @@ pub(super) fn synthetic(
                             entry: false,
                             patch_bytes: 0,
                             fault_bytes: bytes,
+                            poll: None,
                             values: vec![],
                         })
                         .into_iter()
@@ -274,6 +276,7 @@ pub(super) fn synthetic(
         .unwrap();
     let mut states = vec![StateRecord {
         exit: None,
+        transfer: None,
         native_offset: offset,
         state: exit.clone(),
     }];
@@ -282,6 +285,7 @@ pub(super) fn synthetic(
             exit.site.state_map = 1;
             states.push(StateRecord {
                 exit: None,
+                transfer: None,
                 native_offset: fault_offset,
                 state: exit,
             });

@@ -1,0 +1,335 @@
+use super::*;
+use crate::native::pic::{Record, Table, set_index};
+use crate::native::rsb::{emit_push, emit_return_probe};
+use crate::rsb::{CAPACITY, Continuation, ReturnStack};
+use nixe_cpu::{platform::TargetPlatform, profile::CpuProfileId, state::a64::Nzcv};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+
+fn key(wide: bool) -> BlockKey {
+    BlockKey {
+        address_space: AddressSpaceId::new(if wide { 0xfedc_ba98_7654_3210 } else { 1 }),
+        pc: GuestVirtualAddress::new(if wide { 0x1234_5678_9abc_0000 } else { 0x1000 }),
+        profile: CpuProfileId::new(if wide { 0x8765_4321_fedc_ba98 } else { 1 }),
+        platform: if wide {
+            TargetPlatform::Switch2
+        } else {
+            TargetPlatform::Switch1
+        },
+        fp: if wide {
+            FpSpecialization::Exact(u32::MAX)
+        } else {
+            FpSpecialization::Dynamic
+        },
+    }
+}
+
+#[test]
+fn native_rsb_return_checks_full_keys_pops_and_uses_only_matched_pics() {
+    let _restore = crate::fp_env::tests::RestoreHost::new();
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        for flags in 0..4 {
+            let (mut source, mut entry) = canonical::complete(abi);
+            if flags < 2 {
+                source.nzcv = NzcvLocation::Host {
+                    carry_inverted: flags == 1,
+                };
+                entry.nzcv = source.nzcv.clone();
+            } else if flags == 3 {
+                source.nzcv = NzcvLocation::Deferred(LazyFlags::Packed(spill(3240, 4)));
+            }
+            for wide in [false, true] {
+                let target = key(wide);
+                for operand in 0..4 {
+                    let pc = match operand {
+                        0 => {
+                            source
+                                .bindings
+                                .iter()
+                                .find(|b| b.value == GuestValue::General(0))
+                                .unwrap()
+                                .location
+                        }
+                        1 => spill(3400, 8),
+                        2 => ValueLocation::Constant(target.pc.get().into()),
+                        _ => vector(0),
+                    };
+                    let probe = emit_return_probe(&source, target, pc).unwrap();
+                    if !canonical::native(abi) {
+                        continue;
+                    }
+                    let mut hit = gateway::landing(abi);
+                    hit.extend(
+                        emit_canonical_exit(
+                            &source,
+                            ValueLocation::Constant(0x4444),
+                            NativeExitReason::Dispatch,
+                            0,
+                        )
+                        .unwrap(),
+                    );
+                    let (hit_owner, hit_id) = gateway::compile(&hit);
+                    let mut bytes = gateway::landing(abi);
+                    bytes.extend(emit_canonical_entry(&entry).unwrap());
+                    bytes.extend(probe);
+                    bytes.extend(
+                        emit_canonical_exit(
+                            &source,
+                            ValueLocation::Constant(0x8888),
+                            NativeExitReason::Control,
+                            0,
+                        )
+                        .unwrap(),
+                    );
+                    let (owner, id) = gateway::compile(&bytes);
+                    let table = Table::new();
+                    let slot = set_index(source.site, target) * 2;
+                    let mut record = Box::new(Record::new(
+                        source.site,
+                        target,
+                        hit_owner.get_finalized_function(hit_id) as usize,
+                    ));
+                    for case in 0..12 {
+                        // 0/1 hit either way; 2 no cached bridge; 3..7 wrong RSB
+                        // field; 8 empty RSB; 9 absent RSB; 10 absent PIC;
+                        // 11 wrong PIC source, even though the RSB matches.
+                        record.source =
+                            source.site.source.get() ^ if case == 11 { 1 << 40 } else { 0 };
+                        unsafe {
+                            table.set(slot, std::ptr::null());
+                            table.set(slot + 1, std::ptr::null());
+                            if case != 2 {
+                                table.set(slot + usize::from(case == 1), &*record);
+                            }
+                        }
+                        for head in [0_u32, 15] {
+                            for depth in [1, 16] {
+                                for nibble in 0..16 {
+                                    let mut stack = ReturnStack {
+                                        entries: [Continuation::from(target); CAPACITY],
+                                        head,
+                                        depth: if case == 8 { 0 } else { depth },
+                                    };
+                                    let top = ((head.wrapping_sub(1)) & 15) as usize;
+                                    match case {
+                                        3 => stack.entries[top].pc ^= 1, // Misaligned architectural target must not match.
+                                        4 => stack.entries[top].address_space ^= 1 << 40,
+                                        5 => stack.entries[top].profile ^= 1 << 40,
+                                        6 => stack.entries[top].platform ^= 1,
+                                        7 => stack.entries[top].fp ^= 1 << 32, // Dynamic vs Exact(0).
+                                        _ => {}
+                                    }
+                                    let mut expected_stack = stack.clone();
+                                    if (3..=8).contains(&case) {
+                                        expected_stack.clear();
+                                    } else if case != 9 {
+                                        expected_stack.head = top as u32;
+                                        expected_stack.depth -= 1;
+                                    }
+                                    let hit = case < 2;
+                                    let (mut state, _) = canonical::pattern(&entry);
+                                    state.set_fpcr(0);
+                                    state.set_nzcv(Nzcv::from_bits(nibble << 28));
+                                    state.general_register_storage_mut()[0] = target.pc.get();
+                                    if operand == 3 {
+                                        state.set_vector(
+                                            0,
+                                            u128::from(target.pc.get()) | (0xabcd_u128 << 64),
+                                        );
+                                    }
+                                    let mut expected_state = state.clone();
+                                    expected_state.set_pc(if hit { 0x4444 } else { 0x8888 });
+                                    {
+                                        let mut frame = NativeFrame::new(
+                                            &mut state,
+                                            PollBudget::new(7, 11).unwrap(),
+                                        );
+                                        if case != 9 {
+                                            frame = frame.with_return_stack(&mut stack);
+                                        }
+                                        for (i, byte) in
+                                            target.pc.get().to_le_bytes().into_iter().enumerate()
+                                        {
+                                            frame.spill[3400 + i] = MaybeUninit::new(byte);
+                                        }
+                                        frame.indirect_pic = if case == 10 {
+                                            std::ptr::null()
+                                        } else {
+                                            table.as_ptr()
+                                        };
+                                        frame.execution_epoch = 1;
+                                        unsafe { frame.begin_fp() };
+                                        let returned = unsafe {
+                                            enter_protected(
+                                                &mut frame,
+                                                std::ptr::dangling_mut(),
+                                                owner.get_finalized_function(id),
+                                            )
+                                        }
+                                        .unwrap();
+                                        assert_eq!(
+                                            returned.reason,
+                                            if hit {
+                                                NativeExitReason::Dispatch
+                                            } else {
+                                                NativeExitReason::Control
+                                            },
+                                            "{abi:?}, case={case}"
+                                        );
+                                    }
+                                    assert_eq!(
+                                        state, expected_state,
+                                        "{abi:?}, case={case}, flags={flags}, nzcv={nibble}, operand={operand}"
+                                    );
+                                    assert_eq!(
+                                        stack, expected_stack,
+                                        "{abi:?}, case={case}, head={head}, depth={depth}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    unsafe {
+                        table.set(slot, std::ptr::null());
+                        table.set(slot + 1, std::ptr::null());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_rsb_push_rejects_misaligned_continuations() {
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        let (source, _) = canonical::complete(abi);
+        let mut target = key(false);
+        target.pc = GuestVirtualAddress::new(0x1001);
+        assert_eq!(
+            emit_push(&source, target),
+            Err(TransferError::InvalidContract("unaligned RSB continuation"))
+        );
+    }
+}
+
+#[test]
+fn native_rsb_push_wraps_and_saturates_without_changing_guest_state() {
+    let _restore = crate::fp_env::tests::RestoreHost::new();
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        for flags in 0..4 {
+            let (mut source, mut entry) = canonical::complete(abi);
+            if flags < 2 {
+                source.nzcv = NzcvLocation::Host {
+                    carry_inverted: flags == 1,
+                };
+                entry.nzcv = source.nzcv.clone();
+            } else if flags == 3 {
+                source.nzcv = NzcvLocation::Deferred(LazyFlags::Packed(spill(3240, 4)));
+            }
+            for wide in [false, true] {
+                for count in [1, 20] {
+                    let first = key(wide);
+                    let continuations: Vec<_> = (0..count)
+                        .map(|index| first.at(first.pc.checked_add(index * 4).unwrap()).unwrap())
+                        .collect();
+                    let mut bytes = gateway::landing(abi);
+                    bytes.extend(emit_canonical_entry(&entry).unwrap());
+                    for continuation in &continuations {
+                        bytes.extend(emit_push(&source, *continuation).unwrap());
+                    }
+                    bytes.extend(
+                        emit_canonical_exit(
+                            &source,
+                            ValueLocation::Constant(0x4444),
+                            NativeExitReason::Dispatch,
+                            0,
+                        )
+                        .unwrap(),
+                    );
+                    if !canonical::native(abi) {
+                        continue;
+                    }
+                    let (owner, id) = gateway::compile(&bytes);
+                    for head in [0, 1, 15] {
+                        for depth in [0, 1, 15, 16] {
+                            for nibble in 0..16 {
+                                let (mut state, _) = canonical::pattern(&entry);
+                                state.set_fpcr(0);
+                                state.set_nzcv(Nzcv::from_bits(nibble << 28));
+                                let mut expected_state = state.clone();
+                                expected_state.set_pc(0x4444);
+                                let mut stack = ReturnStack {
+                                    entries: [Continuation::default(); CAPACITY],
+                                    head,
+                                    depth,
+                                };
+                                // Distinct old entries detect writes to the wrong slot, including
+                                // unoccupied cells which the push has no reason to touch.
+                                for (slot, value) in stack.entries.iter_mut().enumerate() {
+                                    *value = Continuation::from(
+                                        first
+                                            .at(GuestVirtualAddress::new(0x8000 + slot as u64 * 4))
+                                            .unwrap(),
+                                    );
+                                }
+                                let mut expected = stack.clone();
+                                for continuation in &continuations {
+                                    expected.entries[expected.head as usize] =
+                                        Continuation::from(*continuation);
+                                    expected.head = (expected.head + 1) % 16;
+                                    expected.depth = (expected.depth + 1).min(16);
+                                }
+                                {
+                                    let mut frame = NativeFrame::new(
+                                        &mut state,
+                                        PollBudget::new(7, 11).unwrap(),
+                                    )
+                                    .with_return_stack(&mut stack);
+                                    frame.execution_epoch = 1;
+                                    unsafe { frame.begin_fp() };
+                                    let returned = unsafe {
+                                        enter_protected(
+                                            &mut frame,
+                                            std::ptr::dangling_mut(),
+                                            owner.get_finalized_function(id),
+                                        )
+                                    }
+                                    .unwrap();
+                                    assert_eq!(returned.reason, NativeExitReason::Dispatch);
+                                }
+                                assert_eq!(
+                                    state, expected_state,
+                                    "{abi:?}, flags={flags}, nzcv={nibble}"
+                                );
+                                assert_eq!(
+                                    stack, expected,
+                                    "{abi:?}, head={head}, depth={depth}, count={count}"
+                                );
+                            }
+                        }
+                    }
+                    // An isolated frame may omit prediction storage. Native guest
+                    // register/flag semantics must remain identical in that case.
+                    let (mut state, _) = canonical::pattern(&entry);
+                    state.set_fpcr(0);
+                    let mut expected = state.clone();
+                    expected.set_pc(0x4444);
+                    {
+                        let mut frame =
+                            NativeFrame::new(&mut state, PollBudget::new(7, 11).unwrap());
+                        frame.execution_epoch = 1;
+                        unsafe { frame.begin_fp() };
+                        unsafe {
+                            enter_protected(
+                                &mut frame,
+                                std::ptr::dangling_mut(),
+                                owner.get_finalized_function(id),
+                            )
+                        }
+                        .unwrap();
+                    }
+                    assert_eq!(state, expected);
+                }
+            }
+        }
+    }
+}

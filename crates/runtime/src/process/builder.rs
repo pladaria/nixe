@@ -254,6 +254,8 @@ impl ProcessBuilder {
             object: main_thread_object,
             exit: None,
             state: Some(state),
+            jit_returns: matches!(self.cpu_backend, execution::CpuBackendConfig::Jit)
+                .then(Box::<nixe_cpu_jit::ReturnStack>::default),
             handle: main_thread_handle,
             stack_bottom,
             stack_top,
@@ -572,8 +574,9 @@ fn install_homebrew_loader_return(
     address: GuestVirtualAddress,
 ) -> Result<(), ProcessBuildError> {
     let mut page = [0_u8; SYNTHETIC_PAGE_SIZE];
-    // If a CPU backend misses the runtime return-address boundary, the
-    // mapped fallback still performs the ABI-prescribed process exit.
+    // Execute a normal ExitProcess SVC on return. Runtime completion recognizes
+    // this thread's stub source and retains X0 as the loader result; CPU backends
+    // and native links need no special return-address interception.
     page[..4].copy_from_slice(&HOME_BREW_EXIT_PROCESS_INSTRUCTION.to_le_bytes());
     memory
         .install_ram_pages_atomic(

@@ -225,6 +225,7 @@ identities!(
     AdmissionEpoch,
     MaintenanceSequence,
     DispatchGeneration,
+    BridgeGeneration,
     AdmissionSnapshotSequence,
     SampleSequence
 );
@@ -339,7 +340,7 @@ impl DispatchPayload {
 }
 
 /// Version of the NativeFrame/register/entry layout recorded by CodeUnits.
-pub const NATIVE_ABI_VERSION: u32 = 1;
+pub const NATIVE_ABI_VERSION: u32 = 3;
 pub const TRANSFER_BYTES: u32 = 2048;
 pub const SPILL_BYTES: u32 = 16384;
 pub const SAMPLE_INTERVAL: i64 = 4096;
@@ -503,14 +504,34 @@ pub struct NativeFrame<'a> {
     pub admission_epoch: u64,
     pub runtime: *mut c_void,
     pub exit_pc: u64,
+    /// Address inside the actual exiting unit, published only on a cold exit.
+    /// Resolve through the protected native-PC directory, not the initial entry.
+    pub exit_native_pc: usize,
     pub exit_source_version: u64,
     pub exit_state_map: u32,
     pub exit_reason: u32,
     /// Invocation-local assembly continuation, installed by the native gateway.
     /// Never an inter-unit link or a host return address used by guest units.
     pub(crate) gateway_exit: usize,
+    /// Native fallback continuation and invocation-borrowed cold resolver.
+    /// Neither pointer is used by an installed fast link. A bare gateway with
+    /// no dispatch owner leaves the callback absent and exits canonically.
+    pub(crate) dispatch_fallback: usize,
+    pub(crate) dispatch_resolver:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i64) -> usize>,
+    pub(crate) dispatch_context: *mut c_void,
+    /// Borrowed stable table for this process/vCPU; null disables native PIC
+    /// probes. The registration and its occupied bridge owners outlive entry.
+    pub(crate) indirect_pic: *const *const crate::native::pic::Record,
+    /// Exclusively borrowed from the scheduled guest thread, not the vCPU.
+    /// Bare ABI fixtures may leave it null; production invocations bind it.
+    pub(crate) return_stack: *mut crate::ReturnStack,
+    /// Acquire-read only at cold polls: process maintenance, vCPU requests,
+    /// and pending interrupts. Owners must outlive protected execution. An
+    /// isolated invocation with no such owner uses the immutable quiet word.
+    pub(crate) poll_requests: [*const std::sync::atomic::AtomicU32; 3],
     pub(crate) exclusive_load: PendingExclusiveLoad,
-    state_borrow: PhantomData<&'a mut A64State>,
+    state_borrow: PhantomData<(&'a mut A64State, &'a mut crate::ReturnStack)>,
 }
 
 /// A completed native load whose physical identity is resolved at the exit,
@@ -584,13 +605,27 @@ impl<'a> NativeFrame<'a> {
             admission_epoch: 0,
             runtime: std::ptr::null_mut(),
             exit_pc: 0,
+            exit_native_pc: 0,
             exit_source_version: 0,
             exit_state_map: 0,
             exit_reason: 0,
             gateway_exit: 0,
+            dispatch_fallback: 0,
+            dispatch_resolver: None,
+            dispatch_context: std::ptr::null_mut(),
+            indirect_pic: std::ptr::null(),
+            return_stack: std::ptr::null_mut(),
+            poll_requests: [&QUIET_POLL_REQUEST; 3],
             exclusive_load: PendingExclusiveLoad::default(),
             state_borrow: PhantomData,
         }
+    }
+
+    /// Both architectural state and predictions remain exclusively borrowed
+    /// until this frame is dropped, including all cold resolver resumptions.
+    pub fn with_return_stack(mut self, returns: &'a mut crate::ReturnStack) -> Self {
+        self.return_stack = returns;
+        self
     }
 
     /// Transfer the last successful native exclusive load to the persistent
@@ -619,6 +654,7 @@ impl<'a> NativeFrame<'a> {
     }
 }
 const _: () = assert!(offset_of!(NativeFrame<'static>, spill) == 0);
+static QUIET_POLL_REQUEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const _: () = assert!(offset_of!(NativeFrame<'static>, canonical) == SPILL_BYTES as usize);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -949,10 +985,14 @@ pub struct ExitStateMap {
     /// Include clean live values too: helper saves and fast bridges need their
     /// physical locations even when canonical exit need not store them.
     pub live: StateSet,
+    /// Values whose canonical homes may be stale, including inherited fast-entry
+    /// state still needed by this boundary, not just writes performed in this unit.
     pub dirty_live: StateSet,
     pub bindings: Box<[ValueBinding]>,
     pub nzcv: NzcvLocation,
-    /// OR pending host status with the mapped/canonical software FPSR.
+    /// Host status may be pending, including from earlier units. OR it with
+    /// mapped/canonical software FPSR only when NativeFrame owns an active
+    /// guest FP segment. This is not proof that this unit activated FP.
     pub host_fpsr_pending: bool,
 }
 

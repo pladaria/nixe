@@ -329,7 +329,9 @@ impl Drop for ExecutionSharedGuard {
             .active_shared
             .checked_sub(1)
             .expect("a shared execution guard is released exactly once");
-        if state.active_shared == 0 {
+        // Only an exclusive transition waits for readers to drain. Its pending
+        // flag and this last-reader check share the condvar's predicate mutex.
+        if state.active_shared == 0 && state.transition_pending {
             self.gate.inner.changed.notify_all();
         }
     }
@@ -537,6 +539,37 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(follower.join().unwrap(), 2);
         assert_eq!(gate.epoch(), 2);
+    }
+
+    #[test]
+    fn transition_waits_for_the_last_shared_reader() {
+        let gate = ExecutionGate::new();
+        let first = gate.acquire_shared();
+        let last = gate.acquire_shared();
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        gate.set_transition_notifier(Some(Arc::new(move || {
+            pending_tx.send(()).unwrap();
+        })));
+        let worker_gate = gate.clone();
+        let worker = std::thread::spawn(move || {
+            let _transition = worker_gate.acquire_exclusive();
+            done_tx.send(()).unwrap();
+        });
+        pending_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(first);
+        assert_eq!(gate.lock_state().active_shared, 1);
+        assert_eq!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        drop(last);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        // Once the writer reopens admission, ordinary reader release remains
+        // sufficient for the next writer even without an outstanding waiter.
+        drop(gate.acquire_shared());
+        drop(gate.acquire_exclusive());
     }
 
     #[test]

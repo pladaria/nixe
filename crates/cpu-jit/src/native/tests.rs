@@ -6,10 +6,13 @@ use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::mem::MaybeUninit;
 
 mod backend;
+mod bridge;
 mod canonical;
 mod flags;
 mod gateway;
+mod pic;
 mod published;
+mod rsb;
 
 fn register(class: RegisterClass, index: u8) -> ValueLocation {
     ValueLocation::Register { class, index }
@@ -78,6 +81,7 @@ fn identical_contracts_emit_no_transfer() {
         };
         target.nzcv = source.nzcv.clone();
         assert!(emit_fast_transfer(&source, &target).unwrap().is_empty());
+        assert!(emit_chain_transfer(&source, &target).unwrap().is_empty());
         execute(&source, &target, 11);
     }
 }

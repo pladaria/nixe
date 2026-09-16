@@ -89,7 +89,6 @@ pub struct InterpreterRunRequest<'a> {
     pub memory_lease: Option<ExecutionMemoryLease<'a>>,
     pub state: &'a mut A64State,
     pub instruction_budget: u64,
-    pub loader_return: Option<GuestVirtualAddress>,
     pub timer: &'a dyn ArchitecturalTimer,
     pub events: VcpuEventState,
 }
@@ -149,18 +148,6 @@ impl InterpreterThread {
         )
         .with_direct_memory(direct_slice.as_ref());
         loop {
-            if let Some((source, result_code)) =
-                loader_return_observation(self.cpu, request.state, request.loader_return)
-            {
-                return Ok(Self::report(
-                    executed,
-                    CpuExit::LoaderReturn {
-                        source,
-                        result_code,
-                    },
-                    request.state,
-                ));
-            }
             let pending_interrupts = request.events.take_pending_interrupts();
             if pending_interrupts != 0 {
                 return Ok(Self::report(
@@ -342,19 +329,4 @@ fn backend_fault(message: impl ToString) -> CpuFault {
         message: message.to_string().into(),
         context: Box::new(A64State::default().register_context()),
     }
-}
-
-fn loader_return_observation(
-    cpu: ProcessCpuContext,
-    state: &A64State,
-    loader_return: Option<GuestVirtualAddress>,
-) -> Option<(LocationDescriptor, u64)> {
-    let return_address = loader_return?;
-    (state.pc() == return_address.get()).then(|| {
-        let source = LocationDescriptor::new(return_address, cpu.profile_id());
-        let result_code = state.read_x(nixe_cpu::state::a64::A64Register::General(
-            nixe_cpu::state::a64::A64GeneralRegister::new(0).expect("valid result register"),
-        ));
-        (source, result_code)
-    })
 }

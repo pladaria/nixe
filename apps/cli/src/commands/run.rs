@@ -489,6 +489,10 @@ fn execute_worker(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
     );
+    // No scheduler lease survives execute(). Stop and join GPU work while its
+    // canonical memory transitions can still use the JIT coordinator. Removing
+    // the process closes native admission and would reject those transitions.
+    let graphics_teardown = video_system.teardown();
     let process = coordinator
         .remove_process(process_id)
         .expect("serialized execution returns every scheduler lease");
@@ -507,7 +511,7 @@ fn execute_worker(
     WorkerResult {
         execution,
         teardown,
-        graphics_teardown: video_system.teardown(),
+        graphics_teardown,
     }
 }
 

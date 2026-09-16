@@ -46,6 +46,52 @@ pub(super) fn setup(words: &[u32], writable: bool) -> JitThread {
 }
 
 #[test]
+fn cold_poll_observes_bound_requests_without_consuming_them() {
+    use nixe_cpu::execution::ControlRequest;
+    for interrupt in [false, true] {
+        let mut worker = NativeWorker::default();
+        let mut thread = setup(&[0xb1000400, 0x14000000], false); // ADDS X0,X0,#1; B .
+        let events = VcpuEventState::default();
+        if interrupt {
+            events.post_interrupts(4);
+        } else {
+            thread.control.request(ControlRequest::Preempt);
+        }
+        let mut state = A64State::default();
+        state.set_pc(PC.get());
+        let (Some(Exit::Native { returned, .. }), budget) = thread
+            .invoke(
+                &mut crate::ReturnStack::default(),
+                &mut worker,
+                &mut state,
+                PollBudget::new(1, 100).unwrap(),
+                &events,
+            )
+            .unwrap()
+        else {
+            panic!("expected native control exit")
+        };
+        assert_eq!(returned.reason, crate::abi::NativeExitReason::Control);
+        assert!(!returned.poll.sample && !returned.poll.exhausted);
+        assert_eq!(budget.slice_remaining, 98);
+        assert_eq!(budget.sample_remaining, 4095);
+        assert_eq!(state.general_register_storage_mut()[0], 1);
+        assert_eq!(state.pc(), PC.get() + 4);
+        if interrupt {
+            assert_eq!(events.take_pending_interrupts(), 4);
+        } else {
+            assert!(
+                thread
+                    .control
+                    .take_pending()
+                    .unwrap()
+                    .contains(ControlRequest::Preempt)
+            );
+        }
+    }
+}
+
+#[test]
 fn bounded_straight_line_work_is_charged_once_with_slice_and_sample_overshoot() {
     let mut worker = NativeWorker::default();
     for count in [1, 17, 512] {
@@ -53,7 +99,13 @@ fn bounded_straight_line_work_is_charged_once_with_slice_and_sample_overshoot() 
         let mut state = A64State::default();
         state.set_pc(PC.get());
         let (Some(Exit::Native { returned, .. }), budget) = thread
-            .invoke(&mut worker, &mut state, PollBudget::new(1, 1).unwrap())
+            .invoke(
+                &mut crate::ReturnStack::default(),
+                &mut worker,
+                &mut state,
+                PollBudget::new(1, 1).unwrap(),
+                &VcpuEventState::default(),
+            )
             .unwrap()
         else {
             panic!()
@@ -79,7 +131,13 @@ fn taken_and_untaken_branches_charge_the_branch_and_preserve_lazy_nzcv() {
             }),
             budget,
         ) = thread
-            .invoke(&mut worker, &mut state, PollBudget::new(4096, 1).unwrap())
+            .invoke(
+                &mut crate::ReturnStack::default(),
+                &mut worker,
+                &mut state,
+                PollBudget::new(4096, 1).unwrap(),
+                &VcpuEventState::default(),
+            )
             .unwrap()
         else {
             panic!()
@@ -111,7 +169,13 @@ fn escaped_fault_charges_only_completed_prefix_and_retry_does_not_double_charge(
         state.general_register_storage_mut()[0] = 37;
         state.general_register_storage_mut()[1] = if valid { 0x3800 } else { 0x5000 };
         let (Some(exit), budget) = thread
-            .invoke(&mut worker, &mut state, PollBudget::new(4096, 1).unwrap())
+            .invoke(
+                &mut crate::ReturnStack::default(),
+                &mut worker,
+                &mut state,
+                PollBudget::new(4096, 1).unwrap(),
+                &VcpuEventState::default(),
+            )
             .unwrap()
         else {
             panic!()
@@ -135,9 +199,13 @@ fn escaped_fault_charges_only_completed_prefix_and_retry_does_not_double_charge(
                 MemoryValue::U64(37)
             );
         } else {
-            assert!(
-                matches!(exit, Exit::Memory { outcome: MemoryExit::Fault(_), poll, .. } if poll.exhausted)
-            );
+            assert!(matches!(
+                exit,
+                Exit::Memory {
+                    outcome: MemoryExit::Fault(_),
+                    ..
+                }
+            ));
             assert_eq!(budget.slice_remaining, 0);
             assert_eq!(state.pc(), PC.get() + 4);
         }
@@ -153,7 +221,13 @@ fn pre_completion_exits_do_not_charge_the_pending_instruction() {
         let mut state = A64State::default();
         state.set_pc(PC.get());
         let (Some(Exit::Native { returned, .. }), budget) = thread
-            .invoke(&mut worker, &mut state, PollBudget::new(4096, 10).unwrap())
+            .invoke(
+                &mut crate::ReturnStack::default(),
+                &mut worker,
+                &mut state,
+                PollBudget::new(4096, 10).unwrap(),
+                &VcpuEventState::default(),
+            )
             .unwrap()
         else {
             panic!()
@@ -175,7 +249,13 @@ fn exhausted_budget_never_registers_a_worker_or_enters_native_code() {
         let mut budget = PollBudget::new(4096, 1).unwrap();
         budget.reconcile(remaining, false).unwrap();
         assert!(matches!(
-            thread.invoke(&mut worker, &mut state, budget),
+            thread.invoke(
+                &mut crate::ReturnStack::default(),
+                &mut worker,
+                &mut state,
+                budget,
+                &VcpuEventState::default()
+            ),
             Err(invocation::Error::Native(
                 crate::native::NativeReturnError::Budget(crate::abi::BudgetError::ExhaustedSlice)
             ))

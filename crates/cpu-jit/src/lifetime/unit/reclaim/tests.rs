@@ -213,6 +213,66 @@ fn empty_segment_republication_uses_same_address_but_fresh_generation() {
 }
 
 #[test]
+fn decommit_scan_preserves_unpublished_allocations_without_directory_tables() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let staged = input(&process, &[0], Tier::Lcq);
+    let address = staged.code.allocation.address();
+    let generation = staged.code.allocation.generation;
+    // No unit record or directory table exists yet. The cache lease must still
+    // prevent the empty-segment check from decommitting this segment.
+    assert!(process.lock().units.segment_records.iter().all(|n| *n == 0));
+    assert_eq!(process.reclaim_units().unwrap(), 0);
+    assert_eq!(process.cache.usage().unwrap().committed, SEGMENT_BYTES);
+    assert!(process.lock().units.decommitting.iter().all(|flag| !flag));
+    let unit = process
+        .prepare_unit(&[process.reserve(key(0)).unwrap()], staged, &cursor)
+        .unwrap()
+        .publish()
+        .unwrap();
+    let snapshot = process.snapshot(unit).unwrap();
+    let segment = snapshot.code.allocation.segment;
+    assert_eq!(process.lock().units.segment_records[segment], 1);
+    assert_eq!(snapshot.code.allocation.address(), address);
+    assert_eq!(snapshot.code.allocation.generation, generation);
+    process.retire_unit(unit).unwrap();
+    drain(&process);
+    assert_eq!(process.reclaim_units().unwrap(), 0);
+    assert_eq!(process.lock().units.segment_records[segment], 1);
+    drop(snapshot);
+    assert_eq!(process.reclaim_units().unwrap(), 1);
+    assert_eq!(process.lock().units.segment_records[segment], 0);
+    assert_eq!(process.cache.usage().unwrap().committed, 0);
+}
+
+#[test]
+fn segment_record_counts_follow_shared_spans_and_reused_slots() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let survivor = publish(&process, &cursor, &[0], Tier::Lcq);
+    let segment = process.snapshot(survivor).unwrap().code.allocation.segment;
+    for _ in 0..16 {
+        let old = publish(&process, &cursor, &[4], Tier::Lcq);
+        let retained = process.snapshot(old).unwrap();
+        assert_eq!(retained.code.allocation.segment, segment);
+        assert_eq!(process.lock().units.segment_records[segment], 2);
+        process.retire_unit(old).unwrap();
+        drain(&process);
+        assert_eq!(process.reclaim_units().unwrap(), 0);
+        assert_eq!(process.lock().units.segment_records[segment], 2);
+        drop(retained);
+        assert_eq!(process.reclaim_units().unwrap(), 1);
+        assert_eq!(process.lock().units.segment_records[segment], 1);
+        assert_eq!(process.cache.usage().unwrap().committed, SEGMENT_BYTES);
+    }
+    process.retire_unit(survivor).unwrap();
+    drain(&process);
+    assert_eq!(process.reclaim_units().unwrap(), 1);
+    assert!(process.lock().units.segment_records.iter().all(|n| *n == 0));
+    assert_eq!(process.cache.usage().unwrap().committed, 0);
+}
+
+#[test]
 fn hcq_retirement_restores_all_baselines_and_releases_family_pins() {
     let process = process();
     let cursor = AtomicU64::new(0);
@@ -430,6 +490,84 @@ fn pressure_evicts_oldest_hcq_before_any_lcq_without_waiting_on_snapshots() {
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
     drop(charge);
+}
+
+#[test]
+fn pressure_leaves_headroom_for_the_next_segment_without_another_eviction() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let baseline = publish(&process, &cursor, &[0], Tier::Lcq);
+    let optimized = publish(&process, &cursor, &[0], Tier::Hcq);
+    assert_eq!(process.cache.usage().unwrap().committed, 2 * SEGMENT_BYTES);
+    let charge = process
+        .cache
+        .charge_metadata(
+            SOFT_BYTES - process.cache.usage().unwrap().total(),
+            Tier::Lcq,
+        )
+        .unwrap();
+    process.recover_capacity().unwrap();
+    // Merely dropping below the trigger would evict HCQ alone. The low-water
+    // target also retires the now-unpinned baseline, leaving a segment plus
+    // metadata worth of headroom; no retained references are bypassed.
+    assert!(process.lock().units.records.get(optimized.0).is_none());
+    assert!(process.lock().units.records.get(baseline.0).is_none());
+    assert!(process.cache.usage().unwrap().total() <= SOFT_BYTES - 2 * SEGMENT_BYTES);
+    assert!(process.lock().units.segment_retired.iter().all(|n| *n == 0));
+    let replacement = publish(&process, &cursor, &[4], Tier::Lcq);
+    assert!(!process.cache.usage().unwrap().needs_reclamation());
+    process.recover_capacity().unwrap();
+    assert!(process.snapshot(replacement).is_ok());
+    drop(charge);
+}
+
+#[test]
+fn eviction_batches_keep_creation_order_after_slot_reuse_and_prioritize_hcq() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let units: Vec<_> = (0..EVICTION_BATCH + 8)
+        .map(|index| publish(&process, &cursor, &[4 * index as u64], Tier::Lcq))
+        .collect();
+    for unit in &units[..4] {
+        process.retire_unit(*unit).unwrap();
+    }
+    drain(&process);
+    assert_eq!(process.reclaim_units().unwrap(), 4);
+    for index in 0..4 {
+        publish(&process, &cursor, &[4 * index], Tier::Lcq);
+    }
+    {
+        let state = process.lock();
+        let candidates: Vec<_> = state
+            .units
+            .eviction_candidates()
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(candidates.len(), EVICTION_BATCH);
+        assert_eq!(
+            candidates,
+            units[4..4 + EVICTION_BATCH]
+                .iter()
+                .map(|unit| unit.0)
+                .collect::<Vec<_>>()
+        );
+    }
+    let hcq = publish(&process, &cursor, &[0], Tier::Hcq);
+    assert_eq!(
+        process
+            .lock()
+            .units
+            .eviction_candidates()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        vec![hcq.0]
+    );
+    process.retire_unit(hcq).unwrap();
+    drain(&process);
+    process.reclaim_units().unwrap();
+    assert!(process.lock().units.segment_retired.iter().all(|n| *n == 0));
 }
 
 #[test]

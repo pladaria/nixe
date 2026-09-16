@@ -125,6 +125,7 @@ impl CpuThread {
         &mut self,
         worker: &mut nixe_cpu_direct_memory::NativeWorker,
         request: RunRequest<'_>,
+        returns: Option<&mut nixe_cpu_jit::ReturnStack>,
     ) -> Result<ExecutionReport, CpuFault> {
         match self {
             Self::Interpreter(thread) => {
@@ -133,7 +134,6 @@ impl CpuThread {
                     memory_lease,
                     state,
                     instruction_budget,
-                    loader_return,
                     timer,
                     events,
                     ..
@@ -145,7 +145,6 @@ impl CpuThread {
                         memory_lease,
                         state,
                         instruction_budget,
-                        loader_return,
                         timer,
                         events,
                     },
@@ -156,10 +155,10 @@ impl CpuThread {
                 // native entry. Never carry a caller lease into its cold loop.
                 drop(request.memory_lease);
                 thread.run_slice(
+                    returns.expect("a scheduled JIT guest owns its return stack"),
                     worker,
                     request.state,
                     request.instruction_budget,
-                    request.loader_return,
                     request.timer,
                     &request.events,
                 )
@@ -438,6 +437,10 @@ impl ProcessExecutionControl {
     pub(crate) const fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
+
+    pub(crate) fn new_return_stack(&self) -> Option<Box<nixe_cpu_jit::ReturnStack>> {
+        matches!(self.backend, CpuBackend::Jit(_)).then(Box::default)
+    }
     pub(crate) const fn process_id(&self) -> CpuProcessId {
         self.process_id
     }
@@ -619,13 +622,13 @@ struct RuntimeTimer<'a> {
 
 pub(crate) struct VcpuExecutionState {
     pub(crate) thread: ThreadCpuState,
+    pub(crate) jit_returns: Option<Box<nixe_cpu_jit::ReturnStack>>,
     pub(crate) cpu: ProcessCpuContext,
     pub(crate) memory: Arc<ExecutionMemory>,
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) architectural_timer_frequency: u64,
     pub(crate) address_space_end: GuestVirtualAddress,
     pub(crate) instruction_budget: u64,
-    pub(crate) loader_return: Option<GuestVirtualAddress>,
     pub(crate) events: VcpuEventState,
 }
 
@@ -672,10 +675,10 @@ impl VcpuExecutionState {
                     memory_lease,
                     state: &mut self.thread,
                     instruction_budget: self.instruction_budget,
-                    loader_return: self.loader_return,
                     timer: &timer,
                     events: self.events.clone(),
                 },
+                self.jit_returns.as_deref_mut(),
             )
             .map_err(|fault| ProcessExecutionError::Cpu { fault })
     }

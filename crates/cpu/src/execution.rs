@@ -108,7 +108,6 @@ pub struct RunRequest<'a> {
     /// Exact instruction limit for the interpreter. The normal JIT uses
     /// control-driven entry and backedge synchronization instead.
     pub instruction_budget: u64,
-    pub loader_return: Option<GuestVirtualAddress>,
     pub timer: &'a dyn ArchitecturalTimer,
     pub events: VcpuEventState,
 }
@@ -149,6 +148,8 @@ pub enum CpuExit {
         source: LocationDescriptor,
         fault: DataAccessFault,
     },
+    /// Runtime classification of a completed loader-stub SVC. CPU backends
+    /// report the ordinary SupervisorCall and do not recognize loader addresses.
     LoaderReturn {
         source: LocationDescriptor,
         result_code: u64,

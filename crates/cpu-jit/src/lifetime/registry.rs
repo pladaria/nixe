@@ -62,6 +62,33 @@ impl<T> Registry<T> {
         self.free.is_some() || self.slots.len() < self.slots.capacity()
     }
 
+    /// Publication reserves all insertions before exposing any of them. Visit
+    /// at most `count` free slots, never the occupied registry or held owners.
+    pub fn has_space_for(&self, count: usize) -> bool {
+        let mut needed = count.saturating_sub(self.slots.capacity() - self.slots.len());
+        let mut free = self.free;
+        while needed != 0 {
+            let Some(index) = free else { return false };
+            free = self.slots[index].next_free;
+            needed -= 1;
+        }
+        true
+    }
+
+    pub fn check_insertions(&self, count: usize) -> Result<(), Error> {
+        if !self.has_space_for(count) {
+            return Err(Error::Capacity("registry storage must be prepared"));
+        }
+        self.generation
+            .checked_add(
+                count
+                    .try_into()
+                    .map_err(|_| Error::Exhausted(IdentityExhausted("registry generation")))?,
+            )
+            .ok_or(Error::Exhausted(IdentityExhausted("registry generation")))?;
+        Ok(())
+    }
+
     /// Check the next insertion while state is locked, before any visible
     /// publication mutation. The subsequent insertion under the same lock
     /// cannot fail for capacity or generation exhaustion.
@@ -188,6 +215,20 @@ impl<T> Registry<T> {
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.slots.iter().filter_map(|slot| slot.value.as_ref())
     }
+    pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            slot.value.as_ref().map(|value| {
+                (
+                    Handle {
+                        index,
+                        generation: slot.generation,
+                        marker: PhantomData,
+                    },
+                    value,
+                )
+            })
+        })
+    }
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
         self.slots
             .iter_mut()
@@ -202,23 +243,91 @@ impl<T> Registry<T> {
             })
     }
 
-    pub fn find(&self, mut predicate: impl FnMut(&T) -> bool) -> Option<Handle<T>> {
-        self.slots.iter().enumerate().find_map(|(index, slot)| {
-            slot.value
-                .as_ref()
-                .filter(|value| predicate(value))
-                .map(|_| Handle {
+    pub fn find(&self, predicate: impl FnMut(&T) -> bool) -> Option<Handle<T>> {
+        self.find_from(&mut 0, predicate)
+    }
+
+    /// Resume a collector's scan without revisiting the prefix after each
+    /// removal. Concurrent changes behind the cursor belong to the next pass.
+    pub fn find_from(
+        &self,
+        cursor: &mut usize,
+        mut predicate: impl FnMut(&T) -> bool,
+    ) -> Option<Handle<T>> {
+        while let Some(slot) = self.slots.get(*cursor) {
+            let index = *cursor;
+            *cursor += 1;
+            if slot.value.as_ref().is_some_and(&mut predicate) {
+                return Some(Handle {
                     index,
                     generation: slot.generation,
                     marker: PhantomData,
-                })
-        })
+                });
+            }
+        }
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collector_cursor_visits_each_value_once_across_removals() {
+        let mut registry = Registry::default();
+        registry.grow(&mut Vec::with_capacity(128));
+        for value in 0..128 {
+            registry.insert(&mut Some(value)).unwrap();
+        }
+        let mut cursor = 0;
+        let mut visits = 0;
+        while let Some(handle) = registry.find_from(&mut cursor, |value| {
+            visits += 1;
+            value % 2 == 0
+        }) {
+            registry.remove(handle).unwrap();
+        }
+        assert_eq!(visits, 128);
+        assert_eq!(registry.values().count(), 64);
+        // Reusing a slot behind the cursor is picked up by the next pass.
+        let reused = registry.insert(&mut Some(256)).unwrap();
+        assert!(registry.find_from(&mut cursor, |_| true).is_none());
+        cursor = 0;
+        assert_eq!(
+            registry.find_from(&mut cursor, |value| *value == 256),
+            Some(reused)
+        );
+    }
+
+    #[test]
+    fn batch_reservation_counts_reusable_but_not_held_slots_and_checks_all_generations() {
+        let mut registry = Registry::default();
+        registry.grow(&mut Vec::with_capacity(4));
+        let a = registry.insert(&mut Some(1)).unwrap();
+        let b = registry.insert(&mut Some(2)).unwrap();
+        let c = registry.insert(&mut Some(3)).unwrap();
+        registry.remove(a);
+        registry.take_held(b).unwrap();
+        assert!(registry.has_space_for(2)); // Free a plus unused tail.
+        assert!(!registry.has_space_for(3)); // Held b remains unavailable.
+        assert!(registry.check_insertions(2).is_ok());
+        let reused = registry.insert(&mut Some(4)).unwrap();
+        assert_eq!(reused.index, a.index);
+        registry.insert(&mut Some(5)).unwrap();
+        assert!(!registry.has_space_for(1));
+        assert!(registry.release_held(b));
+        registry.remove(c);
+        registry.generation = u64::MAX - 1;
+        assert!(registry.check_insertions(1).is_ok());
+        assert!(matches!(
+            registry.check_insertions(2),
+            Err(Error::Exhausted(_))
+        ));
+        assert!(registry.has_space_for(2));
+        assert_eq!(registry.get(reused), Some(&4));
+        assert_eq!(registry.generation, u64::MAX - 1);
+    }
 
     #[test]
     fn held_slot_is_not_reused_until_external_destruction_finishes() {

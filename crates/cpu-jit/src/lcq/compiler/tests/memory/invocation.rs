@@ -6,6 +6,8 @@ use nixe_cpu_direct_memory::WorkerFaultContext;
 use nixe_memory::DirectBackendPolicy;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod chaining;
+
 fn fixture(words: &[u32], device: Option<Arc<AtomicUsize>>) -> ExecutionMemory {
     let mut memory = ExecutionMemory::new();
     for page in 1..=2 {
@@ -258,7 +260,6 @@ fn lcq_invocation_escapes_with_owned_cold_or_precise_fault_and_releases_owners()
         let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 1000).unwrap());
         let Some(Exit::Memory {
             instruction,
-            poll,
             outcome,
         }) = (unsafe {
             invocation::run(
@@ -279,8 +280,8 @@ fn lcq_invocation_escapes_with_owned_cold_or_precise_fault_and_releases_owners()
             instruction.key.block_key(),
             key().at(GuestVirtualAddress::new(PC + 8)).unwrap()
         );
-        assert!(!poll.exhausted);
-        assert!(!poll.sample);
+        assert_eq!(frame.budget.slice_remaining, 998);
+        assert_eq!(frame.budget.sample_remaining, 4094);
         assert_eq!(frame.execution_epoch, 0);
         assert_eq!(frame.admission_epoch, 0);
         assert_eq!(frame.host_fp.saved, 0);
@@ -467,6 +468,7 @@ fn lcq_invocation_completes_exclusive_store_from_a_previous_invocation() {
                     &memory,
                 )
                 .unwrap();
+            assert!(process.try_service_links().unwrap());
             let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 1000).unwrap());
             let exit = unsafe {
                 invocation::run(

@@ -44,6 +44,10 @@ impl Translator<'_> {
             )?;
             return Ok(true);
         }
+        if crate::lcq::system::is_cache_probe(platform, instruction) {
+            self.cache_probe(pc, instruction.operands().rt, flags)?;
+            return Ok(false);
+        }
         if let Some(operation) = crate::lcq::system::runtime_boundary(platform, instruction) {
             self.constant_exit(
                 pc,

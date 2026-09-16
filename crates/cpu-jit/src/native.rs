@@ -1,19 +1,27 @@
 //! Native boundary emission. Transfers are compiled to bytes, never interpreted
 //! on a guest edge. Code ownership, publication and the final target branch
-//! belong to the caller. Transfers materialize required lazy NZCV only when
-//! the target representation needs it; canonical writeback is a separate boundary.
+//! belong to the caller. Physical transfers and architectural bridges share the
+//! copy engine; bridges additionally preserve non-carried dirty canonical homes.
 
 mod backend;
+mod bridge;
 mod canonical;
 mod flags;
 mod fp;
 mod gateway;
+pub(crate) mod link;
 mod moves;
+pub(crate) mod pic;
+mod poll;
+pub(crate) mod rsb;
 
 pub use backend::AllocatedBoundary;
+pub use bridge::emit_chain_transfer;
+pub(crate) use canonical::emit_dispatch_fallback;
 pub use canonical::{emit_canonical_entry, emit_canonical_exit, emit_canonical_writeback};
 pub(crate) use fp::emit_fp_activation;
 pub use gateway::{NativeReturn, NativeReturnError, check_host, enter_protected};
+pub(crate) use poll::emit_poll;
 
 use crate::abi::{EntryContract, ExitStateMap, GuestValue, NzcvLocation, ValueLocation};
 use moves::{Copy, Emitter};
@@ -64,6 +72,11 @@ impl std::error::Error for TransferError {}
 /// assumes the documented SAHF minimum; execution owners validate it at setup.
 /// This function never silently drops a required value,
 /// executes a helper, touches SP or allocates storage during guest execution.
+/// It is a physical-copy primitive, not a complete chain-state protocol: it
+/// copies target bindings only. The caller must account for dirty source values
+/// absent from that contract, missing clean target inputs and dirtiness inherited
+/// by the target. Unnamed locations surviving these copies does not mean that
+/// the target's independently allocated body preserves them.
 pub fn emit_fast_transfer(
     source: &ExitStateMap,
     target: &EntryContract,

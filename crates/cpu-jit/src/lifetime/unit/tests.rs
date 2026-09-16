@@ -25,6 +25,15 @@ pub(super) fn process() -> Arc<Lifetime> {
     Arc::new(Lifetime::new(Cache::new().unwrap()).unwrap())
 }
 pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
+    input_with_islands(process, pcs, tier, 0)
+}
+
+pub(super) fn input_with_islands(
+    process: &Lifetime,
+    pcs: &[u64],
+    tier: Tier,
+    islands: usize,
+) -> Input {
     let identity = process.begin_unit(tier).unwrap();
     let version = identity.version();
     let abi = if cfg!(target_arch = "x86_64") {
@@ -51,7 +60,7 @@ pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
     };
     let code = process
         .cache
-        .install(
+        .install_with_islands(
             Output {
                 bytes: bytes.into_boxed_slice(),
                 alignment: 16,
@@ -66,6 +75,7 @@ pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
                         entry: false,
                         patch_bytes: 0,
                         fault_bytes: (end - 12) as u8,
+                        poll: None,
                         values: vec![],
                     }]),
                     traps: Box::new([]),
@@ -73,6 +83,7 @@ pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
                 },
             },
             tier,
+            islands,
             |_| None,
         )
         .unwrap();
@@ -108,6 +119,7 @@ pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
         cursor: MemoryInvalidationCursor::INITIAL,
         states: Box::new([StateRecord {
             exit: None,
+            transfer: None,
             native_offset: 12,
             state: ExitStateMap {
                 site: ExitSiteKey {
@@ -153,6 +165,33 @@ pub(super) fn publish(
 }
 pub(super) fn frame(state: &mut A64State) -> NativeFrame<'_> {
     NativeFrame::new(state, PollBudget::new(77, 1000).unwrap())
+}
+
+#[test]
+fn protected_static_lookup_uses_full_keys_and_stops_on_closing_admission() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    publish(&process, &cursor, &[0], Tier::Lcq);
+    publish(&process, &cursor, &[4], Tier::Lcq);
+    let target = publish(&process, &cursor, &[4], Tier::Hcq);
+    let expected = process.snapshot(target).unwrap().id;
+    let mut reader = process.register().unwrap();
+    let mut state = A64State::default();
+    let mut frame = frame(&mut state);
+    let mut invocation = unsafe { reader.admit(&mut frame, key(0)) }
+        .unwrap()
+        .unwrap();
+    let (frame, lookup) = invocation.frame_and_faults();
+    assert_ne!(frame.execution_epoch, 0);
+    assert_eq!(lookup.static_entry(key(4)).unwrap().unwrap().unit, expected);
+    assert_eq!(lookup.static_entry(key(8)).unwrap(), None);
+    let mut specialized = key(4);
+    specialized.fp = FpSpecialization::Exact(0);
+    assert_eq!(lookup.static_entry(specialized).unwrap(), None);
+    process.retire_unit(target).unwrap();
+    assert_eq!(lookup.static_entry(key(4)), Err(Error::Closed));
+    drop(invocation);
+    assert!(process.try_shutdown().unwrap());
 }
 
 #[test]
@@ -547,7 +586,7 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
     let process = process();
     let cursor = AtomicU64::new(0);
     let publication = process.reserve(key(0)).unwrap();
-    for case in 0..14 {
+    for case in 0..15 {
         let mut candidate = input(&process, &[0], Tier::Lcq);
         match case {
             0 => candidate.entries[0].fast_offset = 16,
@@ -572,6 +611,27 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
                     candidate.faults[0].completed_read = Some(ValueLocation::Constant(0));
                     candidate.faults[0].commit_stage = 1;
                 }
+            }
+            14 => {
+                let before = candidate.metadata_bytes();
+                // A fault observation is not a patchable terminal. The payload
+                // must still be charged even when publication will reject it.
+                candidate.states[0].transfer = Some(Box::new(TerminalTransfer {
+                    destination: ValueLocation::Constant(4),
+                    static_target: Some(key(4)),
+                    completed: 1,
+                    patch_bytes: if candidate.code.metadata.abi == HostAbi::X86_64 {
+                        8
+                    } else {
+                        4
+                    },
+                    fallback_offset: 0,
+                    poll_offset: None,
+                }));
+                assert_eq!(
+                    candidate.metadata_bytes() - before,
+                    size_of::<TerminalTransfer>()
+                );
             }
             _ => unreachable!(),
         }

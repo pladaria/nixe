@@ -16,7 +16,7 @@ impl MemoryExit {
     /// its exclusive-monitor handoff, epoch and mapping lease must have ended.
     /// None means successful completion; a guest fault is a structured stop,
     /// while backend inconsistencies are terminal CpuFaults, never guest aborts.
-    /// The caller retains its poll result and supplies already-earned coarse
+    /// The caller retains its reconciled budget and supplies already-earned
     /// progress; failure here does not fabricate an instruction completion.
     /// Fault stops leave the reconstructed/partially completed state available
     /// for ExecutionReport.context, including compound-access prefixes.
@@ -31,6 +31,14 @@ impl MemoryExit {
         let key = instruction.key.block_key();
         let source = LocationDescriptor::new(key.pc, key.profile);
         let result = match self {
+            Self::CacheCleanInvalidate { address } => memory
+                .maintain_cache(
+                    key.address_space,
+                    nixe_cpu::memory::CacheMaintenanceKind::DataCleanAndInvalidate,
+                    Some(address),
+                )
+                .map(|()| state.set_pc(key.pc.get().wrapping_add(4)))
+                .map_err(cold::Error::Data),
             Self::Cold(completion) => completion.complete(state, memory, monitor),
             Self::ExclusiveStore(operation) => operation
                 .complete(state, memory, key.address_space, monitor)

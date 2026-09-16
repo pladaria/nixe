@@ -38,7 +38,7 @@ fn runtime_system_helpers_match_interpreter_after_protected_native_exit() {
         0xd50b_7520,
         0xd508_7620,
         0xd50b_7b20,
-        0xd50b_7e20, // IC/DC
+        // CIVAC has native-probe coverage in lifetime::memory::tests::data_cache.
     ] {
         for event_mode in 0..3 {
             // SUBS creates dirty helper input/NZCV with C=1; ADC consumes it after a

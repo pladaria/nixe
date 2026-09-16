@@ -153,10 +153,11 @@ impl Lifetime {
         self.retire_rootless()?;
         // Detach candidates one at a time. A short-lived strong reference
         // protects their code while replacement tables are built outside state.
+        let mut cursor = 0;
         loop {
             let candidate = {
                 let state = self.lock();
-                let handle = state.units.records.find(|record| {
+                let handle = state.units.records.find_from(&mut cursor, |record| {
                     matches!(record.lifecycle, Lifecycle::Retired(epoch) if state.quiescent(epoch))
                         && record.detached_epoch.is_none()
                         && Arc::strong_count(&record.code) == 1
@@ -178,10 +179,11 @@ impl Lifetime {
             }
         }
         let mut reclaimed = 0;
+        let mut cursor = 0;
         loop {
             let removed = {
                 let mut state = self.lock();
-                let handle = state.units.records.find(|record| {
+                let handle = state.units.records.find_from(&mut cursor, |record| {
                     record
                         .detached_epoch
                         .is_some_and(|epoch| state.quiescent(epoch))
@@ -191,6 +193,8 @@ impl Lifetime {
                     break;
                 };
                 let record = state.units.records.take_held(handle).unwrap();
+                state.units.segment_records[record.code.code.allocation.segment] -= 1;
+                state.units.segment_retired[record.code.code.allocation.segment] -= 1;
                 for page in &*record.code.dependencies {
                     let hash = state.units.dependencies.hash.hash_one(page.page);
                     if let Ok(entry) = state.units.dependencies.entries.find_entry(hash, |entry| {
@@ -232,8 +236,9 @@ impl Lifetime {
 
     fn retire_rootless(&self) -> Result<(), Error> {
         let mut state = self.lock();
+        let mut cursor = 0;
         loop {
-            let handle = state.units.records.find(|record| {
+            let handle = state.units.records.find_from(&mut cursor, |record| {
                 record.lifecycle == Lifecycle::Superseded
                     && record.retirement.is_none()
                     && record.code.baseline_pins.load(Ordering::Relaxed) == 0
@@ -242,12 +247,38 @@ impl Lifetime {
             let Some(handle) = handle else {
                 return Ok(());
             };
+            let record = state.units.records.get(handle).unwrap();
+            if record.incoming.is_some()
+                || record.outgoing.is_some()
+                || record.pic_incoming.is_some()
+                || record.pic_outgoing.is_some()
+            {
+                // A cancelled earlier cutover can become rootless later.
+                // Link adjacency must still drain through the coordinator;
+                // never bypass it via this collector-only retirement path.
+                let sequence = self
+                    .request_locked(&mut state, Reason::TierCutover)?
+                    .sequence;
+                let units = &mut state.units;
+                units.records.get_mut(handle).unwrap().queue_retirement(
+                    handle,
+                    &mut units.retirements,
+                    Reason::TierCutover,
+                    sequence,
+                );
+                continue;
+            }
             let retired = state.execution;
             let result = state.executions.next_id();
             state.execution = self.checked(&mut state, result)?;
+            state
+                .units
+                .remove_static_source(UnitHandle(handle, self.identity));
             let record = state.units.records.get_mut(handle).unwrap();
             record.lifecycle = Lifecycle::Unlinked;
             record.lifecycle = Lifecycle::Retired(retired);
+            let segment = record.code.code.allocation.segment;
+            state.units.segment_retired[segment] += 1;
         }
     }
 
@@ -360,12 +391,10 @@ impl Lifetime {
         for segment in 0..SEGMENTS {
             {
                 let mut state = self.lock();
+                // O(1), including records whose directory was already detached.
+                // Never scan every unit for each unused segment under pressure.
                 if state.units.tables[segment].is_some()
-                    || state
-                        .units
-                        .records
-                        .values()
-                        .any(|record| record.code.code.allocation.segment == segment)
+                    || state.units.segment_records[segment] != 0
                 {
                     continue;
                 }
@@ -386,6 +415,44 @@ impl Lifetime {
     }
 }
 
+const EVICTION_BATCH: usize = 64;
+
+impl Units {
+    /// A fixed-size oldest-first batch, selected without allocating while the
+    /// cache may already be at its hard limit. Reused registry slots and compiler
+    /// publication order need not follow CodeUnitId order.
+    fn eviction_candidates(&self) -> [Option<Handle<UnitRecord>>; EVICTION_BATCH] {
+        for tier in [Tier::Hcq, Tier::Lcq] {
+            let mut oldest: [Option<(CodeUnitId, Handle<UnitRecord>)>; EVICTION_BATCH] =
+                [None; EVICTION_BATCH];
+            let mut len = 0;
+            for (handle, record) in self.records.iter() {
+                if record.code.tier != tier
+                    || !matches!(
+                        record.lifecycle,
+                        Lifecycle::Published | Lifecycle::Superseded
+                    )
+                    || record.code.baseline_pins.load(Ordering::Relaxed) != 0
+                {
+                    continue;
+                }
+                let index = oldest[..len]
+                    .partition_point(|entry| entry.as_ref().unwrap().0 < record.code.id);
+                if index == EVICTION_BATCH {
+                    continue;
+                }
+                len = (len + 1).min(EVICTION_BATCH);
+                oldest[index..len].rotate_right(1);
+                oldest[index] = Some((record.code.id, handle));
+            }
+            if len != 0 {
+                return oldest.map(|entry| entry.map(|(_, handle)| handle));
+            }
+        }
+        [None; EVICTION_BATCH]
+    }
+}
+
 impl Transition<'_> {
     /// Cold pressure pass. `additional` is the pending allocation's full
     /// incremental code/metadata charge (including any new segment). This does
@@ -401,73 +468,93 @@ impl Transition<'_> {
         }
         self.drain_retirements()?;
         self.retire_empty_dispatch()?;
+        // Once pressure starts, leave room for one new 16 MiB code segment
+        // plus its metadata. Stopping at the trigger makes every small demand
+        // allocation request another whole-process rendezvous.
+        let initial = self.process.cache.usage()?;
+        let target = if initial.total().saturating_add(additional) >= crate::executable::SOFT_BYTES
+        {
+            crate::executable::SOFT_BYTES - 2 * crate::executable::SEGMENT_BYTES
+        } else {
+            crate::executable::SOFT_BYTES
+        };
         loop {
             self.process.reclaim_units()?;
             let usage = self.process.cache.usage()?;
             if usage
                 .total()
                 .checked_add(additional)
-                .is_some_and(|total| total <= crate::executable::SOFT_BYTES)
+                .is_some_and(|total| total <= target)
             {
                 return Ok(());
             }
-            let candidate = {
+            let candidates = {
                 let state = self.process.lock();
                 // Stop scheduling evictions once retiring whole segments can
                 // cover the shortage. Compiler/staging leases can postpone
                 // their actual decommit; this is NOT a budget refund or a
                 // promise that the allocator's retry will succeed.
-                let mut pending = [false; SEGMENTS];
-                let mut resident = [false; SEGMENTS];
-                for record in state.units.records.values() {
-                    let segment = record.code.code.allocation.segment;
-                    if matches!(record.lifecycle, Lifecycle::Retired(_)) {
-                        pending[segment] = true;
-                    } else {
-                        resident[segment] = true;
-                    }
-                }
                 let pending_bytes: usize = (0..SEGMENTS)
-                    .filter(|&index| pending[index] && !resident[index])
+                    .filter(|&index| {
+                        state.units.segment_retired[index] != 0
+                            && state.units.segment_retired[index]
+                                == state.units.segment_records[index]
+                    })
                     .map(|index| {
                         (crate::executable::WINDOW_BYTES - index * crate::executable::SEGMENT_BYTES)
                             .min(crate::executable::SEGMENT_BYTES)
                     })
                     .sum();
-                if usage
-                    .total()
-                    .saturating_sub(pending_bytes)
-                    .checked_add(additional)
-                    .is_some_and(|total| total <= crate::executable::SOFT_BYTES)
+                if pending_bytes != 0
+                    && usage
+                        .total()
+                        .saturating_sub(pending_bytes)
+                        .checked_add(additional)
+                        .is_some_and(|total| total <= crate::executable::SOFT_BYTES)
                 {
                     return usage.check(additional, tier).map_err(Error::from);
                 }
-                [Tier::Hcq, Tier::Lcq].into_iter().find_map(|kind| {
-                    let id = state
-                        .units
-                        .records
-                        .values()
-                        .filter(|record| {
-                            record.code.tier == kind
-                                && matches!(
-                                    record.lifecycle,
-                                    Lifecycle::Published | Lifecycle::Superseded
-                                )
-                                && record.code.baseline_pins.load(Ordering::Relaxed) == 0
-                        })
-                        .map(|record| record.code.id)
-                        .min()?;
-                    state.units.records.find(|record| record.code.id == id)
-                })
+                state.units.eviction_candidates()
             };
-            let Some(handle) = candidate else {
+            if candidates[0].is_none() {
                 // LCQ may consume the hard-limit headroom; HCQ must abandon
                 // this attempt if snapshots prevent returning below soft.
                 return usage.check(additional, tier).map_err(Error::from);
-            };
-            self.process
-                .retire_unit(UnitHandle(handle, self.process.identity))?;
-            self.drain_retirements()?;
+            }
+            let mut native_bytes = 0;
+            for handle in candidates.into_iter().flatten() {
+                let bytes = {
+                    let state = self.process.lock();
+                    // A concurrent invalidation may have queued or retired a
+                    // selected unit. It still drains through the same owner.
+                    state
+                        .units
+                        .records
+                        .get(handle)
+                        .filter(|record| {
+                            matches!(
+                                record.lifecycle,
+                                Lifecycle::Published | Lifecycle::Superseded
+                            ) && record.code.baseline_pins.load(Ordering::Relaxed) == 0
+                        })
+                        .map(|record| record.code.code.allocation.len())
+                };
+                if let Some(bytes) = bytes {
+                    match self
+                        .process
+                        .retire_unit(UnitHandle(handle, self.process.identity))
+                    {
+                        Ok(_) => native_bytes += bytes,
+                        Err(Error::StaleUnit | Error::PinnedBaseline) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                self.drain_retirements()?;
+                // Limit overshoot for unusually large units as well as count.
+                if native_bytes >= crate::executable::SEGMENT_BYTES {
+                    break;
+                }
+            }
         }
     }
 
@@ -549,6 +636,8 @@ impl Transition<'_> {
                 std::mem::take(&mut state.dispatch),
                 std::mem::replace(&mut state.keys, empty_keys),
                 std::mem::take(&mut state.readers),
+                std::mem::take(&mut state.weak_shards),
+                state.weak_shard_storage.take(),
                 state.dispatch_storage.take(),
                 state.key_storage.take(),
                 state.reader_storage.take(),
@@ -570,16 +659,8 @@ impl Transition<'_> {
         Ok(count)
     }
 
-    fn require_closed(&self, state: &crate::lifetime::State) -> Result<(), Error> {
-        state.healthy()?;
-        if !self.active || state.phase != Phase::Closed {
-            return Err(Error::Closed);
-        }
-        Ok(())
-    }
-
     fn unlink_next(&mut self) -> Result<Option<bool>, Error> {
-        let removed_family = {
+        let (removed_family, withdrawn) = {
             let mut state = self.process.lock();
             self.require_closed(&state)?;
             let Some(handle) = state.units.retirements.next() else {
@@ -597,6 +678,21 @@ impl Transition<'_> {
             }
             if !state.shutdown && record.code.baseline_pins.load(Ordering::Relaxed) != 0 {
                 return Err(Error::PinnedBaseline);
+            }
+            if let Some(site) = record.pic_incoming.or(record.pic_outgoing) {
+                // All invocations have acknowledged closure. Clear the private
+                // way and detach both backlinks before releasing its bridge.
+                let removed = state.remove_pic_way(site);
+                drop(state);
+                drop(removed);
+                return Ok(Some(false));
+            }
+            if let Some(link) = record.incoming.or(record.outgoing) {
+                // Restore any installed incoming/outgoing branch before the
+                // unit can become Unlinked. Safety work has no install limit.
+                drop(state);
+                self.unlink_registered_link(link)?;
+                return Ok(Some(false));
             }
             let count = record
                 .slots
@@ -640,17 +736,34 @@ impl Transition<'_> {
                     state.dispatch.get_mut(slot).unwrap().retired = Some(retired);
                 }
             }
+            state
+                .units
+                .remove_static_source(UnitHandle(handle, self.process.identity));
             let record = state.units.records.get_mut(handle).unwrap();
             record.lifecycle = Lifecycle::Unlinked;
             record.lifecycle = Lifecycle::Retired(retired);
             let family = record.family;
+            let withdrawn = (record.code.tier == Tier::Hcq).then(|| Arc::clone(&record.code));
+            let segment = record.code.code.allocation.segment;
+            state.units.segment_retired[segment] += 1;
             state.units.finish_retirement(handle);
             state.execution = next;
-            family.map(|family| state.units.families.take_held(family).unwrap())
+            (
+                family.map(|family| state.units.families.take_held(family).unwrap()),
+                withdrawn,
+            )
         };
         // Last-family destruction releases baseline pins outside state. Its
         // registry slot remains held until the HCQ unit's span is actually freed.
         drop(removed_family);
+        if let Some(withdrawn) = withdrawn {
+            // No reader can observe the rewritten dispatch until this owner
+            // reopens. Pin the immutable entry keys across registration, which
+            // may grow its charged registry outside the state lock.
+            for entry in &withdrawn.entries {
+                self.refresh_baseline_sources(entry.key)?;
+            }
+        }
         Ok(Some(true))
     }
 }

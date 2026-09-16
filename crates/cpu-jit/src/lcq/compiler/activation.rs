@@ -32,7 +32,12 @@ impl Translator<'_> {
             .try_map(&mut |value| Ok::<_, std::convert::Infallible>(push(*value)))
             .unwrap();
         let mut dirty = self.dirty;
-        let source_flags = flags.dirty().then(|| {
+        // Activation may be a no-op for a segment inherited from another unit.
+        dirty.fpsr = true;
+        if flags.dirty() {
+            dirty.nzcv = crate::analysis::NZCV;
+        }
+        let source_flags = (dirty.nzcv != 0).then(|| {
             recipe
                 .try_map(&mut |index| {
                     Ok::<_, std::convert::Infallible>((
@@ -42,9 +47,6 @@ impl Translator<'_> {
                 })
                 .unwrap()
         });
-        if source_flags.is_some() {
-            dirty.nzcv = crate::analysis::NZCV;
-        }
         let operands = register_operands(dirty)
             .into_iter()
             .map(|guest| {
@@ -160,9 +162,10 @@ impl Pending {
                 dirty_live: self.dirty,
                 bindings: source.bindings(&self.operands).map_err(fail)?,
                 nzcv,
-                host_fpsr_pending: false,
+                host_fpsr_pending: true,
             },
             exit: None,
+            transfer: None,
         };
         state.state.validate().map_err(fail)?;
         Ok((source.map.clone(), bytes, target.map.offset, state))

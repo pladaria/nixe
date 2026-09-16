@@ -525,7 +525,8 @@ Canonical A64State remains the architectural authority outside native
 execution. Within a unit, guest values remain in SSA/native registers. At an
 external edge:
 
-- the source stores only dirty values proven live-out;
+- the bridge stores only dirty live-out values which are not transferred
+  directly to the target's physical contract;
 - values proven overwritten before any read or observation are discarded;
 - the target canonical adapter loads only true live-ins;
 - PC is not stored on an ordinary known static link;
@@ -551,18 +552,54 @@ every dirty live-out plus lazy NZCV/FPSR state. These maps come from final
 register allocation; undocumented compiler SSA is never the sole owner of a
 value at a link, helper, control poll or fault boundary.
 
+At fast ingress, canonical homes remain current for every architectural value
+or bit not represented as potentially dirty in the target's state contract,
+except values proven overwritten before any target read or observation.
+For each source exit and target entry, the compiled bridge therefore:
+
+- transfers available target inputs directly from the source's physical map;
+- loads missing clean inputs from their canonical homes;
+- stores dirty source values/bits not carried by the target into their
+  canonical homes, unless shared analysis proves them overwritten before any
+  read or observation on every relevant target path; and
+- preserves source operands until every dependent store, flag conversion and
+  parallel copy has consumed them, including aliases and spill overlap.
+
+Absence from a target's semantic live-ins is not a dead-value proof. A fault or
+helper before an overwrite can observe the old value; a value untouched by the
+entire target must survive its exit. A missing dirty input is a contract error,
+not permission to reload stale canonical storage.
+
+The target conservatively treats incoming writable guest-state bindings as
+potentially dirty, even when entered canonically. It retains inherited values
+in subsequent fault, helper, poll and exit maps until overwritten, safely
+committed or proven dead. A local-write-only dirty set is insufficient. Shared
+analysis must retain values needed only for such observations. Track NZCV at
+bit granularity: bits neither carried nor proven dead must remain current in
+canonical NZCV. Host FP ownership and pending FPSR survive independently of
+whether the target itself performs an FP operation.
+
+These selective loads/stores are native bridge instructions, not a canonical
+exit: they do not call Rust, leave the execution epoch or mapping lease,
+restore caller FP, or store the guest PC. There is no unconditional full-state
+commit/reload, per-edge runtime dirty-mask interpretation or second architectural
+register image. The same rule applies to static, PIC and matched-return bridges.
+
 Static and dynamic link bridges perform cycle-safe parallel copies and use the
 fixed transfer slots when source and target physical locations differ. A
-compatible static edge whose source locations already satisfy the target fast
-contract has an empty bridge followed by one direct branch.
+compatible static edge has an empty bridge only when its source locations
+already satisfy the target fast contract and no canonical load/store or flag
+conversion is required. Such an edge is followed by one direct branch.
 
 An indirect branch probes with an ExitSiteKey containing its source
 CodeVersion and exact ExitStateMap identity. A PIC hit jumps to the immutable
 bridge compiled for that site and target fast-entry contract. It does not
-commit A64State, leave the execution epoch or interpret a register-move plan.
-Only a PIC miss canonicalizes the dirty state before its cold resolver. Dynamic
-BridgeUnits are bounded by the number of live PIC ways, deduplicated weakly and
-retired through the same epoch/cache lifecycle as normal code.
+leave fast mode or interpret a register-move plan. Nonempty hit bridges may
+access the selective canonical homes described above; empty bridges perform
+no canonical-state traffic. A PIC miss canonicalizes the observable dirty state
+before its cold resolver. Dynamic BridgeUnits are bounded by the number of
+live PIC ways, deduplicated weakly and retired through the same epoch/cache
+lifecycle as normal code.
 
 The ABI does not promise that all 31 GPRs and 32 vectors remain permanently
 assigned to host registers across independently allocated LCQ blocks; HCQ
@@ -579,6 +616,17 @@ each boundary.
 
 ### Helpers and architectural boundaries
 
+Homebrew loader return is a runtime convention, not a JIT branch boundary.
+The runtime puts the guest address of its mapped `SVC #7` exit stub in initial
+X30. All CPU backends execute that stub normally; static links, PICs and the
+RSB need no loader-address checks. On a completed SVC #7 from the returning
+thread's registered stub address, the runtime reports `LoaderReturn` with X0
+as the result instead of routing an ordinary ExitProcess call. The SVC counts
+as one executed instruction. Its source and saved PC remain the stub address,
+as at every SVC dispatch boundary; termination never resumes past it. A
+slice/control stop before the SVC does not report termination. Other SVC sites
+and threads keep ordinary behavior.
+
 Helpers have typed signatures and explicit state effects. A helper veneer saves
 only live caller-clobbered values. Pure supported integer, branch, memory and
 SIMD operations do not use a generic helper.
@@ -587,6 +635,18 @@ A stateful runtime helper, SVC, FP-mode write, unsupported instruction,
 scheduler request or nonretry fault canonicalizes exactly the state it can
 observe and leaves fast mode. A successful typed helper reloads only the
 continuation live-ins.
+
+Switch 1 `DC CIVAC` stays native when a confined, trapping byte read of its
+direct alias succeeds: readable aliases prove canonical RAM with `Clean` or
+`CpuNewer` visibility, for which canonical maintenance has no further effect.
+The discarded read remains inside an allocation-visible PRE fault span and
+does not end the fragment. Its fault record identifies a cache probe, not a
+guest load. On failure, reconstruct PRE state and release the epoch/memory
+lease before completing the original cache operation through the memory owner;
+never perform MMIO reads or ordinary load permission/repair handling for this
+probe. Charge only the completed prefix on escape, then the instruction once
+if cold completion succeeds. Other cache operations and barriers retain their
+canonical completion paths.
 
 Guest FPCR/FPSR and host FP ownership retain one implementation for both tiers:
 
@@ -734,8 +794,10 @@ thunk. The thunk resolves the target BlockKey through the dispatch index or
 exits to compile that exact key. Before lookup it uses the source ExitStateMap
 to canonicalize dirty state; an already-published target resumes through its
 canonical ingress, while a miss leaves through the ordinary compile exit. This
-traffic is confined to the unlinked fallback. Once source and target contracts
-are compatible, the linker creates the minimal source-owned bridge and marks
+resolver round trip is confined to the unlinked fallback; selective canonical
+home accesses in a resolved bridge follow the State transfer contract and do
+not invoke the resolver. Once source and target contracts are compatible,
+the linker creates the minimal source-owned bridge and marks
 the edge for a direct patch.
 
 A source compiled while its target is already valid is linked before the
@@ -792,7 +854,8 @@ for the exact BridgeUnit. Generated BR/BLR:
 1. computes the guest target;
 2. preserves any lazy guest flags which its scratch-only probe would destroy;
 3. probes both ways using the full source-site and target key;
-4. jumps to the matching bridge on a valid hit; and
+4. jumps to the matching native bridge on a valid hit, performing only the
+   selective state transfer required by its source/target contracts; and
 5. canonicalizes dirty state and enters the resolver on a miss.
 
 The cache is private to the vCPU, so hits need no atomic operation, shared
@@ -824,9 +887,11 @@ X30; overflow overwrites the oldest entry and keeps depth at sixteen.
 
 RET first computes the architectural target and compares it with the top full
 BlockKey. On a match it pops and probes the ordinary per-vCPU PIC using that
-RET's ExitSiteKey; a hit reaches the exact return bridge without canonical
-state traffic. An unresolved match, mismatch or underflow uses the ordinary
-indirect miss resolver; mismatch/underflow also clears the unreliable
+RET's ExitSiteKey; a hit reaches the exact return bridge without leaving fast
+mode. As with other PIC hits, only a nonempty bridge may access selective
+canonical homes; an empty bridge has no canonical-state traffic. An unresolved
+match, mismatch or underflow uses the ordinary indirect miss resolver;
+mismatch/underflow also clears the unreliable
 prediction chain. The RSB contains no host code pointer and does not keep code
 alive. Clearing affected PIC ways at maintenance is sufficient for bridge and
 target reclamation.
@@ -1109,6 +1174,14 @@ compiler/link/fault strong references are gone. A wholly free segment is
 decommitted or reused with a new checked segment generation.
 
 Under soft-limit pressure:
+
+The trigger remains 512 MiB; a pressure pass targets 480 MiB of committed
+code plus metadata (including the requested additional allocation), leaving
+32 MiB for a new segment and metadata. This is an amortization target, not a
+new admission limit: retained references can prevent reaching it, LCQ may use
+the existing hard-limit headroom, and HCQ still requires soft-limit admission.
+Do not keep evicting unrelated units solely to meet the target when already
+retired whole segments can cover the soft-limit shortage after references drop.
 
 1. reclaim quiescent spans and wholly free segments;
 2. request a maintenance rendezvous and retire the oldest HCQ CodeUnits by
@@ -1458,10 +1531,14 @@ compatible static edge with an empty bridge has only the guest branch decision
 and one direct host branch, with no dispatch lookup, Rust call, PC store or
 canonical-state traffic. Nonempty and far-link shapes match their separately
 specified bridge/island forms. Monomorphic PIC and matched RSB hits are keyed
-by the exact ExitSiteKey, execute no canonical-state traffic and cannot reuse a
-bridge from another source. Link/bridge counts remain within declared bounds;
-all roots are cleared before target reclamation; BTI and CET/IBT accept every
-indirect target.
+by the exact ExitSiteKey and cannot reuse a bridge from another source. They
+remain native without Rust/resolver calls or a full-state commit/reload;
+nonempty bridges may access only the canonical homes required by the state
+transfer contract. Empty bridges have no canonical-state traffic. Inherited
+dirty values and flags remain reconstructible through intervening units,
+including at faults before an overwrite. Link/bridge counts remain within
+declared bounds; all roots are cleared before target reclamation; BTI and
+CET/IBT accept every indirect target.
 
 ### Task 5: add functional sampling and bounded background admission
 
@@ -1631,7 +1708,9 @@ The architecture is complete only when all of these statements are true:
   system ABI, full-state commit/reload or dispatch-slot loads on resolved
   static edges and indirect-cache hits.
 - Static links, indirect dispatch and matched returns remain native and have a
-  safe unlink path.
+  safe unlink path. Nonempty bridges perform only required selective state
+  transfers; empty compatible bridges have no canonical-state traffic.
+  Inherited dirty state remains recoverable at all architectural observations.
 - HCQ region shape is deterministic for one snapshot, has one total
   2048-instruction cap and can be reshaped instead of preserving the first
   root's partition forever.

@@ -58,7 +58,6 @@ fn concrete_thread_matches_direct_single_step_state_counts_and_stops() {
                     memory_lease: None,
                     state: &mut adapted,
                     instruction_budget: 1,
-                    loader_return: None,
                     timer: &FixedTimer,
                     events: nixe_cpu::execution::VcpuEventState::default(),
                 },
@@ -312,7 +311,6 @@ fn linux_direct_interpreter_requires_a_live_mapping_lease() {
                 memory_lease: None,
                 state: &mut state,
                 instruction_budget: 1,
-                loader_return: None,
                 timer: &FixedTimer,
                 events: nixe_cpu::execution::VcpuEventState::default(),
             },
@@ -548,7 +546,6 @@ fn direct_request<'a>(
         memory_lease: Some(memory.acquire_execution_lease()),
         state,
         instruction_budget: 1,
-        loader_return: None,
         timer: &FixedTimer,
         events: nixe_cpu::execution::VcpuEventState::default(),
     }

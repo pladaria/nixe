@@ -15,6 +15,13 @@ use nixe_cpu::{
 };
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
+/// Switch 1 CIVAC can prove the canonical coherent-RAM case through the
+/// existing readable direct alias. Other maintenance operations stay cold.
+pub(crate) fn is_cache_probe(platform: TargetPlatform, instruction: Instruction) -> bool {
+    platform == TargetPlatform::Switch1
+        && matches!(instruction, Instruction::System(f) if f.system_key == 0xd50b_7e20)
+}
+
 pub(crate) fn runtime_boundary(
     platform: TargetPlatform,
     instruction: Instruction,

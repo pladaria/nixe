@@ -43,7 +43,7 @@ fn run_with_fault(
     arena: &mut [u8],
     fault: Option<(usize, u16, u16)>,
 ) {
-    run_memory_case(words, state, arena, fault, false);
+    run_memory_case(words, state, arena, fault, false, false);
 }
 
 fn run_memory_case(
@@ -52,6 +52,7 @@ fn run_memory_case(
     arena: &mut [u8],
     fault: Option<(usize, u16, u16)>,
     escape: bool,
+    inherited_fp: bool,
 ) -> Option<(
     crate::lcq::fault::Reconstructed,
     crate::lcq::fault::access::Access,
@@ -151,7 +152,11 @@ fn run_memory_case(
                 repair_mapping,
                 std::ptr::from_mut(&mut repair).cast(),
                 NativeInvocation {
-                    gateway: captured_entry,
+                    gateway: if inherited_fp {
+                        captured_fp_entry
+                    } else {
+                        captured_entry
+                    },
                     context: std::ptr::from_mut(&mut call).cast(),
                     entry: entry.canonical.get(),
                 },
@@ -181,6 +186,10 @@ fn run_memory_case(
     } else {
         Some(
             unsafe {
+                if inherited_fp {
+                    invocation.frame().ensure_fp().unwrap();
+                    crate::fp_env::tests::divide_by_zero();
+                }
                 crate::native::enter_protected(
                     invocation.frame(),
                     direct.view().base as *mut u8,
@@ -223,6 +232,60 @@ unsafe extern "C" fn captured_entry(opaque: *mut libc::c_void, entry: usize) {
     let call = unsafe { &mut *opaque.cast::<CapturedEntry<'_, '_>>() };
     call.result =
         Some(unsafe { crate::native::enter_protected(call.frame, call.arena, entry as *const u8) });
+}
+
+// Seed the invocation as if a previous native unit activated FP. Do this only
+// after fault capture is installed and before entering the integer-only unit.
+unsafe extern "C" fn captured_fp_entry(opaque: *mut libc::c_void, entry: usize) {
+    unsafe {
+        let call = &mut *opaque.cast::<CapturedEntry<'_, '_>>();
+        call.frame.ensure_fp().unwrap();
+        crate::fp_env::tests::divide_by_zero();
+        captured_entry(opaque, entry);
+    }
+}
+
+#[test]
+fn integer_only_unit_keeps_inherited_fpsr_on_return_retry_and_escape() {
+    let _restore = crate::fp_env::tests::RestoreHost::new();
+    // Deliberately nonzero caller status, distinct from guest divide-by-zero.
+    // Inactive guest FP must never import those caller bits at a memory fault.
+    let caller = crate::fp_env::tests::distinct_caller();
+    for inherited_fp in [false, true] {
+        for mode in 0..3 {
+            let escape = mode == 2;
+            let mut state = A64State::default();
+            state.set_pc(PC);
+            state.set_fpsr(1 << 27);
+            state.general_register_storage_mut()[0] = 0xdead_beef;
+            state.general_register_storage_mut()[1] = 0x3000;
+            state.general_register_storage_mut()[5] = 5;
+            let mut expected = state.clone();
+            expected.general_register_storage_mut()[5] = 6;
+            expected.set_pc(PC + if escape { 4 } else { 8 });
+            expected.set_fpsr((1 << 27) | if inherited_fp { 2 } else { 0 });
+            if !escape {
+                expected.general_register_storage_mut()[0] = 0x1212_1212_1212_1212;
+            }
+            let mut arena = vec![0x12; ARENA];
+            let result = run_memory_case(
+                &[0x9100_04a5, 0xf940_0020, 0xd420_0000], // ADD X5; LDR X0,[X1]; BRK
+                &mut state,
+                &mut arena,
+                (mode != 0).then_some((0x3000, 0, 0)),
+                escape,
+                inherited_fp,
+            );
+            assert_eq!(result.is_some(), escape);
+            assert_eq!(state, expected, "inherited={inherited_fp}, mode={mode}");
+            let mut restored = crate::abi::HostFpState::default();
+            unsafe {
+                restored.begin();
+                restored.finish();
+            }
+            assert_eq!((restored.saved_control, restored.saved_status), caller);
+        }
+    }
 }
 
 struct Repair<'a> {
@@ -283,14 +346,6 @@ unsafe extern "C" fn repair_mapping(
     // Invocation, without Arc acquisition or legacy registry publication.
     let state = &found.unit.states[found.record.state_map as usize].state;
     state.validate().unwrap();
-    if state.host_fpsr_pending {
-        assert!(
-            state
-                .bindings
-                .iter()
-                .any(|binding| matches!(binding.location, crate::abi::ValueLocation::Spill { .. }))
-        );
-    }
     repair.seen += 1;
     if repair.escape {
         return FaultDisposition::Escape;
@@ -421,6 +476,7 @@ fn check_address(
         &mut arena,
         Some((page, 0, 0)),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(access.address.get(), address, "word={word:08x}");
@@ -587,6 +643,7 @@ fn check_escape(prefix: &[u32], word: u32, base: u64, subaccess: u16, stage: u16
         &mut actual_bytes,
         Some((0x3000, subaccess, stage)),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(actual, expected, "{word:08x} prefix={prefix:x?}");
@@ -682,6 +739,18 @@ fn delivered_lcq_retry_preserves_dirty_spills_lazy_flags_and_pending_fp() {
         0x9a1f_00c6, // ADC X6,X6,XZR consumes the lazy carry
         0xd420_0000,
     ]);
+    let fragment = Fragment::capture(&super::memory(&words), key()).unwrap();
+    let lowered = Compiler::for_arena(native_abi(), ARENA)
+        .unwrap()
+        .lower(&fragment, CodeVersion::new(1).unwrap())
+        .unwrap();
+    let map = &lowered.states[lowered.faults[0].state_map as usize].state;
+    assert!(map.host_fpsr_pending);
+    assert!(
+        map.bindings
+            .iter()
+            .any(|binding| matches!(binding.location, crate::abi::ValueLocation::Spill { .. }))
+    );
     let mut expected = A64State::default();
     expected.set_pc(PC);
     expected.set_fpcr(1 << 22);
@@ -897,11 +966,12 @@ fn contiguous_structure_fault_maps_cover_grouped_and_element_paths() {
                                 assert_eq!(fault.bytes, 1 << size);
                             }
                             let state = &lowered.states[fault.state_map as usize].state;
-                            assert!(!state.dirty_live.integer.x[1]); // no early writeback
+                            assert!(state.dirty_live.integer.x[1]); // inherited pre-writeback base
                             for register in 0..32 {
                                 assert_eq!(
                                     state.dirty_live.vector[(31 + register) & 31],
-                                    load && register < count && register * lanes < index
+                                    lowered.entry.live_in.vector[(31 + register) & 31]
+                                        || (load && register < count && register * lanes < index)
                                 );
                             }
                             state.validate().unwrap();
@@ -951,13 +1021,14 @@ fn multiple_structure_fault_maps_preserve_each_committed_lane() {
                             assert_eq!(fault.bytes, 1 << size);
                             assert!(fault.completed_read.is_none());
                             let state = &lowered.states[fault.state_map as usize].state;
-                            assert!(!state.dirty_live.integer.x[1]);
+                            assert!(state.dirty_live.integer.x[1]);
                             assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
-                            assert!(!state.host_fpsr_pending);
+                            assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
                             for offset in 0..32 {
                                 assert_eq!(
                                     state.dirty_live.vector[(31 + offset) & 31],
-                                    load && offset < count && offset < index
+                                    lowered.entry.live_in.vector[(31 + offset) & 31]
+                                        || (load && offset < count && offset < index)
                                 );
                             }
                             if index > 0 {
@@ -1068,11 +1139,14 @@ fn single_structure_fault_maps_preserve_completed_elements_and_defer_writeback()
                     assert_eq!(fault.bytes, 1 << size);
                     assert!(fault.completed_read.is_none());
                     let state = &lowered.states[fault.state_map as usize].state;
-                    assert!(!state.dirty_live.integer.x[1]);
+                    assert!(state.dirty_live.integer.x[1]);
                     assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
-                    assert!(!state.host_fpsr_pending);
+                    assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
                     for (element, register) in [31, 0, 1, 2].into_iter().enumerate() {
-                        assert_eq!(state.dirty_live.vector[register], load && element < index);
+                        assert_eq!(
+                            state.dirty_live.vector[register],
+                            lowered.entry.live_in.vector[register] || (load && element < index)
+                        );
                     }
                     if index > 0 {
                         assert!(lowered.faults[index - 1].native_end <= fault.native_start);
@@ -1087,7 +1161,10 @@ fn single_structure_fault_maps_preserve_completed_elements_and_defer_writeback()
                     .state;
                 assert!(exit.dirty_live.integer.x[1]);
                 for register in [31, 0, 1, 2] {
-                    assert_eq!(exit.dirty_live.vector[register], load);
+                    assert_eq!(
+                        exit.dirty_live.vector[register],
+                        lowered.entry.live_in.vector[register] || load
+                    );
                 }
                 let clif = compiler.context.func.display().to_string();
                 assert_eq!(clif.matches("nixe_fault_start").count(), 4);
@@ -1291,14 +1368,14 @@ fn pair_fault_maps_retain_uncommitted_reads_and_completed_store_stages() {
                         assert_eq!(fault.commit_stage, if load == 0 { i as u16 } else { 0 });
                         assert_eq!(fault.completed_read.is_some(), load == 1 && i == 1);
                         let state = &lowered.states[fault.state_map as usize].state;
-                        assert!(!state.dirty_live.integer.x[1]);
+                        assert!(state.dirty_live.integer.x[1]);
                         let dirty = if vector {
                             &state.dirty_live.vector[..]
                         } else {
                             &state.dirty_live.integer.x[..]
                         };
                         assert!(dirty[0] && dirty[3]);
-                        assert!(!state.host_fpsr_pending);
+                        assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
                         if let Some(location) = fault.completed_read {
                             assert!(location.valid(abi, fault.bytes));
                             let backend = &lowered.output.metadata.faults[i];
@@ -1387,9 +1464,8 @@ fn vector_prefault_maps_preserve_previous_vector_and_pre_writeback_base() {
             assert_eq!(fault.bytes, 16);
             let state = &lowered.states[fault.state_map as usize].state;
             assert!(state.dirty_live.vector[0]);
-            assert_eq!(state.dirty_live.integer.x[1], i == 1);
-            assert!(!state.host_fpsr_pending);
-            assert!(!state.dirty_live.fpsr);
+            assert!(state.dirty_live.integer.x[1]);
+            assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
             let map = &lowered.output.metadata.faults[i];
             assert_eq!(
                 fault.native_end - fault.native_start,
@@ -1432,7 +1508,7 @@ fn scalar_prefault_maps_keep_pre_writeback_state_and_lazy_flags() {
             let state = &lowered.states[fault.state_map as usize].state;
             assert!(state.dirty_live.integer.x[5]);
             assert_eq!(state.dirty_live.integer.x[0], i == 1);
-            assert_eq!(state.dirty_live.integer.x[1], i == 1);
+            assert!(state.dirty_live.integer.x[1]);
             assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
             state.validate().unwrap();
         }
@@ -1463,6 +1539,6 @@ fn scalar_prefault_maps_include_prior_native_fp_effects() {
         assert!(state.dirty_live.fpsr);
         assert!(state.dirty_live.vector[0]);
         assert!(!state.dirty_live.integer.x[0]);
-        assert!(!state.dirty_live.integer.x[1]);
+        assert!(state.dirty_live.integer.x[1]);
     }
 }
