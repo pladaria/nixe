@@ -2,8 +2,11 @@
 //! mutex, never JIT state. A lease owns an exact span; published CodeUnit owners
 //! must retain it through unlink, reader quiescence and all strong references.
 
+mod islands;
 mod linux;
 pub(crate) mod output;
+mod patch;
+pub(crate) use patch::Write;
 #[cfg(test)]
 mod tests;
 
@@ -121,6 +124,7 @@ struct Segment {
     tier: Option<Tier>,
     bump: usize,
     live: usize,
+    islands: islands::Pool,
     // Sorted, coalesced ranges. Capacity is charged, including replacement
     // overlap; fixed boxed storage makes that extent exact. No release allocates.
     free: Box<[Span]>,
@@ -275,6 +279,16 @@ impl Cache {
         alignment: usize,
         tier: Tier,
     ) -> Result<Allocation, Error> {
+        self.allocate_with_islands(size, alignment, tier, 0)
+    }
+
+    fn allocate_with_islands(
+        self: &Arc<Self>,
+        size: usize,
+        alignment: usize,
+        tier: Tier,
+        island_count: usize,
+    ) -> Result<Allocation, Error> {
         if size == 0 || size > SEGMENT_BYTES - ISLAND_BYTES {
             return Err(Error::Capacity(
                 "unit is empty or exceeds one segment's code area",
@@ -282,6 +296,11 @@ impl Cache {
         }
         if !alignment.is_power_of_two() || alignment > SEGMENT_BYTES {
             return Err(Error::Capacity("invalid code alignment"));
+        }
+        if island_count > islands::SLOTS {
+            return Err(Error::Capacity(
+                "unit island demand exceeds one segment; split before publication",
+            ));
         }
         let mut state = self.lock()?;
         if state.backing.is_none() {
@@ -291,7 +310,9 @@ impl Cache {
         // borrow an unused segment, never another tier's live active segment.
         let mut best: Option<(usize, usize, usize, usize)> = None;
         for (index, segment) in state.segments.iter().enumerate() {
-            if segment.live != 0 && segment.tier != Some(tier) {
+            if (segment.live != 0 && segment.tier != Some(tier))
+                || segment.islands.find(island_count).is_none()
+            {
                 continue;
             }
             for (free_index, free) in segment.free[..segment.free_len].iter().enumerate() {
@@ -315,6 +336,7 @@ impl Cache {
                 for (index, segment) in state.segments.iter().enumerate() {
                     if segment.generation.is_some() != committed
                         || (segment.live != 0 && segment.tier != Some(tier))
+                        || segment.islands.find(island_count).is_none()
                     {
                         continue;
                     }
@@ -331,7 +353,7 @@ impl Cache {
                 }
             }
             candidate.ok_or(Error::Capacity(
-                "2047 MiB executable window has no fitting span",
+                "2047 MiB executable window has no fitting code/island reservation",
             ))?
         };
         state.ensure_free_storage(index, tier)?;
@@ -402,6 +424,7 @@ impl Cache {
             segment: index,
             generation: segment.generation.unwrap(),
             span: Span { start, len: size },
+            islands: segment.islands.claim(island_count),
         })
     }
 
@@ -410,6 +433,55 @@ impl Cache {
         output: Output,
         tier: Tier,
         resolve: impl FnMut(&Target) -> Option<usize>,
+    ) -> Result<Installed, Error> {
+        self.install_with_islands(output, tier, 0, resolve)
+    }
+
+    /// Reserve the source's complete worst-case set of 16-byte islands while
+    /// choosing its code segment. Slots remain non-callable until initialized
+    /// and published by the link owner; this does not permit live-code writes.
+    pub fn install_with_islands(
+        self: &Arc<Self>,
+        output: Output,
+        tier: Tier,
+        island_count: usize,
+        resolve: impl FnMut(&Target) -> Option<usize>,
+    ) -> Result<Installed, Error> {
+        self.install_final(output, tier, island_count, resolve, None)
+    }
+
+    /// Populate an unpublished bridge's terminal branch at its final RX
+    /// address. Its own reserved island covers a far target independently of
+    /// the source-to-bridge island. Both are immutable before first execution.
+    pub fn install_with_branch(
+        self: &Arc<Self>,
+        output: Output,
+        tier: Tier,
+        tail: usize,
+        target: usize,
+    ) -> Result<Installed, Error> {
+        self.install_final(output, tier, 1, |_| None, Some((tail, target)))
+    }
+
+    /// A dynamic bridge reserves its 16-byte worst-case tail in the ordinary
+    /// code span. It must not reserve any static island, even for a far target.
+    pub fn install_with_inline_branch(
+        self: &Arc<Self>,
+        output: Output,
+        tier: Tier,
+        tail: usize,
+        target: usize,
+    ) -> Result<Installed, Error> {
+        self.install_final(output, tier, 0, |_| None, Some((tail, target)))
+    }
+
+    fn install_final(
+        self: &Arc<Self>,
+        output: Output,
+        tier: Tier,
+        island_count: usize,
+        resolve: impl FnMut(&Target) -> Option<usize>,
+        tail: Option<(usize, usize)>,
     ) -> Result<Installed, Error> {
         if !output.alignment.is_power_of_two() {
             return Err(Error::Capacity("invalid code alignment"));
@@ -425,12 +497,51 @@ impl Cache {
             charge: MetadataLease,
         }
         let mut staging = Staging { output, charge };
-        let allocation = self.allocate(
+        let allocation = self.allocate_with_islands(
             staging.output.bytes.len(),
             staging.output.alignment.max(16),
             tier,
+            island_count,
         )?;
         staging.output.relocate(allocation.address(), resolve)?; // No cache/JIT lock.
+        let mut island = None;
+        if let Some((tail, target)) = tail {
+            let source = allocation
+                .address()
+                .checked_add(tail)
+                .ok_or_else(|| Error::Output("bridge tail address overflow".into()))?;
+            if let Some(island_address) = allocation.island_address(0) {
+                let branch = crate::native::link::emit(
+                    staging.output.metadata.abi,
+                    source as u64,
+                    target as u64,
+                    island_address as u64,
+                )
+                .map_err(|error| Error::Output(error.into()))?;
+                staging
+                    .output
+                    .bytes
+                    .get_mut(tail..)
+                    .and_then(|bytes| bytes.get_mut(..branch.patch().len()))
+                    .ok_or_else(|| Error::Output("bridge tail outside staged bytes".into()))?
+                    .copy_from_slice(branch.patch());
+                island = branch.island;
+            } else {
+                let bytes = crate::native::link::inline_tail(
+                    staging.output.metadata.abi,
+                    source as u64,
+                    target as u64,
+                )
+                .map_err(|error| Error::Output(error.into()))?;
+                staging
+                    .output
+                    .bytes
+                    .get_mut(tail..)
+                    .and_then(|output| output.get_mut(..bytes.len()))
+                    .ok_or_else(|| Error::Output("inline bridge tail outside staged bytes".into()))?
+                    .copy_from_slice(&bytes);
+            }
+        }
         {
             let mut state = self.lock()?;
             let offset = allocation.segment * SEGMENT_BYTES;
@@ -447,6 +558,14 @@ impl Cache {
                 libc::PROT_READ | libc::PROT_WRITE,
             )?;
             unsafe {
+                if let Some(bytes) = &island {
+                    let address = allocation.island_address(0).unwrap();
+                    linux::copy(
+                        rw.base.as_ptr().add(address - self.base),
+                        address as *const u8,
+                        bytes,
+                    );
+                }
                 linux::copy(
                     rw.base.as_ptr().add(offset + allocation.span.start),
                     allocation.address() as *const u8,
@@ -534,11 +653,14 @@ impl Cache {
     }
 }
 
+// Error has drop glue: eager ok_or emitted a destructor call for every free
+// span examined, even on success. Keep error construction on the cold path.
+#[allow(clippy::unnecessary_lazy_evaluations)]
 fn align(address: usize, alignment: usize) -> Result<usize, Error> {
     address
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
-        .ok_or(Error::Capacity("aligned address overflow"))
+        .ok_or_else(|| Error::Capacity("aligned address overflow"))
 }
 fn segment_size(index: usize) -> usize {
     (WINDOW_BYTES - index * SEGMENT_BYTES).min(SEGMENT_BYTES)
@@ -550,6 +672,9 @@ pub(crate) struct Allocation {
     pub segment: usize,
     pub generation: SegmentGeneration,
     span: Span,
+    // Slot indexes inside this segment's final 64 KiB. This reservation shares
+    // the allocation's lifetime, generation and existing live-segment count.
+    islands: Span,
 }
 impl Allocation {
     pub fn belongs_to(&self, cache: &Arc<Cache>) -> bool {
@@ -561,12 +686,23 @@ impl Allocation {
     pub fn len(&self) -> usize {
         self.span.len
     }
+    pub fn island_count(&self) -> usize {
+        self.islands.len
+    }
+    pub fn island_address(&self, index: usize) -> Option<usize> {
+        (index < self.islands.len).then(|| {
+            self.cache.base + self.segment * SEGMENT_BYTES + segment_size(self.segment)
+                - ISLAND_BYTES
+                + (self.islands.start + index) * islands::SLOT_BYTES
+        })
+    }
 }
 impl Drop for Allocation {
     fn drop(&mut self) {
         if let Ok(mut state) = self.cache.lock() {
             let segment = &mut state.segments[self.segment];
             assert_eq!(segment.generation, Some(self.generation));
+            segment.islands.release(self.islands);
             segment.release(self.span);
         }
     }

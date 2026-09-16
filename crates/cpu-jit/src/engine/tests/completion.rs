@@ -7,6 +7,135 @@ use nixe_cpu::memory::{DataAccessFaultReason, MemoryAccess, MemoryValue, Synthet
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Timer;
+
+#[test]
+fn civac_probe_keeps_active_fp_status_on_success_and_escape() {
+    let _restore = crate::fp_env::tests::RestoreHost::new();
+    for address in [0x1000, 0x8000] {
+        // FADD D0,D1,D2 rounds 1 + 2^-54 to 1 and raises guest IXC.
+        let mut thread = budget::setup(&[0x1e622820, 0xd50b7e20, 0xd4200000], false);
+        let mut state = state();
+        state.general_register_storage_mut()[0] = address;
+        state.set_vector(1, u128::from(1_f64.to_bits()));
+        state.set_vector(2, u128::from((2_f64.powi(-54)).to_bits()));
+        let (exit, budget) = exit(&mut thread, &mut state);
+        assert_eq!(state.vector(0), Some(u128::from(1_f64.to_bits())));
+        assert_eq!(state.fpsr(), 1 << 4);
+        if address == 0x1000 {
+            assert!(matches!(exit, invocation::Exit::Native { guest, .. }
+                if guest.kind == EdgeKind::Breakpoint(0)));
+            assert_eq!(state.pc(), PC.get() + 8);
+            assert_eq!(budget.slice_remaining, -1);
+        } else {
+            assert!(matches!(
+                exit,
+                invocation::Exit::Memory {
+                    outcome: invocation::MemoryExit::CacheCleanInvalidate { .. },
+                    ..
+                }
+            ));
+            assert_eq!(state.pc(), PC.get() + 4);
+            assert_eq!(budget.slice_remaining, 0);
+        }
+    }
+}
+
+#[test]
+fn civac_probe_preserves_lazy_state_and_charges_hot_and_cold_work_once() {
+    // SUBS X0,X0,#1; CIVAC X0; ADC X3,X3,XZR; BRK.
+    let words = [0xf1000400, 0xd50b7e20, 0x9a1f0063, 0xd4200000];
+    for address in [0x1001_u64, 0x1fff, 0x3001, 0x4000, 0x10000, u64::MAX] {
+        let mut thread = budget::setup(&words, true);
+        let mut state = state();
+        state.general_register_storage_mut()[0] = address.wrapping_add(1);
+        state.general_register_storage_mut()[3] = 41;
+        state.set_fpsr(1 << 27);
+        let mut expected = state.clone();
+        nixe_cpu_interpreter::execute_one(&TargetPlatform::Switch1, &mut expected, words[0])
+            .unwrap();
+        let (exit, mut budget) = exit(&mut thread, &mut state);
+        let hot = address < 0x4000;
+        if hot {
+            assert!(matches!(exit, invocation::Exit::Native { guest, .. }
+                if guest.kind == EdgeKind::Breakpoint(0) && guest.pc.get() == PC.get() + 12));
+            nixe_cpu_interpreter::execute_one(&TargetPlatform::Switch1, &mut expected, words[2])
+                .unwrap();
+            expected.set_pc(PC.get() + 12);
+            assert_eq!(budget.slice_remaining, -2);
+            assert_eq!(budget.sample_remaining, 4093);
+        } else {
+            assert!(matches!(exit, invocation::Exit::Memory {
+                outcome: invocation::MemoryExit::CacheCleanInvalidate { address: found }, ..
+            } if found.get() == address));
+            expected.set_pc(PC.get() + 4);
+            assert_eq!(state, expected);
+            assert_eq!(budget.slice_remaining, 0);
+            let stop = thread
+                .complete(
+                    exit,
+                    &mut state,
+                    &mut budget,
+                    &Timer,
+                    &VcpuEventState::default(),
+                    1,
+                )
+                .unwrap();
+            assert!(matches!(stop, Some(CpuExit::DataFault { source, fault })
+                if source.pc.get() == PC.get() + 4 && fault.address.get() == address
+                    && fault.reason == DataAccessFaultReason::Unmapped));
+            assert_eq!(budget.slice_remaining, 0); // Failed CIVAC is not charged.
+        }
+        assert_eq!(state, expected, "address {address:#x}");
+    }
+}
+
+#[test]
+fn civac_probe_on_nonreadable_ram_uses_cache_semantics_and_charges_success_once() {
+    let mut thread = budget::setup(&[0x91000421, 0xd50b7e20, 0xd4200000], true);
+    thread
+        .process
+        .memory
+        .set_permissions(
+            SPACE,
+            GuestVirtualAddress::new(0x3000),
+            4096,
+            MemoryPermissions::NONE,
+        )
+        .unwrap();
+    // Permission mutation may withdraw the source. Demand its current version.
+    assert!(matches!(thread.demand(PC).unwrap(), Demand::Ready));
+    let mut state = state();
+    state.general_register_storage_mut()[0] = 0x3001;
+    let (exit, mut budget) = exit(&mut thread, &mut state);
+    assert!(matches!(
+        exit,
+        invocation::Exit::Memory {
+            outcome: invocation::MemoryExit::CacheCleanInvalidate { .. },
+            ..
+        }
+    ));
+    assert_eq!(state.pc(), PC.get() + 4);
+    assert_eq!(state.general_register_storage_mut()[1], 1);
+    assert_eq!(budget.slice_remaining, 0);
+    // Preserve the canonical maintenance contract, not an ordinary LDR's
+    // permission check. A future permission-policy change belongs to that owner.
+    assert!(
+        thread
+            .complete(
+                exit,
+                &mut state,
+                &mut budget,
+                &Timer,
+                &VcpuEventState::default(),
+                1
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(state.pc(), PC.get() + 8);
+    assert_eq!(budget.slice_remaining, -1);
+    assert_eq!(budget.sample_remaining, 4094);
+}
 impl ArchitecturalTimer for Timer {
     fn snapshot(&self) -> TimerSnapshot {
         TimerSnapshot {
@@ -25,7 +154,13 @@ fn state() -> A64State {
 fn exit(thread: &mut JitThread, state: &mut A64State) -> (invocation::Exit, PollBudget) {
     let mut worker = NativeWorker::default();
     let (exit, budget) = thread
-        .invoke(&mut worker, state, PollBudget::new(4096, 1).unwrap())
+        .invoke(
+            &mut crate::ReturnStack::default(),
+            &mut worker,
+            state,
+            PollBudget::new(4096, 1).unwrap(),
+            &VcpuEventState::default(),
+        )
         .unwrap();
     (exit.unwrap(), budget)
 }
@@ -96,7 +231,13 @@ fn ic_completion_can_unlink_its_source_and_faults_do_not_earn_work() {
             state.set_pc(PC.get());
             assert!(
                 thread
-                    .invoke(&mut worker, &mut state, PollBudget::new(4096, 1).unwrap())
+                    .invoke(
+                        &mut crate::ReturnStack::default(),
+                        &mut worker,
+                        &mut state,
+                        PollBudget::new(4096, 1).unwrap(),
+                        &VcpuEventState::default()
+                    )
                     .unwrap()
                     .0
                     .is_none()

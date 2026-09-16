@@ -70,10 +70,10 @@ fn stopping_inside_a_cold_completion_prevents_native_continuation() {
     state.set_pc(PC.get());
     let error = thread
         .run_slice(
+            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             100,
-            None,
             &StoppingTimer(process.clone()),
             &VcpuEventState::default(),
         )

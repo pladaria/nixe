@@ -42,6 +42,8 @@ fn host_requirement_matches_exposed_cpuid() {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeReturn {
     pub reason: NativeExitReason,
+    /// Final canonical reconciliation only. Sample-only deadlines already
+    /// reconciled by a resumable cold poll are not repeated here.
     pub poll: PollOutcome,
 }
 
@@ -71,6 +73,12 @@ pub enum NativeReturnError {
 /// exit (not RET), preserving the pinned registers and host SP. Every exit map
 /// must make observed state canonical, including deferred flags. No unwinding
 /// may cross native code. The frame must not be moved or entered recursively.
+/// Its cold-poll request pointers must refer to aligned AtomicU32 words whose
+/// owners remain alive throughout this call. Native polls acquire-read them;
+/// they never consume or acknowledge requests while holding native protection.
+/// A nonnull indirect_pic must name this vCPU's stable table; its occupied
+/// bridge records and executable targets stay strongly owned, and no writer may
+/// mutate the table while this vCPU executes native code.
 /// If native FP is already active, no general Rust work may intervene between
 /// activation and this call. This is not a substitute for protected dispatch.
 #[inline(always)]
@@ -80,11 +88,13 @@ pub unsafe fn enter_protected(
     entry: *const u8,
 ) -> Result<NativeReturn, NativeReturnError> {
     frame.exit_reason = NativeExitReason::None as u32;
+    frame.dispatch_fallback = dispatch_fallback as *const () as usize;
     let remaining = unsafe { enter(frame, arena, entry) };
     // Only the bounded, shared FP-owner leaf may run before caller restoration.
     // Software FPSR writeback has already completed in the generated exit.
     unsafe { frame.finish_fp() };
     frame.gateway_exit = 0;
+    frame.dispatch_fallback = 0;
     let reason = NativeExitReason::try_from(frame.exit_reason)
         .ok()
         .filter(|reason| *reason != NativeExitReason::None)
@@ -94,6 +104,58 @@ pub unsafe fn enter_protected(
         .reconcile(remaining, reason == NativeExitReason::Control)
         .map_err(NativeReturnError::Budget)?;
     Ok(NativeReturn { reason, poll })
+}
+
+// Entered by a canonicalized source-local thunk, with the gateway's aligned
+// stack. Only pinned System-ABI nonvolatiles (context, arena, poll) must survive
+// the helper: target ingress reloads architectural inputs. In particular X30
+// may be clobbered; all native returns use gateway_exit, never guest RET.
+// The callback suspends guest FP BEFORE general Rust and resumes only on a hit.
+// System ABI references are the same as the gateway below.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn dispatch_fallback() {
+    core::arch::naked_asm!(
+        "endbr64",
+        "mov rax, [r15 + {resolver}]",
+        "test rax, rax",
+        "jz 2f",
+        "mov rdi, [r15 + {context}]",
+        "mov rsi, r15",
+        "mov rdx, r14",
+        "call rax",
+        "test rax, rax",
+        "jnz 3f",
+        "2:",
+        "jmp qword ptr [r15 + {exit}]",
+        "3:",
+        "jmp rax",
+        resolver = const offset_of!(NativeFrame<'static>, dispatch_resolver),
+        context = const offset_of!(NativeFrame<'static>, dispatch_context),
+        exit = const offset_of!(NativeFrame<'static>, gateway_exit),
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn dispatch_fallback() {
+    core::arch::naked_asm!(
+        "bti j",
+        "ldr x16, [x21, #{resolver}]",
+        "cbz x16, 2f",
+        "ldr x0, [x21, #{context}]",
+        "mov x1, x21",
+        "mov x2, x20",
+        "blr x16",
+        "cbz x0, 2f",
+        "br x0",
+        "2:",
+        "ldr x16, [x21, #{exit}]",
+        "br x16",
+        resolver = const offset_of!(NativeFrame<'static>, dispatch_resolver),
+        context = const offset_of!(NativeFrame<'static>, dispatch_context),
+        exit = const offset_of!(NativeFrame<'static>, gateway_exit),
+    );
 }
 
 // Both entries keep SP aligned for eventual cold system-ABI helper calls.

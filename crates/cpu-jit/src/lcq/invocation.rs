@@ -3,7 +3,7 @@
 
 use super::fault::{self, cold::Completion};
 use crate::{
-    abi::{BlockKey, ExclusiveStoreOperation, NativeFrame, PollOutcome, PublishedEntry},
+    abi::{BlockKey, ExclusiveStoreOperation, NativeFrame},
     lifetime::{
         self, FaultLookup, Reader,
         unit::{EdgeKind, GuestExit, Instruction},
@@ -24,9 +24,8 @@ mod memory;
 
 pub(crate) enum Exit {
     Native {
-        // Linked execution consumes this outcome in Task 4; the unlinked loop
-        // already receives the reconciled PollBudget separately.
-        #[allow(dead_code)]
+        // The canonical loop consumes control exits after owned completion;
+        // it receives the reconciled PollBudget separately.
         returned: NativeReturn,
         guest: GuestExit,
         /// The exiting instruction, not the destination PC's current bytes.
@@ -34,13 +33,15 @@ pub(crate) enum Exit {
     },
     Memory {
         instruction: Instruction,
-        #[allow(dead_code)] // Task 4 native polling; LCQ uses reconciled budget.
-        poll: PollOutcome,
         outcome: MemoryExit,
     },
 }
 
 pub(crate) enum MemoryExit {
+    /// Failed native proof; the original CIVAC has not executed yet.
+    CacheCleanInvalidate {
+        address: nixe_memory::GuestVirtualAddress,
+    },
     // Allocate only on a cold memory escape, not on every native return.
     Cold(Box<Completion>),
     /// A canonical PRE exit using a reservation from another invocation or VA.
@@ -79,10 +80,13 @@ impl std::fmt::Display for Error {
 ///
 /// # Safety
 /// The reader and memory belong to the same process. Published entries are
-/// unlinked LCQ fragments with contiguous instruction images; they use
+/// LCQ fragments with contiguous instruction images; they use
 /// this host's checked NativeFrame ABI and this memory's arena size. No other
 /// FP owner is active on this OS thread. The canonical state matches `key`,
 /// and the frame has no pending exclusive load from an earlier invocation.
+/// Production static edges use the Closed linker as their targets become
+/// resident; indirect hits use the owning vCPU's PIC. Every target in the chain
+/// remains rooted through this same epoch. Misses resume canonical ingress.
 /// The caller must not resume guest execution after an internal/runtime error.
 pub(crate) unsafe fn run(
     reader: &mut Reader,
@@ -110,7 +114,10 @@ pub(crate) unsafe fn run(
         memory,
         arena,
         resolution: None,
+        dispatch_error: None,
     };
+    frame.dispatch_resolver = Some(dispatch_link);
+    frame.dispatch_context = std::ptr::from_mut(&mut dispatch).cast();
     // Raw pointers only: the callback borrows the frame while the gateway is
     // suspended. No Rust &mut frame is retained in the invocation context.
     let mut call = Entry {
@@ -130,19 +137,25 @@ pub(crate) unsafe fn run(
                 entry: entry.canonical.get(),
             },
         )
+    };
+    // The frame may outlive this stack-owned dispatcher, including fault and
+    // runtime error paths. No borrowed callback pointer survives the call.
+    frame.dispatch_resolver = None;
+    frame.dispatch_context = std::ptr::null_mut();
+    let returned = returned.map_err(Error::Runtime)?;
+    if let Some(error) = dispatch.dispatch_error.take() {
+        return Err(error);
     }
-    .map_err(Error::Runtime)?;
     let exit = match returned {
         InvocationOutcome::Returned => {
             let returned = call
                 .result
                 .ok_or(Error::Internal("LCQ gateway returned without an exit"))?
                 .map_err(Error::Native)?;
-            let (guest, instruction) = canonical_exit(&dispatch.lookup, entry, frame)?;
+            let (guest, instruction) = canonical_exit(&dispatch.lookup, frame)?;
             if let EdgeKind::ExclusiveStore(operation) = guest.kind {
                 Exit::Memory {
                     instruction,
-                    poll: returned.poll,
                     outcome: MemoryExit::ExclusiveStore(operation),
                 }
             } else {
@@ -171,12 +184,19 @@ pub(crate) unsafe fn run(
             let instruction = *instruction;
             let reconstructed =
                 unsafe { fault::reconstruct(frame, &captured, &fault) }.map_err(Error::Internal)?;
-            let resolution = dispatch
+            let (access, resolution) = dispatch
                 .resolution
                 .take()
                 .ok_or(Error::Internal("LCQ escape has no memory resolution"))?
                 .map_err(Error::Internal)?;
             let outcome = match resolution {
+                DirectFaultResolution::Cold
+                    if fault.record.access == lifetime::unit::Access::CacheProbe =>
+                {
+                    MemoryExit::CacheCleanInvalidate {
+                        address: access.address,
+                    }
+                }
                 DirectFaultResolution::Cold => MemoryExit::Cold(Box::new(
                     unsafe { Completion::prepare(frame, &fault, reconstructed.completed_read) }
                         .map_err(Error::Internal)?,
@@ -187,7 +207,7 @@ pub(crate) unsafe fn run(
                     return Err(Error::Internal("LCQ retry unexpectedly escaped"));
                 }
             };
-            let poll = frame
+            frame
                 .budget
                 // No canonical epilogue ran on escape. Charge only the prefix;
                 // repair/retry never comes here and cold completion owns the
@@ -202,7 +222,6 @@ pub(crate) unsafe fn run(
                 .map_err(|error| Error::Native(NativeReturnError::Budget(error)))?;
             Exit::Memory {
                 instruction,
-                poll,
                 outcome,
             }
         }
@@ -215,22 +234,17 @@ pub(crate) unsafe fn run(
     Ok(Some(exit))
 }
 
-/// Consume exit identity before quiescence. The entry is the already-admitted
-/// value, never a fresh dispatch lookup that could select a replacement unit.
-/// Inter-unit native linking will need the actual exiting unit's identity;
-/// an unlinked LCQ invocation must exit from the unit it entered.
+/// Resolve the actual exiting unit while the invocation still protects its
+/// metadata. The guest destination and initial entry need not belong to it.
+/// Never perform a fresh dispatch lookup which could select a replacement.
 fn canonical_exit(
     lookup: &FaultLookup<'_>,
-    entry: PublishedEntry,
     frame: &NativeFrame<'_>,
 ) -> Result<(GuestExit, Instruction), Error> {
     let unit = lookup
-        .unit(entry.canonical.get())
-        .ok_or(Error::Internal("LCQ canonical entry has no live code unit"))?;
-    if unit.id != entry.unit
-        || unit.version != entry.version
-        || frame.exit_source_version != entry.version.get()
-    {
+        .unit(frame.exit_native_pc)
+        .ok_or(Error::Internal("LCQ canonical exit has no live code unit"))?;
+    if frame.exit_source_version != unit.version.get() {
         return Err(Error::Internal(
             "LCQ canonical exit has a different source version",
         ));
@@ -266,7 +280,126 @@ struct Dispatch<'a> {
     lookup: FaultLookup<'a>,
     memory: &'a ExecutionMemory,
     arena: DirectAddressSpaceView,
-    resolution: Option<Result<DirectFaultResolution, &'static str>>,
+    resolution: Option<Result<(fault::access::Access, DirectFaultResolution), &'static str>>,
+    dispatch_error: Option<Error>,
+}
+
+unsafe extern "C" fn dispatch_link(
+    opaque: *mut libc::c_void,
+    frame: *mut libc::c_void,
+    remaining: i64,
+) -> usize {
+    let frame = unsafe { &mut *frame.cast::<NativeFrame<'_>>() };
+    // Canonical source writeback precedes this helper. Collect host status only
+    // afterwards, so mapped software FPSR cannot overwrite it. No general Rust
+    // (locking, unwinding or lookup) may run with the guest FP environment.
+    unsafe { frame.suspend_fp() };
+    let dispatch = unsafe { &mut *opaque.cast::<Dispatch<'_>>() };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        use crate::abi::NativeExitReason;
+        use std::sync::atomic::Ordering;
+        if frame
+            .poll_requests
+            .iter()
+            .any(|word| unsafe { &**word }.load(Ordering::Acquire) != 0)
+        {
+            frame.exit_reason = NativeExitReason::Control as u32;
+            return Ok(0);
+        }
+        let spent = frame
+            .budget
+            .armed_span
+            .checked_sub(remaining)
+            .ok_or(Error::Internal("link fallback work accounting overflow"))?;
+        let left = frame
+            .budget
+            .slice_remaining
+            .checked_sub(spent)
+            .ok_or(Error::Internal("link fallback slice accounting overflow"))?;
+        if left <= 0 {
+            return Ok(0);
+        }
+        let unit = dispatch
+            .lookup
+            .unit(frame.exit_native_pc)
+            .ok_or(Error::Internal("link fallback has no live source"))?;
+        if frame.exit_source_version != unit.version.get() {
+            return Err(Error::Internal("link fallback source version mismatch"));
+        }
+        let map = unit
+            .states
+            .get(frame.exit_state_map as usize)
+            .ok_or(Error::Internal("link fallback has no source state map"))?;
+        let transfer = map
+            .transfer
+            .as_ref()
+            .ok_or(Error::Internal("link fallback has no terminal transfer"))?;
+        if frame.exit_reason != NativeExitReason::Dispatch as u32 {
+            return Err(Error::Internal("link fallback destination mismatch"));
+        }
+        let resolved = if let Some(target) = transfer.static_target {
+            if target.pc.get() != frame.exit_pc {
+                return Err(Error::Internal("link fallback destination mismatch"));
+            }
+            dispatch.lookup.static_entry(target)
+        } else {
+            if !map.exit.is_some_and(|exit| {
+                matches!(
+                    exit.kind,
+                    EdgeKind::Indirect | EdgeKind::Call | EdgeKind::Return
+                )
+            }) {
+                return Err(Error::Internal("link fallback is not an indirect terminal"));
+            }
+            let Some(target) = unit.instructions[0]
+                .key
+                .block_key()
+                .at(nixe_memory::GuestVirtualAddress::new(frame.exit_pc))
+            else {
+                // Preserve the guest destination for ordinary canonical fault
+                // handling; a misaligned address can never become a PIC key.
+                return Ok(0);
+            };
+            let source = unit
+                .registered_handle()
+                .ok_or(Error::Internal("link fallback has no source registration"))?;
+            // Canonical writeback and FP suspension precede this exclusive
+            // borrow. No native execution/retry resumes until it is dropped.
+            unsafe { dispatch.lookup.suspend_native() }.resolve_bridge(
+                source,
+                frame.exit_state_map,
+                target,
+            )
+        };
+        match resolved {
+            Ok(entry) => Ok(entry.map_or(0, |entry| entry.canonical.get())),
+            Err(
+                lifetime::Error::Closed
+                | lifetime::Error::Shutdown
+                | lifetime::Error::StaleUnit
+                | lifetime::Error::StalePublication,
+            ) => {
+                frame.exit_reason = NativeExitReason::Control as u32;
+                Ok(0)
+            }
+            Err(error) => Err(Error::Lifetime(error)),
+        }
+    }))
+    .unwrap_or(Err(Error::Internal("panic in link fallback resolver")));
+    match result {
+        Ok(address) => {
+            if address != 0 && unsafe { frame.resume_fp() }.is_err() {
+                dispatch.dispatch_error = Some(Error::Internal("link fallback cannot resume FP"));
+                return 0;
+            }
+            // No Rust work with destructors follows successful FP resumption.
+            address
+        }
+        Err(error) => {
+            dispatch.dispatch_error = Some(error);
+            0
+        }
+    }
 }
 
 unsafe extern "C" fn dispatch_fault(
@@ -289,9 +422,8 @@ unsafe extern "C" fn dispatch_fault(
                 dispatch.arena,
                 dispatch.memory,
             )
-        }
-        .map(|(_, resolution)| resolution);
-        if matches!(resolution, Ok(DirectFaultResolution::Retry)) {
+        };
+        if matches!(resolution, Ok((_, DirectFaultResolution::Retry))) {
             // Keep the captured image, lazy flags, FP and exclusive-load record
             // untouched. Shared capture rejects repeated unchanged repairs.
             FaultDisposition::Retry
@@ -339,7 +471,7 @@ mod tests {
     use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
     use std::sync::Arc;
 
-    fn reader_with_breakpoint() -> (Reader, BlockKey) {
+    fn reader_with_breakpoints() -> (Reader, [BlockKey; 2]) {
         let space = AddressSpaceId::new(1);
         let pc = GuestVirtualAddress::new(0x1000);
         let page = GuestPhysicalPageId::new(1);
@@ -352,47 +484,49 @@ mod tests {
         let mut memory = SyntheticMemory::new();
         assert!(memory.add_ram_page(page));
         assert!(memory.initialize_ram(page, 0, &0xd420_0000u32.to_le_bytes()));
+        assert!(memory.initialize_ram(page, 4, &0xd420_0020u32.to_le_bytes()));
         assert!(memory.map_page(space, pc, page, MemoryPermissions::READ_EXECUTE));
         let cache = Cache::new().unwrap();
         let process = Arc::new(Lifetime::new(cache.clone()).unwrap());
         let mut reader = process.register().unwrap();
-        let Request::Owner(claim) = reader.claim(key).unwrap() else {
-            panic!()
-        };
         let abi = if cfg!(target_arch = "x86_64") {
             HostAbi::X86_64
         } else {
             HostAbi::Aarch64
         };
-        Compiler::new(abi)
-            .unwrap()
-            .publish(
-                Compilation::capture(claim, &memory).unwrap(),
-                &process,
-                &cache,
-                &memory,
-            )
-            .unwrap();
-        (reader, key)
+        let keys = [key, key.at(GuestVirtualAddress::new(0x1004)).unwrap()];
+        let mut compiler = Compiler::new(abi).unwrap();
+        for key in keys {
+            let Request::Owner(claim) = reader.claim(key).unwrap() else {
+                panic!()
+            };
+            compiler
+                .publish(
+                    Compilation::capture(claim, &memory).unwrap(),
+                    &process,
+                    &cache,
+                    &memory,
+                )
+                .unwrap();
+        }
+        (reader, keys)
     }
 
     #[test]
     fn canonical_exit_rejects_stale_versions_missing_units_and_invalid_map_indices() {
-        let (mut reader, key) = reader_with_breakpoint();
+        let (mut reader, [key, _]) = reader_with_breakpoints();
         let mut state = A64State::default();
         let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 1000).unwrap());
         let mut invocation = unsafe { reader.admit(&mut frame, key) }.unwrap().unwrap();
         let entry = invocation.payload().preferred().unwrap();
         let (frame, lookup) = invocation.frame_and_faults();
+        frame.exit_native_pc = entry.canonical.get();
         frame.exit_source_version = entry.version.get();
         frame.exit_state_map = 0;
-        assert_eq!(
-            canonical_exit(&lookup, entry, frame).unwrap().1.bits,
-            0xd420_0000
-        );
+        assert_eq!(canonical_exit(&lookup, frame).unwrap().1.bits, 0xd420_0000);
         frame.exit_source_version += 1;
         assert!(matches!(
-            canonical_exit(&lookup, entry, frame),
+            canonical_exit(&lookup, frame),
             Err(Error::Internal(
                 "LCQ canonical exit has a different source version"
             ))
@@ -400,19 +534,64 @@ mod tests {
         frame.exit_source_version = entry.version.get();
         frame.exit_state_map = u32::MAX;
         assert!(matches!(
-            canonical_exit(&lookup, entry, frame),
+            canonical_exit(&lookup, frame),
             Err(Error::Internal(
                 "LCQ canonical exit has no guest exit record"
             ))
         ));
         frame.exit_state_map = 0;
-        let missing = PublishedEntry {
-            canonical: std::num::NonZeroUsize::new(1).unwrap(),
-            ..entry
-        };
+        frame.exit_native_pc = 1;
         assert!(matches!(
-            canonical_exit(&lookup, missing, frame),
-            Err(Error::Internal("LCQ canonical entry has no live code unit"))
+            canonical_exit(&lookup, frame),
+            Err(Error::Internal("LCQ canonical exit has no live code unit"))
+        ));
+    }
+
+    #[test]
+    fn canonical_exit_resolves_the_executed_unit_not_the_admitted_entry() {
+        let (mut reader, [first, second]) = reader_with_breakpoints();
+        let mut state = A64State::default();
+        let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 1000).unwrap());
+        // No retirement or mutation runs in this fixture. The admission below
+        // protects both published units when the captured second address is used.
+        let second_entry = {
+            let invocation = unsafe { reader.admit(&mut frame, second) }
+                .unwrap()
+                .unwrap();
+            invocation.payload().preferred().unwrap()
+        };
+        let mut invocation = unsafe { reader.admit(&mut frame, first) }.unwrap().unwrap();
+        let first_entry = invocation.payload().preferred().unwrap();
+        assert_ne!(first_entry.version, second_entry.version);
+        let (frame, lookup) = invocation.frame_and_faults();
+        let epoch = frame.execution_epoch;
+        // Exercise final-unit attribution independently of edge publication:
+        // enter the second real LCQ unit under the first unit's admission.
+        unsafe {
+            native::enter_protected(
+                frame,
+                std::ptr::null_mut(),
+                second_entry.canonical.get() as *const u8,
+            )
+        }
+        .unwrap();
+        assert_eq!(frame.execution_epoch, epoch);
+        assert_ne!(epoch, 0);
+        assert_eq!(frame.exit_source_version, second_entry.version.get());
+        assert_eq!(
+            lookup.unit(frame.exit_native_pc).unwrap().id,
+            second_entry.unit
+        );
+        let (guest, instruction) = canonical_exit(&lookup, frame).unwrap();
+        assert_eq!(guest.pc, second.pc);
+        assert_eq!(instruction.bits, 0xd420_0020);
+        // A mapped address alone must not allow an unrelated version/map pair.
+        frame.exit_source_version = first_entry.version.get();
+        assert!(matches!(
+            canonical_exit(&lookup, frame),
+            Err(Error::Internal(
+                "LCQ canonical exit has a different source version"
+            ))
         ));
     }
 
@@ -426,7 +605,7 @@ mod tests {
                 address.cast::<u8>().read_volatile();
             }
         }
-        let (mut reader, key) = reader_with_breakpoint();
+        let (mut reader, [key, _]) = reader_with_breakpoints();
         let arena = nixe_memory::DirectArena::new(0x4000).unwrap();
         let view = arena.view();
         let memory = ExecutionMemory::new();
@@ -440,6 +619,7 @@ mod tests {
             memory: &memory,
             arena: view,
             resolution: None,
+            dispatch_error: None,
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         // The arena address is valid for capture, but this Rust load has no

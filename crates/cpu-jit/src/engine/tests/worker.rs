@@ -27,10 +27,10 @@ fn data_fault(thread: &mut JitThread, worker: &mut NativeWorker) {
     state.general_register_storage_mut()[1] = 0x5000;
     let report = thread
         .run_slice(
+            &mut crate::ReturnStack::default(),
             worker,
             &mut state,
             10,
-            None,
             &Timer,
             &VcpuEventState::default(),
         )
@@ -117,7 +117,6 @@ fn interpreter_and_lcq_share_one_worker_and_survive_either_backend_retirement() 
                             memory_lease: Some(memory.acquire_execution_lease()),
                             state: &mut state,
                             instruction_budget: 1,
-                            loader_return: None,
                             timer: &Timer,
                             events: VcpuEventState::default(),
                         },

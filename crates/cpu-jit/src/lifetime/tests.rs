@@ -497,6 +497,10 @@ fn fp_status_and_caller_environment_complete_before_reader_quiescence() {
         invocation.frame().host_fp.saved_control,
         invocation.frame().host_fp.saved_status,
     );
+    assert_eq!(
+        invocation.frame().poll_requests[0],
+        std::ptr::from_ref(process.control_word())
+    );
     unsafe {
         invocation.frame().ensure_fp().unwrap();
         crate::fp_env::tests::divide_by_zero();

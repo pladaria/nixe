@@ -1,25 +1,23 @@
-//! Canonical slice loop for unlinked LCQ fragments. Demand and semantic
+//! Canonical slice loop around native LCQ execution. Demand and semantic
 //! completion run only after invocation, FP ownership and memory lease release.
 
 use super::*;
-use nixe_cpu::{
-    execution::{
-        ArchitecturalTimer, ControlRequest, CpuExit, CpuFault, CpuFaultKind, ExecutionReport,
-        VcpuEventState,
-    },
-    location::LocationDescriptor,
-    state::a64::{A64GeneralRegister, A64Register},
+use nixe_cpu::execution::{
+    ArchitecturalTimer, ControlRequest, CpuExit, CpuFault, CpuFaultKind, ExecutionReport,
+    VcpuEventState,
 };
 
 impl JitThread {
     /// Memory and CPU identity come from this vCPU's immutable process binding;
     /// callers must not retain an execution lease across this cold loop.
+    /// `returns` belongs to the scheduled guest and must follow it across slices
+    /// and vCPU migration, independently of this worker's PIC registration.
     pub fn run_slice(
         &mut self,
+        returns: &mut crate::ReturnStack,
         worker: &mut NativeWorker,
         state: &mut A64State,
         instruction_budget: u64,
-        loader_return: Option<GuestVirtualAddress>,
         timer: &dyn ArchitecturalTimer,
         events: &VcpuEventState,
     ) -> Result<ExecutionReport, CpuFault> {
@@ -41,9 +39,9 @@ impl JitThread {
             // failed retry reports capacity instead of recompiling/evicting forever.
             let mut capacity_pass = false;
             loop {
-                // Each LCQ terminal edge (including a backedge) returns canonical.
-                // Control is independent of the sample/slice deadline. Linked
-                // execution must preserve this check at its native boundaries.
+                // Check host notifications whenever execution is canonical.
+                // Native chains observe requests through bounded cold polls,
+                // independently of the caller's full slice budget.
                 if let Some(control) = self.control.take_pending() {
                     // This is a notification, not authority to invalidate code:
                     // the bound memory observer unlinks before publishing changes.
@@ -58,26 +56,22 @@ impl JitThread {
                     return Ok(CpuExit::PendingEvent { mask });
                 }
                 let pc = GuestVirtualAddress::new(state.pc());
-                if loader_return == Some(pc) {
-                    return Ok(CpuExit::LoaderReturn {
-                        source: LocationDescriptor::new(pc, self.process.cpu.profile_id()),
-                        result_code: state
-                            .read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
-                    });
-                }
                 if budget.slice_remaining <= 0 {
                     return Ok(CpuExit::BudgetExhausted);
                 }
                 let progress = initial.abs_diff(budget.slice_remaining);
-                let exit = match self.invoke(worker, state, budget) {
+                let exit = match self.invoke(returns, worker, state, budget, events) {
                     Ok((exit, reconciled)) => {
                         budget = reconciled;
                         exit
                     }
-                    // Admission failed before native execution. Yield to the
-                    // maintenance owner; do not spin, re-enter or acknowledge its
-                    // outstanding work. Capacity/shutdown draining is separate.
+                    // No invocation/lease survives failed admission. Service
+                    // owned link/cutover work if quiescent, otherwise yield to
+                    // the remaining readers or the foreign maintenance owner.
                     Err(invocation::Error::Lifetime(lifetime::Error::Closed)) => {
+                        if self.service_links(state, progress)? {
+                            continue;
+                        }
                         return Ok(CpuExit::Safepoint);
                     }
                     Err(invocation::Error::Lifetime(lifetime::Error::Shutdown)) => {
@@ -99,6 +93,8 @@ impl JitThread {
                 };
                 if let Some(exit) = exit {
                     capacity_pass = false;
+                    let control = matches!(&exit, invocation::Exit::Native { returned, .. }
+                        if returned.reason == crate::abi::NativeExitReason::Control);
                     // Finish an already-started instruction even when its native
                     // prefix exhausted the slice. Never execute it again merely
                     // to handle control or budget; completion returns owned stops.
@@ -107,6 +103,12 @@ impl JitThread {
                         self.complete(exit, state, &mut budget, timer, events, progress)?
                     {
                         return Ok(stop);
+                    }
+                    if control {
+                        // Complete the instruction before servicing maintenance.
+                        // This also handles deferred LinkPatch requests which
+                        // deliberately reopened admission between batches.
+                        self.service_links(state, initial.abs_diff(budget.slice_remaining))?;
                     }
                 } else {
                     if !capacity_pass
@@ -130,6 +132,9 @@ impl JitThread {
                         | Err(PublishError::Lifetime(lifetime::Error::StalePublication)) => {}
                         Ok(Demand::FetchFault(fault)) => return Ok(CpuExit::FetchFault { fault }),
                         Err(PublishError::Lifetime(lifetime::Error::Closed)) => {
+                            if self.service_links(state, progress)? {
+                                continue;
+                            }
                             return Ok(CpuExit::Safepoint);
                         }
                         Err(PublishError::Lifetime(lifetime::Error::Shutdown)) => {
@@ -170,6 +175,24 @@ impl JitThread {
         })();
         self.sample_remaining = budget.sample_remaining;
         result.map(|stop| report(stop, initial.abs_diff(budget.slice_remaining), state))
+    }
+
+    fn service_links(&self, state: &A64State, progress: u64) -> Result<bool, CpuFault> {
+        self.process.lifetime.try_service_links().map_err(|error| {
+            fault(
+                if matches!(
+                    error,
+                    lifetime::Error::Capacity(_) | lifetime::Error::Shutdown
+                ) {
+                    CpuFaultKind::Unavailable
+                } else {
+                    CpuFaultKind::Internal
+                },
+                format!("LCQ link maintenance at {:#x}: {error}", state.pc()),
+                progress,
+                state,
+            )
+        })
     }
 
     fn recover_capacity(&self, state: &A64State, progress: u64) -> Result<(), CpuFault> {

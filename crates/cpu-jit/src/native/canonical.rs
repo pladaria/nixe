@@ -97,6 +97,14 @@ pub fn emit_canonical_entry(target: &EntryContract) -> Result<Vec<u8>, TransferE
 /// The final NZCV merge may clobber x86-64 condition flags, never host FP state.
 pub fn emit_canonical_writeback(source: &ExitStateMap) -> Result<Vec<u8>, TransferError> {
     source.validate().map_err(TransferError::InvalidContract)?;
+    let mut emitter = Emitter::new(source.abi);
+    writeback(&mut emitter, source, &source.nzcv);
+    Ok(emitter.finish())
+}
+
+// The bridge may supply an already materialized NZCV in ABI-owned transfer
+// storage. Public maps still prohibit that storage; only emission creates it.
+pub(super) fn writeback(emitter: &mut Emitter, source: &ExitStateMap, nzcv: &NzcvLocation) {
     let operands = source
         .bindings
         .iter()
@@ -108,17 +116,16 @@ pub fn emit_canonical_writeback(source: &ExitStateMap) -> Result<Vec<u8>, Transf
         })
         .map(|binding| operand(binding.value, binding.location))
         .collect();
-    let mut emitter = Emitter::new(source.abi);
-    let nzcv = if source.dirty_live.nzcv != 0 && !matches!(source.nzcv, NzcvLocation::Packed(_)) {
-        super::flags::materialize(&mut emitter, &source.nzcv, source.dirty_live.nzcv);
+    let nzcv = if source.dirty_live.nzcv != 0 && !matches!(nzcv, NzcvLocation::Packed(_)) {
+        super::flags::materialize(emitter, nzcv, source.dirty_live.nzcv);
         NzcvLocation::Packed(ValueLocation::Spill {
             offset: super::flags::RESULT,
             bytes: 4,
         })
     } else {
-        source.nzcv.clone()
+        nzcv.clone()
     };
-    emit_operands(&mut emitter, source.abi, false, operands);
+    emit_operands(emitter, source.abi, false, operands);
     if source.dirty_live.nzcv != 0 {
         let NzcvLocation::Packed(location) = nzcv else {
             unreachable!()
@@ -146,7 +153,61 @@ pub fn emit_canonical_writeback(source: &ExitStateMap) -> Result<Vec<u8>, Transf
             emitter.memory(true, RegisterClass::Integer, value, BORROW_SAVE, 8);
         }
     }
-    Ok(emitter.finish())
+}
+
+/// Load missing clean bridge inputs after physical copies. Unlike canonical
+/// ingress, already-installed inputs (including RAX) must remain untouched.
+pub(super) fn load_missing(emitter: &mut Emitter, bindings: &[crate::abi::ValueBinding]) {
+    let preserve_rax = emitter.abi == HostAbi::X86_64
+        && bindings
+            .iter()
+            .any(|b| matches!(b.location, ValueLocation::Spill { .. }))
+        && !bindings.iter().any(|b| {
+            b.location
+                == ValueLocation::Register {
+                    class: RegisterClass::Integer,
+                    index: 0,
+                }
+        });
+    if preserve_rax {
+        emitter.memory(false, RegisterClass::Integer, 0, BORROW_SAVE, 8);
+    }
+    emit_operands(
+        emitter,
+        emitter.abi,
+        true,
+        bindings
+            .iter()
+            .map(|b| operand(b.value, b.location))
+            .collect(),
+    );
+    if preserve_rax {
+        emitter.memory(true, RegisterClass::Integer, 0, BORROW_SAVE, 8);
+    }
+}
+
+/// Fill flags absent from the source from their authoritative canonical home.
+/// RESULT already holds the source bits; preserve every allocated register.
+pub(super) fn fill_missing_flags(emitter: &mut Emitter, source_bits: u8) {
+    let abi = emitter.abi;
+    let value = temporary_register(abi);
+    let pointer = abi.reserved().link_scratch[0];
+    if abi == HostAbi::X86_64 {
+        emitter.memory(false, RegisterClass::Integer, value, BORROW_SAVE, 8);
+    }
+    emitter.memory(true, RegisterClass::Integer, value, super::flags::RESULT, 4);
+    emitter.memory(true, RegisterClass::Integer, pointer, NZCV_POINTER, 8);
+    emitter.merge_nzcv(value, pointer, source_bits);
+    emitter.memory(
+        false,
+        RegisterClass::Integer,
+        value,
+        super::flags::RESULT,
+        4,
+    );
+    if abi == HostAbi::X86_64 {
+        emitter.memory(true, RegisterClass::Integer, value, BORROW_SAVE, 8);
+    }
 }
 
 /// Emit dirty state writeback, dynamic/constant destination PC and exit identity,
@@ -163,6 +224,38 @@ pub fn emit_canonical_exit(
     pc: ValueLocation,
     reason: NativeExitReason,
     completed: u16,
+) -> Result<Vec<u8>, TransferError> {
+    emit_exit(
+        source,
+        pc,
+        reason,
+        completed,
+        offset_of!(NativeFrame<'static>, gateway_exit),
+    )
+}
+
+/// Canonicalize a link miss and enter the invocation's cold resolver instead
+/// of leaving its gateway/epoch. Budget and control exits use the ordinary exit.
+pub(crate) fn emit_dispatch_fallback(
+    source: &ExitStateMap,
+    pc: ValueLocation,
+    completed: u16,
+) -> Result<Vec<u8>, TransferError> {
+    emit_exit(
+        source,
+        pc,
+        NativeExitReason::Dispatch,
+        completed,
+        offset_of!(NativeFrame<'static>, dispatch_fallback),
+    )
+}
+
+fn emit_exit(
+    source: &ExitStateMap,
+    pc: ValueLocation,
+    reason: NativeExitReason,
+    completed: u16,
+    continuation: usize,
 ) -> Result<Vec<u8>, TransferError> {
     if completed > 2048 {
         return Err(TransferError::InvalidContract(
@@ -225,6 +318,27 @@ pub fn emit_canonical_exit(
             );
         }
     }
+    // Self-relative identity survives staging/copying without a relocation.
+    // No guest operand is live here. Hot links never publish a current owner.
+    if source.abi == HostAbi::X86_64 {
+        // LEA scratch,[RIP+0]: address of the following store in this adapter.
+        emitter.code.extend([
+            0x48 | ((scratch >> 3) << 2),
+            0x8d,
+            0x05 | ((scratch & 7) << 3),
+        ]);
+        emitter.code.extend(0i32.to_le_bytes());
+    } else {
+        // ADR scratch,.: address of this instruction in the exit adapter.
+        emitter.word(0x10000000 | u32::from(scratch));
+    }
+    emitter.memory(
+        false,
+        RegisterClass::Integer,
+        scratch,
+        offset_of!(NativeFrame<'static>, exit_native_pc) as u32,
+        8,
+    );
     emitter.constant(scratch, source.site.source.get(), 8);
     emitter.memory(
         false,
@@ -257,7 +371,7 @@ pub fn emit_canonical_exit(
         true,
         RegisterClass::Integer,
         scratch,
-        offset_of!(NativeFrame<'static>, gateway_exit) as u32,
+        continuation as u32,
         8,
     );
     emitter.jump_register(scratch);

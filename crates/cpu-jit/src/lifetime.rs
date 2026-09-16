@@ -4,8 +4,10 @@
 
 pub(crate) mod compile;
 mod directory;
+mod maintenance;
 mod memory;
 pub(crate) use directory::Fault;
+use unit::dynamic::pic;
 mod registry;
 #[cfg(test)]
 mod tests;
@@ -116,6 +118,9 @@ const REASONS: [Reason; 5] = [
 
 struct DispatchSlot {
     payload: AtomicPtr<Accounted<DispatchPayload>>,
+    // LCQ and HCQ registry locations, cold and serialized by JIT state.
+    // Never read by generated code or published as a separate atomic payload.
+    owners: [Option<unit::UnitEntry>; 2],
     retired: Option<ExecutionEpoch>,
     units: usize,
     compile: Option<compile::Identity>,
@@ -125,6 +130,13 @@ impl DispatchSlot {
     /// copy under state and none retains its pointer. This avoids allocating
     /// replacement boxes to evict code when the hard budget is already full.
     fn rewrite_closed(&mut self, payload: DispatchPayload) {
+        let old = self.snapshot();
+        if old.lcq() != payload.lcq() {
+            self.owners[0] = None;
+        }
+        if old.hcq() != payload.hcq() {
+            self.owners[1] = None;
+        }
         let pointer = self.payload.swap(std::ptr::null_mut(), Ordering::Relaxed);
         unsafe {
             (*pointer).value = payload;
@@ -134,6 +146,7 @@ impl DispatchSlot {
     fn new(payload: Box<Accounted<DispatchPayload>>) -> Self {
         Self {
             payload: AtomicPtr::new(Box::into_raw(payload)),
+            owners: [None; 2],
             retired: None,
             units: 0,
             compile: None,
@@ -154,9 +167,11 @@ impl DispatchSlot {
     fn replace(
         &mut self,
         payload: Box<Accounted<DispatchPayload>>,
+        owners: [Option<unit::UnitEntry>; 2],
     ) -> Box<Accounted<DispatchPayload>> {
         // Publication linearizes at this release swap, not at separate stores
         // of address/version. The state lock has already validated admission.
+        self.owners = owners;
         let old = self.payload.swap(Box::into_raw(payload), Ordering::Release);
         unsafe { Box::from_raw(old) }
     }
@@ -261,6 +276,9 @@ struct State {
     pending: [Option<MaintenanceSequence>; 5],
     completed: [Option<MaintenanceSequence>; 5],
     transition_owned: bool,
+    // Shared by every batch/owner of one stop. Only reopening resets it;
+    // abandoning and reacquiring Closed cannot bypass the installation cap.
+    link_install_attempts: usize,
     memory_mutations: usize,
     // Cold claims can outlive their dispatch reservation after closure/eviction.
     // Shutdown must drain those compilers before releasing the cache/indexes.
@@ -269,7 +287,10 @@ struct State {
     failure: Option<Error>,
     dispatch: Registry<DispatchSlot>,
     keys: KeyIndex,
-    readers: Registry<Arc<Accounted<AtomicU64>>>,
+    readers: Registry<pic::Registration>,
+    weak_shards: Vec<Handle<pic::Registration>>,
+    weak_shard_storage: Option<MetadataLease>,
+    bridge_generations: CheckedCounter<crate::abi::BridgeGeneration>,
     dispatch_storage: Option<MetadataLease>,
     key_storage: Option<MetadataLease>,
     reader_storage: Option<MetadataLease>,
@@ -292,7 +313,7 @@ impl State {
 
     fn quiescent(&self, retired: ExecutionEpoch) -> bool {
         self.readers.values().all(|reader| {
-            let epoch = reader.load(Ordering::Acquire);
+            let epoch = reader.announcement.load(Ordering::Acquire);
             epoch == 0 || epoch > retired.get()
         })
     }
@@ -300,7 +321,7 @@ impl State {
     fn idle(&self) -> bool {
         self.readers
             .values()
-            .all(|reader| reader.load(Ordering::Acquire) == 0)
+            .all(|reader| reader.announcement.load(Ordering::Acquire) == 0)
     }
 
     fn validate(&self, publication: &Publication<'_>) -> Result<(), Error> {
@@ -363,6 +384,7 @@ impl Lifetime {
                 pending: [None; 5],
                 completed: [None; 5],
                 transition_owned: false,
+                link_install_attempts: 0,
                 memory_mutations: 0,
                 compilers: 0,
                 shutdown: false,
@@ -370,6 +392,9 @@ impl Lifetime {
                 dispatch: Registry::default(),
                 keys: KeyIndex::with_capacity(0),
                 readers: Registry::default(),
+                weak_shards: Vec::new(),
+                weak_shard_storage: None,
+                bridge_generations: CheckedCounter::default(),
                 dispatch_storage: None,
                 key_storage: None,
                 reader_storage: None,
@@ -437,7 +462,10 @@ impl Lifetime {
             std::mem::size_of::<Accounted<AtomicU64>>() + 2 * std::mem::size_of::<usize>(),
             Tier::Lcq,
         )?);
-        let mut registration = Some(Arc::clone(&announcement));
+        let mut registration = Some(pic::Registration {
+            announcement: Arc::clone(&announcement),
+            pic: pic::Pic::new(&self.cache)?,
+        });
         loop {
             let capacity = {
                 let mut state = self.lock();
@@ -445,9 +473,13 @@ impl Lifetime {
                 if state.shutdown {
                     return Err(Error::Shutdown);
                 }
-                if state.readers.has_space() {
+                if state.readers.has_space()
+                    && state.weak_shards.len() < state.weak_shards.capacity()
+                {
+                    registration.as_mut().unwrap().pic.shard_index = state.weak_shards.len();
                     let result = state.readers.insert(&mut registration);
                     let handle = result.inspect_err(|error| self.fail(&mut state, *error))?;
+                    state.weak_shards.push(handle);
                     return Ok(Reader {
                         process: Arc::clone(self),
                         handle,
@@ -457,9 +489,11 @@ impl Lifetime {
                 state.readers.capacity()
             };
             let spare = Vec::with_capacity(capacity.saturating_mul(2).max(16));
-            let bytes =
-                spare.capacity() * std::mem::size_of::<registry::Slot<Arc<Accounted<AtomicU64>>>>();
+            let bytes = spare.capacity() * std::mem::size_of::<registry::Slot<pic::Registration>>();
             let mut spare = PreparedStorage::new(spare, bytes, &self.cache)?;
+            let shards = Vec::with_capacity(capacity.saturating_mul(2).max(16));
+            let bytes = shards.capacity() * std::mem::size_of::<Handle<pic::Registration>>();
+            let mut shards = PreparedStorage::new(shards, bytes, &self.cache)?;
             let mut state = self.lock();
             state.healthy()?;
             if state.shutdown {
@@ -468,6 +502,11 @@ impl Lifetime {
             if spare.value.capacity() > state.readers.capacity() {
                 state.readers.grow(&mut spare.value);
                 std::mem::swap(&mut state.reader_storage, &mut spare.charge);
+            }
+            if shards.value.capacity() > state.weak_shards.capacity() {
+                shards.value.append(&mut state.weak_shards);
+                std::mem::swap(&mut state.weak_shards, &mut shards.value);
+                std::mem::swap(&mut state.weak_shard_storage, &mut shards.charge);
             }
             // The old empty allocation is dropped without holding state.
         }
@@ -578,7 +617,7 @@ impl Lifetime {
                 .dispatch
                 .get_mut(publication.slot)
                 .unwrap()
-                .replace(payload)
+                .replace(payload, [None; 2])
         };
         drop(old);
         self.changed.notify_all();
@@ -612,11 +651,12 @@ impl Lifetime {
 
     pub(crate) fn collect_dispatch(&self) -> Result<usize, Error> {
         let mut count = 0;
+        let mut cursor = 0;
         loop {
             let removed = {
                 let mut state = self.lock();
                 state.healthy()?;
-                let Some(handle) = state.dispatch.find(|slot| {
+                let Some(handle) = state.dispatch.find_from(&mut cursor, |slot| {
                     slot.units == 0 && slot.retired.is_some_and(|epoch| state.quiescent(epoch))
                 }) else {
                     return Ok(count);
@@ -744,7 +784,7 @@ pub(crate) struct Publication<'a> {
 
 pub(crate) struct Reader {
     process: Arc<Lifetime>,
-    handle: Handle<Arc<Accounted<AtomicU64>>>,
+    handle: Handle<pic::Registration>,
     announcement: Arc<Accounted<AtomicU64>>,
 }
 impl Reader {
@@ -765,6 +805,7 @@ impl Reader {
             return Err(Error::ActiveReader);
         }
         unsafe { frame.begin_fp() };
+        frame.poll_requests[0] = self.process.control_word();
         let mut invocation = Invocation {
             reader: self,
             frame,
@@ -775,6 +816,12 @@ impl Reader {
             let state = invocation.reader.process.lock();
             let admission = state.open()?;
             let execution = state.execution;
+            invocation.frame.indirect_pic = state
+                .readers
+                .get(invocation.reader.handle)
+                .ok_or(Error::StaleUnit)?
+                .pic
+                .native_table();
             invocation.frame.execution_epoch = execution.get();
             invocation.frame.admission_epoch = admission.get();
             invocation
@@ -811,13 +858,33 @@ impl Reader {
 }
 impl Drop for Reader {
     fn drop(&mut self) {
+        // The private PIC cannot be executing after its reader is quiescent.
+        // Detach backlinks before removing the registration, and release last
+        // executable/metadata owners outside JIT state.
+        if self.announcement.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        loop {
+            let removed = {
+                let mut state = self.process.lock();
+                let Some(slot) = state.readers.get(self.handle).and_then(|r| r.pic.head) else {
+                    break;
+                };
+                state.remove_pic_way(pic::Site {
+                    reader: self.handle,
+                    slot,
+                })
+            };
+            drop(removed);
+        }
         let removed = {
             let mut state = self.process.lock();
-            // Safe borrowing prevents dropping a reader with a live guard.
-            // A forgotten guard leaks its announcement rather than permitting
-            // reclamation of code that might still be used.
-            if self.announcement.load(Ordering::Acquire) != 0 {
-                return;
+            if let Some(registration) = state.readers.get(self.handle) {
+                let index = registration.pic.shard_index;
+                state.weak_shards.swap_remove(index);
+                if let Some(&moved) = state.weak_shards.get(index) {
+                    state.readers.get_mut(moved).unwrap().pic.shard_index = index;
+                }
             }
             state.readers.remove(self.handle)
         };
@@ -836,28 +903,70 @@ pub(crate) struct Invocation<'r, 'f, 's> {
 
 /// A borrow of an active invocation, not ownership of a metadata snapshot.
 /// It cannot survive epoch quiescence and creates no second fault registry.
+/// The same protection supports cold static dispatch without readmission.
 pub(crate) struct FaultLookup<'a> {
-    directory: &'a directory::Directory,
+    reader: &'a mut Reader,
+}
+
+/// Exclusive access to this invocation's vCPU while native execution is
+/// suspended. It neither ends nor republishes the reader's execution epoch.
+/// The borrowed Reader cannot be admitted again or used by another resolver.
+pub(crate) struct NativeSuspension<'a> {
+    reader: &'a mut Reader,
+    thread: PhantomData<Rc<()>>,
 }
 impl FaultLookup<'_> {
     /// Borrow immutable unit metadata while the same invocation epoch used for
     /// fault lookup is active, including units with no faultable instructions.
     pub(crate) fn unit(&self, pc: usize) -> Option<&unit::CodeUnit> {
-        unsafe { self.directory.unit(pc) }
+        unsafe { self.reader.process.directory.unit(pc) }
     }
     pub(crate) fn find(&self, pc: usize) -> Option<directory::Fault<'_>> {
-        unsafe { self.directory.lookup(pc) }
+        unsafe { self.reader.process.directory.lookup(pc) }
+    }
+
+    /// Borrow cold PIC mutation authority for the same vCPU as native lookup.
+    ///
+    /// # Safety
+    /// This vCPU must be suspended on its normal Rust dispatcher stack, with
+    /// canonical writeback and guest FP suspension complete. No native code may
+    /// run or resume (including fault retry) until the returned borrow ends.
+    /// The caller must not retain physical source-register values across a
+    /// System-ABI helper: resume through canonical ingress after a cold miss.
+    pub(crate) unsafe fn suspend_native(&mut self) -> NativeSuspension<'_> {
+        NativeSuspension {
+            reader: self.reader,
+            thread: PhantomData,
+        }
+    }
+
+    /// Cold static resolution under this already-announced invocation. Never
+    /// wait for closure while holding its epoch or create a second admission.
+    /// The owned payload is read coherently under state; its address stays
+    /// protected by the same epoch after unlocking, even if closure then wins.
+    pub(crate) fn static_entry(
+        &self,
+        key: BlockKey,
+    ) -> Result<Option<crate::abi::PublishedEntry>, Error> {
+        let state = self.reader.process.lock();
+        state.open()?;
+        Ok(state
+            .keys
+            .get(&key)
+            .and_then(|handle| state.dispatch.get(*handle))
+            .and_then(|slot| slot.snapshot().preferred()))
     }
 }
 
 impl<'s> Invocation<'_, '_, 's> {
-    /// Split native mutation of the frame from read-only fault attribution.
+    /// Split native mutation of the frame from protected fault attribution and
+    /// exclusive suspended-vCPU access for cold dispatch.
     /// Both borrows keep this invocation and its epoch active through dispatch.
     pub(crate) fn frame_and_faults(&mut self) -> (&mut NativeFrame<'s>, FaultLookup<'_>) {
         (
             self.frame,
             FaultLookup {
-                directory: &self.reader.process.directory,
+                reader: self.reader,
             },
         )
     }
@@ -878,13 +987,18 @@ impl Drop for Invocation<'_, '_, '_> {
         // FP/status completion must precede even acquiring state. The native
         // gateway may already have finished FP; finish_fp is idempotent then.
         unsafe { self.frame.finish_fp() };
-        let _state = self.reader.process.lock();
+        let state = self.reader.process.lock();
         self.frame.execution_epoch = 0;
         self.frame.admission_epoch = 0;
+        self.frame.indirect_pic = std::ptr::null();
         self.reader.announcement.store(0, Ordering::Release);
         // Same predicate mutex as wait_closed: no exit notification can fall
         // between its predicate test and releasing the mutex to wait.
-        self.reader.process.changed.notify_all();
+        // Open admission has no waiter for reader quiescence. Closing is
+        // published under this same mutex before any transition can wait.
+        if state.phase == Phase::Closing {
+            self.reader.process.changed.notify_all();
+        }
     }
 }
 
@@ -907,6 +1021,14 @@ pub(crate) struct Transition<'a> {
     defer_links: bool,
 }
 impl<'p> Transition<'p> {
+    fn require_closed(&self, state: &State) -> Result<(), Error> {
+        state.healthy()?;
+        if !self.active || state.phase != Phase::Closed {
+            return Err(Error::Closed);
+        }
+        Ok(())
+    }
+
     /// Call only from canonical mode, never while protecting one's own native
     /// invocation or holding a code-cache/memory lock. Condvar::wait releases
     /// state while other vCPUs finish, including normal-stack fault dispatch.
@@ -964,6 +1086,7 @@ impl<'p> Transition<'p> {
             let result = state.admissions.next_id();
             state.admission = self.process.checked(&mut state, result)?;
             state.phase = Phase::Open;
+            state.link_install_attempts = 0;
             let reasons = state
                 .pending
                 .iter()
@@ -1028,6 +1151,12 @@ impl Batch<'_, '_> {
             sequence
                 .is_some_and(|sequence| state.units.pending_retirement(REASONS[index], sequence))
         }) {
+            return Err(Error::MaintenancePending);
+        }
+        if !defer_links
+            && self.sequences[Reason::LinkPatch as usize]
+                .is_some_and(|sequence| state.units.pending_links(sequence))
+        {
             return Err(Error::MaintenancePending);
         }
         self.transition.defer_links |= defer_links;

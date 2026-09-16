@@ -15,7 +15,7 @@ impl Drop for RestoreHost {
     }
 }
 
-fn distinct_caller() -> (u64, u64) {
+pub(crate) fn distinct_caller() -> (u64, u64) {
     let original = host::read();
     #[cfg(target_arch = "x86_64")]
     let caller = ((original.0 & !(3 << 13)) | (2 << 13) | 0x1f80, 0x21);

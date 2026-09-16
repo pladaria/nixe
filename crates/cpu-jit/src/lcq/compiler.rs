@@ -16,7 +16,10 @@ use crate::fp_lowering::FpLowering;
 use crate::jit_error::Error;
 use crate::lifetime::{
     Lifetime,
-    unit::{EdgeKind, Entry, FaultRecord, GuestExit, Input, Instruction, StateRecord, UnitHandle},
+    unit::{
+        EdgeKind, Entry, FaultRecord, GuestExit, Input, Instruction, StateRecord, TerminalTransfer,
+        UnitHandle,
+    },
 };
 use crate::lowering::IntegerLowering;
 use crate::native::{AllocatedBoundary, emit_canonical_entry, emit_canonical_exit};
@@ -101,7 +104,6 @@ struct Lowered {
 }
 
 struct PendingState {
-    host_fpsr_pending: bool,
     dirty: StateSet,
     operands: Vec<(GuestValue, usize)>,
     flags: Option<LazyFlags<usize>>,
@@ -113,6 +115,12 @@ struct PendingExit {
     pc_operand: usize,
     guest: GuestExit,
     reason: NativeExitReason,
+    static_target: Option<GuestVirtualAddress>,
+}
+
+enum ExitTarget {
+    Static(GuestVirtualAddress),
+    Dynamic(ir::Value),
 }
 
 impl PendingState {
@@ -142,7 +150,7 @@ impl PendingState {
             dirty_live: self.dirty,
             bindings: allocated.bindings(&self.operands).map_err(fail)?,
             nzcv,
-            host_fpsr_pending: self.host_fpsr_pending,
+            host_fpsr_pending: true,
         };
         state.validate().map_err(fail)?;
         Ok(state)
@@ -276,12 +284,23 @@ impl Compiler {
         Ok(compiler)
     }
 
-    /// The memory/coordinator cutover is still required before the runtime can
-    /// call this concurrently with mutations. Revalidation here rejects stale
-    /// captured work; it does not manufacture a pre-mutation rendezvous.
+    /// Publish through the process's memory/coordinator authority. Revalidation
+    /// rejects stale captures; it does not replace the bound mutation observer.
     pub(crate) fn publish(
         &mut self,
         compilation: Compilation<'_>,
+        process: &Lifetime,
+        cache: &Arc<Cache>,
+        memory: &(impl ExecutableMemory + MemoryInvalidationSource),
+    ) -> Result<UnitHandle, PublishError> {
+        compilation.claim.validate()?;
+        let lowered = self.lower(&compilation.fragment, compilation.identity.version())?;
+        Self::publish_lowered(compilation, lowered, process, cache, memory)
+    }
+
+    fn publish_lowered(
+        compilation: Compilation<'_>,
+        lowered: Lowered,
         process: &Lifetime,
         cache: &Arc<Cache>,
         memory: &(impl ExecutableMemory + MemoryInvalidationSource),
@@ -291,14 +310,25 @@ impl Compiler {
             fragment,
             identity,
         } = compilation;
-        claim.validate()?;
-        let lowered = self.lower(&fragment, identity.version())?;
         if !memory.image_is_current(&fragment.image) {
             return Err(PublishError::StaleCapture);
         }
         claim.validate()?;
+        // Reserve every static site's worst-case island before the source
+        // becomes reachable. The stable order among static state maps is the
+        // island index; observations/dynamic exits consume no slots.
+        let islands = lowered
+            .states
+            .iter()
+            .filter(|state| {
+                state
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.static_target.is_some())
+            })
+            .count();
         let code = cache
-            .install(lowered.output, Tier::Lcq, |_| None)
+            .install_with_islands(lowered.output, Tier::Lcq, islands, |_| None)
             .map_err(PublishError::Storage)?;
         if !memory.image_is_current(&fragment.image) {
             return Err(PublishError::StaleCapture);
@@ -405,9 +435,9 @@ impl Compiler {
                     )));
                 }
                 let mut effect = instruction_effects(normalized);
-                // Clean values already reside in canonical storage. Native SSA
-                // needs semantic reads/defs; observation exits below write back
-                // every dirty value, not another copy of the clean state.
+                // Semantic reads/defs determine fast inputs. Bridges keep homes
+                // current for values not carried by that contract; snapshots
+                // retain carried inputs as potentially dirty, even if only read.
                 effect.observe_before = StateSet::default();
                 effect.observe_after = StateSet::default();
                 effects.push(effect);
@@ -420,6 +450,13 @@ impl Compiler {
         }])[0]
             .live_in;
         let inputs = register_operands(live_in);
+        let mut inherited = live_in;
+        // FPCR changes leave fast mode and TPIDRRO_EL0 is read-only, so their
+        // canonical homes remain current. FPSR ownership is invocation-wide,
+        // not an SSA input (handled separately from register bindings).
+        inherited.fpcr = false;
+        inherited.tpidrro_el0 = false;
+        inherited.fpsr = false;
         let isa_flags = self.isa.isa_flags();
         let use_clif_shuffle = self.abi != HostAbi::X86_64
             || isa_flags
@@ -441,7 +478,7 @@ impl Compiler {
                         .iter()
                         .any(|flag| flag.name == *name && flag.as_bool() == Some(true))
                 }),
-            dirty: StateSet::default(),
+            dirty: inherited,
             exits: Vec::new(),
             fp_activation: None,
             arena_size: self.arena_size,
@@ -469,6 +506,8 @@ impl Compiler {
                 _ => translator.registers[register_index(*guest)] = Some(values[index]),
             }
         }
+        // No local producer yet. The inherited NZCV mask still makes these
+        // physical input bits observable; Canonical is not a clean-home proof.
         let mut flags = LazyFlags::Canonical(values[inputs.len()]);
         let mut terminated = false;
         for (index, decoded) in fragment.instructions.iter().enumerate() {
@@ -560,13 +599,34 @@ impl Compiler {
         }
         translator.builder.seal_all_blocks();
         translator.builder.finalize(self.isa.frontend_config());
-        let exits = translator.exits;
+        let exits = translator
+            .exits
+            .into_iter()
+            .map(|pending| {
+                let prefix = pending.guest.pc.get().wrapping_sub(fragment.key.pc.get()) / 4;
+                let committed = match pending.reason {
+                    NativeExitReason::Dispatch => 1,
+                    NativeExitReason::Architectural | NativeExitReason::Unsupported => 0,
+                    _ => return Err(Error::internal("LCQ exit lacks work accounting")),
+                };
+                let completed = u16::try_from(prefix + committed).map_err(fail)?;
+                Ok((pending, completed))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         let fp_activation = translator.fp_activation;
         let pending_faults = translator.faults;
         let entries: Vec<_> = std::iter::once(block)
             .chain(fp_activation.as_ref().map(|pending| pending.entry))
             .collect();
         cranelift_codegen::nixe::set_entries(&mut self.context.func, &entries).map_err(fail)?;
+        for (index, (pending, completed)) in exits.iter().enumerate() {
+            if pending.reason == NativeExitReason::Dispatch {
+                self.context
+                    .func
+                    .nixe_exit_costs
+                    .insert(index as u64 + 1, *completed);
+            }
+        }
         self.context
             .compile(&*self.isa, &mut ControlPlane::default())
             .map_err(|error| Error::internal(format!("LCQ Cranelift: {error:?}")))?;
@@ -605,7 +665,7 @@ impl Compiler {
         let fast = input_map.offset;
         let mut records = Vec::new();
         let mut patches = Vec::new();
-        for (index, pending) in exits.into_iter().enumerate() {
+        for (index, (pending, completed)) in exits.into_iter().enumerate() {
             let map = code
                 .buffer
                 .nixe_states
@@ -619,20 +679,87 @@ impl Compiler {
             let pc = allocated
                 .location(pending.pc_operand, types::I64)
                 .map_err(fail)?;
-            let prefix = pending.guest.pc.get().wrapping_sub(fragment.key.pc.get()) / 4;
-            let committed = match pending.reason {
-                NativeExitReason::Dispatch => 1,
-                NativeExitReason::Architectural | NativeExitReason::Unsupported => 0,
-                _ => return Err(Error::internal("LCQ exit lacks work accounting")),
+            // Dispatch checkpoints charge once before either patch. PRE exits
+            // still charge their partial prefix in the canonical adapter.
+            let uncharged = if map.poll.is_some() { 0 } else { completed };
+            let indirect = pending.static_target.is_none()
+                && matches!(
+                    pending.guest.kind,
+                    EdgeKind::Indirect | EdgeKind::Call | EdgeKind::Return
+                );
+            let mut adapter = if pending.static_target.is_some() || indirect {
+                crate::native::emit_dispatch_fallback(&state, pc, uncharged)
+            } else {
+                emit_canonical_exit(&state, pc, pending.reason, uncharged)
+            }
+            .map_err(fail)?;
+            let operation = match pending.guest.kind {
+                EdgeKind::Call => crate::native::rsb::emit_push(
+                    &state,
+                    fragment
+                        .key
+                        .at(GuestVirtualAddress::new(
+                            pending.guest.pc.get().wrapping_add(4),
+                        ))
+                        .unwrap(),
+                )
+                .map_err(fail)?,
+                EdgeKind::Return => {
+                    crate::native::rsb::emit_return_update(&state, fragment.key, pc)
+                        .map_err(fail)?
+                }
+                _ => Vec::new(),
             };
-            let completed = u16::try_from(prefix + committed).map_err(fail)?;
-            let adapter =
-                emit_canonical_exit(&state, pc, pending.reason, completed).map_err(fail)?;
-            patches.push((map.clone(), adapter));
+            // An indirect hot path already updates the RSB before a PIC miss.
+            // An exhausted poll bypasses that hot path and needs its own update.
+            let slice_adapter = if indirect && !operation.is_empty() {
+                let mut cold = operation.clone();
+                cold.extend_from_slice(&adapter);
+                Some(cold)
+            } else {
+                None
+            };
+            let probe_bytes = if indirect {
+                if map.poll.is_none() {
+                    return Err(Error::internal(
+                        "LCQ indirect probe has no charged terminal checkpoint",
+                    ));
+                }
+                let mut probe = if pending.guest.kind == EdgeKind::Return {
+                    crate::native::rsb::emit_return_probe(&state, fragment.key, pc).map_err(fail)?
+                } else {
+                    let mut probe = operation.clone();
+                    probe.extend(
+                        crate::native::pic::probe::emit(&state, fragment.key, pc).map_err(fail)?,
+                    );
+                    probe
+                };
+                let length = probe.len();
+                probe.append(&mut adapter);
+                adapter = probe;
+                length
+            } else {
+                let mut prefix = operation.clone();
+                prefix.append(&mut adapter);
+                adapter = prefix;
+                0
+            };
+            patches.push((
+                index,
+                map.clone(),
+                adapter,
+                pc,
+                pending.static_target,
+                completed,
+                probe_bytes,
+                operation,
+                slice_adapter,
+            ));
             records.push(StateRecord {
                 native_offset: map.offset,
                 state,
                 exit: Some(pending.guest),
+                transfer: None,
             });
         }
         let activation = if let Some(pending) = fp_activation {
@@ -659,10 +786,47 @@ impl Compiler {
         )?;
         let mut output = Output::from_backend(self.abi, code, &self.context.func).map_err(fail)?;
         let mut bytes = output.bytes.into_vec();
-        for (map, adapter) in patches {
+        for (index, map, adapter, pc, target, completed, probe_bytes, operation, slice_adapter) in
+            patches
+        {
             let destination = append(&mut bytes, &adapter);
             map.patch_exit(&mut bytes, 0, destination as u64)
                 .map_err(fail)?;
+            // A slice exit must bypass the PIC even if its target is cached.
+            // Sample-only polls instead resume the already-charged hot patch.
+            let fallback = destination + probe_bytes;
+            if map.poll.is_some() {
+                let slice = slice_adapter.map_or(fallback, |adapter| append(&mut bytes, &adapter));
+                let mut control = operation;
+                control.extend(
+                    emit_canonical_exit(&records[index].state, pc, NativeExitReason::Control, 0)
+                        .map_err(fail)?,
+                );
+                let control = append(&mut bytes, &control);
+                let (poll, branches) = crate::native::emit_poll(self.abi);
+                let start = append(&mut bytes, &poll);
+                let mut branch = map.clone();
+                branch.poll = None;
+                for (offset, target) in
+                    branches
+                        .into_iter()
+                        .zip([map.offset, slice as u32, control as u32])
+                {
+                    branch.offset = start as u32 + offset;
+                    branch
+                        .patch_exit(&mut bytes, 0, u64::from(target))
+                        .map_err(fail)?;
+                }
+                map.patch_poll(&mut bytes, 0, start as u64).map_err(fail)?;
+            }
+            records[index].transfer = Some(Box::new(TerminalTransfer {
+                destination: pc,
+                static_target: target.map(|pc| fragment.key.at(pc).unwrap()),
+                completed,
+                patch_bytes: map.patch_bytes,
+                fallback_offset: fallback as u32,
+                poll_offset: map.poll.map(|poll| poll.offset),
+            }));
         }
         if let Some((source, adapter, continuation)) = activation {
             let start = append(&mut bytes, &adapter);
@@ -680,6 +844,7 @@ impl Compiler {
                 entry: false,
                 patch_bytes: if self.abi == HostAbi::X86_64 { 8 } else { 4 },
                 fault_bytes: 0,
+                poll: None,
                 values: Vec::new(),
             }
             .patch_exit(&mut bytes, 0, u64::from(continuation))
@@ -699,6 +864,7 @@ impl Compiler {
             entry: false,
             patch_bytes: if self.abi == HostAbi::X86_64 { 8 } else { 4 },
             fault_bytes: 0,
+            poll: None,
             values: Vec::new(),
         }
         .patch_exit(&mut bytes, 0, u64::from(fast))
@@ -780,17 +946,23 @@ impl Translator<'_> {
         reason: NativeExitReason,
         flags: &LazyFlags<ir::Value>,
     ) -> Result<(), Error> {
-        let target = self.builder.ins().iconst(types::I64, target.get() as i64);
-        self.exit(source, target, kind, reason, flags)
+        self.exit(source, ExitTarget::Static(target), kind, reason, flags)
     }
     fn exit(
         &mut self,
         source: GuestVirtualAddress,
-        target: ir::Value,
+        target: ExitTarget,
         kind: EdgeKind,
         reason: NativeExitReason,
         flags: &LazyFlags<ir::Value>,
     ) -> Result<(), Error> {
+        let (target, static_target) = match target {
+            ExitTarget::Static(pc) => (
+                self.builder.ins().iconst(types::I64, pc.get() as i64),
+                Some(pc),
+            ),
+            ExitTarget::Dynamic(value) => (value, None),
+        };
         let (mut state, mut values) = self.snapshot(flags)?;
         let pc_operand = values.len();
         values.push(target);
@@ -803,6 +975,10 @@ impl Translator<'_> {
             pc_operand,
             guest: GuestExit { pc: source, kind },
             reason,
+            // A constant observation PC (SVC, BRK, helper, unsupported input)
+            // is not a branch destination. Linking it would skip its semantic
+            // completion, so only normal dispatch exports a static-link key.
+            static_target: static_target.filter(|_| reason == NativeExitReason::Dispatch),
         });
         Ok(())
     }
@@ -812,10 +988,10 @@ impl Translator<'_> {
         flags: &LazyFlags<ir::Value>,
     ) -> Result<(PendingState, Vec<ir::Value>), Error> {
         let mut dirty = self.dirty;
-        let host_fpsr_pending = self.fp_activation.is_some();
-        if host_fpsr_pending {
-            dirty.fpsr = true;
-        }
+        // An earlier unit may own an active segment, even if this unit never
+        // touches FP. The frame owns its status; there is no extra SSA operand
+        // or eager status read/store at this boundary.
+        dirty.fpsr = true;
         let mut values = Vec::new();
         let mut operands = Vec::new();
         for guest in register_operands(dirty) {
@@ -828,8 +1004,10 @@ impl Translator<'_> {
                 _ => self.read_register(register_index(guest) as u8, guest == GuestValue::Sp)?,
             });
         }
-        let recipe = if flags.dirty() {
+        if flags.dirty() {
             dirty.nzcv = crate::analysis::NZCV;
+        }
+        let recipe = if dirty.nzcv != 0 {
             Some(
                 flags
                     .try_map(&mut |value| -> Result<usize, std::convert::Infallible> {
@@ -848,7 +1026,6 @@ impl Translator<'_> {
             .collect();
         Ok((
             PendingState {
-                host_fpsr_pending,
                 dirty,
                 operands,
                 flags: recipe,
@@ -903,7 +1080,13 @@ impl Translator<'_> {
                     0xd65f_0000 => EdgeKind::Return,
                     _ => EdgeKind::Indirect,
                 };
-                self.exit(pc, target, kind, NativeExitReason::Dispatch, flags)
+                self.exit(
+                    pc,
+                    ExitTarget::Dynamic(target),
+                    kind,
+                    NativeExitReason::Dispatch,
+                    flags,
+                )
             }
             control::Instruction::SupervisorCall(_) => self.constant_exit(
                 pc,

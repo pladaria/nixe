@@ -151,8 +151,9 @@ pub(super) unsafe fn synchronize(rw: *mut u8, rx: *const u8, bytes: usize) {
 }
 #[cfg(target_arch = "x86_64")]
 pub(super) unsafe fn synchronize(_rw: *mut u8, _rx: *const u8, _bytes: usize) {
-    // Coherent x86 instruction/data caches; no live instruction is overwritten
-    // here. Release publication follows the finalized stores.
+    // Coherent x86 instruction/data caches. The caller broadcasts pipeline
+    // synchronization after closing RW and before publication/reopening;
+    // modifying published instructions additionally requires Closed authority.
     // https://github.com/pladaria/wasmtime/blob/e2a984d96678207094c0fc50057c8b6bcfd68715/crates/jit-icache-coherence/src/libc.rs
 }
 

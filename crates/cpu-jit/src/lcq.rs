@@ -161,7 +161,8 @@ fn boundary(decoded: &DecodeResult, key: BlockKey) -> Option<End> {
             Some(End::Architectural)
         }
         A64Instruction::System(instruction)
-            if self::system::runtime_boundary(key.platform, instruction).is_some() =>
+            if self::system::runtime_boundary(key.platform, instruction).is_some()
+                && !self::system::is_cache_probe(key.platform, instruction) =>
         {
             Some(End::Architectural)
         }

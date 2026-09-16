@@ -57,6 +57,16 @@ impl<'a> AllocatedBoundary<'a> {
         if u64::from(map.offset) + u64::from(map.patch_bytes) > code.code_buffer().len() as u64 {
             return Err(fail("backend boundary lies outside its code"));
         }
+        if map.poll.is_some_and(|poll| {
+            map.entry
+                || map.fault_bytes != 0
+                || map.patch_bytes != patch_bytes
+                || !(1..=2048).contains(&poll.completed)
+                || u64::from(poll.offset) != u64::from(map.offset) + u64::from(patch_bytes)
+                || u64::from(poll.offset) + u64::from(patch_bytes) > code.code_buffer().len() as u64
+        }) {
+            return Err(fail("invalid backend poll checkpoint"));
+        }
         let result = Self {
             map,
             abi,

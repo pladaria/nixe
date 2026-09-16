@@ -471,6 +471,13 @@ impl NativeWorker {
 }
 
 /// Per-host-worker registration and preallocated recovery stacks.
+/// The installed alternate stack and its owner must stay on their OS thread.
+/// This makes native entry/exit thread-affine without per-invocation gettid.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<nixe_cpu_direct_memory::WorkerFaultContext>();
+/// ```
 pub struct WorkerFaultContext {
     slot: NonNull<FaultSlot>,
     signal_stack: ManuallyDrop<GuardedStack>,
@@ -478,13 +485,8 @@ pub struct WorkerFaultContext {
     previous_stack: libc::stack_t,
     tid: i32,
     escaped: bool,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
-
-// SAFETY: methods reject use from any TID other than the one which registered
-// the context. If a safe caller nevertheless moves and drops a registered
-// context on another TID, `Drop` deliberately retains its stacks and slot so
-// the original thread's installed alternate stack can never dangle.
-unsafe impl Send for WorkerFaultContext {}
 
 struct GuardedStack {
     mapping: NonNull<libc::c_void>,
@@ -604,6 +606,7 @@ impl WorkerFaultContext {
             previous_stack,
             tid,
             escaped: false,
+            _thread_bound: std::marker::PhantomData,
         })
     }
 
@@ -775,9 +778,9 @@ impl WorkerFaultContext {
         dispatcher: FaultDispatcher,
         opaque: *mut libc::c_void,
     ) -> Result<(), FaultRuntimeError> {
-        if current_tid() != self.tid {
+        if self.tid == 0 {
             return Err(FaultRuntimeError::new(
-                "native fault context was invoked from a different host TID",
+                "native fault context was invoked after unregistration",
             ));
         }
         let end = arena
@@ -822,9 +825,9 @@ impl WorkerFaultContext {
 
     /// Ends a previously published fixed-access batch.
     pub fn end_batch(&mut self) -> Result<(), FaultRuntimeError> {
-        if current_tid() != self.tid {
+        if self.tid == 0 {
             return Err(FaultRuntimeError::new(
-                "native fault context batch ended from a different host TID",
+                "native fault context batch ended after unregistration",
             ));
         }
         let slot = unsafe { self.slot.as_ref() };
@@ -3024,20 +3027,29 @@ mod tests {
     }
 
     #[test]
-    fn explicit_worker_unregistration_rejects_another_tid_and_retains_ownership_for_retry() {
-        let worker = WorkerFaultContext::register().unwrap();
-        let tid = worker.registered_tid();
-        let mut worker = std::thread::spawn(move || {
-            let mut worker = worker;
-            let error = worker.unregister().unwrap_err();
-            assert!(error.to_string().contains("different host TID"));
-            assert_eq!(worker.registered_tid(), tid);
-            worker
-        })
-        .join()
-        .unwrap();
+    fn unregistered_worker_cannot_touch_a_replacement_batch() {
+        let (arena, _) = fixture();
+        let mut worker = WorkerFaultContext::register().unwrap();
         worker.unregister().unwrap();
-        assert_eq!(worker.registered_tid(), 0);
+        let mut replacement = WorkerFaultContext::register().unwrap();
+        // Reuse the original slot and leave the replacement snapshot active.
+        let slot = unsafe { replacement.slot.as_ref() };
+        slot.active.store(true, Ordering::Release);
+        assert!(worker.end_batch().is_err());
+        assert!(
+            unsafe {
+                worker.begin_capture(
+                    arena.view(),
+                    std::ptr::null_mut(),
+                    None,
+                    reject_fault,
+                    std::ptr::null_mut(),
+                )
+            }
+            .is_err()
+        );
+        assert!(slot.active.load(Ordering::Acquire));
+        replacement.end_batch().unwrap();
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub(super) fn landing(abi: HostAbi) -> Vec<u8> {
     }
 }
 
-fn compile(bytes: &[u8]) -> (JITModule, cranelift_module::FuncId) {
+pub(super) fn compile(bytes: &[u8]) -> (JITModule, cranelift_module::FuncId) {
     check_host().unwrap();
     let mut module = JITModule::new(JITBuilder::new(default_libcall_names()).unwrap());
     let id = module
@@ -25,9 +25,22 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
     let _restore = crate::fp_env::tests::RestoreHost::new();
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         // Both encoders are exercised; only host-compatible bytes execute.
-        for cycle in [false, true] {
+        for layout in 0..3 {
+            let cycle = layout != 0;
             for fp in [false, true] {
-                let (mut source, entry) = complete(abi);
+                let (mut source, mut entry) = complete(abi);
+                if layout == 2 {
+                    // AArch64 has enough vector registers for this source.
+                    // Place V31 in a fixed spill explicitly so both hosts must
+                    // break the same vector-register/spill cycle at the link.
+                    for bindings in [&mut source.bindings, &mut entry.bindings] {
+                        bindings
+                            .iter_mut()
+                            .find(|b| b.value == GuestValue::Vector(31))
+                            .unwrap()
+                            .location = spill(3264, 16);
+                    }
+                }
                 let mut target = entry.clone();
                 if cycle {
                     let a = target.bindings[0].location;
@@ -36,6 +49,28 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                     target.nzcv = NzcvLocation::Host {
                         carry_inverted: true,
                     };
+                }
+                if layout == 2 {
+                    // Extend the GPR swap to a three-way GPR/GPR/spill cycle.
+                    // Swap V0 and V31 as a separate 128-bit register/spill cycle.
+                    for (a, b) in [
+                        (GuestValue::General(0), GuestValue::General(30)),
+                        (GuestValue::Vector(0), GuestValue::Vector(31)),
+                    ] {
+                        let a = target.bindings.iter().position(|v| v.value == a).unwrap();
+                        let b = target.bindings.iter().position(|v| v.value == b).unwrap();
+                        assert!(matches!(
+                            target.bindings[a].location,
+                            ValueLocation::Register { .. }
+                        ));
+                        assert!(matches!(
+                            target.bindings[b].location,
+                            ValueLocation::Spill { .. }
+                        ));
+                        let location = target.bindings[a].location;
+                        target.bindings[a].location = target.bindings[b].location;
+                        target.bindings[b].location = location;
+                    }
                 }
                 let mut exit = source.clone();
                 exit.bindings = target.bindings.clone();
@@ -66,13 +101,13 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                     )
                     .unwrap(),
                 );
-                let transfer = emit_fast_transfer(&source, &target).unwrap();
+                let transfer = emit_chain_transfer(&source, &target).unwrap();
                 assert_eq!(transfer.is_empty(), !cycle);
                 if !native(abi) {
                     continue;
                 }
                 // This is compiler-owned code, not a dispatch read. Both owners
-                // stay alive through execution; production ownership is Task 2.
+                // stay alive through execution; no published dispatch/link root.
                 let (second_owner, second_id) = compile(&second);
                 let target_address = second_owner.get_finalized_function(second_id);
                 let mut first = landing(abi);
@@ -136,8 +171,8 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                 {
                     let mut frame = NativeFrame::new(&mut state, PollBudget::new(7, 11).unwrap());
                     unsafe { frame.begin_fp() };
-                    // Isolated invocation proof only: actual publication and
-                    // reachability revalidation arrive with Task 2's coordinator.
+                    // Isolated invocation proof: both synthetic owners remain
+                    // alive; the LCQ chain tests exercise real reader admission.
                     frame.execution_epoch = 7;
                     let address = first_owner.get_finalized_function(first_id);
                     let outcome = unsafe {
@@ -160,6 +195,10 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                         (4083, -9)
                     );
                     assert_eq!(frame.exit_pc, 0xfedcba9876543210);
+                    assert!(
+                        (target_address as usize..target_address as usize + second.len())
+                            .contains(&frame.exit_native_pc)
+                    );
                     assert_eq!(
                         (frame.exit_source_version, frame.exit_state_map),
                         (93, 0x12345678)

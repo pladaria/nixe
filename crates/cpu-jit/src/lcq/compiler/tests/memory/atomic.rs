@@ -188,6 +188,7 @@ fn delivered_scalar_rmw_retry_escape_and_alignment_preserve_pre_state() {
                     &mut arena,
                     Some((if misaligned { ARENA } else { DATA }, 0, 0)),
                     escape,
+                    false,
                 );
                 if escape {
                     let (reconstructed, access) = reconstructed.unwrap();
@@ -334,7 +335,8 @@ fn scalar_cas_maps_cover_lse_and_exclusive_loop_without_committing() {
                 assert_eq!(fault.commit_stage, 0);
                 assert!(fault.completed_read.is_none());
                 let state = &lowered.states[fault.state_map as usize].state;
-                assert!(!state.dirty_live.integer.x[2]);
+                // CAS must retain the incoming compare value before commit.
+                assert!(state.dirty_live.integer.x[2]);
                 assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
                 state.validate().unwrap();
                 if abi == HostAbi::Aarch64 {
@@ -361,8 +363,15 @@ fn delivered_scalar_cas_alignment_fault_keeps_pre_state() {
         state.general_register_storage_mut()[2] = 0x9292_9292_9292_9292;
         state.general_register_storage_mut()[3] = 19;
         let expected = state.clone();
-        let (_, access) =
-            run_memory_case(&words, &mut state, &mut arena, Some((ARENA, 0, 0)), true).unwrap();
+        let (_, access) = run_memory_case(
+            &words,
+            &mut state,
+            &mut arena,
+            Some((ARENA, 0, 0)),
+            true,
+            false,
+        )
+        .unwrap();
         let fault = access.guest_fault(SPACE).unwrap();
         assert_eq!(fault.kind, nixe_cpu::memory::DataAccessKind::Read);
         assert_eq!(
@@ -412,8 +421,14 @@ fn delivered_scalar_cas_retry_and_escape_preserve_pre_state() {
                 )
                 .unwrap();
             }
-            let reconstructed =
-                run_memory_case(&words, &mut state, &mut arena, Some((DATA, 0, 0)), escape);
+            let reconstructed = run_memory_case(
+                &words,
+                &mut state,
+                &mut arena,
+                Some((DATA, 0, 0)),
+                escape,
+                false,
+            );
             if escape {
                 assert!(reconstructed.unwrap().0.completed_read.is_none());
                 assert_eq!(arena[DATA..DATA + 8], 1u64.to_le_bytes());

@@ -37,7 +37,9 @@ pub(crate) unsafe fn reconstruct(
 ) -> Result<Reconstructed, &'static str> {
     let map = captured_state(frame, captured, fault)?;
     let abi = map.abi;
-    let fp_status = if map.host_fpsr_pending {
+    // Static maps permit inherited FP; the invocation decides whether the
+    // captured image contains guest status or merely the caller's environment.
+    let fp_status = if frame.host_fp.active != 0 {
         crate::fp_env::guest_status_from_host(
             abi,
             captured.fp().ok_or("missing captured FP state")?[1],
@@ -138,7 +140,7 @@ fn captured_state<'a>(
         return Err("captured PC/frame does not match the published fault map");
     }
     map.validate()?;
-    if frame.host_fp.saved == 0 || (frame.host_fp.active != 0) != map.host_fpsr_pending {
+    if frame.host_fp.saved == 0 || (frame.host_fp.active != 0 && !map.host_fpsr_pending) {
         return Err("captured fault map disagrees with invocation FP ownership");
     }
     Ok(map)

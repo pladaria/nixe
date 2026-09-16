@@ -42,11 +42,17 @@ Nixe uses a modified [Cranelift](https://cranelift.dev/) compiler to translate c
 
 See [Cranelift modifications](docs/cranelift-modifications.md) for implementation details.
 
-The production JIT currently uses synchronous, straight-line LCQ compilation
-with the bounded cache and fault-aware native gateway. Inter-block native
-linking and HCQ promotion are not enabled yet; the backend hooks above support
-those later stages. Task 3 development still requires the local Cranelift
-override described in [Cranelift modifications](docs/cranelift-modifications.md).
+The production JIT uses synchronous, straight-line LCQ compilation with a
+bounded code cache and fault-aware native gateway. Resolved static branches,
+per-vCPU indirect-cache hits and matched guest returns stay native across
+blocks under one execution epoch. Replacement and invalidation unlink targets
+before reclaiming their storage. Cold misses, semantic helpers, faults and
+control boundaries retain their required canonical paths.
+
+Functional hotness sampling and background HCQ compilation are not enabled
+yet. Development still requires the local Cranelift override described in
+[Cranelift modifications](docs/cranelift-modifications.md); the checked-in Git
+pin does not include the complete implementation.
 
 ## Running
 

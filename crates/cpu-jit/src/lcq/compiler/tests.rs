@@ -9,6 +9,7 @@ use nixe_cpu::{
 };
 use nixe_memory::{AddressSpaceId, GuestPhysicalPageId};
 
+mod chaining;
 mod fp;
 mod fp_add;
 mod fp_divide;
@@ -18,9 +19,11 @@ mod fp_multiply;
 mod fp_to_integer;
 mod fp_unary;
 mod fp_value;
+mod inherited;
 mod integer;
 mod integer_to_fp;
 mod memory;
+mod polling;
 mod shape;
 mod simd;
 mod system;
@@ -133,9 +136,11 @@ fn execute_with_fp(
     .reason;
     assert_eq!(invocation.frame().host_fp.active, 0);
     assert_eq!(invocation.frame().host_fp.saved, 0);
-    let exit = snapshot.states[invocation.frame().exit_state_map as usize]
-        .exit
-        .unwrap();
+    let record = &snapshot.states[invocation.frame().exit_state_map as usize];
+    let exit = record.exit.unwrap();
+    let completed = i64::from(record.transfer.as_ref().unwrap().completed);
+    assert_eq!(invocation.frame().budget.slice_remaining, 1000 - completed);
+    assert_eq!(invocation.frame().budget.sample_remaining, 4096 - completed);
     assert_eq!(
         invocation.frame().exit_source_version,
         snapshot.version.get()

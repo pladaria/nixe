@@ -73,7 +73,12 @@ pub(crate) unsafe fn resolve(
         return Err("fault memory authority does not own the captured arena");
     }
     let access = unsafe { inspect(frame, captured, fault, arena)? };
-    let resolution = if let Some(fault) = access.guest_fault(space) {
+    let resolution = if fault.record.access == unit::Access::CacheProbe {
+        // The byte read is only a proof of the fast case. In particular, read
+        // permissions and MMIO callbacks are not CIVAC semantics. The cold
+        // owner validates the original address after this epoch/lease ends.
+        DirectFaultResolution::Cold
+    } else if let Some(fault) = access.guest_fault(space) {
         DirectFaultResolution::Fault(fault)
     } else if fault.record.access == unit::Access::Atomic {
         memory.resolve_direct_atomic_fault(space, access.address, access.size)
@@ -205,6 +210,25 @@ pub(super) fn decode_access(
     record: &unit::FaultRecord,
     read: &impl Fn(u8, bool) -> Result<u64, &'static str>,
 ) -> Result<Access, &'static str> {
+    if record.access == unit::Access::CacheProbe {
+        let A64Instruction::System(instruction) = instruction else {
+            return Err("cache probe has a non-system instruction");
+        };
+        if !crate::lcq::system::is_cache_probe(record.instruction.block_key().platform, instruction)
+            || record.bytes != 1
+            || record.subaccess != 0
+            || record.commit_stage != 0
+            || record.completed_read.is_some()
+        {
+            return Err("invalid cache probe fault metadata");
+        }
+        return Ok(Access {
+            address: GuestVirtualAddress::new(read(instruction.operands().rt, false)?),
+            size: MemoryAccessSize::Byte,
+            kind: DataAccessKind::Read,
+            alignment: 1,
+        });
+    }
     let index = record.subaccess;
     let mut count = 1;
     let mut paired = false;

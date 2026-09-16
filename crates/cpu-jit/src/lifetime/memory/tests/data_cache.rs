@@ -1,5 +1,5 @@
 use super::*;
-use crate::abi::RuntimeSystemOperation;
+use crate::lcq::invocation::{Exit, MemoryExit};
 use crate::lcq::system::{CompletionError, RuntimeServices, complete_runtime};
 use nixe_cpu::exclusive::ExclusiveMonitorState;
 use nixe_cpu::execution::{ArchitecturalTimer, TimerSnapshot, VcpuEventState};
@@ -12,22 +12,71 @@ use nixe_memory::{
 use std::sync::atomic::AtomicUsize;
 
 struct NoTimer;
+
+struct UnreadableDevice;
+impl nixe_cpu::memory::SyntheticMmio for UnreadableDevice {
+    fn read(
+        &mut self,
+        _: u64,
+        _: nixe_cpu::memory::MemoryAccess,
+    ) -> Result<nixe_cpu::memory::MemoryValue, Box<str>> {
+        panic!("CIVAC must not read MMIO");
+    }
+    fn write(
+        &mut self,
+        _: u64,
+        _: nixe_cpu::memory::MemoryAccess,
+        _: nixe_cpu::memory::MemoryValue,
+    ) -> Result<(), Box<str>> {
+        panic!("CIVAC must not write MMIO");
+    }
+}
+
+#[test]
+fn civac_probe_mmio_and_zero_register_preserve_the_original_fault() {
+    for word in [0xd50b7e20_u32, 0xd50b7e3f] {
+        let (process, mut memory) = fixture();
+        assert!(memory.add_mmio_page(GuestPhysicalPageId::new(3), UnreadableDevice));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x3000),
+            GuestPhysicalPageId::new(3),
+            MemoryPermissions::READ_WRITE
+        ));
+        memory
+            .overwrite_mapped_ram(SPACE, GuestVirtualAddress::new(0x2000), &word.to_le_bytes())
+            .unwrap();
+        publish(&process, &memory, 0x2000);
+        let mut state = A64State::default();
+        state.set_pc(0x2000);
+        state.general_register_storage_mut()[0] = 0x3000;
+        *state.stack_pointer_storage_mut() = 0x1000; // XZR must not use mapped SP.
+        let before = state.clone();
+        let exit = native_exit(&process, &memory, &mut state);
+        assert_eq!(state, before);
+        let fault = complete_cache(exit, &mut state, &memory).unwrap_err();
+        if word & 31 == 31 {
+            assert_eq!(fault.address.get(), 0);
+            assert_eq!(fault.reason, DataAccessFaultReason::Unmapped);
+        } else {
+            assert_eq!(fault.address.get(), 0x3000);
+            assert!(matches!(fault.reason, DataAccessFaultReason::Device(_)));
+        }
+        assert_eq!(state, before);
+    }
+}
 impl ArchitecturalTimer for NoTimer {
     fn snapshot(&self) -> TimerSnapshot {
         panic!("DC does not read the timer")
     }
 }
 
-fn native_exit(
-    process: &Arc<Lifetime>,
-    memory: &ExecutionMemory,
-    state: &mut A64State,
-) -> RuntimeSystemOperation {
+fn native_exit(process: &Arc<Lifetime>, memory: &ExecutionMemory, state: &mut A64State) -> Exit {
     let mut reader = process.register().unwrap();
     let mut frame = NativeFrame::new(state, PollBudget::new(4096, 1000).unwrap());
     let mut worker = nixe_cpu_direct_memory::WorkerFaultContext::register().unwrap();
     let mut monitor = ExclusiveMonitorState::default();
-    let exit = unsafe {
+    unsafe {
         crate::lcq::invocation::run(
             &mut reader,
             &mut frame,
@@ -38,20 +87,56 @@ fn native_exit(
         )
     }
     .unwrap()
-    .unwrap();
-    let crate::lcq::invocation::Exit::Native { guest, .. } = exit else {
-        panic!()
-    };
-    assert_eq!(guest.pc.get(), 0x2000);
-    let unit::EdgeKind::RuntimeSystem(operation) = guest.kind else {
-        panic!()
-    };
-    operation
+    .unwrap()
+}
+
+fn complete_cache(
+    exit: Exit,
+    state: &mut A64State,
+    memory: &ExecutionMemory,
+) -> Result<(), nixe_cpu::memory::DataAccessFault> {
+    let mut monitor = ExclusiveMonitorState::default();
+    match exit {
+        Exit::Native { guest, .. } => {
+            let unit::EdgeKind::RuntimeSystem(operation) = guest.kind else {
+                panic!()
+            };
+            match complete_runtime(
+                operation,
+                state,
+                &mut RuntimeServices {
+                    address_space: SPACE,
+                    memory,
+                    timer: &NoTimer,
+                    events: &VcpuEventState::default(),
+                    exclusive: &mut monitor,
+                },
+            ) {
+                Ok(None) => Ok(()),
+                Err(CompletionError::Memory(fault)) => Err(fault),
+                other => panic!("{other:?}"),
+            }
+        }
+        Exit::Memory {
+            instruction,
+            outcome,
+        } => {
+            assert!(matches!(outcome, MemoryExit::CacheCleanInvalidate { .. }));
+            match outcome
+                .complete(instruction, state, memory, &mut monitor, 0)
+                .unwrap()
+            {
+                None => Ok(()),
+                Some(nixe_cpu::execution::CpuExit::DataFault { fault, .. }) => Err(fault),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
 }
 
 #[test]
 fn native_data_cache_on_coherent_bytes_preserves_code_claims_and_log() {
-    // Existing DC IVAC/CVAU/CIVAC system-exit encodings.
+    // CIVAC stays native; the other data maintenance operations stay cold.
     for word in [0xd5087620_u32, 0xd50b7b20, 0xd50b7e20] {
         let (process, memory) = fixture();
         memory
@@ -67,24 +152,14 @@ fn native_data_cache_on_coherent_bytes_preserves_code_claims_and_log() {
         let mut state = A64State::default();
         state.set_pc(0x2000);
         state.general_register_storage_mut()[0] = 0x1000;
-        let operation = native_exit(&process, &memory, &mut state);
         let cursor = memory.invalidation_cursor();
-        let mut monitor = ExclusiveMonitorState::default();
-        assert_eq!(
-            complete_runtime(
-                operation,
-                &mut state,
-                &mut RuntimeServices {
-                    address_space: SPACE,
-                    memory: &memory,
-                    timer: &NoTimer,
-                    events: &VcpuEventState::default(),
-                    exclusive: &mut monitor,
-                }
-            )
-            .unwrap(),
-            None
-        );
+        let exit = native_exit(&process, &memory, &mut state);
+        if word == 0xd50b7e20 {
+            assert!(matches!(exit, Exit::Native { guest, .. }
+                if guest.kind == unit::EdgeKind::Breakpoint(0) && guest.pc.get() == 0x2004));
+        } else {
+            complete_cache(exit, &mut state, &memory).unwrap();
+        }
         assert_eq!(state.pc(), 0x2004);
         assert_eq!(memory.invalidation_cursor(), cursor);
         captured.claim.validate().unwrap();
@@ -197,22 +272,12 @@ fn native_data_cache_writeback_is_unlocked_retranslates_and_preserves_precise_er
             let mut state = A64State::default();
             state.set_pc(0x2000);
             state.general_register_storage_mut()[0] = 0x1000;
-            let operation = native_exit(&process, &memory, &mut state);
+            let exit = native_exit(&process, &memory, &mut state);
             let before = state.clone();
-            let mut monitor = ExclusiveMonitorState::default();
-            let result = complete_runtime(
-                operation,
-                &mut state,
-                &mut RuntimeServices {
-                    address_space: SPACE,
-                    memory: memory.as_ref(),
-                    timer: &NoTimer,
-                    events: &VcpuEventState::default(),
-                    exclusive: &mut monitor,
-                },
-            );
+            assert_eq!(device.downloads.load(Ordering::Relaxed), 0);
+            let result = complete_cache(exit, &mut state, &memory);
             if mode < 2 {
-                assert_eq!(result.unwrap(), None);
+                result.unwrap();
                 assert_eq!(state.pc(), 0x2004);
                 let new = publish(&process, &memory, 0x1000);
                 assert_eq!(
@@ -222,10 +287,18 @@ fn native_data_cache_writeback_is_unlocked_retranslates_and_preserves_precise_er
                 let mut old_bytes = [0; 4];
                 retained.read(0, &mut old_bytes).unwrap();
                 assert_eq!(u32::from_le_bytes(old_bytes), 0xd4200120);
+                if word == 0xd50b7e20 && mode == 0 {
+                    // The completed download restored the direct alias. The
+                    // same instruction now succeeds natively without a second
+                    // callback or canonical cache exit.
+                    state.set_pc(0x2000);
+                    let exit = native_exit(&process, &memory, &mut state);
+                    assert!(matches!(exit, Exit::Native { guest, .. }
+                        if guest.kind == unit::EdgeKind::Breakpoint(0)));
+                    assert_eq!(state.pc(), 0x2004);
+                }
             } else {
-                let Err(CompletionError::Memory(fault)) = result else {
-                    panic!()
-                };
+                let Err(fault) = result else { panic!() };
                 if mode == 2 {
                     assert_eq!(fault.reason, DataAccessFaultReason::Unmapped);
                 } else {

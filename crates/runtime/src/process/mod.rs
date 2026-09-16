@@ -363,6 +363,7 @@ impl RunnableProcess {
             object,
             exit: None,
             state: Some(state),
+            jit_returns: self.execution.new_return_stack(),
             handle,
             stack_bottom: request.stack_top,
             stack_top: request.stack_top,

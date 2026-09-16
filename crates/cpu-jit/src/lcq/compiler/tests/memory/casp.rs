@@ -55,6 +55,7 @@ fn delivered_casp_x_retry_escape_and_alignment_preserve_both_pre_registers() {
                     &mut arena,
                     Some((if misaligned { ARENA } else { DATA }, 0, 0)),
                     escape,
+                    false,
                 );
                 if escape {
                     let (reconstructed, access) = result.unwrap();
@@ -219,8 +220,9 @@ fn casp_maps_describe_one_transaction_and_both_pre_destinations() {
             assert_eq!((fault.subaccess, fault.commit_stage), (0, 0));
             assert!(fault.completed_read.is_none());
             let state = &lowered.states[fault.state_map as usize].state;
-            assert!(!state.dirty_live.integer.x[2]);
-            assert!(!state.dirty_live.integer.x[3]);
+            // Both incoming compare values survive until the transaction commits.
+            assert!(state.dirty_live.integer.x[2]);
+            assert!(state.dirty_live.integer.x[3]);
             assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
             state.validate().unwrap();
         }
@@ -274,6 +276,7 @@ fn delivered_casp_w_retry_escape_and_alignment_preserve_both_pre_registers() {
                     &mut arena,
                     Some((if misaligned { ARENA } else { DATA }, 0, 0)),
                     escape,
+                    false,
                 );
                 if escape {
                     let (reconstructed, access) = result.unwrap();

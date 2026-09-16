@@ -122,28 +122,24 @@ impl RunnableProcess {
         instruction_budget: u64,
         events: nixe_cpu::execution::VcpuEventState,
     ) -> Result<execution::VcpuExecutionState, ProcessExecutionError> {
-        let Some(selected) = self.threads.get(thread_id) else {
-            return Err(ProcessExecutionError::UnknownThread(thread_id));
-        };
-        let loader_return = selected.loader_return;
         let (virtual_clock, architectural_timer_frequency, cpu, address_space_end) =
             self.execution.execution_environment();
         let thread = self
             .threads
             .get_mut(thread_id)
-            .expect("the selected thread was validated");
-        let state = thread
+            .ok_or(ProcessExecutionError::UnknownThread(thread_id))?;
+        let (state, jit_returns) = thread
             .take_state()
             .expect("a ready scheduler thread owns resident CPU state");
         Ok(execution::VcpuExecutionState {
             thread: state,
+            jit_returns,
             cpu,
             memory: std::sync::Arc::clone(&self.memory),
             virtual_clock,
             architectural_timer_frequency,
             address_space_end,
             instruction_budget,
-            loader_return,
             events,
         })
     }
@@ -155,21 +151,25 @@ impl RunnableProcess {
         execution: execution::VcpuExecutionState,
         result: Result<ExecutionReport, ProcessExecutionError>,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
-        let execution::VcpuExecutionState { thread: state, .. } = execution;
+        let execution::VcpuExecutionState {
+            thread: state,
+            jit_returns,
+            ..
+        } = execution;
         let concurrent_stop =
             (self.lifecycle != nixe_scheduler::ProcessLifecycle::Running).then_some(self.lifecycle);
         let thread = self
             .threads
             .get_mut(thread_id)
             .expect("the executed thread remains registered");
-        thread.restore_state(state);
+        thread.restore_state(state, jit_returns);
         if let Some(lifecycle) = concurrent_stop {
             return Err(ProcessExecutionError::ConcurrentProcessStop {
                 lifecycle,
                 context: Box::new(thread.state().register_context()),
             });
         }
-        let report = match result {
+        let mut report = match result {
             Ok(report) => report,
             Err(error) => {
                 if self.lifecycle == nixe_scheduler::ProcessLifecycle::Running {
@@ -182,6 +182,23 @@ impl RunnableProcess {
                 return Err(error);
             }
         };
+        // The stub is ordinary guest code, so both backends and native chains
+        // reach the same SVC boundary. Recognize the completed SVC's source,
+        // not mere arrival at that PC (which may instead stop for budget/control).
+        // Preserve normal instruction accounting and the returned CPU context.
+        if let ExecutionStop::SupervisorCall {
+            source,
+            immediate: 7,
+        } = &report.stop
+            && thread.loader_return == Some(source.pc)
+        {
+            report.stop = ExecutionStop::LoaderReturn {
+                source: *source,
+                result_code: thread.state().read_x(A64Register::General(
+                    nixe_cpu::state::a64::A64GeneralRegister::new(0).unwrap(),
+                )),
+            };
+        }
         if let ExecutionStop::LoaderReturn {
             source,
             result_code,
@@ -226,12 +243,16 @@ impl RunnableProcess {
         _vcpu: nixe_scheduler::VirtualCpuId,
         execution: execution::VcpuExecutionState,
     ) {
-        let execution::VcpuExecutionState { thread: state, .. } = execution;
+        let execution::VcpuExecutionState {
+            thread: state,
+            jit_returns,
+            ..
+        } = execution;
         let thread = self
             .threads
             .get_mut(thread_id)
             .expect("the failed worker's thread remains registered");
-        thread.restore_state(state);
+        thread.restore_state(state, jit_returns);
         if self.lifecycle == nixe_scheduler::ProcessLifecycle::Running {
             nixe_scheduler::transition_process(
                 &mut self.lifecycle,

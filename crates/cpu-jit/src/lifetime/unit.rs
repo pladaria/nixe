@@ -19,7 +19,11 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+mod bridge;
+pub(crate) mod dynamic;
 mod invalidation;
+pub(crate) mod links;
+pub(crate) mod patch;
 mod reclaim;
 pub(crate) use reclaim::Snapshot;
 #[cfg(test)]
@@ -43,6 +47,30 @@ pub(crate) struct StateRecord {
     pub native_offset: u32,
     pub state: ExitStateMap,
     pub exit: Option<GuestExit>,
+    // Only terminals allocate this payload; do not enlarge every prefault map
+    // by the full transfer descriptor. Its bytes share the CodeUnit's budget.
+    pub transfer: Option<Box<TerminalTransfer>>,
+}
+
+/// Immutable terminal information from lowering and final allocation. The
+/// patch starts at StateRecord.native_offset; mutable links belong to Lifetime.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TerminalTransfer {
+    pub destination: ValueLocation,
+    /// Linkable static dispatch destination, not an observation's constant PC.
+    /// Never inferred from allocated machine bytes; dynamic exits use None.
+    pub static_target: Option<crate::abi::BlockKey>,
+    /// Completed guest prefix: dispatch includes the branch, PRE exits do not.
+    pub completed: u16,
+    pub patch_bytes: u8,
+    /// Canonical fallback after any indirect RSB/PIC operation. A static call
+    /// includes its push here because unlinking bypasses the installed bridge.
+    /// Call/return slice polls perform their update on a separate path when
+    /// necessary; they must neither probe a successor nor repeat an update.
+    pub fallback_offset: u32,
+    /// Already-charged cold patch. Resume at native_offset, never at the
+    /// subtraction preceding it. None for uncheckpointed PRE observations.
+    pub poll_offset: Option<u32>,
 }
 
 /// Source identity and edge semantics, retained with the physical exit map.
@@ -87,6 +115,8 @@ pub(crate) enum Access {
     Read,
     Write,
     Atomic,
+    /// A host byte read proving coherent RAM, never a guest data read/retry.
+    CacheProbe,
 }
 
 pub(crate) struct FaultRecord {
@@ -142,6 +172,9 @@ pub(crate) struct CodeUnit {
     pub input: Input,
     // Cold ownership accounting, never read by generated code or fault lookup.
     baseline_pins: AtomicUsize,
+    // Set once before directory/dispatch exposure. Cold native-PC resolution
+    // reaches the exact generational registry slot without scanning live units.
+    registration: std::sync::OnceLock<UnitHandle>,
 }
 impl std::ops::Deref for CodeUnit {
     type Target = Input;
@@ -150,6 +183,10 @@ impl std::ops::Deref for CodeUnit {
     }
 }
 impl CodeUnit {
+    pub(crate) fn registered_handle(&self) -> Option<UnitHandle> {
+        self.registration.get().copied()
+    }
+
     fn entry(&self, entry: &Entry) -> PublishedEntry {
         let base = self.code.allocation.address();
         PublishedEntry {
@@ -164,6 +201,15 @@ impl CodeUnit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnitHandle(Handle<UnitRecord>, u64);
 
+/// Cold dispatch-to-registry identity. The slot does not acquire an extra
+/// strong reference; publication/retirement maintain it with the payload under
+/// JIT state. The generational handle resolves ownership without a unit scan.
+#[derive(Clone, Copy)]
+pub(super) struct UnitEntry {
+    unit: UnitHandle,
+    index: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Lifecycle {
     Published,
@@ -175,6 +221,7 @@ enum Lifecycle {
 
 struct UnitRecord {
     code: Arc<Accounted<CodeUnit>>,
+    static_sites: Accounted<Box<[links::SourceSite]>>,
     published: ExecutionEpoch,
     lifecycle: Lifecycle,
     slots: Accounted<Box<[Handle<DispatchSlot>]>>,
@@ -186,6 +233,10 @@ struct UnitRecord {
     invalidation: Option<MaintenanceSequence>,
     detached_epoch: Option<ExecutionEpoch>,
     detached_table: Option<Arc<Accounted<Table>>>,
+    outgoing: Option<Handle<links::Link>>,
+    incoming: Option<Handle<links::Link>>,
+    pic_outgoing: Option<super::pic::Site>,
+    pic_incoming: Option<super::pic::Site>,
 }
 
 /// Intrusive pending-only lists: membership is exactly `retirement.is_some()`.
@@ -300,6 +351,12 @@ struct RetiredTable {
 
 pub(super) struct Units {
     records: Registry<UnitRecord>,
+    // Includes retired/detached records until their last reference and epoch
+    // permit removal. Directory-table presence alone is not sufficient.
+    segment_records: [usize; SEGMENTS],
+    segment_retired: [usize; SEGMENTS],
+    links: links::Links,
+    static_sites: links::StaticSites,
     retirements: Retirements,
     families: Registry<Arc<Accounted<Family>>>,
     ids: CheckedCounter<CodeUnitId>,
@@ -313,6 +370,7 @@ pub(super) struct Units {
     family_storage: Option<MetadataLease>,
     retired_storage: Option<MetadataLease>,
     dependency_storage: Option<MetadataLease>,
+    static_site_storage: Option<MetadataLease>,
     hcq_failure: Option<Error>,
     collecting: bool,
     decommitting: [bool; SEGMENTS],
@@ -322,6 +380,10 @@ impl Default for Units {
     fn default() -> Self {
         Self {
             records: Registry::default(),
+            segment_records: [0; SEGMENTS],
+            segment_retired: [0; SEGMENTS],
+            links: links::Links::default(),
+            static_sites: links::StaticSites::new(0),
             retirements: Retirements::default(),
             families: Registry::default(),
             ids: CheckedCounter::default(),
@@ -335,6 +397,7 @@ impl Default for Units {
             family_storage: None,
             retired_storage: None,
             dependency_storage: None,
+            static_site_storage: None,
             hcq_failure: None,
             collecting: false,
             decommitting: [false; SEGMENTS],
@@ -432,7 +495,14 @@ impl Input {
             + self
                 .states
                 .iter()
-                .map(|map| size_of_val(&*map.state.bindings) + nzcv_bytes(&map.state.nzcv))
+                .map(|map| {
+                    size_of_val(&*map.state.bindings)
+                        + nzcv_bytes(&map.state.nzcv)
+                        + map
+                            .transfer
+                            .as_ref()
+                            .map_or(0, |transfer| size_of_val(&**transfer))
+                })
                 .sum::<usize>()
     }
 
@@ -518,17 +588,66 @@ impl Input {
             {
                 return Err(fail("invalid semantic state-map identity, ABI or offset"));
             }
-            if !self
+            let backend = self
                 .code
                 .metadata
                 .states
                 .iter()
                 .chain(self.code.metadata.faults.iter())
-                .any(|backend| !backend.entry && backend.offset == map.native_offset)
-            {
-                return Err(fail("semantic state map has no final backend boundary"));
+                .find(|backend| !backend.entry && backend.offset == map.native_offset)
+                .ok_or_else(|| fail("semantic state map has no final backend boundary"))?;
+            if let Some(transfer) = &map.transfer {
+                let patch_bytes = if map.state.abi == HostAbi::X86_64 {
+                    8
+                } else {
+                    4
+                };
+                if map.exit.is_none()
+                    || !transfer.destination.valid(map.state.abi, 8)
+                    || transfer.completed > 2048
+                    || transfer.patch_bytes != patch_bytes
+                    || transfer.patch_bytes != backend.patch_bytes
+                    || transfer.poll_offset != backend.poll.map(|poll| poll.offset)
+                    || backend
+                        .poll
+                        .is_some_and(|poll| poll.completed != transfer.completed)
+                    || !map.native_offset.is_multiple_of(u32::from(patch_bytes))
+                    || map.native_offset as usize + usize::from(patch_bytes)
+                        > self.code.allocation.len()
+                    || transfer.fallback_offset as usize >= self.code.allocation.len()
+                    || (map.state.abi == HostAbi::Aarch64 && transfer.fallback_offset % 4 != 0)
+                    || transfer.static_target.is_some_and(|target| {
+                        self.instructions[0].key.block_key().at(target.pc) != Some(target)
+                            || !map.exit.is_some_and(|exit| {
+                                matches!(
+                                    exit.kind,
+                                    EdgeKind::Static
+                                        | EdgeKind::Taken
+                                        | EdgeKind::NotTaken
+                                        | EdgeKind::Call
+                                        | EdgeKind::FragmentLimit
+                                )
+                            })
+                    })
+                {
+                    return Err(fail("invalid terminal transfer contract"));
+                }
             }
             map.state.validate().map_err(fail)?;
+        }
+        let static_exits = self
+            .states
+            .iter()
+            .filter(|map| {
+                map.transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.static_target.is_some())
+            })
+            .count();
+        if static_exits > self.code.allocation.island_count() {
+            return Err(fail(
+                "static exits exceed the source's reserved island capacity",
+            ));
         }
         if self.code.metadata.states.iter().any(|backend| {
             backend.patch_bytes != 0
@@ -657,7 +776,11 @@ impl Lifetime {
     ) -> Result<PreparedUnit<'a>, Error> {
         input.validate(self, publications)?;
         self.collect_tables()?;
-        self.grow_units(input.tier, input.dependencies.len())?;
+        let static_sites = input.source_sites();
+        let bytes = size_of_val(&*static_sites);
+        let static_sites = self.cache.account(static_sites, bytes, input.tier)?;
+        self.grow_units(input.tier, input.dependencies.len(), static_sites.len())?;
+        self.reserve_publication_links(input.tier, static_sites.len(), &input.entries)?;
         let publications = publications.to_vec().into_boxed_slice();
         let bytes = size_of_val(&*publications);
         let publications = self.cache.account(publications, bytes, input.tier)?;
@@ -727,11 +850,13 @@ impl Lifetime {
                     let lcq = old
                         .lcq()
                         .ok_or(Error::InvalidUnit("HCQ entry has no resident LCQ baseline"))?;
+                    let owner = state.dispatch.get(publication.slot).unwrap().owners[0]
+                        .ok_or(Error::StalePublication)?;
                     let record = state
                         .units
                         .records
-                        .values()
-                        .find(|record| {
+                        .get(owner.unit.0)
+                        .filter(|record| {
                             record.code.id == lcq.unit
                                 && record.code.version == lcq.version
                                 && record.lifecycle == Lifecycle::Published
@@ -781,6 +906,7 @@ impl Lifetime {
                 abi_version: NATIVE_ABI_VERSION,
                 input,
                 baseline_pins: AtomicUsize::new(0),
+                registration: std::sync::OnceLock::new(),
             },
             bytes,
             tier,
@@ -878,12 +1004,18 @@ impl Lifetime {
             table: Some(next_table),
             payloads: payload_boxes,
             slots: Some(slots),
+            static_sites: Some(static_sites),
         })
     }
 
-    fn grow_units(&self, tier: Tier, dependency_count: usize) -> Result<(), Error> {
+    fn grow_units(
+        &self,
+        tier: Tier,
+        dependency_count: usize,
+        static_count: usize,
+    ) -> Result<(), Error> {
         loop {
-            let (records, families, retired, dependencies) = {
+            let (records, families, retired, dependencies, static_sites) = {
                 let state = self.lock();
                 state.open()?;
                 let records = if state.units.records.has_space() {
@@ -928,10 +1060,25 @@ impl Lifetime {
                         )
                         .max(16)
                 };
-                if records == 0 && families == 0 && retired == 0 && dependencies == 0 {
+                let sites = &state.units.static_sites.entries;
+                let needed = sites
+                    .len()
+                    .checked_add(static_count)
+                    .ok_or(Error::Capacity("static source index size overflow"))?;
+                let static_sites = if needed <= sites.capacity() {
+                    0
+                } else {
+                    needed.max(sites.capacity().saturating_mul(2)).max(16)
+                };
+                if records == 0
+                    && families == 0
+                    && retired == 0
+                    && dependencies == 0
+                    && static_sites == 0
+                {
                     return Ok(());
                 }
-                (records, families, retired, dependencies)
+                (records, families, retired, dependencies, static_sites)
             };
             let records = Vec::with_capacity(records);
             let bytes = records.capacity() * size_of::<Slot<UnitRecord>>();
@@ -946,8 +1093,22 @@ impl Lifetime {
             let bytes = dependencies.entries.allocation_size();
             let mut dependencies =
                 PreparedStorage::for_tier(dependencies, bytes, &self.cache, tier)?;
+            let static_sites = links::StaticSites::new(static_sites);
+            let bytes = static_sites.entries.allocation_size();
+            let mut static_sites =
+                PreparedStorage::for_tier(static_sites, bytes, &self.cache, tier)?;
             let mut state = self.lock();
             state.open()?;
+            if static_sites.value.entries.capacity() > state.units.static_sites.entries.capacity() {
+                for site in state.units.static_sites.entries.drain() {
+                    static_sites.value.insert(site);
+                }
+                std::mem::swap(&mut static_sites.value, &mut state.units.static_sites);
+                std::mem::swap(
+                    &mut static_sites.charge,
+                    &mut state.units.static_site_storage,
+                );
+            }
             if dependencies.value.entries.capacity() > state.units.dependencies.entries.capacity() {
                 for dependency in state.units.dependencies.entries.drain() {
                     dependencies.value.insert(dependency);
@@ -1016,6 +1177,7 @@ pub(crate) struct PreparedUnit<'a> {
     table: Option<Arc<Accounted<Table>>>,
     payloads: Accounted<Box<[Option<OwnedPayload>]>>,
     slots: Option<Accounted<Box<[Handle<DispatchSlot>]>>>,
+    static_sites: Option<Accounted<Box<[links::SourceSite]>>>,
 }
 type OwnedPayload = Box<Accounted<DispatchPayload>>;
 impl PreparedUnit<'_> {
@@ -1025,7 +1187,7 @@ impl PreparedUnit<'_> {
         for publication in self.publications.iter() {
             state.validate(publication)?;
         }
-        let unit = self.unit.as_ref().unwrap();
+        let unit = Arc::clone(self.unit.as_ref().unwrap());
         let tier = unit.tier;
         if tier == Tier::Hcq
             && let Some(error) = state.units.hcq_failure
@@ -1040,6 +1202,8 @@ impl PreparedUnit<'_> {
             || !same_snapshot(&state.units.tables[segment], &self.previous_table)
             || state.units.dependencies.entries.capacity() - state.units.dependencies.entries.len()
                 < unit.dependencies.len()
+            || state.units.static_sites.entries.capacity() - state.units.static_sites.entries.len()
+                < self.static_sites.as_ref().unwrap().len()
             || (self.previous_table.is_some()
                 && state.units.retired_tables.len() == state.units.retired_tables.capacity())
         {
@@ -1060,6 +1224,21 @@ impl PreparedUnit<'_> {
                 return Err(Error::StalePublication);
             }
         }
+        // Resolve and validate all outgoing roots before mutation. New sources
+        // and their links become registered together under this same lock.
+        let source = UnitHandle(handle, process.identity);
+        let link_count = self
+            .check_outgoing_links(&state, source, &unit)?
+            .checked_add(self.check_waiting_links(&state, source, &unit)?)
+            .ok_or(Error::Capacity("publication link count overflow"))?;
+        state
+            .units
+            .check_publication_link_capacity(link_count)
+            .inspect_err(|error| {
+                if matches!(error, Error::Exhausted(_)) {
+                    process.publication_failure(&mut state, *error, tier);
+                }
+            })?;
         // Reserve epochs and any cutover request before reachable mutation.
         // The retirement stamp covers ANY
         // invocations that could have loaded the replaced table, including
@@ -1085,6 +1264,15 @@ impl PreparedUnit<'_> {
         } else {
             None
         };
+        let link_sequence = if link_count != 0 {
+            Some(
+                process
+                    .request_locked(&mut state, Reason::LinkPatch)?
+                    .sequence,
+            )
+        } else {
+            None
+        };
 
         for page in &*unit.dependencies {
             state.units.dependencies.insert(Dependency {
@@ -1095,6 +1283,7 @@ impl PreparedUnit<'_> {
 
         let record = UnitRecord {
             code: self.unit.take().unwrap(),
+            static_sites: self.static_sites.take().unwrap(),
             published: retired,
             lifecycle: Lifecycle::Published,
             slots: self.slots.take().unwrap(),
@@ -1104,6 +1293,10 @@ impl PreparedUnit<'_> {
             invalidation: None,
             detached_epoch: None,
             detached_table: None,
+            outgoing: None,
+            incoming: None,
+            pic_outgoing: None,
+            pic_incoming: None,
         };
         let inserted = state
             .units
@@ -1111,6 +1304,19 @@ impl PreparedUnit<'_> {
             .insert(&mut Some(record))
             .expect("validated unit insertion");
         debug_assert_eq!(inserted, handle);
+        state.units.segment_records[segment] += 1;
+        unit.registration
+            .set(source)
+            .expect("single-use unit publication");
+        // Discovery and the source payload share one publication point. These
+        // weak associations neither expose code nor retain target ownership.
+        state
+            .units
+            .insert_static_source(UnitHandle(handle, process.identity));
+        if let Some(sequence) = link_sequence {
+            self.insert_outgoing_links(&mut state, source, &unit, sequence);
+            self.insert_waiting_links(&mut state, source, &unit, sequence);
+        }
         if self.family.is_some() {
             let family = state
                 .units
@@ -1135,20 +1341,25 @@ impl PreparedUnit<'_> {
             );
         }
         state.execution = next_epoch;
-        for (publication, payload) in self.publications.iter().zip(self.payloads.value.iter_mut()) {
-            state.dispatch.get_mut(publication.slot).unwrap().units += 1;
-            let old = state
-                .dispatch
-                .get_mut(publication.slot)
-                .unwrap()
-                .replace(payload.take().unwrap());
+        for (index, (publication, payload)) in self
+            .publications
+            .iter()
+            .zip(self.payloads.value.iter_mut())
+            .enumerate()
+        {
+            let slot = state.dispatch.get_mut(publication.slot).unwrap();
+            slot.units += 1;
+            let previous = slot.owners;
+            let mut owners = previous;
+            owners[if tier == Tier::Lcq { 0 } else { 1 }] = Some(UnitEntry {
+                unit: UnitHandle(handle, process.identity),
+                index,
+            });
+            let old = slot.replace(payload.take().unwrap(), owners);
             if let Some(sequence) = cutover
-                && let Some(old) = old.lcq()
-                && let Some(handle) = state
-                    .units
-                    .records
-                    .find(|record| record.code.id == old.unit && record.code.version == old.version)
+                && let Some(old) = previous[0]
             {
+                let handle = old.unit.0;
                 let units = &mut state.units;
                 let record = units.records.get_mut(handle).unwrap();
                 record.lifecycle = Lifecycle::Superseded;

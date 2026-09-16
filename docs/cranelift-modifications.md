@@ -12,13 +12,32 @@ not measured speedups.
   `7bac2c2775808aaec5d4aa5627a5e447b51102cf`.
 - Fork: `pladaria/wasmtime`, branch `nixe`; Nixe currently pins
   `e2a984d96678207094c0fc50057c8b6bcfd68715` in
-  [the JIT manifest](../crates/cpu-jit/Cargo.toml) and `Cargo.lock`.
-- The maintained changes are in two commits:
+  [the JIT manifest](../crates/cpu-jit/Cargo.toml) and the checked-in `Cargo.lock`.
+- The pinned changes are in two commits:
   [leaf ABI and canonical multi-entry support][abi-commit], and
   [boundary maps and patchable native exits][boundary-commit].
 
-The [complete diff][fork-diff] is the source inventory. Paths below are relative
-to that Wasmtime checkout. Update this document when advancing the dependency
+Development still uses the local `nixe` checkout and Cargo override.
+Its additional changes, including the terminal checkpoints below, are not in
+that Git pin. Do not remove the override until the maintainer publishes and
+pins the updated fork.
+
+Task 4 validation uses local HEAD `3dabafe6e5cb04b88265b0d3612f88ffe50b7332`
+plus uncommitted backend changes, including `nixe_exit_costs`/terminal polling.
+That HEAD alone is not a reproducible replacement for the local checkout.
+On this development machine the checkout is `/home/pladaria/projects/wasmtime`
+and the existing override is used with:
+
+```bash
+cargo --offline --config /tmp/nixe-observable-fp-local.toml cli run es2gears
+```
+
+The override file is machine-local. Keep override-induced lockfile changes out
+of the dependency-pin handoff; publishing and pinning the updated fork remains
+a separate maintainer action.
+
+The [pinned diff][fork-diff] covers only the pinned commits, not the later local
+changes. Paths below are relative to that Wasmtime checkout. Update this document when advancing the dependency
 pin, including any changes removed because upstream now supplies them.
 
 ## Implemented modifications and benefits
@@ -127,6 +146,20 @@ Added aligned exit patch units: 8 bytes on x86-64 and 4 bytes on AArch64.
 bytes and validates the patch bounds, alignment and branch reach. Boundary
 metadata is protected from subsequent branch truncation that could invalidate
 its recorded position.
+
+The local fork also supports `Function::nixe_exit_costs` (`nixe_poll` in printed
+CLIF). An opted-in terminal subtracts 1–2048 instructions from r14/x20 and takes
+the deadline path when the signed balance is nonpositive. The normal path is
+one subtraction, one normally-not-taken conditional branch and the aligned
+hot patch. `StateMap::poll` exports the second patch and charged cost;
+`patch_poll` installs its cold target. Both paths retain every allocated SSA
+operand, not implicit host condition flags. LCQ retains lazy NZCV operands
+explicitly and must not charge the same prefix again in either adapter.
+Resumption belongs at the hot patch, after the checkpoint. Nixe now patches the
+cold path to its native control/budget leaf, which can rearm and resume that hot
+patch without a host call. Pending requests or slice exhaustion leave through
+canonical adapters. Production static links, indirect PIC hits and matched
+guest returns now use these checkpoints and remain native across units.
 
 Added `enable_nixe_ibt` for x86-64 `ENDBR64` landings and integrated selected
 entries with the existing AArch64 BTI machinery. Entry offsets point to the
@@ -261,8 +294,11 @@ The [Task 1 handoff](specs/tiered-jit/task-01-plan.md#integration-handoff)
 records backend integration and its tests. Its validation includes native
 x86-64 execution, both encoders and AArch64 execution under QEMU; native AArch64
 hardware validation remains outstanding. Production publication and lifetime
-management are tracked in [Task 2](specs/tiered-jit/task-02-plan.md), with frontend
-cutover and the complete fault protocol in later specification tasks.
+management are tracked in [Task 2](specs/tiered-jit/task-02-plan.md), frontend
+cutover in [Task 3](specs/tiered-jit/task-03-plan.md), and production native
+chaining/retirement in [Task 4](specs/tiered-jit/task-04-plan.md). Functional
+sampling and background HCQ compilation remain subsequent work. Emitted landing
+checks and QEMU tests do not establish native BTI/CET enforcement.
 
 [abi-commit]: https://github.com/pladaria/wasmtime/commit/2f8ccabacf
 [boundary-commit]: https://github.com/pladaria/wasmtime/commit/e2a984d96678207094c0fc50057c8b6bcfd68715
