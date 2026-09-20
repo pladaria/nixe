@@ -51,7 +51,82 @@ impl std::fmt::Display for UnsupportedFpControl {
 }
 impl std::error::Error for UnsupportedFpControl {}
 
+/// A non-observing pause keeps hardware status separate from live software
+/// FPSR. It borrows the existing owner, allocates nothing, and cannot cross OS
+/// threads. Unlike canonical suspension, it must not clear guest sticky flags
+/// on a successful continuation. There is deliberately no automatic resume on
+/// drop: a failed/panicking observer must never resume guest execution.
+#[must_use = "resume the observation or abort and merge status after canonical writeback"]
+pub(crate) struct ObservationPause<'a> {
+    owner: &'a mut HostFpState,
+    guest: Option<(u64, u64)>,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl ObservationPause<'_> {
+    /// Restore the exact interrupted image, including accumulated sticky flags.
+    /// An inactive segment stays inactive; observer FP effects are discarded.
+    ///
+    /// # Safety
+    /// The observer succeeded and changed no guest architectural state. All
+    /// locks/temporaries requiring general Rust work have been released. After
+    /// this bounded leaf, run no general Rust until the next FP suspension.
+    pub(crate) unsafe fn resume(self) {
+        if let Some((control, status)) = self.guest {
+            self.owner.active = 1;
+            host::restore(control, status);
+        } else {
+            host::restore(self.owner.saved_control, self.owner.saved_status);
+        }
+    }
+
+    /// Keep the caller environment and end the interrupted segment. The caller
+    /// must retain this contribution until source canonical writeback completes,
+    /// then OR it into FPSR exactly once. Merging before writeback would allow
+    /// the still-live software FPSR to overwrite the hardware contribution.
+    /// Never resume the guest after this failure path.
+    #[must_use = "merge the interrupted guest status after canonical writeback"]
+    pub(crate) fn abort(self) -> u32 {
+        host::restore(self.owner.saved_control, self.owner.saved_status);
+        self.owner.suspended = 0;
+        let abi = if cfg!(target_arch = "x86_64") {
+            crate::abi::HostAbi::X86_64
+        } else {
+            crate::abi::HostAbi::Aarch64
+        };
+        self.guest
+            .map_or(0, |(_, status)| guest_status_from_host(abi, status))
+    }
+}
+
 impl HostFpState {
+    /// Pause a cold observation without touching canonical state or consuming
+    /// host status. Read/restore uses the same host encoding authority as the
+    /// normal FP owner; neither NativeFrame layout nor its ABI changes.
+    ///
+    /// # Safety
+    /// `begin` ran on this OS thread and the invocation remains protected.
+    /// Save all live caller-clobbered physical values before entering this
+    /// System-ABI leaf. Do not change guest state while the pause is alive.
+    /// Catch observer failure while retaining the pause, then consume it via
+    /// `abort`; only a successful observer may consume it via `resume`.
+    pub(crate) unsafe fn pause_observation(&mut self) -> ObservationPause<'_> {
+        let guest = if self.active != 0 {
+            Some(host::read())
+        } else {
+            None
+        };
+        host::restore(self.saved_control, self.saved_status);
+        self.active = 0;
+        // Any diagnostic runs only after restoration of the caller environment.
+        assert_ne!(self.saved, 0, "FP observation before gateway save");
+        ObservationPause {
+            owner: self,
+            guest,
+            thread: std::marker::PhantomData,
+        }
+    }
+
     /// Save the caller environment once, before any guest segment.
     ///
     /// # Safety

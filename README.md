@@ -49,8 +49,11 @@ blocks under one execution epoch. Replacement and invalidation unlink targets
 before reclaiming their storage. Cold misses, semantic helpers, faults and
 control boundaries retain their required canonical paths.
 
-Functional hotness sampling and background HCQ compilation are not enabled
-yet. Development still requires the local Cranelift override described in
+Functional hotness sampling is active on cold paths, with fixed per-vCPU
+tables. Bounded background admission and worker ownership are implemented and
+tested, but remain dormant until Task 6 supplies the real HCQ compiler;
+production still executes LCQ only. Development requires the local Cranelift
+override described in
 [Cranelift modifications](docs/cranelift-modifications.md); the checked-in Git
 pin does not include the complete implementation.
 

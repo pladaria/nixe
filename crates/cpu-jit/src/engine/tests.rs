@@ -9,6 +9,7 @@ use nixe_memory::{AddressSpaceId, DirectBackendPolicy, GuestPhysicalPageId};
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
 const PC: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);
 
+mod background;
 mod budget;
 mod capacity;
 mod completion;
@@ -16,6 +17,7 @@ mod execution;
 mod fallback;
 mod lifecycle;
 mod rsb;
+mod sampling;
 mod shutdown;
 mod worker;
 

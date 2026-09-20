@@ -14,11 +14,17 @@ mod engine;
 mod fp_env;
 mod fp_lowering;
 mod fp_policy;
+// HCQ graph construction is staged before the real worker consumer (Task 6).
+#[allow(dead_code)]
+mod hcq;
 mod jit_error;
 mod lcq;
 mod lowering;
 mod memory_lowering;
 mod rsb;
+// Sampling is active; seed/reshape admission consumers arrive in Tasks 6/7.
+#[allow(dead_code)]
+mod sampling;
 mod simd_lowering;
 // Link/tier maintenance contracts become production consumers in Tasks 4–8.
 #[allow(dead_code)]

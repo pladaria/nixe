@@ -96,6 +96,7 @@ fn lcq_invocation_owns_normal_exit_identity_without_memory_fault_sites() {
         let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 1000).unwrap());
         let result = unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,
@@ -130,6 +131,7 @@ fn lcq_invocation_owns_normal_exit_identity_without_memory_fault_sites() {
             returned,
             guest,
             instruction,
+            ..
         } = result
         else {
             panic!("unexpected memory exit")
@@ -161,6 +163,7 @@ fn lcq_invocation_owns_admission_retry_and_exclusive_handoff() {
     assert!(
         unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,
@@ -194,8 +197,10 @@ fn lcq_invocation_owns_admission_retry_and_exclusive_handoff() {
         returned,
         guest,
         instruction,
+        ..
     }) = (unsafe {
         invocation::run(
+            &mut crate::sampling::Samples::new(),
             &mut reader,
             &mut frame,
             &memory,
@@ -261,8 +266,10 @@ fn lcq_invocation_escapes_with_owned_cold_or_precise_fault_and_releases_owners()
         let Some(Exit::Memory {
             instruction,
             outcome,
+            ..
         }) = (unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,
@@ -389,6 +396,7 @@ fn lcq_invocation_pair_cold_exit_retains_the_first_native_read() {
         ..
     }) = (unsafe {
         invocation::run(
+            &mut crate::sampling::Samples::new(),
             &mut reader,
             &mut frame,
             &memory,
@@ -472,6 +480,7 @@ fn lcq_invocation_completes_exclusive_store_from_a_previous_invocation() {
             let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 1000).unwrap());
             let exit = unsafe {
                 invocation::run(
+                    &mut crate::sampling::Samples::new(),
                     &mut reader,
                     &mut frame,
                     &memory,
@@ -664,6 +673,7 @@ fn lcq_invocation_rejected_admission_releases_fp_epoch_and_mapping_lease() {
         }
         let result = unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,
@@ -698,6 +708,7 @@ fn lcq_invocation_rejected_admission_releases_fp_epoch_and_mapping_lease() {
     assert!(
         unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,

@@ -807,10 +807,21 @@ impl Compiler {
                 let start = append(&mut bytes, &poll);
                 let mut branch = map.clone();
                 branch.poll = None;
+                let (observe, continuations) =
+                    crate::native::observation::emit_callback(&records[index].state, pc)
+                        .map_err(fail)?;
+                let sample = append(&mut bytes, &observe);
+                for (offset, target) in continuations.into_iter().zip([map.offset, control as u32])
+                {
+                    branch.offset = sample as u32 + offset;
+                    branch
+                        .patch_exit(&mut bytes, 0, u64::from(target))
+                        .map_err(fail)?;
+                }
                 for (offset, target) in
                     branches
                         .into_iter()
-                        .zip([map.offset, slice as u32, control as u32])
+                        .zip([sample as u32, slice as u32, control as u32])
                 {
                     branch.offset = start as u32 + offset;
                     branch

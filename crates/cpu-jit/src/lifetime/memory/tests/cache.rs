@@ -194,6 +194,7 @@ fn native_ic_completion_releases_its_own_epoch_and_advances_pc_only_on_success()
             let mut worker = nixe_cpu_direct_memory::WorkerFaultContext::register().unwrap();
             unsafe {
                 crate::lcq::invocation::run(
+                    &mut crate::sampling::Samples::new(),
                     &mut reader,
                     &mut frame,
                     &memory,

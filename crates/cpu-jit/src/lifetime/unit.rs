@@ -6,9 +6,10 @@ use super::directory::{Interval, Table};
 use super::registry::{Handle, Registry, Slot};
 use super::{DispatchSlot, Error, Lifetime, PreparedStorage, Publication, Reason};
 use crate::abi::{
-    CheckedCounter, CodeUnitId, CodeVersion, DispatchPayload, EntryContract, ExecutionEpoch,
-    ExitStateMap, FamilyVersion, HcqEntry, HcqFamilyId, HostAbi, InstructionKey, LazyFlags,
-    MaintenanceSequence, NATIVE_ABI_VERSION, NzcvLocation, PublishedEntry, ValueLocation,
+    BlockKey, CheckedCounter, CodeUnitId, CodeVersion, DispatchPayload, EntryContract,
+    ExecutionEpoch, ExitStateMap, FamilyVersion, HcqEntry, HcqFamilyId, HostAbi, InstructionKey,
+    LazyFlags, MaintenanceSequence, NATIVE_ABI_VERSION, NzcvLocation, PublishedEntry,
+    ValueLocation,
 };
 use crate::executable::{Accounted, Installed, MetadataLease, SEGMENTS, Tier};
 use nixe_cpu::memory::CodePageDependency;
@@ -23,11 +24,15 @@ mod bridge;
 pub(crate) mod dynamic;
 mod invalidation;
 pub(crate) mod links;
+mod ownership;
 pub(crate) mod patch;
 mod reclaim;
+pub(super) mod reshape;
+mod sampling;
 pub(crate) use reclaim::Snapshot;
+pub(crate) use sampling::CompletionSample;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Instruction {
@@ -198,7 +203,7 @@ impl CodeUnit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct UnitHandle(Handle<UnitRecord>, u64);
 
 /// Cold dispatch-to-registry identity. The slot does not acquire an extra
@@ -226,6 +231,8 @@ struct UnitRecord {
     lifecycle: Lifecycle,
     slots: Accounted<Box<[Handle<DispatchSlot>]>>,
     family: Option<Handle<Arc<Accounted<Family>>>>,
+    // Kept through unlink until family/unit registry slots can be reused.
+    reshape: Option<super::background::Owner<FamilyVersion>>,
     retirement: Option<(Reason, MaintenanceSequence)>,
     retirement_next: Option<Handle<UnitRecord>>,
     // Memory safety work may join an already queued eviction/tier cutover.
@@ -359,6 +366,7 @@ pub(super) struct Units {
     static_sites: links::StaticSites,
     retirements: Retirements,
     families: Registry<Arc<Accounted<Family>>>,
+    family_owners: ownership::FamilyOwners,
     ids: CheckedCounter<CodeUnitId>,
     versions: CheckedCounter<CodeVersion>,
     family_ids: CheckedCounter<HcqFamilyId>,
@@ -368,6 +376,7 @@ pub(super) struct Units {
     dependencies: DependencyIndex,
     record_storage: Option<MetadataLease>,
     family_storage: Option<MetadataLease>,
+    family_owner_storage: Option<MetadataLease>,
     retired_storage: Option<MetadataLease>,
     dependency_storage: Option<MetadataLease>,
     static_site_storage: Option<MetadataLease>,
@@ -386,6 +395,7 @@ impl Default for Units {
             static_sites: links::StaticSites::new(0),
             retirements: Retirements::default(),
             families: Registry::default(),
+            family_owners: ownership::FamilyOwners::new(0),
             ids: CheckedCounter::default(),
             versions: CheckedCounter::default(),
             family_ids: CheckedCounter::default(),
@@ -395,6 +405,7 @@ impl Default for Units {
             dependencies: DependencyIndex::new(0),
             record_storage: None,
             family_storage: None,
+            family_owner_storage: None,
             retired_storage: None,
             dependency_storage: None,
             static_site_storage: None,
@@ -406,6 +417,94 @@ impl Default for Units {
     }
 }
 impl Units {
+    pub(super) fn instruction_available(
+        &self,
+        key: InstructionKey,
+        allowed: [Option<crate::sampling::FamilyIdentity>; 2],
+    ) -> bool {
+        let Some(handle) = self.family_owners.get(key) else {
+            return true;
+        };
+        self.families.get(handle).is_some_and(|family| {
+            allowed.contains(&Some(crate::sampling::FamilyIdentity {
+                id: family.id,
+                version: family.version,
+            }))
+        })
+    }
+
+    pub(super) fn demanded_lcq(
+        &self,
+        owner: UnitEntry,
+        key: crate::abi::BlockKey,
+        entry: PublishedEntry,
+        allowed: [Option<crate::sampling::FamilyIdentity>; 2],
+    ) -> Option<Snapshot> {
+        if !self.instruction_available(InstructionKey::new(key)?, allowed) {
+            return None;
+        }
+        self.lcq_record(owner, key, entry)
+            .map(|record| Snapshot::retain(&record.code))
+    }
+
+    pub(super) fn matches_lcq(
+        &self,
+        owner: UnitEntry,
+        key: BlockKey,
+        entry: PublishedEntry,
+        captured: &Snapshot,
+    ) -> bool {
+        captured.registered_handle() == Some(owner.unit)
+            && self.lcq_record(owner, key, entry).is_some_and(|record| {
+                record.code.id == captured.id && record.code.version == captured.version
+            })
+    }
+
+    fn lcq_record(
+        &self,
+        owner: UnitEntry,
+        key: BlockKey,
+        entry: PublishedEntry,
+    ) -> Option<&UnitRecord> {
+        let record = self.records.get(owner.unit.0)?;
+        (record.lifecycle == Lifecycle::Published
+            && record.retirement.is_none()
+            && record.code.tier == Tier::Lcq
+            && record.code.id == entry.unit
+            && record.code.version == entry.version
+            && record
+                .code
+                .entries
+                .get(owner.index)
+                .is_some_and(|root| root.key == key))
+        .then_some(record)
+    }
+
+    pub(super) fn seed_source(
+        &self,
+        owner: UnitEntry,
+        key: crate::abi::BlockKey,
+        entry: PublishedEntry,
+    ) -> Option<UnitHandle> {
+        (self
+            .family_owners
+            .get(InstructionKey::new(key).unwrap())
+            .is_none()
+            && self.records.get(owner.unit.0).is_some_and(|record| {
+                record.lifecycle == Lifecycle::Published
+                    && record.retirement.is_none()
+                    && record.code.tier == Tier::Lcq
+                    && record.code.id == entry.unit
+                    && record.code.version == entry.version
+                    && record
+                        .code
+                        .entries
+                        .first()
+                        .is_some_and(|root| root.key == key)
+            }))
+        .then_some(owner.unit)
+    }
+
     // O(pending units), O(1) when empty. Sequences need not follow list order:
     // repeated requests retain old invalidation work alongside another reason.
     pub(super) fn pending_retirement(&self, reason: Reason, sequence: MaintenanceSequence) -> bool {
@@ -451,13 +550,9 @@ impl Units {
         }
     }
     fn overlaps_family(&self, instructions: &[Instruction]) -> bool {
-        self.families.values().any(|family| {
-            family
-                .unit
-                .instructions
-                .iter()
-                .any(|old| instructions.iter().any(|new| new.key == old.key))
-        })
+        instructions
+            .iter()
+            .any(|instruction| self.family_owners.get(instruction.key).is_some())
     }
 }
 
@@ -779,7 +874,16 @@ impl Lifetime {
         let static_sites = input.source_sites();
         let bytes = size_of_val(&*static_sites);
         let static_sites = self.cache.account(static_sites, bytes, input.tier)?;
-        self.grow_units(input.tier, input.dependencies.len(), static_sites.len())?;
+        self.grow_units(
+            input.tier,
+            input.dependencies.len(),
+            static_sites.len(),
+            if input.tier == Tier::Hcq {
+                input.instructions.len()
+            } else {
+                0
+            },
+        )?;
         self.reserve_publication_links(input.tier, static_sites.len(), &input.entries)?;
         let publications = publications.to_vec().into_boxed_slice();
         let bytes = size_of_val(&*publications);
@@ -994,12 +1098,16 @@ impl Lifetime {
             .collect();
         let bytes = size_of_val(&*slots);
         let slots = self.cache.account(slots, bytes, tier)?;
+        let reshape = (tier == Tier::Hcq)
+            .then(|| super::background::Owner::new(&self.cache, Tier::Hcq))
+            .transpose()?;
         Ok(PreparedUnit {
             process: self,
             publications,
             cursor,
             unit: Some(unit),
             family,
+            reshape,
             previous_table: table,
             table: Some(next_table),
             payloads: payload_boxes,
@@ -1013,9 +1121,10 @@ impl Lifetime {
         tier: Tier,
         dependency_count: usize,
         static_count: usize,
+        ownership_count: usize,
     ) -> Result<(), Error> {
         loop {
-            let (records, families, retired, dependencies, static_sites) = {
+            let (records, families, retired, dependencies, static_sites, family_owners) = {
                 let state = self.lock();
                 state.open()?;
                 let records = if state.units.records.has_space() {
@@ -1070,15 +1179,33 @@ impl Lifetime {
                 } else {
                     needed.max(sites.capacity().saturating_mul(2)).max(16)
                 };
+                let owners = &state.units.family_owners.entries;
+                let needed = owners
+                    .len()
+                    .checked_add(ownership_count)
+                    .ok_or(Error::Capacity("family ownership index size overflow"))?;
+                let family_owners = if needed <= owners.capacity() {
+                    0
+                } else {
+                    needed.max(owners.capacity().saturating_mul(2)).max(16)
+                };
                 if records == 0
                     && families == 0
                     && retired == 0
                     && dependencies == 0
                     && static_sites == 0
+                    && family_owners == 0
                 {
                     return Ok(());
                 }
-                (records, families, retired, dependencies, static_sites)
+                (
+                    records,
+                    families,
+                    retired,
+                    dependencies,
+                    static_sites,
+                    family_owners,
+                )
             };
             let records = Vec::with_capacity(records);
             let bytes = records.capacity() * size_of::<Slot<UnitRecord>>();
@@ -1097,8 +1224,23 @@ impl Lifetime {
             let bytes = static_sites.entries.allocation_size();
             let mut static_sites =
                 PreparedStorage::for_tier(static_sites, bytes, &self.cache, tier)?;
+            let family_owners = ownership::FamilyOwners::new(family_owners);
+            let bytes = family_owners.entries.allocation_size();
+            let mut family_owners =
+                PreparedStorage::for_tier(family_owners, bytes, &self.cache, tier)?;
             let mut state = self.lock();
             state.open()?;
+            if family_owners.value.entries.capacity() > state.units.family_owners.entries.capacity()
+            {
+                for membership in state.units.family_owners.entries.drain() {
+                    family_owners.value.insert(membership);
+                }
+                std::mem::swap(&mut family_owners.value, &mut state.units.family_owners);
+                std::mem::swap(
+                    &mut family_owners.charge,
+                    &mut state.units.family_owner_storage,
+                );
+            }
             if static_sites.value.entries.capacity() > state.units.static_sites.entries.capacity() {
                 for site in state.units.static_sites.entries.drain() {
                     static_sites.value.insert(site);
@@ -1173,6 +1315,7 @@ pub(crate) struct PreparedUnit<'a> {
     cursor: &'a AtomicU64,
     unit: Option<Arc<Accounted<CodeUnit>>>,
     family: Option<Arc<Accounted<Family>>>,
+    reshape: Option<super::background::Owner<FamilyVersion>>,
     previous_table: Option<Arc<Accounted<Table>>>,
     table: Option<Arc<Accounted<Table>>>,
     payloads: Accounted<Box<[Option<OwnedPayload>]>>,
@@ -1199,6 +1342,10 @@ impl PreparedUnit<'_> {
             || state.units.decommitting[segment]
             || !state.units.records.has_space()
             || (self.family.is_some() && !state.units.families.has_space())
+            || (self.family.is_some()
+                && state.units.family_owners.entries.capacity()
+                    - state.units.family_owners.entries.len()
+                    < unit.instructions.len())
             || !same_snapshot(&state.units.tables[segment], &self.previous_table)
             || state.units.dependencies.entries.capacity() - state.units.dependencies.entries.len()
                 < unit.dependencies.len()
@@ -1288,6 +1435,7 @@ impl PreparedUnit<'_> {
             lifecycle: Lifecycle::Published,
             slots: self.slots.take().unwrap(),
             family: None,
+            reshape: self.reshape.take(),
             retirement: None,
             retirement_next: None,
             invalidation: None,
@@ -1324,6 +1472,9 @@ impl PreparedUnit<'_> {
                 .insert(&mut self.family)
                 .expect("validated family insertion");
             state.units.records.get_mut(handle).unwrap().family = Some(family);
+            for instruction in &unit.instructions {
+                state.units.family_owners.publish(instruction.key, family);
+            }
         }
         // Swap table owners before the signal-visible pointer. Old tables
         // remain owned by the epoch retire list and any compiler preparation.

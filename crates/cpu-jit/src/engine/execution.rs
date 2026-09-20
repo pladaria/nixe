@@ -174,7 +174,19 @@ impl JitThread {
             }
         })();
         self.sample_remaining = budget.sample_remaining;
-        result.map(|stop| report(stop, initial.abs_diff(budget.slice_remaining), state))
+        result
+            .map(|stop| report(stop, initial.abs_diff(budget.slice_remaining), state))
+            .map_err(|mut fault| {
+                // Enrich terminal internal failure only after the canonical
+                // path captured exact progress/state and restored host FP.
+                // No extra lookup or lock is added to successful execution.
+                if fault.kind == CpuFaultKind::Internal
+                    && let Some(error) = self.process.lifetime.background_failure()
+                {
+                    fault.message = error.detail;
+                }
+                fault
+            })
     }
 
     fn service_links(&self, state: &A64State, progress: u64) -> Result<bool, CpuFault> {

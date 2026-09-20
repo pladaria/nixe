@@ -106,6 +106,7 @@ fn native_mmio_completion_can_retire_its_source_and_remove_its_own_device_mappin
             ..
         } = unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,

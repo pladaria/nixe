@@ -163,6 +163,7 @@ fn device_publication_invalidates_all_code_aliases_before_ownership_is_visible()
     let mut monitor = nixe_cpu::exclusive::ExclusiveMonitorState::default();
     let exit = unsafe {
         crate::lcq::invocation::run(
+            &mut crate::sampling::Samples::new(),
             &mut reader,
             &mut next_frame,
             &memory,

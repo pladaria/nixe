@@ -12,6 +12,16 @@ use output::{Metadata, Relocation};
 use std::os::fd::AsRawFd;
 
 #[test]
+fn background_usage_snapshot_defers_instead_of_waiting_for_allocator() {
+    let cache = Cache::new().unwrap();
+    let state = cache.state.lock().unwrap();
+    assert_eq!(cache.try_usage().unwrap(), None);
+    let expected = state.usage;
+    drop(state);
+    assert_eq!(cache.try_usage().unwrap(), Some(expected));
+}
+
+#[test]
 fn inline_bridge_tail_uses_no_island_and_returns_failed_storage() {
     let cache = Cache::new().unwrap();
     let target = cache

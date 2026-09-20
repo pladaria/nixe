@@ -3,7 +3,7 @@ use crate::abi::{FpSpecialization, GuestValue, RegisterClass, ValueBinding};
 use crate::lifetime::unit::tests::{input, key, process, publish};
 use cranelift_codegen::nixe::StateMap;
 
-pub(super) fn source(
+pub(in crate::lifetime) fn source(
     process: &Lifetime,
     cursor: &AtomicU64,
     pc: u64,

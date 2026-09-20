@@ -112,6 +112,44 @@ impl Pic {
 }
 
 impl State {
+    /// Target-unit adjacency includes indirect calls and returns. Filter by the
+    /// exact target key: a multi-entry unit does not make every label incoming.
+    pub(in crate::lifetime) fn has_external_dynamic_source(
+        &self,
+        target: UnitEntry,
+        key: BlockKey,
+        contains: impl Fn(InstructionKey) -> bool,
+    ) -> bool {
+        let mut next = self.units.records.get(target.unit.0).unwrap().pic_incoming;
+        while let Some(site) = next {
+            let way = self.readers.get(site.reader).unwrap().pic.way(site.slot);
+            next = way.incoming.next;
+            let bridge = way.bridge.as_ref().unwrap();
+            let source = self.units.records.get(bridge.source.0).unwrap();
+            if bridge.key.target != key
+                || source.retirement.is_some()
+                || !matches!(
+                    source.lifecycle,
+                    Lifecycle::Published | Lifecycle::Superseded
+                )
+            {
+                continue;
+            }
+            let exit = source.code.states[bridge.key.source.state_map as usize]
+                .exit
+                .unwrap();
+            let source = source.code.instructions[0]
+                .key
+                .block_key()
+                .at(exit.pc)
+                .unwrap();
+            if !contains(InstructionKey::new(source).unwrap()) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn pic_way_mut(&mut self, site: Site) -> &mut Way {
         self.readers
             .get_mut(site.reader)

@@ -10,6 +10,7 @@ mod bridge;
 mod canonical;
 mod flags;
 mod gateway;
+mod observation;
 mod pic;
 mod published;
 mod rsb;

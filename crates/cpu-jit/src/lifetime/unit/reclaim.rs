@@ -11,6 +11,13 @@ mod tests;
 pub(crate) struct Snapshot {
     unit: Arc<Accounted<CodeUnit>>,
 }
+impl Snapshot {
+    pub(super) fn retain(unit: &Arc<Accounted<CodeUnit>>) -> Self {
+        Self {
+            unit: Arc::clone(unit),
+        }
+    }
+}
 impl std::ops::Deref for Snapshot {
     type Target = CodeUnit;
     fn deref(&self) -> &CodeUnit {
@@ -160,6 +167,7 @@ impl Lifetime {
                 let handle = state.units.records.find_from(&mut cursor, |record| {
                     matches!(record.lifecycle, Lifecycle::Retired(epoch) if state.quiescent(epoch))
                         && record.detached_epoch.is_none()
+                        && record.reshape.as_ref().is_none_or(|owner| !owner.pinned())
                         && Arc::strong_count(&record.code) == 1
                 });
                 handle.map(|handle| {
@@ -187,6 +195,7 @@ impl Lifetime {
                     record
                         .detached_epoch
                         .is_some_and(|epoch| state.quiescent(epoch))
+                        && record.reshape.as_ref().is_none_or(|owner| !owner.pinned())
                         && Arc::strong_count(&record.code) == 1
                 });
                 let Some(handle) = handle else {
@@ -605,7 +614,13 @@ impl Transition<'_> {
             if state.units.shutdown_finished {
                 return Ok(true);
             }
-            if state.compilers != 0 || state.memory_mutations != 0 {
+            if state.compilers != 0
+                || state.memory_mutations != 0
+                || state
+                    .dispatch
+                    .values()
+                    .any(|slot| slot.optimization.pinned() || slot.reshape.pinned())
+            {
                 return Ok(false);
             }
         }
@@ -627,6 +642,7 @@ impl Transition<'_> {
         }
         let empty_units = Units::default();
         let empty_keys = crate::lifetime::KeyIndex::with_capacity(0);
+        let empty_candidates = crate::lifetime::background::CandidateIndex::new(0);
         let removed = {
             let mut state = self.process.lock();
             // Admission is terminal; resetting empty slab counters cannot
@@ -641,6 +657,7 @@ impl Transition<'_> {
                 state.dispatch_storage.take(),
                 state.key_storage.take(),
                 state.reader_storage.take(),
+                std::mem::replace(&mut state.candidates, empty_candidates),
             )
         };
         drop(removed);
@@ -739,10 +756,20 @@ impl Transition<'_> {
             state
                 .units
                 .remove_static_source(UnitHandle(handle, self.process.identity));
+            let units = &mut state.units;
+            let record = units.records.get(handle).unwrap();
+            if let Some(family) = record.family {
+                for instruction in &record.code.instructions {
+                    assert!(units.family_owners.remove(instruction.key, family));
+                }
+            }
             let record = state.units.records.get_mut(handle).unwrap();
             record.lifecycle = Lifecycle::Unlinked;
             record.lifecycle = Lifecycle::Retired(retired);
             let family = record.family;
+            if let Some(owner) = &record.reshape {
+                owner.cancel();
+            }
             let withdrawn = (record.code.tier == Tier::Hcq).then(|| Arc::clone(&record.code));
             let segment = record.code.code.allocation.segment;
             state.units.segment_retired[segment] += 1;

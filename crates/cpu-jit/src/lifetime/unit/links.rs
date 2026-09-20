@@ -567,4 +567,4 @@ impl<'p> Transition<'p> {
 mod install;
 
 #[cfg(test)]
-mod tests;
+pub(in crate::lifetime) mod tests;

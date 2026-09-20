@@ -714,6 +714,16 @@ runtime-slice decision above. This reuses a required control boundary; it adds
 no dispatch-slot load/store, atomic RMW or promotion branch to the normal link
 path.
 
+Attribute each observation to the actual source unit/version, not the initial
+gateway entry. For LCQ the seed key is that source unit's root BlockKey.
+Canonical prefix exits and successful cold instruction completion also consume
+crossed deadlines exactly once; a non-edge observation heats its seed without
+inventing a successor. Forced transitions still suppress heat as above.
+Validate current source identity/ownership through existing-key, nonblocking
+lookup before updating heat. Missing or contended lookup discards the
+observation, not the budget charge or sample-phase advancement. Never replay
+it later or allocate a dispatch slot merely to sample.
+
 Each vCPU owns one HotSeedTable of exactly 256 sets by four ways. It is updated
 non-atomically only by that vCPU's cold poll; process migration cannot corrupt
 it and may only delay promotion. A record contains full BlockKey,
@@ -734,8 +744,9 @@ preallocated queue cell as an immutable AdmissionSnapshot. A worker never
 reads another vCPU's HotSeedTable.
 
 Each vCPU also owns a 64-set, two-way BoundaryTable. Its full key is source
-InstructionKey, target InstructionKey, source family/version and optional
-target family/version. Its u8 score saturates at four and uses the same
+InstructionKey, target InstructionKey, both endpoint ReachabilityVersions and
+optional source and target family/version pairs (zero, one or two owners).
+Its u8 score saturates at four and uses the same
 empty/lowest-score/oldest-sequence/lowest-way replacement rule. Four samples
 copy an immutable ReshapeSnapshot into a queue cell. Queue contention keeps the
 score at three. This table covers HCQ-to-LCQ, HCQ-to-HCQ and a retained-LCQ
@@ -911,6 +922,12 @@ there is no ordinal veneer or common br_table entry dispatcher.
 ## HCQ selection and region formation
 
 ### Admission
+
+Guest-side identity lookup and reservation must not allocate or acquire a
+blocking registry lock. Once a verified threshold attempts admission, contention
+defers it with score seven for a seed or three for a boundary. Reservation
+owners remain stable and pin their registry slots through exact-token cleanup;
+queue failure must not require a blocking registry reacquisition to roll back.
 
 A cold sample which raises an uncovered seed to score eight first CAS-reserves
 the exact BlockKey/ReachabilityVersion as AdmissionReserved(token). It then
@@ -1548,6 +1565,13 @@ preallocated queue and the fixed worker formula. Implement nonblocking guest
 admission, seven-newest/one-oldest selection, zero-worker behavior, startup
 rollback, checked sequence handling and exact stale cleanup.
 
+During this staged migration, connect production sampling in Task 5, but defer
+production admission and worker startup until the real HCQ compiler in Task 6.
+Validate queue/worker behavior here with finite test-only jobs through the real
+owners. Do not add a production placeholder consumer, backend-absent rejection
+or retry loop. This staging does not change the worker-count policy or add a
+user option. Reshape admission waits for its real Task 7 consumer.
+
 **Exit criterion:** LCQ contains only its already-required block budget check
 and no hotness load/store/RMW or promotion branch; seven matching samples do not
 enqueue and the eighth can enqueue exactly one matching version; four matching
@@ -1565,21 +1589,38 @@ Task 1 liveness/state contracts so internal edges retain SSA and selected
 entries load only true live-ins. Emit real selected native labels with
 opt_level=speed and backtracking. Calls remain external.
 
+Implement exclusive in-flight InstructionKey batch reservations after discovery
+and before liveness/backend work. Revalidate captured inputs and acquire the
+whole candidate or none under the short JIT-state lock. Until Task 7 adds
+collision trimming, any foreign membership/reservation race defers the whole
+candidate without waiting, immediate retry loops or permanent seed rejection.
+Retain exact reservations through publication and release only the build's own
+tokens on abandonment. Revalidate them in the publication transaction.
+
+Connect production seed admission and start the fixed worker group with this
+real compiler, using Task 5's queue, ownership and shutdown protocol.
+
 **Exit criterion:** the same AdmissionSnapshot and CodeUnit set always yield
 the same instruction/block/entry order; unexecuted successors are never
 decoded; overlapping LCQ roots produce one copy of each InstructionKey; every
 selected PC enters its real label; internal edges contain no adapter,
 canonical round trip or budget check except required backedges; coverage-only
-instructions create no dispatch slot; there is no ordinal/br_table dispatcher,
-second decoder or trace/deoptimization machinery.
+instructions create no dispatch slot; unrelated candidates cannot enter backend
+work with overlapping reservations, while nonoverlapping builds run in parallel;
+stale cleanup cannot clear a newer reservation; there is no ordinal/br_table
+dispatcher, second decoder or trace/deoptimization machinery.
 
 ### Task 7: add parallel ownership and versioned reshape
 
-Run discovery concurrently from strong snapshots, then reserve exact
-InstructionKeys once before backend work. Implement collision trimming,
-negative reshape results and the four-sample replacement transaction for zero,
-one or two adjacent families. Keep predecessor versions callable until the
-maintenance rendezvous has cut every incoming root.
+Extend Task 6's parallel discovery and exact batch reservations with the
+collision-trimming policy defined above, replacing whole-candidate deferral
+when only successors collide. Implement negative reshape results and the
+four-sample replacement transaction for zero, one or two adjacent families.
+Keep predecessor versions callable until the maintenance rendezvous has cut
+every incoming root.
+
+Connect production reshape admission once this real replacement consumer is
+available; do not consume and discard reshape requests in the interim.
 
 **Exit criterion:** unrelated workers execute backend compilation in parallel;
 no unrelated candidates begin backend work with the same InstructionKey; a

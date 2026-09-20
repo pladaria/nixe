@@ -101,6 +101,7 @@ fn breakpoint(process: &Arc<Lifetime>, memory: &ExecutionMemory) -> u16 {
     let mut worker = nixe_cpu_direct_memory::WorkerFaultContext::register().unwrap();
     let invocation::Exit::Native { guest, .. } = unsafe {
         invocation::run(
+            &mut crate::sampling::Samples::new(),
             &mut reader,
             &mut frame,
             memory,
