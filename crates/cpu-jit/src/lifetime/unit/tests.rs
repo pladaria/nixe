@@ -13,7 +13,7 @@ use nixe_cpu::{platform::TargetPlatform, profile::ProcessCpuContext, state::a64:
 use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration};
 use std::sync::{Barrier, mpsc};
 
-pub(super) fn key(pc: u64) -> BlockKey {
+pub(in crate::lifetime) fn key(pc: u64) -> BlockKey {
     BlockKey::new(
         ProcessCpuContext::new(TargetPlatform::Switch1, AddressSpaceId::new(1)),
         GuestVirtualAddress::new(pc),
@@ -21,10 +21,10 @@ pub(super) fn key(pc: u64) -> BlockKey {
     )
     .unwrap()
 }
-pub(super) fn process() -> Arc<Lifetime> {
+pub(in crate::lifetime) fn process() -> Arc<Lifetime> {
     Arc::new(Lifetime::new(Cache::new().unwrap()).unwrap())
 }
-pub(super) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
+pub(in crate::lifetime) fn input(process: &Lifetime, pcs: &[u64], tier: Tier) -> Input {
     input_with_islands(process, pcs, tier, 0)
 }
 
@@ -147,7 +147,7 @@ pub(super) fn input_with_islands(
         }]),
     }
 }
-pub(super) fn publish(
+pub(in crate::lifetime) fn publish(
     process: &Lifetime,
     cursor: &AtomicU64,
     pcs: &[u64],
@@ -159,6 +159,25 @@ pub(super) fn publish(
         .collect();
     process
         .prepare_unit(&publications, input(process, pcs, tier), cursor)
+        .unwrap()
+        .publish()
+        .unwrap()
+}
+
+// Immutable guest words with synthetic native storage. For compiler input and
+// ownership tests only, never execution of these words through that native body.
+pub(in crate::lifetime) fn publish_words(process: &Lifetime, pc: u64, bits: &[u32]) -> UnitHandle {
+    let pcs: Vec<_> = (0..bits.len()).map(|index| pc + index as u64 * 4).collect();
+    let mut input = input(process, &pcs, Tier::Lcq);
+    for (word, &bits) in input.instructions.iter_mut().zip(bits) {
+        word.bits = bits;
+    }
+    let mut entries = input.entries.into_vec();
+    entries.truncate(1);
+    input.entries = entries.into_boxed_slice();
+    let publication = process.reserve(key(pc)).unwrap();
+    process
+        .prepare_unit(&[publication], input, &AtomicU64::new(0))
         .unwrap()
         .publish()
         .unwrap()

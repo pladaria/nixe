@@ -297,8 +297,11 @@ hardware validation remains outstanding. Production publication and lifetime
 management are tracked in [Task 2](specs/tiered-jit/task-02-plan.md), frontend
 cutover in [Task 3](specs/tiered-jit/task-03-plan.md), and production native
 chaining/retirement in [Task 4](specs/tiered-jit/task-04-plan.md). Functional
-sampling and background HCQ compilation remain subsequent work. Emitted landing
-checks and QEMU tests do not establish native BTI/CET enforcement.
+cold-path sampling is active; [Task 5](specs/tiered-jit/task-05-plan.md) also
+provides bounded admission and worker ownership, tested without a placeholder
+compiler. Production admission and worker startup wait for real HCQ compilation
+in Task 6; reshape activation follows in Task 7. Emitted landing checks and
+QEMU tests do not establish native BTI/CET enforcement.
 
 [abi-commit]: https://github.com/pladaria/wasmtime/commit/2f8ccabacf
 [boundary-commit]: https://github.com/pladaria/wasmtime/commit/e2a984d96678207094c0fc50057c8b6bcfd68715

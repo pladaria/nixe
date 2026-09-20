@@ -20,8 +20,9 @@ use nixe_cpu::{
 };
 use nixe_cpu_direct_memory::NativeWorker;
 use nixe_memory::{CpuMemoryBackend, GuestVirtualAddress};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+mod background;
 mod completion;
 mod execution;
 
@@ -29,6 +30,10 @@ pub struct JitProcess {
     cpu: ProcessCpuContext,
     memory: Arc<ExecutionMemory>,
     lifetime: Arc<Lifetime>,
+    // Selected once; Task 6 consumes this when it activates the real compiler.
+    #[allow(dead_code)]
+    background_workers: usize,
+    background: Mutex<background::Background>,
 }
 
 impl JitProcess {
@@ -37,19 +42,28 @@ impl JitProcess {
     pub fn request_stop(&self) -> Result<(), Error> {
         self.lifetime
             .request_shutdown()
-            .map_err(|error| Error::internal(error.to_string()))
+            .map_err(|error| self.lifetime.diagnostic(error))
     }
 
-    /// Call again after outstanding worker/compiler owners have drained. A
-    /// pending result is not successful teardown; no retained owner is ignored.
+    /// After dependent GPU teardown, join owned background workers without
+    /// holding JIT/memory locks. Retry if execution or foreign compiler owners
+    /// still retain inputs; pending is not successful teardown.
     pub fn try_shutdown(&self) -> Result<bool, Error> {
+        let stopped = self.request_stop();
+        // Even a recorded failure must not skip joining our compiler threads.
+        let joined = self.join_background();
+        stopped?;
+        if !joined? {
+            return Ok(false);
+        }
         self.lifetime
             .try_shutdown()
-            .map_err(|error| Error::internal(error.to_string()))
+            .map_err(|error| self.lifetime.diagnostic(error))
     }
 
     /// Bind the complete memory authority before creating execution workers.
-    /// No rebinding, borrowed owner, checked fallback or background tier exists.
+    /// No rebinding, borrowed owner or checked fallback. Background compilation
+    /// remains dormant until construction supplies the real HCQ consumer.
     pub fn new(cpu: ProcessCpuContext, memory: Arc<ExecutionMemory>) -> Result<Self, Error> {
         if memory.cpu_memory_backend(cpu.address_space_id()) != Some(CpuMemoryBackend::LinuxDirect)
         {
@@ -69,6 +83,9 @@ impl JitProcess {
         let cache = Cache::new().map_err(|error| Error::internal(error.to_string()))?;
         let lifetime =
             Arc::new(Lifetime::new(cache).map_err(|error| Error::internal(error.to_string()))?);
+        let logical_cpus = std::thread::available_parallelism()
+            .map_err(|error| Error::internal(format!("query JIT worker CPU count: {error}")))?;
+        let background_workers = lifetime::background::workers::count(logical_cpus.get());
         // Install last: failed construction must not strand a bound observer.
         // Memory owns Lifetime, not JitProcess, so there is no ownership cycle.
         memory
@@ -78,6 +95,8 @@ impl JitProcess {
             cpu,
             memory,
             lifetime,
+            background_workers,
+            background: Mutex::new(background::Background::Dormant),
         })
     }
 }
@@ -88,8 +107,10 @@ pub struct JitThread {
     compiler: Compiler,
     control: CpuControl,
     exclusive: ExclusiveMonitorState,
-    // Preserve the poll phase across slices, without enabling functional samples.
+    // Preserve the functional sampling phase across runtime slices.
     sample_remaining: i64,
+    // Allocated once per vCPU, never migrated with guest architectural state.
+    samples: crate::sampling::Samples,
 }
 
 pub(crate) enum Demand {
@@ -117,7 +138,7 @@ impl JitThread {
         let reader = process
             .lifetime
             .register()
-            .map_err(|error| Error::internal(error.to_string()))?;
+            .map_err(|error| process.lifetime.diagnostic(error))?;
         Ok(Self {
             process,
             reader,
@@ -125,6 +146,7 @@ impl JitThread {
             control: CpuControl::default(),
             exclusive: ExclusiveMonitorState::default(),
             sample_remaining: crate::abi::SAMPLE_INTERVAL,
+            samples: crate::sampling::Samples::new(),
         })
     }
 
@@ -233,6 +255,7 @@ impl JitThread {
         // static/PIC bridges are published. Prior FP restoration precedes entry.
         let result = unsafe {
             invocation::run(
+                &mut self.samples,
                 &mut self.reader,
                 &mut frame,
                 &self.process.memory,

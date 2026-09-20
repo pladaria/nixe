@@ -11,6 +11,7 @@ mod fp;
 mod gateway;
 pub(crate) mod link;
 mod moves;
+pub(crate) mod observation;
 pub(crate) mod pic;
 mod poll;
 pub(crate) mod rsb;

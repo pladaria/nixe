@@ -78,6 +78,7 @@ fn native_exit(process: &Arc<Lifetime>, memory: &ExecutionMemory, state: &mut A6
     let mut monitor = ExclusiveMonitorState::default();
     unsafe {
         crate::lcq::invocation::run(
+            &mut crate::sampling::Samples::new(),
             &mut reader,
             &mut frame,
             memory,
@@ -120,6 +121,7 @@ fn complete_cache(
         Exit::Memory {
             instruction,
             outcome,
+            ..
         } => {
             assert!(matches!(outcome, MemoryExit::CacheCleanInvalidate { .. }));
             match outcome

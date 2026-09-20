@@ -85,6 +85,7 @@ fn retirement_waits_for_a_later_unit_fault_retry_or_escape_before_unlink_and_rec
             });
             let exit = unsafe {
                 invocation::run(
+                    &mut crate::sampling::Samples::new(),
                     &mut reader,
                     &mut frame,
                     &memory,
@@ -142,6 +143,7 @@ fn retirement_waits_for_a_later_unit_fault_retry_or_escape_before_unlink_and_rec
         let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 1000).unwrap());
         let exit = unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,
@@ -340,6 +342,7 @@ fn selective_chain_faults_preserve_spills_lazy_flags_and_inherited_fp() {
         );
         let exit = unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,
@@ -365,6 +368,7 @@ fn selective_chain_faults_preserve_spills_lazy_flags_and_inherited_fp() {
             Exit::Memory {
                 instruction,
                 outcome: MemoryExit::Fault(fault),
+                ..
             } if escape => {
                 assert_eq!(instruction.bits, words[target_index + 1]);
                 assert_eq!(
@@ -378,6 +382,7 @@ fn selective_chain_faults_preserve_spills_lazy_flags_and_inherited_fp() {
                 returned,
                 instruction,
                 guest,
+                ..
             } if !escape => {
                 assert_eq!(returned.reason, NativeExitReason::Architectural);
                 assert_eq!(instruction.bits, 0xd420_0000);
@@ -500,6 +505,7 @@ fn later_unit_retry_and_escape_preserve_prefix_and_exclusive_load() {
         );
         let exit = unsafe {
             invocation::run(
+                &mut crate::sampling::Samples::new(),
                 &mut reader,
                 &mut frame,
                 &memory,
@@ -554,6 +560,7 @@ fn later_unit_retry_and_escape_preserve_prefix_and_exclusive_load() {
                 returned,
                 guest,
                 instruction,
+                ..
             } if case == 0 => {
                 assert_eq!(returned.reason, NativeExitReason::Architectural);
                 assert!(!returned.poll.exhausted && !returned.poll.sample);
@@ -579,6 +586,7 @@ fn later_unit_retry_and_escape_preserve_prefix_and_exclusive_load() {
             Exit::Memory {
                 instruction,
                 outcome,
+                ..
             } if case != 0 => {
                 assert_eq!(instruction.bits, words[5]);
                 assert_eq!(instruction.key.block_key().pc.get(), PC + 20);

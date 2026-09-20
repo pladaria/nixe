@@ -79,6 +79,12 @@ pub enum NativeReturnError {
 /// A nonnull indirect_pic must name this vCPU's stable table; its occupied
 /// bridge records and executable targets stay strongly owned, and no writer may
 /// mutate the table while this vCPU executes native code.
+/// A bound sample_observer shares dispatch_context's invocation lifetime. Its
+/// source-local adapter must preserve live physical values before calling it.
+/// The observer pauses FP before general Rust, cannot reenter native execution
+/// or mutate guest state, and resumes the exact FP image only on success. On
+/// failure it retains hardware status for the owner to merge after canonical
+/// writeback and never unwinds through native code.
 /// If native FP is already active, no general Rust work may intervene between
 /// activation and this call. This is not a substitute for protected dispatch.
 #[inline(always)]

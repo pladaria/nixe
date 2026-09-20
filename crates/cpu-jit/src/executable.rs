@@ -232,6 +232,16 @@ impl Cache {
         Ok(self.lock()?.usage)
     }
 
+    /// Cold, nonblocking background admission. This is a snapshot, not a byte
+    /// reservation; actual allocations still enforce their tier's limits.
+    pub(crate) fn try_usage(&self) -> Result<Option<Usage>, Error> {
+        match self.state.try_lock() {
+            Ok(state) if !state.failed => Ok(Some(state.usage)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            _ => Err(Error::Poisoned),
+        }
+    }
+
     pub(crate) fn account<T>(
         self: &Arc<Self>,
         value: T,

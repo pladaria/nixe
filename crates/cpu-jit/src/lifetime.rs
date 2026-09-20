@@ -2,6 +2,7 @@
 //! storage and coupled CodeUnits share its publication/reader protocol;
 //! this protocol does not delegate lifetime to the legacy JITModule path.
 
+pub(crate) mod background;
 pub(crate) mod compile;
 mod directory;
 mod maintenance;
@@ -39,6 +40,7 @@ pub(crate) enum Error {
     ActiveReader,
     Capacity(&'static str),
     CacheFailed,
+    BackgroundWorker,
     InvalidUnit(&'static str),
     StaleUnit,
     PinnedBaseline,
@@ -63,6 +65,7 @@ impl std::fmt::Display for Error {
             Self::ActiveReader => f.write_str("JIT reader already protects an invocation"),
             Self::Capacity(detail) => write!(f, "JIT capacity: {detail}"),
             Self::CacheFailed => f.write_str("JIT executable cache has failed"),
+            Self::BackgroundWorker => f.write_str("JIT background compiler failed"),
             Self::InvalidUnit(detail) => write!(f, "JIT unit publication: {detail}"),
             Self::StaleUnit => {
                 f.write_str("JIT unit handle is stale or belongs to another process")
@@ -124,12 +127,18 @@ struct DispatchSlot {
     retired: Option<ExecutionEpoch>,
     units: usize,
     compile: Option<compile::Identity>,
+    optimization: background::Owner,
+    // Zero-family reshapes have their own claim: a rejected ordinary seed
+    // must not suppress a different two-endpoint reshape of that baseline.
+    reshape: background::Owner,
 }
 impl DispatchSlot {
     /// Withdraw and republish the uniquely owned payload during Closed. Readers
     /// copy under state and none retains its pointer. This avoids allocating
     /// replacement boxes to evict code when the hard budget is already full.
     fn rewrite_closed(&mut self, payload: DispatchPayload) {
+        self.optimization.cancel();
+        self.reshape.cancel();
         let old = self.snapshot();
         if old.lcq() != payload.lcq() {
             self.owners[0] = None;
@@ -143,13 +152,19 @@ impl DispatchSlot {
         }
         self.payload.store(pointer, Ordering::Release);
     }
-    fn new(payload: Box<Accounted<DispatchPayload>>) -> Self {
+    fn new(
+        payload: Box<Accounted<DispatchPayload>>,
+        optimization: background::Owner,
+        reshape: background::Owner,
+    ) -> Self {
         Self {
             payload: AtomicPtr::new(Box::into_raw(payload)),
             owners: [None; 2],
             retired: None,
             units: 0,
             compile: None,
+            optimization,
+            reshape,
         }
     }
 
@@ -172,6 +187,8 @@ impl DispatchSlot {
         // Publication linearizes at this release swap, not at separate stores
         // of address/version. The state lock has already validated admission.
         self.owners = owners;
+        self.optimization.cancel();
+        self.reshape.cancel();
         let old = self.payload.swap(Box::into_raw(payload), Ordering::Release);
         unsafe { Box::from_raw(old) }
     }
@@ -283,8 +300,16 @@ struct State {
     // Cold claims can outlive their dispatch reservation after closure/eviction.
     // Shutdown must drain those compilers before releasing the cache/indexes.
     compilers: usize,
+    background_tokens: background::Tokens,
+    candidates: background::CandidateIndex,
+    // Terminal wakeup only. The pool owns its queue and join handles; this
+    // weak link cannot keep either the pool or the process alive.
+    background_queue: std::sync::Weak<background::Queue>,
     shutdown: bool,
     failure: Option<Error>,
+    // Owned diagnostic for the first terminal background failure. Consulted
+    // only on error paths; ordinary native/control checks use failure/pending.
+    background_failure: Option<crate::jit_error::Error>,
     dispatch: Registry<DispatchSlot>,
     keys: KeyIndex,
     readers: Registry<pic::Registration>,
@@ -387,8 +412,12 @@ impl Lifetime {
                 link_install_attempts: 0,
                 memory_mutations: 0,
                 compilers: 0,
+                background_tokens: background::Tokens::default(),
+                candidates: background::CandidateIndex::new(0),
+                background_queue: std::sync::Weak::new(),
                 shutdown: false,
                 failure: None,
+                background_failure: None,
                 dispatch: Registry::default(),
                 keys: KeyIndex::with_capacity(0),
                 readers: Registry::default(),
@@ -543,11 +572,15 @@ impl Lifetime {
                 };
                 (admission, version, slots, keys)
             };
-            let mut slot = Some(DispatchSlot::new(Box::new(self.cache.account(
-                DispatchPayload::new(version, None, None),
-                std::mem::size_of::<Accounted<DispatchPayload>>(),
-                Tier::Lcq,
-            )?)));
+            let mut slot = Some(DispatchSlot::new(
+                Box::new(self.cache.account(
+                    DispatchPayload::new(version, None, None),
+                    std::mem::size_of::<Accounted<DispatchPayload>>(),
+                    Tier::Lcq,
+                )?),
+                background::Owner::new(&self.cache, Tier::Lcq)?,
+                background::Owner::new(&self.cache, Tier::Lcq)?,
+            ));
             let slots = Vec::with_capacity(slot_capacity);
             let bytes = slots.capacity() * std::mem::size_of::<registry::Slot<DispatchSlot>>();
             let mut slots = PreparedStorage::new(slots, bytes, &self.cache)?;
@@ -657,7 +690,10 @@ impl Lifetime {
                 let mut state = self.lock();
                 state.healthy()?;
                 let Some(handle) = state.dispatch.find_from(&mut cursor, |slot| {
-                    slot.units == 0 && slot.retired.is_some_and(|epoch| state.quiescent(epoch))
+                    slot.units == 0
+                        && !slot.optimization.pinned()
+                        && !slot.reshape.pinned()
+                        && slot.retired.is_some_and(|epoch| state.quiescent(epoch))
                 }) else {
                     return Ok(count);
                 };
@@ -673,18 +709,37 @@ impl Lifetime {
     /// and does not pretend to patch code, alter mappings or release storage.
     pub(crate) fn request(&self, reason: Reason) -> Result<Ticket<'_>, Error> {
         let mut state = self.lock();
-        self.request_locked(&mut state, reason)
+        let result = self.request_locked(&mut state, reason);
+        drop(state);
+        if reason == Reason::Shutdown {
+            let closed = self.close_background();
+            return result.and_then(|ticket| closed.map(|()| ticket));
+        }
+        result
     }
 
     /// Idempotent terminal admission closure. Wakes exact-key compile waiters;
     /// the executing workers finish their current bounded native fragment.
     pub(crate) fn request_shutdown(&self) -> Result<(), Error> {
         let mut state = self.lock();
-        state.healthy()?;
-        if !state.shutdown {
-            self.request_locked(&mut state, Reason::Shutdown)?;
-        }
-        Ok(())
+        let result = (|| {
+            state.healthy()?;
+            if !state.shutdown {
+                self.request_locked(&mut state, Reason::Shutdown)?;
+            }
+            Ok(())
+        })();
+        drop(state);
+        // Cleanup must run even after a recorded failure. It never joins here:
+        // GPU/process dependants may still need to release their own owners.
+        let closed = self.close_background();
+        result.and(closed)
+    }
+
+    fn close_background(&self) -> Result<(), Error> {
+        let queue = self.lock().background_queue.upgrade();
+        // Queue cleanup releases pins after both locks have been released.
+        queue.map_or(Ok(()), |queue| queue.close().map(drop))
     }
 
     /// One cold shutdown pass, with no own invocation or memory lease. False
@@ -916,6 +971,22 @@ pub(crate) struct NativeSuspension<'a> {
     thread: PhantomData<Rc<()>>,
 }
 impl FaultLookup<'_> {
+    pub(crate) fn completion_sample(
+        &self,
+        unit: &unit::CodeUnit,
+    ) -> Result<Option<unit::CompletionSample>, Error> {
+        self.reader.process.completion_sample(unit)
+    }
+
+    pub(crate) fn sample_lcq(
+        &self,
+        unit: &unit::CodeUnit,
+        samples: &mut crate::sampling::Samples,
+        edge: Option<crate::sampling::ObservedEdge>,
+    ) -> Result<(), Error> {
+        self.reader.process.sample_lcq(unit, samples, edge)
+    }
+
     /// Borrow immutable unit metadata while the same invocation epoch used for
     /// fault lookup is active, including units with no faultable instructions.
     pub(crate) fn unit(&self, pc: usize) -> Option<&unit::CodeUnit> {

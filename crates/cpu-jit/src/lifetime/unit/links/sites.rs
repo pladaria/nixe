@@ -78,6 +78,21 @@ impl Input {
 }
 
 impl Units {
+    /// Includes pending/uninstalled static associations, not just callable links.
+    /// Partial LCQ inclusion is decided by the logical exit instruction.
+    pub(in crate::lifetime) fn has_external_static_source(
+        &self,
+        target: BlockKey,
+        contains: impl Fn(InstructionKey) -> bool,
+    ) -> bool {
+        self.static_sources(target).any(|site| {
+            let code = &self.records.get(site.source.0).unwrap().code;
+            let exit = code.states[site.state_map as usize].exit.unwrap();
+            let source = code.instructions[0].key.block_key().at(exit.pc).unwrap();
+            !contains(InstructionKey::new(source).unwrap())
+        })
+    }
+
     pub(super) fn static_source_head(&self, target: BlockKey) -> Option<SiteHandle> {
         self.static_sites
             .entries

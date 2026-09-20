@@ -531,6 +531,12 @@ pub struct NativeFrame<'a> {
     /// isolated invocation with no such owner uses the immutable quiet word.
     pub(crate) poll_requests: [*const std::sync::atomic::AtomicU32; 3],
     pub(crate) exclusive_load: PendingExclusiveLoad,
+    /// Invocation-borrowed cold observer. Arguments name the dispatcher, frame,
+    /// native source PC, code version and state map. Returns one to resume, zero
+    /// to canonicalize and exit with the dispatcher's retained internal error.
+    /// Bare gateway fixtures without a sampling owner leave this absent.
+    pub(crate) sample_observer:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, u64, u32) -> u32>,
     state_borrow: PhantomData<(&'a mut A64State, &'a mut crate::ReturnStack)>,
 }
 
@@ -617,6 +623,7 @@ impl<'a> NativeFrame<'a> {
             return_stack: std::ptr::null_mut(),
             poll_requests: [&QUIET_POLL_REQUEST; 3],
             exclusive_load: PendingExclusiveLoad::default(),
+            sample_observer: None,
             state_borrow: PhantomData,
         }
     }

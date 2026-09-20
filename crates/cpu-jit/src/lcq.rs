@@ -128,7 +128,7 @@ impl Fragment {
     }
 }
 
-fn boundary(decoded: &DecodeResult, key: BlockKey) -> Option<End> {
+pub(crate) fn boundary(decoded: &DecodeResult, key: BlockKey) -> Option<End> {
     let decoded = match decoded {
         DecodeResult::Decoded(decoded) => decoded,
         DecodeResult::RecognizedUnimplemented(_) => return Some(End::Unsupported),

@@ -28,6 +28,7 @@ impl JitThread {
         events: &VcpuEventState,
         progress: u64,
     ) -> Result<Option<CpuExit>, CpuFault> {
+        let completion_sample = exit.completion_sample();
         let (stop, instruction) = match exit {
             invocation::Exit::Memory {
                 instruction,
@@ -165,7 +166,7 @@ impl JitThread {
         };
         // The gateway has already reconciled native work. armed_span may be
         // zero after overshoot; this still charges exactly one cold completion.
-        budget
+        let poll = budget
             .reconcile(budget.armed_span - 1, false)
             .map_err(|error| {
                 internal(
@@ -175,6 +176,14 @@ impl JitThread {
                     state,
                 )
             })?;
+        if poll.sample
+            && let Some(source) = completion_sample
+        {
+            self.process
+                .lifetime
+                .sample_completion(source, &mut self.samples)
+                .map_err(|error| internal(instruction, error, progress.saturating_add(1), state))?;
+        }
         Ok(stop)
     }
 }

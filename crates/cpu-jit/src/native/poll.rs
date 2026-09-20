@@ -19,10 +19,11 @@ const ARMED: u32 = BUDGET + offset_of!(PollBudget, armed_span) as u32;
 const _: () = assert!(SAMPLE_INTERVAL == 4096); // AArch64 shifted ADD immediate below.
 
 /// Return bytes and three local branch patches: resume, slice exit, control
-/// exit. Resume goes to the already-completed source's hot patch. Exit adapters
+/// exit. Resume goes through the source-local observation callback and then to
+/// the already-completed source's hot patch. Exit adapters
 /// charge zero: the gateway reconciles the still-unmodified budget. Only the
-/// resumable sample-only path updates both balances here. No functional sample
-/// is emitted yet; Task 5 will consume the source terminal's retained identity.
+/// resumable sample-only path updates both balances here. The callback must not
+/// reconcile or repeat the deadline; slice/control paths bypass it entirely.
 pub(crate) fn emit_poll(abi: HostAbi) -> (Vec<u8>, [u32; 3]) {
     let mut e = Emitter::new(abi);
     let scratch = abi.reserved().link_scratch[0];

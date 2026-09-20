@@ -199,4 +199,4 @@ impl PreparedTransfer<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::lifetime) mod tests;

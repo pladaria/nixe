@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Timer;
 
+mod sampling;
+
 #[test]
 fn civac_probe_keeps_active_fp_status_on_success_and_escape() {
     let _restore = crate::fp_env::tests::RestoreHost::new();
@@ -152,13 +154,21 @@ fn state() -> A64State {
 }
 
 fn exit(thread: &mut JitThread, state: &mut A64State) -> (invocation::Exit, PollBudget) {
+    exit_at_sample(thread, state, 4096)
+}
+
+fn exit_at_sample(
+    thread: &mut JitThread,
+    state: &mut A64State,
+    sample: i64,
+) -> (invocation::Exit, PollBudget) {
     let mut worker = NativeWorker::default();
     let (exit, budget) = thread
         .invoke(
             &mut crate::ReturnStack::default(),
             &mut worker,
             state,
-            PollBudget::new(4096, 1).unwrap(),
+            PollBudget::new(sample, 1).unwrap(),
             &VcpuEventState::default(),
         )
         .unwrap();
@@ -409,7 +419,14 @@ fn mmio_completion_runs_once_and_charges_only_a_successful_access() {
         assert!(matches!(thread.demand(PC).unwrap(), Demand::Ready));
         let mut state = state();
         state.general_register_storage_mut()[1] = 0x3000;
-        let (exit, mut budget) = exit(&mut thread, &mut state);
+        let (exit, mut budget) = exit_at_sample(&mut thread, &mut state, 2);
+        assert!(exit.completion_sample().is_some());
+        assert!(
+            thread
+                .samples
+                .seed_snapshot(thread.key(PC).unwrap())
+                .is_none()
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         let before = state.clone();
         let stop = thread
@@ -423,6 +440,16 @@ fn mmio_completion_runs_once_and_charges_only_a_successful_access() {
             )
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let sample = thread.samples.seed_snapshot(thread.key(PC).unwrap());
+        if fail {
+            assert!(sample.is_none());
+            assert_eq!(budget.sample_remaining, 1);
+        } else {
+            let (snapshot, score) = sample.unwrap();
+            assert_eq!((snapshot.sequence, score), (1, 1));
+            assert_eq!(snapshot.last_edge, None);
+            assert_eq!(budget.sample_remaining, 4096);
+        }
         if fail {
             assert!(
                 matches!(stop, Some(CpuExit::DataFault { fault, .. }) if matches!(fault.reason, DataAccessFaultReason::Device(ref detail) if &**detail == "device refused read"))

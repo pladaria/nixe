@@ -566,7 +566,12 @@ fn publication_rejects_linkable_observations_and_missing_static_islands() {
     }
 }
 
-pub(super) fn source(process: &Lifetime, cursor: &AtomicU64, pc: u64, target: u64) -> UnitHandle {
+pub(in crate::lifetime) fn source(
+    process: &Lifetime,
+    cursor: &AtomicU64,
+    pc: u64,
+    target: u64,
+) -> UnitHandle {
     let handle = process
         .prepare_unit(
             &[process.reserve(key(pc)).unwrap()],
@@ -592,7 +597,7 @@ pub(super) fn source(process: &Lifetime, cursor: &AtomicU64, pc: u64, target: u6
     handle
 }
 
-pub(super) fn source_input(process: &Lifetime, pc: u64, target: u64) -> Input {
+pub(in crate::lifetime) fn source_input(process: &Lifetime, pc: u64, target: u64) -> Input {
     let mut input = input(process, &[pc], Tier::Lcq);
     let abi = input.code.metadata.abi;
     let width = if abi == HostAbi::X86_64 { 8 } else { 4 };

@@ -18,6 +18,7 @@ use nixe_memory::{
 use std::time::Duration;
 
 mod atomics;
+mod background;
 mod cache;
 mod capture;
 mod data_cache;
