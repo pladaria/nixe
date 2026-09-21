@@ -15,8 +15,6 @@ use nixe_cpu::semantics::a64::{
 // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions
 
-const GENERAL_REGISTER_COUNT: usize = 31;
-
 pub(crate) fn system_instruction_supported(
     platform: nixe_cpu::platform::TargetPlatform,
     instruction: system::Instruction,
@@ -50,9 +48,26 @@ pub(crate) fn system_instruction_supported(
     }
 }
 
+/// Compact architectural membership, also retained in every native state map.
+/// XZR/SP interpretation remains with the instruction decoder, not this set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegisterSet(u32);
+
+impl RegisterSet {
+    pub fn contains(self, index: usize) -> bool {
+        assert!(index < 32);
+        self.0 & (1 << index) != 0
+    }
+
+    pub fn insert(&mut self, index: usize) {
+        assert!(index < 32);
+        self.0 |= 1 << index;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IntegerRegisterSet {
-    pub x: [bool; GENERAL_REGISTER_COUNT],
+    pub x: RegisterSet,
     pub sp: bool,
 }
 
@@ -66,7 +81,7 @@ pub const NZCV: u8 = N | Z | C | V;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StateSet {
     pub integer: IntegerRegisterSet,
-    pub vector: [bool; 32],
+    pub vector: RegisterSet,
     pub nzcv: u8,
     pub fpcr: bool,
     pub fpsr: bool,
@@ -77,10 +92,10 @@ pub struct StateSet {
 impl StateSet {
     pub const ALL: Self = Self {
         integer: IntegerRegisterSet {
-            x: [true; 31],
+            x: RegisterSet(0x7fff_ffff),
             sp: true,
         },
-        vector: [true; 32],
+        vector: RegisterSet(u32::MAX),
         nzcv: NZCV,
         fpcr: true,
         fpsr: true,
@@ -89,13 +104,9 @@ impl StateSet {
     };
 
     pub fn union(mut self, other: Self) -> Self {
-        for (a, b) in self.integer.x.iter_mut().zip(other.integer.x) {
-            *a |= b;
-        }
+        self.integer.x.0 |= other.integer.x.0;
         self.integer.sp |= other.integer.sp;
-        for (a, b) in self.vector.iter_mut().zip(other.vector) {
-            *a |= b;
-        }
+        self.vector.0 |= other.vector.0;
         self.nzcv |= other.nzcv;
         self.fpcr |= other.fpcr;
         self.fpsr |= other.fpsr;
@@ -105,13 +116,9 @@ impl StateSet {
     }
 
     pub fn without(mut self, other: Self) -> Self {
-        for (a, b) in self.integer.x.iter_mut().zip(other.integer.x) {
-            *a &= !b;
-        }
+        self.integer.x.0 &= !other.integer.x.0;
         self.integer.sp &= !other.integer.sp;
-        for (a, b) in self.vector.iter_mut().zip(other.vector) {
-            *a &= !b;
-        }
+        self.vector.0 &= !other.vector.0;
         self.nzcv &= !other.nzcv;
         self.fpcr &= !other.fpcr;
         self.fpsr &= !other.fpsr;
@@ -542,15 +549,15 @@ fn register_access_fp_simd_general(
 
 fn register_access_fp_simd_vector(
     instruction: fp_simd::Instruction,
-    accessed: &mut [bool; 32],
-    dirty: &mut [bool; 32],
+    accessed: &mut RegisterSet,
+    dirty: &mut RegisterSet,
 ) {
     let fields = instruction.operands();
-    let read = |accessed: &mut [bool; 32], index: u8| {
-        accessed[usize::from(index)] = true;
+    let read = |accessed: &mut RegisterSet, index: u8| {
+        accessed.insert(usize::from(index));
     };
-    let write = |_accessed: &mut [bool; 32], dirty: &mut [bool; 32], index: u8| {
-        dirty[usize::from(index)] = true;
+    let write = |_accessed: &mut RegisterSet, dirty: &mut RegisterSet, index: u8| {
+        dirty.insert(usize::from(index));
     };
     match instruction {
         fp_simd::Instruction::UnsignedMoveToGeneral(_)
@@ -791,7 +798,7 @@ fn mark_read(accessed: &mut IntegerRegisterSet, index: u8, register31_is_sp: boo
     if index == 31 {
         accessed.sp |= register31_is_sp;
     } else {
-        accessed.x[usize::from(index)] = true;
+        accessed.x.insert(usize::from(index));
     }
 }
 
@@ -805,7 +812,7 @@ fn mark_write(
         dirty.sp |= register31_is_sp;
     } else {
         let slot = usize::from(index);
-        dirty.x[slot] = true;
+        dirty.x.insert(slot);
     }
 }
 
@@ -816,6 +823,40 @@ mod tests {
     use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
     use nixe_cpu::platform::{PlatformDecoder, TargetPlatform};
     use nixe_memory::GuestVirtualAddress;
+
+    #[test]
+    fn compact_state_sets_preserve_every_register_and_special_bit() {
+        assert!(std::mem::size_of::<StateSet>() <= 20);
+        let mut all = StateSet::default();
+        for index in 0..32 {
+            let mut one = StateSet::default();
+            one.vector.insert(index);
+            if index < 31 {
+                one.integer.x.insert(index);
+            } else {
+                one.integer.sp = true;
+            }
+            assert_eq!(StateSet::ALL.intersection(one), one);
+            assert!(one.without(one).is_empty());
+            assert_eq!(all.intersection(one), StateSet::default());
+            all = all.union(one);
+        }
+        assert!(!all.integer.x.contains(31));
+        all.nzcv = NZCV;
+        all.fpcr = true;
+        all.fpsr = true;
+        all.tpidr_el0 = true;
+        all.tpidrro_el0 = true;
+        assert_eq!(all, StateSet::ALL);
+        for flags in 0..=NZCV {
+            let one = StateSet {
+                nzcv: flags,
+                ..StateSet::default()
+            };
+            assert_eq!(one.intersection(all), one);
+            assert_eq!(all.without(one).nzcv, NZCV & !flags);
+        }
+    }
 
     fn instruction(bits: u32) -> A64Instruction {
         let encoding = InstructionEncoding::from_u32(bits);
@@ -841,7 +882,7 @@ mod tests {
     }
     fn x(index: usize) -> StateSet {
         let mut state = StateSet::default();
-        state.integer.x[index] = true;
+        state.integer.x.insert(index);
         state
     }
 
@@ -858,26 +899,32 @@ mod tests {
         assert_eq!(movk_x0.writes, x(0));
         let sequence = block(&[0x5280_0020, 0xf280_0020]);
         assert!(
-            !sequence.live_before(x(0)).integer.x[0],
+            !sequence.live_before(x(0)).integer.x.contains(0),
             "MOVZ defines the preserved part before MOVK"
         );
-        assert!(block(&[0xf280_0020]).live_before(x(0)).integer.x[0]);
+        assert!(
+            block(&[0xf280_0020])
+                .live_before(x(0))
+                .integer
+                .x
+                .contains(0)
+        );
         assert!(effects(0xd280_003f).writes.is_empty(), "XZR is not state");
     }
 
     #[test]
     fn vector_lane_inserts_read_only_the_preserved_destination() {
         let insert = effects(0x4e18_1c20); // INS V0.D[1], X1
-        assert!(insert.reads.integer.x[1]);
-        assert!(insert.reads.vector[0]);
-        assert!(!insert.reads.vector[1], "the source is X1, not V1");
-        assert!(insert.writes.vector[0]);
+        assert!(insert.reads.integer.x.contains(1));
+        assert!(insert.reads.vector.contains(0));
+        assert!(!insert.reads.vector.contains(1), "the source is X1, not V1");
+        assert!(insert.writes.vector.contains(0));
         let fmov = effects(0x1e27_0020); // FMOV S0, W1 clears the upper V bits
-        assert!(fmov.writes.vector[0]);
-        assert!(!fmov.reads.vector[0]);
+        assert!(fmov.writes.vector.contains(0));
+        assert!(!fmov.reads.vector.contains(0));
         let and = effects(0x4e22_1c20); // AND V0.16B, V1.16B, V2.16B
-        assert!(!and.reads.vector[0]);
-        assert!(and.reads.vector[1] && and.reads.vector[2]);
+        assert!(!and.reads.vector.contains(0));
+        assert!(and.reads.vector.contains(1) && and.reads.vector.contains(2));
     }
 
     #[test]
@@ -914,11 +961,15 @@ mod tests {
     #[test]
     fn faults_observe_the_pre_write_state_and_helpers_keep_status() {
         let load = effects(0xf940_0020); // LDR X0, [X1]
-        assert!(load.writes.integer.x[0]);
-        assert!(load.live_before(StateSet::default()).integer.x[0]);
+        assert!(load.writes.integer.x.contains(0));
+        assert!(load.live_before(StateSet::default()).integer.x.contains(0));
         assert_eq!(load.observe_before, StateSet::ALL);
         assert!(
-            !block(&[0xd280_0020, 0xf940_0020]).live_in.integer.x[0],
+            !block(&[0xd280_0020, 0xf940_0020])
+                .live_in
+                .integer
+                .x
+                .contains(0),
             "a preceding write supplies the prefault value"
         );
         assert_eq!(effects(0xd53b_e040).observe_before, StateSet::ALL); // runtime counter helper
@@ -961,18 +1012,21 @@ mod tests {
             },
         ];
         let live = liveness(&blocks);
-        assert!(live[0].live_in.integer.x[0], "the bypass path preserves X0");
         assert!(
-            !live[1].live_in.integer.x[0],
+            live[0].live_in.integer.x.contains(0),
+            "the bypass path preserves X0"
+        );
+        assert!(
+            !live[1].live_in.integer.x.contains(0),
             "the writing entry kills old X0"
         );
-        assert!(live[2].live_in.integer.x[0]);
+        assert!(live[2].live_in.integer.x.contains(0));
         let loop_block = [FlowBlock {
             effects: block(&[0x9100_0400]),
             successors: &[0],
             exit_live: x(0),
         }]; // ADD X0, X0, #1
-        assert!(liveness(&loop_block)[0].live_in.integer.x[0]);
+        assert!(liveness(&loop_block)[0].live_in.integer.x.contains(0));
     }
 
     #[test]

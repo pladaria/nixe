@@ -221,8 +221,8 @@ fn casp_maps_describe_one_transaction_and_both_pre_destinations() {
             assert!(fault.completed_read.is_none());
             let state = &lowered.states[fault.state_map as usize].state;
             // Both incoming compare values survive until the transaction commits.
-            assert!(state.dirty_live.integer.x[2]);
-            assert!(state.dirty_live.integer.x[3]);
+            assert!(state.dirty_live.integer.x.contains(2));
+            assert!(state.dirty_live.integer.x.contains(3));
             assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
             state.validate().unwrap();
         }

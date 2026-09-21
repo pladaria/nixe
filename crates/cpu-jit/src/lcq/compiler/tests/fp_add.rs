@@ -155,16 +155,8 @@ fn activation_transfers_allocated_spills_vectors_and_carry_recipes() {
             .iter()
             .find(|state| state.exit.is_none())
             .unwrap();
-        assert!(
-            internal
-                .state
-                .dirty_live
-                .integer
-                .x
-                .iter()
-                .all(|&dirty| dirty)
-        );
-        assert!(internal.state.dirty_live.vector.iter().all(|&dirty| dirty));
+        assert_eq!(internal.state.dirty_live.integer.x, StateSet::ALL.integer.x);
+        assert!(internal.state.dirty_live.vector == StateSet::ALL.vector);
         assert!(matches!(internal.state.nzcv, NzcvLocation::Deferred(_)));
         assert!(
             internal

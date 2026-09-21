@@ -331,8 +331,8 @@ fn exit(
 ) -> ExitStateMap {
     let mut dirty = live(operands);
     // Clean vectors must remain canonical, although they are physically live.
-    dirty.vector.fill(false);
-    dirty.vector[0] = true;
+    dirty.vector = Default::default();
+    dirty.vector.insert(0);
     let exit = ExitStateMap {
         abi,
         site: ExitSiteKey {

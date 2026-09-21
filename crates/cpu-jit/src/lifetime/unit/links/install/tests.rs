@@ -11,7 +11,7 @@ mod maintenance;
 
 fn target_binding(input: &mut Input) {
     use crate::abi::{GuestValue, RegisterClass, ValueBinding};
-    input.entries[0].contract.live_in.integer.x[0] = true;
+    input.entries[0].contract.live_in.integer.x.insert(0);
     input.entries[0].contract.bindings = Box::new([ValueBinding {
         value: GuestValue::General(0),
         location: ValueLocation::Register {
@@ -702,8 +702,8 @@ fn far_installed_target(with_bridge: bool) {
     if with_bridge {
         // A constant -> X0 transfer is nonempty but needs no NativeFrame, so
         // this synthetic System-ABI chain can execute the owned bridge too.
-        input.states[0].state.live.integer.x[0] = true;
-        input.states[0].state.dirty_live.integer.x[0] = true;
+        input.states[0].state.live.integer.x.insert(0);
+        input.states[0].state.dirty_live.integer.x.insert(0);
         input.states[0].state.bindings = Box::new([crate::abi::ValueBinding {
             value: crate::abi::GuestValue::General(0),
             location: ValueLocation::Constant(9),

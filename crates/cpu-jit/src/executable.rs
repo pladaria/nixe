@@ -2,7 +2,6 @@
 //! mutex, never JIT state. A lease owns an exact span; published CodeUnit owners
 //! must retain it through unlink, reader quiescence and all strong references.
 
-mod islands;
 mod linux;
 pub(crate) mod output;
 mod patch;
@@ -20,7 +19,7 @@ const MIB: usize = 1024 * 1024;
 pub(crate) const WINDOW_BYTES: usize = 2047 * MIB;
 pub(crate) const SEGMENT_BYTES: usize = 16 * MIB;
 pub(crate) const SEGMENTS: usize = 128;
-const ISLAND_BYTES: usize = 64 * 1024;
+const ISLAND_SLOT_BYTES: usize = crate::native::link::ISLAND_BYTES;
 pub(crate) const SOFT_BYTES: usize = 512 * MIB;
 pub(crate) const HARD_BYTES: usize = 640 * MIB;
 const LCQ_RESERVE: usize = 32 * MIB;
@@ -124,7 +123,6 @@ struct Segment {
     tier: Option<Tier>,
     bump: usize,
     live: usize,
-    islands: islands::Pool,
     // Sorted, coalesced ranges. Capacity is charged, including replacement
     // overlap; fixed boxed storage makes that extent exact. No release allocates.
     free: Box<[Span]>,
@@ -299,7 +297,7 @@ impl Cache {
         tier: Tier,
         island_count: usize,
     ) -> Result<Allocation, Error> {
-        if size == 0 || size > SEGMENT_BYTES - ISLAND_BYTES {
+        if size == 0 || size > SEGMENT_BYTES {
             return Err(Error::Capacity(
                 "unit is empty or exceeds one segment's code area",
             ));
@@ -307,11 +305,20 @@ impl Cache {
         if !alignment.is_power_of_two() || alignment > SEGMENT_BYTES {
             return Err(Error::Capacity("invalid code alignment"));
         }
-        if island_count > islands::SLOTS {
-            return Err(Error::Capacity(
-                "unit island demand exceeds one segment; split before publication",
-            ));
-        }
+        // One span owns code, alignment padding and its exact worst-case
+        // island demand. A separate fixed island pool can strand most of a
+        // segment when many small units/bridges run out of slots first.
+        let code_len = size;
+        let (size, alignment) = if island_count == 0 {
+            (size, alignment)
+        } else {
+            let size = island_count
+                .checked_mul(ISLAND_SLOT_BYTES)
+                .and_then(|bytes| bytes.checked_add(align(code_len, ISLAND_SLOT_BYTES).ok()?))
+                .filter(|size| *size <= SEGMENT_BYTES)
+                .ok_or(Error::Capacity("code and islands exceed one segment"))?;
+            (size, alignment.max(ISLAND_SLOT_BYTES))
+        };
         let mut state = self.lock()?;
         if state.backing.is_none() {
             return Err(Error::Closed);
@@ -320,9 +327,7 @@ impl Cache {
         // borrow an unused segment, never another tier's live active segment.
         let mut best: Option<(usize, usize, usize, usize)> = None;
         for (index, segment) in state.segments.iter().enumerate() {
-            if (segment.live != 0 && segment.tier != Some(tier))
-                || segment.islands.find(island_count).is_none()
-            {
+            if segment.live != 0 && segment.tier != Some(tier) {
                 continue;
             }
             for (free_index, free) in segment.free[..segment.free_len].iter().enumerate() {
@@ -346,14 +351,13 @@ impl Cache {
                 for (index, segment) in state.segments.iter().enumerate() {
                     if segment.generation.is_some() != committed
                         || (segment.live != 0 && segment.tier != Some(tier))
-                        || segment.islands.find(island_count).is_none()
                     {
                         continue;
                     }
                     let start = align(self.base + index * SEGMENT_BYTES + segment.bump, alignment)?
                         - self.base
                         - index * SEGMENT_BYTES;
-                    if start + size <= segment_size(index) - ISLAND_BYTES {
+                    if start + size <= segment_size(index) {
                         candidate = Some((index, start, None));
                         break;
                     }
@@ -434,7 +438,8 @@ impl Cache {
             segment: index,
             generation: segment.generation.unwrap(),
             span: Span { start, len: size },
-            islands: segment.islands.claim(island_count),
+            code_len,
+            island_count,
         })
     }
 
@@ -555,18 +560,11 @@ impl Cache {
         {
             let mut state = self.lock()?;
             let offset = allocation.segment * SEGMENT_BYTES;
-            let rw = state
-                .backing
-                .as_ref()
-                .ok_or(Error::Closed)?
-                .rw
-                .as_ref()
-                .ok_or(Error::Poisoned)?;
-            rw.protect(
-                offset,
-                segment_size(allocation.segment),
-                libc::PROT_READ | libc::PROT_WRITE,
-            )?;
+            let backing = state.backing.as_ref().ok_or(Error::Closed)?;
+            let (write_start, write_bytes) =
+                backing.write_window(offset + allocation.span.start, allocation.span.len);
+            let rw = backing.rw.as_ref().ok_or(Error::Poisoned)?;
+            rw.protect(write_start, write_bytes, libc::PROT_READ | libc::PROT_WRITE)?;
             unsafe {
                 if let Some(bytes) = &island {
                     let address = allocation.island_address(0).unwrap();
@@ -582,9 +580,7 @@ impl Cache {
                     &staging.output.bytes,
                 );
             }
-            if let Err(error) =
-                rw.protect(offset, segment_size(allocation.segment), libc::PROT_NONE)
-            {
+            if let Err(error) = rw.protect(write_start, write_bytes, libc::PROT_NONE) {
                 // Disable the entire nonexecutable view, rather than leave it
                 // accessible outside a write window. RX leases stay intact.
                 state.failed = true;
@@ -682,9 +678,10 @@ pub(crate) struct Allocation {
     pub segment: usize,
     pub generation: SegmentGeneration,
     span: Span,
-    // Slot indexes inside this segment's final 64 KiB. This reservation shares
-    // the allocation's lifetime, generation and existing live-segment count.
-    islands: Span,
+    // The span also owns aligned trailing islands. Code bounds intentionally
+    // exclude these bytes: code patches and native-PC intervals name code only.
+    code_len: usize,
+    island_count: usize,
 }
 impl Allocation {
     pub fn belongs_to(&self, cache: &Arc<Cache>) -> bool {
@@ -694,16 +691,16 @@ impl Allocation {
         self.cache.base + self.segment * SEGMENT_BYTES + self.span.start
     }
     pub fn len(&self) -> usize {
-        self.span.len
+        self.code_len
     }
     pub fn island_count(&self) -> usize {
-        self.islands.len
+        self.island_count
     }
     pub fn island_address(&self, index: usize) -> Option<usize> {
-        (index < self.islands.len).then(|| {
-            self.cache.base + self.segment * SEGMENT_BYTES + segment_size(self.segment)
-                - ISLAND_BYTES
-                + (self.islands.start + index) * islands::SLOT_BYTES
+        (index < self.island_count).then(|| {
+            self.address()
+                + self.code_len.next_multiple_of(ISLAND_SLOT_BYTES)
+                + index * ISLAND_SLOT_BYTES
         })
     }
 }
@@ -712,7 +709,6 @@ impl Drop for Allocation {
         if let Ok(mut state) = self.cache.lock() {
             let segment = &mut state.segments[self.segment];
             assert_eq!(segment.generation, Some(self.generation));
-            segment.islands.release(self.islands);
             segment.release(self.span);
         }
     }
@@ -755,4 +751,19 @@ pub(crate) struct Installed {
     pub metadata: Metadata,
     // Field order releases the actual metadata before returning its charge.
     charge: MetadataLease,
+}
+
+impl Installed {
+    /// Backend locations/labels prove the semantic maps before publication;
+    /// afterwards the runtime uses only those semantic maps. Relocations have
+    /// already been applied. Release their storage, not just its budget.
+    pub(crate) fn finish_validation(&mut self) {
+        let before = self.metadata.bytes();
+        self.metadata.entries = Box::new([]);
+        self.metadata.states = Box::new([]);
+        self.metadata.faults = Box::new([]);
+        self.metadata.traps = Box::new([]);
+        self.metadata.relocations = Box::new([]);
+        self.charge.reduce(before - self.metadata.bytes());
+    }
 }

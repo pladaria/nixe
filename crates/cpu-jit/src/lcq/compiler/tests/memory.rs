@@ -966,11 +966,11 @@ fn contiguous_structure_fault_maps_cover_grouped_and_element_paths() {
                                 assert_eq!(fault.bytes, 1 << size);
                             }
                             let state = &lowered.states[fault.state_map as usize].state;
-                            assert!(state.dirty_live.integer.x[1]); // inherited pre-writeback base
+                            assert!(state.dirty_live.integer.x.contains(1)); // inherited pre-writeback base
                             for register in 0..32 {
                                 assert_eq!(
-                                    state.dirty_live.vector[(31 + register) & 31],
-                                    lowered.entry.live_in.vector[(31 + register) & 31]
+                                    state.dirty_live.vector.contains((31 + register) & 31),
+                                    lowered.entry.live_in.vector.contains((31 + register) & 31)
                                         || (load && register < count && register * lanes < index)
                                 );
                             }
@@ -1021,13 +1021,13 @@ fn multiple_structure_fault_maps_preserve_each_committed_lane() {
                             assert_eq!(fault.bytes, 1 << size);
                             assert!(fault.completed_read.is_none());
                             let state = &lowered.states[fault.state_map as usize].state;
-                            assert!(state.dirty_live.integer.x[1]);
+                            assert!(state.dirty_live.integer.x.contains(1));
                             assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
                             assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
                             for offset in 0..32 {
                                 assert_eq!(
-                                    state.dirty_live.vector[(31 + offset) & 31],
-                                    lowered.entry.live_in.vector[(31 + offset) & 31]
+                                    state.dirty_live.vector.contains((31 + offset) & 31),
+                                    lowered.entry.live_in.vector.contains((31 + offset) & 31)
                                         || (load && offset < count && offset < index)
                                 );
                             }
@@ -1047,7 +1047,7 @@ fn multiple_structure_fault_maps_preserve_each_committed_lane() {
                             .find(|map| map.exit.is_some())
                             .unwrap()
                             .state;
-                        assert!(exit.dirty_live.integer.x[1]);
+                        assert!(exit.dirty_live.integer.x.contains(1));
                         let clif = compiler.context.func.display().to_string();
                         assert_eq!(clif.matches("nixe_fault_start").count(), accesses);
                         assert_eq!(
@@ -1139,13 +1139,14 @@ fn single_structure_fault_maps_preserve_completed_elements_and_defer_writeback()
                     assert_eq!(fault.bytes, 1 << size);
                     assert!(fault.completed_read.is_none());
                     let state = &lowered.states[fault.state_map as usize].state;
-                    assert!(state.dirty_live.integer.x[1]);
+                    assert!(state.dirty_live.integer.x.contains(1));
                     assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
                     assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
                     for (element, register) in [31, 0, 1, 2].into_iter().enumerate() {
                         assert_eq!(
-                            state.dirty_live.vector[register],
-                            lowered.entry.live_in.vector[register] || (load && element < index)
+                            state.dirty_live.vector.contains(register),
+                            lowered.entry.live_in.vector.contains(register)
+                                || (load && element < index)
                         );
                     }
                     if index > 0 {
@@ -1159,11 +1160,11 @@ fn single_structure_fault_maps_preserve_completed_elements_and_defer_writeback()
                     .find(|map| map.exit.is_some())
                     .unwrap()
                     .state;
-                assert!(exit.dirty_live.integer.x[1]);
+                assert!(exit.dirty_live.integer.x.contains(1));
                 for register in [31, 0, 1, 2] {
                     assert_eq!(
-                        exit.dirty_live.vector[register],
-                        lowered.entry.live_in.vector[register] || load
+                        exit.dirty_live.vector.contains(register),
+                        lowered.entry.live_in.vector.contains(register) || load
                     );
                 }
                 let clif = compiler.context.func.display().to_string();
@@ -1224,8 +1225,8 @@ fn ordered_fault_maps_name_only_the_access_and_keep_rcsc_ordering() {
                     }
                 );
                 let state = &lowered.states[fault.state_map as usize].state;
-                assert!(state.dirty_live.integer.x[5]);
-                assert!(!state.dirty_live.integer.x[0]);
+                assert!(state.dirty_live.integer.x.contains(5));
+                assert!(!state.dirty_live.integer.x.contains(0));
                 assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
             }
             let store = &lowered.faults[0];
@@ -1368,13 +1369,13 @@ fn pair_fault_maps_retain_uncommitted_reads_and_completed_store_stages() {
                         assert_eq!(fault.commit_stage, if load == 0 { i as u16 } else { 0 });
                         assert_eq!(fault.completed_read.is_some(), load == 1 && i == 1);
                         let state = &lowered.states[fault.state_map as usize].state;
-                        assert!(state.dirty_live.integer.x[1]);
+                        assert!(state.dirty_live.integer.x.contains(1));
                         let dirty = if vector {
-                            &state.dirty_live.vector[..]
+                            &state.dirty_live.vector
                         } else {
-                            &state.dirty_live.integer.x[..]
+                            &state.dirty_live.integer.x
                         };
-                        assert!(dirty[0] && dirty[3]);
+                        assert!(dirty.contains(0) && dirty.contains(3));
                         assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
                         if let Some(location) = fault.completed_read {
                             assert!(location.valid(abi, fault.bytes));
@@ -1437,8 +1438,8 @@ fn pair_prefault_maps_keep_dirty_spills_and_the_first_read_under_pressure() {
             assert_eq!(lowered.faults.len(), 2);
             let second = &lowered.faults[1];
             let state = &lowered.states[second.state_map as usize].state;
-            assert!(state.dirty_live.integer.x.iter().all(|dirty| *dirty));
-            assert!(state.dirty_live.vector.iter().all(|dirty| *dirty));
+            assert!(state.dirty_live.integer.x == StateSet::ALL.integer.x);
+            assert!(state.dirty_live.vector == StateSet::ALL.vector);
             assert!(state.bindings.iter().any(|binding| matches!(
                 binding.location,
                 crate::abi::ValueLocation::Spill { .. }
@@ -1463,8 +1464,8 @@ fn vector_prefault_maps_preserve_previous_vector_and_pre_writeback_base() {
         for (i, fault) in lowered.faults.iter().enumerate() {
             assert_eq!(fault.bytes, 16);
             let state = &lowered.states[fault.state_map as usize].state;
-            assert!(state.dirty_live.vector[0]);
-            assert!(state.dirty_live.integer.x[1]);
+            assert!(state.dirty_live.vector.contains(0));
+            assert!(state.dirty_live.integer.x.contains(1));
             assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
             let map = &lowered.output.metadata.faults[i];
             assert_eq!(
@@ -1506,9 +1507,9 @@ fn scalar_prefault_maps_keep_pre_writeback_state_and_lazy_flags() {
             assert_eq!(fault.subaccess, 0);
             assert_eq!(fault.commit_stage, 0);
             let state = &lowered.states[fault.state_map as usize].state;
-            assert!(state.dirty_live.integer.x[5]);
-            assert_eq!(state.dirty_live.integer.x[0], i == 1);
-            assert!(state.dirty_live.integer.x[1]);
+            assert!(state.dirty_live.integer.x.contains(5));
+            assert_eq!(state.dirty_live.integer.x.contains(0), i == 1);
+            assert!(state.dirty_live.integer.x.contains(1));
             assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
             state.validate().unwrap();
         }
@@ -1537,8 +1538,8 @@ fn scalar_prefault_maps_include_prior_native_fp_effects() {
         let state = &lowered.states[lowered.faults[0].state_map as usize].state;
         assert!(state.host_fpsr_pending);
         assert!(state.dirty_live.fpsr);
-        assert!(state.dirty_live.vector[0]);
-        assert!(!state.dirty_live.integer.x[0]);
-        assert!(state.dirty_live.integer.x[1]);
+        assert!(state.dirty_live.vector.contains(0));
+        assert!(!state.dirty_live.integer.x.contains(0));
+        assert!(state.dirty_live.integer.x.contains(1));
     }
 }

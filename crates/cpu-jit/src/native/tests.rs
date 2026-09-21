@@ -197,7 +197,7 @@ fn unavailable_inputs_fail_and_valid_flag_conversions_emit() {
         Err(TransferError::DifferentHostAbis)
     );
     target.abi = source.abi;
-    target.live_in.integer.x[0] = true;
+    target.live_in.integer.x.insert(0);
     target.bindings = Box::new([ValueBinding {
         value: GuestValue::General(0),
         location: integer(0),

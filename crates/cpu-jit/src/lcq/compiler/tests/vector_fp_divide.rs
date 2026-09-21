@@ -221,7 +221,7 @@ fn overwritten_packed_divide_keeps_status_and_exact_maps() {
             })
             .unwrap();
         assert!(exact.state.host_fpsr_pending && exact.state.dirty_live.fpsr);
-        assert!(exact.state.dirty_live.vector[0]);
+        assert!(exact.state.dirty_live.vector.contains(0));
     }
     let mut actual = A64State::default();
     actual.set_pc(PC);

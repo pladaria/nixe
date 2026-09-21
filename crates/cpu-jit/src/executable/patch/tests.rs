@@ -18,7 +18,8 @@ fn write_window_closes_rw_on_finish_and_discards_it_on_unwind() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut window = Window {
                 state,
-                segment: 0,
+                offset: 0,
+                bytes: SEGMENT_BYTES,
                 finished: false,
             };
             if unwind {

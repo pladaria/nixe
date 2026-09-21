@@ -44,7 +44,7 @@ fn source_with_binding(
             let mut state = initial.clone();
             state.site.state_map = id;
             if constant_x0 {
-                state.live.integer.x[0] = true;
+                state.live.integer.x.insert(0);
                 state.bindings = Box::new([ValueBinding {
                     value: GuestValue::General(0),
                     location: ValueLocation::Constant(17),
@@ -225,7 +225,7 @@ fn dynamic_nonempty_transfer_is_charged_reusable_and_has_no_static_islands() {
             |_| None,
         )
         .unwrap();
-    candidate.entries[0].contract.live_in.integer.x[0] = true;
+    candidate.entries[0].contract.live_in.integer.x.insert(0);
     candidate.entries[0].contract.bindings = Box::new([ValueBinding {
         value: GuestValue::General(0),
         location: ValueLocation::Register {

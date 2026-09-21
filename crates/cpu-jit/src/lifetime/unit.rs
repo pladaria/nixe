@@ -920,11 +920,12 @@ impl Lifetime {
     fn prepare_output<'a>(
         &'a self,
         publications: &[Publication<'a>],
-        input: Input,
+        mut input: Input,
         cursor: &'a AtomicU64,
         candidate: Option<&'a Frozen<'a, 'a>>,
     ) -> Result<PreparedUnit<'a>, Error> {
         input.validate(self, publications)?;
+        input.code.finish_validation();
         self.collect_tables()?;
         let static_sites = input.source_sites();
         let bytes = size_of_val(&*static_sites);
@@ -1334,20 +1335,27 @@ impl Lifetime {
         unit: &Arc<Accounted<CodeUnit>>,
         previous: &Option<Arc<Accounted<Table>>>,
     ) -> Result<Arc<Accounted<Table>>, Error> {
-        let mut intervals = previous
-            .as_ref()
-            .map_or_else(Vec::new, |old| old.intervals.to_vec());
-        intervals.push(Interval {
+        let old = previous.as_ref().map_or(&[][..], |table| &table.intervals);
+        let interval = Interval {
             start: unit.code.allocation.address(),
             end: unit.code.allocation.address() + unit.code.allocation.len(),
             unit: &unit.value,
-        });
-        intervals.sort_unstable_by_key(|interval| interval.start);
-        if intervals.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        };
+        let index = old.partition_point(|old| old.start < interval.start);
+        // Published tables are already sorted/disjoint. Only the new interval's
+        // two neighbors can overlap it. Allocate the final size once: to_vec +
+        // push reallocates/copies the whole table and retains twice its capacity.
+        if (index != 0 && old[index - 1].end > interval.start)
+            || old.get(index).is_some_and(|next| interval.end > next.start)
+        {
             return Err(Error::InvalidUnit(
                 "native unit intervals overlap published code",
             ));
         }
+        let mut intervals = Vec::with_capacity(old.len() + 1);
+        intervals.extend_from_slice(&old[..index]);
+        intervals.push(interval);
+        intervals.extend_from_slice(&old[index..]);
         let bytes = size_of::<Accounted<Table>>()
             + 2 * size_of::<usize>()
             + intervals.capacity() * size_of::<Interval>();

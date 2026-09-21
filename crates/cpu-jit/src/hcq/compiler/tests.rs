@@ -125,8 +125,8 @@ fn hcq_body_simd_partial_registers_and_overlapping_public_entries_share_lowering
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         let (_, body) = emitted(&graph, &[0, block(&graph, 8)], abi);
         assert!(body.ssa.blocks[0].operands.contains(&GuestValue::Vector(0)));
-        assert!(body.exits[0].state.dirty.vector[0]);
-        assert!(body.exits[0].state.dirty.vector[1]);
+        assert!(body.exits[0].state.dirty.vector.contains(0));
+        assert!(body.exits[0].state.dirty.vector.contains(1));
         assert!(body.exits[0].state.flags.is_none());
         assert!(body.exits[0].state.dirty.fpsr); // invocation-owned, not a vector input
     }
@@ -180,7 +180,7 @@ fn hcq_body_calls_and_architectural_exits_keep_shared_lr_and_source_contracts() 
         for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
             let (_, body) = emitted(&graph, &[0], abi);
             assert_eq!(body.exits[0].guest.kind, kind);
-            assert_eq!(body.exits[0].state.dirty.integer.x[30], dirty_lr);
+            assert_eq!(body.exits[0].state.dirty.integer.x.contains(30), dirty_lr);
             assert_eq!(body.exits[0].guest.pc.get(), 0);
         }
     }
