@@ -82,8 +82,14 @@ fn instruction_cache_va_invalidation_drains_fault_readers_and_all_physical_alias
     );
     let new = publish(&process, &memory, 0x1000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
-        snapshot.instructions[0].bits
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
+        snapshot.instructions.get(0).unwrap().bits
     );
 }
 

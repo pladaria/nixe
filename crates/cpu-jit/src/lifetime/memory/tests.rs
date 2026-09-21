@@ -435,7 +435,7 @@ fn resize_only_invalidates_the_changed_tail_and_replacement_uses_fresh_code() {
     let new = process.snapshot(fresh).unwrap();
     assert_ne!(new.id, old.id);
     assert_ne!(new.dependencies[0], old.dependencies[0]);
-    assert_eq!(new.instructions[0].bits, 0);
+    assert_eq!(new.instructions.get(0).unwrap().bits, 0);
     assert!(process.snapshot(first).is_ok());
 }
 

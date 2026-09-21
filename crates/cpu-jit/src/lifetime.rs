@@ -1003,7 +1003,7 @@ impl FaultLookup<'_> {
         edge: crate::sampling::ObservedEdge,
     ) -> Result<(), Error> {
         let (block, instruction) = guest
-            .source(&unit.instructions)
+            .source(|i| unit.instructions.get(i))
             .ok_or(Error::InvalidUnit("sample exit has invalid source indices"))?;
         self.reader
             .process

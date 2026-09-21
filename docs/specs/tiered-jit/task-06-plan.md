@@ -1370,3 +1370,59 @@ metadata 191.83 to 160.84 MiB. LCQ residents are 30,797 versus 30,793 and HCQ
 shut down cleanly and have no lost perf samples. First 1,024 completions were
 10.65 versus 6.86 seconds (an indicator, not an FPS/first-frame guarantee).
 Final evidence: `dump/perf-followup-20260921-233314-VJWojq/analysis.md`.
+
+## Post-closure exit-support compaction
+
+The follow-up audit separates architectural writeback, exit publication,
+RSB/PIC work, polls and sampling. Sharing remains source-local inside each
+unit: one canonical writeback/publication and one cold RSB update serve the
+dispatch, slice and control entries. Indirect misses skip the already-performed
+RSB update. Sampling success/failure share one register restore. No new frame
+field, shared-code registry or hot-link instruction is introduced; cold exit
+selection adds native branches but no Rust calls. Superseded copies are removed.
+
+Matched 45-second emission audits reduce LCQ exit support from 40.74 to 30.06 MB
+(-26.2%) and total emitted LCQ code from 49.26 to 38.46 MB (-21.9%). Backend
+body bytes remain effectively unchanged. Counts include unpublished attempts;
+temporary sizing logs are removed from the final binary. Polls remain a
+separate 9.33 MB cost, not a claim that all former 83% can disappear safely.
+
+Validation: 825 x86-64 JIT tests; AArch64/QEMU 52 native, 123 HCQ and 4 polling
+tests; Clippy and formatting/whitespace checks. New tests cover precise cold
+entry state/identity/budget, all PC location classes, lazy flags, exactly-once
+RSB updates and shared sampling restoration. Evidence and the ordinary-build
+180-second comparison: `dump/perf-followup-20260922-000019-VsX270/analysis.md`.
+
+In that ordinary-build comparison, resident LCQ native bytes fall 49.16 to
+38.38 MB, executable backing 80 to 64 MiB and total cache 240.84 to 224.62 MiB.
+LCQ coverage stays effectively identical (30,793 versus 30,792 units). First
+1,024 completions take 6.86 versus 6.76 seconds; sustained CPU-time deltas are
+unchanged at the measurement's whole-second resolution. Both runs shut down
+cleanly. This demonstrates memory savings without a detected cost regression,
+not an FPS improvement. No fork, dependency or lockfile changes are needed.
+
+## Post-closure resident metadata compaction
+
+The metadata audit identified oversized constant locations, duplicated binding
+arrays/full instruction keys, nullable handle padding and empty backend proof
+headers. Implement those representation changes without changing generated
+native edges: two-u64 constants, nonzero handle generations, unit-local shared
+binding slices, one resident instruction context with PC/bits words and u16
+fault ordinals, and separately owned/discarded backend proofs. Both former
+linear fault-instruction searches become direct indexed loads. Preserve all
+state/commit-stage/dependency data; keep lazy-flags recipes inline. Do not
+shrink registries on execution paths or remove allocator reclamation reserves.
+
+Validation: 829 x86-64 JIT tests; AArch64/QEMU 335 lifetime, 8 ABI, 58 native,
+27 storage, 123 HCQ and 4 invocation tests. Strict JIT-only Clippy, formatting
+and whitespace checks pass. The ordinary 180-second es2gears comparison reduces
+metadata from 160.62 to 119.69 MiB and total cache from 224.62 to 183.69 MiB;
+LCQ/HCQ coverage and native bytes remain practically identical. First 1,024
+completions take 6.76 versus 6.83 seconds. Both captures stop cleanly. These
+figures are cache accounting, not RSS or proof of zero execution-cost change.
+A repeat gives 119.65 MiB metadata, 183.65 MiB total and 6.91-second startup.
+Sampled active-vCPU cycles are 11.50 billion before and 12.62/11.48 billion in
+the two changed runs: no consistent cost regression detected, not a universal
+zero-cost guarantee. Recipes remain inline and registry reserves remain intact.
+Evidence and the repeated CPU comparison:
+`dump/perf-followup-20260922-004748-3s8ByZ/analysis.md`.

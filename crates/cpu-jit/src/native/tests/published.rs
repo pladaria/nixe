@@ -80,7 +80,7 @@ fn faulting_input(process: &Lifetime, cache: &Arc<Cache>, pc: u64) -> Input {
         entry,
         exit,
         (body, Some(length)),
-        ValueLocation::Constant(u128::from(pc)),
+        ValueLocation::constant(u128::from(pc)),
         NativeExitReason::Dispatch,
     )
 }
@@ -369,7 +369,7 @@ fn published_gateway_preserves_full_state_flags_fp_and_pins_before_quiescence() 
                 entry,
                 exit,
                 (emitter.finish(), None),
-                ValueLocation::Constant(0x12345678),
+                ValueLocation::constant(0x12345678),
                 NativeExitReason::Dispatch,
             )
         });

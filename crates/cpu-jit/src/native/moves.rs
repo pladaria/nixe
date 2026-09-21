@@ -75,7 +75,7 @@ impl Emitter {
                     class: Integer,
                     index,
                 },
-            ) => self.constant(index, value as u64, bytes),
+            ) => self.constant(index, value.get() as u64, bytes),
             (
                 Constant(value),
                 Register {
@@ -99,7 +99,7 @@ impl Emitter {
                 for delta in (0..bytes).step_by(usize::from(part)) {
                     match source {
                         Constant(value) => {
-                            self.constant(scratch, (value >> (delta * 8)) as u64, part)
+                            self.constant(scratch, (value.get() >> (delta * 8)) as u64, part)
                         }
                         Spill { offset, .. } => {
                             self.memory(true, Integer, scratch, offset + u32::from(delta), part)

@@ -2,7 +2,11 @@ use super::*;
 use crate::native::pic::{Record, Table, set_index};
 use crate::native::rsb::{emit_push, emit_return_probe};
 use crate::rsb::{CAPACITY, Continuation, ReturnStack};
-use nixe_cpu::{platform::TargetPlatform, profile::CpuProfileId, state::a64::Nzcv};
+use nixe_cpu::{
+    platform::TargetPlatform,
+    profile::CpuProfileId,
+    state::a64::{A64State, Nzcv},
+};
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 fn key(wide: bool) -> BlockKey {
@@ -20,6 +24,79 @@ fn key(wide: bool) -> BlockKey {
         } else {
             FpSpecialization::Dynamic
         },
+    }
+}
+
+#[test]
+fn shared_cold_exits_update_the_return_stack_exactly_once() {
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        let (source, _) = contracts(abi, &[]);
+        let target = key(true);
+        let pc = ValueLocation::constant(target.pc.get().into());
+        for returning in [false, true] {
+            let operation = if returning {
+                crate::native::rsb::emit_return_update(&source, target, pc).unwrap()
+            } else {
+                emit_push(&source, target).unwrap()
+            };
+            for indirect in [false, true] {
+                let (shared, [slice, control]) =
+                    super::super::canonical::emit_polled_exit(&source, pc, &operation, indirect)
+                        .unwrap();
+                if !canonical::native(abi) {
+                    continue;
+                }
+                for (path, offset) in [0, slice, control].into_iter().enumerate() {
+                    let mut bytes = gateway::landing(abi);
+                    if indirect && path == 0 {
+                        // The live probe performs the operation before falling
+                        // through on a cache miss; the fallback must not repeat it.
+                        bytes.extend_from_slice(&operation);
+                    }
+                    if abi == HostAbi::X86_64 {
+                        bytes.push(0xe9);
+                        bytes.extend((offset as i32).to_le_bytes());
+                    } else {
+                        bytes.extend((0x14000000 | ((offset as u32 + 4) / 4)).to_le_bytes());
+                    }
+                    bytes.extend_from_slice(&shared);
+                    let (owner, id) = gateway::compile(&bytes);
+                    let mut stack = ReturnStack {
+                        entries: [Continuation::from(target); CAPACITY],
+                        head: 2,
+                        depth: 2,
+                    };
+                    let mut state = A64State::default();
+                    {
+                        let mut frame =
+                            NativeFrame::new(&mut state, PollBudget::new(77, 1000).unwrap())
+                                .with_return_stack(&mut stack);
+                        frame.execution_epoch = 1;
+                        let result = unsafe {
+                            frame.begin_fp();
+                            enter_protected(
+                                &mut frame,
+                                std::ptr::null_mut(),
+                                owner.get_finalized_function(id),
+                            )
+                        }
+                        .unwrap();
+                        assert_eq!(
+                            result.reason,
+                            if path == 2 {
+                                NativeExitReason::Control
+                            } else {
+                                NativeExitReason::Dispatch
+                            }
+                        );
+                        assert_eq!(frame.budget.slice_remaining, 1000);
+                    }
+                    assert_eq!(stack.depth, if returning { 1 } else { 3 });
+                    assert_eq!(stack.head, stack.depth);
+                    assert_eq!(state.pc(), target.pc.get());
+                }
+            }
+        }
     }
 }
 
@@ -50,7 +127,7 @@ fn native_rsb_return_checks_full_keys_pops_and_uses_only_matched_pics() {
                                 .location
                         }
                         1 => spill(3400, 8),
-                        2 => ValueLocation::Constant(target.pc.get().into()),
+                        2 => ValueLocation::constant(target.pc.get().into()),
                         _ => vector(0),
                     };
                     let probe = emit_return_probe(&source, target, pc).unwrap();
@@ -61,7 +138,7 @@ fn native_rsb_return_checks_full_keys_pops_and_uses_only_matched_pics() {
                     hit.extend(
                         emit_canonical_exit(
                             &source,
-                            ValueLocation::Constant(0x4444),
+                            ValueLocation::constant(0x4444),
                             NativeExitReason::Dispatch,
                             0,
                         )
@@ -74,7 +151,7 @@ fn native_rsb_return_checks_full_keys_pops_and_uses_only_matched_pics() {
                     bytes.extend(
                         emit_canonical_exit(
                             &source,
-                            ValueLocation::Constant(0x8888),
+                            ValueLocation::constant(0x8888),
                             NativeExitReason::Control,
                             0,
                         )
@@ -239,7 +316,7 @@ fn native_rsb_push_wraps_and_saturates_without_changing_guest_state() {
                     bytes.extend(
                         emit_canonical_exit(
                             &source,
-                            ValueLocation::Constant(0x4444),
+                            ValueLocation::constant(0x4444),
                             NativeExitReason::Dispatch,
                             0,
                         )

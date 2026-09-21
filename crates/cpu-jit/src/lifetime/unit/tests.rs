@@ -146,7 +146,7 @@ pub(super) fn input_with_islands(
                 contract: EntryContract {
                     live_in: StateSet::default(),
                     abi,
-                    bindings: Box::new([]),
+                    bindings: std::sync::Arc::from([]),
                     nzcv: NzcvLocation::Canonical,
                 },
             })
@@ -168,7 +168,7 @@ pub(super) fn input_with_islands(
                 abi,
                 live: StateSet::default(),
                 dirty_live: StateSet::default(),
-                bindings: Box::new([]),
+                bindings: std::sync::Arc::from([]),
                 nzcv: NzcvLocation::Canonical,
                 host_fpsr_pending: false,
             },
@@ -274,10 +274,7 @@ fn metadata_and_exact_faults_are_live_before_multi_entry_dispatch() {
         assert_eq!(owner.abi_version, NATIVE_ABI_VERSION);
         // Publication consumed the backend proof. Runtime fault attribution
         // below must work from semantic maps without retaining a second copy.
-        assert!(owner.code.metadata.entries.is_empty());
-        assert!(owner.code.metadata.states.is_empty());
-        assert!(owner.code.metadata.faults.is_empty());
-        assert!(owner.code.metadata.relocations.is_empty());
+        assert!(owner.code.proofs.is_none());
         let fault = invocation.fault(base + 12).unwrap();
         // Unit ownership includes nonfaulting code, but that must not turn
         // arbitrary native PCs into attributed guest memory accesses.
@@ -662,7 +659,7 @@ fn guest_exit_indices_resolve_only_the_exact_captured_block_and_instruction() {
         block_index: 2,
         instruction_index: 3,
     };
-    let (block, instruction) = exit.source(&image).unwrap();
+    let (block, instruction) = exit.source(|i| image.get(i).copied()).unwrap();
     assert_eq!(block, key(0x80));
     assert_eq!(instruction.key, image[3].key);
     assert_eq!(instruction.bits, 3);
@@ -681,14 +678,58 @@ fn guest_exit_indices_resolve_only_the_exact_captured_block_and_instruction() {
                 pc: GuestVirtualAddress::new(pc),
                 ..exit
             }
-            .source(&image)
+            .source(|i| image.get(i).copied())
             .is_none()
         );
     }
     let mut foreign = key(0x84);
     foreign.address_space = AddressSpaceId::new(2);
     image[3].key = InstructionKey::new(foreign).unwrap();
-    assert!(exit.source(&image).is_none());
+    assert!(exit.source(|i| image.get(i).copied()).is_none());
+}
+
+#[test]
+fn binding_sharing_is_unit_local_and_charged_once_per_allocation() {
+    use crate::abi::{GuestValue, ValueBinding};
+    let process = process();
+    let mut candidate = input(&process, &[0, 4], Tier::Lcq);
+    let binding = ValueBinding {
+        value: GuestValue::General(0),
+        location: ValueLocation::Spill {
+            offset: TRANSFER_BYTES,
+            bytes: 8,
+        },
+    };
+    candidate.entries[0].contract.bindings = Arc::from([binding]);
+    candidate.entries[1].contract.bindings = Arc::from([binding]);
+    candidate.states[0].state.bindings = Arc::from([binding]);
+    let instruction_bytes = size_of_val(&*candidate.instructions);
+    let before = candidate.metadata_bytes(instruction_bytes);
+    candidate.share_bindings();
+    let shared = &candidate.entries[0].contract.bindings;
+    assert!(Arc::ptr_eq(shared, &candidate.entries[1].contract.bindings));
+    assert!(Arc::ptr_eq(shared, &candidate.states[0].state.bindings));
+    let after = candidate.metadata_bytes(instruction_bytes);
+    assert_eq!(
+        before - after,
+        2 * (size_of::<ValueBinding>() + 2 * size_of::<usize>())
+    );
+    candidate.share_bindings();
+    assert_eq!(candidate.metadata_bytes(instruction_bytes), after);
+    // Distinct physical locations must not be collapsed on the next pass.
+    Arc::make_mut(&mut candidate.states[0].state.bindings)[0].location = ValueLocation::Spill {
+        offset: TRANSFER_BYTES + 8,
+        bytes: 8,
+    };
+    candidate.share_bindings();
+    assert!(!Arc::ptr_eq(
+        &candidate.entries[0].contract.bindings,
+        &candidate.states[0].state.bindings
+    ));
+    assert_eq!(
+        candidate.metadata_bytes(instruction_bytes),
+        after + size_of::<ValueBinding>() + 2 * size_of::<usize>()
+    );
 }
 
 #[test]
@@ -729,9 +770,9 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
             6 => candidate.instructions[0].key = InstructionKey::new(key(8)).unwrap(),
             7 => candidate.states[0].state.site.source = CodeVersion::new(u64::MAX).unwrap(),
             8 => candidate.faults[0].native_end -= 1,
-            9 => candidate.code.metadata.faults[0].fault_bytes = 0,
+            9 => candidate.code.proofs.as_mut().unwrap().faults[0].fault_bytes = 0,
             10 => candidate.faults[0].native_end += 1,
-            11 => candidate.faults[0].completed_read = Some(ValueLocation::Constant(0)),
+            11 => candidate.faults[0].completed_read = Some(ValueLocation::constant(0)),
             15 => candidate.faults[0].completed = 2048,
             12 | 13 => {
                 candidate.faults[0].subaccess = 1;
@@ -740,16 +781,16 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
                     index: candidate.code.metadata.abi.reserved().frame,
                 });
                 if case == 13 {
-                    candidate.faults[0].completed_read = Some(ValueLocation::Constant(0));
+                    candidate.faults[0].completed_read = Some(ValueLocation::constant(0));
                     candidate.faults[0].commit_stage = 1;
                 }
             }
             14 => {
-                let before = candidate.metadata_bytes();
+                let before = candidate.metadata_bytes(size_of_val(&*candidate.instructions));
                 // A fault observation is not a patchable terminal. The payload
                 // must still be charged even when publication will reject it.
                 candidate.states[0].transfer = Some(Box::new(TerminalTransfer {
-                    destination: ValueLocation::Constant(4),
+                    destination: ValueLocation::constant(4),
                     static_target: Some(key(4)),
                     completed: 1,
                     patch_bytes: if candidate.code.metadata.abi == HostAbi::X86_64 {
@@ -761,7 +802,7 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
                     poll_offset: None,
                 }));
                 assert_eq!(
-                    candidate.metadata_bytes() - before,
+                    candidate.metadata_bytes(size_of_val(&*candidate.instructions)) - before,
                     size_of::<TerminalTransfer>()
                 );
             }

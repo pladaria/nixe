@@ -257,6 +257,120 @@ fn emit_exit(
     completed: u16,
     continuation: usize,
 ) -> Result<Vec<u8>, TransferError> {
+    if reason == NativeExitReason::None {
+        return Err(TransferError::InvalidContract(
+            "canonical exit needs a reason",
+        ));
+    }
+    let mut emitter = exit_state(source, pc, completed)?;
+    exit_identity(&mut emitter, source, reason);
+    exit_continuation(&mut emitter, continuation);
+    Ok(emitter.finish())
+}
+
+/// Cold entries with one state materialization and one RSB update. Entry zero
+/// is the dispatch fallback; returned offsets are [slice, control]. A lookup
+/// miss has already updated the RSB, whereas both poll exits must still do so.
+/// The reason/map pair is
+/// selected before writeback using only link scratch and flag-transparent moves.
+/// No new frame storage, relocation, shared owner or hot-edge work is required.
+/// Both entries have already charged their terminal checkpoint.
+pub(crate) fn emit_polled_exit(
+    source: &ExitStateMap,
+    pc: ValueLocation,
+    operation: &[u8],
+    indirect: bool,
+) -> Result<(Vec<u8>, [usize; 2]), TransferError> {
+    let mut emitter = Emitter::new(source.abi);
+    exit_identity(&mut emitter, source, NativeExitReason::Dispatch);
+    let skip = emitter.code.len();
+    if source.abi == HostAbi::X86_64 {
+        emitter.code_byte(0xe9);
+        emitter.word(0);
+    } else {
+        emitter.word(0x14000000);
+    }
+    let control = emitter.code.len();
+    exit_identity(&mut emitter, source, NativeExitReason::Control);
+    let mut control_skip = None;
+    let slice = if indirect && !operation.is_empty() {
+        control_skip = Some(emitter.code.len());
+        if source.abi == HostAbi::X86_64 {
+            emitter.code_byte(0xe9);
+            emitter.word(0);
+        } else {
+            emitter.word(0x14000000);
+        }
+        let slice = emitter.code.len();
+        exit_identity(&mut emitter, source, NativeExitReason::Dispatch);
+        slice
+    } else {
+        0
+    };
+    let update = emitter.code.len();
+    emitter.code.extend_from_slice(operation);
+    let common = emitter.code.len();
+    for (branch, target) in std::iter::once((skip, if indirect { common } else { update }))
+        .chain(control_skip.map(|branch| (branch, update)))
+    {
+        if source.abi == HostAbi::X86_64 {
+            emitter.code[branch + 1..branch + 5]
+                .copy_from_slice(&((target - branch - 5) as i32).to_le_bytes());
+        } else {
+            emitter.code[branch..branch + 4]
+                .copy_from_slice(&(0x14000000 | ((target - branch) as u32 / 4)).to_le_bytes());
+        }
+    }
+    emitter.code.extend(exit_state(source, pc, 0)?.finish());
+    // Architectural values are now canonical, including lazy flags. Only these
+    // cold paths inspect the selected reason; a linked hot exit bypasses both.
+    let branch;
+    if source.abi == HostAbi::X86_64 {
+        emitter.x64(
+            &[],
+            false,
+            &[0xf6],
+            0,
+            source.abi.reserved().frame,
+            Some(offset_of!(NativeFrame<'static>, exit_reason) as u32),
+        );
+        emitter.code_byte(2); // TEST byte [frame+reason],2: Control=3, Dispatch=1
+        emitter.code.extend([0x0f, 0x85]); // JNZ gateway
+        branch = emitter.code.len();
+        emitter.word(0);
+    } else {
+        emitter.memory(
+            true,
+            RegisterClass::Integer,
+            16,
+            offset_of!(NativeFrame<'static>, exit_state_map) as u32,
+            8,
+        );
+        branch = emitter.code.len();
+        emitter.word(0); // TBNZ X16,#33,gateway (reason bit 1 in packed pair)
+    }
+    const _: () = assert!(NativeExitReason::Dispatch as u32 == 1);
+    const _: () = assert!(NativeExitReason::Control as u32 == 3);
+    exit_continuation(
+        &mut emitter,
+        offset_of!(NativeFrame<'static>, dispatch_fallback),
+    );
+    let gateway = emitter.code.len();
+    let patch = if source.abi == HostAbi::X86_64 {
+        (gateway - branch - 4) as u32
+    } else {
+        0xb7080010 | (((gateway - branch) as u32 / 4) << 5)
+    };
+    emitter.code[branch..branch + 4].copy_from_slice(&patch.to_le_bytes());
+    exit_continuation(&mut emitter, offset_of!(NativeFrame<'static>, gateway_exit));
+    Ok((emitter.finish(), [slice, control]))
+}
+
+fn exit_state(
+    source: &ExitStateMap,
+    pc: ValueLocation,
+    completed: u16,
+) -> Result<Emitter, TransferError> {
     if completed > 2048 {
         return Err(TransferError::InvalidContract(
             "exit work exceeds unit bound",
@@ -265,13 +379,8 @@ fn emit_exit(
     if !pc.valid(source.abi, 8) {
         return Err(TransferError::InvalidContract("invalid exit PC location"));
     }
-    if reason == NativeExitReason::None {
-        return Err(TransferError::InvalidContract(
-            "canonical exit needs a reason",
-        ));
-    }
-    let mut code = emit_canonical_writeback(source)?;
     let mut emitter = Emitter::new(source.abi);
+    emitter.code = emit_canonical_writeback(source)?;
     let scratch = source.abi.reserved().link_scratch[0];
     emitter.copy(Copy {
         source: pc,
@@ -347,6 +456,11 @@ fn emit_exit(
         offset_of!(NativeFrame<'static>, exit_source_version) as u32,
         8,
     );
+    Ok(emitter)
+}
+
+fn exit_identity(emitter: &mut Emitter, source: &ExitStateMap, reason: NativeExitReason) {
+    let scratch = source.abi.reserved().link_scratch[0];
     // The two adjacent u32 fields are one little-endian store. Besides being
     // smaller, this keeps the AArch64 metadata access within scaled LDR/STR's
     // 64-bit immediate range above the 16 KiB spill arena.
@@ -367,6 +481,10 @@ fn emit_exit(
         offset_of!(NativeFrame<'static>, exit_state_map) as u32,
         8,
     );
+}
+
+fn exit_continuation(emitter: &mut Emitter, continuation: usize) {
+    let scratch = emitter.abi.reserved().link_scratch[0];
     emitter.memory(
         true,
         RegisterClass::Integer,
@@ -375,8 +493,6 @@ fn emit_exit(
         8,
     );
     emitter.jump_register(scratch);
-    code.extend(emitter.finish());
-    Ok(code)
 }
 
 fn temporary_register(abi: HostAbi) -> u8 {
@@ -457,9 +573,11 @@ fn emit_operands(emitter: &mut Emitter, abi: HostAbi, load: bool, mut operands: 
                                 offset + u32::from(delta),
                                 part,
                             ),
-                            ValueLocation::Constant(value) => {
-                                emitter.constant(temporary, (value >> (delta * 8)) as u64, part)
-                            }
+                            ValueLocation::Constant(value) => emitter.constant(
+                                temporary,
+                                (value.get() >> (delta * 8)) as u64,
+                                part,
+                            ),
                             _ => unreachable!(),
                         }
                     }

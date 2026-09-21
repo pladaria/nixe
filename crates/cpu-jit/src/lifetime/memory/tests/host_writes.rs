@@ -70,7 +70,13 @@ fn host_write_retranslates_after_device_writeback_remaps_the_destination() {
     assert_eq!(old_bytes, [0x55; 4]);
     let new = publish(&process, &memory, 0x1000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xd4200120
     );
     assert_eq!(process.lock().phase, Phase::Open);
@@ -151,10 +157,16 @@ fn host_overwrite_drains_real_code_and_fault_readers_before_touching_readonly_by
     assert!(process.snapshot(other).is_ok());
     let new = publish(&process, &memory, 0x1000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xd4200120
     );
-    assert_eq!(snapshot.instructions[0].bits, 0xf9400020);
+    assert_eq!(snapshot.instructions.get(0).unwrap().bits, 0xf9400020);
 }
 
 #[test]

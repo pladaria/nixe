@@ -716,12 +716,12 @@ impl HostAbi {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RegisterClass {
     Integer,
     Vector,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ValueLocation {
     Register {
         class: RegisterClass,
@@ -732,9 +732,21 @@ pub enum ValueLocation {
         offset: u32,
         bytes: u8,
     },
-    Constant(u128),
+    Constant(ConstantBits),
+}
+/// Keep the full vector constant without imposing u128 alignment on every
+/// register/spill location, binding and inline lazy-flags recipe.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConstantBits([u64; 2]);
+impl ConstantBits {
+    pub const fn get(self) -> u128 {
+        self.0[0] as u128 | ((self.0[1] as u128) << 64)
+    }
 }
 impl ValueLocation {
+    pub const fn constant(value: u128) -> Self {
+        Self::Constant(ConstantBits([value as u64, (value >> 64) as u64]))
+    }
     pub fn valid(self, abi: HostAbi, bytes: u8) -> bool {
         match self {
             Self::Register {
@@ -773,10 +785,10 @@ impl ValueLocation {
                         .is_some_and(|end| end <= SPILL_BYTES)
             }
             Self::Constant(value) => match bytes {
-                1 => value <= u128::from(u8::MAX),
-                2 => value <= u128::from(u16::MAX),
-                4 => value <= u128::from(u32::MAX),
-                8 => value <= u128::from(u64::MAX),
+                1 => value.get() <= u128::from(u8::MAX),
+                2 => value.get() <= u128::from(u16::MAX),
+                4 => value.get() <= u128::from(u32::MAX),
+                8 => value.get() <= u128::from(u64::MAX),
                 16 => true,
                 _ => false,
             },
@@ -941,7 +953,7 @@ pub enum RuntimeSystemOperation {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum GuestValue {
     General(u8),
     Sp,
@@ -974,7 +986,7 @@ impl GuestValue {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ValueBinding {
     pub value: GuestValue,
     pub location: ValueLocation,
@@ -1002,7 +1014,7 @@ pub struct CanonicalEntryContract {
 pub struct EntryContract {
     pub live_in: StateSet,
     pub abi: HostAbi,
-    pub bindings: Box<[ValueBinding]>,
+    pub bindings: std::sync::Arc<[ValueBinding]>,
     pub nzcv: NzcvLocation,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1015,7 +1027,7 @@ pub struct ExitStateMap {
     /// Values whose canonical homes may be stale, including inherited fast-entry
     /// state still needed by this boundary, not just writes performed in this unit.
     pub dirty_live: StateSet,
-    pub bindings: Box<[ValueBinding]>,
+    pub bindings: std::sync::Arc<[ValueBinding]>,
     pub nzcv: NzcvLocation,
     /// Host status may be pending, including from earlier units. OR it with
     /// mapped/canonical software FPSR only when NativeFrame owns an active
@@ -1236,6 +1248,33 @@ mod tests {
     use std::mem::{align_of, size_of};
 
     #[test]
+    fn compact_locations_preserve_all_constant_bits_and_width_checks() {
+        assert_eq!(align_of::<ValueLocation>(), 8);
+        assert_eq!(size_of::<ValueLocation>(), 24);
+        assert_eq!(size_of::<ValueBinding>(), 32);
+        for bits in [
+            0,
+            u64::MAX as u128,
+            1_u128 << 64,
+            0x8123456789abcdef_fedcba9876543210,
+            u128::MAX,
+        ] {
+            let location = ValueLocation::constant(bits);
+            let ValueLocation::Constant(value) = location else {
+                unreachable!()
+            };
+            assert_eq!(value.get(), bits);
+            for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+                assert!(location.valid(abi, 16));
+                for bytes in [1, 2, 4, 8] {
+                    assert_eq!(location.valid(abi, bytes), bits < (1_u128 << (bytes * 8)));
+                }
+                assert!(!location.valid(abi, 3));
+            }
+        }
+    }
+
+    #[test]
     fn identities_never_wrap_or_reuse_zero() {
         let mut counter = CheckedCounter::<CodeVersion>::default();
         assert_eq!(counter.next_id().unwrap().get(), 1);
@@ -1411,7 +1450,7 @@ mod tests {
             let mut entry = EntryContract {
                 live_in: required,
                 abi,
-                bindings: vec![binding].into_boxed_slice(),
+                bindings: vec![binding].into(),
                 nzcv: NzcvLocation::Canonical,
             };
             assert!(entry.validate().is_ok());
@@ -1432,7 +1471,7 @@ mod tests {
                     ..binding
                 },
             ]
-            .into_boxed_slice();
+            .into();
             assert_eq!(entry.validate(), Err("distinct fast inputs overlap"));
         }
     }
@@ -1452,24 +1491,24 @@ mod tests {
             abi: HostAbi::X86_64,
             live: required,
             dirty_live: required,
-            bindings: Box::new([]),
+            bindings: std::sync::Arc::from([]),
             nzcv: NzcvLocation::Canonical,
             host_fpsr_pending: true,
         };
         assert!(exit.validate().is_err());
         exit.nzcv = NzcvLocation::Deferred(LazyFlags::Subtract {
-            lhs: ValueLocation::Constant(8),
-            rhs: ValueLocation::Constant(3),
-            result: ValueLocation::Constant(5),
+            lhs: ValueLocation::constant(8),
+            rhs: ValueLocation::constant(3),
+            result: ValueLocation::constant(5),
             width: 64,
         });
         assert!(exit.validate().is_ok());
         exit.live.integer.x.insert(7);
         exit.bindings = vec![ValueBinding {
             value: GuestValue::General(7),
-            location: ValueLocation::Constant(42),
+            location: ValueLocation::constant(42),
         }]
-        .into_boxed_slice();
+        .into();
         assert!(
             exit.validate().is_ok(),
             "clean live locations are needed by fast bridges too"
@@ -1492,7 +1531,7 @@ mod tests {
                 bytes: 1,
             },
             when_true: Box::new(LazyFlags::Logical {
-                result: ValueLocation::Constant(0),
+                result: ValueLocation::constant(0),
                 width: 32,
             }),
             when_false: 15,

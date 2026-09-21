@@ -88,7 +88,14 @@ impl Units {
         self.static_sources(target).any(|site| {
             let code = &self.records.get(site.source.0).unwrap().code;
             let exit = code.states[site.state_map as usize].exit.unwrap();
-            let source = code.instructions[0].key.block_key().at(exit.pc).unwrap();
+            let source = code
+                .instructions
+                .get(0)
+                .unwrap()
+                .key
+                .block_key()
+                .at(exit.pc)
+                .unwrap();
             !contains(InstructionKey::new(source).unwrap())
         })
     }

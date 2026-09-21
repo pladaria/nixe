@@ -767,7 +767,7 @@ impl Transition<'_> {
             let units = &mut state.units;
             let record = units.records.get(handle).unwrap();
             if let Some(family) = record.family {
-                for instruction in &record.code.instructions {
+                for instruction in record.code.instructions.iter() {
                     assert!(units.family_owners.remove(instruction.key, family));
                 }
             }

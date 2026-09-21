@@ -236,7 +236,7 @@ fn hcq_runtime_internal_samples_resume_and_resolve_noncontiguous_source() {
                 .iter()
                 .map(|word| word.instruction)
                 .collect();
-            let source = guest.source(&image).unwrap().1;
+            let source = guest.source(|i| image.get(i).copied()).unwrap().1;
             assert_eq!(source.key, instruction.key);
             assert_eq!(source.bits, instruction.bits);
             assert!(matches!(guest.pc.get(), 0x1004 | 0x1044));

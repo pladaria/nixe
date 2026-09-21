@@ -96,5 +96,13 @@ impl Directory {
 
 pub(crate) struct Fault<'a> {
     pub unit: &'a CodeUnit,
-    pub record: &'a FaultRecord,
+    pub record: &'a FaultRecord<u16>,
+}
+impl Fault<'_> {
+    pub(crate) fn instruction(&self) -> super::unit::Instruction {
+        self.unit
+            .instructions
+            .get(usize::from(self.record.instruction))
+            .expect("published fault ordinal was validated")
+    }
 }

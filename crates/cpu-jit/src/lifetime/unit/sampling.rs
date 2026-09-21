@@ -200,7 +200,7 @@ mod tests {
                     2 => process.sample_transfer(
                         &unit,
                         key(0),
-                        unit.instructions[0].key,
+                        unit.instructions.get(0).unwrap().key,
                         &mut samples,
                         ObservedEdge {
                             destination: key(4).pc,

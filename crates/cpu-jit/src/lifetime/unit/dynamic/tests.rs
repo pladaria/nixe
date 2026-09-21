@@ -21,13 +21,13 @@ fn source_with_binding(
 ) -> UnitHandle {
     let mut candidate = input(process, &[pc], Tier::Lcq);
     candidate.faults = Box::new([]);
-    candidate.code.metadata.faults = Box::new([]);
+    candidate.code.proofs.as_mut().unwrap().faults = Box::new([]);
     let width = if candidate.code.metadata.abi == HostAbi::X86_64 {
         8
     } else {
         4
     };
-    candidate.code.metadata.states = (0..2)
+    candidate.code.proofs.as_mut().unwrap().states = (0..2)
         .map(|id| StateMap {
             id,
             offset: 8,
@@ -45,9 +45,9 @@ fn source_with_binding(
             state.site.state_map = id;
             if constant_x0 {
                 state.live.integer.x.insert(0);
-                state.bindings = Box::new([ValueBinding {
+                state.bindings = std::sync::Arc::from([ValueBinding {
                     value: GuestValue::General(0),
-                    location: ValueLocation::Constant(17),
+                    location: ValueLocation::constant(17),
                 }]);
             }
             StateRecord {
@@ -203,7 +203,7 @@ fn dynamic_nonempty_transfer_is_charged_reusable_and_has_no_static_islands() {
     // A constant source X0 must become physical integer register zero. Remove
     // the synthetic leaf's MOV so its return exposes the transferred value.
     // Reinstall unpublished bytes, retaining the landing and unreachable maps.
-    let old = candidate.code;
+    let mut old = candidate.code;
     let mut bytes = unsafe {
         std::slice::from_raw_parts(old.allocation.address() as *const u8, old.allocation.len())
     }
@@ -219,14 +219,14 @@ fn dynamic_nonempty_transfer_is_charged_reusable_and_has_no_static_islands() {
             crate::executable::output::Output {
                 bytes: bytes.into_boxed_slice(),
                 alignment: 16,
-                metadata: old.metadata,
+                metadata: *old.proofs.take().unwrap(),
             },
             Tier::Lcq,
             |_| None,
         )
         .unwrap();
     candidate.entries[0].contract.live_in.integer.x.insert(0);
-    candidate.entries[0].contract.bindings = Box::new([ValueBinding {
+    candidate.entries[0].contract.bindings = std::sync::Arc::from([ValueBinding {
         value: GuestValue::General(0),
         location: ValueLocation::Register {
             class: RegisterClass::Integer,

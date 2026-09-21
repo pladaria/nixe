@@ -448,6 +448,17 @@ slots count against the same cache budget as their CodeUnit; empty slots are
 reused. There is no permanent range partition, process-lifetime node pool or
 second executable lookup table.
 
+Resident metadata keeps one execution context per captured instruction image
+and stores each word as PC plus exact bits. After validating staged full keys,
+fault records use checked instruction ordinals for O(1) image lookup; these
+ordinals are distinct from completed-instruction counts. Identical binding
+slices may share immutable storage within a unit, charged once including their
+ownership headers. Backend proof arrays and their headers are discarded after
+validation; resident code retains only ABI/frame extent. Compact locations
+preserve full 128-bit constants without imposing 128-bit alignment on every
+binding. These representations must not add metadata lookup or interpretation
+to resolved native links. Lazy-flags recipes remain inline.
+
 ## Native fast-chain ABI
 
 The x86-64 ABI requires LAHF/SAHF in 64-bit mode, as documented in
@@ -611,6 +622,13 @@ no canonical-state traffic. A PIC miss canonicalizes the observable dirty state
 before its cold resolver. Dynamic BridgeUnits are bounded by the number of
 live PIC ways, deduplicated weakly and retired through the same epoch/cache
 lifecycle as normal code.
+
+For each charged external exit, link-miss, slice and control paths share their
+source-specific canonical writeback and identity publication. Cold RSB updates
+are emitted once: a PIC/RSB miss skips an update already performed by the probe,
+whereas slice/control paths still perform it exactly once. The selected reason
+uses the existing NativeFrame exit fields. This sharing stays inside the owning
+unit and adds no call, frame storage or instruction to a successful fast link.
 
 The ABI does not promise that all 31 GPRs and 32 vectors remain permanently
 assigned to host registers across independently allocated LCQ blocks; HCQ

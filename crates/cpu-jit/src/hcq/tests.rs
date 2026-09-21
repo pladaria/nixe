@@ -28,7 +28,7 @@ pub(super) fn words(pc: u64, bits: &[u32]) -> Vec<Instruction> {
 fn graph(seed: u64, inputs: &[(u64, &[u32])]) -> (Vec<Word>, Vec<Block>) {
     let mut builder = Builder::new(key(seed));
     for &(pc, bits) in inputs {
-        builder.merge(key(pc), &words(pc, bits)).unwrap();
+        builder.merge(key(pc), words(pc, bits)).unwrap();
     }
     builder.finish().unwrap()
 }
@@ -140,7 +140,7 @@ fn semantic_stops_reuse_lcq_boundary_classification() {
 #[test]
 fn observed_interior_targets_split_without_becoming_public_entries() {
     let mut builder = Builder::new(key(0));
-    builder.merge(key(0), &words(0, &[NOP, NOP, RET])).unwrap();
+    builder.merge(key(0), words(0, &[NOP, NOP, RET])).unwrap();
     builder.leader(key(4)).unwrap();
     builder.leader(key(100)).unwrap();
     let (instructions, blocks) = builder.finish().unwrap();
@@ -163,9 +163,9 @@ fn direct_backedge_splits_an_interior_leader_without_an_extra_lcq_root() {
 #[test]
 fn conflicting_bytes_or_execution_context_are_stale() {
     let mut builder = Builder::new(key(0));
-    builder.merge(key(0), &words(0, &[NOP, RET])).unwrap();
+    builder.merge(key(0), words(0, &[NOP, RET])).unwrap();
     assert_eq!(
-        builder.merge(key(4), &words(4, &[NOP])),
+        builder.merge(key(4), words(4, &[NOP])),
         Err(Error::StaleCapture)
     );
     let foreign = BlockKey {
@@ -176,7 +176,7 @@ fn conflicting_bytes_or_execution_context_are_stale() {
     assert_eq!(
         builder.merge(
             key(0),
-            &[Instruction {
+            [Instruction {
                 key: InstructionKey::new(foreign).unwrap(),
                 bits: NOP,
             }]
@@ -189,7 +189,7 @@ fn conflicting_bytes_or_execution_context_are_stale() {
 fn malformed_input_and_empty_seed_are_not_fabricated_as_code() {
     let mut builder = Builder::new(key(0));
     assert_eq!(
-        builder.merge(key(0), &words(4, &[NOP])),
+        builder.merge(key(0), words(4, &[NOP])),
         Err(Error::InvalidInput(
             "HCQ LCQ image is not contiguous from its root"
         ))
@@ -205,7 +205,7 @@ fn overlap_count_is_distinct_guest_words_not_fragment_lengths() {
     let mut builder = Builder::new(key(0));
     let bits = [NOP; 512];
     for pc in [0, 512, 1024, 1536] {
-        builder.merge(key(pc), &words(pc, &bits)).unwrap();
+        builder.merge(key(pc), words(pc, &bits)).unwrap();
     }
     let (instructions, _) = builder.finish().unwrap();
     assert_eq!(instructions.len(), 896); // Four overlapping 512-word inputs.

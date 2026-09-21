@@ -22,11 +22,12 @@ fn mixed_source(process: &Lifetime, cursor: &AtomicU64) -> UnitHandle {
         transfer: Some(Box::new(transfer)),
     });
     candidate.states = maps.into_boxed_slice();
-    let mut backend_maps = candidate.code.metadata.states.into_vec();
+    let mut backend_maps =
+        std::mem::take(&mut candidate.code.proofs.as_mut().unwrap().states).into_vec();
     let mut dynamic = backend_maps[0].clone();
     dynamic.id = 1;
     backend_maps.push(dynamic);
-    candidate.code.metadata.states = backend_maps.into_boxed_slice();
+    candidate.code.proofs.as_mut().unwrap().states = backend_maps.into_boxed_slice();
     let source = process
         .prepare_unit(&[process.reserve(key(0)).unwrap()], candidate, cursor)
         .unwrap()

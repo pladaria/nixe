@@ -66,7 +66,13 @@ fn initialization_drains_published_code_and_cancels_owned_captures() {
     );
     let new = publish(&process, &memory, 0x1000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xd4200120
     );
     assert_eq!(process.lock().phase, Phase::Open);

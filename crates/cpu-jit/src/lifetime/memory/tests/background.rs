@@ -35,7 +35,7 @@ fn mapping_change_cancels_running_compilation_without_waiting_and_allows_retry()
         let result = work.check();
         // The immutable old image survives unlink/republication until this
         // compiler releases it. It does not hold an execution epoch open.
-        assert_eq!(source.unit.instructions[0].bits, 0xf9400020);
+        assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xf9400020);
         drop(source);
         drop(work);
         finished.send((call, result)).unwrap();

@@ -84,7 +84,7 @@ fn fixed_workers_have_private_reusable_compiler_and_decoder_storage() {
             panic!("expected seed")
         };
         let input = work.lcq(observed.key).map_err(fail)?.unwrap();
-        for instruction in &input.unit.instructions {
+        for instruction in input.unit.instructions.iter() {
             let key = instruction.key.block_key();
             resources.decoded.push(nixe_cpu::decode::decode(
                 key.platform,
@@ -309,7 +309,7 @@ fn process_shutdown_cancels_running_work_drains_jobs_and_blocks_late_enqueue() {
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap();
             assert_eq!(work.check(), Err(lifetime::Error::StalePublication));
-            assert_eq!(source.unit.instructions[0].bits, 0xd503201f);
+            assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
             Ok(())
         })
         .unwrap()

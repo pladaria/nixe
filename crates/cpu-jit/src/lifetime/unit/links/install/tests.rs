@@ -12,7 +12,7 @@ mod maintenance;
 fn target_binding(input: &mut Input) {
     use crate::abi::{GuestValue, RegisterClass, ValueBinding};
     input.entries[0].contract.live_in.integer.x.insert(0);
-    input.entries[0].contract.bindings = Box::new([ValueBinding {
+    input.entries[0].contract.bindings = std::sync::Arc::from([ValueBinding {
         value: GuestValue::General(0),
         location: ValueLocation::Register {
             class: RegisterClass::Integer,
@@ -597,8 +597,7 @@ fn nonempty_transfer_storage_is_owned_until_unlink_and_then_reused() {
         let record = state.units.links.records.get(handle.0).unwrap();
         assert!(record.installed);
         let bridge = record.bridge.as_ref().unwrap();
-        assert!(bridge.metadata.faults.is_empty());
-        assert!(bridge.metadata.states.is_empty());
+        assert!(bridge.proofs.is_none());
         (
             bridge.allocation.address(),
             bridge.allocation.island_address(0).unwrap(),
@@ -704,9 +703,9 @@ fn far_installed_target(with_bridge: bool) {
         // this synthetic System-ABI chain can execute the owned bridge too.
         input.states[0].state.live.integer.x.insert(0);
         input.states[0].state.dirty_live.integer.x.insert(0);
-        input.states[0].state.bindings = Box::new([crate::abi::ValueBinding {
+        input.states[0].state.bindings = std::sync::Arc::from([crate::abi::ValueBinding {
             value: crate::abi::GuestValue::General(0),
-            location: ValueLocation::Constant(9),
+            location: ValueLocation::constant(9),
         }]);
     }
     let src = process
@@ -785,7 +784,7 @@ fn far_installed_target(with_bridge: bool) {
             Output {
                 bytes,
                 alignment: SEGMENT_BYTES,
-                metadata: old.metadata,
+                metadata: *old.proofs.unwrap(),
             },
             Tier::Lcq,
             |_| None,

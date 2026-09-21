@@ -115,7 +115,7 @@ fn canonical_entry_loads_real_state_into_registers_and_spills() {
         for flags_in_rax in [false, true] {
             let (_, mut target) = complete(abi);
             if flags_in_rax {
-                target.bindings[0].location = spill(3248, 8);
+                std::sync::Arc::make_mut(&mut target.bindings)[0].location = spill(3248, 8);
                 target.nzcv = NzcvLocation::Packed(integer(0));
             }
             let code = emit_canonical_entry(&target).unwrap();
@@ -236,15 +236,18 @@ fn canonical_writeback_commits_only_dirty_values_and_selected_flag_bits() {
                 nzcv: mask,
                 ..StateSet::default()
             };
-            for (index, binding) in source.bindings.iter_mut().enumerate() {
+            for (index, binding) in std::sync::Arc::make_mut(&mut source.bindings)
+                .iter_mut()
+                .enumerate()
+            {
                 if index % 3 == usize::from(mask % 3) {
                     source.dirty_live = source.dirty_live.union(binding.value.state().unwrap());
                 }
                 if index == 7 {
-                    binding.location = ValueLocation::Constant(0xabcdef0123456789);
+                    binding.location = ValueLocation::constant(0xabcdef0123456789);
                 }
                 if index == 40 {
-                    binding.location = ValueLocation::Constant(u128::MAX);
+                    binding.location = ValueLocation::constant(u128::MAX);
                 }
             }
             let flags = match mask % 3 {
@@ -263,7 +266,7 @@ fn canonical_writeback_commits_only_dirty_values_and_selected_flag_bits() {
                 let mut frame = NativeFrame::new(&mut state, PollBudget::new(77, 1000).unwrap());
                 initialize(&mut frame);
                 let before = *arena(&frame);
-                for binding in &source.bindings {
+                for binding in source.bindings.iter() {
                     if source
                         .dirty_live
                         .intersection(binding.value.state().unwrap())
@@ -282,7 +285,7 @@ fn canonical_writeback_commits_only_dirty_values_and_selected_flag_bits() {
                     (expected.nzcv().bits() & !mask) | (flags & mask),
                 ));
                 invoke(abi, code, &mut frame);
-                for binding in &source.bindings {
+                for binding in source.bindings.iter() {
                     assert_eq!(
                         read(arena(&frame), binding.location, binding.value.bytes(), true),
                         read(&before, binding.location, binding.value.bytes(), false),
@@ -310,8 +313,7 @@ fn canonical_adapters_compose_with_a_real_fast_transfer() {
                 .map(|b| b.location)
                 .rev()
                 .collect();
-            for (binding, location) in destination
-                .bindings
+            for (binding, location) in std::sync::Arc::make_mut(&mut destination.bindings)
                 .iter_mut()
                 .filter(|b| b.value.bytes() == bytes)
                 .zip(locations)
@@ -367,7 +369,7 @@ fn pending_host_fpsr_is_merged_after_software_writeback() {
         for location in [
             Some(integer(0)),
             Some(spill(3240, 4)),
-            Some(ValueLocation::Constant((1 << 27) | (1 << 4))),
+            Some(ValueLocation::constant((1 << 27) | (1 << 4))),
             None,
         ] {
             let values: Vec<_> = location

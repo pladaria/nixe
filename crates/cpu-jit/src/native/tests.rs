@@ -128,22 +128,22 @@ fn cycles_aliases_constants_and_cross_bank_transfers() {
                 (GuestValue::Fpsr, integer(9), vector(9)),
                 (
                     GuestValue::General(6),
-                    ValueLocation::Constant(0xfeed123456789abc),
+                    ValueLocation::constant(0xfeed123456789abc),
                     vector(10),
                 ),
                 (
                     GuestValue::Vector(4),
-                    ValueLocation::Constant(0x8123456789abcdef_fedcba9876543210),
+                    ValueLocation::constant(0x8123456789abcdef_fedcba9876543210),
                     vector(11),
                 ),
                 (
                     GuestValue::Vector(5),
-                    ValueLocation::Constant(u128::MAX),
+                    ValueLocation::constant(u128::MAX),
                     spill(2320, 16),
                 ),
                 (
                     GuestValue::General(7),
-                    ValueLocation::Constant(0x8000000000000001),
+                    ValueLocation::constant(0x8000000000000001),
                     integer(10),
                 ),
             ],
@@ -182,7 +182,7 @@ fn packed_flags_participate_in_the_copy_graph() {
         source.nzcv = NzcvLocation::Packed(integer(0));
         target.nzcv = NzcvLocation::Packed(integer(1));
         execute(&source, &target, 43);
-        source.nzcv = NzcvLocation::Packed(ValueLocation::Constant(0xa0000000));
+        source.nzcv = NzcvLocation::Packed(ValueLocation::constant(0xa0000000));
         target.nzcv = NzcvLocation::Packed(spill(2048, 4));
         execute(&source, &target, 47);
     }
@@ -198,7 +198,7 @@ fn unavailable_inputs_fail_and_valid_flag_conversions_emit() {
     );
     target.abi = source.abi;
     target.live_in.integer.x.insert(0);
-    target.bindings = Box::new([ValueBinding {
+    target.bindings = std::sync::Arc::from([ValueBinding {
         value: GuestValue::General(0),
         location: integer(0),
     }]);
@@ -210,7 +210,7 @@ fn unavailable_inputs_fail_and_valid_flag_conversions_emit() {
         nzcv: NZCV,
         ..StateSet::default()
     };
-    target.bindings = Box::new([]);
+    target.bindings = std::sync::Arc::from([]);
     target.nzcv = NzcvLocation::Packed(integer(0));
     assert_eq!(
         emit_fast_transfer(&source, &target),
@@ -281,8 +281,8 @@ fn randomized_full_register_files_with_aliases_and_spills() {
                 source_vectors[7] = source_vectors[4];
             }
             if iteration % 3 == 0 {
-                source_ints[5] = ValueLocation::Constant(u128::from(next(&mut seed)));
-                source_vectors[9] = ValueLocation::Constant(
+                source_ints[5] = ValueLocation::constant(u128::from(next(&mut seed)));
+                source_vectors[9] = ValueLocation::constant(
                     u128::from(next(&mut seed)) | (u128::from(next(&mut seed)) << 64),
                 );
             }
@@ -469,7 +469,7 @@ fn invoke_inner(abi: HostAbi, mut bytes: Vec<u8>, frame: &mut NativeFrame<'_>, f
 fn read(frame: &[u8], location: ValueLocation, bytes: u8, output: bool) -> Vec<u8> {
     let offset = match location {
         ValueLocation::Constant(value) => {
-            return value.to_le_bytes()[..usize::from(bytes)].to_vec();
+            return value.get().to_le_bytes()[..usize::from(bytes)].to_vec();
         }
         ValueLocation::Spill { offset, .. } => offset as usize,
         ValueLocation::Register { class, index } => {

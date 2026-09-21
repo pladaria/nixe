@@ -38,7 +38,10 @@ fn running_job_acquires_only_named_current_lcq_inputs_in_its_execution_context()
     assert_eq!(source.key, key(0));
     assert_eq!(source.version, observed.version);
     assert_eq!(source.unit.tier, Tier::Lcq);
-    assert_eq!(source.unit.instructions[0].key.block_key(), key(0));
+    assert_eq!(
+        source.unit.instructions.get(0).unwrap().key.block_key(),
+        key(0)
+    );
     assert!(work.lcq(key(4)).unwrap().is_some());
     assert!(work.lcq(key(8)).unwrap().is_none());
     let count = process.lock().keys.len();
@@ -83,7 +86,10 @@ fn hcq_graph_retains_distinct_demanded_units_and_deterministic_input_identities(
     assert_eq!(work.check(), Err(Error::StalePublication));
     drop(work);
     assert_eq!(process.reclaim_units().unwrap(), 0);
-    assert_eq!(first.instructions[0].instruction.bits, 0xd503201f);
+    assert_eq!(
+        first.instructions.first().unwrap().instruction.bits,
+        0xd503201f
+    );
     drop(first);
     drop(second);
     assert_eq!(process.reclaim_units().unwrap(), 1);
@@ -105,7 +111,7 @@ fn compiler_references_survive_unlink_without_holding_an_execution_epoch() {
     assert_eq!(work.check(), Err(Error::StalePublication));
     assert!(matches!(work.lcq(key(0)), Err(Error::StalePublication)));
     process.reclaim_units().unwrap();
-    assert_eq!(source.unit.instructions[0].bits, 0xd503201f);
+    assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
     drop(work);
     assert_eq!(process.reclaim_units().unwrap(), 0);
     drop(source);
@@ -308,7 +314,10 @@ fn waiting_workers_claim_independent_jobs_and_close_wakes_the_empty_queue() {
                 panic!("expected seed")
             };
             let input = work.lcq(snapshot.key).unwrap().unwrap();
-            assert_eq!(input.unit.instructions[0].key.block_key(), snapshot.key);
+            assert_eq!(
+                input.unit.instructions.get(0).unwrap().key.block_key(),
+                snapshot.key
+            );
             events.send((worker, Some(snapshot.key))).unwrap();
             wait_release.recv().unwrap();
             drop(input);

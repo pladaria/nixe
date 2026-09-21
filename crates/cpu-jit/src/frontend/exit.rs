@@ -14,8 +14,7 @@ pub(crate) struct Patch {
     target: Option<BlockKey>,
     completed: u16,
     probe_bytes: usize,
-    operation: Vec<u8>,
-    slice_adapter: Option<Vec<u8>>,
+    poll_targets: Option<[usize; 2]>,
 }
 
 pub(crate) fn prepare(
@@ -27,7 +26,11 @@ pub(crate) fn prepare(
     completed: u16,
 ) -> Result<(Patch, StateRecord), Error> {
     let map = allocated.map;
-    if map.entry || map.poll.is_some_and(|poll| poll.completed != completed) {
+    if map.entry
+        || map.poll.is_some_and(|poll| {
+            poll.completed != completed || pending.reason != NativeExitReason::Dispatch
+        })
+    {
         return Err(Error::internal(
             "native exit checkpoint cost/shape mismatch",
         ));
@@ -49,12 +52,6 @@ pub(crate) fn prepare(
             pending.guest.kind,
             EdgeKind::Indirect | EdgeKind::Call | EdgeKind::Return
         );
-    let mut adapter = if pending.static_target.is_some() || indirect {
-        crate::native::emit_dispatch_fallback(&state, pc, uncharged)
-    } else {
-        emit_canonical_exit(&state, pc, pending.reason, uncharged)
-    }
-    .map_err(fail)?;
     let operation = match pending.guest.kind {
         EdgeKind::Call => crate::native::rsb::emit_push(
             &state,
@@ -69,14 +66,21 @@ pub(crate) fn prepare(
         }
         _ => Vec::new(),
     };
-    // An indirect hot path already updates the RSB before a PIC miss.
-    // An exhausted poll bypasses that hot path and needs its own update.
-    let slice_adapter = if indirect && !operation.is_empty() {
-        let mut cold = operation.clone();
-        cold.extend_from_slice(&adapter);
-        Some(cold)
+    let (mut adapter, mut poll_targets) = if map.poll.is_some() {
+        let (code, targets) =
+            crate::native::emit_polled_exit(&state, pc, &operation, indirect).map_err(fail)?;
+        (code, Some(targets))
     } else {
-        None
+        let mut adapter = operation.clone();
+        adapter.extend(
+            if pending.static_target.is_some() || indirect {
+                crate::native::emit_dispatch_fallback(&state, pc, uncharged)
+            } else {
+                emit_canonical_exit(&state, pc, pending.reason, uncharged)
+            }
+            .map_err(fail)?,
+        );
+        (adapter, None)
     };
     let probe_bytes = if indirect {
         if map.poll.is_none() {
@@ -92,13 +96,11 @@ pub(crate) fn prepare(
             probe
         };
         let length = probe.len();
+        poll_targets = poll_targets.map(|offsets| offsets.map(|offset| length + offset));
         probe.append(&mut adapter);
         adapter = probe;
         length
     } else {
-        let mut prefix = operation.clone();
-        prefix.append(&mut adapter);
-        adapter = prefix;
         0
     };
 
@@ -117,8 +119,7 @@ pub(crate) fn prepare(
             target,
             completed,
             probe_bytes,
-            operation,
-            slice_adapter,
+            poll_targets,
         },
         StateRecord {
             native_offset: map.offset,
@@ -138,28 +139,24 @@ impl Patch {
             target,
             completed,
             probe_bytes,
-            operation,
-            slice_adapter,
+            poll_targets,
         } = self;
         let destination = append(bytes, &adapter);
         map.patch_exit(bytes, 0, destination as u64).map_err(fail)?;
         // A slice exit must bypass the PIC even if its target is cached.
         // Sample-only polls instead resume the already-charged hot patch.
         let fallback = destination + probe_bytes;
-        if map.poll.is_some() {
-            let slice = slice_adapter.map_or(fallback, |adapter| append(bytes, &adapter));
-            let mut control = operation;
-            control.extend(
-                emit_canonical_exit(&record.state, pc, NativeExitReason::Control, 0)
-                    .map_err(fail)?,
-            );
-            let control = append(bytes, &control);
+        if let Some([slice, control]) = poll_targets {
             let start = append_poll(
                 bytes,
                 &map,
                 &record.state,
                 pc,
-                [map.offset, slice as u32, control as u32],
+                [
+                    map.offset,
+                    (destination + slice) as u32,
+                    (destination + control) as u32,
+                ],
             )?;
             map.patch_poll(bytes, 0, start as u64).map_err(fail)?;
         }

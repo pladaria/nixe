@@ -250,15 +250,7 @@ pub(crate) unsafe fn run(
                 .lookup
                 .find(captured.native_pc())
                 .ok_or(Error::Internal("LCQ escaped PC has no live fault record"))?;
-            let instruction = fault
-                .unit
-                .instructions
-                .iter()
-                .find(|instruction| instruction.key == fault.record.instruction)
-                .ok_or(Error::Internal(
-                    "LCQ fault has no captured guest instruction",
-                ))?;
-            let instruction = *instruction;
+            let instruction = fault.instruction();
             let reconstructed =
                 unsafe { fault::reconstruct(frame, &captured, &fault) }.map_err(Error::Internal)?;
             let (access, resolution) = dispatch
@@ -354,9 +346,11 @@ fn canonical_exit(
         .ok_or(Error::Internal(
             "LCQ canonical exit has no guest exit record",
         ))?;
-    let (_, instruction) = guest.source(&unit.instructions).ok_or(Error::Internal(
-        "LCQ canonical exit is absent from its instruction image",
-    ))?;
+    let (_, instruction) = guest
+        .source(|i| unit.instructions.get(i))
+        .ok_or(Error::Internal(
+            "LCQ canonical exit is absent from its instruction image",
+        ))?;
     Ok((guest, instruction))
 }
 
@@ -510,7 +504,10 @@ unsafe extern "C" fn dispatch_link(
             }) {
                 return Err(Error::Internal("link fallback is not an indirect terminal"));
             }
-            let Some(target) = unit.instructions[0]
+            let Some(target) = unit
+                .instructions
+                .get(0)
+                .unwrap()
                 .key
                 .block_key()
                 .at(nixe_memory::GuestVirtualAddress::new(frame.exit_pc))

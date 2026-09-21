@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 mod bridge;
 mod diagnostic;
 pub(crate) mod dynamic;
+mod image;
 mod invalidation;
 pub(crate) mod links;
 mod ownership;
@@ -31,6 +32,7 @@ pub(crate) mod patch;
 mod reclaim;
 pub(super) mod reshape;
 mod sampling;
+pub(crate) use image::InstructionImage;
 pub(crate) use reclaim::Snapshot;
 pub(crate) use sampling::CompletionSample;
 #[cfg(test)]
@@ -92,9 +94,12 @@ pub(crate) struct GuestExit {
 }
 
 impl GuestExit {
-    pub(crate) fn source(self, image: &[Instruction]) -> Option<(BlockKey, Instruction)> {
-        let block = image.get(usize::from(self.block_index))?.key.block_key();
-        let instruction = *image.get(usize::from(self.instruction_index))?;
+    pub(crate) fn source(
+        self,
+        mut get: impl FnMut(usize) -> Option<Instruction>,
+    ) -> Option<(BlockKey, Instruction)> {
+        let block = get(usize::from(self.block_index))?.key.block_key();
+        let instruction = get(usize::from(self.instruction_index))?;
         let prefix = self.instruction_index.checked_sub(self.block_index)?;
         (block.pc.get().checked_add(u64::from(prefix) * 4) == Some(self.pc.get())
             && block.at(self.pc) == Some(instruction.key.block_key()))
@@ -141,12 +146,13 @@ pub(crate) enum Access {
     CacheProbe,
 }
 
-pub(crate) struct FaultRecord {
+pub(crate) struct FaultRecord<I = InstructionKey> {
     /// One exact instruction interval, supplied by native emission. Never
     /// approximate it with the gap to the next faulting instruction.
     pub native_start: u32,
     pub native_end: u32,
-    pub instruction: InstructionKey,
+    /// Full key during staging; validated u16 image ordinal in a CodeUnit.
+    pub instruction: I,
     /// Uncharged completed prefix within the source canonical block, not an
     /// ordinal in CodeUnit.instructions. Earlier blocks are already charged in
     /// the captured native poll counter; retry leaves both values unchanged.
@@ -164,16 +170,16 @@ pub(crate) struct FaultRecord {
     pub state_map: u32,
 }
 
-pub(crate) struct Input {
+pub(crate) struct Input<I = Box<[Instruction]>, F = InstructionKey> {
     pub identity: EmissionIdentity,
     pub code: Installed,
     pub tier: Tier,
-    pub instructions: Box<[Instruction]>,
+    pub instructions: I,
     pub entries: Box<[Entry]>,
     pub dependencies: Box<[CodePageDependency]>,
     pub cursor: MemoryInvalidationCursor,
     pub states: Box<[StateRecord]>,
-    pub faults: Box<[FaultRecord]>,
+    pub faults: Box<[FaultRecord<F>]>,
 }
 
 /// Single-use identity reserved before emitting version-bearing native exits.
@@ -195,7 +201,7 @@ pub(crate) struct CodeUnit {
     pub id: CodeUnitId,
     pub version: CodeVersion,
     pub abi_version: u32,
-    pub input: Input,
+    pub input: Input<InstructionImage, u16>,
     // Cold ownership accounting, never read by generated code or fault lookup.
     baseline_pins: AtomicUsize,
     // Set once before directory/dispatch exposure. Cold native-PC resolution
@@ -203,8 +209,8 @@ pub(crate) struct CodeUnit {
     registration: std::sync::OnceLock<UnitHandle>,
 }
 impl std::ops::Deref for CodeUnit {
-    type Target = Input;
-    fn deref(&self) -> &Input {
+    type Target = Input<InstructionImage, u16>;
+    fn deref(&self) -> &Self::Target {
         &self.input
     }
 }
@@ -570,9 +576,9 @@ impl Units {
             }
         }
     }
-    fn overlaps_family(&self, instructions: &[Instruction]) -> bool {
+    fn overlaps_family(&self, instructions: impl Iterator<Item = Instruction>) -> bool {
         instructions
-            .iter()
+            .into_iter()
             .any(|instruction| self.family_owners.get(instruction.key).is_some())
     }
 }
@@ -591,29 +597,54 @@ fn nzcv_bytes(nzcv: &NzcvLocation) -> usize {
         _ => 0,
     }
 }
-impl Input {
-    fn metadata_bytes(&self) -> usize {
+impl<I, F> Input<I, F> {
+    /// Intern only within this immutable unit. The table dies before
+    /// publication; executing/faulting code still reads an ordinary slice.
+    fn share_bindings(&mut self) {
+        let mut unique = std::collections::HashSet::<Arc<[crate::abi::ValueBinding]>>::new();
+        for bindings in self
+            .entries
+            .iter_mut()
+            .map(|entry| &mut entry.contract.bindings)
+            .chain(self.states.iter_mut().map(|map| &mut map.state.bindings))
+        {
+            if let Some(existing) = unique.get(bindings.as_ref()) {
+                *bindings = Arc::clone(existing);
+            } else {
+                unique.insert(Arc::clone(bindings));
+            }
+        }
+    }
+
+    fn metadata_bytes(&self, instruction_bytes: usize) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let bindings = self
+            .entries
+            .iter()
+            .map(|entry| &entry.contract.bindings)
+            .chain(self.states.iter().map(|map| &map.state.bindings))
+            .filter(|bindings| seen.insert(bindings.as_ptr()))
+            .map(|bindings| size_of_val(&**bindings) + 2 * size_of::<usize>())
+            .sum::<usize>();
         // Installed already charges its own inline storage and backend metadata.
         size_of::<Accounted<CodeUnit>>() - size_of::<Installed>()
             + 2 * size_of::<usize>()
-            + size_of_val(&*self.instructions)
+            + instruction_bytes
             + size_of_val(&*self.entries)
             + size_of_val(&*self.dependencies)
             + size_of_val(&*self.states)
             + size_of_val(&*self.faults)
+            + bindings
             + self
                 .entries
                 .iter()
-                .map(|entry| {
-                    size_of_val(&*entry.contract.bindings) + nzcv_bytes(&entry.contract.nzcv)
-                })
+                .map(|entry| nzcv_bytes(&entry.contract.nzcv))
                 .sum::<usize>()
             + self
                 .states
                 .iter()
                 .map(|map| {
-                    size_of_val(&*map.state.bindings)
-                        + nzcv_bytes(&map.state.nzcv)
+                    nzcv_bytes(&map.state.nzcv)
                         + map
                             .transfer
                             .as_ref()
@@ -621,9 +652,15 @@ impl Input {
                 })
                 .sum::<usize>()
     }
-
+}
+impl Input {
     fn validate(&self, process: &Lifetime, publications: &[Publication<'_>]) -> Result<(), Error> {
         let fail = Error::InvalidUnit;
+        let proofs = self
+            .code
+            .proofs
+            .as_ref()
+            .ok_or(fail("missing backend proofs"))?;
         if !self.code.allocation.belongs_to(&process.cache) {
             return Err(fail(
                 "executable allocation belongs to a different process cache",
@@ -637,6 +674,7 @@ impl Input {
         }
         if self.entries.is_empty()
             || self.instructions.is_empty()
+            || self.instructions.len() > usize::from(u16::MAX) + 1
             || publications.len() != self.entries.len()
         {
             return Err(fail(
@@ -678,9 +716,7 @@ impl Input {
                 }
             }
             if entry.contract.abi != self.code.metadata.abi
-                || !self
-                    .code
-                    .metadata
+                || !proofs
                     .entries
                     .iter()
                     .any(|(_, offset)| *offset == entry.fast_offset)
@@ -699,7 +735,7 @@ impl Input {
         for (index, map) in self.states.iter().enumerate() {
             if map
                 .exit
-                .is_some_and(|exit| exit.source(&self.instructions).is_none())
+                .is_some_and(|exit| exit.source(|i| self.instructions.get(i).copied()).is_none())
             {
                 return Err(fail("invalid guest exit source indices"));
             }
@@ -710,12 +746,10 @@ impl Input {
             {
                 return Err(fail("invalid semantic state-map identity, ABI or offset"));
             }
-            let backend = self
-                .code
-                .metadata
+            let backend = proofs
                 .states
                 .iter()
-                .chain(self.code.metadata.faults.iter())
+                .chain(proofs.faults.iter())
                 .find(|backend| !backend.entry && backend.offset == map.native_offset)
                 .ok_or_else(|| fail("semantic state map has no final backend boundary"))?;
             if let Some(transfer) = &map.transfer {
@@ -771,7 +805,7 @@ impl Input {
                 "static exits exceed the source's reserved island capacity",
             ));
         }
-        if self.code.metadata.states.iter().any(|backend| {
+        if proofs.states.iter().any(|backend| {
             backend.patch_bytes != 0
                 && !self
                     .states
@@ -807,7 +841,7 @@ impl Input {
                 return Err(fail("invalid retained pair-read location or stage"));
             }
             if map.native_offset != fault.native_start
-                || !self.code.metadata.faults.iter().any(|map| {
+                || !proofs.faults.iter().any(|map| {
                     map.offset == fault.native_start
                         && map.offset.checked_add(u32::from(map.fault_bytes))
                             == Some(fault.native_end)
@@ -830,7 +864,7 @@ impl Input {
                 return Err(fail("x86-64 fault interval exceeds one instruction"));
             }
         }
-        if self.code.metadata.faults.iter().any(|map| {
+        if proofs.faults.iter().any(|map| {
             !self
                 .faults
                 .iter()
@@ -925,6 +959,7 @@ impl Lifetime {
         candidate: Option<&'a Frozen<'a, 'a>>,
     ) -> Result<PreparedUnit<'a>, Error> {
         input.validate(self, publications)?;
+        input.share_bindings();
         input.code.finish_validation();
         self.collect_tables()?;
         let static_sites = input.source_sites();
@@ -984,7 +1019,10 @@ impl Lifetime {
             if input.tier == Tier::Hcq {
                 // Family discovery/reshape is later work. Initial family
                 // publication already rejects overlap and pins each baseline.
-                if state.units.overlaps_family(&input.instructions) {
+                if state
+                    .units
+                    .overlaps_family(input.instructions.iter().copied())
+                {
                     return Err(Error::InvalidUnit(
                         "HCQ overlap requires coordinated family replacement",
                     ));
@@ -1078,7 +1116,8 @@ impl Lifetime {
             return Err(Error::StalePublication);
         }
         let tier = input.tier;
-        let bytes = input.metadata_bytes();
+        let input = input.into_resident();
+        let bytes = input.metadata_bytes(input.instructions.bytes());
         let unit = Arc::new(self.cache.account(
             CodeUnit {
                 id,
@@ -1546,7 +1585,7 @@ impl PreparedUnit<'_> {
                 .families
                 .next_handle()
                 .inspect_err(|error| process.publication_failure(&mut state, *error, tier))?;
-            if state.units.overlaps_family(&unit.instructions) {
+            if state.units.overlaps_family(unit.instructions.iter()) {
                 return Err(Error::StalePublication);
             }
         }
@@ -1651,7 +1690,7 @@ impl PreparedUnit<'_> {
                 .insert(&mut self.family)
                 .expect("validated family insertion");
             state.units.records.get_mut(handle).unwrap().family = Some(family);
-            for instruction in &unit.instructions {
+            for instruction in unit.instructions.iter() {
                 state.units.family_owners.publish(instruction.key, family);
             }
         }

@@ -133,7 +133,7 @@ impl Work<'_> {
         }
         let allowed = self.allowed_families();
         let mut instructions = 0;
-        for word in &input.unit.instructions {
+        for word in input.unit.instructions.iter() {
             if !state.units.instruction_available(word.key, allowed) {
                 break;
             }

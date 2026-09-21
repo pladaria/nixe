@@ -435,7 +435,7 @@ fn append_exit(bytes: &mut Vec<u8>, state: &ExitStateMap) -> usize {
     exit.extend(
         emit_canonical_exit(
             state,
-            ValueLocation::Constant(0x12345678),
+            ValueLocation::constant(0x12345678),
             NativeExitReason::Dispatch,
             0,
         )

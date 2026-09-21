@@ -38,9 +38,9 @@ fn selective_bridge_preserves_cycles_missing_inputs_and_partial_flags() {
                         target.live_in.nzcv = target_bits;
                         let bits = 0x6000_0000u32;
                         source.nzcv = match kind {
-                            0 => NzcvLocation::Packed(ValueLocation::Constant(bits.into())),
+                            0 => NzcvLocation::Packed(ValueLocation::constant(bits.into())),
                             1 => NzcvLocation::Deferred(LazyFlags::Packed(
-                                ValueLocation::Constant(bits.into()),
+                                ValueLocation::constant(bits.into()),
                             )),
                             2 => NzcvLocation::Host {
                                 carry_inverted: true,
@@ -58,7 +58,7 @@ fn selective_bridge_preserves_cycles_missing_inputs_and_partial_flags() {
                         if kind == 2 {
                             let (mut seed, mut entry) = contracts(abi, &[]);
                             seed.live.nzcv = source_bits;
-                            seed.nzcv = NzcvLocation::Packed(ValueLocation::Constant(bits.into()));
+                            seed.nzcv = NzcvLocation::Packed(ValueLocation::constant(bits.into()));
                             entry.live_in.nzcv = source_bits;
                             entry.nzcv = source.nzcv.clone();
                             code.extend(emit_fast_transfer(&seed, &entry).unwrap());
@@ -100,7 +100,7 @@ fn selective_bridge_preserves_cycles_missing_inputs_and_partial_flags() {
                             .iter()
                             .map(|b| unsafe { b.assume_init() })
                             .collect();
-                        for binding in &target.bindings {
+                        for binding in target.bindings.iter() {
                             let expected = if let Some(input) =
                                 source.bindings.iter().find(|b| b.value == binding.value)
                             {
