@@ -111,7 +111,13 @@ fn instruction_tracking_drains_fault_readers_then_captures_with_new_compile_admi
     );
     assert!(process.snapshot(code).is_ok());
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xd4200000
     );
 }
@@ -170,7 +176,13 @@ fn new_capture_admission_does_not_make_an_intervening_code_write_current() {
     assert!(process.lock().keys.is_empty());
     let new = publish(&process, &memory, 0x1000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xd4200120
     );
 }

@@ -687,7 +687,7 @@ fn validation_releases_backend_storage_and_only_its_exact_charge() {
             32
         ],
     }]);
-    let heap = output.metadata.bytes() - size_of::<Metadata>();
+    let heap = output.metadata.bytes();
     let mut installed = cache.install(output, Tier::Lcq, |_| None).unwrap();
     let before = cache.usage().unwrap();
     let address = installed.allocation.address();
@@ -695,7 +695,7 @@ fn validation_releases_backend_storage_and_only_its_exact_charge() {
     let after = cache.usage().unwrap();
     assert_eq!(after.committed, before.committed);
     assert_eq!(before.metadata - after.metadata, heap);
-    assert_eq!(installed.metadata.bytes(), size_of::<Metadata>());
+    assert!(installed.proofs.is_none());
     assert_eq!(installed.allocation.address(), address);
     assert_eq!(unsafe { execute(&installed) }, 29);
     installed.finish_validation();
@@ -901,8 +901,8 @@ fn backend_output_survives_context_reset_with_exact_labels_and_fault_maps() {
                     .then_some(symbol)
                 })
                 .unwrap();
-            assert_eq!(&*installed.metadata.entries, &offsets);
-            assert_eq!(&*installed.metadata.faults, &faults);
+            assert_eq!(&*installed.proofs.as_ref().unwrap().entries, &offsets);
+            assert_eq!(&*installed.proofs.as_ref().unwrap().faults, &faults);
             assert!(permissions(installed.allocation.address()).starts_with("r-x"));
         }
     }

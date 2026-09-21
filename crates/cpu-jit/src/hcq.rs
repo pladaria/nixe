@@ -184,9 +184,14 @@ impl Builder {
         Ok(())
     }
 
-    fn merge(&mut self, root: BlockKey, words: &[Instruction]) -> Result<(), Error> {
+    fn merge(
+        &mut self,
+        root: BlockKey,
+        words: impl IntoIterator<Item = impl std::borrow::Borrow<Instruction>>,
+    ) -> Result<(), Error> {
         self.leader(root)?;
-        for (index, &word) in words.iter().enumerate() {
+        for (index, word) in words.into_iter().enumerate() {
+            let word = *word.borrow();
             let key = word.key.block_key();
             if self.seed.at(key.pc) != Some(key) {
                 return Err(Error::StaleCapture);

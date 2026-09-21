@@ -93,7 +93,15 @@ impl Lifetime {
                     EdgeKind::Indirect | EdgeKind::Call | EdgeKind::Return
                 )
             })
-            || from.code.instructions[0].key.block_key().at(target.pc) != Some(target)
+            || from
+                .code
+                .instructions
+                .get(0)
+                .unwrap()
+                .key
+                .block_key()
+                .at(target.pc)
+                != Some(target)
         {
             return Err(Error::InvalidUnit(
                 "dynamic source or target execution key does not match",

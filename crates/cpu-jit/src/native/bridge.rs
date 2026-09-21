@@ -23,7 +23,7 @@ pub fn emit_chain_transfer(
     commit.dirty_live = source.dirty_live.without(target.live_in);
     let mut copies = Vec::new();
     let mut missing = Vec::new();
-    for binding in &target.bindings {
+    for binding in target.bindings.iter() {
         if let Some(input) = source
             .bindings
             .iter()

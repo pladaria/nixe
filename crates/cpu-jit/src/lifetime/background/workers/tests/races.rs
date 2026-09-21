@@ -86,7 +86,7 @@ fn pressure_cancels_running_work_without_rejection_and_resets_unfinished_fronten
                 .unwrap();
         }
         let result = work.check();
-        assert_eq!(source.unit.instructions[0].bits, 0xd503201f);
+        assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
         drop(source);
         drop(work);
         finished.send((call, result)).unwrap();
@@ -138,7 +138,7 @@ fn replaced_running_job_cannot_clear_new_running_reservation() {
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
         let result = work.check();
-        assert_eq!(source.unit.instructions[0].bits, 0xd503201f);
+        assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
         drop(source);
         drop(work);
         events.send((call, true)).unwrap();

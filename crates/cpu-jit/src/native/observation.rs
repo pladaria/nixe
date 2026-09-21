@@ -72,7 +72,7 @@ fn preservation(
             widths[usize::from(index)] = widths[usize::from(index)].max(bytes.max(8));
         }
     };
-    for binding in &source.bindings {
+    for binding in source.bindings.iter() {
         retain(binding.location, binding.value.bytes());
     }
     retain(destination, 8);
@@ -154,7 +154,6 @@ pub(crate) fn emit_callback(
         8,
     );
     let absent;
-    let failed;
     if source.abi == HostAbi::X86_64 {
         e.code.extend([0x4d, 0x85, 0xdb]); // TEST R11,R11
         e.code.extend([0x0f, 0x84]);
@@ -172,9 +171,7 @@ pub(crate) fn emit_callback(
         e.constant(1, source.site.source.get(), 8); // RCX: version
         e.constant(8, u64::from(source.site.state_map), 4); // R8D: map
         e.code.extend([0x41, 0xff, 0xd3]); // CALL R11; gateway SP already aligned
-        e.code.extend([0x85, 0xc0, 0x0f, 0x84]); // TEST EAX,EAX; JZ failure
-        failed = e.code.len();
-        e.word(0);
+        e.code.extend([0x85, 0xc0]); // TEST EAX,EAX; MOV restores preserve ZF
     } else {
         absent = e.code.len();
         e.word(0); // CBZ X16,resume
@@ -190,14 +187,22 @@ pub(crate) fn emit_callback(
         e.constant(3, source.site.source.get(), 8);
         e.constant(4, u64::from(source.site.state_map), 4);
         e.word(0xd63f0200); // BLR X16; native continuations do not use X30
-        failed = e.code.len();
-        e.word(0); // CBZ W0,failure
+        e.word(0x2a0003f0); // MOV W16,W0: preserve callback result across X0 restore
     }
+    // Success and failure restore the same image once. Host flags are forbidden
+    // above, so these are only flag-transparent moves/loads. An absent callback
+    // bypasses restoration: saving values and the destination modified only
+    // transfer storage and reserved link scratch, never a mapped register.
+    e.code.extend_from_slice(&preservation.restore);
+    if source.abi == HostAbi::X86_64 {
+        e.code.extend([0x0f, 0x84]); // JZ failure
+    }
+    let failed = e.code.len();
+    e.word(0); // AArch64: CBZ W16,failure
     let mut labels = [0; 2];
     let mut patches = [0; 2];
     for index in 0..2 {
         labels[index] = e.code.len();
-        e.code.extend_from_slice(&preservation.restore);
         while !e.code.len().is_multiple_of(8) {
             if source.abi == HostAbi::X86_64 {
                 e.code_byte(0x90);
@@ -215,7 +220,7 @@ pub(crate) fn emit_callback(
     }
     for (offset, target, arm) in [
         (absent, labels[0], 0xb4000010),
-        (failed, labels[1], 0x34000000),
+        (failed, labels[1], 0x34000010),
     ] {
         let word = if source.abi == HostAbi::X86_64 {
             (target as i32 - offset as i32 - 4) as u32

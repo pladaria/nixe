@@ -77,7 +77,7 @@ pub(crate) unsafe fn reconstruct(
     let poll_remaining = captured
         .integer(abi.reserved().poll)
         .ok_or("missing captured poll register")? as i64;
-    for binding in &map.bindings {
+    for binding in map.bindings.iter() {
         if map
             .dirty_live
             .intersection(binding.value.state().unwrap())
@@ -107,7 +107,7 @@ pub(crate) unsafe fn reconstruct(
         *frame.canonical.nzcv =
             Nzcv::from_bits(((*frame.canonical.nzcv).bits() & !mask) | (flags & mask));
         *frame.canonical.fpsr |= fp_status; // after mapped software FPSR writeback
-        *frame.canonical.pc = fault.record.instruction.block_key().pc.get();
+        *frame.canonical.pc = fault.instruction().key.block_key().pc.get();
     }
     // Guest sticky bits came from the saved image, NOT the dispatcher's live
     // host state. Prevent finish/drop from collecting host flags as guest FPSR.
@@ -157,7 +157,7 @@ unsafe fn read_location(
         return Err("invalid captured value location");
     }
     let value = match location {
-        ValueLocation::Constant(value) => value,
+        ValueLocation::Constant(value) => value.get(),
         ValueLocation::Register {
             class: RegisterClass::Integer,
             index,

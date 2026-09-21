@@ -10,7 +10,7 @@ const RET: u32 = 0xd65f03c0;
 pub(in crate::hcq) fn graph(inputs: &[(u64, &[u32])]) -> Graph {
     let mut builder = Builder::new(key(inputs[0].0));
     for &(pc, bits) in inputs {
-        builder.merge(key(pc), &words(pc, bits)).unwrap();
+        builder.merge(key(pc), words(pc, bits)).unwrap();
     }
     let (instructions, blocks) = builder.finish().unwrap();
     Graph {

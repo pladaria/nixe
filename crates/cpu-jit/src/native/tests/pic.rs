@@ -17,7 +17,7 @@ fn native_pic_rejects_targets_in_reserved_registers_or_transfer_storage() {
         for pc in [
             integer(abi.reserved().link_scratch[0]),
             spill(0, 8),
-            ValueLocation::Constant(1_u128 << 64),
+            ValueLocation::constant(1_u128 << 64),
         ] {
             assert_eq!(
                 probe::emit(&source, target, pc),
@@ -85,7 +85,7 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                                 .location
                         }
                         1 => spill(3400, 8),
-                        2 => ValueLocation::Constant(target.pc.get().into()),
+                        2 => ValueLocation::constant(target.pc.get().into()),
                         _ => vector(0),
                     };
                     let bytes = probe::emit(&source, target, pc).unwrap();
@@ -96,7 +96,7 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                     hit.extend(
                         emit_canonical_exit(
                             &source,
-                            ValueLocation::Constant(0x4444),
+                            ValueLocation::constant(0x4444),
                             NativeExitReason::Dispatch,
                             0,
                         )
@@ -110,7 +110,7 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                     first.extend(
                         emit_canonical_exit(
                             &source,
-                            ValueLocation::Constant(0x8888),
+                            ValueLocation::constant(0x8888),
                             NativeExitReason::Control,
                             0,
                         )

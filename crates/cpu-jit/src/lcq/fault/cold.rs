@@ -162,7 +162,7 @@ impl Completion {
         fault: &Fault<'_>,
         retained_read: Option<u128>,
     ) -> Result<Self, &'static str> {
-        let key = fault.record.instruction.block_key();
+        let key = fault.instruction().key.block_key();
         if frame.host_fp.saved != 0 || unsafe { *frame.canonical.pc } != key.pc.get() {
             return Err("cold completion requires reconstructed state and finished FP ownership");
         }
@@ -176,7 +176,7 @@ impl Completion {
                 }
             })
         };
-        let access = access::decode_access(instruction, key.pc.get(), fault.record, &read)?;
+        let access = access::decode_access(instruction, key, fault.record, &read)?;
         if retained_read.is_some() != fault.record.completed_read.is_some() {
             return Err("cold pair completion is missing or has unexpected retained read bits");
         }

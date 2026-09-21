@@ -19,6 +19,7 @@ pub(crate) mod rsb;
 pub use backend::AllocatedBoundary;
 pub use bridge::emit_chain_transfer;
 pub(crate) use canonical::emit_dispatch_fallback;
+pub(crate) use canonical::emit_polled_exit;
 pub use canonical::{emit_canonical_entry, emit_canonical_exit, emit_canonical_writeback};
 pub(crate) use fp::emit_fp_activation;
 pub use gateway::{NativeReturn, NativeReturnError, check_host, enter_protected};
@@ -90,7 +91,7 @@ pub fn emit_fast_transfer(
     let mut emitter = Emitter::new(source.abi);
     let mut install_host = None;
     let mut copies = Vec::with_capacity(target.bindings.len() + 1);
-    for binding in &target.bindings {
+    for binding in target.bindings.iter() {
         let input = source
             .bindings
             .iter()

@@ -45,8 +45,12 @@ impl Graph {
             if extent.instructions == 0 {
                 continue;
             }
-            let words = &input.unit.instructions[..extent.instructions];
-            let last = *words.last().unwrap();
+            let words = || input.unit.instructions.iter().take(extent.instructions);
+            let last = input
+                .unit
+                .instructions
+                .get(extent.instructions - 1)
+                .unwrap();
             let decoded = decode::decode(
                 key.platform,
                 LocationDescriptor::new(last.key.block_key().pc, key.profile),
@@ -86,11 +90,11 @@ impl Graph {
             for target in direct_targets(&exit).into_iter().flatten() {
                 builder.leader(target)?;
             }
-            let count = select_prefix(&builder, key, words, MAX_INSTRUCTIONS)?;
+            let count = select_prefix(&builder, key, words(), MAX_INSTRUCTIONS)?;
             if count == 0 {
                 continue;
             }
-            builder.merge(key, &words[..count])?;
+            builder.merge(key, words().take(count))?;
             // A captured fragment end is a canonical leader even when a longer
             // overlapping image is encountered later.
             builder.leader(
@@ -104,7 +108,7 @@ impl Graph {
                     pending.push(leader, 2, 0, 0);
                 }
             }
-            if count == words.len() && complete_image {
+            if count == extent.instructions && complete_image {
                 for successor in successors {
                     pending.sample(successor);
                 }
@@ -198,13 +202,15 @@ fn permits_sample(exit: &Exit, target: BlockKey) -> bool {
 fn select_prefix(
     builder: &Builder,
     root: BlockKey,
-    words: &[Instruction],
+    words: impl IntoIterator<Item = impl std::borrow::Borrow<Instruction>>,
     limit: usize,
 ) -> Result<usize, Error> {
     let mut admitted = 0;
     let mut total = builder.words.len();
     let mut block_new = 0;
-    for (index, word) in words.iter().enumerate() {
+    let mut words = words.into_iter().enumerate().peekable();
+    while let Some((index, word)) = words.next() {
+        let word = word.borrow();
         let key = word.key.block_key();
         if builder.seed.at(key.pc) != Some(key) {
             return Err(Error::StaleCapture);
@@ -219,8 +225,7 @@ fn select_prefix(
             Some(_) => {}
             None => block_new += 1,
         }
-        let end =
-            index + 1 == words.len() || builder.leaders.contains(&key.pc.get().wrapping_add(4));
+        let end = words.peek().is_none() || builder.leaders.contains(&key.pc.get().wrapping_add(4));
         if end {
             if total + block_new > limit {
                 break;

@@ -3,6 +3,25 @@ use super::*;
 use canonical::{complete, native, pattern};
 
 #[test]
+fn sampling_callback_emits_one_shared_register_restore() {
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        let (source, _) = complete(abi);
+        let destination = integer(0);
+        let restore = emit(&source, destination).unwrap().restore;
+        let (code, continuations) =
+            super::super::observation::emit_callback(&source, destination, false).unwrap();
+        assert!(!restore.is_empty());
+        assert_eq!(
+            code.windows(restore.len())
+                .filter(|bytes| *bytes == restore.as_slice())
+                .count(),
+            1
+        );
+        assert!(continuations[0] < continuations[1]);
+    }
+}
+
+#[test]
 fn observation_saves_aliases_once_and_only_volatile_live_registers() {
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         let nonvolatile = if abi == HostAbi::X86_64 { 3 } else { 22 };
@@ -21,7 +40,7 @@ fn observation_saves_aliases_once_and_only_volatile_live_registers() {
                 (GuestValue::General(4), spill(2048, 8), spill(2048, 8)),
                 (
                     GuestValue::General(5),
-                    ValueLocation::Constant(17),
+                    ValueLocation::constant(17),
                     integer(1),
                 ),
             ],
@@ -34,7 +53,7 @@ fn observation_saves_aliases_once_and_only_volatile_live_registers() {
         assert_eq!(preservation.restore, expected.finish());
         // The scalar half of d8 is preserved by AAPCS64, but not by SysV.
         let (scalar, _) = contracts(abi, &[(GuestValue::General(0), vector(8), vector(8))]);
-        let scalar = emit(&scalar, ValueLocation::Constant(0)).unwrap();
+        let scalar = emit(&scalar, ValueLocation::constant(0)).unwrap();
         assert_eq!(scalar.restore.is_empty(), abi == HostAbi::Aarch64);
     }
 }
@@ -97,8 +116,8 @@ fn observation_survives_real_system_call_without_canonical_roundtrip() {
                     });
                 }
                 3 => {
-                    source.bindings[0].location = spill(3304, 8);
-                    entry.bindings[0].location = spill(3304, 8);
+                    std::sync::Arc::make_mut(&mut source.bindings)[0].location = spill(3304, 8);
+                    std::sync::Arc::make_mut(&mut entry.bindings)[0].location = spill(3304, 8);
                     source.nzcv = NzcvLocation::Packed(integer(0));
                     entry.nzcv = source.nzcv.clone();
                 }
@@ -108,7 +127,7 @@ fn observation_survives_real_system_call_without_canonical_roundtrip() {
                 integer(1),
                 vector(8),
                 spill(3200, 8),
-                ValueLocation::Constant(0xabc),
+                ValueLocation::constant(0xabc),
             ];
             for destination in destinations {
                 // Save clean values too; the test continuation will consume all

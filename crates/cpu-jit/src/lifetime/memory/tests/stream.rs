@@ -77,7 +77,7 @@ fn stream_consumption_drains_exact_targets_and_does_not_skip_later_records() {
         assert!(matches!(process.snapshot(handle), Err(Error::StaleUnit)));
     }
     assert!(process.snapshot(other).is_ok());
-    assert_eq!(snapshot.instructions[0].bits, 0xf9400020);
+    assert_eq!(snapshot.instructions.get(0).unwrap().bits, 0xf9400020);
     process
         .consume_memory_invalidations(&source, &mut cursor)
         .unwrap();

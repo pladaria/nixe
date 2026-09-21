@@ -138,7 +138,11 @@ impl State {
             let exit = source.code.states[bridge.key.source.state_map as usize]
                 .exit
                 .unwrap();
-            let source = source.code.instructions[0]
+            let source = source
+                .code
+                .instructions
+                .get(0)
+                .unwrap()
                 .key
                 .block_key()
                 .at(exit.pc)

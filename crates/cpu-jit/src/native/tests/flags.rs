@@ -183,7 +183,7 @@ fn values_to_host_flags_survive_overwriting_cycles() {
                         integer(0),
                         vector(3),
                         spill(2048, 4),
-                        ValueLocation::Constant(u128::from(nibble << 28)),
+                        ValueLocation::constant(u128::from(nibble << 28)),
                     ] {
                         for deferred in [false, true] {
                             let location = if deferred {
@@ -357,7 +357,7 @@ fn conditional_logical_and_packed_recipes_keep_partial_flags() {
                 }
             }
             for recipe in [
-                LazyFlags::Canonical(ValueLocation::Constant(0xd1234567)),
+                LazyFlags::Canonical(ValueLocation::constant(0xd1234567)),
                 LazyFlags::Packed(integer(0)),
             ] {
                 check(

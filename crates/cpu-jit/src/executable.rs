@@ -501,8 +501,7 @@ impl Cache {
         if !output.alignment.is_power_of_two() {
             return Err(Error::Capacity("invalid code alignment"));
         }
-        let metadata_bytes = output.metadata.bytes() - std::mem::size_of::<Metadata>()
-            + std::mem::size_of::<Installed>();
+        let metadata_bytes = output.metadata.bytes() + std::mem::size_of::<Installed>();
         // Staging bytes overlap the actual executable backing during transfer.
         let charge = self.charge_metadata(metadata_bytes + output.bytes.len(), tier)?;
         // On every error, destroy storage before releasing its budget. Locals
@@ -599,10 +598,30 @@ impl Cache {
         let Staging { output, mut charge } = staging;
         let staging_bytes = output.bytes.len();
         drop(output.bytes);
-        charge.reduce(staging_bytes);
+        let metadata = ResidentMetadata {
+            abi: output.metadata.abi,
+            frame_extent: output.metadata.frame_extent,
+        };
+        let proofs = if output.metadata.bytes() == std::mem::size_of::<Metadata>() {
+            // Native bridges have no backend proof payload. Do not allocate
+            // a box just to discard five empty headers immediately afterwards.
+            drop(output.metadata);
+            None
+        } else {
+            Some(Box::new(output.metadata))
+        };
+        charge.reduce(
+            staging_bytes
+                + if proofs.is_none() {
+                    std::mem::size_of::<Metadata>()
+                } else {
+                    0
+                },
+        );
         Ok(Installed {
             allocation,
-            metadata: output.metadata,
+            metadata,
+            proofs,
             charge,
         })
     }
@@ -748,9 +767,17 @@ impl Drop for MetadataLease {
 
 pub(crate) struct Installed {
     pub allocation: Allocation,
-    pub metadata: Metadata,
+    pub metadata: ResidentMetadata,
+    pub proofs: Option<Box<Metadata>>,
     // Field order releases the actual metadata before returning its charge.
     charge: MetadataLease,
+}
+
+/// Only these backend facts are needed after semantic validation. In
+/// particular, published units/bridges do not retain five empty slice headers.
+pub(crate) struct ResidentMetadata {
+    pub abi: crate::abi::HostAbi,
+    pub frame_extent: u32,
 }
 
 impl Installed {
@@ -758,12 +785,10 @@ impl Installed {
     /// afterwards the runtime uses only those semantic maps. Relocations have
     /// already been applied. Release their storage, not just its budget.
     pub(crate) fn finish_validation(&mut self) {
-        let before = self.metadata.bytes();
-        self.metadata.entries = Box::new([]);
-        self.metadata.states = Box::new([]);
-        self.metadata.faults = Box::new([]);
-        self.metadata.traps = Box::new([]);
-        self.metadata.relocations = Box::new([]);
-        self.charge.reduce(before - self.metadata.bytes());
+        if let Some(proofs) = self.proofs.take() {
+            let bytes = proofs.bytes();
+            drop(proofs);
+            self.charge.reduce(bytes);
+        }
     }
 }

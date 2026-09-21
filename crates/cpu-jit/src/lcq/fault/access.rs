@@ -68,7 +68,7 @@ pub(crate) unsafe fn resolve(
     arena: DirectAddressSpaceView,
     memory: &dyn CpuMemory,
 ) -> Result<(Access, DirectFaultResolution), &'static str> {
-    let space = fault.record.instruction.block_key().address_space;
+    let space = fault.instruction().key.block_key().address_space;
     if memory.direct_address_space_view(space) != Some(arena) {
         return Err("fault memory authority does not own the captured arena");
     }
@@ -127,7 +127,7 @@ pub(crate) unsafe fn inspect(
     if captured.integer(map.abi.reserved().arena) != Some(arena.base as u64) {
         return Err("captured arena does not match the invocation");
     }
-    let key = fault.record.instruction.block_key();
+    let key = fault.instruction().key.block_key();
     let read = |index: u8, sp: bool| -> Result<u64, &'static str> {
         if index == 31 && !sp {
             return Ok(0);
@@ -157,7 +157,7 @@ pub(crate) unsafe fn inspect(
             }
         })
     };
-    let access = decode_access(instruction(fault)?, key.pc.get(), fault.record, &read)?;
+    let access = decode_access(instruction(fault)?, key, fault.record, &read)?;
     // Confinement redirects an invalid start/alignment to the trailing guard;
     // a valid start may cross into that guard or another inaccessible page.
     let bytes = access.size.bytes();
@@ -183,14 +183,8 @@ pub(crate) unsafe fn inspect(
 }
 
 pub(super) fn instruction(fault: &Fault<'_>) -> Result<A64Instruction, &'static str> {
-    let key = fault.record.instruction.block_key();
-    let bits = fault
-        .unit
-        .instructions
-        .iter()
-        .find(|instruction| instruction.key == fault.record.instruction)
-        .ok_or("fault instruction is absent from the published image")?
-        .bits;
+    let key = fault.instruction().key.block_key();
+    let bits = fault.instruction().bits;
     let DecodeResult::Decoded(decoded) = decode::decode(
         key.platform,
         LocationDescriptor::new(key.pc, key.profile),
@@ -206,15 +200,16 @@ pub(super) fn instruction(fault: &Fault<'_>) -> Result<A64Instruction, &'static 
 
 pub(super) fn decode_access(
     instruction: A64Instruction,
-    pc: u64,
-    record: &unit::FaultRecord,
+    key: crate::abi::BlockKey,
+    record: &unit::FaultRecord<u16>,
     read: &impl Fn(u8, bool) -> Result<u64, &'static str>,
 ) -> Result<Access, &'static str> {
+    let pc = key.pc.get();
     if record.access == unit::Access::CacheProbe {
         let A64Instruction::System(instruction) = instruction else {
             return Err("cache probe has a non-system instruction");
         };
-        if !crate::lcq::system::is_cache_probe(record.instruction.block_key().platform, instruction)
+        if !crate::lcq::system::is_cache_probe(key.platform, instruction)
             || record.bytes != 1
             || record.subaccess != 0
             || record.commit_stage != 0

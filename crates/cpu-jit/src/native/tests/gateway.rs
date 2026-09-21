@@ -34,7 +34,7 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                     // Place V31 in a fixed spill explicitly so both hosts must
                     // break the same vector-register/spill cycle at the link.
                     for bindings in [&mut source.bindings, &mut entry.bindings] {
-                        bindings
+                        std::sync::Arc::make_mut(bindings)
                             .iter_mut()
                             .find(|b| b.value == GuestValue::Vector(31))
                             .unwrap()
@@ -44,8 +44,9 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                 let mut target = entry.clone();
                 if cycle {
                     let a = target.bindings[0].location;
-                    target.bindings[0].location = target.bindings[1].location;
-                    target.bindings[1].location = a;
+                    std::sync::Arc::make_mut(&mut target.bindings)[0].location =
+                        target.bindings[1].location;
+                    std::sync::Arc::make_mut(&mut target.bindings)[1].location = a;
                     target.nzcv = NzcvLocation::Host {
                         carry_inverted: true,
                     };
@@ -68,8 +69,9 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                             ValueLocation::Spill { .. }
                         ));
                         let location = target.bindings[a].location;
-                        target.bindings[a].location = target.bindings[b].location;
-                        target.bindings[b].location = location;
+                        std::sync::Arc::make_mut(&mut target.bindings)[a].location =
+                            target.bindings[b].location;
+                        std::sync::Arc::make_mut(&mut target.bindings)[b].location = location;
                     }
                 }
                 let mut exit = source.clone();
@@ -95,7 +97,7 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                 second.extend(
                     emit_canonical_exit(
                         &exit,
-                        ValueLocation::Constant(0xfedcba9876543210),
+                        ValueLocation::constant(0xfedcba9876543210),
                         reason,
                         0,
                     )
@@ -114,12 +116,12 @@ fn real_gateway_links_independent_units_and_completes_canonical_exit() {
                 if fp {
                     let mut emitter = moves::Emitter::new(abi);
                     emitter.copy(moves::Copy {
-                        source: ValueLocation::Constant(1.0f64.to_bits() as u128),
+                        source: ValueLocation::constant(1.0f64.to_bits() as u128),
                         destination: vector(0),
                         bytes: 8,
                     });
                     emitter.copy(moves::Copy {
-                        source: ValueLocation::Constant(0),
+                        source: ValueLocation::constant(0),
                         destination: vector(1),
                         bytes: 8,
                     });
@@ -270,14 +272,14 @@ fn canonical_exit_validates_pc_and_reason() {
         for pc in [
             integer(abi.reserved().frame),
             spill(0, 8),
-            ValueLocation::Constant(u128::MAX),
+            ValueLocation::constant(u128::MAX),
         ] {
             assert!(emit_canonical_exit(&source, pc, NativeExitReason::Dispatch, 0).is_err());
         }
         assert!(
             emit_canonical_exit(
                 &source,
-                ValueLocation::Constant(0),
+                ValueLocation::constant(0),
                 NativeExitReason::None,
                 0
             )
@@ -293,7 +295,7 @@ fn canonical_exit_preserves_dynamic_pc_until_writeback_finishes() {
             integer(0),
             vector(0),
             spill(2048, 8),
-            ValueLocation::Constant(0x123456789abcdef0),
+            ValueLocation::constant(0x123456789abcdef0),
         ] {
             let (mut source, entry) = contracts(abi, &[(GuestValue::General(0), pc, pc)]);
             // Constant exit sources are valid, constant ingress destinations aren't.
@@ -356,6 +358,105 @@ fn canonical_exit_preserves_dynamic_pc_until_writeback_finishes() {
 }
 
 #[test]
+fn polled_exits_share_writeback_and_preserve_each_cold_entry_contract() {
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        for flags in 0..3 {
+            let (mut source, mut entry) = canonical::complete(abi);
+            if flags == 1 {
+                source.nzcv = NzcvLocation::Host {
+                    carry_inverted: true,
+                };
+                entry.nzcv = source.nzcv.clone();
+            } else if flags == 2 {
+                source.nzcv = NzcvLocation::Deferred(LazyFlags::Subtract {
+                    lhs: integer(0),
+                    rhs: integer(1),
+                    result: integer(2),
+                    width: 64,
+                });
+            }
+            for pc in [
+                integer(0),
+                vector(0),
+                spill(2048, 8),
+                ValueLocation::constant(0x123456789abcdef0),
+            ] {
+                let (shared, [_, control]) =
+                    super::super::canonical::emit_polled_exit(&source, pc, &[], false).unwrap();
+                let dispatch =
+                    super::super::canonical::emit_dispatch_fallback(&source, pc, 0).unwrap();
+                let exit = emit_canonical_exit(&source, pc, NativeExitReason::Control, 0).unwrap();
+                assert!(shared.len() < dispatch.len() + exit.len());
+                if !native(abi) {
+                    continue;
+                }
+                for reason in [NativeExitReason::Dispatch, NativeExitReason::Control] {
+                    let mut results = Vec::new();
+                    for use_shared in [false, true] {
+                        let mut bytes = landing(abi);
+                        bytes.extend(emit_canonical_entry(&entry).unwrap());
+                        // Initialize the explicit spill PC even when this complete
+                        // map keeps guest X0 in a register rather than that slot.
+                        let mut initialize = Emitter::new(abi);
+                        initialize.copy(Copy {
+                            source: ValueLocation::constant(0xabcdef),
+                            destination: spill(2048, 8),
+                            bytes: 8,
+                        });
+                        bytes.extend(initialize.finish());
+                        if use_shared {
+                            if reason == NativeExitReason::Control {
+                                if abi == HostAbi::X86_64 {
+                                    bytes.push(0xe9);
+                                    bytes.extend((control as i32).to_le_bytes());
+                                } else {
+                                    bytes.extend(
+                                        (0x14000000 | ((control as u32 + 4) / 4)).to_le_bytes(),
+                                    );
+                                }
+                            }
+                            bytes.extend_from_slice(&shared);
+                        } else {
+                            bytes.extend(emit_canonical_exit(&source, pc, reason, 0).unwrap());
+                        }
+                        let (owner, id) = compile(&bytes);
+                        let (mut state, _) = canonical::pattern(&entry);
+                        state.set_fpcr(0);
+                        state.set_fpsr(0);
+                        let address = owner.get_finalized_function(id);
+                        {
+                            let mut frame =
+                                NativeFrame::new(&mut state, PollBudget::new(77, 1000).unwrap());
+                            frame.execution_epoch = 17;
+                            let result = unsafe {
+                                frame.begin_fp();
+                                enter_protected(&mut frame, std::ptr::null_mut(), address)
+                            }
+                            .unwrap();
+                            assert_eq!(result.reason, reason);
+                            assert_eq!(frame.exit_source_version, source.site.source.get());
+                            assert_eq!(frame.exit_state_map, source.site.state_map);
+                            assert_eq!(frame.execution_epoch, 17);
+                            assert_eq!(frame.budget.slice_remaining, 1000);
+                            assert_eq!(frame.budget.sample_remaining, 77);
+                            assert!(
+                                (address as usize..address as usize + bytes.len())
+                                    .contains(&frame.exit_native_pc)
+                            );
+                        }
+                        results.push(state);
+                    }
+                    assert_eq!(
+                        results[0], results[1],
+                        "flags={flags}, pc={pc:?}, reason={reason:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn invalid_native_budget_restores_fp_without_announcing_quiescence() {
     let _restore = crate::fp_env::tests::RestoreHost::new();
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
@@ -368,7 +469,7 @@ fn invalid_native_budget_restores_fp_without_announcing_quiescence() {
         code.extend(
             emit_canonical_exit(
                 &source,
-                ValueLocation::Constant(4),
+                ValueLocation::constant(4),
                 NativeExitReason::Internal,
                 0,
             )
@@ -384,7 +485,7 @@ fn invalid_native_budget_restores_fp_without_announcing_quiescence() {
                 entry,
                 source,
                 (body, None),
-                ValueLocation::Constant(4),
+                ValueLocation::constant(4),
                 NativeExitReason::Internal,
             )
         });

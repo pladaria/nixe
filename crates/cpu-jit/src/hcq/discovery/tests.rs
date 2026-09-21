@@ -74,12 +74,12 @@ fn sample_filter_does_not_follow_calls_returns_or_semantic_boundaries() {
 #[test]
 fn whole_block_selection_accepts_2048_and_refuses_2049_without_partial_mutation() {
     let mut builder = Builder::new(key(0));
-    builder.merge(key(0), &words(0, &vec![NOP; 1536])).unwrap();
+    builder.merge(key(0), words(0, &vec![NOP; 1536])).unwrap();
     assert_eq!(
         select_prefix(
             &builder,
             key(0x10000),
-            &words(0x10000, &[NOP; 512]),
+            words(0x10000, &[NOP; 512]),
             MAX_INSTRUCTIONS
         ),
         Ok(512)
@@ -88,7 +88,7 @@ fn whole_block_selection_accepts_2048_and_refuses_2049_without_partial_mutation(
         select_prefix(
             &builder,
             key(0x10000),
-            &words(0x10000, &[NOP; 513]),
+            words(0x10000, &[NOP; 513]),
             MAX_INSTRUCTIONS
         ),
         Ok(0)
@@ -99,7 +99,7 @@ fn whole_block_selection_accepts_2048_and_refuses_2049_without_partial_mutation(
 #[test]
 fn an_interior_leader_allows_a_complete_prefix_but_never_an_arbitrary_slice() {
     let mut builder = Builder::new(key(0));
-    builder.merge(key(0), &words(0, &vec![NOP; 1792])).unwrap();
+    builder.merge(key(0), words(0, &vec![NOP; 1792])).unwrap();
     let incoming = words(0x10000, &[NOP; 512]);
     assert_eq!(
         select_prefix(&builder, key(0x10000), &incoming, MAX_INSTRUCTIONS),
@@ -115,17 +115,17 @@ fn an_interior_leader_allows_a_complete_prefix_but_never_an_arbitrary_slice() {
 #[test]
 fn identical_overlap_costs_zero_but_conflicting_words_cancel_selection() {
     let mut builder = Builder::new(key(0));
-    builder.merge(key(0), &words(0, &[NOP; 512])).unwrap();
+    builder.merge(key(0), words(0, &[NOP; 512])).unwrap();
     assert_eq!(
-        select_prefix(&builder, key(4), &words(4, &[NOP; 512]), 513),
+        select_prefix(&builder, key(4), words(4, &[NOP; 512]), 513),
         Ok(512)
     );
     assert_eq!(
-        select_prefix(&builder, key(4), &words(4, &[NOP; 512]), 512),
+        select_prefix(&builder, key(4), words(4, &[NOP; 512]), 512),
         Ok(0)
     );
     assert_eq!(
-        select_prefix(&builder, key(4), &words(4, &[0xd65f03c0]), 2048),
+        select_prefix(&builder, key(4), words(4, &[0xd65f03c0]), 2048),
         Err(Error::StaleCapture)
     );
 }

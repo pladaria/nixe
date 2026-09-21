@@ -48,7 +48,7 @@ fn faultless_unit_directory_borrow_survives_detachment_and_span_reuse() {
     let mut candidate = input(&process, &[0], Tier::Lcq);
     candidate.faults = Box::new([]);
     candidate.states = Box::new([]);
-    candidate.code.metadata.faults = Box::new([]);
+    candidate.code.proofs.as_mut().unwrap().faults = Box::new([]);
     let address = candidate.code.allocation.address();
     let old = process
         .prepare_unit(&[process.reserve(key(0)).unwrap()], candidate, &cursor)

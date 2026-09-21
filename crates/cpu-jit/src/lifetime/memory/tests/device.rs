@@ -151,11 +151,17 @@ fn device_publication_invalidates_all_code_aliases_before_ownership_is_visible()
     );
     let new = publish(&process, &memory, 0x3000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xd4200120
     );
     assert_eq!(device.downloads.load(Ordering::Relaxed), 1);
-    assert_eq!(snapshot.instructions[0].bits, 0xf9400020);
+    assert_eq!(snapshot.instructions.get(0).unwrap().bits, 0xf9400020);
     let mut next_state = A64State::default();
     next_state.set_pc(0x3000);
     let mut next_frame = NativeFrame::new(&mut next_state, PollBudget::new(4096, 1000).unwrap());

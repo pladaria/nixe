@@ -152,10 +152,16 @@ fn staged_write_discovers_later_capture_and_drains_fault_reader_before_publicati
     assert!(process.snapshot(other).is_ok());
     let new = publish(&process, &memory, 0x1000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xd4200120
     );
-    assert_eq!(snapshot.instructions[0].bits, 0xf9400020);
+    assert_eq!(snapshot.instructions.get(0).unwrap().bits, 0xf9400020);
 }
 
 #[test]
@@ -180,7 +186,13 @@ fn virtual_bulk_write_cancels_captured_code_through_a_writable_alias() {
     drop(captured);
     let new = publish(&process, &memory, 0x1000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xd4200120
     );
 }
@@ -367,7 +379,13 @@ fn rejected_batch_validation_publishes_neither_bytes_nor_log_and_releases_stop()
     assert!(!memory.mapping_mutation_pending());
     let new = publish(&process, &memory, 0x1000);
     assert_eq!(
-        process.snapshot(new).unwrap().instructions[0].bits,
+        process
+            .snapshot(new)
+            .unwrap()
+            .instructions
+            .get(0)
+            .unwrap()
+            .bits,
         0xf9400020
     );
 }

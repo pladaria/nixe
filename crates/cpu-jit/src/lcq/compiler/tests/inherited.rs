@@ -61,7 +61,7 @@ fn fast_inputs_survive_read_only_use_and_fp_activation() {
                 };
                 ValueBinding {
                     value: binding.value,
-                    location: ValueLocation::Constant(value),
+                    location: ValueLocation::constant(value),
                 }
             })
             .collect();
@@ -74,7 +74,7 @@ fn fast_inputs_survive_read_only_use_and_fp_activation() {
             live: lowered.entry.live_in,
             dirty_live: lowered.entry.live_in,
             bindings,
-            nzcv: NzcvLocation::Packed(ValueLocation::Constant(u128::from(initial.nzcv().bits()))),
+            nzcv: NzcvLocation::Packed(ValueLocation::constant(u128::from(initial.nzcv().bits()))),
             host_fpsr_pending: false,
         };
         source.dirty_live.fpcr = false;

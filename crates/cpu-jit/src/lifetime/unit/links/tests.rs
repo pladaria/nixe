@@ -450,7 +450,7 @@ fn static_source_index_keeps_each_exit_and_island_across_index_growth() {
         }
         .to_vec();
         bytes.resize(40, 0);
-        let mut backend_states = old.metadata.states.to_vec();
+        let mut backend_states = old.proofs.as_mut().unwrap().states.to_vec();
         for (index, offset) in [24, 32].into_iter().enumerate() {
             let mut backend = backend_states[0].clone();
             backend.id = (index + 1) as u64;
@@ -460,14 +460,14 @@ fn static_source_index_keeps_each_exit_and_island_across_index_growth() {
                 crate::native::link::emit(old.metadata.abi, u64::from(offset), 16, 0).unwrap();
             bytes[offset as usize..][..branch.patch().len()].copy_from_slice(branch.patch());
         }
-        old.metadata.states = backend_states.into_boxed_slice();
+        old.proofs.as_mut().unwrap().states = backend_states.into_boxed_slice();
         process
             .cache
             .install_with_islands(
                 Output {
                     bytes: bytes.into_boxed_slice(),
                     alignment: 16,
-                    metadata: old.metadata,
+                    metadata: *old.proofs.take().unwrap(),
                 },
                 Tier::Lcq,
                 2,
@@ -529,7 +529,7 @@ fn publication_rejects_linkable_observations_and_missing_static_islands() {
         let cursor = AtomicU64::new(0);
         let mut input = source_input(&process, 0, 4);
         let expected = if case == 3 {
-            let old = input.code;
+            let mut old = input.code;
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     old.allocation.address() as *const u8,
@@ -545,7 +545,7 @@ fn publication_rejects_linkable_observations_and_missing_static_islands() {
                     Output {
                         bytes,
                         alignment: 16,
-                        metadata: old.metadata,
+                        metadata: *old.proofs.take().unwrap(),
                     },
                     Tier::Lcq,
                     |_| None,
@@ -663,7 +663,7 @@ pub(in crate::lifetime) fn source_input(process: &Lifetime, pc: u64, target: u64
         instruction_index: 0,
     });
     input.states[0].transfer = Some(Box::new(TerminalTransfer {
-        destination: ValueLocation::Constant(u128::from(target)),
+        destination: ValueLocation::constant(u128::from(target)),
         static_target: Some(key(target)),
         completed: 1,
         patch_bytes: width,

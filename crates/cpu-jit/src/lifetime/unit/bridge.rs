@@ -25,7 +25,10 @@ pub(super) fn install(
     let mut transfer = if matches!(tail_kind, Tail::StaticIsland)
         && state.exit.is_some_and(|exit| exit.kind == EdgeKind::Call)
     {
-        let continuation = source.instructions[0]
+        let continuation = source
+            .instructions
+            .get(0)
+            .unwrap()
             .key
             .block_key()
             .at(GuestVirtualAddress::new(

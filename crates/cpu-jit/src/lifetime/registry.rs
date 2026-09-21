@@ -5,10 +5,11 @@
 use super::Error;
 use crate::abi::IdentityExhausted;
 use std::marker::PhantomData;
+use std::num::NonZeroU64;
 
 pub(super) struct Handle<T> {
     index: usize,
-    generation: u64,
+    generation: NonZeroU64,
     marker: PhantomData<fn() -> T>,
 }
 impl<T> Copy for Handle<T> {}
@@ -103,10 +104,12 @@ impl<T> Registry<T> {
         }
         Ok(Handle {
             index: self.free.unwrap_or(self.slots.len()),
-            generation: self
-                .generation
-                .checked_add(1)
-                .ok_or(Error::Exhausted(IdentityExhausted("registry generation")))?,
+            generation: NonZeroU64::new(
+                self.generation
+                    .checked_add(1)
+                    .ok_or(Error::Exhausted(IdentityExhausted("registry generation")))?,
+            )
+            .unwrap(),
             marker: PhantomData,
         })
     }
@@ -159,7 +162,7 @@ impl<T> Registry<T> {
         };
         Ok(Handle {
             index,
-            generation,
+            generation: NonZeroU64::new(generation).unwrap(),
             marker: PhantomData,
         })
     }
@@ -167,7 +170,7 @@ impl<T> Registry<T> {
     pub fn get(&self, handle: Handle<T>) -> Option<&T> {
         self.slots
             .get(handle.index)
-            .filter(|slot| slot.generation == handle.generation)?
+            .filter(|slot| slot.generation == handle.generation.get())?
             .value
             .as_ref()
     }
@@ -175,7 +178,7 @@ impl<T> Registry<T> {
     pub fn get_mut(&mut self, handle: Handle<T>) -> Option<&mut T> {
         self.slots
             .get_mut(handle.index)
-            .filter(|slot| slot.generation == handle.generation)?
+            .filter(|slot| slot.generation == handle.generation.get())?
             .value
             .as_mut()
     }
@@ -190,7 +193,7 @@ impl<T> Registry<T> {
     /// state has returned the actual executable span and associated storage.
     pub fn take_held(&mut self, handle: Handle<T>) -> Option<T> {
         let slot = self.slots.get_mut(handle.index)?;
-        if slot.generation != handle.generation {
+        if slot.generation != handle.generation.get() {
             return None;
         }
         let value = slot.value.take()?;
@@ -202,7 +205,7 @@ impl<T> Registry<T> {
         let Some(slot) = self.slots.get_mut(handle.index) else {
             return false;
         };
-        if slot.generation != handle.generation || !slot.held {
+        if slot.generation != handle.generation.get() || !slot.held {
             return false;
         }
         slot.held = false;
@@ -226,7 +229,7 @@ impl<T> Registry<T> {
                 (
                     Handle {
                         index,
-                        generation: slot.generation,
+                        generation: NonZeroU64::new(slot.generation).unwrap(),
                         marker: PhantomData,
                     },
                     value,
@@ -241,7 +244,7 @@ impl<T> Registry<T> {
             .filter_map(|(index, slot)| {
                 let handle = Handle {
                     index,
-                    generation: slot.generation,
+                    generation: NonZeroU64::new(slot.generation).unwrap(),
                     marker: PhantomData,
                 };
                 slot.value.as_mut().map(|value| (handle, value))
@@ -265,7 +268,7 @@ impl<T> Registry<T> {
             if slot.value.as_ref().is_some_and(&mut predicate) {
                 return Some(Handle {
                     index,
-                    generation: slot.generation,
+                    generation: NonZeroU64::new(slot.generation).unwrap(),
                     marker: PhantomData,
                 });
             }
@@ -277,6 +280,24 @@ impl<T> Registry<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nullable_handles_use_the_generation_niche_without_losing_the_last_generation() {
+        assert_eq!(
+            std::mem::size_of::<Option<Handle<u8>>>(),
+            std::mem::size_of::<Handle<u8>>()
+        );
+        let mut registry = Registry::default();
+        registry.grow(&mut Vec::with_capacity(1));
+        registry.generation = u64::MAX - 1;
+        let predicted = registry.next_handle().unwrap();
+        let handle = registry.insert(&mut Some(7)).unwrap();
+        assert_eq!(handle, predicted);
+        assert_eq!(handle.generation.get(), u64::MAX);
+        assert_eq!(registry.remove(handle), Some(7));
+        assert!(matches!(registry.next_handle(), Err(Error::Exhausted(_))));
+        assert_eq!(registry.get(handle), None);
+    }
 
     #[test]
     fn collector_cursor_visits_each_value_once_across_removals() {

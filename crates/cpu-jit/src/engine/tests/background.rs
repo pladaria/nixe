@@ -107,7 +107,7 @@ fn process_join_releases_owner_lock_and_cannot_be_mistaken_for_completed_teardow
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
         assert_eq!(work.check(), Err(lifetime::Error::StalePublication));
-        assert_eq!(source.unit.instructions[0].bits, 0xd503201f);
+        assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
         Ok(())
     });
     let mut thread = JitThread::new(Arc::clone(&process)).unwrap();
