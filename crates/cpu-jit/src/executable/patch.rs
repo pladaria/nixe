@@ -12,7 +12,7 @@ pub(crate) enum Write<'a> {
     },
     Island {
         index: usize,
-        bytes: &'a [u8; islands::SLOT_BYTES],
+        bytes: &'a [u8; ISLAND_SLOT_BYTES],
     },
 }
 
@@ -37,22 +37,20 @@ impl Cache {
         if writes.is_empty() {
             return Ok(());
         }
-        let offset = allocation.segment * SEGMENT_BYTES;
-        state
-            .backing
-            .as_ref()
-            .ok_or(Error::Closed)?
-            .rw
-            .as_ref()
-            .ok_or(Error::Poisoned)?
-            .protect(
-                offset,
-                segment_size(allocation.segment),
-                libc::PROT_READ | libc::PROT_WRITE,
-            )?;
+        let backing = state.backing.as_ref().ok_or(Error::Closed)?;
+        let (offset, bytes) = backing.write_window(
+            allocation.segment * SEGMENT_BYTES + allocation.span.start,
+            allocation.span.len,
+        );
+        backing.rw.as_ref().ok_or(Error::Poisoned)?.protect(
+            offset,
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )?;
         let mut window = Window {
             state,
-            segment: allocation.segment,
+            offset,
+            bytes,
             finished: false,
         };
         for write in writes {
@@ -86,7 +84,8 @@ impl Cache {
 
 struct Window<'a> {
     state: MutexGuard<'a, State>,
-    segment: usize,
+    offset: usize,
+    bytes: usize,
     finished: bool,
 }
 impl Window<'_> {
@@ -98,11 +97,7 @@ impl Window<'_> {
             .rw
             .as_ref()
             .unwrap()
-            .protect(
-                self.segment * SEGMENT_BYTES,
-                segment_size(self.segment),
-                libc::PROT_NONE,
-            )?;
+            .protect(self.offset, self.bytes, libc::PROT_NONE)?;
         // Cache lines were synchronized using RX addresses by copy(). Other
         // cores must discard old fetched instructions before admission reopens.
         wasmtime_internal_jit_icache_coherence::pipeline_flush_mt().map_err(|error| {

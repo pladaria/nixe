@@ -15,6 +15,43 @@ use std::sync::{Barrier, mpsc};
 
 mod diagnostic;
 
+#[test]
+fn native_pc_tables_insert_in_address_order_without_spare_capacity() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let mut inputs: Vec<_> = (0..3)
+        .map(|i| Some(input(&process, &[i * 4], Tier::Lcq)))
+        .collect();
+    let mut handles = Vec::new();
+    for index in [1, 0, 2] {
+        let publication = process.reserve(key(index as u64 * 4)).unwrap();
+        let prepared = process
+            .prepare_unit(&[publication], inputs[index].take().unwrap(), &cursor)
+            .unwrap();
+        let table = prepared.table.as_ref().unwrap();
+        assert_eq!(table.intervals.len(), handles.len() + 1);
+        assert_eq!(table.intervals.capacity(), table.intervals.len());
+        assert!(
+            table
+                .intervals
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start)
+        );
+        handles.push(prepared.publish().unwrap());
+    }
+    let (unit, table) = {
+        let state = process.lock();
+        let unit = state.units.records.get(handles[0].0).unwrap().code.clone();
+        let table = state.units.tables[unit.code.allocation.segment].clone();
+        (unit, table)
+    };
+    // Reinserting an already present owner overlaps its neighbor and must fail.
+    assert!(matches!(
+        process.unit_table(&unit, &table),
+        Err(Error::InvalidUnit(_))
+    ));
+}
+
 pub(in crate::lifetime) fn key(pc: u64) -> BlockKey {
     BlockKey::new(
         ProcessCpuContext::new(TargetPlatform::Switch1, AddressSpaceId::new(1)),
@@ -235,6 +272,12 @@ fn metadata_and_exact_faults_are_live_before_multi_entry_dispatch() {
         let owner = &state.units.records.get(handle.0).unwrap().code;
         assert_eq!((entry.unit, entry.version), (owner.id, owner.version));
         assert_eq!(owner.abi_version, NATIVE_ABI_VERSION);
+        // Publication consumed the backend proof. Runtime fault attribution
+        // below must work from semantic maps without retaining a second copy.
+        assert!(owner.code.metadata.entries.is_empty());
+        assert!(owner.code.metadata.states.is_empty());
+        assert!(owner.code.metadata.faults.is_empty());
+        assert!(owner.code.metadata.relocations.is_empty());
         let fault = invocation.fault(base + 12).unwrap();
         // Unit ownership includes nonfaulting code, but that must not turn
         // arbitrary native PCs into attributed guest memory accesses.
@@ -681,7 +724,7 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
             1 => candidate.faults[0].native_start = 11,
             2 => candidate.faults[0].state_map = 1,
             3 => candidate.faults = Box::new([]),
-            4 => candidate.entries[0].contract.live_in.integer.x[0] = true,
+            4 => candidate.entries[0].contract.live_in.integer.x.insert(0),
             5 => candidate.tier = Tier::Hcq,
             6 => candidate.instructions[0].key = InstructionKey::new(key(8)).unwrap(),
             7 => candidate.states[0].state.site.source = CodeVersion::new(u64::MAX).unwrap(),

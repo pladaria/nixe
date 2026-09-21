@@ -1317,3 +1317,56 @@ Do not run them automatically at checkpoints or at final validation.
   multiple HCQ entry labels, exact cache accounting, repeated teardown and
   retired HCQ retained by a compiler snapshot. Logging is checked outside both
   JIT and cache locks. JIT Clippy, formatting and whitespace checks pass.
+
+## Post-closure memory audit
+
+The maintainer authorized es2gears profiling and corrections after observing
+about 493 MiB of cache. The 180-second reference reproduced 495.8 MiB with
+30,797 LCQ and 469 HCQ resident units. The principal waste was not overlapping
+LCQ: 157,954 instruction instances represented 153,088 distinct InstructionKeys
+(3.08% extra instances). Almost all LCQ segments exhausted their 4,096 island
+slots with only 2.6–3.2 MiB used in each committed 16 MiB segment.
+
+Corrected in the existing production path:
+
+- Coallocate exact aligned island reservations with the owning code span; remove
+  the fixed bitmap pool. Preserve checked code/island bounds, ownership, W^X,
+  same-segment branch reach and coalescing/decommit behavior.
+- Release backend-only labels/maps/relocations after semantic-map validation;
+  keep all runtime fault/state/dependency contracts and ABI/frame extent.
+- Store register membership as bit masks rather than boolean arrays; StateSet
+  is 20 instead of 69 bytes, with direct bitwise union/difference.
+- Scope writable-alias permission windows to the owner's host pages. Dense
+  segments otherwise expose excessive per-install/per-patch mprotect work.
+- Insert into immutable native-PC tables by binary search and neighbor checks,
+  using one exact-capacity allocation. This removes duplicate copying/full
+  sorting, not the O(n) copy required by the current immutable-table design.
+
+The first three corrections reduced the comparable 180-second cache snapshot
+from 495.8 to 250.5 MiB, with essentially identical LCQ coverage. An exposed
+startup slowdown was then corrected by the permission/directory changes:
+matched 45-second startup captures reached 1,024 guest completions in 20.67
+versus 7.55 seconds. This is neither first-frame timing nor FPS.
+
+Temporary emission sizing found 6.94 MB of LCQ backend body, 40.95 MB of exit
+support and 1.37 MB of entry support across 30,858 emissions, including
+unpublished attempts. Adapter storage remains a real separate cost; this audit
+does not introduce a speculative shared-stub architecture or attribute all
+expansion to guest-instruction lowering. Detailed local evidence is in
+`dump/perf-followup-20260921-232045-Cv0crV/analysis.md`.
+
+Validation: 822 host JIT tests; AArch64/QEMU 11.1.1 storage 27, lifetime 332 and
+HCQ 123 tests; JIT Clippy and formatting/whitespace checks. Regression coverage
+includes >4,096 colocated island slots, exact extent/padding/last-segment bounds,
+span reuse and failure cleanup, page-scoped W^X aliases, released metadata
+charges with surviving semantic fault maps, ordered directory insertion and
+all architectural register/flag bits. Temporary diagnostic code is removed.
+No fork, dependency pin, lockfile, commit or push changes.
+
+Final ordinary-build comparison (180 seconds, perf at 120–180): **495.83 to
+240.84 MiB**, saving 254.99 MiB/51.43%. Executable backing is 304 to 80 MiB;
+metadata 191.83 to 160.84 MiB. LCQ residents are 30,797 versus 30,793 and HCQ
+469 versus 481, with essentially unchanged native-unit byte totals. Both runs
+shut down cleanly and have no lost perf samples. First 1,024 completions were
+10.65 versus 6.86 seconds (an indicator, not an FPS/first-frame guarantee).
+Final evidence: `dump/perf-followup-20260921-233314-VJWojq/analysis.md`.

@@ -192,8 +192,8 @@ fn division_exact_boundary_preserves_pending_status_and_final_maps() {
             })
             .unwrap();
         assert!(exact.state.host_fpsr_pending && exact.state.dirty_live.fpsr);
-        assert!(exact.state.dirty_live.vector[3]);
-        assert!(!exact.state.dirty_live.vector[0]);
+        assert!(exact.state.dirty_live.vector.contains(3));
+        assert!(!exact.state.dirty_live.vector.contains(0));
     }
     let mut actual = A64State::default();
     actual.set_pc(PC);

@@ -59,9 +59,16 @@ pub(super) struct Backing {
     pub rx: Mapping,
     pub rw: Option<Mapping>,
     pub fd: OwnedFd,
+    page_bytes: usize,
 }
 impl Backing {
     pub fn new() -> Result<Self, Error> {
+        let page_bytes = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|bytes| bytes.is_power_of_two() && WINDOW_BYTES.is_multiple_of(*bytes))
+            .ok_or_else(|| {
+                Error::Output("unsupported host page size for executable window".into())
+            })?;
         // Sparse memfd: reservation is not committed capacity. fallocate below
         // commits whole segments; PUNCH_HOLE releases their real backing.
         // https://man7.org/linux/man-pages/man2/memfd_create.2.html
@@ -78,7 +85,17 @@ impl Backing {
             rx: Mapping::new(&fd)?,
             rw: Some(Mapping::new(&fd)?),
             fd,
+            page_bytes,
         })
+    }
+
+    /// Allocation extents have already been checked against their segment.
+    /// Only their host pages need writable alias permissions, not every page
+    /// of a densely occupied 16 MiB segment on each tiny install/link patch.
+    pub fn write_window(&self, offset: usize, bytes: usize) -> (usize, usize) {
+        let start = offset & !(self.page_bytes - 1);
+        let end = (offset + bytes).next_multiple_of(self.page_bytes);
+        (start, end - start)
     }
     pub fn commit(&self, offset: usize, bytes: usize) -> Result<(), Error> {
         if unsafe {

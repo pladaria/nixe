@@ -955,8 +955,8 @@ impl GuestValue {
     pub fn state(self) -> Option<StateSet> {
         let mut state = StateSet::default();
         match self {
-            Self::General(index) if index < 31 => state.integer.x[usize::from(index)] = true,
-            Self::Vector(index) if index < 32 => state.vector[usize::from(index)] = true,
+            Self::General(index) if index < 31 => state.integer.x.insert(usize::from(index)),
+            Self::Vector(index) if index < 32 => state.vector.insert(usize::from(index)),
             Self::Sp => state.integer.sp = true,
             Self::Fpcr => state.fpcr = true,
             Self::Fpsr => state.fpsr = true,
@@ -1400,7 +1400,7 @@ mod tests {
                 .valid(abi, 8)
             );
             let mut required = StateSet::default();
-            required.integer.x[0] = true;
+            required.integer.x.insert(0);
             let binding = ValueBinding {
                 value: GuestValue::General(0),
                 location: ValueLocation::Register {
@@ -1423,7 +1423,7 @@ mod tests {
             );
             entry.live_in.nzcv = 0;
             entry.nzcv = NzcvLocation::Canonical;
-            entry.live_in.integer.x[1] = true;
+            entry.live_in.integer.x.insert(1);
             assert!(entry.validate().is_err());
             entry.bindings = vec![
                 binding,
@@ -1464,7 +1464,7 @@ mod tests {
             width: 64,
         });
         assert!(exit.validate().is_ok());
-        exit.live.integer.x[7] = true;
+        exit.live.integer.x.insert(7);
         exit.bindings = vec![ValueBinding {
             value: GuestValue::General(7),
             location: ValueLocation::Constant(42),
@@ -1475,7 +1475,7 @@ mod tests {
             "clean live locations are needed by fast bridges too"
         );
         assert!(
-            !exit.dirty_live.integer.x[7],
+            !exit.dirty_live.integer.x.contains(7),
             "canonical exit must not store the clean value"
         );
         exit.nzcv = NzcvLocation::Host {

@@ -261,7 +261,7 @@ runtime tuner or title override.
 | software return-stack size                             |                                                16 entries per guest thread |
 | virtual executable reservation                         |                                                                   2047 MiB |
 | executable segment size                                |                                                                     16 MiB |
-| link-island reservation per segment                    |                                                                     64 KiB |
+| link-island reservation                                |                         16 bytes per static exit, owned with its code span |
 | committed code+metadata soft limit                     |                                                                    512 MiB |
 | committed code+metadata hard limit                     |                                                                    640 MiB |
 | LCQ emergency reserve                                  |                                                                     32 MiB |
@@ -407,6 +407,13 @@ does not remove fault/dependency metadata. Reclamation alone returns registry
 slots and executable spans. State transitions compare CodeUnitId, CodeVersion
 and the expected lifecycle; speculative admission additionally checks its epoch
 so a stale task cannot advance a newer unit.
+
+Backend labels, physical operand maps and relocation records are staging and
+validation inputs. After installation and validation against the semantic
+entry/state/fault records, release that backend-only storage and its charge.
+Published units retain the semantic records needed for execution, linking,
+fault reconstruction and invalidation, plus the host ABI and spill extent;
+they do not retain a redundant backend copy for the unit's whole lifetime.
 
 ### Bounded registries and indexes
 
@@ -847,12 +854,16 @@ epoch-managed target and executes br; x86-64 uses the equivalent island only
 when rel32 cannot reach. These are distinct accepted shapes and are not called
 single-branch links.
 
-Each 16 MiB segment reserves its final 64 KiB for link/helper islands. A
-CodeUnit preflights one fixed island slot for every static exit which could need
-one plus the exact helper veneer bytes before final allocation. Dynamic targets
-never allocate islands. If the segment cannot reserve the complete worst-case
-set, the allocator tries another segment or splits the unpublished unit. It
-never publishes a unit whose island demand can overflow later.
+Each CodeUnit preflights one 16-byte island slot for every static exit which
+could need one plus the exact helper veneer bytes before final allocation.
+Code and its aligned trailing islands occupy one allocator span in the same
+16 MiB segment, and are reclaimed together. There is no independent fixed
+per-segment island quota: small sources must not strand otherwise usable code
+space by exhausting a slot pool. Code bounds/native-PC intervals exclude the
+trailing islands; island writes use their separate checked indexes. Dynamic
+targets never allocate islands. If the complete code-plus-island extent cannot
+fit, the allocator tries another segment or rejects the unpublished allocation.
+It never publishes a unit whose island demand can overflow later.
 
 Every patch record names source CodeVersion, target BlockKey,
 ReachabilityVersion and CodeVersion, source state map, target entry contract,
@@ -1175,7 +1186,8 @@ to HCQ so background compilation cannot prevent LCQ forward progress.
 The 2047 MiB bound describes the executable-address window. The separate
 nonexecutable RW alias is outside that window; shared backing is charged once,
 not once per alias. Segments 0 through 126 have 16 MiB each; segment 127 has
-15 MiB. Each reserves its final 64 KiB for islands, including the last segment.
+15 MiB. Owned code-plus-island spans must fit entirely inside their segment,
+including that shorter last segment.
 Bounds checks precede `(native_pc - executable_base) / 16 MiB`; the missing
 final 1 MiB is neither reserved executable capacity nor an allocatable span.
 No allocation may cross a segment boundary. Decommit must release backing
@@ -1198,7 +1210,9 @@ address the writable alias.
 
 With dual aliases, populating an unreachable span may coexist with execution
 of other spans in that segment. Only the unpublished span is written; opening
-the RW alias does not authorize modifying callable bytes. Reuse of a formerly
+the RW alias does not authorize modifying callable bytes. Permission windows
+cover only the host pages of the owned code-plus-island span, not every page
+of the segment for each small installation or patch. Reuse of a formerly
 published span still requires unlink, epoch quiescence and release of all
 protecting references. Relocations use RX addresses, never RW alias addresses.
 

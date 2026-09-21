@@ -47,9 +47,15 @@ fn hcq_liveness_diamond_preserves_bypass_values_at_a_public_join() {
     ]);
     let join = block(&graph, 24);
     let analysis = Analysis::build(&graph, &[0, join]);
-    assert!(analysis.blocks[0].live_in.integer.x[0]);
-    assert!(!analysis.blocks[block(&graph, 4)].live_in.integer.x[0]);
-    assert!(analysis.blocks[join].live_in.integer.x[0]);
+    assert!(analysis.blocks[0].live_in.integer.x.contains(0));
+    assert!(
+        !analysis.blocks[block(&graph, 4)]
+            .live_in
+            .integer
+            .x
+            .contains(0)
+    );
+    assert!(analysis.blocks[join].live_in.integer.x.contains(0));
     assert!(analysis.backedges.iter().flatten().all(|&edge| !edge));
 }
 
@@ -62,12 +68,30 @@ fn hcq_liveness_fault_observes_old_destination_and_keeps_earlier_producers() {
     let analysis = Analysis::build(&graph, &[0, block(&graph, 8)]);
     let load = point(&graph, &analysis, 8);
     assert_eq!(load.live_before, StateSet::ALL);
-    assert!(!analysis.blocks[0].live_in.integer.x[0]);
-    assert!(analysis.blocks[block(&graph, 8)].live_in.integer.x[0]);
+    assert!(!analysis.blocks[0].live_in.integer.x.contains(0));
+    assert!(
+        analysis.blocks[block(&graph, 8)]
+            .live_in
+            .integer
+            .x
+            .contains(0)
+    );
     let graph = self::graph(&[(0, &[0xf9400020, RET])]);
     let analysis = Analysis::build(&graph, &[0]);
-    assert!(!analysis.native.instructions[0].dirty_before.integer.x[0]);
-    assert!(analysis.native.instructions[0].dirty_after.integer.x[0]);
+    assert!(
+        !analysis.native.instructions[0]
+            .dirty_before
+            .integer
+            .x
+            .contains(0)
+    );
+    assert!(
+        analysis.native.instructions[0]
+            .dirty_after
+            .integer
+            .x
+            .contains(0)
+    );
 }
 
 #[test]
@@ -83,9 +107,9 @@ fn hcq_liveness_partial_integer_and_vector_writes_keep_preserved_parts() {
         let live = analysis.blocks[0].live_in;
         assert_eq!(
             if vector {
-                live.vector[0]
+                live.vector.contains(0)
             } else {
-                live.integer.x[0]
+                live.integer.x.contains(0)
             },
             preserved
         );
@@ -124,7 +148,7 @@ fn hcq_liveness_invalid_and_unsupported_boundaries_never_commit_nominal_writes()
     let mut graph = self::graph(&[(0, &[0xd2800020])]);
     graph.blocks[0].exit = Exit::Boundary(End::Unsupported);
     let analysis = Analysis::build(&graph, &[0]);
-    assert!(analysis.instructions[0].live_before.integer.x[0]);
+    assert!(analysis.instructions[0].live_before.integer.x.contains(0));
     assert!(analysis.native.instructions[0].dirty_after.is_empty());
 }
 
@@ -133,10 +157,22 @@ fn hcq_liveness_closed_loop_keeps_post_values_for_its_control_poll() {
     let graph = graph(&[(0, &[0xd2800020, 0x17ffffff])]); // MOVZ X0,#1; B 0
     let analysis = Analysis::build(&graph, &[0]);
     assert_eq!(analysis.backedges, vec![[true, false]]);
-    assert!(!analysis.blocks[0].live_in.integer.x[0]);
+    assert!(!analysis.blocks[0].live_in.integer.x.contains(0));
     assert_eq!(analysis.blocks[0].live_out, StateSet::ALL);
-    assert!(point(&graph, &analysis, 4).live_before.integer.x[0]);
-    assert!(analysis.native.instructions[0].dirty_before.integer.x[0]);
+    assert!(
+        point(&graph, &analysis, 4)
+            .live_before
+            .integer
+            .x
+            .contains(0)
+    );
+    assert!(
+        analysis.native.instructions[0]
+            .dirty_before
+            .integer
+            .x
+            .contains(0)
+    );
 }
 
 #[test]

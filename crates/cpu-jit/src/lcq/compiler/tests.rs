@@ -599,7 +599,7 @@ fn mixed_vector_spills_preserve_lazy_flags_and_partial_register_writes() {
             .unwrap();
         let exit = &lowered.states[0].state;
         assert!(matches!(exit.nzcv, NzcvLocation::Deferred(_)));
-        assert!(exit.dirty_live.vector.iter().all(|dirty| *dirty));
+        assert!(exit.dirty_live.vector == StateSet::ALL.vector);
         assert!(
             abi == HostAbi::Aarch64
                 || exit.bindings.iter().any(|binding| matches!(

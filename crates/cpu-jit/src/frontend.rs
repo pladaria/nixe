@@ -192,7 +192,7 @@ impl<'a> IntegerLowering<'a> for Translator<'a> {
         if index == 31 {
             self.dirty.integer.sp = true;
         } else {
-            self.dirty.integer.x[usize::from(index)] = true;
+            self.dirty.integer.x.insert(usize::from(index));
         }
         Ok(())
     }
@@ -207,7 +207,7 @@ impl<'a> SimdLowering<'a> for Translator<'a> {
     }
     fn write_vector(&mut self, index: u8, value: ir::Value) -> Result<(), Error> {
         self.values.vectors[usize::from(index)] = Some(value);
-        self.dirty.vector[usize::from(index)] = true;
+        self.dirty.vector.insert(usize::from(index));
         Ok(())
     }
 }

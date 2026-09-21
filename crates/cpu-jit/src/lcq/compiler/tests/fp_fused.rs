@@ -261,7 +261,7 @@ fn fused_capabilities_and_pending_status_use_real_boundaries() {
             })
             .unwrap();
         assert!(exact.state.host_fpsr_pending && exact.state.dirty_live.fpsr);
-        assert!(exact.state.dirty_live.vector[6]);
+        assert!(exact.state.dirty_live.vector.contains(6));
     }
     let mut actual = A64State::default();
     actual.set_pc(PC);

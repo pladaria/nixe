@@ -149,9 +149,9 @@ fn prefault_maps_keep_inputs_needed_only_after_the_fault() {
                     .all(|b| b.value != GuestValue::Fpsr)
             );
         }
-        assert!(state.dirty_live.integer.x[19]);
-        assert!(state.dirty_live.integer.x[1]);
-        assert!(!state.dirty_live.integer.x[0]);
+        assert!(state.dirty_live.integer.x.contains(19));
+        assert!(state.dirty_live.integer.x.contains(1));
+        assert!(!state.dirty_live.integer.x.contains(0));
         assert_eq!(state.dirty_live.nzcv, crate::analysis::C);
         assert!(matches!(
             state.nzcv,

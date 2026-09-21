@@ -228,7 +228,7 @@ fn selective_chain_faults_preserve_spills_lazy_flags_and_inherited_fp() {
             .unwrap();
         let second = process.snapshot(target).unwrap();
         let entry = &second.entries[0].contract;
-        assert!(!entry.live_in.integer.x[19] && !entry.live_in.vector[19]);
+        assert!(!entry.live_in.integer.x.contains(19) && !entry.live_in.vector.contains(19));
         assert_eq!(entry.live_in.nzcv, crate::analysis::C);
         assert!(
             entry
@@ -257,7 +257,7 @@ fn selective_chain_faults_preserve_spills_lazy_flags_and_inherited_fp() {
             .find(|s| s.exit.is_some_and(|exit| exit.kind == EdgeKind::Static))
             .unwrap()
             .state;
-        assert!(source.dirty_live.integer.x[19] && source.dirty_live.vector[19]);
+        assert!(source.dirty_live.integer.x.contains(19) && source.dirty_live.vector.contains(19));
         assert!(
             source
                 .bindings

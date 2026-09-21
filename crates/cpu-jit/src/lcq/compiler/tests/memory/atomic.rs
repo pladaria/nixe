@@ -129,7 +129,7 @@ fn scalar_rmw_maps_cover_native_and_loop_accesses_without_committing() {
                     assert_eq!(fault.commit_stage, 0);
                     assert!(fault.completed_read.is_none());
                     let state = &lowered.states[fault.state_map as usize].state;
-                    assert!(!state.dirty_live.integer.x[3]);
+                    assert!(!state.dirty_live.integer.x.contains(3));
                     assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
                     state.validate().unwrap();
                     if abi == HostAbi::Aarch64 {
@@ -336,7 +336,7 @@ fn scalar_cas_maps_cover_lse_and_exclusive_loop_without_committing() {
                 assert!(fault.completed_read.is_none());
                 let state = &lowered.states[fault.state_map as usize].state;
                 // CAS must retain the incoming compare value before commit.
-                assert!(state.dirty_live.integer.x[2]);
+                assert!(state.dirty_live.integer.x.contains(2));
                 assert!(matches!(state.nzcv, NzcvLocation::Deferred(_)));
                 state.validate().unwrap();
                 if abi == HostAbi::Aarch64 {

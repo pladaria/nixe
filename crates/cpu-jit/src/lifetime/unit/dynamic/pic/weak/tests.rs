@@ -119,7 +119,7 @@ fn weak_bridge_hit_shares_nonempty_code_without_allocating_or_emitting() {
     let process = process();
     let cursor = AtomicU64::new(0);
     let mut candidate = input(&process, &[4], Tier::Lcq);
-    candidate.entries[0].contract.live_in.integer.x[0] = true;
+    candidate.entries[0].contract.live_in.integer.x.insert(0);
     candidate.entries[0].contract.bindings = Box::new([ValueBinding {
         value: GuestValue::General(0),
         location: ValueLocation::Register {

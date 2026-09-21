@@ -43,12 +43,12 @@ impl Values {
 
 pub(crate) fn register_operands(state: StateSet) -> Vec<GuestValue> {
     (0..31)
-        .filter(|&index| state.integer.x[index])
+        .filter(|&index| state.integer.x.contains(index))
         .map(|index| GuestValue::General(index as u8))
         .chain(state.integer.sp.then_some(GuestValue::Sp))
         .chain(
             (0..32)
-                .filter(|&index| state.vector[index])
+                .filter(|&index| state.vector.contains(index))
                 .map(|index| GuestValue::Vector(index as u8)),
         )
         .chain(state.fpcr.then_some(GuestValue::Fpcr))

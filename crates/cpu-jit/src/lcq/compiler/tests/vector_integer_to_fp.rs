@@ -179,7 +179,7 @@ fn overwritten_vector_conversion_keeps_status_at_precise_exit() {
             })
             .unwrap();
         assert!(exit.state.host_fpsr_pending && exit.state.dirty_live.fpsr);
-        assert!(exit.state.dirty_live.integer.x[0]);
+        assert!(exit.state.dirty_live.integer.x.contains(0));
     }
     let mut actual = A64State::default();
     actual.set_pc(PC);

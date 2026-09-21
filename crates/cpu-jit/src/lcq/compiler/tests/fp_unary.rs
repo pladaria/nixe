@@ -162,8 +162,8 @@ fn unary_boundaries_use_final_maps_and_keep_pending_status() {
             .find(|s| matches!(s.exit.map(|e| e.kind), Some(EdgeKind::FpUnary(_))))
             .unwrap();
         assert!(exact.state.host_fpsr_pending && exact.state.dirty_live.fpsr);
-        assert!(exact.state.dirty_live.vector[3]);
-        assert!(!exact.state.dirty_live.vector[0]);
+        assert!(exact.state.dirty_live.vector.contains(3));
+        assert!(!exact.state.dirty_live.vector.contains(0));
     }
     let mut actual = A64State::default();
     actual.set_pc(PC);

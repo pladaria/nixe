@@ -133,8 +133,8 @@ fn hcq_fp_exact_and_status_boundaries_keep_pending_state_without_new_activation(
             let exit = &body.exits[1];
             assert_eq!(exit.guest.pc.get(), 64);
             assert_eq!(exit.reason, NativeExitReason::Architectural);
-            assert!(exit.state.dirty.vector[0]);
-            assert!(exit.state.dirty.integer.x[0]);
+            assert!(exit.state.dirty.vector.contains(0));
+            assert!(exit.state.dirty.integer.x.contains(0));
             assert_eq!(exit.state.dirty.nzcv, crate::analysis::NZCV);
             assert!(exit.state.dirty.fpsr);
             assert!(matches!(exit.state.flags, Some(LazyFlags::Packed(_))));
@@ -165,8 +165,8 @@ fn hcq_fp_continuations_transport_typed_lazy_operands_and_subsequent_fault_state
         )
         .unwrap();
         assert_eq!(faults[0].instruction.block_key().pc.get(), 68);
-        assert!(states[0].state.dirty_live.integer.x[0]);
-        assert!(states[0].state.dirty_live.vector[0]);
+        assert!(states[0].state.dirty_live.integer.x.contains(0));
+        assert!(states[0].state.dirty_live.vector.contains(0));
         assert!(states[0].state.host_fpsr_pending);
         assert!(matches!(
             body.exits[0].state.flags,

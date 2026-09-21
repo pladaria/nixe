@@ -264,7 +264,7 @@ fn round_lowering_uses_selected_isa_and_retains_exact_prestate_maps() {
                 lowered.states[0].exit.unwrap().kind,
                 EdgeKind::FpRound(_)
             ));
-            assert!(lowered.states[0].state.dirty_live.vector[0]);
+            assert!(lowered.states[0].state.dirty_live.vector.contains(0));
             assert!(lowered.states[0].state.host_fpsr_pending);
             assert!(lowered.output.metadata.faults.is_empty());
             if native {

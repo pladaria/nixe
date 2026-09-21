@@ -199,8 +199,8 @@ fn comparison_final_maps_retain_prestate_and_normal_path_has_no_helper() {
         ));
         // The later ADC reads X3: its inherited value is observable even at
         // the earlier FP guard, before the ADC has executed.
-        assert!(lowered.states[0].state.dirty_live.integer.x[3]);
-        assert!(lowered.states[1].state.dirty_live.integer.x[3]);
+        assert!(lowered.states[0].state.dirty_live.integer.x.contains(3));
+        assert!(lowered.states[1].state.dirty_live.integer.x.contains(3));
         assert!(lowered.output.metadata.faults.is_empty());
     }
     let mut state = A64State::default();

@@ -153,7 +153,7 @@ fn integer_to_fp_activation_and_exact_maps_preserve_pending_status() {
             })
             .unwrap();
         assert!(exit.state.host_fpsr_pending && exit.state.dirty_live.fpsr);
-        assert!(exit.state.dirty_live.vector[0]);
+        assert!(exit.state.dirty_live.vector.contains(0));
     }
     let mut actual = A64State::default();
     actual.set_pc(PC);

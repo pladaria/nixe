@@ -37,8 +37,8 @@ fn hcq_memory_faults_keep_noncontiguous_source_and_incoming_lazy_state() {
         assert_eq!(fault.bytes, 8);
         assert!(fault.native_end > fault.native_start);
         let state = &states[fault.state_map as usize].state;
-        assert!(state.dirty_live.integer.x[0]); // old destination, not the load result
-        assert!(state.dirty_live.integer.x[1]); // PRE post-index base
+        assert!(state.dirty_live.integer.x.contains(0)); // old destination, not the load result
+        assert!(state.dirty_live.integer.x.contains(1)); // PRE post-index base
         assert!(matches!(
             state.nzcv,
             NzcvLocation::Deferred(LazyFlags::Add { .. })
@@ -68,7 +68,8 @@ fn hcq_memory_public_join_preserves_bypass_values_before_overwrite() {
                 .state
                 .dirty_live
                 .integer
-                .x[0]
+                .x
+                .contains(0)
         );
         assert_eq!(faults[0].instruction.block_key().pc.get(), 24);
     }
@@ -100,11 +101,11 @@ fn hcq_pair_faults_keep_deferred_reads_and_partial_store_stages() {
                 assert_eq!(fault.completed_read.is_some(), load && i == 1);
                 let state = &states[fault.state_map as usize].state;
                 let dirty = if vector {
-                    &state.dirty_live.vector[..]
+                    &state.dirty_live.vector
                 } else {
-                    &state.dirty_live.integer.x[..]
+                    &state.dirty_live.integer.x
                 };
-                assert!(dirty[0] && dirty[3]);
+                assert!(dirty.contains(0) && dirty.contains(3));
                 assert!(state.host_fpsr_pending && state.dirty_live.fpsr);
                 if let Some(location) = fault.completed_read {
                     assert!(location.valid(abi, fault.bytes));
@@ -128,7 +129,7 @@ fn hcq_vector_writeback_and_cache_probe_use_shared_fault_boundaries() {
             assert_eq!(fault.instruction.block_key().pc.get(), 64 + i as u64 * 4);
             assert_eq!(fault.completed, i as u16);
             let state = &states[fault.state_map as usize].state;
-            assert!(state.dirty_live.vector[0] && state.dirty_live.integer.x[1]);
+            assert!(state.dirty_live.vector.contains(0) && state.dirty_live.integer.x.contains(1));
         }
         assert_eq!(faults[2].access, Access::CacheProbe);
         assert_eq!(faults[2].bytes, 1);
@@ -147,7 +148,7 @@ fn hcq_system_read_completion_does_not_lose_the_old_destination_at_public_join()
             assert_eq!(exit.guest.pc.get(), 64);
             assert_eq!(exit.reason, NativeExitReason::Architectural);
             assert!(
-                exit.state.dirty.integer.x[0],
+                exit.state.dirty.integer.x.contains(0),
                 "cold completion has not written X0"
             );
             assert!(
@@ -175,7 +176,7 @@ fn hcq_system_cold_exits_preserve_pre_state_without_nominal_writes() {
             let exit = &body.exits[0];
             assert_eq!(exit.reason, NativeExitReason::Architectural);
             assert_eq!(exit.guest.pc.get(), 64);
-            assert!(exit.state.dirty.integer.x[0]);
+            assert!(exit.state.dirty.integer.x.contains(0));
             assert_eq!(exit.state.dirty.nzcv, crate::analysis::NZCV);
             assert!(exit.state.dirty.fpsr);
             assert!(!exit.state.dirty.fpcr);
@@ -202,7 +203,7 @@ fn hcq_atomic_and_exclusive_maps_stay_precise_across_internal_edges() {
                 assert_eq!(fault.bytes, 8);
                 assert!(matches!(fault.access, Access::Read | Access::Atomic));
                 let state = &states[fault.state_map as usize].state;
-                assert!(state.dirty_live.integer.x[3]);
+                assert!(state.dirty_live.integer.x.contains(3));
                 assert_eq!(state.dirty_live.nzcv, crate::analysis::NZCV);
             }
             if words.len() == 3 {
@@ -210,7 +211,7 @@ fn hcq_atomic_and_exclusive_maps_stay_precise_across_internal_edges() {
                 let exit = &body.exits[0];
                 assert!(matches!(exit.guest.kind, EdgeKind::ExclusiveStore(_)));
                 assert_eq!(exit.guest.pc.get(), 68);
-                assert!(exit.state.dirty.integer.x[3]);
+                assert!(exit.state.dirty.integer.x.contains(3));
             } else {
                 assert_eq!(body.exits.len(), 1);
             }
