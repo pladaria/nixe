@@ -2,18 +2,17 @@ use super::*;
 use nixe_cpu::execution::{ArchitecturalTimer, CpuFaultKind, TimerSnapshot, VcpuEventState};
 
 #[test]
-fn process_stop_wakes_background_workers_without_starting_production_compilation() {
-    let thread = budget::setup(&[0xd4200120], false);
-    let process = Arc::clone(&thread.process);
-    let mut pool =
-        lifetime::background::workers::Workers::start(2, Arc::clone(&process.lifetime), |_, _| {
-            panic!("no production HCQ consumer in Task 5")
-        })
-        .unwrap()
-        .unwrap();
+fn process_stop_wakes_its_real_background_workers() {
+    let process =
+        JitProcess::with_workers(cpu(), memory(DirectBackendPolicy::Required), 2).unwrap();
     process.request_stop().unwrap();
-    assert!(pool.queue().wait().unwrap().is_none());
-    pool.shutdown().unwrap();
+    {
+        let owner = process.background.lock().unwrap();
+        let super::super::background::Background::Running(pool) = &*owner else {
+            panic!("expected real pool")
+        };
+        assert!(pool.queue().wait().unwrap().is_none());
+    }
     assert!(process.try_shutdown().unwrap());
 }
 

@@ -11,6 +11,8 @@ mod native;
 pub(crate) use native::NativeFlow;
 mod fp;
 pub(crate) use fp::FpFlow;
+mod flags;
+pub(crate) use flags::FlagFlow;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Point {
@@ -21,6 +23,7 @@ pub(crate) struct Point {
 pub(crate) struct Analysis {
     pub native: NativeFlow,
     pub fp: FpFlow,
+    pub flags: FlagFlow,
     pub blocks: Vec<BlockLiveness>,
     /// Same unique instruction ordinals as Graph.instructions.
     pub instructions: Vec<Point>,
@@ -53,8 +56,26 @@ impl Analysis {
         // An unsupported decoded encoding exits PRE without executing its
         // nominal writes. Keep the precise pre-state, including its destination.
         for block in &graph.blocks {
+            let last = block.instructions.end - 1;
             if matches!(block.exit, Exit::Boundary(End::Unsupported | End::Invalid)) {
-                effects[block.instructions.end - 1] = InstructionEffects {
+                effects[last] = InstructionEffects {
+                    observe_before: StateSet::ALL,
+                    ..Default::default()
+                };
+            } else if let DecodeResult::Decoded(decoded) = &graph.instructions[last].decoded
+                && let decode::a64::A64Instruction::System(instruction) =
+                    decode::a64::normalize(&decoded.instruction, decoded.encoding)
+                && (crate::lcq::system::fp_boundary(instruction).is_some()
+                    || (crate::lcq::system::runtime_boundary(block.key.platform, instruction)
+                        .is_some()
+                        && !crate::lcq::system::is_cache_probe(block.key.platform, instruction)))
+            {
+                // These instructions complete after leaving native execution.
+                // Their nominal destination is still PRE here (notably MRS
+                // FPSR); it must survive an incoming edge/public entry even
+                // though the architectural instruction will overwrite it.
+                effects[last] = InstructionEffects {
+                    reads: effects[last].reads,
                     observe_before: StateSet::ALL,
                     ..Default::default()
                 };
@@ -110,6 +131,7 @@ impl Analysis {
         let blocks = analysis::liveness(&flow);
         let native = NativeFlow::build(graph, entries, &effects, &flow);
         let fp = FpFlow::build(graph, entries, &flow);
+        let flags = FlagFlow::build(graph, entries, &flow, &native);
         let mut instructions = vec![Point::default(); graph.instructions.len()];
         for (index, block) in graph.blocks.iter().enumerate() {
             let mut live = blocks[index].live_out;
@@ -125,6 +147,7 @@ impl Analysis {
         Self {
             native,
             fp,
+            flags,
             blocks,
             instructions,
             backedges,
@@ -178,4 +201,4 @@ fn backedges(targets: &[[Option<Target>; 2]], entries: &[usize]) -> Vec<[bool; 2
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

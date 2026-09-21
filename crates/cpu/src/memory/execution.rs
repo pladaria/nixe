@@ -2060,7 +2060,6 @@ impl super::ExecutableMemory for ExecutionMemory {
     fn image_is_current(&self, image: &super::InstructionImage) -> bool {
         let inner = self.lock_inner();
         Arc::ptr_eq(&self.invalidations, &image.owner)
-            && self.invalidation_cursor() == image.cursor
             && image.pages.iter().all(|page| {
                 let Some(mapping) = inner.mapping_at(image.space, page.address) else {
                     return false;

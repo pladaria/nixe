@@ -1,6 +1,12 @@
 use super::*;
-use crate::abi::{BlockKey, FpSpecialization, NativeFrame, PollBudget};
+use crate::abi::{BlockKey, FpSpecialization, GuestValue, NativeFrame, PollBudget};
 use crate::lifetime::compile::Request;
+use crate::lifetime::unit::GuestExit;
+use cranelift_codegen::nixe::{Location, StateMap};
+use cranelift_codegen::{
+    isa,
+    settings::{self, Configurable},
+};
 use nixe_cpu::{
     memory::{MemoryPermissions, SyntheticMemory},
     platform::TargetPlatform,

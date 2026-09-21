@@ -10,7 +10,7 @@ use crate::simd_lowering::scalar_width;
 use nixe_cpu::decode::a64::fp_simd::Instruction;
 
 impl Translator<'_> {
-    pub(super) fn fp(
+    pub(crate) fn fp(
         &mut self,
         pc: GuestVirtualAddress,
         instruction: Instruction,
@@ -466,7 +466,7 @@ impl Translator<'_> {
         self.builder.switch_to_block(exact);
         self.constant_exit(pc, pc, kind, NativeExitReason::Architectural, flags)?;
         self.builder.switch_to_block(native);
-        self.ensure_fp(flags);
+        self.ensure_fp(pc, flags);
         Ok(())
     }
 
@@ -646,6 +646,7 @@ impl Translator<'_> {
         )?;
         self.builder.switch_to_block(native);
         *flags = LazyFlags::Packed(self.ordered_fp_compare(first, second, width));
+        self.dirty.nzcv = crate::analysis::NZCV;
         Ok(false)
     }
 }

@@ -61,7 +61,7 @@ impl<'a> AllocatedBoundary<'a> {
             map.entry
                 || map.fault_bytes != 0
                 || map.patch_bytes != patch_bytes
-                || !(1..=2048).contains(&poll.completed)
+                || poll.completed > 2048
                 || u64::from(poll.offset) != u64::from(map.offset) + u64::from(patch_bytes)
                 || u64::from(poll.offset) + u64::from(patch_bytes) > code.code_buffer().len() as u64
         }) {

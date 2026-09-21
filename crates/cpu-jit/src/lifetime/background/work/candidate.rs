@@ -1,5 +1,5 @@
-//! Exclusive initial-region claims. Keys carry one work token and admission
-//! epoch; neither callable pointers nor per-instruction refcounted owners.
+//! Exclusive initial-region claims. Keys carry one unique work token, independent
+//! of execution maintenance; no callable pointers or per-instruction owners.
 
 use super::*;
 use crate::abi::InstructionKey;
@@ -7,11 +7,11 @@ use crate::hcq::Graph;
 use crate::lifetime::background::workers::{CompileError, MAX_INSTRUCTIONS};
 
 mod freeze;
+pub(crate) use freeze::Frozen;
 
 #[derive(Clone, Copy)]
 struct Claim {
     key: InstructionKey,
-    epoch: AdmissionEpoch,
     token: u64,
 }
 
@@ -48,9 +48,9 @@ impl Index {
         }
     }
 
-    fn remove(&mut self, key: InstructionKey, epoch: AdmissionEpoch, token: u64) {
+    fn remove(&mut self, key: InstructionKey, token: u64) {
         if let Ok(entry) = self.entries.find_entry(self.hash.hash_one(key), |claim| {
-            claim.key == key && claim.epoch == epoch && claim.token == token
+            claim.key == key && claim.token == token
         }) {
             entry.remove();
         }
@@ -62,7 +62,6 @@ impl Index {
 pub(crate) struct Candidate<'w, 'p> {
     work: &'w Work<'p>,
     graph: Graph,
-    epoch: AdmissionEpoch,
     token: u64,
 }
 
@@ -91,7 +90,7 @@ impl<'p> Work<'p> {
         } else {
             None
         };
-        let (epoch, token) = {
+        let token = {
             let mut state = self.process.lock();
             self.validate_graph(&state, &graph)?;
             let needed = self.candidate_space(&state, &graph)?;
@@ -112,25 +111,22 @@ impl<'p> Work<'p> {
             let Job::Seed(job) = &self.job else {
                 return Err(Error::InvalidUnit("initial candidate requires a seed job").into());
             };
-            let epoch = state.admission;
             let token = job.reservation.word & !PHASE_MASK;
             // All validation and capacity checks precede the first insertion.
             // No fallible operation remains in this atomic batch.
             for word in &graph.instructions {
                 state.candidates.insert(Claim {
                     key: word.instruction.key,
-                    epoch,
                     token,
                 });
             }
-            (epoch, token)
+            token
         };
         // Replaced storage/charges drop after the mutex guard above.
         drop(prepared);
         Ok(Candidate {
             work: self,
             graph,
-            epoch,
             token,
         })
     }
@@ -184,10 +180,9 @@ impl<'p> Work<'p> {
                 return Err(CompileError::Deferred);
             }
             match state.candidates.get(key) {
-                Some(claim) if claim.epoch == state.admission => {
+                Some(_) => {
                     return Err(CompileError::Deferred);
                 }
-                Some(_) => {} // An expired worker may only clear its own token.
                 None => {
                     needed = needed
                         .checked_add(1)
@@ -213,14 +208,11 @@ impl Candidate<'_, '_> {
     /// on an earlier unlocked phase check. Memory/image validation stays outside.
     pub(in crate::lifetime) fn validate_locked(&self, state: &State) -> Result<(), Error> {
         self.work.validate_graph(state, &self.graph)?;
-        if state.admission != self.epoch {
-            return Err(Error::StalePublication);
-        }
         for word in &self.graph.instructions {
             if !state
                 .candidates
                 .get(word.instruction.key)
-                .is_some_and(|claim| claim.epoch == self.epoch && claim.token == self.token)
+                .is_some_and(|claim| claim.token == self.token)
                 || !state
                     .units
                     .instruction_available(word.instruction.key, [None; 2])
@@ -236,9 +228,7 @@ impl Drop for Candidate<'_, '_> {
     fn drop(&mut self) {
         let mut state = self.work.process.lock();
         for word in &self.graph.instructions {
-            state
-                .candidates
-                .remove(word.instruction.key, self.epoch, self.token);
+            state.candidates.remove(word.instruction.key, self.token);
         }
         // Graph fields (strong code references) drop after releasing state.
     }

@@ -243,6 +243,49 @@ fn mutation_hold_prevents_premature_acknowledgement_and_coalesces_with_another_h
 }
 
 #[test]
+fn last_memory_hold_finishes_mapping_work_while_another_transition_owns_the_stop() {
+    let (process, _memory) = fixture();
+    let hold = process.clone().begin(&[]).unwrap();
+    let transition = process.try_transition().unwrap().unwrap();
+    drop(hold);
+    assert_eq!(process.lock().memory_mutations, 0);
+    drop(transition);
+    // The execution owner may have yielded after seeing foreign work. No
+    // future memory mutation is required to make native admission progress.
+    assert!(process.try_service_links().unwrap());
+    assert_eq!(process.lock().phase, Phase::Open);
+}
+
+#[test]
+fn older_batch_does_not_regress_the_last_memory_authoritys_acknowledgement() {
+    let (process, _memory) = fixture();
+    let first = process.clone().begin(&[]).unwrap();
+    let mut transition = process.try_transition().unwrap().unwrap();
+    let batch = transition.batch().unwrap();
+    let second = process.clone().begin(&[]).unwrap();
+    let latest = process.request(Reason::MappingChange).unwrap();
+    drop(first);
+    assert!(!latest.is_complete().unwrap());
+    drop(second);
+    assert!(latest.is_complete().unwrap());
+    batch.complete().unwrap();
+    assert!(latest.is_complete().unwrap());
+    assert!(transition.try_reopen().unwrap());
+}
+
+#[test]
+fn execution_reopens_an_acknowledged_stop_after_its_transition_is_abandoned() {
+    let (process, _memory) = fixture();
+    process.request(Reason::TierCutover).unwrap();
+    let mut transition = process.try_transition().unwrap().unwrap();
+    transition.wait_closed().unwrap();
+    transition.batch().unwrap().complete().unwrap();
+    drop(transition);
+    assert!(process.try_service_links().unwrap());
+    assert_eq!(process.lock().phase, Phase::Open);
+}
+
+#[test]
 fn memory_request_joins_an_existing_owner_without_requiring_it_to_relinquish_the_stop() {
     let (process, memory) = fixture();
     publish(&process, &memory, 0x1000);

@@ -293,6 +293,7 @@ pub(super) fn synthetic(
                 native_start: fault_offset,
                 native_end: fault_offset + u32::from(length),
                 instruction: InstructionKey::new(key()).unwrap(),
+                completed: 0,
                 access: crate::lifetime::unit::Access::Read,
                 bytes: 8,
                 subaccess: 0,

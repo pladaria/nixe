@@ -114,7 +114,7 @@ fn compiler_references_survive_unlink_without_holding_an_execution_epoch() {
 }
 
 #[test]
-fn old_running_cleanup_cannot_cancel_a_new_epoch_job() {
+fn running_work_survives_maintenance_but_not_input_replacement() {
     let (process, queue, mut samples) = setup(1);
     let observed = enqueue(&process, &queue, &mut samples, 0);
     let old = process
@@ -122,7 +122,16 @@ fn old_running_cleanup_cannot_cancel_a_new_epoch_job() {
         .unwrap()
         .unwrap();
     process.request(Reason::LinkPatch).unwrap();
+    old.check().unwrap(); // Closed admission does not invalidate compiler inputs.
     process.try_service_links().unwrap();
+    old.check().unwrap();
+    assert_eq!(
+        process.admit_seed(&queue, &mut samples, observed).unwrap(),
+        Outcome::Duplicate
+    );
+    publish(&process, &AtomicU64::new(0), &[0], Tier::Lcq);
+    process.try_service_links().unwrap();
+    let observed = snapshot(&process, 0);
     assert_eq!(old.check(), Err(Error::StalePublication));
     assert_eq!(
         process.admit_seed(&queue, &mut samples, observed).unwrap(),
@@ -144,7 +153,7 @@ fn old_running_cleanup_cannot_cancel_a_new_epoch_job() {
 }
 
 #[test]
-fn dequeue_rejects_replaced_epoch_version_and_foreign_process_identities() {
+fn dequeue_preserves_maintenance_but_rejects_replaced_and_foreign_inputs() {
     for replace in [false, true] {
         let (process, queue, mut samples) = setup(1);
         enqueue(&process, &queue, &mut samples, 0);
@@ -154,8 +163,13 @@ fn dequeue_rejects_replaced_epoch_version_and_foreign_process_identities() {
         } else {
             process.request(Reason::LinkPatch).unwrap();
         }
+        let accepted = process.accept_background(job).unwrap();
+        assert_eq!(accepted.is_none(), replace);
+        if let Some(work) = &accepted {
+            work.check().unwrap();
+        }
+        drop(accepted);
         process.try_service_links().unwrap();
-        assert!(process.accept_background(job).unwrap().is_none());
         assert_eq!(process.lock().compilers, 0);
         let current = enqueue(&process, &queue, &mut samples, 0);
         let foreign = crate::lifetime::unit::tests::process();

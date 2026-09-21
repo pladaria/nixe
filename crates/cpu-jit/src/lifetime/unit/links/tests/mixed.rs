@@ -16,6 +16,8 @@ fn mixed_source(process: &Lifetime, cursor: &AtomicU64) -> UnitHandle {
         exit: Some(GuestExit {
             pc: key(0).pc,
             kind: EdgeKind::Indirect,
+            block_index: 0,
+            instruction_index: 0,
         }),
         transfer: Some(Box::new(transfer)),
     });

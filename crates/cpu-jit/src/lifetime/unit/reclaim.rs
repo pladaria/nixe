@@ -693,7 +693,15 @@ impl Transition<'_> {
                 state.units.finish_retirement(handle);
                 return Ok(Some(false));
             }
-            if !state.shutdown && record.code.baseline_pins.load(Ordering::Relaxed) != 0 {
+            // Pins exclude eviction, not memory invalidation. Invalidation
+            // queues every affected published family ahead of its baselines;
+            // admission closure cancels unpublished families. Their strong
+            // references still retain the old code until the compiler drops it,
+            // but must not block the memory producer's rendezvous.
+            if !state.shutdown
+                && record.invalidation.is_none()
+                && record.code.baseline_pins.load(Ordering::Relaxed) != 0
+            {
                 return Err(Error::PinnedBaseline);
             }
             if let Some(site) = record.pic_incoming.or(record.pic_outgoing) {

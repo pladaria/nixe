@@ -2,8 +2,8 @@
 //!
 //! Demanded straight-line A64 fragments lower to CLIF and execute through the
 //! bounded code cache and epoch-safe native gateway, with static links and
-//! per-vCPU indirect PICs and guest-thread return prediction. Functional HCQ
-//! promotion is not yet enabled.
+//! per-vCPU indirect PICs and guest-thread return prediction. Sampled hot seeds
+//! are promoted by a fixed background HCQ compiler pool.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("nixe-cpu-jit requires Linux direct-memory support");
@@ -14,7 +14,8 @@ mod engine;
 mod fp_env;
 mod fp_lowering;
 mod fp_policy;
-// HCQ graph construction is staged before the real worker consumer (Task 6).
+mod frontend;
+// Includes graph/SSA inspection helpers used by encoder tests.
 #[allow(dead_code)]
 mod hcq;
 mod jit_error;
@@ -22,7 +23,7 @@ mod lcq;
 mod lowering;
 mod memory_lowering;
 mod rsb;
-// Sampling is active; seed/reshape admission consumers arrive in Tasks 6/7.
+// Seed admission is active; reshape admission arrives in Task 7.
 #[allow(dead_code)]
 mod sampling;
 mod simd_lowering;

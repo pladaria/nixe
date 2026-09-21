@@ -16,10 +16,9 @@ pub(super) enum Background {
 
 impl JitProcess {
     /// Called once during construction, before publishing the process owner.
-    /// Task 6 will supply the real compiler; there is no placeholder consumer.
-    #[allow(dead_code)]
     pub(super) fn start_background(
         &mut self,
+        selected: usize,
         compile: impl Fn(&mut Resources, Work<'_>) -> Result<(), CompileError> + Send + Sync + 'static,
     ) -> Result<(), Error> {
         let owner = self
@@ -31,8 +30,7 @@ impl JitProcess {
                 "JIT background workers already started or closed",
             ));
         }
-        *owner = match Workers::start(self.background_workers, Arc::clone(&self.lifetime), compile)?
-        {
+        *owner = match Workers::start(selected, Arc::clone(&self.lifetime), compile)? {
             Some(workers) => Background::Running(workers),
             None => Background::Joined,
         };

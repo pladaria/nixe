@@ -49,7 +49,7 @@ impl Lifetime {
         let accepted = {
             let mut state = self.lock();
             state.healthy()?;
-            if state.phase != Phase::Open || state.shutdown {
+            if state.shutdown {
                 return Ok(None);
             }
             if job.process() != self.identity {
@@ -213,13 +213,12 @@ impl Job {
     }
 
     fn valid(&self, state: &State, process: u64, phase: u64) -> bool {
-        if state.phase != Phase::Open || state.shutdown {
+        if state.shutdown {
             return false;
         }
         match self {
             Self::Seed(job) => {
                 if job.process != process
-                    || job.admission != state.admission
                     || !job.reservation.is_current(phase)
                     || state.keys.get(&job.snapshot.key) != Some(&job.slot)
                 {

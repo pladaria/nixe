@@ -9,6 +9,7 @@ cranelift-codegen = { git = "https://github.com/pladaria/wasmtime", rev = "e2a98
 cranelift-frontend = { git = "https://github.com/pladaria/wasmtime", rev = "e2a984d96678207094c0fc50057c8b6bcfd68715" }
 cranelift-native = { git = "https://github.com/pladaria/wasmtime", rev = "e2a984d96678207094c0fc50057c8b6bcfd68715" }
 libc = "0.2"
+log.workspace = true
 hashbrown = { version = "0.16", default-features = false }
 wasmtime-internal-jit-icache-coherence = { git = "https://github.com/pladaria/wasmtime", rev = "e2a984d96678207094c0fc50057c8b6bcfd68715" }
 nixe-cpu.workspace = true

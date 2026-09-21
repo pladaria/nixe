@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::abi::{BlockKey, ReachabilityVersion};
-use crate::lifetime::{Phase, State};
+use crate::lifetime::{Phase, State, background::Queue};
 use crate::sampling::{ObservedEdge, Samples};
 use std::sync::{MutexGuard, TryLockError};
 
@@ -48,8 +48,9 @@ impl Lifetime {
             return Ok(());
         };
         if let Some(source) = self.lcq_sample_identity(&state, unit)? {
-            // No production admission until Task 6 connects the real consumer.
-            samples.seed(source.key, source.version, edge, false);
+            let queue = state.background_queue.upgrade();
+            drop(state);
+            self.sample_seed(queue, samples, source.key, source.version, edge)?;
         }
         Ok(())
     }
@@ -81,7 +82,27 @@ impl Lifetime {
             return Ok(());
         };
         if self.lcq_sample_identity(&state, &record.code)? == Some(source) {
-            samples.seed(source.key, source.version, None, false);
+            let queue = state.background_queue.upgrade();
+            drop(state);
+            self.sample_seed(queue, samples, source.key, source.version, None)?;
+        }
+        Ok(())
+    }
+
+    // Only verified scalar identities cross this boundary. Release JIT state
+    // before capacity/queue admission; every contended admission uses try-lock.
+    fn sample_seed(
+        &self,
+        queue: Option<Arc<Queue>>,
+        samples: &mut Samples,
+        key: BlockKey,
+        version: ReachabilityVersion,
+        edge: Option<ObservedEdge>,
+    ) -> Result<(), Error> {
+        if let Some(snapshot) = samples.seed(key, version, edge, queue.is_some())
+            && let Some(queue) = queue
+        {
+            self.admit_seed(&queue, samples, snapshot)?;
         }
         Ok(())
     }
@@ -161,6 +182,51 @@ impl Lifetime {
 mod tests {
     use super::*;
     use crate::lifetime::unit::tests::{key, process, publish};
+
+    #[test]
+    fn all_seed_sample_sites_admit_after_unlocking_identity_state() {
+        for site in 0..3 {
+            let process = process();
+            let handle = publish(&process, &AtomicU64::new(0), &[0], Tier::Lcq);
+            let unit = process.snapshot(handle).unwrap();
+            let source = process.completion_sample(&unit).unwrap().unwrap();
+            let queue = Arc::new(Queue::new(1, &process).unwrap().unwrap());
+            process.lock().background_queue = Arc::downgrade(&queue);
+            let mut samples = Samples::new();
+            for count in 1..=8 {
+                match site {
+                    0 => process.sample_lcq(&unit, &mut samples, None),
+                    1 => process.sample_completion(source, &mut samples),
+                    2 => process.sample_transfer(
+                        &unit,
+                        key(0),
+                        unit.instructions[0].key,
+                        &mut samples,
+                        ObservedEdge {
+                            destination: key(4).pc,
+                            kind: EdgeKind::Static,
+                        },
+                    ),
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                if count < 8 {
+                    assert!(queue.pop().unwrap().is_none());
+                }
+            }
+            // If the identity mutex still covered admission, its try-lock
+            // would defer instead of producing this exact threshold job.
+            let job = queue.pop().unwrap().expect("eighth sample must enqueue");
+            let work = process.accept_background(job).unwrap().unwrap();
+            let crate::lifetime::background::Observation::Seed(snapshot) = work.observation()
+            else {
+                panic!("seed expected")
+            };
+            assert_eq!(snapshot.key, key(0));
+            assert_eq!(snapshot.version, source.version);
+            assert_eq!(snapshot.sequence, 8);
+        }
+    }
 
     #[test]
     fn completion_revalidates_reachability_and_never_waits_for_the_registry() {

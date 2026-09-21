@@ -30,9 +30,6 @@ pub struct JitProcess {
     cpu: ProcessCpuContext,
     memory: Arc<ExecutionMemory>,
     lifetime: Arc<Lifetime>,
-    // Selected once; Task 6 consumes this when it activates the real compiler.
-    #[allow(dead_code)]
-    background_workers: usize,
     background: Mutex<background::Background>,
 }
 
@@ -62,9 +59,51 @@ impl JitProcess {
     }
 
     /// Bind the complete memory authority before creating execution workers.
-    /// No rebinding, borrowed owner or checked fallback. Background compilation
-    /// remains dormant until construction supplies the real HCQ consumer.
+    /// Start the fixed HCQ pool before exposing the process. Memory owns only
+    /// Lifetime, never the process/pool responsible for joining those workers.
     pub fn new(cpu: ProcessCpuContext, memory: Arc<ExecutionMemory>) -> Result<Self, Error> {
+        let logical_cpus = std::thread::available_parallelism()
+            .map_err(|error| Error::internal(format!("query JIT worker CPU count: {error}")))?;
+        Self::with_workers(
+            cpu,
+            memory,
+            lifetime::background::workers::count(logical_cpus.get()),
+        )
+    }
+
+    fn with_workers(
+        cpu: ProcessCpuContext,
+        memory: Arc<ExecutionMemory>,
+        selected: usize,
+    ) -> Result<Self, Error> {
+        Self::with_compiler(cpu, memory, selected, |size, memory| {
+            crate::hcq::worker::consumer(
+                if cfg!(target_arch = "x86_64") {
+                    HostAbi::X86_64
+                } else {
+                    HostAbi::Aarch64
+                },
+                size,
+                memory,
+            )
+        })
+    }
+
+    fn with_compiler<F>(
+        cpu: ProcessCpuContext,
+        memory: Arc<ExecutionMemory>,
+        selected: usize,
+        make_compiler: impl FnOnce(usize, Arc<ExecutionMemory>) -> Result<F, Error>,
+    ) -> Result<Self, Error>
+    where
+        F: Fn(
+                &mut lifetime::background::workers::Resources,
+                lifetime::background::Work<'_>,
+            ) -> Result<(), lifetime::background::workers::CompileError>
+            + Send
+            + Sync
+            + 'static,
+    {
         if memory.cpu_memory_backend(cpu.address_space_id()) != Some(CpuMemoryBackend::LinuxDirect)
         {
             return Err(Error::unsupported(
@@ -74,30 +113,32 @@ impl JitProcess {
         if let Some(error) = memory.direct_backend_failure() {
             return Err(Error::internal(error));
         }
-        if memory
+        let arena_size = memory
             .direct_address_space_view(cpu.address_space_id())
-            .is_none()
-        {
-            return Err(Error::internal("LCQ JIT memory has no direct arena"));
-        }
+            .ok_or_else(|| Error::internal("LCQ JIT memory has no direct arena"))?
+            .address_space_size;
         let cache = Cache::new().map_err(|error| Error::internal(error.to_string()))?;
         let lifetime =
             Arc::new(Lifetime::new(cache).map_err(|error| Error::internal(error.to_string()))?);
-        let logical_cpus = std::thread::available_parallelism()
-            .map_err(|error| Error::internal(format!("query JIT worker CPU count: {error}")))?;
-        let background_workers = lifetime::background::workers::count(logical_cpus.get());
-        // Install last: failed construction must not strand a bound observer.
-        // Memory owns Lifetime, not JitProcess, so there is no ownership cycle.
-        memory
-            .set_mutation_observer(lifetime.clone())
-            .map_err(|error| Error::internal(error.to_string()))?;
-        Ok(Self {
+        let mut process = Self {
             cpu,
             memory,
             lifetime,
-            background_workers,
             background: Mutex::new(background::Background::Dormant),
-        })
+        };
+        if selected == 0 {
+            *process.background.get_mut().unwrap() = background::Background::Joined;
+        } else {
+            let compile = make_compiler(arena_size, process.memory.clone())?;
+            process.start_background(selected, compile)?;
+        }
+        // Install last: failed construction must not strand a bound observer.
+        // Memory owns Lifetime, not JitProcess, so there is no ownership cycle.
+        process
+            .memory
+            .set_mutation_observer(process.lifetime.clone())
+            .map_err(|error| Error::internal(error.to_string()))?;
+        Ok(process)
     }
 }
 

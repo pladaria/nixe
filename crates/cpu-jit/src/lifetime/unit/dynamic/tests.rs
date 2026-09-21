@@ -56,6 +56,8 @@ fn source_with_binding(
                 exit: Some(GuestExit {
                     pc: key(pc).pc,
                     kind,
+                    block_index: 0,
+                    instruction_index: 0,
                 }),
                 transfer: Some(Box::new(TerminalTransfer {
                     destination: ValueLocation::Register {

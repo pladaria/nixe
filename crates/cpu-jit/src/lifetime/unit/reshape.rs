@@ -232,7 +232,7 @@ impl Lifetime {
             // No family owns either endpoint. Its source dispatch owner
             // serializes reshapes independently of ordinary seed rejection.
             let owner = &mut state.dispatch.get_mut(source_slot).unwrap().reshape;
-            if !owner.available(admission, key.source_version) {
+            if !owner.available_at(Some(admission), key.source_version) {
                 return Ok(Err(Outcome::Deferred));
             }
             reservations[0] = Some(owner.reserve(token).unwrap());
@@ -251,7 +251,7 @@ impl Lifetime {
                     .reshape
                     .as_mut()
                     .unwrap();
-                if !owner.available(admission, participant.identity.version) {
+                if !owner.available_at(Some(admission), participant.identity.version) {
                     return Ok(Err(Outcome::Deferred));
                 }
                 reservations[index] = Some(owner.reserve(token).unwrap());

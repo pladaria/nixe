@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::{
-    abi::{BlockKey, ExclusiveStoreOperation, NativeFrame, PendingExclusiveLoad},
+    abi::{BlockKey, ExclusiveStoreOperation, InstructionKey, NativeFrame, PendingExclusiveLoad},
     lifetime::unit::Access,
     memory_lowering,
 };
@@ -19,8 +19,9 @@ use std::mem::offset_of;
 
 const FAULT_ID_BASE: u64 = 1 << 60;
 
-pub(super) struct Pending {
+pub(crate) struct Pending {
     pc: GuestVirtualAddress,
+    completed: u16,
     access: Access,
     atomic_rmw: bool,
     bytes: u8,
@@ -84,7 +85,7 @@ impl Translator<'_> {
     /// Keep the load trapping even though its value is unused, and retain PRE
     /// operands in the existing fault span on both host backends.
     /// https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/DC-CIVAC--Data-or-unified-Cache-line-Clean-and-Invalidate-by-VA-to-PoC
-    pub(super) fn cache_probe(
+    pub(crate) fn cache_probe(
         &mut self,
         pc: GuestVirtualAddress,
         rt: u8,
@@ -101,7 +102,7 @@ impl Translator<'_> {
         Ok(())
     }
 
-    pub(super) fn memory(
+    pub(crate) fn memory(
         &mut self,
         pc: GuestVirtualAddress,
         instruction: Instruction,
@@ -539,7 +540,7 @@ impl Translator<'_> {
         Ok(())
     }
 
-    pub(super) fn vector_memory(
+    pub(crate) fn vector_memory(
         &mut self,
         pc: GuestVirtualAddress,
         instruction: nixe_cpu::decode::a64::fp_simd::Instruction,
@@ -644,7 +645,7 @@ impl Translator<'_> {
         let done = self.builder.create_block();
         self.builder.set_cold_block(elements);
         self.builder.ins().brif(fits, grouped, &[], elements, &[]);
-        let before_vectors = self.vectors;
+        let before_vectors = self.values.vectors;
         let before_dirty = self.dirty;
         self.builder.switch_to_block(grouped);
         let size = if shape.vector_bytes == 16 {
@@ -689,7 +690,7 @@ impl Translator<'_> {
         }
         self.builder.ins().jump(done, &grouped_values);
         // Compiler-local SSA state, not a runtime checkpoint or rollback.
-        self.vectors = before_vectors;
+        self.values.vectors = before_vectors;
         self.dirty = before_dirty;
         self.builder.switch_to_block(elements);
         self.structure_elements(pc, instruction, shape, base, flags)?;
@@ -885,7 +886,7 @@ impl Translator<'_> {
     ) -> Result<Option<ir::Value>, Error> {
         let size = self
             .arena_size
-            .ok_or_else(|| Error::internal("LCQ memory requires a configured process arena"))?;
+            .ok_or_else(|| Error::internal("native memory requires a configured process arena"))?;
         // Redirect out-of-range guest values to the reserved trailing guard.
         // A crossing access also faults in that guard. Never mask an invalid
         // guest address onto valid RAM; reconstruction uses the PRE guest state.
@@ -955,6 +956,7 @@ impl Translator<'_> {
         self.builder.ins().nixe_fault_end(id as i64, &[]);
         self.faults.push(Pending {
             pc: site.pc,
+            completed: self.instruction_prefix,
             access: match operation {
                 Operation::Load => Access::Read,
                 Operation::CacheProbe => Access::CacheProbe,
@@ -972,16 +974,19 @@ impl Translator<'_> {
     }
 }
 
-pub(super) fn records(
+#[allow(clippy::too_many_arguments)] // Physical output and surviving IR are checked together.
+pub(crate) fn records(
     abi: HostAbi,
     version: CodeVersion,
     key: BlockKey,
     code: &cranelift_codegen::CompiledCode,
+    function: &ir::Function,
     pending: &[Pending],
     states: &mut Vec<StateRecord>,
 ) -> Result<Box<[FaultRecord]>, Error> {
     let mut faults = Vec::new();
     let mut counts = vec![0; pending.len()];
+    let live = super::boundary_ids(function);
     for map in &code.buffer.nixe_faults {
         let pending_index = map
             .id
@@ -1003,6 +1008,7 @@ pub(super) fn records(
         faults.push(FaultRecord {
             native_start: map.offset,
             native_end: map.offset + u32::from(map.fault_bytes),
+            completed: pending.completed,
             instruction: key
                 .at(pending.pc)
                 .and_then(InstructionKey::new)
@@ -1026,16 +1032,24 @@ pub(super) fn records(
     // alternative stores (replacement on match, observed bits on mismatch).
     // RMW uses one instruction or a load/CAS (x86) or LL/SC (Arm) loop.
     // All loop sites name the same uncommitted guest operation and PRE state.
-    if pending.iter().zip(counts).any(|(pending, count)| {
-        if pending.atomic_rmw {
-            !matches!(count, 1 | 2)
-        } else if pending.access == Access::Atomic {
-            matches!(abi, HostAbi::X86_64) && count != 1
-                || matches!(abi, HostAbi::Aarch64) && !matches!(count, 1 | 3)
-        } else {
-            count != 1
-        }
-    }) {
+    if pending
+        .iter()
+        .zip(counts)
+        .enumerate()
+        .any(|(index, (pending, count))| {
+            if !live.contains(&(FAULT_ID_BASE + index as u64)) {
+                return count != 0;
+            }
+            if pending.atomic_rmw {
+                !matches!(count, 1 | 2)
+            } else if pending.access == Access::Atomic {
+                matches!(abi, HostAbi::X86_64) && count != 1
+                    || matches!(abi, HostAbi::Aarch64) && !matches!(count, 1 | 3)
+            } else {
+                count != 1
+            }
+        })
+    {
         return Err(Error::internal(
             "LCQ access emitted an unexpected number of faulting instructions",
         ));

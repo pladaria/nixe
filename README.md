@@ -50,9 +50,12 @@ before reclaiming their storage. Cold misses, semantic helpers, faults and
 control boundaries retain their required canonical paths.
 
 Functional hotness sampling is active on cold paths, with fixed per-vCPU
-tables. Bounded background admission and worker ownership are implemented and
-tested, but remain dormant until Task 6 supplies the real HCQ compiler;
-production still executes LCQ only. Development requires the local Cranelift
+tables. Hot LCQ seeds are admitted to a bounded queue and promoted by a fixed
+background HCQ compiler pool (disabled on hosts with at most two logical CPUs).
+HCQ emits multi-entry regions with shared internal SSA and preserves valid
+compilation across unrelated maintenance stops; publication revalidates exact
+LCQ inputs and ownership under Open authority.
+Family reshaping is not yet active. Development requires the local Cranelift
 override described in
 [Cranelift modifications](docs/cranelift-modifications.md); the checked-in Git
 pin does not include the complete implementation.

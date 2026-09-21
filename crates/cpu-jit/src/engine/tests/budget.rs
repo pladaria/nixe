@@ -39,7 +39,9 @@ pub(super) fn setup(words: &[u32], writable: bool) -> JitThread {
             })
             .unwrap();
     }
-    let process = Arc::new(JitProcess::new(cpu(), memory).unwrap());
+    // These tests assert baseline-specific fragment/poll behavior. Promotion
+    // has separate execution tests with an explicitly selected nonzero pool.
+    let process = Arc::new(JitProcess::with_workers(cpu(), memory, 0).unwrap());
     let mut thread = JitThread::new(process).unwrap();
     assert!(matches!(thread.demand(PC).unwrap(), Demand::Ready));
     thread

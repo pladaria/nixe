@@ -65,7 +65,7 @@ impl Lifetime {
         } else {
             Targets::Exact(&changes)
         })?;
-        // The same memory hold waits for exact unlinks, including compiler pins.
+        // The same memory hold waits for exact unlinks, not compiler storage pins.
         // A failed stop/reopen must not acknowledge any part of this snapshot.
         drop(mutation);
         self.lock().healthy()?;
@@ -149,27 +149,33 @@ impl Drop for Mutation {
             if state.failure.is_some() {
                 return;
             }
+            // The last memory authority completes its own reason even while
+            // another transition owns the stop. That owner may already have
+            // decided to yield to MappingChange; leaving acknowledgement to
+            // it would orphan the request after it relinquishes ownership.
+            // This never reopens admission or acknowledges unrelated work.
+            let index = Reason::MappingChange as usize;
+            if state.phase == Phase::Closed
+                && state.memory_mutations == 0
+                && let Some(sequence) = state.pending[index]
+                && !state
+                    .units
+                    .pending_retirement(Reason::MappingChange, sequence)
+            {
+                state.completed[index] = Some(sequence);
+                state.pending[index] = None;
+            }
         }
         // No memory or gate mutex survives into this completion. Do not
         // acknowledge unrelated LinkPatch/Eviction/Shutdown work on behalf of
-        // its owner. If one is active, its next batch/reopen observes this drop.
+        // its owner. If one is active, it observes the acknowledgement above;
+        // execution can resume an abandoned stop without another memory write.
         let result = (|| {
             if let Some(mut transition) = process.try_transition()? {
-                let mut state = process.lock();
+                let state = process.lock();
                 state.healthy()?;
                 if state.phase != Phase::Closed || state.memory_mutations != 0 {
                     return Ok(());
-                }
-                let index = Reason::MappingChange as usize;
-                if let Some(sequence) = state.pending[index] {
-                    if state
-                        .units
-                        .pending_retirement(Reason::MappingChange, sequence)
-                    {
-                        return Ok(());
-                    }
-                    state.completed[index] = Some(sequence);
-                    state.pending[index] = None;
                 }
                 drop(state);
                 transition.try_reopen()?;

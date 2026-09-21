@@ -32,7 +32,7 @@ pub(super) struct Owner<Version = ReachabilityVersion> {
     cell: Arc<Accounted<Cell>>,
     // Accessed only under JIT state. The atomic word is the only part touched
     // after releasing that lock (enqueue, rollback and worker completion).
-    identity: Option<(AdmissionEpoch, Version)>,
+    identity: Option<(Option<AdmissionEpoch>, Version)>,
 }
 
 impl<Version: Copy + Eq> Owner<Version> {
@@ -57,14 +57,19 @@ impl<Version: Copy + Eq> Owner<Version> {
         self.cell.0.store(0, Ordering::Release);
     }
 
-    pub(super) fn available(&mut self, epoch: AdmissionEpoch, version: Version) -> bool {
-        let word = self.cell.0.load(Ordering::Acquire);
+    pub(super) fn available(&mut self, version: Version) -> bool {
+        self.available_at(None, version)
+    }
+
+    // Task 7's not-yet-enabled reshape reservations retain their existing
+    // epoch contract. Production seed jobs use exact input versions instead.
+    pub(super) fn available_at(&mut self, epoch: Option<AdmissionEpoch>, version: Version) -> bool {
         if self.identity != Some((epoch, version)) {
-            // Rejection belongs to the exact reachability, not the maintenance
-            // epoch. In-flight tokens, unlike rejections, cannot cross reopen.
-            let retain_rejection = self.identity.is_some_and(|(_, old)| old == version)
-                && word & PHASE_MASK == REJECTED;
-            if !retain_rejection {
+            // Seed work has no epoch here, so maintenance preserves its live
+            // token. A typed rejection remains version-local for either kind.
+            let rejected = self.identity.is_some_and(|(_, old)| old == version)
+                && self.cell.0.load(Ordering::Acquire) & PHASE_MASK == REJECTED;
+            if !rejected {
                 self.cancel();
             }
             self.identity = Some((epoch, version));
@@ -117,16 +122,21 @@ impl Reservation {
         true
     }
 
-    // Worker completion must validate the captured epoch/version under JIT
+    // Worker completion must validate the captured input identity under JIT
     // state before calling this; a stale job may only drop its exact token.
-    fn reject(mut self) -> bool {
-        if !self.transition(REJECTED) {
-            return false;
-        }
-        // Leave rejection in its owner until reachability changes. Drop still
-        // releases the registry pin, but must not clear this persistent state.
-        self.word = 0;
-        true
+    fn reject(&self) -> bool {
+        // Keep the caller's exact token for Drop. Its later compare-exchange
+        // cannot clear REJECTED (or a replacement token); the registry pin is
+        // nevertheless released normally when the compiler drops its work.
+        self.cell
+            .0
+            .compare_exchange(
+                self.word,
+                (self.word & !PHASE_MASK) | REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
@@ -145,7 +155,6 @@ impl Drop for Reservation {
 /// or a borrow of the vCPU's tables. Strong code acquisition belongs to dequeue.
 pub(crate) struct SeedJob {
     process: u64,
-    admission: AdmissionEpoch,
     slot: Handle<DispatchSlot>,
     unit: unit::UnitHandle,
     snapshot: AdmissionSnapshot,
@@ -380,9 +389,8 @@ impl Lifetime {
         let Some(unit) = state.units.seed_source(owner, snapshot.key, entry) else {
             return Ok(Err(Outcome::Stale));
         };
-        let admission = state.admission;
         let slot = state.dispatch.get_mut(handle).unwrap();
-        if !slot.optimization.available(admission, snapshot.version) {
+        if !slot.optimization.available(snapshot.version) {
             return Ok(Err(Outcome::Duplicate));
         }
         let result = state.background_tokens.next();
@@ -396,7 +404,6 @@ impl Lifetime {
             .unwrap();
         Ok(Ok(SeedJob {
             process: self.identity,
-            admission,
             slot: handle,
             unit,
             snapshot,
@@ -406,6 +413,7 @@ impl Lifetime {
 }
 
 mod work;
+pub(crate) use work::candidate::Frozen;
 pub(super) use work::candidate::Index as CandidateIndex;
 pub(crate) use work::{Demanded, Observation, Work};
 pub(crate) mod workers;

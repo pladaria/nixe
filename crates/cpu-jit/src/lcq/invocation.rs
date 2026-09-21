@@ -94,8 +94,8 @@ impl std::fmt::Display for Error {
 /// for this invocation, except admission failures before any native execution.
 ///
 /// # Safety
-/// The reader and memory belong to the same process. Published entries are
-/// LCQ fragments with contiguous instruction images; they use
+/// The reader and memory belong to the same process. Published entries carry
+/// exact source-block/instruction indices in their observation records and use
 /// this host's checked NativeFrame ABI and this memory's arena size. No other
 /// FP owner is active on this OS thread. The canonical state matches `key`,
 /// and the frame has no pending exclusive load from an earlier invocation.
@@ -200,10 +200,17 @@ pub(crate) unsafe fn run(
                     }),
                     kind: guest.kind,
                 });
-                dispatch
-                    .lookup
-                    .sample_lcq(unit, dispatch.samples, edge)
-                    .map_err(Error::Lifetime)?;
+                if let Some(edge) = edge {
+                    dispatch
+                        .lookup
+                        .sample_transfer(unit, guest, dispatch.samples, edge)
+                        .map_err(Error::Lifetime)?;
+                } else {
+                    dispatch
+                        .lookup
+                        .sample_lcq(unit, dispatch.samples, None)
+                        .map_err(Error::Lifetime)?;
+                }
             }
             // Only a successful one-instruction completion can cross this
             // deadline. Do not look up identity on every canonical exit.
@@ -243,12 +250,11 @@ pub(crate) unsafe fn run(
                 .lookup
                 .find(captured.native_pc())
                 .ok_or(Error::Internal("LCQ escaped PC has no live fault record"))?;
-            let (completed, instruction) = fault
+            let instruction = fault
                 .unit
                 .instructions
                 .iter()
-                .enumerate()
-                .find(|(_, instruction)| instruction.key == fault.record.instruction)
+                .find(|instruction| instruction.key == fault.record.instruction)
                 .ok_or(Error::Internal(
                     "LCQ fault has no captured guest instruction",
                 ))?;
@@ -286,7 +292,7 @@ pub(crate) unsafe fn run(
                 .reconcile(
                     reconstructed
                         .poll_remaining
-                        .checked_sub(completed as i64)
+                        .checked_sub(i64::from(fault.record.completed))
                         .ok_or(Error::Internal("LCQ fault work accounting overflow"))?,
                     false,
                 )
@@ -348,22 +354,9 @@ fn canonical_exit(
         .ok_or(Error::Internal(
             "LCQ canonical exit has no guest exit record",
         ))?;
-    let first = unit
-        .instructions
-        .first()
-        .ok_or(Error::Internal("LCQ exit unit has no instruction image"))?;
-    let instruction = guest
-        .pc
-        .get()
-        .checked_sub(first.key.block_key().pc.get())
-        .filter(|offset| offset % 4 == 0)
-        .and_then(|offset| usize::try_from(offset / 4).ok())
-        .and_then(|index| unit.instructions.get(index))
-        .filter(|instruction| instruction.key.block_key().pc == guest.pc)
-        .copied()
-        .ok_or(Error::Internal(
-            "LCQ canonical exit is absent from its instruction image",
-        ))?;
+    let (_, instruction) = guest.source(&unit.instructions).ok_or(Error::Internal(
+        "LCQ canonical exit is absent from its instruction image",
+    ))?;
     Ok((guest, instruction))
 }
 
@@ -405,12 +398,12 @@ unsafe extern "C" fn observe_sample(
         let guest = map
             .exit
             .ok_or(Error::Internal("sample poll has no guest exit"))?;
-        if map
-            .transfer
-            .as_ref()
-            .and_then(|transfer| transfer.poll_offset)
-            .is_none()
-        {
+        if !match &map.transfer {
+            Some(transfer) => transfer.poll_offset.is_some(),
+            // Internal HCQ checks retain a source exit but deliberately have
+            // no inter-unit transfer, dispatch entry or linkable patch root.
+            None => unit.tier == crate::executable::Tier::Hcq,
+        } {
             return Err(Error::Internal("sample poll is not a charged terminal"));
         }
         let destination = unsafe {
@@ -423,13 +416,14 @@ unsafe extern "C" fn observe_sample(
         };
         dispatch
             .lookup
-            .sample_lcq(
+            .sample_transfer(
                 unit,
+                guest,
                 dispatch.samples,
-                Some(crate::sampling::ObservedEdge {
+                crate::sampling::ObservedEdge {
                     destination: nixe_memory::GuestVirtualAddress::new(destination),
                     kind: guest.kind,
-                }),
+                },
             )
             .map_err(Error::Lifetime)
     }))
