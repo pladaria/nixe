@@ -30,8 +30,9 @@ impl UnitRecord {
 
 impl Lifetime {
     /// Register before the memory mutation, with no memory/cache lock held.
-    /// Closure cancels every old compile admission, including captures whose
-    /// dependencies have not yet been discovered. Published targets are exact:
+    /// Closure cancels speculative LCQ admission. HCQ jobs retain their exact
+    /// published inputs across unrelated stops; invalidating any captured input
+    /// cancels that candidate before publication. Published targets are exact:
     /// physical pages include all aliases; mappings inspect the entire image,
     /// not just dispatch roots. Empty targets still close for tracking changes.
     ///
@@ -103,22 +104,26 @@ impl Lifetime {
         // An HCQ family promises entry into each pinned baseline. Invalidation
         // must remove that promise even if only a baseline's other bytes changed.
         // The existing drain visits HCQ first and drops its pins outside state.
+        // Both owners already carry their exact generational registry handles.
+        // Resolve each in O(1), not a full unit scan for every pinned baseline
+        // under the JIT mutex. Family pins keep those records resident.
         for family in units.families.values() {
-            if family.baselines.iter().any(|baseline| {
+            for baseline in &family.baselines {
+                let baseline_handle = baseline.registered_handle().ok_or(Error::StaleUnit)?;
+                let baseline_record = units
+                    .records
+                    .get(baseline_handle.0)
+                    .ok_or(Error::StaleUnit)?;
+                if baseline_record.invalidation.is_none() {
+                    continue;
+                }
+                let handle = family.unit.registered_handle().ok_or(Error::StaleUnit)?;
                 units
                     .records
-                    .values()
-                    .any(|record| record.code.id == baseline.id && record.invalidation.is_some())
-            }) {
-                let handle = units
-                    .records
-                    .find(|record| record.code.id == family.unit.id)
-                    .unwrap();
-                units.records.get_mut(handle).unwrap().invalidate(
-                    handle,
-                    &mut units.retirements,
-                    ticket.sequence,
-                );
+                    .get_mut(handle.0)
+                    .ok_or(Error::StaleUnit)?
+                    .invalidate(handle.0, &mut units.retirements, ticket.sequence);
+                break;
             }
         }
         Ok(ticket)

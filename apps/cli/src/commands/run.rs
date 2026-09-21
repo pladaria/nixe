@@ -440,7 +440,7 @@ impl Drop for WorkerCompletion {
 
 struct WorkerResult {
     execution: Result<ExecutionSummary, String>,
-    teardown: ProcessTeardownReport,
+    teardown: Result<ProcessTeardownReport, String>,
     graphics_teardown: nixe_horizon::GraphicsTeardownReport,
 }
 
@@ -493,9 +493,19 @@ fn execute_worker(
     // canonical memory transitions can still use the JIT coordinator. Removing
     // the process closes native admission and would reject those transitions.
     let graphics_teardown = video_system.teardown();
-    let process = coordinator
-        .remove_process(process_id)
-        .expect("serialized execution returns every scheduler lease");
+    let process = match coordinator.remove_process(process_id) {
+        Ok(process) => process,
+        Err(error) => {
+            // Stopping the backend can report an asynchronous compiler failure
+            // even after every scheduler lease has been returned. Preserve it
+            // and let the coordinator's Drop stop/join its remaining workers.
+            return WorkerResult {
+                execution,
+                teardown: Err(format!("cannot remove process during teardown: {error}")),
+                graphics_teardown,
+            };
+        }
+    };
     let teardown = match process.try_teardown() {
         Ok(report) => report,
         Err(failure) => {
@@ -510,17 +520,23 @@ fn execute_worker(
     };
     WorkerResult {
         execution,
-        teardown,
+        teardown: Ok(teardown),
         graphics_teardown,
     }
 }
 
 fn finish_execution(result: WorkerResult) -> Result<(), String> {
+    let teardown = result
+        .teardown
+        .map_err(|diagnostic| match &result.execution {
+            Ok(_) => diagnostic,
+            Err(error) => format!("{error}; {diagnostic}"),
+        })?;
     log::debug!(
         "resources released: handles={}, address_waiters={}, layers={}, queues={}, \
          pending_frames={}, nvdrv_fds={}, nvmap_allocations={}",
-        result.teardown.handles_released,
-        result.teardown.address_waiters_released,
+        teardown.handles_released,
+        teardown.address_waiters_released,
         result.graphics_teardown.layers_released,
         result.graphics_teardown.queues_released,
         result.graphics_teardown.pending_frames_released,
@@ -534,12 +550,8 @@ fn finish_execution(result: WorkerResult) -> Result<(), String> {
             return Err(error);
         }
     };
-    let exit_code = result
-        .teardown
-        .exit
-        .as_ref()
-        .map_or(0, |exit| exit.exit_code);
-    let exit_cause = result.teardown.exit.as_ref().map_or_else(
+    let exit_code = teardown.exit.as_ref().map_or(0, |exit| exit.exit_code);
+    let exit_cause = teardown.exit.as_ref().map_or_else(
         || "without an exit record".to_owned(),
         |exit| format!("{:?}", exit.cause),
     );
@@ -550,7 +562,7 @@ fn finish_execution(result: WorkerResult) -> Result<(), String> {
         exit_cause,
         exit_code
     );
-    classify_exit(result.teardown.exit)
+    classify_exit(teardown.exit)
 }
 
 struct ExecutionSummary {
@@ -994,6 +1006,27 @@ fn execution_stop_error(stop: &ExecutionStop, report: &nixe_runtime::ExecutionRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn teardown_failure_preserves_execution_error_without_panicking() {
+        for execution in [
+            Ok(ExecutionSummary {
+                svc_calls: 0,
+                rejected_svc_kinds: 0,
+            }),
+            Err("HCQ Cranelift: invalid checkpoint".to_owned()),
+        ] {
+            let failed = execution.is_err();
+            let error = finish_execution(WorkerResult {
+                execution,
+                teardown: Err("cannot remove process during teardown: backend failure".into()),
+                graphics_teardown: Default::default(),
+            })
+            .unwrap_err();
+            assert!(error.contains("cannot remove process during teardown: backend failure"));
+            assert_eq!(error.contains("HCQ Cranelift: invalid checkpoint"), failed);
+        }
+    }
 
     #[test]
     fn runnable_process_can_be_owned_by_the_guest_worker() {

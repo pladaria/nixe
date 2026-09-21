@@ -12,6 +12,10 @@ use cranelift_frontend::FunctionBuilder;
 use nixe_cpu::semantics::conditions::Condition;
 type LazyFlags = crate::abi::LazyFlags<ir::Value>;
 
+mod flags;
+pub(crate) mod values;
+pub(crate) use flags::integer_flag_shape;
+
 pub(crate) trait IntegerLowering<'a> {
     // MSR NZCV ignores all bits except [31:28], even if an MRS consumes the
     // packed value before a canonical exit masks it during writeback.
@@ -330,13 +334,43 @@ pub(crate) trait IntegerLowering<'a> {
         self.builder().ins().bor(nz, cv)
     }
 
+    /// Materialize only the bits demanded by a packed internal SSA merge.
+    /// Other bits are unspecified and cannot be observed through this contract.
+    fn packed_flag_subset(&mut self, flags: &LazyFlags, mask: u8) -> ir::Value {
+        if mask == crate::analysis::NZCV {
+            return self.packed_flags(flags);
+        }
+        if let LazyFlags::Canonical(value) | LazyFlags::Packed(value) = flags {
+            return *value;
+        }
+        let mut packed = None;
+        for (bit, shift) in [(8, 31), (4, 30), (2, 29), (1, 28)] {
+            if mask & bit == 0 {
+                continue;
+            }
+            let value = match bit {
+                8 => self.flag_n(flags),
+                4 => self.flag_z(flags),
+                2 => self.flag_c(flags),
+                _ => self.flag_v(flags),
+            };
+            let value = self.builder().ins().uextend(types::I32, value);
+            let value = self.builder().ins().ishl_imm_u(value, shift);
+            packed = Some(match packed {
+                Some(old) => self.builder().ins().bor(old, value),
+                None => value,
+            });
+        }
+        packed.unwrap_or_else(|| self.builder().ins().iconst(types::I32, 0))
+    }
+
     fn emit_integer(
         &mut self,
         source: GuestVirtualAddress,
         instruction: Instruction,
         flags: &LazyFlags,
     ) -> Result<Option<LazyFlags>, Error> {
-        match instruction {
+        let updated = match instruction {
             Instruction::MoveWide(fields) => self.emit_move_wide(fields),
             Instruction::AddSubImmediate(fields) => self.emit_add_sub_immediate(fields),
             Instruction::AddSubShifted(fields) => self.emit_add_sub_shifted(fields),
@@ -356,7 +390,14 @@ pub(crate) trait IntegerLowering<'a> {
             Instruction::OneSource(fields) => self.emit_one_source(fields),
             Instruction::Adr(fields) => self.emit_adr(source, fields, false),
             Instruction::Adrp(fields) => self.emit_adr(source, fields, true),
-        }
+        }?;
+        // Keep the pre-emission CFG contract tied to the actual shared emitter.
+        // No shape allocation/check is performed by release LCQ compilation.
+        debug_assert_eq!(
+            updated.as_ref().map(LazyFlags::shape),
+            integer_flag_shape(instruction)
+        );
+        Ok(updated)
     }
 
     // A64 integer data-processing semantics follow Arm DDI 0602 (2025-12),

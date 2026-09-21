@@ -814,7 +814,6 @@ impl super::ExecutableMemory for SyntheticMemory {
     fn image_is_current(&self, image: &super::InstructionImage) -> bool {
         let inner = self.lock_inner();
         std::sync::Arc::ptr_eq(&self.invalidations, &image.owner)
-            && self.invalidation_cursor() == image.cursor
             && image.pages.iter().all(|page| {
                 let Some(mapping) = mapping_at(&inner, image.space, page.address) else {
                     return false;
@@ -2260,8 +2259,8 @@ mod tests {
 
     use super::*;
     use crate::memory::{
-        CacheMaintenanceKind, ExecutionMemory, MemoryAccessClass, MemoryAccessSize,
-        MemoryAlignment, MemoryOrdering,
+        CacheMaintenanceKind, ExecutableMemory, ExecutionMemory, MemoryAccessClass,
+        MemoryAccessSize, MemoryAlignment, MemoryOrdering,
     };
 
     #[test]
@@ -2364,6 +2363,49 @@ mod tests {
         assert!(memory.initialize_ram(PAGE_1, 0, &[0x1f, 0x20, 0x03, 0xd5]));
         assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_EXECUTE));
         memory
+    }
+
+    #[test]
+    fn executable_images_validate_exact_dependencies_not_unrelated_history() {
+        fn check<M: MemorySetup + ExecutableMemory + MemoryInvalidationSource + ProcessMemory>(
+            mut memory: M,
+            other: M,
+        ) {
+            assert!(memory.add_ram_page(PAGE_1));
+            assert!(memory.add_ram_page(PAGE_2));
+            assert!(memory.initialize_ram(PAGE_1, 0, &0xd503201fu32.to_le_bytes()));
+            assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_EXECUTE));
+            let capture = |memory: &M| {
+                memory.capture_instructions(
+                    SPACE,
+                    CODE,
+                    std::num::NonZeroU16::new(1).unwrap(),
+                    &|_, _| false,
+                )
+            };
+            let image = capture(&memory);
+            assert!(memory.image_is_current(&image));
+            assert!(!other.image_is_current(&image));
+            assert!(memory.map_page(SPACE, ALIAS, PAGE_2, MemoryPermissions::READ_EXECUTE));
+            assert_ne!(memory.invalidation_cursor(), image.cursor());
+            assert!(memory.image_is_current(&image));
+            assert!(memory.initialize_ram(PAGE_2, 0, &0xd65f03c0u32.to_le_bytes()));
+            assert!(memory.image_is_current(&image));
+            assert!(memory.initialize_ram(PAGE_1, 0, &0xd65f03c0u32.to_le_bytes()));
+            assert!(!memory.image_is_current(&image));
+            let image = capture(&memory);
+            memory
+                .set_permissions(SPACE, CODE, PAGE_SIZE, MemoryPermissions::READ)
+                .unwrap();
+            assert!(!memory.image_is_current(&image));
+            memory
+                .set_permissions(SPACE, CODE, PAGE_SIZE, MemoryPermissions::READ_EXECUTE)
+                .unwrap();
+            // Restored permissions still have a new mapping identity.
+            assert!(!memory.image_is_current(&image));
+        }
+        check(SyntheticMemory::new(), SyntheticMemory::new());
+        check(ExecutionMemory::new(), ExecutionMemory::new());
     }
 
     #[test]

@@ -125,7 +125,10 @@ impl Lifetime {
         {
             // An undemanded/misaligned target can still be an observed seed
             // successor, but cannot supply a versioned reshape endpoint.
-            samples.seed(block, source.payload.reachability(), Some(edge), false);
+            let queue = state.background_queue.upgrade();
+            let version = source.payload.reachability();
+            drop(state);
+            self.sample_seed(queue, samples, block, version, Some(edge))?;
         }
         Ok(())
     }

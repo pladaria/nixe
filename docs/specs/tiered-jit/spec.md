@@ -365,10 +365,13 @@ epoch and maintenance request sequence are checked u64 counters. They never
 wrap: exhaustion disables HCQ and produces a precise capacity failure on the
 next operation that requires new LCQ publication or lifecycle transition.
 
-Reserve the unit identity and captured admission epoch before emitting native
-exits that embed its CodeVersion. Publication consumes that identity unchanged;
-it must not relabel state maps after emission or accept code from an older
-admission epoch. Abandoned emission identities are never reused.
+Reserve the unit identity before emitting native exits that embed its
+CodeVersion. Publication consumes that identity unchanged; it must not relabel
+state maps after emission. LCQ captures the admission epoch as its speculative
+publication guard. Initial HCQ instead retains exact LCQ input identities and
+exclusive instruction claims across unrelated maintenance; it publishes only
+under current Open authority after revalidating those inputs. Abandoned emission
+identities are never reused.
 
 An immutable CodeUnit owns:
 
@@ -401,8 +404,9 @@ first closes process admission. `Unlinked` means no future gateway, dispatch,
 static patch or PIC can enter the unit. An RSB contains only a guest BlockKey
 and cannot enter code by itself. Retirement records the epoch but
 does not remove fault/dependency metadata. Reclamation alone returns registry
-slots and executable spans. State transitions compare CodeUnitId,
-CodeVersion and admission epoch so a stale task cannot advance a newer unit.
+slots and executable spans. State transitions compare CodeUnitId, CodeVersion
+and the expected lifecycle; speculative admission additionally checks its epoch
+so a stale task cannot advance a newer unit.
 
 ### Bounded registries and indexes
 
@@ -952,8 +956,8 @@ With zero workers HCQ is disabled and no pending container exists.
 
 After dequeue, a worker enters compiler read-side protection. Discovery is
 incremental: when the bounded worklist names a BlockKey, the worker briefly
-uses the corresponding dispatch-index shard to validate the captured admission
-epoch and clone that LCQ CodeUnit's strong immutable reference, then releases
+uses the corresponding dispatch index to validate the captured demand version
+and clone that LCQ CodeUnit's strong immutable reference, then releases
 the shard before decoding it. It scans neither the registry nor all resident
 LCQ units and holds at most the candidate's 2048 InstructionKeys worth of
 references. A job never reads a per-vCPU profile table or a raw registry
@@ -1107,17 +1111,32 @@ before completing. No pre-IC candidate can publish after that closure/reopen.
 
 Host/device executable-content publication and mapping/permission changes use
 the same coordinator before becoming visible; they do not wait for guest IC.
-The admission epoch and memory cursor close the gap between image validation
-and dispatch publication without nesting memory locks under JIT state or
-adding per-store checks. Backend output remains in a worker-owned nonexecutable
-staging buffer until it has a final size and relocation set.
+For initial HCQ, exact captured LCQ identities, their Published lifecycle and
+instruction claims close the gap between image validation and publication:
+the bound memory coordinator invalidates every affected source unit under the
+same JIT-state mutex before its dependency can change. Strong references alone
+are not validity; superseded, invalidating, retired or replaced inputs cancel
+the candidate even while their storage remains alive. History loss invalidates
+all sources. Cold image validation checks exact owner/mapping/content stamps,
+not the unrelated global memory cursor. LCQ and unbound synthetic publications
+retain their speculative admission-epoch/cursor guard. No memory lock is nested
+under JIT state and no per-store compiler check is added.
+
+Initial HCQ jobs and exact-token instruction reservations survive unrelated
+Closing/Closed intervals. Completed output waits for Open using the coordinator's
+condition variable, without holding a guest lease or execution epoch. Shutdown
+wakes and cancels it. Concurrent directory publication or capacity growth
+rebuilds only the cold publication metadata; do not repeat backend compilation
+or replace the already emitted CodeVersion. Backend output remains in a
+worker-owned nonexecutable staging buffer until it has its final size and
+relocation set. Unpublished installed spans remain owned while publication waits.
 
 After final allocation and relocation, publication uses one short JIT-state
 mutex:
 
-1. require the process state to remain Open at the captured admission epoch;
-2. revalidate seed, ReachabilityVersions, owner generations, memory cursor and
-   exact InstructionKey reservations;
+1. require current Open authority;
+2. revalidate seed, every captured LCQ identity/lifecycle/ReachabilityVersion,
+   owner generations and exact InstructionKey reservations;
 3. install the complete immutable CodeUnit, dependency/fault registry entries,
    family membership and incoming/outgoing patch records;
 4. register every required patch/clear as part of the same cutover transaction;
@@ -1138,7 +1157,8 @@ published; it cannot be enqueued after its source was retired.
 
 The explicitly requested debug replacement message is emitted once per
 published HCQ unit, after the mutex is released. It contains the family/version
-and seed, not one line per selected entry and no timing or counters.
+and seed, guest instruction count, selected entry count and total installed
+native bytes; not one line per selected entry or a hot-path counter.
 
 ## Executable cache and backend ownership
 
@@ -1252,8 +1272,9 @@ Open admission epoch only after the observed sequence is fully accounted for.
 
 ### Code and mapping invalidation
 
-Every gateway and LCQ/HCQ publication must observe the same Open epoch before
-and after resolving its entry/reservation. The page indexes return every
+Every gateway and speculative LCQ publication must observe the same Open epoch
+before and after resolving its entry/reservation. Initial HCQ validates retained
+source identities and claims under current Open authority instead. The page indexes return every
 intersecting resident or retired-but-callable CodeUnit. A MappingChange request
 uses this order:
 
@@ -1277,10 +1298,13 @@ uses this order:
 7. retire code and all coupled metadata at the current execution epoch; and
 8. reopen admission with a new Open epoch.
 
-An LCQ compiler, HCQ worker or linker which captured an older admission epoch
-fails revalidation and drops only its exact generational handles. It cannot
-publish after Closing starts or reopen the process. Mapping changes therefore
-cannot race a synchronous compile into the old address space.
+An LCQ compiler or linker which captured an older admission epoch fails
+revalidation and drops only its exact generational handles. An initial HCQ
+worker survives an unrelated stop, but cannot publish while Closed or after
+any captured source was invalidated. It uses the existing maintenance service
+and never bypasses the coordinator to reopen the process. Mapping changes
+therefore cannot publish code for stale mappings. The provisional reshape-job
+admission remains epoch-bound until Task 7 supplies its real consumer.
 
 An executable-page write caught by host protection leaves native code before
 the write occurs. The writing vCPU does not wait for its own active epoch: it
@@ -1400,6 +1424,17 @@ Shutdown closes admission, wakes workers, prevents publication, drains exact
 queued/reserved states, joins workers without holding JIT locks, forces final
 quiescence, unlinks code and releases every segment and metadata allocation.
 
+At the first terminal shutdown request, debug logging snapshots resident LCQ/HCQ
+unit counts, still-Published HCQ units and each tier's occupied native-span bytes
+before shutdown marks those units invalidating. Retired units still awaiting
+reclamation remain resident; multiple entry labels do not multiply the count.
+Unpublished worker output is not a registered resident unit.
+A separate cache snapshot reports committed segment bytes, charged metadata
+(including any charged staging) and their sum. These are current, not peak or
+historical counts, and are not process RSS. The two snapshots do not nest cache
+and JIT locks and need not be transactionally simultaneous. Log once outside
+locks, without new hot-path counters; skip the unit scan when debug is disabled.
+
 ## Failure policy and concurrency rules
 
 - LCQ invalid guest code or lowering failure is a precise CPU failure.
@@ -1438,8 +1473,8 @@ Locking is intentionally narrow and nonnested:
 - a worker reserves logical membership, releases state, then compiles from
   strong immutable references;
 - publication may fail only before any DispatchPayload becomes reachable; and
-- abort cleanup matches exact BlockKey, admission/ReachabilityVersion,
-  reservation generation and CodeUnitId.
+- abort cleanup matches exact BlockKey/ReachabilityVersion, reservation token
+  and CodeUnitId (plus the admission epoch for speculative LCQ work).
 
 ## Migration map
 

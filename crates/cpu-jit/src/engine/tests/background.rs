@@ -7,15 +7,22 @@ use crate::lifetime::background::{
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+mod production;
+
 fn process(
     count: usize,
     compile: impl Fn(&mut Resources, Work<'_>) -> Result<(), CompileError> + Send + Sync + 'static,
 ) -> Arc<JitProcess> {
-    let mut process = JitProcess::new(cpu(), memory(DirectBackendPolicy::Required)).unwrap();
     // Deterministic worker count in tests, regardless of the test host's CPUs.
-    process.background_workers = count;
-    process.start_background(compile).unwrap();
-    Arc::new(process)
+    Arc::new(
+        JitProcess::with_compiler(
+            cpu(),
+            memory(DirectBackendPolicy::Required),
+            count,
+            |_, _| Ok(compile),
+        )
+        .unwrap(),
+    )
 }
 
 fn enqueue(thread: &mut JitThread, worker: &mut NativeWorker) {
@@ -73,7 +80,7 @@ fn process_joins_idle_workers_and_zero_worker_policy_without_a_second_start() {
         assert!(
             Arc::get_mut(&mut process)
                 .unwrap()
-                .start_background(|_, _| panic!("restart"))
+                .start_background(count, |_, _| panic!("restart"))
                 .is_err()
         );
     }
@@ -200,4 +207,56 @@ fn last_process_owner_closes_and_joins_workers_without_an_arc_cycle() {
     assert!(weak.upgrade().is_none());
     assert_eq!(Arc::strong_count(&captures), 1);
     assert!(lifetime.try_shutdown().unwrap());
+}
+
+#[test]
+fn owned_real_hcq_consumer_promotes_and_executes_before_joining() {
+    let memory = memory(DirectBackendPolicy::Required);
+    let compile = crate::hcq::worker::consumer(
+        if cfg!(target_arch = "x86_64") {
+            HostAbi::X86_64
+        } else {
+            HostAbi::Aarch64
+        },
+        0x10000,
+        memory.clone(),
+    )
+    .unwrap();
+    let (finished, done) = mpsc::channel();
+    let process = JitProcess::with_compiler(cpu(), memory.clone(), 1, |_, _| {
+        Ok(move |resources: &mut Resources, work: Work<'_>| {
+            let result = compile(resources, work);
+            finished
+                .send(result.as_ref().copied().map_err(|e| format!("{e:?}")))
+                .unwrap();
+            result
+        })
+    })
+    .unwrap();
+    let process = Arc::new(process);
+    let weak = Arc::downgrade(&process);
+    let mut thread = JitThread::new(process.clone()).unwrap();
+    let mut native = NativeWorker::default();
+    enqueue(&mut thread, &mut native);
+    done.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    process.lifetime.try_service_links().unwrap();
+    {
+        let mut state = A64State::default();
+        let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 10).unwrap());
+        let invocation = unsafe { thread.reader.admit(&mut frame, thread.key(PC).unwrap()) }
+            .unwrap()
+            .unwrap();
+        assert!(invocation.payload().hcq().is_some());
+    }
+    breakpoint(&mut thread, &mut native, 1);
+    process.request_stop().unwrap();
+    assert!(process.try_shutdown().unwrap());
+    assert!(matches!(
+        *process.background.lock().unwrap(),
+        Background::Joined
+    ));
+    drop(thread);
+    drop(process);
+    assert!(weak.upgrade().is_none());
+    native.finish().unwrap();
 }

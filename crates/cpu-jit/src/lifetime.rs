@@ -306,6 +306,7 @@ struct State {
     // weak link cannot keep either the pool or the process alive.
     background_queue: std::sync::Weak<background::Queue>,
     shutdown: bool,
+    shutdown_reported: bool,
     failure: Option<Error>,
     // Owned diagnostic for the first terminal background failure. Consulted
     // only on error paths; ordinary native/control checks use failure/pending.
@@ -326,14 +327,20 @@ impl State {
     }
 
     fn open(&self) -> Result<AdmissionEpoch, Error> {
-        self.healthy()?;
-        if self.shutdown {
-            return Err(Error::Shutdown);
-        }
+        self.running()?;
         if self.phase != Phase::Open {
             return Err(Error::Closed);
         }
         Ok(self.admission)
+    }
+
+    /// Cold compiler work may survive a maintenance stop, but not shutdown.
+    fn running(&self) -> Result<(), Error> {
+        self.healthy()?;
+        if self.shutdown {
+            return Err(Error::Shutdown);
+        }
+        Ok(())
     }
 
     fn quiescent(&self, retired: ExecutionEpoch) -> bool {
@@ -353,6 +360,10 @@ impl State {
         if self.open()? != publication.admission {
             return Err(Error::StalePublication);
         }
+        self.validate_entry(publication)
+    }
+
+    fn validate_entry(&self, publication: &Publication<'_>) -> Result<(), Error> {
         let slot = self
             .dispatch
             .get(publication.slot)
@@ -416,6 +427,7 @@ impl Lifetime {
                 candidates: background::CandidateIndex::new(0),
                 background_queue: std::sync::Weak::new(),
                 shutdown: false,
+                shutdown_reported: false,
                 failure: None,
                 background_failure: None,
                 dispatch: Registry::default(),
@@ -722,6 +734,15 @@ impl Lifetime {
     /// the executing workers finish their current bounded native fragment.
     pub(crate) fn request_shutdown(&self) -> Result<(), Error> {
         let mut state = self.lock();
+        // Snapshot once, before shutdown changes Published lifecycles. No
+        // persistent per-unit counters or guest-path bookkeeping are needed.
+        let summary = if !std::mem::replace(&mut state.shutdown_reported, true)
+            && log::log_enabled!(log::Level::Debug)
+        {
+            Some(state.units.shutdown_summary())
+        } else {
+            None
+        };
         let result = (|| {
             state.healthy()?;
             if !state.shutdown {
@@ -730,6 +751,9 @@ impl Lifetime {
             Ok(())
         })();
         drop(state);
+        if let Some(summary) = summary {
+            summary.log(self.identity, &self.cache);
+        }
         // Cleanup must run even after a recorded failure. It never joins here:
         // GPU/process dependants may still need to release their own owners.
         let closed = self.close_background();
@@ -971,6 +995,20 @@ pub(crate) struct NativeSuspension<'a> {
     thread: PhantomData<Rc<()>>,
 }
 impl FaultLookup<'_> {
+    pub(crate) fn sample_transfer(
+        &self,
+        unit: &unit::CodeUnit,
+        guest: unit::GuestExit,
+        samples: &mut crate::sampling::Samples,
+        edge: crate::sampling::ObservedEdge,
+    ) -> Result<(), Error> {
+        let (block, instruction) = guest
+            .source(&unit.instructions)
+            .ok_or(Error::InvalidUnit("sample exit has invalid source indices"))?;
+        self.reader
+            .process
+            .sample_transfer(unit, block, instruction.key, samples, edge)
+    }
     pub(crate) fn completion_sample(
         &self,
         unit: &unit::CodeUnit,
@@ -1236,7 +1274,9 @@ impl Batch<'_, '_> {
                 continue;
             }
             if let Some(sequence) = sequence {
-                state.completed[index] = Some(sequence);
+                // The last memory hold may already have acknowledged a newer
+                // MappingChange while this owner retained an older batch.
+                state.completed[index] = state.completed[index].max(Some(sequence));
                 if state.pending[index] == Some(sequence) {
                     state.pending[index] = None;
                 }

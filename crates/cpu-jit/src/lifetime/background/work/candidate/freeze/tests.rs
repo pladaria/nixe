@@ -222,6 +222,7 @@ fn freeze_uses_the_source_instruction_not_partial_baseline_unit_membership() {
         })
         .collect();
     input.states[0].exit.as_mut().unwrap().pc = key(12).pc;
+    input.states[0].exit.as_mut().unwrap().instruction_index = 3;
     input.states[0].transfer.as_mut().unwrap().completed = 4;
     process
         .prepare_unit(

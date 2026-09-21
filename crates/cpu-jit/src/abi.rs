@@ -61,23 +61,43 @@ pub enum LazyFlags<Value> {
 }
 
 impl<Value> LazyFlags<Value> {
+    /// SSA merge shape, independent of operand identity and canonical-home
+    /// freshness. Dirtiness is tracked separately by the native flow analysis.
+    pub(crate) fn shape(&self) -> LazyFlags<()> {
+        if matches!(self, Self::Canonical(_) | Self::Packed(_)) {
+            return LazyFlags::Packed(());
+        }
+        self.try_map(&mut |_| Ok::<_, std::convert::Infallible>(()))
+            .unwrap()
+    }
+
     /// Preserve the recipe while translating SSA operands to final locations.
     pub fn try_map<T, E>(
         &self,
         map: &mut impl FnMut(&Value) -> Result<T, E>,
     ) -> Result<LazyFlags<T>, E> {
+        self.try_map_with_bits(&mut |value, _| map(value))
+    }
+
+    /// Same stable operand order as try_map, with each SSA operand's bit width.
+    /// Packed NZCV is I32, arithmetic follows guest width, and captured carry
+    /// and predicate values are I8 even for 64-bit arithmetic.
+    pub(crate) fn try_map_with_bits<T, E>(
+        &self,
+        map: &mut impl FnMut(&Value, u8) -> Result<T, E>,
+    ) -> Result<LazyFlags<T>, E> {
         Ok(match self {
-            Self::Canonical(value) => LazyFlags::Canonical(map(value)?),
-            Self::Packed(value) => LazyFlags::Packed(map(value)?),
+            Self::Canonical(value) => LazyFlags::Canonical(map(value, 32)?),
+            Self::Packed(value) => LazyFlags::Packed(map(value, 32)?),
             Self::Add {
                 lhs,
                 rhs,
                 result,
                 width,
             } => LazyFlags::Add {
-                lhs: map(lhs)?,
-                rhs: map(rhs)?,
-                result: map(result)?,
+                lhs: map(lhs, *width)?,
+                rhs: map(rhs, *width)?,
+                result: map(result, *width)?,
                 width: *width,
             },
             Self::Subtract {
@@ -86,9 +106,9 @@ impl<Value> LazyFlags<Value> {
                 result,
                 width,
             } => LazyFlags::Subtract {
-                lhs: map(lhs)?,
-                rhs: map(rhs)?,
-                result: map(result)?,
+                lhs: map(lhs, *width)?,
+                rhs: map(rhs, *width)?,
+                result: map(result, *width)?,
                 width: *width,
             },
             Self::AddCarry {
@@ -98,10 +118,10 @@ impl<Value> LazyFlags<Value> {
                 result,
                 width,
             } => LazyFlags::AddCarry {
-                lhs: map(lhs)?,
-                rhs: map(rhs)?,
-                carry: map(carry)?,
-                result: map(result)?,
+                lhs: map(lhs, *width)?,
+                rhs: map(rhs, *width)?,
+                carry: map(carry, 8)?,
+                result: map(result, *width)?,
                 width: *width,
             },
             Self::SubtractCarry {
@@ -111,14 +131,14 @@ impl<Value> LazyFlags<Value> {
                 result,
                 width,
             } => LazyFlags::SubtractCarry {
-                lhs: map(lhs)?,
-                rhs: map(rhs)?,
-                carry: map(carry)?,
-                result: map(result)?,
+                lhs: map(lhs, *width)?,
+                rhs: map(rhs, *width)?,
+                carry: map(carry, 8)?,
+                result: map(result, *width)?,
                 width: *width,
             },
             Self::Logical { result, width } => LazyFlags::Logical {
-                result: map(result)?,
+                result: map(result, *width)?,
                 width: *width,
             },
             Self::Conditional {
@@ -126,8 +146,8 @@ impl<Value> LazyFlags<Value> {
                 when_true,
                 when_false,
             } => LazyFlags::Conditional {
-                predicate: map(predicate)?,
-                when_true: Box::new(when_true.try_map(map)?),
+                predicate: map(predicate, 8)?,
+                when_true: Box::new(when_true.try_map_with_bits(map)?),
                 when_false: *when_false,
             },
         })

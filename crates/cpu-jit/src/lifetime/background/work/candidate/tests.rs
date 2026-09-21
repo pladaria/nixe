@@ -84,7 +84,7 @@ fn candidate_rechecks_nonseed_versions_after_acquisition() {
 }
 
 #[test]
-fn expired_candidate_cleanup_preserves_new_tokens_and_releases_only_old_keys() {
+fn candidate_claims_survive_maintenance_until_their_owner_releases_them() {
     let (process, queue, mut samples) = setup(0);
     publish_words(&process, 0, &[NOP, RET]);
     publish_words(&process, 4, &[RET]);
@@ -94,13 +94,18 @@ fn expired_candidate_cleanup_preserves_new_tokens_and_releases_only_old_keys() {
         .unwrap();
     process.request(Reason::LinkPatch).unwrap();
     process.try_service_links().unwrap();
-    assert_eq!(old.check(), Err(Error::StalePublication));
+    old.check().unwrap();
     let current_work = work(&process, &queue, &mut samples, 4);
+    assert!(matches!(
+        current_work.reserve_candidate(Graph::discover(&current_work).unwrap()),
+        Err(CompileError::Deferred)
+    ));
+    assert_eq!(process.lock().candidates.entries.len(), 2);
+    drop(old);
+    assert!(process.lock().candidates.entries.is_empty());
     let current = current_work
         .reserve_candidate(Graph::discover(&current_work).unwrap())
         .unwrap();
-    assert_eq!(process.lock().candidates.entries.len(), 2);
-    drop(old);
     assert_eq!(process.lock().candidates.entries.len(), 1);
     current.check().unwrap();
 }

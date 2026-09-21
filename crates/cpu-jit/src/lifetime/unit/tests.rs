@@ -13,6 +13,8 @@ use nixe_cpu::{platform::TargetPlatform, profile::ProcessCpuContext, state::a64:
 use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration};
 use std::sync::{Barrier, mpsc};
 
+mod diagnostic;
+
 pub(in crate::lifetime) fn key(pc: u64) -> BlockKey {
     BlockKey::new(
         ProcessCpuContext::new(TargetPlatform::Switch1, AddressSpaceId::new(1)),
@@ -138,6 +140,7 @@ pub(super) fn input_with_islands(
             native_start: 12,
             native_end: end,
             instruction: InstructionKey::new(key(pcs[0])).unwrap(),
+            completed: 0,
             access: Access::Read,
             bytes: 8,
             subaccess: 0,
@@ -601,11 +604,77 @@ fn hcq_family_owns_baselines_and_preserves_lcq_dispatch() {
 }
 
 #[test]
+fn guest_exit_indices_resolve_only_the_exact_captured_block_and_instruction() {
+    let mut image: Vec<_> = [0x1000, 0x1004, 0x80, 0x84, 0x2000]
+        .into_iter()
+        .enumerate()
+        .map(|(index, pc)| Instruction {
+            key: InstructionKey::new(key(pc)).unwrap(),
+            bits: index as u32,
+        })
+        .collect();
+    let exit = GuestExit {
+        pc: GuestVirtualAddress::new(0x84),
+        kind: EdgeKind::Static,
+        block_index: 2,
+        instruction_index: 3,
+    };
+    let (block, instruction) = exit.source(&image).unwrap();
+    assert_eq!(block, key(0x80));
+    assert_eq!(instruction.key, image[3].key);
+    assert_eq!(instruction.bits, 3);
+    for (block_index, instruction_index, pc) in [
+        (5, 3, 0x84),
+        (2, 5, 0x84),
+        (3, 2, 0x80),
+        (0, 3, 0x84),
+        (2, 4, 0x2000),
+        (2, 3, 0x88),
+    ] {
+        assert!(
+            GuestExit {
+                block_index,
+                instruction_index,
+                pc: GuestVirtualAddress::new(pc),
+                ..exit
+            }
+            .source(&image)
+            .is_none()
+        );
+    }
+    let mut foreign = key(0x84);
+    foreign.address_space = AddressSpaceId::new(2);
+    image[3].key = InstructionKey::new(foreign).unwrap();
+    assert!(exit.source(&image).is_none());
+}
+
+#[test]
+fn malformed_guest_exit_indices_are_rejected_before_publication() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let publication = process.reserve(key(0)).unwrap();
+    for (block_index, instruction_index, pc) in [(1, 0, 0), (0, 1, 0), (0, 0, 4)] {
+        let mut candidate = input(&process, &[0], Tier::Lcq);
+        candidate.states[0].exit = Some(GuestExit {
+            block_index,
+            instruction_index,
+            pc: GuestVirtualAddress::new(pc),
+            kind: EdgeKind::Static,
+        });
+        assert!(matches!(
+            process.prepare_unit(&[publication], candidate, &cursor),
+            Err(Error::InvalidUnit("invalid guest exit source indices"))
+        ));
+    }
+    assert!(process.lock().units.records.values().next().is_none());
+}
+
+#[test]
 fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() {
     let process = process();
     let cursor = AtomicU64::new(0);
     let publication = process.reserve(key(0)).unwrap();
-    for case in 0..15 {
+    for case in 0..16 {
         let mut candidate = input(&process, &[0], Tier::Lcq);
         match case {
             0 => candidate.entries[0].fast_offset = 16,
@@ -620,6 +689,7 @@ fn malformed_metadata_and_foreign_allocations_are_rejected_before_publication() 
             9 => candidate.code.metadata.faults[0].fault_bytes = 0,
             10 => candidate.faults[0].native_end += 1,
             11 => candidate.faults[0].completed_read = Some(ValueLocation::Constant(0)),
+            15 => candidate.faults[0].completed = 2048,
             12 | 13 => {
                 candidate.faults[0].subaccess = 1;
                 candidate.faults[0].completed_read = Some(ValueLocation::Register {

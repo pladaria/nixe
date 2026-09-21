@@ -2,6 +2,7 @@
 //! capture/lowering and coordinated mapping changes are wired by Task 3;
 //! this boundary consumes their owned image and checks its captured cursor.
 
+use super::background::Frozen;
 use super::directory::{Interval, Table};
 use super::registry::{Handle, Registry, Slot};
 use super::{DispatchSlot, Error, Lifetime, PreparedStorage, Publication, Reason};
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 mod bridge;
+mod diagnostic;
 pub(crate) mod dynamic;
 mod invalidation;
 pub(crate) mod links;
@@ -83,6 +85,21 @@ pub(crate) struct TerminalTransfer {
 pub(crate) struct GuestExit {
     pub pc: nixe_memory::GuestVirtualAddress,
     pub kind: EdgeKind,
+    /// Exact source indices in the unit's captured instruction image. HCQ
+    /// blocks need not be contiguous with each other or publicly dispatchable.
+    pub block_index: u16,
+    pub instruction_index: u16,
+}
+
+impl GuestExit {
+    pub(crate) fn source(self, image: &[Instruction]) -> Option<(BlockKey, Instruction)> {
+        let block = image.get(usize::from(self.block_index))?.key.block_key();
+        let instruction = *image.get(usize::from(self.instruction_index))?;
+        let prefix = self.instruction_index.checked_sub(self.block_index)?;
+        (block.pc.get().checked_add(u64::from(prefix) * 4) == Some(self.pc.get())
+            && block.at(self.pc) == Some(instruction.key.block_key()))
+        .then_some((block, instruction))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +147,10 @@ pub(crate) struct FaultRecord {
     pub native_start: u32,
     pub native_end: u32,
     pub instruction: InstructionKey,
+    /// Uncharged completed prefix within the source canonical block, not an
+    /// ordinal in CodeUnit.instructions. Earlier blocks are already charged in
+    /// the captured native poll counter; retry leaves both values unchanged.
+    pub completed: u16,
     pub access: Access,
     pub bytes: u8,
     pub subaccess: u16,
@@ -676,6 +697,12 @@ impl Input {
             }
         }
         for (index, map) in self.states.iter().enumerate() {
+            if map
+                .exit
+                .is_some_and(|exit| exit.source(&self.instructions).is_none())
+            {
+                return Err(fail("invalid guest exit source indices"));
+            }
             if map.state.abi != self.code.metadata.abi
                 || map.state.site.source != self.identity.version
                 || map.state.site.state_map as usize != index
@@ -755,6 +782,7 @@ impl Input {
         }
         for (i, fault) in self.faults.iter().enumerate() {
             if fault.native_start >= fault.native_end
+                || fault.completed >= 2048
                 || fault.native_end as usize > self.code.allocation.len()
                 || (i != 0 && self.faults[i - 1].native_end > fault.native_start)
                 || !matches!(fault.bytes, 1 | 2 | 4 | 8 | 16)
@@ -817,7 +845,12 @@ impl Input {
 impl Lifetime {
     pub(crate) fn begin_unit(&self, tier: Tier) -> Result<EmissionIdentity, Error> {
         let mut state = self.lock();
-        let admission = state.open()?;
+        let admission = if tier == Tier::Hcq {
+            state.running()?;
+            state.admission
+        } else {
+            state.open()?
+        };
         if tier == Tier::Hcq
             && let Some(error) = state.units.hcq_failure
         {
@@ -863,11 +896,33 @@ impl Lifetime {
     /// the captured image must have been frozen at Input.cursor, and future
     /// mapping/content transitions must serialize through this coordinator.
     /// Synthetic units can have no guest dependencies; no guest fetch occurs here.
+    /// Candidate-bound HCQ instead validates all retained LCQ input identities
+    /// and lifecycles under state, after exact memory stamps were checked outside.
     pub(crate) fn prepare_unit<'a>(
         &'a self,
         publications: &[Publication<'a>],
         input: Input,
         cursor: &'a AtomicU64,
+    ) -> Result<PreparedUnit<'a>, Error> {
+        self.prepare_output(publications, input, cursor, None)
+    }
+
+    pub(in crate::lifetime) fn prepare_candidate<'a>(
+        &'a self,
+        publications: &[Publication<'a>],
+        input: Input,
+        cursor: &'a AtomicU64,
+        candidate: &'a Frozen<'a, 'a>,
+    ) -> Result<PreparedUnit<'a>, Error> {
+        self.prepare_output(publications, input, cursor, Some(candidate))
+    }
+
+    fn prepare_output<'a>(
+        &'a self,
+        publications: &[Publication<'a>],
+        input: Input,
+        cursor: &'a AtomicU64,
+        candidate: Option<&'a Frozen<'a, 'a>>,
     ) -> Result<PreparedUnit<'a>, Error> {
         input.validate(self, publications)?;
         self.collect_tables()?;
@@ -892,7 +947,9 @@ impl Lifetime {
         let bytes = payloads.capacity() * size_of::<DispatchPayload>();
         let mut payloads = self.cache.account(payloads, bytes, input.tier)?;
         let baselines = Vec::with_capacity(if input.tier == Tier::Hcq {
-            input.instructions.len() + publications.len()
+            candidate.map_or(input.instructions.len(), |candidate| {
+                candidate.graph().units.len()
+            }) + publications.len()
         } else {
             0
         });
@@ -903,19 +960,25 @@ impl Lifetime {
         // All vectors used below have charged storage before the state lock.
         let (id, version, family_identity, table) = {
             let mut state = self.lock();
-            for publication in publications.iter() {
-                state.validate(publication)?;
-            }
-            if input.identity.admission != state.admission {
-                return Err(Error::StalePublication);
+            if let Some(candidate) = candidate {
+                candidate.validate_locked(&state)?;
+                for publication in publications.iter() {
+                    state.validate_entry(publication)?;
+                }
+            } else {
+                for publication in publications.iter() {
+                    state.validate(publication)?;
+                }
+                if input.identity.admission != state.admission
+                    || cursor.load(Ordering::Acquire) != input.cursor.get()
+                {
+                    return Err(Error::StalePublication);
+                }
             }
             if input.tier == Tier::Hcq
                 && let Some(error) = state.units.hcq_failure
             {
                 return Err(error);
-            }
-            if cursor.load(Ordering::Acquire) != input.cursor.get() {
-                return Err(Error::StalePublication);
             }
             if input.tier == Tier::Hcq {
                 // Family discovery/reshape is later work. Initial family
@@ -925,26 +988,38 @@ impl Lifetime {
                         "HCQ overlap requires coordinated family replacement",
                     ));
                 }
-                for instruction in &input.instructions {
-                    let record = state
-                        .units
-                        .records
-                        .values()
-                        .find(|record| {
-                            record.code.tier == Tier::Lcq
-                                && record.lifecycle == Lifecycle::Published
-                                && record.code.instructions.iter().any(|old| {
-                                    old.key == instruction.key && old.bits == instruction.bits
-                                })
-                        })
-                        .ok_or(Error::InvalidUnit(
-                            "HCQ instruction has no matching resident LCQ image",
-                        ))?;
-                    if !baselines
-                        .iter()
-                        .any(|unit: &BaselinePin| unit.id == record.code.id)
-                    {
+                if let Some(candidate) = candidate {
+                    // Discovery already owns distinct immutable LCQ snapshots;
+                    // validate_locked checked every captured demand/version.
+                    // Pin those exact units with point lookups, not a registry
+                    // scan per instruction or an arbitrary matching baseline.
+                    for snapshot in &candidate.graph().units {
+                        let handle = snapshot.registered_handle().ok_or(Error::StaleUnit)?;
+                        let record = state.units.records.get(handle.0).ok_or(Error::StaleUnit)?;
                         baselines.value.push(BaselinePin::new(&record.code));
+                    }
+                } else {
+                    for instruction in &input.instructions {
+                        let record = state
+                            .units
+                            .records
+                            .values()
+                            .find(|record| {
+                                record.code.tier == Tier::Lcq
+                                    && record.lifecycle == Lifecycle::Published
+                                    && record.code.instructions.iter().any(|old| {
+                                        old.key == instruction.key && old.bits == instruction.bits
+                                    })
+                            })
+                            .ok_or(Error::InvalidUnit(
+                                "HCQ instruction has no matching resident LCQ image",
+                            ))?;
+                        if !baselines
+                            .iter()
+                            .any(|unit: &BaselinePin| unit.id == record.code.id)
+                        {
+                            baselines.value.push(BaselinePin::new(&record.code));
+                        }
                     }
                 }
             }
@@ -1015,31 +1090,7 @@ impl Lifetime {
             bytes,
             tier,
         )?);
-        let mut intervals = table
-            .as_ref()
-            .map_or_else(Vec::new, |old| old.intervals.to_vec());
-        intervals.push(Interval {
-            start: unit.code.allocation.address(),
-            end: unit.code.allocation.address() + unit.code.allocation.len(),
-            unit: &unit.value,
-        });
-        intervals.sort_unstable_by_key(|interval| interval.start);
-        if intervals.windows(2).any(|pair| pair[0].end > pair[1].start) {
-            return Err(Error::InvalidUnit(
-                "native unit intervals overlap published code",
-            ));
-        }
-        let bytes = size_of::<Accounted<Table>>()
-            + 2 * size_of::<usize>()
-            + intervals.capacity() * size_of::<Interval>();
-        let next_table = Arc::new(self.cache.account(
-            Table {
-                generation,
-                intervals,
-            },
-            bytes,
-            tier,
-        )?);
+        let next_table = self.unit_table(&unit, &table)?;
         let family = if let Some((id, version)) = family_identity {
             let Accounted {
                 value: baselines,
@@ -1103,6 +1154,7 @@ impl Lifetime {
             .transpose()?;
         Ok(PreparedUnit {
             process: self,
+            candidate,
             publications,
             cursor,
             unit: Some(unit),
@@ -1126,7 +1178,7 @@ impl Lifetime {
         loop {
             let (records, families, retired, dependencies, static_sites, family_owners) = {
                 let state = self.lock();
-                state.open()?;
+                state.running()?;
                 let records = if state.units.records.has_space() {
                     0
                 } else {
@@ -1229,7 +1281,7 @@ impl Lifetime {
             let mut family_owners =
                 PreparedStorage::for_tier(family_owners, bytes, &self.cache, tier)?;
             let mut state = self.lock();
-            state.open()?;
+            state.running()?;
             if family_owners.value.entries.capacity() > state.units.family_owners.entries.capacity()
             {
                 for membership in state.units.family_owners.entries.drain() {
@@ -1277,6 +1329,38 @@ impl Lifetime {
         }
     }
 
+    fn unit_table(
+        &self,
+        unit: &Arc<Accounted<CodeUnit>>,
+        previous: &Option<Arc<Accounted<Table>>>,
+    ) -> Result<Arc<Accounted<Table>>, Error> {
+        let mut intervals = previous
+            .as_ref()
+            .map_or_else(Vec::new, |old| old.intervals.to_vec());
+        intervals.push(Interval {
+            start: unit.code.allocation.address(),
+            end: unit.code.allocation.address() + unit.code.allocation.len(),
+            unit: &unit.value,
+        });
+        intervals.sort_unstable_by_key(|interval| interval.start);
+        if intervals.windows(2).any(|pair| pair[0].end > pair[1].start) {
+            return Err(Error::InvalidUnit(
+                "native unit intervals overlap published code",
+            ));
+        }
+        let bytes = size_of::<Accounted<Table>>()
+            + 2 * size_of::<usize>()
+            + intervals.capacity() * size_of::<Interval>();
+        Ok(Arc::new(self.cache.account(
+            Table {
+                generation: unit.code.allocation.generation,
+                intervals,
+            },
+            bytes,
+            unit.tier,
+        )?))
+    }
+
     /// Cold snapshot collection. Records named by any still-readable table
     /// remain in the unit registry until the directory grace period completes.
     pub(crate) fn collect_tables(&self) -> Result<usize, Error> {
@@ -1311,6 +1395,7 @@ fn same_snapshot<T>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
 
 pub(crate) struct PreparedUnit<'a> {
     process: &'a Lifetime,
+    candidate: Option<&'a Frozen<'a, 'a>>,
     publications: Accounted<Box<[Publication<'a>]>>,
     cursor: &'a AtomicU64,
     unit: Option<Arc<Accounted<CodeUnit>>>,
@@ -1325,10 +1410,92 @@ pub(crate) struct PreparedUnit<'a> {
 type OwnedPayload = Box<Accounted<DispatchPayload>>;
 impl PreparedUnit<'_> {
     pub(crate) fn publish(mut self) -> Result<UnitHandle, Error> {
+        loop {
+            if let Some(candidate) = self.candidate {
+                self.wait_for_publication(candidate)?;
+            }
+            match self.publish_once() {
+                Err(Error::Closed | Error::StalePublication) if self.candidate.is_some() => {
+                    // Another publisher can consume reserved registry capacity
+                    // or replace this segment's native-PC table. Keep our native
+                    // bytes, identity, pins and claims; refresh only cold metadata.
+                    self.refresh_publication()?;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn wait_for_publication(&self, candidate: &Frozen<'_, '_>) -> Result<(), Error> {
+        loop {
+            candidate.check()?;
+            // A publication can itself request LinkPatch with no active guest
+            // to service it. Help the existing coordinator; never hold an
+            // execution epoch, queue lock or memory lock while waiting.
+            self.process.try_service_links()?;
+            let state = self.process.lock();
+            candidate.validate_locked(&state)?;
+            if state.phase == super::Phase::Open {
+                return Ok(());
+            }
+            if state.link_service_ready() {
+                // The previous service attempt lost ownership or saw a reader
+                // which has since quiesced. Its notification may already have
+                // happened; service the now-ready work instead of missing it.
+                drop(state);
+                continue;
+            }
+            drop(self.process.recover(self.process.changed.wait(state)));
+        }
+    }
+
+    fn refresh_publication(&mut self) -> Result<(), Error> {
+        let candidate = self.candidate.unwrap();
+        candidate.check()?;
+        let unit = self.unit.as_ref().unwrap();
+        self.process.grow_units(
+            unit.tier,
+            unit.dependencies.len(),
+            self.static_sites.as_ref().unwrap().len(),
+            unit.instructions.len(),
+        )?;
+        self.process.reserve_publication_links(
+            unit.tier,
+            self.static_sites.as_ref().unwrap().len(),
+            &unit.entries,
+        )?;
+        let previous = {
+            let state = self.process.lock();
+            candidate.validate_locked(&state)?;
+            let segment = unit.code.allocation.segment;
+            if state.units.decommitting[segment] {
+                return Err(Error::StaleUnit);
+            }
+            state.units.tables[segment].clone()
+        };
+        let table = self.process.unit_table(unit, &previous)?;
+        self.previous_table = previous;
+        self.table = Some(table);
+        Ok(())
+    }
+
+    fn publish_once(&mut self) -> Result<UnitHandle, Error> {
         let process = self.process;
+        let replacement = self
+            .family
+            .as_ref()
+            .map(|family| (family.id, family.version));
         let mut state = process.lock();
-        for publication in self.publications.iter() {
-            state.validate(publication)?;
+        if let Some(candidate) = self.candidate {
+            candidate.validate_locked(&state)?;
+            state.open()?;
+            for publication in self.publications.iter() {
+                state.validate_entry(publication)?;
+            }
+        } else {
+            for publication in self.publications.iter() {
+                state.validate(publication)?;
+            }
         }
         let unit = Arc::clone(self.unit.as_ref().unwrap());
         let tier = unit.tier;
@@ -1338,7 +1505,11 @@ impl PreparedUnit<'_> {
             return Err(error);
         }
         let segment = unit.code.allocation.segment;
-        if self.cursor.load(Ordering::Acquire) != unit.cursor.get()
+        // Candidate inputs are exact, strongly retained LCQ units whose
+        // lifecycle is invalidated under this mutex BEFORE dependency changes.
+        // Their validation above closes the memory-check/publication race;
+        // unrelated memory cursors and maintenance epochs are not provenance.
+        if (self.candidate.is_none() && self.cursor.load(Ordering::Acquire) != unit.cursor.get())
             || state.units.decommitting[segment]
             || !state.units.records.has_space()
             || (self.family.is_some() && !state.units.families.has_space())
@@ -1527,6 +1698,19 @@ impl PreparedUnit<'_> {
         // No publication can fail here. Old payload owners drop only
         // after unlocking state; the unit registry now owns all executable bytes.
         drop(state);
+        if let Some((family, version)) = replacement {
+            let seed = unit.entries[0].key;
+            log::debug!(
+                "HCQ promotion: family={} version={} address_space={} seed={:#x} instructions={} entries={} native_bytes={}",
+                family.get(),
+                version.get(),
+                seed.address_space.get(),
+                seed.pc.get(),
+                unit.instructions.len(),
+                unit.entries.len(),
+                unit.code.allocation.len(),
+            );
+        }
         Ok(UnitHandle(handle, process.identity))
     }
 }

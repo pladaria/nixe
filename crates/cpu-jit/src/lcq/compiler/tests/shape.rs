@@ -221,7 +221,9 @@ fn terminal_descriptors_keep_destinations_costs_and_safe_fallbacks() {
                     record.exit.unwrap(),
                     GuestExit {
                         pc: GuestVirtualAddress::new(PC + 4),
-                        kind
+                        kind,
+                        block_index: 0,
+                        instruction_index: 1,
                     }
                 );
                 let transfer = record.transfer.as_ref().unwrap();

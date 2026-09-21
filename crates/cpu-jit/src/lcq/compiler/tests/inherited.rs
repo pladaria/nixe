@@ -1,6 +1,6 @@
 //! Fast inputs may be newer than their canonical homes even when only read.
 use super::*;
-use crate::abi::{ValueBinding, ValueLocation};
+use crate::abi::{ExitStateMap, ValueBinding, ValueLocation};
 
 #[test]
 fn fast_inputs_survive_read_only_use_and_fp_activation() {

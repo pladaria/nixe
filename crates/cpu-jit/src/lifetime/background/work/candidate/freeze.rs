@@ -79,6 +79,75 @@ impl<'w, 'p> Candidate<'w, 'p> {
 }
 
 impl Frozen<'_, '_> {
+    /// An optimizer limit rejects only this still-current seed version. Check
+    /// every input/claim under the same lock as the persistent token update;
+    /// an obsolete compilation may cancel, but cannot reject its replacement.
+    pub(crate) fn reject(&self) -> Result<(), Error> {
+        let work = self.candidate.work;
+        let state = work.process.lock();
+        self.validate_locked(&state)?;
+        let Job::Seed(job) = &work.job else {
+            return Err(Error::InvalidUnit("initial HCQ rejection requires a seed"));
+        };
+        if !job.reservation.reject() {
+            return Err(Error::StalePublication);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lifetime(&self) -> &Lifetime {
+        self.candidate.work.process
+    }
+
+    /// Bind staged output to this exact frozen candidate. The returned owner
+    /// borrows the candidate, retaining its claims and compiler/input protection
+    /// through the final publication transaction (including error cleanup).
+    pub fn prepare<'a>(
+        &'a self,
+        input: unit::Input,
+        cursor: &'a AtomicU64,
+    ) -> Result<unit::PreparedUnit<'a>, Error> {
+        let graph = self.graph();
+        if input.tier != Tier::Hcq
+            || input.instructions.len() != graph.instructions.len()
+            || input
+                .instructions
+                .iter()
+                .zip(&graph.instructions)
+                .any(|(a, b)| a.key != b.instruction.key || a.bits != b.instruction.bits)
+            || input.entries.len() != self.entries.len()
+            || input
+                .entries
+                .iter()
+                .zip(&self.entries)
+                .any(|(entry, &index)| entry.key != graph.blocks[index].key)
+            || input.dependencies.as_ref() != self.dependencies()
+        {
+            return Err(Error::InvalidUnit(
+                "HCQ output differs from its frozen candidate",
+            ));
+        }
+        let process = self.candidate.work.process;
+        // Every exported entry is an already captured LCQ demand. Do not
+        // acquire new admission or create slots while maintenance is closed.
+        let mut publications = Vec::with_capacity(input.entries.len());
+        {
+            let state = process.lock();
+            self.validate_locked(&state)?;
+            for entry in &input.entries {
+                let slot = *state.keys.get(&entry.key).ok_or(Error::StalePublication)?;
+                publications.push(crate::lifetime::Publication {
+                    process,
+                    key: entry.key,
+                    slot,
+                    admission: state.admission,
+                    reachability: state.dispatch.get(slot).unwrap().reachability(),
+                });
+            }
+        }
+        process.prepare_candidate(&publications, input, cursor, self)
+    }
+
     pub fn analyze(&self) -> Result<crate::hcq::flow::Analysis, CompileError> {
         self.check()?;
         // No registry/cache lock or guest read spans the CFG fixed points.
@@ -121,5 +190,7 @@ fn dependency_union<'a>(
     dependencies
 }
 
+#[cfg(test)]
+mod publication_tests;
 #[cfg(test)]
 mod tests;

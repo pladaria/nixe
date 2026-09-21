@@ -56,7 +56,6 @@ fn eighth_seed_sample_enqueues_one_immutable_exact_version() {
     let mut job = queue.pop().unwrap().unwrap().seed();
     assert_eq!(job.snapshot, observed);
     assert_eq!(job.process, process.identity);
-    assert_eq!(job.admission, process.lock().admission);
     assert_eq!(
         process.snapshot(job.unit).unwrap().entries[0].key,
         observed.key
@@ -166,19 +165,25 @@ fn process_queue_removes_seven_newest_then_one_oldest_across_empty_periods() {
 }
 
 #[test]
-fn old_enqueue_and_rollback_cannot_erase_a_new_epoch_token() {
+fn maintenance_preserves_reservation_and_stale_rollback_cannot_erase_replacement() {
     let (process, queue, mut samples) = setup(1);
     let observed = snapshot(&process, 0);
     let old = process.reserve_seed(observed).unwrap().ok().unwrap();
     process.request(Reason::LinkPatch).unwrap();
     process.try_service_links().unwrap();
-    // Same LCQ version after an ordinary maintenance cycle must be admissible.
+    // Maintenance cannot steal a live token from the same input version.
+    assert_eq!(
+        process.admit_seed(&queue, &mut samples, observed).unwrap(),
+        Outcome::Duplicate
+    );
+    publish(&process, &AtomicU64::new(0), &[0], Tier::Lcq);
+    process.try_service_links().unwrap();
+    let observed = snapshot(&process, 0);
     assert_eq!(
         process.admit_seed(&queue, &mut samples, observed).unwrap(),
         Outcome::Queued
     );
     let current = queue.pop().unwrap().unwrap().seed();
-    assert_ne!(old.admission, current.admission);
     assert_ne!(
         old.reservation.word & !PHASE_MASK,
         current.reservation.word & !PHASE_MASK

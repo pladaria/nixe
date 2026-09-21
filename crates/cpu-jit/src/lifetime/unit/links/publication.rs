@@ -15,7 +15,7 @@ impl Lifetime {
         loop {
             let capacity = {
                 let state = self.lock();
-                state.open()?;
+                state.running()?;
                 // Only the affected full-key buckets are visited. Capacity is
                 // rechecked at publication if more waiting sources arrive.
                 let count = entries.iter().try_fold(outgoing, |count, entry| {
@@ -38,7 +38,7 @@ impl Lifetime {
             let bytes = spare.capacity() * size_of::<Slot<Link>>();
             let mut spare = PreparedStorage::for_tier(spare, bytes, &self.cache, tier)?;
             let mut state = self.lock();
-            state.open()?;
+            state.running()?;
             if spare.value.capacity() > state.units.links.records.capacity() {
                 state.units.links.records.grow(&mut spare.value);
                 std::mem::swap(&mut state.units.links.storage, &mut spare.charge);

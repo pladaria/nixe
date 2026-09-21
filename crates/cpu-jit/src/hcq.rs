@@ -15,6 +15,10 @@ use nixe_memory::GuestVirtualAddress;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
+mod compiler;
+mod ssa;
+pub(crate) mod worker;
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Error {
     StaleCapture,

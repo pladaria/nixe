@@ -361,7 +361,86 @@ fn invalidating_a_baseline_also_removes_a_family_using_only_its_unchanged_words(
 }
 
 #[test]
-fn stale_inflight_family_cannot_publish_or_release_the_stop_before_its_pins_drop() {
+fn family_invalidation_resolves_exact_pins_and_preserves_unrelated_families() {
+    use crate::lifetime::unit::tests::publish;
+
+    for change in [mapping(1, 20, 4), content(18)] {
+        let process = process();
+        let cursor = AtomicU64::new(0);
+        let first = publish_image(&process, &cursor, &[0, 4], 1, 17);
+        let second = publish_image(&process, &cursor, &[16, 20], 1, 18);
+        let unrelated = publish_image(&process, &cursor, &[32, 36], 1, 19);
+        let family = publish(&process, &cursor, &[0, 16], Tier::Hcq);
+        let other_family = publish(&process, &cursor, &[32], Tier::Hcq);
+
+        // Common tracking-only/data-mapping mutations must not withdraw code.
+        process.invalidate_memory(&[]).unwrap();
+        process
+            .invalidate_memory(&[mapping(1, 0x1000, 4096)])
+            .unwrap();
+        assert!(pending_units(&process).is_empty());
+        assert_eq!(drain(&process), 0);
+
+        // The changed word/page belongs to the second pinned baseline, not
+        // to the family's own image/dependencies. Repeated requests coalesce.
+        process.invalidate_memory(&[change]).unwrap();
+        process.invalidate_memory(&[change]).unwrap();
+        assert_eq!(pending_units(&process), [family, second]);
+        assert_eq!(drain(&process), 2);
+        for survivor in [first, unrelated, other_family] {
+            assert!(process.snapshot(survivor).is_ok());
+        }
+        for removed in [second, family] {
+            assert!(matches!(process.snapshot(removed), Err(Error::StaleUnit)));
+        }
+        assert_eq!(process.reclaim_units().unwrap(), 2);
+    }
+}
+
+#[test]
+fn family_invalidation_uses_current_generations_in_reused_sparse_registry() {
+    use crate::lifetime::unit::tests::publish;
+
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    // Leave vacant slots so neither CodeUnitId nor dense iteration ordinal
+    // can stand in for the registered generational handle.
+    for index in 0..32 {
+        publish_image(&process, &cursor, &[0x1000 + index * 4], 2, 100 + index);
+    }
+    process
+        .invalidate_memory(&[mapping(2, 0x1000, 4096)])
+        .unwrap();
+    assert_eq!(drain(&process), 32);
+    assert_eq!(process.reclaim_units().unwrap(), 32);
+    let capacity = process.lock().units.records.capacity();
+    let mut previous = None;
+    for _ in 0..3 {
+        let baseline = publish_image(&process, &cursor, &[0, 4], 1, 17);
+        let family = publish(&process, &cursor, &[0], Tier::Hcq);
+        if let Some((old_baseline, old_family)) = previous {
+            assert_ne!(baseline, old_baseline);
+            assert_ne!(family, old_family);
+            assert!(matches!(
+                process.snapshot(old_baseline),
+                Err(Error::StaleUnit)
+            ));
+            assert!(matches!(
+                process.snapshot(old_family),
+                Err(Error::StaleUnit)
+            ));
+        }
+        process.invalidate_memory(&[mapping(1, 4, 4)]).unwrap();
+        assert_eq!(pending_units(&process), [family, baseline]);
+        assert_eq!(drain(&process), 2);
+        assert_eq!(process.reclaim_units().unwrap(), 2);
+        assert_eq!(process.lock().units.records.capacity(), capacity);
+        previous = Some((baseline, family));
+    }
+}
+
+#[test]
+fn stale_inflight_family_retains_storage_without_blocking_memory_invalidation() {
     let process = process();
     let cursor = AtomicU64::new(0);
     publish_image(&process, &cursor, &[0, 4], 1, 7);
@@ -375,16 +454,12 @@ fn stale_inflight_family_cannot_publish_or_release_the_stop_before_its_pins_drop
     process.invalidate_memory(&[mapping(1, 4, 4)]).unwrap();
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();
-    assert_eq!(transition.drain_retirements(), Err(Error::PinnedBaseline));
-    assert_eq!(
-        transition.batch().unwrap().complete(),
-        Err(Error::MaintenancePending)
-    );
-    assert!(!transition.try_reopen().unwrap());
-    assert!(matches!(prepared.publish(), Err(Error::Closed)));
     assert_eq!(transition.drain_retirements().unwrap(), 1);
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
+    assert_eq!(process.reclaim_units().unwrap(), 0);
+    assert!(matches!(prepared.publish(), Err(Error::StalePublication)));
+    assert_eq!(process.reclaim_units().unwrap(), 1);
 }
 
 #[test]

@@ -7,7 +7,7 @@ use crate::hcq::{
 const NOP: u32 = 0xd503201f;
 const RET: u32 = 0xd65f03c0;
 
-pub(super) fn graph(inputs: &[(u64, &[u32])]) -> Graph {
+pub(in crate::hcq) fn graph(inputs: &[(u64, &[u32])]) -> Graph {
     let mut builder = Builder::new(key(inputs[0].0));
     for &(pc, bits) in inputs {
         builder.merge(key(pc), &words(pc, bits)).unwrap();
@@ -21,7 +21,7 @@ pub(super) fn graph(inputs: &[(u64, &[u32])]) -> Graph {
     }
 }
 
-pub(super) fn block(graph: &Graph, pc: u64) -> usize {
+pub(in crate::hcq) fn block(graph: &Graph, pc: u64) -> usize {
     graph
         .blocks
         .iter()
@@ -107,9 +107,10 @@ fn hcq_liveness_flags_and_fp_status_are_observable_not_discarded_register_result
     let fp = point(&graph, &analysis, 8);
     assert!(fp.live_before.fpcr && fp.live_before.fpsr);
     assert!(fp.live_after.fpsr);
-    let graph = self::graph(&[(0, &[0xd51b4400])]); // MSR FPCR,X0; POST boundary
+    let graph = self::graph(&[(0, &[0xd51b4400])]); // MSR FPCR,X0 completes after PRE exit
     let analysis = Analysis::build(&graph, &[0]);
-    assert!(!analysis.blocks[0].live_in.fpcr);
+    assert!(analysis.blocks[0].live_in.fpcr);
+    assert!(!analysis.native.instructions[0].dirty_after.fpcr);
     assert!(analysis.instructions[0].live_after.fpcr);
 }
 

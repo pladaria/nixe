@@ -431,6 +431,8 @@ fn static_source_index_keeps_each_exit_and_island_across_index_growth() {
             state,
             exit: Some(GuestExit {
                 pc: key(0).pc,
+                block_index: 0,
+                instruction_index: 0,
                 kind: if index == 0 {
                     EdgeKind::Breakpoint(0)
                 } else {
@@ -657,6 +659,8 @@ pub(in crate::lifetime) fn source_input(process: &Lifetime, pc: u64, target: u64
     input.states[0].exit = Some(GuestExit {
         pc: key(pc).pc,
         kind: EdgeKind::Static,
+        block_index: 0,
+        instruction_index: 0,
     });
     input.states[0].transfer = Some(Box::new(TerminalTransfer {
         destination: ValueLocation::Constant(u128::from(target)),

@@ -14,9 +14,8 @@ pub trait ExecutableMemory: InstructionMemory {
     /// only classifies the copied word; it must not call memory or retain state
     /// across calls (tracking or device reconciliation may restart capture). No word after
     /// the first stop is fetched. A fetch fault retains the preceding prefix.
-    /// Arming dirty tracking can stop a bound engine and cancel prior compiler
-    /// admission. Acquire the publication identity after capture and revalidate
-    /// the owned image against it; never renew already-emitted native output.
+    /// Arming dirty tracking can stop a bound engine. Publication must validate
+    /// the captured dependencies through that engine's mutation coordinator.
     fn capture_instructions(
         &self,
         space: AddressSpaceId,
@@ -26,7 +25,10 @@ pub trait ExecutableMemory: InstructionMemory {
     ) -> InstructionImage;
 
     /// Cold revalidation, not a substitute for coordinating mutations with
-    /// publication. False also covers a different memory owner or cursor.
+    /// publication. Checks the memory owner and exact captured mappings/content
+    /// stamps; an unrelated invalidation elsewhere does not stale this image.
+    /// Translators without pinned, coordinator-validated input units must also
+    /// guard the check-to-publication race with the captured invalidation cursor.
     fn image_is_current(&self, image: &InstructionImage) -> bool;
 }
 

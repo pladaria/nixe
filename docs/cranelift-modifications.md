@@ -148,7 +148,7 @@ metadata is protected from subsequent branch truncation that could invalidate
 its recorded position.
 
 The local fork also supports `Function::nixe_exit_costs` (`nixe_poll` in printed
-CLIF). An opted-in terminal subtracts 1–2048 instructions from r14/x20 and takes
+CLIF). An opted-in terminal subtracts 0–2048 instructions from r14/x20 and takes
 the deadline path when the signed balance is nonpositive. The normal path is
 one subtraction, one normally-not-taken conditional branch and the aligned
 hot patch. `StateMap::poll` exports the second patch and charged cost;
@@ -160,6 +160,37 @@ cold path to its native control/budget leaf, which can rearm and resume that hot
 patch without a host call. Pending requests or slice exhaustion leave through
 canonical adapters. Production static links, indirect PIC hits and matched
 guest returns now use these checkpoints and remain native across units.
+
+Checkpoint costs are validated before optimization. When constant-branch
+simplification makes an exit unreachable, unreachable-code elimination removes
+its cost metadata with the instruction. The final backend validation still
+rejects invalid costs and references. Nixe stages only surviving IR boundaries;
+a surviving boundary without its machine map remains an error.
+
+Fault-span delimiters also act as compiler-only memory barriers in alias
+analysis. Distinct guest accesses cannot be load-CSE'd, store-forwarded or
+dead-store-eliminated across them: each retains its own observation and precise
+fault state. The delimiters still emit zero bytes, not host fences; ordinary
+memory optimizations outside them remain enabled.
+
+HCQ also uses `nixe_charge` to subtract 1–2048 completed instructions from the
+same reserved counter without checking the deadline. It emits one flag-preserving
+instruction (`LEA` on x86-64, `SUB` on AArch64), with no memory access, state map,
+call or branch. Side-effect ordering prevents elimination or speculative motion;
+validation forbids use outside the Nixe ABI or inside an active fault span.
+This lets ordinary region edges remain SSA branches. A zero-cost terminal checks
+already-charged work without charging it again; calls/returns and PRE exits can
+still own an uncharged source-local prefix.
+
+`nixe_check` supplies a nonterminating internal check: a positive counter skips
+one aligned cold patch and continues in the same SSA block. It charges no work,
+exports the cold patch's allocated state, and resumes immediately after that
+patch, including subsequent allocator edits. HCQ emits it only on the shared
+flow analysis's cycle-cutting edges. The cold path reuses native control/budget
+and sample handling; its callback preserves all volatile registers, including
+optimizer temporaries absent from guest maps. No hot-path canonical writeback,
+call, public ingress or link bridge is introduced. Production seed promotion
+and source-aware runtime observation are connected in Task 6.
 
 Added `enable_nixe_ibt` for x86-64 `ENDBR64` landings and integrated selected
 entries with the existing AArch64 BTI machinery. Entry offsets point to the
@@ -298,9 +329,9 @@ management are tracked in [Task 2](specs/tiered-jit/task-02-plan.md), frontend
 cutover in [Task 3](specs/tiered-jit/task-03-plan.md), and production native
 chaining/retirement in [Task 4](specs/tiered-jit/task-04-plan.md). Functional
 cold-path sampling is active; [Task 5](specs/tiered-jit/task-05-plan.md) also
-provides bounded admission and worker ownership, tested without a placeholder
-compiler. Production admission and worker startup wait for real HCQ compilation
-in Task 6; reshape activation follows in Task 7. Emitted landing checks and
+provides bounded admission and worker ownership. Task 6 connects production seed
+admission and the real HCQ worker consumer; reshape activation follows in Task 7.
+Emitted landing checks and
 QEMU tests do not establish native BTI/CET enforcement.
 
 [abi-commit]: https://github.com/pladaria/wasmtime/commit/2f8ccabacf
