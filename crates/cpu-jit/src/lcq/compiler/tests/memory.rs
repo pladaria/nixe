@@ -509,6 +509,49 @@ fn escaped_lcq_faults_reconstruct_the_architectural_prefix() {
 }
 
 #[test]
+fn constant_maps_reconstruct_integer_vector_and_lazy_flags_at_faults() {
+    // MOVZ X5,#42; MOVI V0.16B,#0xff; SUBS X6,X5,#1.
+    let prefix = [0xd280_0545, 0x4f07_e7e0, 0xf100_04a6];
+    for word in [0xf840_8420, 0x3cc1_0420] {
+        // LDR X0/Q0,[X1],#8/#16
+        check_escape(&prefix, word, 0x3000, 0, 0);
+        let mut words = prefix.to_vec();
+        words.extend([word, 0xd420_0000]);
+        let memory = super::memory(&words);
+        let fragment = Fragment::capture(&memory, key()).unwrap();
+        for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+            let lowered = Compiler::for_arena(abi, ARENA)
+                .unwrap()
+                .lower(&fragment, CodeVersion::new(1).unwrap())
+                .unwrap();
+            let state = &lowered.states[lowered.faults[0].state_map as usize].state;
+            for (guest, value) in [
+                (GuestValue::General(5), 42),
+                (GuestValue::Vector(0), u128::MAX),
+            ] {
+                assert_eq!(
+                    state
+                        .bindings
+                        .iter()
+                        .find(|b| b.value == guest)
+                        .unwrap()
+                        .location,
+                    crate::abi::ValueLocation::constant(value),
+                    "{abi:?} {guest:?}"
+                );
+            }
+            assert!(
+                lowered
+                    .entry
+                    .bindings
+                    .iter()
+                    .all(|b| !matches!(b.location, crate::abi::ValueLocation::Constant(_)))
+            );
+        }
+    }
+}
+
+#[test]
 fn contiguous_structure_faults_reconstruct_grouped_pre_state_and_partial_vectors() {
     for full in [false, true] {
         for size in 0..4 {
@@ -1398,6 +1441,7 @@ fn pair_fault_maps_retain_uncommitted_reads_and_completed_store_stages() {
                                     bytes: fault.bytes,
                                 },
                                 Location::Unused => panic!("first read lost at second access"),
+                                Location::Constant(_) => panic!("a memory read is not a literal"),
                             };
                             assert_eq!(location, expected);
                         }

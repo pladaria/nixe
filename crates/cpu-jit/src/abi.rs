@@ -778,13 +778,6 @@ pub enum ValueLocation {
         offset: u32,
         bytes: u8,
     },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "approved pending constant-map integration; see Task 9 plan"
-        )
-    )]
     Constant(ConstantBits),
 }
 /// Keep the full vector constant without imposing u128 alignment on every
@@ -797,7 +790,6 @@ impl ConstantBits {
     }
 }
 impl ValueLocation {
-    #[cfg(test)]
     pub const fn constant(value: u128) -> Self {
         Self::Constant(ConstantBits([value as u64, (value >> 64) as u64]))
     }
@@ -1059,13 +1051,6 @@ pub enum NzcvLocation {
     Canonical,
     Packed(ValueLocation),
     /// Host condition flags; bridges/poll arithmetic must preserve the live bits.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "approved pending host-NZCV integration; see Task 9 plan"
-        )
-    )]
     Host {
         carry_inverted: bool,
     },

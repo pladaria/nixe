@@ -23,8 +23,10 @@ Its additional changes, including the terminal checkpoints below, are not in
 that Git pin. Do not remove the override until the maintainer publishes and
 pins the updated fork.
 
-Task 9 development uses local HEAD `0380097992d7d337bdf66873510a8c42a8923c0b`
-on branch `nixe`; the checkout is clean as inspected on 2026-09-24. This includes
+Task 9 used local HEAD `0380097992d7d337bdf66873510a8c42a8923c0b`
+on branch `nixe`. ABI integration steps 1 and 3 add uncommitted literal-boundary
+support and explicit subtraction-flag terminals on top of that revision
+(2026-09-24). The committed revision includes
 the observable-FP changes and budget checkpoints/precise memory boundaries.
 It is the locally tested revision, not Nixe's portable dependency pin; this
 check does not establish that it is available on the remote.
@@ -132,9 +134,16 @@ Implementation: `cranelift/codegen/src/nixe.rs`,
 Added the CLIF operations `nixe_entry`, `nixe_state` and `nixe_exit`, with
 lowering for both targets. Entry results define simultaneous physical inputs;
 state and exit operands remain live through allocation. Final `StateMap`
-records retain operand order, types, physical registers or NativeFrame spill
-offsets, and exact native positions, independently of debug information.
+records retain operand order, types, physical registers, NativeFrame spill
+offsets or exact literal bits, and exact native positions, independently of
+debug information. Literal iconst/f32const/f64const/vconst operands are carried
+without a register use through allocation into `Location::Constant([low, high])`.
+Vector constants retain all 128 bits; FP literals preserve NaN payloads and
+signed zero. Other operands still report their final physical allocation.
+This is backend emission, not a frontend guess about rematerialized registers.
 Eliminated entry inputs are explicitly reported as `Location::Unused`.
+Entry definitions never report constant locations. Constants also survive the
+precise fault/exit/poll maps without runtime metadata lookup on linked edges.
 
 Entry constraints allow allocation to choose a location (`Any`) or require a
 specific register. Allocation-chosen spills are supported; forced spills and
@@ -174,6 +183,19 @@ cold path to its native control/budget leaf, which can rearm and resume that hot
 patch without a host call. Pending requests or slice exhaustion leave through
 canonical adapters. Production static links, indirect PIC hits and matched
 guest returns now use these checkpoints and remain native across units.
+
+`Function::nixe_exit_compares` opts a terminal into CMP from two I32/I64 boundary
+arguments constrained to physical registers. CMP is fused with the exit after
+the poll decision on each path: `StateMap::subtract_flags` is an explicit final
+proof, not ambient flag inference. x86 CF is borrow; Arm C is not-borrow.
+The cold patch is then two patch widths after the hot patch, because it has its
+own CMP and alignment; consumers use `poll.offset`. Nixe emits Host NZCV for
+subtraction terminals and preserves it through cold polling and callbacks.
+That preservation retains raw native flags; guest NZCV packing is reserved for
+architectural consumers, not repeated around each cold operation.
+Entry/marker/fault maps do not acquire this flag proof. Dead-code elimination
+removes comparison metadata along with costs; invalid inputs fail before
+optimization. This requires the local override, like the constant-map changes.
 
 Checkpoint costs are validated before optimization. When constant-branch
 simplification makes an exit unreachable, unreachable-code elimination removes

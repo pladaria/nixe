@@ -461,12 +461,20 @@ to resolved native links. Lazy-flags recipes remain inline.
 
 ## Native fast-chain ABI
 
-Implementation status: LCQ/HCQ currently emit register/spill locations, dynamic
-FP-mode keys and canonical/packed/deferred NZCV recipes; software FPSR is not a mapped SSA
-operand. Constant locations, exact-FPCR specialization, host-NZCV boundaries and
-FPSR SSA contracts are retained by explicit decision, with production integration
-tracked in [the ABI integration plan](abi-integration-plan.md). Their isolated
-contract tests do not demonstrate a current compiler producer.
+Implementation status: LCQ/HCQ emit register/spill and exact literal-constant
+locations, dynamic FP-mode keys, canonical/packed/deferred NZCV recipes and
+explicit host subtraction flags at terminal patches;
+software FPSR is not a mapped SSA operand. The backend preserves literal bits
+through allocation into final use/fault maps without allocating those operands;
+entry definitions remain physical inputs or explicitly unused, never constants.
+Terminal host flags are produced by a fused backend comparison after the poll
+decision, not inferred from preceding instructions. Cold polls and callbacks
+preserve their native representation without packing guest NZCV and reinstalling
+it at each cold boundary. Packing occurs at architectural consumers. Entry and
+fault contracts still use packed/deferred/canonical NZCV. The completed terminal
+flag integration, pending exact-FPCR specialization and deferred FPSR SSA are tracked in
+[the ABI integration plan](abi-integration-plan.md). Their isolated contract
+tests alone do not demonstrate production integration of the remaining cases.
 
 The x86-64 ABI requires LAHF/SAHF in 64-bit mode, as documented in
 [host requirements](../../host-requirements.md). Check CPUID support during JIT

@@ -207,6 +207,7 @@ struct Observation {
     map: u32,
     destination: u64,
     fail: bool,
+    aborted_status: u32,
 }
 
 unsafe extern "C" fn observe(
@@ -264,6 +265,7 @@ unsafe extern "C" fn observe(
         );
     }
     if observation.fail {
+        observation.aborted_status = pause.abort();
         return 0;
     }
     unsafe {
@@ -338,5 +340,83 @@ fn hcq_internal_sample_callback_preserves_live_ssa_fp_and_precise_failure_state(
         assert_eq!(observation.destination, 0);
         assert!(observation.source >= owner.code.allocation.address());
         assert!(observation.source < owner.code.allocation.address() + owner.code.allocation.len());
+    }
+}
+
+#[test]
+fn hcq_terminal_host_flags_survive_sampling_success_and_failure() {
+    let _restore = crate::fp_env::tests::RestoreHost::new();
+    let words = [0xeb01_001f, 0x1400_003f]; // CMP X0,X1; B 0x100
+    let graph = graph(&[(0, &words)]);
+    let (process, owner) = published(&graph, &[0], host());
+    assert!(
+        owner
+            .states
+            .iter()
+            .any(|s| matches!(s.state.nzcv, crate::abi::NzcvLocation::Host { .. }))
+    );
+    let entry = owner.entries[0].key;
+    let mut reader = process.register().unwrap();
+    for fail in [false, true] {
+        for active_fp in [false, true] {
+            for (lhs, rhs) in [(0, 0), (0, 1), (1 << 63, 1), (i64::MAX as u64, u64::MAX)] {
+                let mut observation = Observation {
+                    fail,
+                    ..Default::default()
+                };
+                let mut actual = A64State::default();
+                actual.general_register_storage_mut()[0] = lhs;
+                actual.general_register_storage_mut()[1] = rhs;
+                actual.set_fpsr(1 << 27);
+                let mut expected = actual.clone();
+                for word in words {
+                    nixe_cpu_interpreter::execute_one(&entry.platform, &mut expected, word)
+                        .unwrap();
+                }
+                if active_fp {
+                    expected.set_fpsr(expected.fpsr() | 2);
+                }
+                {
+                    let mut frame = NativeFrame::new(&mut actual, PollBudget::new(1, 100).unwrap());
+                    let mut invocation =
+                        unsafe { reader.admit(&mut frame, entry) }.unwrap().unwrap();
+                    let address = invocation.payload().preferred().unwrap().canonical.get();
+                    let frame = invocation.frame();
+                    frame.dispatch_context = (&mut observation as *mut Observation).cast();
+                    frame.sample_observer = Some(observe);
+                    let result = unsafe {
+                        if active_fp {
+                            frame.ensure_fp().unwrap();
+                            crate::fp_env::tests::divide_by_zero();
+                        }
+                        crate::native::enter_protected(
+                            frame,
+                            std::ptr::null_mut(),
+                            address as *const u8,
+                        )
+                    }
+                    .unwrap();
+                    assert_eq!(
+                        result.reason,
+                        if fail {
+                            NativeExitReason::Control
+                        } else {
+                            NativeExitReason::Dispatch
+                        }
+                    );
+                    assert_eq!(frame.budget.slice_remaining, 98);
+                    assert_eq!(frame.host_fp.active, 0);
+                    assert_eq!(frame.host_fp.saved, 0);
+                }
+                assert_eq!(observation.calls, 1);
+                // Match invocation::execute: failed observers retain pending
+                // host status until the native adapter has written back state.
+                actual.set_fpsr(actual.fpsr() | observation.aborted_status);
+                assert_eq!(
+                    actual, expected,
+                    "fail={fail}, FP={active_fp}, {lhs:x}-{rhs:x}"
+                );
+            }
+        }
     }
 }

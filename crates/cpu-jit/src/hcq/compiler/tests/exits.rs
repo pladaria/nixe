@@ -1,6 +1,50 @@
 use super::*;
-use crate::abi::ExitSiteKey;
+use crate::abi::{ExitSiteKey, NzcvLocation};
 use crate::frontend::exit;
+
+#[test]
+fn subtraction_terminals_export_host_flags_without_a_result_recipe() {
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        for cmp in [0x6b01_001f, 0xeb01_001f] {
+            let graph = graph(&[(0, &[cmp, 0x1400_0010])]);
+            let (context, body) = emitted(&graph, &[0], abi);
+            let code = context.compiled_code().unwrap();
+            assert_eq!(body.exits.len(), 1);
+            let map = code
+                .buffer
+                .nixe_states
+                .iter()
+                .find(|map| map.id == 1 && !map.entry)
+                .unwrap();
+            assert!(map.subtract_flags);
+            assert!(body.exits[0].state.flags.is_none());
+            let allocated = crate::native::AllocatedBoundary::new(abi, code, map).unwrap();
+            let state = body.exits[0]
+                .state
+                .allocate(abi, CodeVersion::new(1).unwrap(), 0, &allocated)
+                .unwrap();
+            assert_eq!(
+                state.nzcv,
+                NzcvLocation::Host {
+                    carry_inverted: abi == HostAbi::X86_64
+                }
+            );
+            assert!(
+                code.buffer
+                    .nixe_states
+                    .iter()
+                    .filter(|map| map.entry)
+                    .all(|map| !map.subtract_flags)
+            );
+            assert!(
+                code.buffer
+                    .nixe_faults
+                    .iter()
+                    .all(|map| !map.subtract_flags)
+            );
+        }
+    }
+}
 
 // One entry, one finite path: ADDS; B 64; terminal. Three instructions really
 // execute, despite the noncontiguous PCs. The root is charged in the body;

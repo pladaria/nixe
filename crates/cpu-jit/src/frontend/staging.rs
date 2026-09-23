@@ -38,6 +38,7 @@ pub(crate) fn jump(bytes: &mut Vec<u8>, abi: HostAbi, target: u32) -> Result<(),
         patch_bytes: if abi == HostAbi::X86_64 { 8 } else { 4 },
         fault_bytes: 0,
         poll: None,
+        subtract_flags: false,
         values: Vec::new(),
     }
     .patch_exit(bytes, 0, u64::from(target))

@@ -690,6 +690,7 @@ fn validation_releases_backend_storage_and_only_its_exact_charge() {
         patch_bytes: 0,
         fault_bytes: 0,
         poll: None,
+        subtract_flags: false,
         values: vec![
             LocatedValue {
                 ty: cranelift_codegen::ir::types::I64,

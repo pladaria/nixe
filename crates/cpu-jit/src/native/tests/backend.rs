@@ -373,6 +373,7 @@ fn branch(abi: HostAbi, bytes: &mut [u8], from: usize, to: usize) {
         patch_bytes: if abi == HostAbi::X86_64 { 8 } else { 4 },
         fault_bytes: 0,
         poll: None,
+        subtract_flags: false,
         values: vec![],
     }
     .patch_exit(bytes, 0, to as u64)
@@ -909,5 +910,7 @@ fn backend_mapping_rejects_missing_mistyped_reserved_and_out_of_extent_operands(
         bad.values[0].location = Location::Unused;
         let unused = AllocatedBoundary::new(abi, &code, &bad).unwrap();
         assert!(unused.location(0, types::I64).is_err());
+        bad.values[0].location = Location::Constant([42, 0]);
+        assert!(AllocatedBoundary::new(abi, &code, &bad).is_err());
     }
 }

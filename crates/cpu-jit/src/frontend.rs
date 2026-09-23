@@ -88,6 +88,7 @@ pub(crate) struct PendingState {
     pub(crate) dirty: StateSet,
     pub(crate) operands: Vec<(GuestValue, usize)>,
     pub(crate) flags: Option<LazyFlags<usize>>,
+    host_compare: bool,
     pub(crate) types: Vec<ir::Type>,
 }
 
@@ -116,7 +117,14 @@ impl PendingState {
         index: u32,
         allocated: &AllocatedBoundary<'_>,
     ) -> Result<ExitStateMap, Error> {
-        let nzcv = if let Some(recipe) = &self.flags {
+        if allocated.map.subtract_flags != self.host_compare {
+            return Err(Error::internal("backend terminal flag proof mismatch"));
+        }
+        let nzcv = if allocated.map.subtract_flags {
+            NzcvLocation::Host {
+                carry_inverted: abi == HostAbi::X86_64,
+            }
+        } else if let Some(recipe) = &self.flags {
             NzcvLocation::Deferred(
                 recipe
                     .try_map(&mut |index| allocated.location(*index, self.types[*index]))
@@ -344,6 +352,31 @@ impl Translator<'_> {
             ExitTarget::Dynamic(value) => (value, None),
         };
         let (mut state, mut values) = self.snapshot(flags)?;
+        // The fused terminal recreates subtraction flags after allocator edits
+        // and poll arithmetic. Faults and other observations retain recipes.
+        // Do not carry a flags-only result across the boundary: CMP needs only
+        // the two original operands; a guest destination has its own binding.
+        if let Some(LazyFlags::Subtract {
+            lhs,
+            rhs,
+            result,
+            width,
+        }) = state.flags.as_ref()
+            && matches!(width, 32 | 64)
+        {
+            debug_assert_eq!(*result, values.len() - 1);
+            self.builder.func.nixe_exit_compares.insert(
+                (self.exits.len() + 1) as u64,
+                cranelift_codegen::nixe::ExitCompare {
+                    lhs: *lhs,
+                    rhs: *rhs,
+                },
+            );
+            values.pop();
+            state.types.pop();
+            state.flags = None;
+            state.host_compare = true;
+        }
         let pc_operand = values.len();
         values.push(target);
         state.types.push(types::I64);
@@ -424,6 +457,7 @@ impl Translator<'_> {
                 dirty,
                 operands,
                 flags: recipe,
+                host_compare: false,
                 types,
             },
             values,

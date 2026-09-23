@@ -69,6 +69,35 @@ fn native_abi() -> HostAbi {
     }
 }
 
+#[test]
+fn subtraction_terminal_host_flags_match_guest_width_and_carry() {
+    for word in [0x6b01_001f, 0xeb01_001f] {
+        // CMP W0,W1 / CMP X0,X1
+        let words = [word, 0xd420_0000];
+        for (lhs, rhs) in [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (u64::MAX, 1),
+            (0x8000_0000, 1),
+            (0x7fff_ffff, u64::MAX),
+            (1 << 63, 1),
+            (i64::MAX as u64, u64::MAX),
+            (0xffff_ffff_0000_0000, 0),
+        ] {
+            let mut actual = integer::initial_state();
+            actual.general_register_storage_mut()[0] = lhs;
+            actual.general_register_storage_mut()[1] = rhs;
+            let mut expected = actual.clone();
+            nixe_cpu_interpreter::execute_one(&TargetPlatform::Switch1, &mut expected, word)
+                .unwrap();
+            let (reason, _) = execute(&words, &mut actual);
+            assert_eq!(reason, NativeExitReason::Architectural);
+            assert_eq!(actual, expected, "{word:08x}: {lhs:x} - {rhs:x}");
+        }
+    }
+}
+
 fn execute(words: &[u32], state: &mut A64State) -> (NativeExitReason, GuestExit) {
     let memory = memory(words);
     execute_memory(&memory, words.len(), state)
@@ -598,7 +627,12 @@ fn mixed_vector_spills_preserve_lazy_flags_and_partial_register_writes() {
             .lower(&fragment, CodeVersion::new(1).unwrap())
             .unwrap();
         let exit = &lowered.states[0].state;
-        assert!(matches!(exit.nzcv, NzcvLocation::Deferred(_)));
+        assert_eq!(
+            exit.nzcv,
+            NzcvLocation::Host {
+                carry_inverted: abi == HostAbi::X86_64,
+            }
+        );
         assert!(exit.dirty_live.vector == StateSet::ALL.vector);
         assert!(
             abi == HostAbi::Aarch64

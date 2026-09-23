@@ -115,6 +115,7 @@ pub(super) fn input_with_islands(
                         patch_bytes: 0,
                         fault_bytes: (end - 12) as u8,
                         poll: None,
+                        subtract_flags: false,
                         values: vec![],
                     }]),
                     traps: Box::new([]),

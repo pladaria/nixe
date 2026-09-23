@@ -1,7 +1,19 @@
 # Host requirements
 
-These are required CPU capabilities, not a guarantee of title compatibility or
-performance. RAM, GPU and operating-system requirements are not specified here.
+These are required host capabilities, not a guarantee of title compatibility or
+performance. RAM and GPU requirements are not specified here.
+
+## Linux memory pages
+
+The current tiered JIT requires **4 KiB host pages** (`getconf PAGESIZE` must
+return `4096`). Its LinuxDirect memory backend maps and protects individual
+4 KiB guest pages through host mappings. Hosts with 16 KiB or 64 KiB pages are
+rejected; there is no automatic checked-memory fallback for the JIT.
+
+On Raspberry Pi 5, select an installed 4 KiB kernel such as `kernel8.img`
+instead of the default 16 KiB `kernel_2712.img`, and verify the page size after
+reboot. This is a host setup option, not support for larger host pages. The
+separate [16 KiB portability follow-up](specs/tiered-jit/next.md) remains open.
 
 ## x86-64
 
@@ -9,10 +21,12 @@ Nixe requires **LAHF/SAHF support in 64-bit mode**, advertised by
 `CPUID.80000001H:ECX[0]` (`LAHF_SAHF_64`). This is an explicit CPU requirement,
 not a requirement for the entire x86-64-v2 or AVX feature sets.
 
-The tiered JIT uses SAHF when a fragment expects guest NZCV in host condition
-flags. It installs sign, zero and carry without using the host stack; overflow
-is established separately because SAHF leaves it unchanged. Matching native
-contracts need no conversion. See the [Intel instruction reference](https://cdrdv2-public.intel.com/782151/253667-sdm-vol-2b.pdf).
+The tiered JIT uses LAHF/SETO to capture live native subtraction flags and
+ADD/SAHF to restore them across cold polls and callbacks, without using the
+host stack. SAHF installs sign, zero and carry; overflow is established
+separately because SAHF leaves it unchanged. Conversions to guest NZCV happen
+at architectural consumers, not at every preservation boundary. See the
+[Intel instruction reference](https://cdrdv2-public.intel.com/782151/253667-sdm-vol-2b.pdf).
 
 The JIT checks support when creating a process, before compiling or executing
 code. An incompatible host fails initialization with a clear error; there is

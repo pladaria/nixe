@@ -21,8 +21,8 @@ const _: () = {
 /// A borrowed final entry, observation, exit or instruction-attached fault map.
 /// The lowering retains the semantic meaning of its ordered operands and uses
 /// `bindings` / `location` to build the shared contracts and lazy recipes.
-/// Backend maps describe SSA values, not persistent host condition flags;
-/// never infer `NzcvLocation::Host` from a preceding machine instruction.
+/// Only an explicit terminal flag proof permits `NzcvLocation::Host`; never
+/// infer it from a preceding machine instruction or an ordinary SSA map.
 /// Native execution never walks this object. Code ownership and publication
 /// remain the caller's responsibility; offsets are relative to `code[0]`.
 pub struct AllocatedBoundary<'a> {
@@ -62,10 +62,15 @@ impl<'a> AllocatedBoundary<'a> {
                 || map.fault_bytes != 0
                 || map.patch_bytes != patch_bytes
                 || poll.completed > 2048
-                || u64::from(poll.offset) != u64::from(map.offset) + u64::from(patch_bytes)
+                || u64::from(poll.offset)
+                    != u64::from(map.offset)
+                        + u64::from(patch_bytes) * if map.subtract_flags { 2 } else { 1 }
                 || u64::from(poll.offset) + u64::from(patch_bytes) > code.code_buffer().len() as u64
         }) {
             return Err(fail("invalid backend poll checkpoint"));
+        }
+        if map.subtract_flags && (map.entry || map.fault_bytes != 0 || map.patch_bytes == 0) {
+            return Err(fail("host flag proof requires a terminal patch"));
         }
         let result = Self {
             map,
@@ -73,6 +78,9 @@ impl<'a> AllocatedBoundary<'a> {
             frame_extent,
         };
         for (index, value) in map.values.iter().enumerate() {
+            if map.entry && matches!(value.location, Location::Constant(_)) {
+                return Err(fail("entry definition cannot have a constant location"));
+            }
             if map.entry && value.location == Location::Unused {
                 continue;
             }
@@ -104,6 +112,9 @@ impl<'a> AllocatedBoundary<'a> {
             return Err(fail("unsupported boundary operand type"));
         }
         let location = match value.location {
+            Location::Constant([low, high]) => {
+                ValueLocation::constant(u128::from(low) | (u128::from(high) << 64))
+            }
             Location::Unused => return Err(fail("required entry operand was eliminated")),
             Location::Register {
                 index,
