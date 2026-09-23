@@ -21,6 +21,7 @@ use nixe_cpu::{
     state::a64::A64State,
 };
 use nixe_cpu_direct_memory::WorkerFaultContext;
+use nixe_memory::MemoryInvalidationCursor;
 use nixe_memory::{
     AddressSpaceId, DirectBackendPolicy, GuestPhysicalPageId, MemoryInvalidation,
     MemoryInvalidationError,

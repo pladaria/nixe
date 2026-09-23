@@ -1,5 +1,5 @@
-//! Minimal common-body value contracts. Full architectural observations stay
-//! in flow::Analysis; only potentially stale homes need SSA values in maps.
+//! Minimal common-body value contracts. Architectural effects define observation
+//! obligations; only potentially stale homes need SSA values in maps.
 
 use super::*;
 use std::collections::VecDeque;

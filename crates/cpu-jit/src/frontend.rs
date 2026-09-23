@@ -15,13 +15,11 @@ use crate::abi::{
     NzcvLocation,
 };
 use crate::analysis::StateSet;
-use crate::fp_lowering::FpLowering;
 use crate::jit_error::Error;
 use crate::lifetime::unit::{EdgeKind, FaultRecord, GuestExit, StateRecord};
-use crate::lowering::IntegerLowering;
 use crate::lowering::values::{Values, register_index, register_operands, system_index};
 use crate::native::AllocatedBoundary;
-use crate::simd_lowering::{SimdLowering, is_register_simd};
+use crate::simd_lowering::is_register_simd;
 use cranelift_codegen::{
     ir::{self, AbiParam, InstBuilder, condcodes::IntCC, types},
     isa::{CallConv, TargetIsa},
@@ -165,11 +163,8 @@ pub(crate) struct Translator<'a> {
     pub(crate) faults: Vec<memory::Pending>,
 }
 
-impl<'a> IntegerLowering<'a> for Translator<'a> {
-    fn builder(&mut self) -> &mut FunctionBuilder<'a> {
-        &mut self.builder
-    }
-    fn read_register(&mut self, index: u8, sp: bool) -> Result<ir::Value, Error> {
+impl Translator<'_> {
+    pub(crate) fn read_register(&mut self, index: u8, sp: bool) -> Result<ir::Value, Error> {
         if index == 31 && !sp {
             return Ok(self.builder.ins().iconst(types::I64, 0));
         }
@@ -179,14 +174,9 @@ impl<'a> IntegerLowering<'a> for Translator<'a> {
             GuestValue::General(index)
         })
     }
-    fn write_register_with_sp(
-        &mut self,
-        index: u8,
-        sp: bool,
-        value: ir::Value,
-    ) -> Result<(), Error> {
+    pub(crate) fn write_register_with_sp(&mut self, index: u8, sp: bool, value: ir::Value) {
         if index == 31 && !sp {
-            return Ok(());
+            return;
         }
         self.values.registers[usize::from(index)] = Some(value);
         if index == 31 {
@@ -194,24 +184,15 @@ impl<'a> IntegerLowering<'a> for Translator<'a> {
         } else {
             self.dirty.integer.x.insert(usize::from(index));
         }
-        Ok(())
     }
-}
-
-impl<'a> SimdLowering<'a> for Translator<'a> {
-    fn use_clif_shuffle(&self) -> bool {
-        self.use_clif_shuffle
-    }
-    fn read_vector(&mut self, index: u8) -> Result<ir::Value, Error> {
+    pub(crate) fn read_vector(&mut self, index: u8) -> Result<ir::Value, Error> {
         self.values.get(GuestValue::Vector(index))
     }
-    fn write_vector(&mut self, index: u8, value: ir::Value) -> Result<(), Error> {
+    pub(crate) fn write_vector(&mut self, index: u8, value: ir::Value) {
         self.values.vectors[usize::from(index)] = Some(value);
         self.dirty.vector.insert(usize::from(index));
-        Ok(())
     }
 }
-impl<'a> FpLowering<'a> for Translator<'a> {}
 
 impl<'a> Translator<'a> {
     pub(crate) fn new(
@@ -474,7 +455,7 @@ impl Translator<'_> {
             ),
             control::Instruction::BranchLinkImmediate(_) => {
                 let lr = self.builder.ins().iconst(types::I64, next.get() as i64);
-                self.write_register(30, lr)?;
+                self.write_register(30, lr);
                 self.constant_exit(
                     pc,
                     target(u64::from(f.immediate_26), 26),
@@ -488,7 +469,7 @@ impl Translator<'_> {
                 let kind = match f.branch_register_key {
                     0xd63f_0000 => {
                         let lr = self.builder.ins().iconst(types::I64, next.get() as i64);
-                        self.write_register(30, lr)?;
+                        self.write_register(30, lr);
                         EdgeKind::Call
                     }
                     0xd65f_0000 => EdgeKind::Return,

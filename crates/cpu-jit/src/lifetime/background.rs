@@ -79,14 +79,18 @@ impl<Version: Copy + Eq> Owner<Version> {
     }
 
     pub(super) fn pin(&self) -> Pin {
-        Pin(Arc::clone(&self.cell))
+        Pin {
+            _cell: Arc::clone(&self.cell),
+        }
     }
 }
 
 // Unlike a strong CodeUnit/Family reference, this pin cannot destroy code,
 // baseline references or charged storage on guest-side rollback: its registry
 // owner remains in place until pinned() becomes false.
-pub(super) struct Pin(Arc<Accounted<Cell>>);
+pub(super) struct Pin {
+    _cell: Arc<Accounted<Cell>>,
+}
 
 pub(super) struct Reservation {
     cell: Arc<Accounted<Cell>>,

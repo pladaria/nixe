@@ -271,7 +271,6 @@ fn metadata_and_exact_faults_are_live_before_multi_entry_dispatch() {
         let state = process.lock();
         let owner = &state.units.records.get(handle.0).unwrap().code;
         assert_eq!((entry.unit, entry.version), (owner.id, owner.version));
-        assert_eq!(owner.abi_version, NATIVE_ABI_VERSION);
         // Publication consumed the backend proof. Runtime fault attribution
         // below must work from semantic maps without retaining a second copy.
         assert!(owner.code.proofs.is_none());
@@ -429,7 +428,11 @@ fn closing_after_preparation_rejects_every_entry_and_returns_exact_span() {
         );
     }
     drop(state);
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::MappingChange, ticket)
+            .unwrap()
+    );
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();
     transition.batch().unwrap().complete().unwrap();

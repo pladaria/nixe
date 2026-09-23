@@ -7,6 +7,7 @@ use nixe_cpu::memory::{
     MemoryOrdering, MemoryValue,
 };
 use nixe_memory::MemoryInvalidation;
+use nixe_memory::{MemoryInvalidationCursor, MemoryInvalidationError};
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 

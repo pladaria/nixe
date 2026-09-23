@@ -257,11 +257,19 @@ fn closing_waits_for_admitted_reader_even_before_its_machine_jump() {
         assert_eq!(process.lock().phase, Phase::Closing);
         assert!(process.try_transition().unwrap().is_none());
         assert_eq!(closed_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
-        assert!(!ticket.is_complete().unwrap());
+        assert!(
+            !process
+                .maintenance_complete(Reason::Eviction, ticket)
+                .unwrap()
+        );
         drop(invocation);
         closed_rx.recv().unwrap();
     });
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::Eviction, ticket)
+            .unwrap()
+    );
     assert_eq!(process.control_word().load(Ordering::Acquire), 0);
 }
 
@@ -276,15 +284,35 @@ fn requests_arriving_in_closed_survive_old_batch_acknowledgement() {
     let second = process.request(Reason::MappingChange).unwrap();
     let third = process.request(Reason::TierCutover).unwrap();
     batch.complete().unwrap();
-    assert!(first.is_complete().unwrap());
-    assert!(!second.is_complete().unwrap());
-    assert!(!third.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::MappingChange, first)
+            .unwrap()
+    );
+    assert!(
+        !process
+            .maintenance_complete(Reason::MappingChange, second)
+            .unwrap()
+    );
+    assert!(
+        !process
+            .maintenance_complete(Reason::TierCutover, third)
+            .unwrap()
+    );
     assert!(!transition.try_reopen().unwrap());
     assert_ne!(process.control_word().load(Ordering::Acquire), 0);
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
-    assert!(second.is_complete().unwrap());
-    assert!(third.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::MappingChange, second)
+            .unwrap()
+    );
+    assert!(
+        process
+            .maintenance_complete(Reason::TierCutover, third)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -296,10 +324,18 @@ fn abandoned_transition_and_batch_do_not_acknowledge_or_reopen() {
         transition.wait_closed().unwrap();
         let _batch = transition.batch().unwrap();
     }
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::MappingChange, ticket)
+            .unwrap()
+    );
     assert_eq!(process.lock().phase, Phase::Closed);
     drain(&process);
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::MappingChange, ticket)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -355,8 +391,12 @@ fn shutdown_is_terminal_and_drains_earlier_work() {
     let old = process.request(Reason::Eviction).unwrap();
     let shutdown = process.request(Reason::Shutdown).unwrap();
     drain(&process);
-    assert!(old.is_complete().unwrap());
-    assert!(shutdown.is_complete().unwrap());
+    assert!(process.maintenance_complete(Reason::Eviction, old).unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::Shutdown, shutdown)
+            .unwrap()
+    );
     assert_eq!(process.lock().phase, Phase::Closed);
     assert!(matches!(process.reserve(key(0)), Err(Error::Shutdown)));
     assert!(matches!(process.register(), Err(Error::Shutdown)));
@@ -369,39 +409,12 @@ fn shutdown_is_terminal_and_drains_earlier_work() {
 }
 
 #[test]
-fn removed_dispatch_slots_wait_for_epochs_then_reuse_actual_storage() {
-    let process = Arc::new(new_process());
-    install(&process, key(0), 1);
-    let old = process.reserve(key(0)).unwrap();
-    assert_eq!(process.retire_dispatch(old), Err(Error::OccupiedDispatch));
-    let mut reader = process.register().unwrap();
-    let mut state = A64State::default();
-    let mut frame = frame(&mut state);
-    let invocation = unsafe { reader.admit(&mut frame, key(0)) }
-        .unwrap()
-        .unwrap();
-    process.publish(old, None, None).unwrap();
-    let empty = process.reserve(key(0)).unwrap();
-    process.retire_dispatch(empty).unwrap();
-    assert_eq!(process.collect_dispatch().unwrap(), 0);
-    let new = process.reserve(key(0)).unwrap();
-    assert_ne!(old.slot, new.slot);
-    drop(invocation);
-    assert_eq!(process.collect_dispatch().unwrap(), 1);
-    let reused = process.reserve(key(4)).unwrap();
-    assert_ne!(old.slot, reused.slot);
-    assert!(process.lock().dispatch.get(old.slot).is_none());
-    assert_eq!(process.retire_dispatch(empty), Err(Error::StalePublication));
-    assert_eq!(process.collect_dispatch().unwrap(), 0);
-}
-
-#[test]
 fn readers_and_empty_dispatch_churn_reuse_bounded_slots() {
     let process = Arc::new(new_process());
     for i in 0..1000 {
         let reader = process.register().unwrap();
-        let publication = process.reserve(key(i * 4)).unwrap();
-        process.retire_dispatch(publication).unwrap();
+        process.reserve(key(i * 4)).unwrap();
+        process.recover_capacity().unwrap();
         assert!(process.try_service_links().unwrap());
         drop(reader);
     }
@@ -450,15 +463,27 @@ fn deferred_links_keep_their_ticket_and_control_request_for_the_next_stop() {
         .complete_with_links_deferred()
         .unwrap();
     assert!(first.try_reopen().unwrap());
-    assert!(!link.is_complete().unwrap());
-    assert!(safety.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::LinkPatch, link)
+            .unwrap()
+    );
+    assert!(
+        process
+            .maintenance_complete(Reason::MappingChange, safety)
+            .unwrap()
+    );
     assert_eq!(
         process.control_word().load(Ordering::Acquire),
         1 << Reason::LinkPatch as usize
     );
     // No new request is needed to service the retained LinkPatch reason.
     drain(&process);
-    assert!(link.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::LinkPatch, link)
+            .unwrap()
+    );
     assert_eq!(process.control_word().load(Ordering::Acquire), 0);
 }
 
@@ -559,7 +584,7 @@ fn counter_exhaustion_fails_closed_without_success_or_wrapping() {
     let publication = process.reserve(key(0)).unwrap();
     process.lock().executions = CheckedCounter::exhausted();
     assert!(matches!(
-        process.retire_dispatch(publication),
+        process.recover_capacity(),
         Err(Error::Exhausted(_))
     ));
     let state = process.lock();
@@ -586,33 +611,6 @@ fn reopen_epoch_exhaustion_keeps_admission_closed() {
     assert!(matches!(transition.try_reopen(), Err(Error::Exhausted(_))));
     assert_eq!(process.lock().phase, Phase::Closed);
     assert_ne!(process.control_word().load(Ordering::Acquire), 0);
-}
-
-#[test]
-fn a_newer_invocation_does_not_pin_an_already_retired_slot() {
-    let process = Arc::new(new_process());
-    install(&process, key(0), 1);
-    let mut reader = process.register().unwrap();
-    let mut cpu = A64State::default();
-    let mut frame = frame(&mut cpu);
-    let invocation = unsafe { reader.admit(&mut frame, key(0)) }
-        .unwrap()
-        .unwrap();
-    process
-        .publish(process.reserve(key(0)).unwrap(), None, None)
-        .unwrap();
-    process
-        .retire_dispatch(process.reserve(key(0)).unwrap())
-        .unwrap();
-    assert_eq!(process.collect_dispatch().unwrap(), 0);
-    drop(invocation);
-    install(&process, key(4), 2);
-    let mut invocation = unsafe { reader.admit(&mut frame, key(4)) }
-        .unwrap()
-        .unwrap();
-    assert_eq!(invocation.frame().execution_epoch, 2);
-    assert_eq!(process.collect_dispatch().unwrap(), 1);
-    assert_eq!(invocation.payload().preferred(), Some(entry(2)));
 }
 
 #[test]
@@ -662,11 +660,9 @@ fn dispatch_readers_and_index_storage_share_the_executable_budget() {
         process
             .publish(process.reserve(key(0)).unwrap(), None, None)
             .unwrap();
-        process
-            .retire_dispatch(process.reserve(key(0)).unwrap())
-            .unwrap();
         assert_eq!(cache.usage().unwrap(), resident);
-        assert_eq!(process.collect_dispatch().unwrap(), 1);
+        process.recover_capacity().unwrap();
+        assert_eq!(process.collect_dispatch().unwrap(), 0);
         assert!(cache.usage().unwrap().metadata < resident.metadata);
     }
     assert_eq!(cache.usage().unwrap(), initial);

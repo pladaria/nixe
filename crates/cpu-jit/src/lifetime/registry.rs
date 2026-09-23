@@ -251,10 +251,6 @@ impl<T> Registry<T> {
             })
     }
 
-    pub fn find(&self, predicate: impl FnMut(&T) -> bool) -> Option<Handle<T>> {
-        self.find_from(&mut 0, predicate)
-    }
-
     /// Resume a collector's scan without revisiting the prefix after each
     /// removal. Concurrent changes behind the cursor belong to the next pass.
     pub fn find_from(

@@ -61,7 +61,11 @@ fn published_code_changes_only_after_closed_and_runs_after_reopening() {
         Err(Error::Closed)
     );
     assert_eq!(process.lock().phase, Phase::Closing);
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
+    );
     drop(invocation);
     transition.wait_closed().unwrap();
 

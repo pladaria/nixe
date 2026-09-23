@@ -1,6 +1,6 @@
-//! Complete, immutable code ownership and metadata-first publication. Guest
-//! capture/lowering and coordinated mapping changes are wired by Task 3;
-//! this boundary consumes their owned image and checks its captured cursor.
+//! Complete, immutable code ownership and metadata-first publication. This
+//! boundary consumes the compiler's owned image and validates its captured
+//! memory cursor against coordinated mapping and instruction-cache changes.
 
 use super::background::Frozen;
 use super::directory::{Interval, Table};
@@ -9,8 +9,7 @@ use super::{DispatchSlot, Error, Lifetime, PreparedStorage, Publication, Reason}
 use crate::abi::{
     BlockKey, CheckedCounter, CodeUnitId, CodeVersion, DispatchPayload, EntryContract,
     ExecutionEpoch, ExitStateMap, FamilyVersion, HcqEntry, HcqFamilyId, HostAbi, InstructionKey,
-    LazyFlags, MaintenanceSequence, NATIVE_ABI_VERSION, NzcvLocation, PublishedEntry,
-    ValueLocation,
+    LazyFlags, MaintenanceSequence, NzcvLocation, PublishedEntry, ValueLocation,
 };
 use crate::executable::{Accounted, Installed, MetadataLease, SEGMENTS, Tier};
 use nixe_cpu::memory::CodePageDependency;
@@ -201,7 +200,6 @@ impl EmissionIdentity {
 pub(crate) struct CodeUnit {
     pub id: CodeUnitId,
     pub version: CodeVersion,
-    pub abi_version: u32,
     pub input: Input<InstructionImage, u16>,
     // Cold ownership accounting, never read by generated code or fault lookup.
     baseline_pins: AtomicUsize,
@@ -255,7 +253,6 @@ enum Lifecycle {
 struct UnitRecord {
     code: Arc<Accounted<CodeUnit>>,
     static_sites: Accounted<Box<[links::SourceSite]>>,
-    published: ExecutionEpoch,
     lifecycle: Lifecycle,
     slots: Accounted<Box<[Handle<DispatchSlot>]>>,
     family: Option<Handle<Arc<Accounted<Family>>>>,
@@ -382,7 +379,8 @@ impl DependencyIndex {
 }
 
 struct RetiredTable {
-    table: Arc<Accounted<Table>>,
+    // Own the old directory until all readers of its epoch have left.
+    _table: Arc<Accounted<Table>>,
     epoch: ExecutionEpoch,
 }
 
@@ -1211,7 +1209,6 @@ impl Lifetime {
             CodeUnit {
                 id,
                 version,
-                abi_version: NATIVE_ABI_VERSION,
                 input,
                 baseline_pins: AtomicUsize::new(0),
                 registration: std::sync::OnceLock::new(),
@@ -1731,20 +1728,12 @@ impl PreparedUnit<'_> {
                         .lcq()
                         .is_some()
                 })) {
-            Some(
-                process
-                    .request_locked(&mut state, Reason::TierCutover)?
-                    .sequence,
-            )
+            Some(process.request_locked(&mut state, Reason::TierCutover)?)
         } else {
             None
         };
         let link_sequence = if link_count != 0 {
-            Some(
-                process
-                    .request_locked(&mut state, Reason::LinkPatch)?
-                    .sequence,
-            )
+            Some(process.request_locked(&mut state, Reason::LinkPatch)?)
         } else {
             None
         };
@@ -1759,7 +1748,6 @@ impl PreparedUnit<'_> {
         let record = UnitRecord {
             code: self.unit.take().unwrap(),
             static_sites: self.static_sites.take().unwrap(),
-            published: retired,
             lifecycle: Lifecycle::Published,
             slots: self.slots.take().unwrap(),
             family: None,
@@ -1823,7 +1811,7 @@ impl PreparedUnit<'_> {
         std::mem::swap(&mut state.units.tables[segment], &mut self.table);
         if let Some(table) = self.table.take() {
             state.units.retired_tables.push(RetiredTable {
-                table,
+                _table: table,
                 epoch: retired,
             });
         }

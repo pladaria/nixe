@@ -2,6 +2,7 @@ use super::discovery::{NOP, RET, owned, owned_entries, reshape};
 use super::*;
 use crate::hcq::Graph;
 use crate::lifetime::background::Frozen;
+use crate::lifetime::unit::dynamic::pic::tests::cache;
 use crate::lifetime::unit::{Input, dynamic, links, tests::publish_words};
 
 fn output(process: &Lifetime, frozen: &Frozen<'_, '_>) -> Input {
@@ -196,14 +197,14 @@ fn replacement_cuts_installed_static_and_pic_roots_before_retiring_predecessor()
     assert!(process.try_service_links().unwrap());
     let mut reader = process.register().unwrap();
     for (map, pc) in [(0, 16), (1, 64)] {
-        reader
-            .cache_bridge(
-                process
-                    .prepare_dynamic_bridge(indirect, map, key(pc))
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
+        cache(
+            &mut reader,
+            process
+                .prepare_dynamic_bridge(indirect, map, key(pc))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
     }
     {
         let state = process.lock();
@@ -502,8 +503,6 @@ fn replacement_reuses_native_span_and_registry_storage_only_after_fault_reader_g
 
 #[test]
 fn alternating_interior_observations_stabilize_membership_entries_and_storage() {
-    use nixe_memory::MemoryInvalidationCursor;
-
     let process = process();
     let cursor = AtomicU64::new(0);
     publish_words(&process, 0, &[0x14000004]); // B 16.
@@ -536,13 +535,7 @@ fn alternating_interior_observations_stabilize_membership_entries_and_storage() 
         }
         assert!(frozen.unchanged());
         assert_eq!(frozen.entries().len(), 3);
-        assert!(
-            frozen
-                .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-                .unwrap()
-                .install()
-                .unwrap()
-        );
+        assert!(frozen.prepare_unchanged().unwrap().install().unwrap());
         drop(frozen);
         drop(work);
         let boundary = boundary(&process, root, root, target);

@@ -176,7 +176,7 @@ fn dynamic_empty_transfer_owns_units_without_allocating_code_or_islands() {
     assert_eq!(process.cache.usage().unwrap(), before);
     {
         let state = process.lock();
-        transfer.validate(&state).unwrap();
+        transfer.prepared.validate(&state).unwrap();
         assert_eq!(
             Arc::strong_count(&state.units.records.get(a.0).unwrap().code),
             2
@@ -215,13 +215,14 @@ fn dynamic_nonempty_transfer_is_charged_reusable_and_has_no_static_islands() {
     }
     candidate.code = process
         .cache
-        .install(
+        .install_with_islands(
             crate::executable::output::Output {
                 bytes: bytes.into_boxed_slice(),
                 alignment: 16,
                 metadata: *old.proofs.take().unwrap(),
             },
             Tier::Lcq,
+            0,
             |_| None,
         )
         .unwrap();
@@ -273,19 +274,23 @@ fn dynamic_preparations_do_not_survive_admission_changes_as_callable_entries() {
     let a = source(&process, &cursor, 0, EdgeKind::Indirect);
     let transfer = bridge(&process, a, 0).emit().unwrap();
     process.request(Reason::LinkPatch).unwrap();
-    assert_eq!(transfer.validate(&process.lock()), Err(Error::Closed));
+    assert_eq!(
+        transfer.prepared.validate(&process.lock()),
+        Err(Error::Closed)
+    );
     assert!(matches!(
         process.prepare_dynamic_bridge(a, 0, key(4)),
         Err(Error::Closed)
     ));
     assert!(process.try_service_links().unwrap());
     assert_eq!(
-        transfer.validate(&process.lock()),
+        transfer.prepared.validate(&process.lock()),
         Err(Error::StalePublication)
     );
     bridge(&process, a, 0)
         .emit()
         .unwrap()
+        .prepared
         .validate(&process.lock())
         .unwrap();
 }
@@ -304,7 +309,7 @@ fn dynamic_preparation_roots_delay_reclamation_but_not_safety_withdrawal() {
     transition.drain_retirements().unwrap();
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
-    assert!(transfer.validate(&process.lock()).is_err());
+    assert!(transfer.prepared.validate(&process.lock()).is_err());
     assert_eq!(process.reclaim_units().unwrap(), 0);
     assert!(!process.try_shutdown().unwrap());
     drop(transfer);

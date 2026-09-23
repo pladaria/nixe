@@ -1,25 +1,10 @@
+use super::super::tests::{cache, install};
 use super::*;
 use crate::abi::{GuestValue, RegisterClass, ValueBinding};
+use crate::lifetime::Reader;
 use crate::lifetime::unit::dynamic::tests::source;
 use crate::lifetime::unit::tests::{input, key, process, publish};
 use crate::native::pic::WAYS;
-
-fn install(
-    reader: &mut Reader,
-    process: &Lifetime,
-    source: UnitHandle,
-    map: u32,
-    pc: u64,
-) -> PicHandle {
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, map, key(pc))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap()
-}
 
 #[test]
 fn weak_bridge_collision_replacement_rotates_without_releasing_pic_roots() {
@@ -79,7 +64,7 @@ fn weak_bridge_concurrent_preparations_share_the_published_winner() {
                 .unwrap()
                 .unwrap();
             barrier.wait();
-            let handle = reader.cache_bridge(prepared).unwrap();
+            let handle = cache(&mut reader, prepared).unwrap();
             (reader, handle)
         };
         let a = scope.spawn(move || run(first));

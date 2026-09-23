@@ -31,7 +31,10 @@ fn flag_flow_same_recipe_carries_operands_even_when_producers_use_different_regi
     let join = block(&graph, 24);
     assert_eq!(analysis.flags.blocks[join].input, Some(shape(ADDS)));
     for source in [4, 16] {
-        assert!(!analysis.flags.packs_edge(block(&graph, source), join));
+        assert_eq!(
+            analysis.flags.blocks[block(&graph, source)].output,
+            analysis.flags.blocks[join].input
+        );
     }
 }
 
@@ -46,7 +49,10 @@ fn flag_flow_different_kind_width_or_carry_requires_explicit_ssa_merge() {
             Some(LazyFlags::Packed(()))
         );
         for source in [4, 16] {
-            assert!(analysis.flags.packs_edge(block(&graph, source), join));
+            assert_ne!(
+                analysis.flags.blocks[block(&graph, source)].output,
+                analysis.flags.blocks[join].input
+            );
         }
     }
 }
@@ -68,16 +74,17 @@ fn flag_flow_carry_and_conditional_recipes_keep_captured_operands_and_literals()
             .unwrap();
         assert_eq!(count, 4); // lhs/rhs/result + carry or predicate
         assert_eq!(rebound.shape(), *input);
-        assert!(!analysis.flags.packs_edge(block(&graph, 4), join));
+        assert_eq!(
+            analysis.flags.blocks[block(&graph, 4)].output,
+            analysis.flags.blocks[join].input
+        );
     }
     // Different predicates remain operand values; a different literal changes shape.
     for (other, packed) in [(0xfa42002a, false), (0xfa42102b, true)] {
         let graph = diamond(0xfa42102a, other);
         let analysis = Analysis::build(&graph, &[0]);
         assert_eq!(
-            analysis
-                .flags
-                .packs_edge(block(&graph, 4), block(&graph, 24)),
+            analysis.flags.blocks[block(&graph, 24)].input == Some(LazyFlags::Packed(())),
             packed
         );
     }
@@ -91,7 +98,6 @@ fn flag_flow_public_join_cannot_inherit_a_private_predecessor_recipe() {
     assert_eq!(internal.flags.blocks[join].input, Some(shape(ADDS)));
     let public = Analysis::build(&graph, &[0, join]);
     assert_eq!(public.flags.blocks[join].input, Some(LazyFlags::Packed(())));
-    assert!(public.flags.packs_edge(0, join));
     assert_eq!(
         LazyFlags::Canonical(42).shape(),
         LazyFlags::Packed(7).shape()
@@ -104,8 +110,14 @@ fn flag_flow_bypass_packed_and_fp_or_system_definitions_mix_without_home_roundtr
         let graph = diamond(ADDS, other);
         let analysis = Analysis::build(&graph, &[0]);
         let join = block(&graph, 24);
-        assert!(analysis.flags.packs_edge(block(&graph, 4), join));
-        assert!(!analysis.flags.packs_edge(block(&graph, 16), join));
+        assert_eq!(
+            analysis.flags.blocks[block(&graph, 4)].output,
+            Some(shape(ADDS))
+        );
+        assert_eq!(
+            analysis.flags.blocks[block(&graph, 16)].output,
+            analysis.flags.blocks[join].input
+        );
         assert_eq!(
             analysis.flags.blocks[join].input,
             Some(LazyFlags::Packed(()))
@@ -132,7 +144,6 @@ fn flag_flow_loop_fixed_point_preserves_compatible_recipes_and_handles_conflicts
                 shape(ADDS)
             })
         );
-        assert_eq!(analysis.flags.packs_edge(0, header), body == SUBS);
         let public = Analysis::build(&graph, &[0, header]);
         assert_eq!(
             public.flags.blocks[header].input,
@@ -147,7 +158,6 @@ fn flag_flow_dead_inputs_do_not_create_parameters_or_pack_edges() {
     let analysis = Analysis::build(&graph, &[0, block(&graph, 8)]);
     assert_eq!(analysis.flags.blocks[0], FlagBlock::default());
     assert_eq!(analysis.flags.blocks[block(&graph, 8)].input, None);
-    assert!(!analysis.flags.packs_edge(0, block(&graph, 8)));
 }
 
 #[test]
@@ -225,7 +235,13 @@ fn flag_flow_irreducible_and_unrooted_cycles_have_stable_total_contracts() {
     for (index, node) in graph.blocks.iter().enumerate() {
         for target in successors(&node.exit).iter().flatten() {
             if let Target::Internal(target) = target {
-                analysis.flags.packs_edge(index, *target);
+                let source = &analysis.flags.blocks[index].output;
+                let destination = &analysis.flags.blocks[*target].input;
+                assert!(
+                    destination.is_none()
+                        || source == destination
+                        || (source.is_some() && *destination == Some(LazyFlags::Packed(())))
+                );
             }
         }
     }

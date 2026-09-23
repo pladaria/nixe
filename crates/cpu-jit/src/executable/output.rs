@@ -1,5 +1,5 @@
-//! Owned final backend output. No JITModule, recompilation, context-borrowed
-//! symbol indices, or pre-allocation state-map guesses cross this boundary.
+//! Owned final backend output: bytes, relocations and final allocated state
+//! maps. No context-borrowed symbol indices cross this boundary.
 
 use super::Error;
 use crate::{abi::HostAbi, native::AllocatedBoundary};

@@ -166,7 +166,11 @@ fn snapshots_pin_actual_code_dependencies_and_slots_until_last_release() {
     let address = snapshot.code.allocation.address();
     let ticket = process.retire_unit(old).unwrap();
     drain(&process);
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::Eviction, ticket)
+            .unwrap()
+    );
     assert!(matches!(process.snapshot(old), Err(Error::StaleUnit)));
     let clone = snapshot.clone(); // Existing compiler ownership remains valid.
     drop(snapshot);
@@ -438,7 +442,11 @@ fn cancelled_partial_cutover_can_be_queued_again_for_eviction() {
     assert_eq!(transition.drain_retirements().unwrap(), 1);
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
-    assert!(eviction.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::Eviction, eviction)
+            .unwrap()
+    );
     assert!(process.snapshot(replacement).is_ok());
     assert_eq!(process.reclaim_units().unwrap(), 1);
 }
@@ -457,7 +465,11 @@ fn newly_queued_hcq_is_drained_before_pending_baselines() {
 
     // New work can arrive between unlinks; selection must recheck HCQ every
     // time, even though the older baseline precedes its family in the registry.
-    process.invalidate_all_memory().unwrap();
+    process
+        .invalidate_memory(&[nixe_memory::MemoryInvalidationKind::InstructionCache {
+            address_space: key(0).address_space,
+        }])
+        .unwrap();
     assert_eq!(process.lock().units.retirements.next(), Some(hcq.0));
     assert_eq!(transition.unlink_next().unwrap(), Some(true));
     assert_eq!(process.lock().units.retirements.next(), Some(baseline.0));
@@ -673,7 +685,11 @@ fn shutdown_waits_for_snapshots_and_unpublished_outputs_then_unmaps() {
     drop(staged);
     assert!(transition.try_finish_shutdown().unwrap());
     transition.batch().unwrap().complete().unwrap();
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::Shutdown, ticket)
+            .unwrap()
+    );
     assert!(transition.try_reopen().unwrap());
     assert_eq!(process.cache.usage().unwrap().committed, 0);
     assert_eq!(process.lock().units.records.capacity(), 0);
@@ -724,8 +740,16 @@ fn requests_arriving_during_closed_keep_their_exact_targets_pending() {
     let batch = transition.batch().unwrap();
     let second_ticket = process.retire_unit(second).unwrap();
     batch.complete().unwrap();
-    assert!(first_ticket.is_complete().unwrap());
-    assert!(!second_ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::Eviction, first_ticket)
+            .unwrap()
+    );
+    assert!(
+        !process
+            .maintenance_complete(crate::lifetime::Reason::Eviction, second_ticket)
+            .unwrap()
+    );
     assert!(!transition.try_reopen().unwrap());
     assert_eq!(
         transition.batch().unwrap().complete(),
@@ -734,7 +758,11 @@ fn requests_arriving_during_closed_keep_their_exact_targets_pending() {
     assert_eq!(transition.drain_retirements().unwrap(), 1);
     assert_eq!(process.reclaim_units().unwrap(), 2);
     transition.batch().unwrap().complete().unwrap();
-    assert!(second_ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::Eviction, second_ticket)
+            .unwrap()
+    );
     assert!(transition.try_reopen().unwrap());
 }
 
@@ -752,7 +780,7 @@ fn pressure_returns_empty_compiler_reservations_without_reviving_old_handles() {
     assert!(transition.try_reopen().unwrap());
     let new = process.reserve(key(0)).unwrap();
     assert_ne!(old.slot, new.slot);
-    assert_eq!(process.retire_dispatch(old), Err(Error::StalePublication));
+    assert_eq!(process.lock().validate(&old), Err(Error::StalePublication));
 }
 
 #[test]

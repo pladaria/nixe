@@ -2,7 +2,7 @@
 //! Compiler snapshots own code; raw directory pointers never acquire ownership.
 
 use super::*;
-use crate::lifetime::{Phase, Ticket, Transition};
+use crate::lifetime::{Phase, Transition};
 
 #[cfg(test)]
 mod tests;
@@ -55,7 +55,7 @@ impl Lifetime {
     /// allocation from a fresh capture: this neither reserves bytes nor promises
     /// that another compiler cannot consume the recovered headroom.
     pub(crate) fn recover_capacity(&self) -> Result<(), Error> {
-        let ticket = self.request(Reason::Eviction)?;
+        let sequence = self.request(Reason::Eviction)?;
         loop {
             {
                 let mut state = self.lock();
@@ -65,7 +65,7 @@ impl Lifetime {
                 }
                 if state.phase == Phase::Open
                     && state.completed[Reason::Eviction as usize]
-                        .is_some_and(|sequence| sequence >= ticket.sequence)
+                        .is_some_and(|completed| completed >= sequence)
                 {
                     return Ok(());
                 }
@@ -98,6 +98,7 @@ impl Lifetime {
     /// Acquire compiler/link ownership while the exact version is still
     /// eligible. A retired/invalidating unit cannot gain a new snapshot from
     /// an index; an existing snapshot may clone its own strong reference.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self, handle: UnitHandle) -> Result<super::Snapshot, Error> {
         let state = self.lock();
         state.open()?;
@@ -119,7 +120,7 @@ impl Lifetime {
     /// Register the exact target and closure under the same mutex. Snapshot
     /// references delay reclamation, not unlink; baseline promises additionally
     /// prevent LCQ eviction until their active/in-flight family releases them.
-    pub(crate) fn retire_unit(&self, handle: UnitHandle) -> Result<Ticket<'_>, Error> {
+    pub(crate) fn retire_unit(&self, handle: UnitHandle) -> Result<MaintenanceSequence, Error> {
         let mut state = self.lock();
         state.healthy()?;
         if handle.1 != self.identity {
@@ -135,7 +136,7 @@ impl Lifetime {
         if record.code.baseline_pins.load(Ordering::Relaxed) != 0 {
             return Err(Error::PinnedBaseline);
         }
-        let ticket = self.request_locked(&mut state, Reason::Eviction)?;
+        let sequence = self.request_locked(&mut state, Reason::Eviction)?;
         let units = &mut state.units;
         let record = units.records.get_mut(handle.0).unwrap();
         record.lifecycle = Lifecycle::Invalidating;
@@ -144,12 +145,12 @@ impl Lifetime {
             &mut units.retirements,
             &mut units.negatives,
             Reason::Eviction,
-            ticket.sequence,
+            sequence,
         );
         let removed = state.units.negatives.take_removed();
         drop(state);
         drop(removed);
-        Ok(ticket)
+        Ok(sequence)
     }
 
     /// No waiting, allocation, or destruction under JIT state. A collector
@@ -299,9 +300,7 @@ impl Lifetime {
                 // A cancelled earlier cutover can become rootless later.
                 // Link adjacency must still drain through the coordinator;
                 // never bypass it via this collector-only retirement path.
-                let sequence = self
-                    .request_locked(&mut state, Reason::TierCutover)?
-                    .sequence;
+                let sequence = self.request_locked(&mut state, Reason::TierCutover)?;
                 let units = &mut state.units;
                 units.records.get_mut(handle).unwrap().queue_retirement(
                     handle,
@@ -618,7 +617,7 @@ impl Transition<'_> {
                     .is_none()
             });
             let Some((key, slot)) = empty else {
-                return Ok(());
+                break;
             };
             let epoch = match retired {
                 Some(epoch) => epoch,
@@ -634,7 +633,15 @@ impl Transition<'_> {
             // these keys. Retained CodeUnit users still postpone slot reuse.
             state.keys.remove(&key);
             state.retire_dispatch_slot(slot, epoch);
+            state
+                .units
+                .negatives
+                .invalidate(negative::Owner::Dispatch(slot));
         }
+        let removed = state.units.negatives.take_removed();
+        drop(state);
+        drop(removed);
+        Ok(())
     }
 
     /// Nonblocking shutdown progress. Call again after outstanding compiler
@@ -755,7 +762,7 @@ impl Transition<'_> {
                 // Restore any installed incoming/outgoing branch before the
                 // unit can become Unlinked. Safety work has no install limit.
                 drop(state);
-                self.unlink_registered_link(link)?;
+                self.unlink_link(links::LinkHandle(link, self.process.identity))?;
                 return Ok(Some(false));
             }
             let count = record

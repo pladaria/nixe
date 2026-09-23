@@ -14,12 +14,11 @@ use crate::{
     },
 };
 use nixe_cpu::memory::{ExecutableMemory, InstructionImage};
-use nixe_memory::{MemoryInvalidationCursor, MemoryInvalidationSource};
+use nixe_memory::MemoryInvalidationSource;
 use std::num::NonZeroU16;
 
 struct Image {
     runs: Vec<InstructionImage>,
-    cursor: MemoryInvalidationCursor,
 }
 
 impl Image {
@@ -28,7 +27,6 @@ impl Image {
         memory: &(impl ExecutableMemory + MemoryInvalidationSource),
     ) -> Result<Self, Failure> {
         frozen.check()?;
-        let cursor = memory.invalidation_cursor();
         let mut runs = Vec::new();
         let mut words = frozen.graph().instructions.as_slice();
         while !words.is_empty() {
@@ -59,7 +57,7 @@ impl Image {
         // Capture can arm tracking and close/reopen execution. Only a change
         // to an actual captured LCQ input invalidates the candidate.
         frozen.check()?;
-        let image = Self { runs, cursor };
+        let image = Self { runs };
         image.validate(memory)?;
         Ok(image)
     }
@@ -79,7 +77,6 @@ impl Image {
         inputs: crate::executable::Accounted<Vec<crate::lifetime::unit::Snapshot>>,
         memory: &(impl ExecutableMemory + MemoryInvalidationSource),
     ) -> Result<Self, Failure> {
-        let cursor = memory.invalidation_cursor();
         let mut runs = Vec::new();
         for input in inputs.iter() {
             // LCQ images are contiguous. Chunking also handles the largest
@@ -96,7 +93,7 @@ impl Image {
             }
         }
         // Strong code pins and their vector charge end before final checks.
-        Ok(Self { runs, cursor })
+        Ok(Self { runs })
     }
 
     fn capture_run(
@@ -157,7 +154,7 @@ pub(in crate::hcq) fn record_unchanged(
     memory: &(impl ExecutableMemory + MemoryInvalidationSource),
 ) -> Result<bool, Failure> {
     let image = Image::capture(frozen, memory)?;
-    let prepared = frozen.prepare_unchanged(image.cursor)?;
+    let prepared = frozen.prepare_unchanged()?;
     image.validate(memory)?;
     prepared.install().map_err(Into::into)
 }
@@ -169,7 +166,7 @@ pub(in crate::hcq) fn record_structural(
     memory: &(impl ExecutableMemory + MemoryInvalidationSource),
 ) -> Result<bool, Failure> {
     let image = Image::capture_structural(result, memory)?;
-    let prepared = result.prepare(image.cursor)?;
+    let prepared = result.prepare()?;
     image.validate(memory)?;
     prepared.install().map_err(Into::into)
 }
@@ -183,7 +180,7 @@ pub(in crate::hcq) fn record_backend_rejection(
 ) -> Result<bool, Failure> {
     let image = Image::capture_inputs(frozen.capture_backend_inputs()?, memory)?;
     image.validate(memory)?;
-    let prepared = frozen.prepare_backend_negative(image.cursor)?;
+    let prepared = frozen.prepare_backend_negative()?;
     image.validate(memory)?;
     prepared.install().map_err(Into::into)
 }
@@ -199,6 +196,9 @@ impl Compiler {
         frozen: &Frozen<'_, '_>,
         memory: &(impl ExecutableMemory + MemoryInvalidationSource),
     ) -> Result<UnitHandle, Failure> {
+        // Positive publication keeps its cursor guard from before input capture.
+        // Negative results only need the exact memory images and owner evidence.
+        let cursor = memory.invalidation_cursor();
         let image = Image::capture(frozen, memory)?;
         let process = frozen.lifetime();
         let identity = process.begin_unit(Tier::Hcq)?;
@@ -241,7 +241,7 @@ impl Compiler {
                 .collect(),
             entries: staged.entries,
             dependencies: frozen.dependencies().into(),
-            cursor: image.cursor,
+            cursor,
             states: staged.states,
             faults: staged.faults,
         };

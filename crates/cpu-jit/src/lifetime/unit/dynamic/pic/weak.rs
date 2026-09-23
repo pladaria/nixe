@@ -5,10 +5,11 @@
 
 use super::*;
 
-#[derive(Clone, Copy)]
-struct WeakBridge {
-    site: Site,
-    generation: BridgeGeneration,
+/// Reader and bridge generations prevent resurrection after slot reuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::lifetime) struct WeakBridge {
+    pub(super) site: Site,
+    pub(super) generation: BridgeGeneration,
 }
 
 #[derive(Default)]
@@ -84,13 +85,9 @@ impl State {
         None
     }
 
-    fn index_bridge(&mut self, key: BridgeKey, handle: PicHandle) {
+    fn index_bridge(&mut self, key: BridgeKey, entry: WeakBridge) {
         let (shard, set) = self.weak_set(key).unwrap();
         let bucket = &mut self.readers.get_mut(shard).unwrap().pic.weak.sets[set];
-        let entry = WeakBridge {
-            site: handle.site,
-            generation: handle.generation,
-        };
         bucket.insert(entry);
     }
 
@@ -98,8 +95,7 @@ impl State {
         &mut self,
         reader: Handle<Registration>,
         bridge: Arc<Accounted<Bridge>>,
-        process: u64,
-    ) -> (PicHandle, Option<Arc<Accounted<Bridge>>>) {
+    ) -> Option<Arc<Accounted<Bridge>>> {
         let pic = &self.readers.get(reader).unwrap().pic;
         let key = bridge.key;
         let set = set_index(key.source, key.target);
@@ -107,36 +103,28 @@ impl State {
             reader,
             slot: set * 2 + pic.sets[set].replace,
         };
-        let handle = PicHandle {
-            process,
+        let handle = WeakBridge {
             site,
             generation: bridge.generation,
         };
         let removed = self.remove_pic_way(site);
         self.insert_pic_way(site, bridge);
         self.index_bridge(key, handle);
-        (handle, removed)
+        removed
     }
 
+    // None is a miss; a hit returns the replaced owner, if any, for deferred drop.
     pub(super) fn reuse_bridge(
         &mut self,
         reader: Handle<Registration>,
         key: BridgeKey,
-        process: u64,
-    ) -> Option<(PicHandle, Option<Arc<Accounted<Bridge>>>)> {
+    ) -> Option<Option<Arc<Accounted<Bridge>>>> {
         let pic = &self.readers.get(reader)?.pic;
-        if let Some(slot) = pic.find(key) {
-            return Some((
-                PicHandle {
-                    process,
-                    site: Site { reader, slot },
-                    generation: pic.way(slot).bridge.as_ref().unwrap().generation,
-                },
-                None,
-            ));
+        if pic.find(key).is_some() {
+            return Some(None);
         }
         let bridge = self.find_weak_bridge(key)?;
-        Some(self.place_bridge(reader, bridge, process))
+        Some(self.place_bridge(reader, bridge))
     }
 }
 

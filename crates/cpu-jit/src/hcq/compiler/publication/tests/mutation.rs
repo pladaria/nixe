@@ -120,7 +120,7 @@ fn alias_ic_invalidates_real_replacement_and_baselines_but_preserves_unrelated_c
 }
 
 #[test]
-fn real_memory_history_loss_cancels_pending_replacement_all_baselines_and_unrelated_work() {
+fn history_loss_preserves_code_until_a_real_instruction_cache_mutation() {
     let (process, mut memory, mut reader) = setup();
     assert!(memory.add_ram_page(GuestPhysicalPageId::new(8)));
     assert!(memory.map_page(
@@ -152,7 +152,7 @@ fn real_memory_history_loss_cancels_pending_replacement_all_baselines_and_unrela
         .iter()
         .map(|unit| unit.registered_handle().unwrap())
         .collect();
-    let mut cursor = memory.invalidation_cursor();
+    let cursor = memory.invalidation_cursor();
     // Overflow the real bounded log with coordinated mutations on an unrelated,
     // non-code page. No fabricated HistoryLost result or unsafe memory producer.
     for index in 0..=MEMORY_INVALIDATION_CAPACITY {
@@ -173,17 +173,26 @@ fn real_memory_history_loss_cancels_pending_replacement_all_baselines_and_unrela
     unrelated.check().unwrap();
     assert!(process.snapshot(predecessor).is_ok());
     let successor = publish(&frozen, &memory).unwrap();
-    // Leave cutover pending: the overrun consumer must also find predecessors
-    // which are no longer the preferred dispatch owner.
+    // History loss alone cannot retire code: each mutation already passed
+    // through the bound observer. A pending cutover is still valid.
     let observed = memory.invalidation_cursor();
     assert!(matches!(
         memory.read_invalidations_since(cursor, &mut Vec::new()),
         Err(MemoryInvalidationError::HistoryLost { latest, .. }) if latest == observed
     ));
-    process
-        .consume_memory_invalidations(&memory, &mut cursor)
+    process.try_service_links().unwrap();
+    assert!(process.snapshot(successor).is_ok());
+    unrelated.check().unwrap();
+    // Now stop before a real whole-address-space instruction-cache mutation.
+    // It must also find predecessors no longer preferred by dispatch.
+    memory
+        .maintain_cache(
+            AddressSpaceId::new(1),
+            CacheMaintenanceKind::InstructionInvalidate,
+            None,
+        )
         .unwrap();
-    assert_eq!(cursor, observed);
+    assert!(memory.invalidation_cursor() > observed);
     process.try_service_links().unwrap();
     for handle in baselines.into_iter().chain([predecessor, successor]) {
         assert!(matches!(process.snapshot(handle), Err(Error::StaleUnit)));

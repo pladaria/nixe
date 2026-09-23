@@ -80,8 +80,18 @@ fn late_source_retirement_cancels_preparations_without_cutting_surviving_returns
         let indirect_ticket = process.lifetime.retire_unit(indirect).unwrap();
         batch.complete().unwrap();
         assert!(!transition.try_reopen().unwrap());
-        assert!(!direct_ticket.is_complete().unwrap());
-        assert!(!indirect_ticket.is_complete().unwrap());
+        assert!(
+            !process
+                .lifetime
+                .maintenance_complete(crate::lifetime::Reason::Eviction, direct_ticket)
+                .unwrap()
+        );
+        assert!(
+            !process
+                .lifetime
+                .maintenance_complete(crate::lifetime::Reason::Eviction, indirect_ticket)
+                .unwrap()
+        );
         assert!(transition.drain_links().unwrap());
         assert_eq!(process.lifetime.reclaim_units().unwrap(), 0);
         assert_eq!(
@@ -91,8 +101,18 @@ fn late_source_retirement_cancels_preparations_without_cutting_surviving_returns
         transition.batch().unwrap().complete().unwrap();
         assert!(transition.try_reopen().unwrap());
         drop(transition);
-        assert!(direct_ticket.is_complete().unwrap());
-        assert!(indirect_ticket.is_complete().unwrap());
+        assert!(
+            process
+                .lifetime
+                .maintenance_complete(crate::lifetime::Reason::Eviction, direct_ticket)
+                .unwrap()
+        );
+        assert!(
+            process
+                .lifetime
+                .maintenance_complete(crate::lifetime::Reason::Eviction, indirect_ticket)
+                .unwrap()
+        );
         assert!(matches!(dynamic.emit(), Err(Error::StalePublication)));
         assert!(matches!(
             first.compiler.publish(

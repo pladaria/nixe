@@ -25,7 +25,11 @@ fn link_service_yields_to_readers_and_resumes_deferred_work_without_waiting() {
         .unwrap();
     assert!(!process.try_service_links().unwrap());
     assert_eq!(process.lock().phase, crate::lifetime::Phase::Closing);
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
+    );
     assert!(
         !process
             .lock()
@@ -38,7 +42,11 @@ fn link_service_yields_to_readers_and_resumes_deferred_work_without_waiting() {
     );
     drop(invocation);
     assert!(process.try_service_links().unwrap());
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
+    );
     assert!(
         process
             .lock()
@@ -69,7 +77,7 @@ fn link_service_never_acknowledges_memory_pressure_or_shutdown_work() {
         } else {
             assert!(!process.try_service_links().unwrap());
         }
-        assert!(!ticket.is_complete().unwrap());
+        assert!(!process.maintenance_complete(foreign, ticket).unwrap());
         assert!(!pending(&process).is_empty());
         assert!(process.try_shutdown().unwrap());
     }

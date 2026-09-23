@@ -24,6 +24,7 @@ pub(crate) struct Structural<'w, 'p> {
 }
 
 impl Structural<'_, '_> {
+    #[cfg(test)]
     pub fn reason(&self) -> StructuralReason {
         self.reason
     }
@@ -36,10 +37,8 @@ impl Structural<'_, '_> {
 
     pub(crate) fn prepare(
         &self,
-        cursor: nixe_memory::MemoryInvalidationCursor,
     ) -> Result<lifetime::background::Rejected<'_, '_>, lifetime::Error> {
-        self.work
-            .prepare_structural(&self.evidence, self.reason, cursor)
+        self.work.prepare_structural(&self.evidence)
     }
 
     pub(in crate::hcq) fn capture_inputs(

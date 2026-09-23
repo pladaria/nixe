@@ -258,7 +258,8 @@ impl Translator<'_> {
             self.builder.ins().jump(done, &[status.into()]);
             self.builder.switch_to_block(done);
             let status = self.builder.block_params(done)[0];
-            return self.write_register_with_sp(f.rm, false, status);
+            self.write_register_with_sp(f.rm, false, status);
+            return Ok(());
         }
         if matches!(
             instruction,
@@ -366,15 +367,12 @@ impl Translator<'_> {
                     || memory_lowering::split_pair(&mut self.builder, value, element_size),
                     |high| (value, high),
                 );
-                memory_lowering::write_loaded(self, f.rt, LoadSpec::unsigned(element_size), low)?;
-                return memory_lowering::write_loaded(
-                    self,
-                    f.rt2,
-                    LoadSpec::unsigned(element_size),
-                    high,
-                );
+                memory_lowering::write_loaded(self, f.rt, LoadSpec::unsigned(element_size), low);
+                memory_lowering::write_loaded(self, f.rt2, LoadSpec::unsigned(element_size), high);
+                return Ok(());
             }
-            return memory_lowering::write_loaded(self, f.rt, LoadSpec::unsigned(size), value);
+            memory_lowering::write_loaded(self, f.rt, LoadSpec::unsigned(size), value);
+            return Ok(());
         }
         if let Instruction::CompareAndSwapPair(f) = instruction {
             // CASP compares/replaces the entire little-endian register pair
@@ -423,13 +421,9 @@ impl Translator<'_> {
                 )?
                 .unwrap();
             let (low, high) = memory_lowering::split_pair(&mut self.builder, value, element_size);
-            memory_lowering::write_loaded(self, f.rm, LoadSpec::unsigned(element_size), low)?;
-            return memory_lowering::write_loaded(
-                self,
-                f.rm + 1,
-                LoadSpec::unsigned(element_size),
-                high,
-            );
+            memory_lowering::write_loaded(self, f.rm, LoadSpec::unsigned(element_size), low);
+            memory_lowering::write_loaded(self, f.rm + 1, LoadSpec::unsigned(element_size), high);
+            return Ok(());
         }
         if let Instruction::AtomicReadModifyWrite(f) = instruction {
             let kind = atomic_rmw_kind(f.atomic_opcode)
@@ -454,7 +448,8 @@ impl Translator<'_> {
                     flags,
                 )?
                 .unwrap();
-            return memory_lowering::write_loaded(self, f.rt, LoadSpec::unsigned(size), value);
+            memory_lowering::write_loaded(self, f.rt, LoadSpec::unsigned(size), value);
+            return Ok(());
         }
         if let Instruction::CompareAndSwap(f) = instruction {
             // CAS[B/H], CASA, CASL and CASAL return the old zero-extended value
@@ -484,7 +479,8 @@ impl Translator<'_> {
                     flags,
                 )?
                 .unwrap();
-            return memory_lowering::write_loaded(self, f.rm, LoadSpec::unsigned(size), value);
+            memory_lowering::write_loaded(self, f.rm, LoadSpec::unsigned(size), value);
+            return Ok(());
         }
         if let Instruction::Pair(f) = instruction {
             let (size, load) = pair_transfer(f.size, f.load)
@@ -532,10 +528,10 @@ impl Translator<'_> {
             flags,
         )?;
         if let (ScalarTransfer::Load(load), Some(value)) = (access.transfer, result) {
-            memory_lowering::write_loaded(self, access.register, load, value)?;
+            memory_lowering::write_loaded(self, access.register, load, value);
         }
         if let Some((register, value)) = access.writeback {
-            self.write_register_with_sp(register, true, value)?;
+            self.write_register_with_sp(register, true, value);
         }
         Ok(())
     }
@@ -593,10 +589,10 @@ impl Translator<'_> {
             source.map_or(Operation::Load, Operation::Store),
             flags,
         )? {
-            memory_lowering::write_vector_loaded(self, access.register, value)?;
+            memory_lowering::write_vector_loaded(self, access.register, value);
         }
         if let Some((register, value)) = access.writeback {
-            self.write_register_with_sp(register, true, value)?;
+            self.write_register_with_sp(register, true, value);
         }
         Ok(())
     }
@@ -683,7 +679,7 @@ impl Translator<'_> {
                 flags,
             )?;
             if let Some(value) = value {
-                memory_lowering::write_vector_loaded(self, register, value)?;
+                memory_lowering::write_vector_loaded(self, register, value);
                 grouped_values.push(self.read_vector(register)?.into());
                 self.builder.append_block_param(done, types::I8X16);
             }
@@ -705,7 +701,7 @@ impl Translator<'_> {
         if f.load {
             for index in 0..shape.register_count() {
                 let value = self.builder.block_params(done)[usize::from(index)];
-                self.write_vector(f.rd.wrapping_add(index) & 31, value)?;
+                self.write_vector(f.rd.wrapping_add(index) & 31, value);
             }
         }
         Ok(())
@@ -862,16 +858,14 @@ impl Translator<'_> {
             if let Some(value) = value {
                 match kind {
                     PairKind::Scalar(spec) => {
-                        memory_lowering::write_loaded(self, register, spec, value)?
+                        memory_lowering::write_loaded(self, register, spec, value)
                     }
-                    PairKind::Vector => {
-                        memory_lowering::write_vector_loaded(self, register, value)?
-                    }
+                    PairKind::Vector => memory_lowering::write_vector_loaded(self, register, value),
                 }
             }
         }
         if let Some((register, value)) = address.writeback {
-            self.write_register_with_sp(register, true, value)?;
+            self.write_register_with_sp(register, true, value);
         }
         Ok(())
     }

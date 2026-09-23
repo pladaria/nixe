@@ -3,7 +3,6 @@
 //! are meaningful only while the caller protects the owning execution epoch.
 
 use crate::analysis::StateSet;
-pub use crate::fp_env::UnsupportedFpControl;
 use nixe_cpu::exclusive::{ExclusiveMonitorState, ExclusiveReservation};
 use nixe_cpu::memory::{
     CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccessSize,
@@ -152,10 +151,6 @@ impl<Value> LazyFlags<Value> {
             },
         })
     }
-
-    pub const fn dirty(&self) -> bool {
-        !matches!(self, Self::Canonical(_))
-    }
 }
 
 /// Unspecialized code reads the current FPCR; specialized code is usable only
@@ -163,6 +158,13 @@ impl<Value> LazyFlags<Value> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FpSpecialization {
     Dynamic,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "approved pending FP specialization integration; see Task 9 plan"
+        )
+    )]
     Exact(u32),
 }
 
@@ -227,10 +229,6 @@ macro_rules! identities {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         #[repr(transparent)]
         pub struct $name(NonZeroU64);
-        impl $name {
-            pub const fn new(value: u64) -> Option<Self> { match NonZeroU64::new(value) { Some(value) => Some(Self(value)), None => None } }
-            pub const fn get(self) -> u64 { self.0.get() }
-        }
         impl Identity for $name { const NAME: &'static str = stringify!($name); fn from_nonzero(value: NonZeroU64) -> Self { Self(value) } }
     )+};
 }
@@ -244,10 +242,59 @@ identities!(
     ExecutionEpoch,
     AdmissionEpoch,
     MaintenanceSequence,
-    DispatchGeneration,
-    BridgeGeneration,
-    AdmissionSnapshotSequence,
-    SampleSequence
+    BridgeGeneration
+);
+
+impl CodeVersion {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+impl HcqFamilyId {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+impl FamilyVersion {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+impl ExecutionEpoch {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+impl AdmissionEpoch {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[cfg(test)]
+impl ReachabilityVersion {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[cfg(test)]
+macro_rules! test_identity_constructors {
+    ($($name:ident),+ $(,)?) => {$ (
+        impl $name {
+            pub const fn new(value: u64) -> Option<Self> {
+                match NonZeroU64::new(value) { Some(value) => Some(Self(value)), None => None }
+            }
+        }
+    )+};
+}
+#[cfg(test)]
+test_identity_constructors!(
+    CodeUnitId,
+    CodeVersion,
+    ReachabilityVersion,
+    HcqFamilyId,
+    FamilyVersion
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,8 +406,7 @@ impl DispatchPayload {
     }
 }
 
-/// Version of the NativeFrame/register/entry layout recorded by CodeUnits.
-pub const NATIVE_ABI_VERSION: u32 = 3;
+/// NativeFrame spill-prefix bytes reserved for boundary transfers.
 pub const TRANSFER_BYTES: u32 = 2048;
 pub const SPILL_BYTES: u32 = 16384;
 pub const SAMPLE_INTERVAL: i64 = 4096;
@@ -732,6 +778,13 @@ pub enum ValueLocation {
         offset: u32,
         bytes: u8,
     },
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "approved pending constant-map integration; see Task 9 plan"
+        )
+    )]
     Constant(ConstantBits),
 }
 /// Keep the full vector constant without imposing u128 alignment on every
@@ -744,6 +797,7 @@ impl ConstantBits {
     }
 }
 impl ValueLocation {
+    #[cfg(test)]
     pub const fn constant(value: u128) -> Self {
         Self::Constant(ConstantBits([value as u64, (value >> 64) as u64]))
     }
@@ -959,6 +1013,13 @@ pub enum GuestValue {
     Sp,
     Vector(u8),
     Fpcr,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "approved pending FPSR SSA integration; see Task 9 plan"
+        )
+    )]
     Fpsr,
     TpidrEl0,
     TpidrroEl0,
@@ -998,15 +1059,17 @@ pub enum NzcvLocation {
     Canonical,
     Packed(ValueLocation),
     /// Host condition flags; bridges/poll arithmetic must preserve the live bits.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "approved pending host-NZCV integration; see Task 9 plan"
+        )
+    )]
     Host {
         carry_inverted: bool,
     },
     Deferred(LazyFlags<ValueLocation>),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CanonicalEntryContract {
-    pub live_in: StateSet,
 }
 
 /// Physical fast ingress. Canonical ingress has no physical input requirements.

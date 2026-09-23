@@ -25,7 +25,7 @@ fn background_usage_snapshot_defers_instead_of_waiting_for_allocator() {
 fn inline_bridge_tail_uses_no_island_and_returns_failed_storage() {
     let cache = Cache::new().unwrap();
     let target = cache
-        .install(return_value(91), Tier::Lcq, |_| None)
+        .install_with_islands(return_value(91), Tier::Lcq, 0, |_| None)
         .unwrap();
     let (bytes, tail) = crate::native::link::bridge(host(), &[]);
     let mut bytes = bytes.into_vec();
@@ -65,7 +65,7 @@ fn inline_bridge_tail_uses_no_island_and_returns_failed_storage() {
 fn final_bridge_tail_executes_with_closed_write_view_and_rejects_invalid_extents() {
     let cache = Cache::new().unwrap();
     let target = cache
-        .install(return_value(73), Tier::Lcq, |_| None)
+        .install_with_islands(return_value(73), Tier::Lcq, 0, |_| None)
         .unwrap();
     let transfer = match host() {
         HostAbi::X86_64 => vec![0x90],
@@ -125,7 +125,7 @@ fn static_branch_bytes_execute_through_owned_segment_islands() {
     let mut previous_island = None;
     for value in [17, 93] {
         let target = cache
-            .install(return_value(value), Tier::Lcq, |_| None)
+            .install_with_islands(return_value(value), Tier::Lcq, 0, |_| None)
             .unwrap();
         let source = cache.allocate_with_islands(16, 16, Tier::Lcq, 1).unwrap();
         let source_pc = source.address();
@@ -263,7 +263,7 @@ fn code_island_padding_and_extent_are_checked_before_allocation() {
         allocation.island_address(1),
         Some(allocation.address() + 48)
     );
-    let next = cache.allocate(1, 1, Tier::Lcq).unwrap();
+    let next = cache.allocate_with_islands(1, 1, Tier::Lcq, 0).unwrap();
     assert_eq!(next.address(), allocation.address() + 64);
     drop(allocation);
     let reused = cache.allocate_with_islands(17, 1, Tier::Lcq, 2).unwrap();
@@ -427,7 +427,7 @@ fn synthetic_code_executes_from_rx_with_the_write_view_closed() {
     let cache = Cache::new().unwrap();
     let initial = cache.usage().unwrap();
     let code = cache
-        .install(return_value(42), Tier::Lcq, |_| None)
+        .install_with_islands(return_value(42), Tier::Lcq, 0, |_| None)
         .unwrap();
     assert_eq!(unsafe { execute(&code) }, 42);
     assert!(permissions(code.allocation.address()).starts_with("r-x"));
@@ -463,13 +463,19 @@ fn synthetic_code_executes_from_rx_with_the_write_view_closed() {
 #[test]
 fn individual_spans_reuse_and_empty_segments_release_real_backing() {
     let cache = Cache::new().unwrap();
-    let first = cache.install(return_value(1), Tier::Lcq, |_| None).unwrap();
+    let first = cache
+        .install_with_islands(return_value(1), Tier::Lcq, 0, |_| None)
+        .unwrap();
     let address = first.allocation.address();
     let generation = first.allocation.generation;
-    let neighbor = cache.install(return_value(2), Tier::Lcq, |_| None).unwrap();
+    let neighbor = cache
+        .install_with_islands(return_value(2), Tier::Lcq, 0, |_| None)
+        .unwrap();
     assert!(!unsafe { cache.decommit_empty(0) }.unwrap());
     drop(first);
-    let replacement = cache.install(return_value(3), Tier::Lcq, |_| None).unwrap();
+    let replacement = cache
+        .install_with_islands(return_value(3), Tier::Lcq, 0, |_| None)
+        .unwrap();
     assert_eq!(replacement.allocation.address(), address);
     assert_eq!(unsafe { execute(&replacement) }, 3);
     assert_eq!(unsafe { execute(&neighbor) }, 2);
@@ -498,7 +504,9 @@ fn individual_spans_reuse_and_empty_segments_release_real_backing() {
     assert!(unsafe { cache.decommit_empty(0) }.unwrap());
     assert_eq!(blocks(), 0);
     assert!(permissions(address).starts_with("---"));
-    let reused = cache.install(return_value(4), Tier::Lcq, |_| None).unwrap();
+    let reused = cache
+        .install_with_islands(return_value(4), Tier::Lcq, 0, |_| None)
+        .unwrap();
     assert_eq!(reused.allocation.address(), address);
     assert_ne!(reused.allocation.generation, generation);
     let expected = return_value(4);
@@ -512,17 +520,17 @@ fn individual_spans_reuse_and_empty_segments_release_real_backing() {
 #[test]
 fn best_fit_then_lowest_address_and_coalescing_match_policy() {
     let cache = Cache::new().unwrap();
-    let a = cache.allocate(80, 16, Tier::Lcq).unwrap();
-    let b = cache.allocate(16, 16, Tier::Lcq).unwrap();
-    let c = cache.allocate(48, 16, Tier::Lcq).unwrap();
-    let d = cache.allocate(16, 16, Tier::Lcq).unwrap();
-    let e = cache.allocate(80, 16, Tier::Lcq).unwrap();
-    let f = cache.allocate(16, 16, Tier::Lcq).unwrap();
+    let a = cache.allocate_with_islands(80, 16, Tier::Lcq, 0).unwrap();
+    let b = cache.allocate_with_islands(16, 16, Tier::Lcq, 0).unwrap();
+    let c = cache.allocate_with_islands(48, 16, Tier::Lcq, 0).unwrap();
+    let d = cache.allocate_with_islands(16, 16, Tier::Lcq, 0).unwrap();
+    let e = cache.allocate_with_islands(80, 16, Tier::Lcq, 0).unwrap();
+    let f = cache.allocate_with_islands(16, 16, Tier::Lcq, 0).unwrap();
     let (low, small) = (a.address(), c.address());
     drop((a, c, e));
-    let fit = cache.allocate(40, 16, Tier::Lcq).unwrap();
+    let fit = cache.allocate_with_islands(40, 16, Tier::Lcq, 0).unwrap();
     assert_eq!(fit.address(), small);
-    let tie = cache.allocate(60, 16, Tier::Lcq).unwrap();
+    let tie = cache.allocate_with_islands(60, 16, Tier::Lcq, 0).unwrap();
     assert_eq!(tie.address(), low);
     drop((b, d, f, fit, tie));
     let state = cache.lock().unwrap();
@@ -539,17 +547,21 @@ fn best_fit_then_lowest_address_and_coalescing_match_policy() {
 #[test]
 fn alignment_padding_and_fragmentation_are_reusable() {
     let cache = Cache::new().unwrap();
-    let a = cache.allocate(3, 1, Tier::Lcq).unwrap();
-    let b = cache.allocate(19, 4096, Tier::Lcq).unwrap();
+    let a = cache.allocate_with_islands(3, 1, Tier::Lcq, 0).unwrap();
+    let b = cache.allocate_with_islands(19, 4096, Tier::Lcq, 0).unwrap();
     assert_eq!(b.address() % 4096, 0);
-    let gap = cache.allocate(16, 16, Tier::Lcq).unwrap();
+    let gap = cache.allocate_with_islands(16, 16, Tier::Lcq, 0).unwrap();
     assert!(a.address() < gap.address() && gap.address() < b.address());
     drop((a, b, gap));
     assert_eq!(cache.lock().unwrap().segments[0].bump, 0);
-    assert!(cache.allocate(1, 3, Tier::Lcq).is_err());
+    assert!(cache.allocate_with_islands(1, 3, Tier::Lcq, 0).is_err());
     let mut malformed = return_value(1);
     malformed.alignment = 3;
-    assert!(cache.install(malformed, Tier::Lcq, |_| None).is_err());
+    assert!(
+        cache
+            .install_with_islands(malformed, Tier::Lcq, 0, |_| None)
+            .is_err()
+    );
 }
 
 #[test]
@@ -572,12 +584,12 @@ fn address_alignment_preserves_exact_overflow_boundary() {
 #[test]
 fn tiers_do_not_share_live_segments_but_borrow_empty_ones() {
     let cache = Cache::new().unwrap();
-    let lcq = cache.allocate(16, 16, Tier::Lcq).unwrap();
-    let hcq = cache.allocate(16, 16, Tier::Hcq).unwrap();
+    let lcq = cache.allocate_with_islands(16, 16, Tier::Lcq, 0).unwrap();
+    let hcq = cache.allocate_with_islands(16, 16, Tier::Hcq, 0).unwrap();
     assert_ne!(lcq.segment, hcq.segment);
     let first_segment = lcq.segment;
     drop((lcq, hcq));
-    let borrowed = cache.allocate(16, 16, Tier::Hcq).unwrap();
+    let borrowed = cache.allocate_with_islands(16, 16, Tier::Hcq, 0).unwrap();
     assert_eq!(borrowed.segment, first_segment);
 }
 
@@ -590,16 +602,17 @@ fn reservation_bounds_and_islands_exclude_unallocatable_bytes() {
     );
     assert_eq!(segment_size(127), 15 * MIB);
     let base = cache.executable_base();
-    assert_eq!(cache.segment_for_pc(base - 1), None);
-    assert_eq!(cache.segment_for_pc(base), Some(0));
-    assert_eq!(cache.segment_for_pc(base + WINDOW_BYTES - 1), Some(127));
-    assert_eq!(cache.segment_for_pc(base + WINDOW_BYTES), None);
-    assert_eq!(cache.segment_for_pc(usize::MAX), None);
-    let whole = cache.allocate(SEGMENT_BYTES, 16, Tier::Lcq).unwrap();
-    let next = cache.allocate(16, 16, Tier::Lcq).unwrap();
+    let whole = cache
+        .allocate_with_islands(SEGMENT_BYTES, 16, Tier::Lcq, 0)
+        .unwrap();
+    let next = cache.allocate_with_islands(16, 16, Tier::Lcq, 0).unwrap();
     assert_eq!((whole.segment, next.segment), (0, 1));
     assert!(whole.address() + whole.len() <= base + SEGMENT_BYTES);
-    assert!(cache.allocate(SEGMENT_BYTES + 1, 16, Tier::Lcq).is_err());
+    assert!(
+        cache
+            .allocate_with_islands(SEGMENT_BYTES + 1, 16, Tier::Lcq, 0)
+            .is_err()
+    );
 }
 
 #[test]
@@ -688,7 +701,9 @@ fn validation_releases_backend_storage_and_only_its_exact_charge() {
         ],
     }]);
     let heap = output.metadata.bytes();
-    let mut installed = cache.install(output, Tier::Lcq, |_| None).unwrap();
+    let mut installed = cache
+        .install_with_islands(output, Tier::Lcq, 0, |_| None)
+        .unwrap();
     let before = cache.usage().unwrap();
     let address = installed.allocation.address();
     installed.finish_validation();
@@ -714,7 +729,7 @@ fn local_absolute_relocations_use_rx_not_rw_addresses() {
     }]
     .into_boxed_slice();
     let code = cache
-        .install(data, Tier::Lcq, |_| {
+        .install_with_islands(data, Tier::Lcq, 0, |_| {
             panic!("local target must not call resolver")
         })
         .unwrap();
@@ -892,7 +907,7 @@ fn backend_output_survives_context_reset_with_exact_labels_and_fault_maps() {
             let cache = Cache::new().unwrap();
             let symbol = cache.executable_base() + 0x12340;
             let installed = cache
-                .install(owned, Tier::Lcq, |target| {
+                .install_with_islands(owned, Tier::Lcq, 0, |target| {
                     (*target
                         == Target::User {
                             namespace: 42,
@@ -921,7 +936,9 @@ fn span_churn_never_overlaps_live_allocations_and_returns_to_empty() {
         }
         let length = (random as usize % 1024) + 1;
         let alignment = 1 << (4 + (random >> 48) as usize % 9);
-        let allocation = cache.allocate(length, alignment, Tier::Lcq).unwrap();
+        let allocation = cache
+            .allocate_with_islands(length, alignment, Tier::Lcq, 0)
+            .unwrap();
         assert_eq!(allocation.address() % alignment, 0);
         for other in slots.iter().flatten() {
             assert!(
@@ -949,7 +966,11 @@ fn hard_limit_rejection_does_not_commit_a_segment_or_consume_reserve() {
     let charge = cache
         .charge_metadata(HARD_BYTES - initial.total(), Tier::Lcq)
         .unwrap();
-    assert!(cache.install(return_value(1), Tier::Lcq, |_| None).is_err());
+    assert!(
+        cache
+            .install_with_islands(return_value(1), Tier::Lcq, 0, |_| None)
+            .is_err()
+    );
     assert_eq!(cache.usage().unwrap().committed, 0);
     assert_eq!(cache.usage().unwrap().total(), HARD_BYTES);
     drop(charge);
@@ -972,7 +993,7 @@ fn code_is_coherent_when_published_and_reused_on_another_thread() {
         });
         for value in 0..32 {
             let code = cache
-                .install(return_value(value), Tier::Lcq, |_| None)
+                .install_with_islands(return_value(value), Tier::Lcq, 0, |_| None)
                 .unwrap();
             send.send(code).unwrap();
             acknowledged.recv().unwrap();

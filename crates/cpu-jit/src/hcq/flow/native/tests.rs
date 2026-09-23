@@ -22,7 +22,6 @@ fn native_inputs_do_not_load_clean_homes_for_full_fault_or_exit_observations() {
         let graph = graph(&[(0, &words)]);
         let analysis = Analysis::build(&graph, &[0]);
         assert_eq!(analysis.native.blocks[0].live_in, expected);
-        assert_ne!(analysis.blocks[0].live_in, expected);
         assert!(
             !analysis.native.instructions[0]
                 .dirty_before
@@ -30,15 +29,6 @@ fn native_inputs_do_not_load_clean_homes_for_full_fault_or_exit_observations() {
                 .x
                 .contains(0)
         );
-        for (native, semantic) in analysis
-            .native
-            .instructions
-            .iter()
-            .zip(&analysis.instructions)
-        {
-            assert!(native.live_before.without(semantic.live_before).is_empty());
-            assert!(native.live_after.without(semantic.live_after).is_empty());
-        }
     }
 }
 
@@ -204,7 +194,6 @@ fn native_inputs_leave_fpsr_invocation_owned_and_read_only_homes_clean() {
     let input = analysis.native.blocks[0].live_in;
     assert!(input.fpcr && input.tpidrro_el0);
     assert!(!input.fpsr);
-    assert!(analysis.instructions[0].live_before.fpsr);
     for point in &analysis.native.instructions {
         assert!(!point.dirty_before.fpcr && !point.dirty_after.fpcr);
         assert!(!point.dirty_before.tpidrro_el0 && !point.dirty_after.tpidrro_el0);

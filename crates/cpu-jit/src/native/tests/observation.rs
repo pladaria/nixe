@@ -141,8 +141,7 @@ fn observation_survives_real_system_call_without_canonical_roundtrip() {
                 for fp in [false, true] {
                     let mut results = Vec::new();
                     for observe in [false, true] {
-                        let mut code = gateway::landing(abi);
-                        code.extend(emit_canonical_entry(&entry).unwrap());
+                        let mut code = Vec::new();
                         if observe {
                             // Repeat to prove the restored image remains usable
                             // without reloading any canonical architectural home.
@@ -169,17 +168,18 @@ fn observation_survives_real_system_call_without_canonical_roundtrip() {
                                 code.extend_from_slice(&preservation.restore);
                             }
                         }
-                        code.extend(
-                            emit_canonical_exit(
-                                &source,
+                        let owner = published::Published::new(|process, cache| {
+                            published::synthetic(
+                                process.begin_unit(crate::executable::Tier::Lcq).unwrap(),
+                                cache,
+                                entry.clone(),
+                                source.clone(),
+                                (code, None),
                                 destination,
                                 NativeExitReason::Dispatch,
-                                0,
                             )
-                            .unwrap(),
-                        );
-                        let (owner, id) = gateway::compile(&code);
-                        let address = owner.get_finalized_function(id);
+                        });
+                        let mut reader = owner.process.register().unwrap();
                         let (mut state, _) = pattern(&entry);
                         state.set_fpcr(0);
                         state.set_fpsr(1 << 27);
@@ -188,17 +188,22 @@ fn observation_survives_real_system_call_without_canonical_roundtrip() {
                             let mut frame =
                                 NativeFrame::new(&mut state, PollBudget::new(77, 1000).unwrap());
                             frame.runtime = observed.as_mut_ptr().cast();
-                            frame.execution_epoch = 17;
+                            let mut invocation =
+                                unsafe { reader.admit(&mut frame, published::key()) }
+                                    .unwrap()
+                                    .unwrap();
+                            let address = invocation.payload().preferred().unwrap().canonical.get()
+                                as *const u8;
+                            let epoch = invocation.frame().execution_epoch;
+                            let frame = invocation.frame();
                             unsafe {
-                                frame.begin_fp();
                                 if fp {
                                     frame.ensure_fp().unwrap();
                                     crate::fp_env::tests::divide_by_zero();
                                 }
-                                enter_protected(&mut frame, std::ptr::dangling_mut(), address)
-                                    .unwrap();
+                                enter_protected(frame, std::ptr::dangling_mut(), address).unwrap();
                             }
-                            assert_eq!(frame.execution_epoch, 17);
+                            assert_eq!(frame.execution_epoch, epoch);
                             assert_eq!(frame.budget.sample_remaining, 77);
                             assert_eq!(frame.budget.slice_remaining, 1000);
                         }
@@ -208,6 +213,8 @@ fn observation_survives_real_system_call_without_canonical_roundtrip() {
                         }
                         assert_eq!(state.fpsr(), (1 << 27) | if fp { 2 } else { 0 });
                         results.push(state);
+                        drop(reader);
+                        owner.shutdown();
                     }
                     let mut actual = results.pop().unwrap();
                     let mut expected = results.pop().unwrap();

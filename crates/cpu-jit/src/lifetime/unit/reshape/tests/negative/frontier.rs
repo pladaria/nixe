@@ -24,13 +24,7 @@ fn partial_input_no_op_watches_foreign_membership_without_pinning_its_code() {
         .unwrap();
     assert!(frozen.unchanged());
     assert_eq!(frozen.graph().instructions.len(), 2);
-    assert!(
-        frozen
-            .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-            .unwrap()
-            .install()
-            .unwrap()
-    );
+    assert!(frozen.prepare_unchanged().unwrap().install().unwrap());
     drop(frozen);
     drop(work);
     assert_eq!(
@@ -60,9 +54,7 @@ fn retiring_blocker_rejects_completion_before_membership_is_detached() {
         .unwrap()
         .freeze()
         .unwrap();
-    let prepared = frozen
-        .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-        .unwrap();
+    let prepared = frozen.prepare_unchanged().unwrap();
     process.retire_unit(foreign).unwrap();
     {
         let state = process.lock();
@@ -102,13 +94,7 @@ fn foreign_membership_is_evidence_even_without_a_dispatch_entry() {
         .unwrap()
         .freeze()
         .unwrap();
-    assert!(
-        frozen
-            .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-            .unwrap()
-            .install()
-            .unwrap()
-    );
+    assert!(frozen.prepare_unchanged().unwrap().install().unwrap());
     assert!(!process.lock().keys.contains_key(&key(36))); // No fabricated demand.
     drop(frozen);
     drop(work);
@@ -123,7 +109,7 @@ fn foreign_membership_is_evidence_even_without_a_dispatch_entry() {
         .freeze()
         .unwrap();
     assert!(matches!(
-        frozen.prepare_unchanged(MemoryInvalidationCursor::INITIAL),
+        frozen.prepare_unchanged(),
         Err(Error::StalePublication)
     ));
 }

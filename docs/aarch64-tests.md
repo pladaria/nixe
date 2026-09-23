@@ -45,16 +45,17 @@ The binary uses host shared libraries; copying it to another distribution is
 not a substitute for building there. This pins QEMU inputs, not the complete
 host kernel, compiler or guest sysroot, and does not promise bit-identical builds.
 
-## Run the tiered-JIT foundation tests
+## Run the tiered-JIT tests
 
 Install the Rust target with `rustup target add aarch64-unknown-linux-gnu`.
 The cross linker and guest sysroot come from `gcc-aarch64-linux-gnu` and
 `libc6-dev-arm64-cross` on Debian/Ubuntu. From the Nixe repository, with Cargo
-dependencies already fetched:
+dependencies already fetched and the [local Cranelift override](cranelift-modifications.md#baseline-and-revision)
+configured (required until the portable fork pin is updated):
 
 ```bash
 /usr/local/bin/qemu-aarch64 --version
-cargo test --offline --locked -p nixe-cpu-jit --lib \
+cargo test --offline --config /tmp/nixe-observable-fp-local.toml -p nixe-cpu-jit --lib \
   --target aarch64-unknown-linux-gnu \
   --config 'target.aarch64-unknown-linux-gnu.linker="aarch64-linux-gnu-gcc"' \
   --config 'target.aarch64-unknown-linux-gnu.runner=["/usr/local/bin/qemu-aarch64", "-cpu", "max", "-L", "/usr/aarch64-linux-gnu"]' \

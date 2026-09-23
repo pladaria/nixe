@@ -9,13 +9,12 @@
 mod fatal;
 
 use std::cell::UnsafeCell;
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::mem::offset_of;
 use std::mem::{ManuallyDrop, MaybeUninit, size_of};
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use nixe_cpu::memory::{
     CpuMemory, DataAccessFault, DataAccessKind, DirectFaultResolution, MemoryAccess,
@@ -62,153 +61,53 @@ pub struct NativeFaultSite {
 
 /// Immutable metadata for one finalized native function.
 #[derive(Clone, Debug)]
-pub struct NativeFaultRegion {
-    pub native_start: usize,
-    pub native_end: usize,
-    pub sites: Arc<[NativeFaultSite]>,
+struct NativeFaultRegion {
+    native_start: usize,
+    native_end: usize,
+    sites: Box<[NativeFaultSite]>,
 }
 
-/// Append-only native-PC attribution registry.
-///
-/// Published regions and their sites are immutable. Publication installs each
-/// region in a fixed open-addressed native-page index with release stores, so
-/// signal-context lookup needs only acquire loads and never allocates, locks,
-/// or observes partially initialized metadata. Native code is process-lifetime
-/// in the JIT; retaining retired metadata here gives linked executions the same
-/// lifetime.
-pub struct NativeFaultRegistry {
-    /// Fixed open-addressed index. One entry is published for every native
-    /// page intersected by a region; duplicate page keys are intentional when
-    /// several small regions share one allocator page.
-    slots: Box<[AtomicPtr<NativeFaultRegion>]>,
-    region_capacity: usize,
-    owned: Mutex<OwnedFaultRegions>,
-}
-
-struct OwnedFaultRegions {
-    regions: Vec<Arc<NativeFaultRegion>>,
-    ranges: BTreeMap<usize, usize>,
+/// Immutable attribution for fixed native memory stubs, published as a whole
+/// before a worker becomes active. JIT code uses its own epoch-owned directory.
+/// Signal-context lookup only reads this table: no locks, allocations or
+/// incremental publication, and no retained retired code.
+struct NativeFaultRegistry {
+    regions: Box<[NativeFaultRegion]>,
 }
 
 impl NativeFaultRegistry {
-    pub fn new(mut regions: Vec<NativeFaultRegion>) -> Result<Self, FaultRuntimeError> {
+    fn new(mut regions: Vec<NativeFaultRegion>) -> Result<Self, FaultRuntimeError> {
         regions.sort_unstable_by_key(|region| region.native_start);
-        let registry = Self::with_capacity(regions.len().max(1))?;
-        for region in regions {
-            registry.publish(Arc::new(region))?;
+        for region in &regions {
+            validate_region(region)?;
         }
-        Ok(registry)
-    }
-
-    pub fn with_capacity(capacity: usize) -> Result<Self, FaultRuntimeError> {
-        if capacity == 0 {
-            return Err(FaultRuntimeError::new(
-                "native fault registry capacity must be nonzero",
-            ));
+        if regions
+            .windows(2)
+            .any(|pair| pair[0].native_end > pair[1].native_start)
+        {
+            return Err(FaultRuntimeError::new("native fault regions overlap"));
         }
-        let index_capacity = capacity
-            .checked_mul(4)
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or_else(|| FaultRuntimeError::new("native fault index capacity overflows"))?;
-        let slots = (0..index_capacity.max(4))
-            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
         Ok(Self {
-            slots,
-            region_capacity: capacity,
-            owned: Mutex::new(OwnedFaultRegions {
-                regions: Vec::with_capacity(capacity.min(4096)),
-                ranges: BTreeMap::new(),
-            }),
+            regions: regions.into_boxed_slice(),
         })
     }
 
-    pub fn publish(&self, region: Arc<NativeFaultRegion>) -> Result<(), FaultRuntimeError> {
-        validate_region(&region)?;
-        let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
-        let index = owned.regions.len();
-        if index == self.region_capacity {
-            return Err(FaultRuntimeError::new(
-                "native fault registry capacity is exhausted",
-            ));
-        }
-        let overlaps_predecessor = owned
-            .ranges
-            .range(..=region.native_start)
-            .next_back()
-            .is_some_and(|(_, end)| *end > region.native_start);
-        let overlaps_successor = owned
-            .ranges
-            .range(region.native_start..)
-            .next()
-            .is_some_and(|(start, _)| *start < region.native_end);
-        if overlaps_predecessor || overlaps_successor {
-            return Err(FaultRuntimeError::new(
-                "native fault regions overlap an already published range",
-            ));
-        }
-        let mut selected = BTreeSet::new();
-        let first_page = region.native_start & !(DIRECT_PAGE_SIZE - 1);
-        let last_page = (region.native_end - 1) & !(DIRECT_PAGE_SIZE - 1);
-        let mut page = first_page;
-        loop {
-            let slot = self
-                .vacant_index_slot(page, &selected)
-                .ok_or_else(|| FaultRuntimeError::new("native fault page index is exhausted"))?;
-            selected.insert(slot);
-            if page == last_page {
-                break;
-            }
-            page = page
-                .checked_add(DIRECT_PAGE_SIZE)
-                .ok_or_else(|| FaultRuntimeError::new("native fault page range overflows"))?;
-        }
-        owned.ranges.insert(region.native_start, region.native_end);
-        owned.regions.push(Arc::clone(&region));
-        for slot in selected {
-            self.slots[slot].store(Arc::as_ptr(&region).cast_mut(), Ordering::Release);
-        }
-        Ok(())
-    }
-
     fn find(&self, native_pc: usize) -> Option<&NativeFaultSite> {
-        let page = native_pc & !(DIRECT_PAGE_SIZE - 1);
-        let start = fault_page_hash(page) & (self.slots.len() - 1);
-        for probe in 0..self.slots.len() {
-            let index = start.wrapping_add(probe) & (self.slots.len() - 1);
-            let pointer = self.slots[index].load(Ordering::Acquire);
-            if pointer.is_null() {
-                return None;
-            }
-            let region = unsafe { &*pointer };
-            if native_pc < region.native_start || native_pc >= region.native_end {
-                continue;
-            }
-            let site_index = region
-                .sites
-                .partition_point(|site| site.native_start <= native_pc)
-                .checked_sub(1)?;
-            let site = region.sites.get(site_index)?;
-            return (native_pc < site.native_end).then_some(site);
+        let index = self
+            .regions
+            .partition_point(|region| region.native_start <= native_pc)
+            .checked_sub(1)?;
+        let region = &self.regions[index];
+        if native_pc >= region.native_end {
+            return None;
         }
-        None
+        let site_index = region
+            .sites
+            .partition_point(|site| site.native_start <= native_pc)
+            .checked_sub(1)?;
+        let site = &region.sites[site_index];
+        (native_pc < site.native_end).then_some(site)
     }
-
-    fn vacant_index_slot(&self, page: usize, selected: &BTreeSet<usize>) -> Option<usize> {
-        let start = fault_page_hash(page) & (self.slots.len() - 1);
-        for probe in 0..self.slots.len() {
-            let index = start.wrapping_add(probe) & (self.slots.len() - 1);
-            if self.slots[index].load(Ordering::Acquire).is_null() && !selected.contains(&index) {
-                return Some(index);
-            }
-        }
-        None
-    }
-}
-
-fn fault_page_hash(page: usize) -> usize {
-    (page / DIRECT_PAGE_SIZE).wrapping_mul(0x9e37_79b9_7f4a_7c15_usize)
 }
 
 fn validate_region(region: &NativeFaultRegion) -> Result<(), FaultRuntimeError> {
@@ -667,28 +566,10 @@ impl WorkerFaultContext {
         })
     }
 
-    /// Executes one native gateway with an immutable attribution snapshot.
-    ///
-    /// # Safety
-    ///
-    /// `context`, `entry`, `gateway`, dispatcher opaque data, and every
-    /// registry pointer must remain valid until this call returns.
-    pub unsafe fn invoke(
-        &mut self,
-        arena: DirectAddressSpaceView,
-        registry: &Arc<NativeFaultRegistry>,
-        dispatcher: FaultDispatcher,
-        opaque: *mut libc::c_void,
-        invocation: NativeInvocation,
-    ) -> Result<InvocationOutcome, FaultRuntimeError> {
-        unsafe { self.begin_batch(arena, registry, dispatcher, opaque) }?;
-        unsafe { self.invoke_active(invocation) }
-    }
-
     /// Capture faults without installing a second native-PC registry. The
     /// dispatcher attributes `CapturedFault::native_pc()` through the execution
     /// owner's already-protected directory, after returning from the signal.
-    /// Fixed interpreter stubs continue to use `invoke`/`begin_batch`.
+    /// Fixed interpreter stubs publish a batch snapshot for each slice.
     /// The landing leaf installs the invocation owner's saved caller FP state
     /// before entering Rust. Retry restores the untouched captured guest state;
     /// it neither commits FPSR nor changes the frontend's FP ownership fields.
@@ -752,17 +633,17 @@ impl WorkerFaultContext {
     ///
     /// `registry`, `opaque`, the arena and everything reachable from the
     /// dispatcher must outlive the matching [`Self::end_batch`].
-    pub unsafe fn begin_batch(
+    unsafe fn begin_batch(
         &mut self,
         arena: DirectAddressSpaceView,
-        registry: &Arc<NativeFaultRegistry>,
+        registry: &NativeFaultRegistry,
         dispatcher: FaultDispatcher,
         opaque: *mut libc::c_void,
     ) -> Result<(), FaultRuntimeError> {
         unsafe {
             self.begin_capture(
                 arena,
-                Arc::as_ptr(registry).cast_mut(),
+                std::ptr::from_ref(registry).cast_mut(),
                 None,
                 dispatcher,
                 opaque,
@@ -824,7 +705,7 @@ impl WorkerFaultContext {
     }
 
     /// Ends a previously published fixed-access batch.
-    pub fn end_batch(&mut self) -> Result<(), FaultRuntimeError> {
+    fn end_batch(&mut self) -> Result<(), FaultRuntimeError> {
         if self.tid == 0 {
             return Err(FaultRuntimeError::new(
                 "native fault context batch ended after unregistration",
@@ -849,7 +730,7 @@ impl WorkerFaultContext {
     ///
     /// `context` must point to the stub call layout and `entry` must be one of
     /// the immutable functions registered in the active registry.
-    pub unsafe fn invoke_stub_in_batch(
+    unsafe fn invoke_stub_in_batch(
         &mut self,
         context: *mut libc::c_void,
         entry: usize,
@@ -1210,9 +1091,8 @@ fn function_address(function: unsafe extern "C" fn(*mut libc::c_void)) -> usize 
     function as *const () as usize
 }
 
-fn memory_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRuntimeError> {
-    static REGISTRY: OnceLock<Result<Arc<NativeFaultRegistry>, FaultRuntimeError>> =
-        OnceLock::new();
+fn memory_stub_registry() -> Result<&'static NativeFaultRegistry, FaultRuntimeError> {
+    static REGISTRY: OnceLock<Result<NativeFaultRegistry, FaultRuntimeError>> = OnceLock::new();
     REGISTRY
         .get_or_init(|| {
             NativeFaultRegistry::new(vec![
@@ -1297,7 +1177,6 @@ fn memory_stub_registry() -> Result<&'static Arc<NativeFaultRegistry>, FaultRunt
                     16,
                 ),
             ])
-            .map(Arc::new)
         })
         .as_ref()
         .map_err(Clone::clone)
@@ -1314,7 +1193,7 @@ fn memory_stub_region(
     NativeFaultRegion {
         native_start,
         native_end,
-        sites: Arc::from([NativeFaultSite {
+        sites: Box::from([NativeFaultSite {
             native_start: site_start,
             native_end: site_end,
             access: NativeMemoryAccess {
@@ -2319,6 +2198,7 @@ mod tests {
     use std::ffi::CString;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Command;
+    use std::sync::Arc;
     use std::sync::Barrier;
 
     use nixe_cpu::memory::{ExecutionMemory, MemoryPermissions};
@@ -2604,7 +2484,7 @@ mod tests {
         let registry = NativeFaultRegistry::new(vec![NativeFaultRegion {
             native_start: start,
             native_end: start + 256,
-            sites: Arc::from([site]),
+            sites: Box::from([site]),
         }])
         .unwrap();
         (arena, Arc::new(registry))
@@ -2620,17 +2500,19 @@ mod tests {
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
-            worker.invoke(
-                view,
-                &registry,
-                retry,
-                std::ptr::from_ref(&arena).cast_mut().cast(),
-                NativeInvocation {
-                    gateway,
-                    context: std::ptr::from_mut(&mut context).cast(),
-                    entry: faulting_read as *const () as usize,
-                },
-            )
+            worker
+                .begin_batch(
+                    view,
+                    &registry,
+                    retry,
+                    std::ptr::from_ref(&arena).cast_mut().cast(),
+                )
+                .unwrap();
+            worker.invoke_active(NativeInvocation {
+                gateway,
+                context: std::ptr::from_mut(&mut context).cast(),
+                entry: faulting_read as *const () as usize,
+            })
         }
         .unwrap();
         assert_eq!(outcome, InvocationOutcome::Returned);
@@ -2657,17 +2539,19 @@ mod tests {
                     };
                     let mut worker = WorkerFaultContext::register().unwrap();
                     let outcome = unsafe {
-                        worker.invoke(
-                            view,
-                            &registry,
-                            retry_concurrently,
-                            Arc::as_ptr(&retry).cast_mut().cast(),
-                            NativeInvocation {
-                                gateway,
-                                context: std::ptr::from_mut(&mut context).cast(),
-                                entry: faulting_read as *const () as usize,
-                            },
-                        )
+                        worker
+                            .begin_batch(
+                                view,
+                                &registry,
+                                retry_concurrently,
+                                Arc::as_ptr(&retry).cast_mut().cast(),
+                            )
+                            .unwrap();
+                        worker.invoke_active(NativeInvocation {
+                            gateway,
+                            context: std::ptr::from_mut(&mut context).cast(),
+                            entry: faulting_read as *const () as usize,
+                        })
                     }
                     .unwrap();
                     (outcome, context.observed)
@@ -2696,7 +2580,7 @@ mod tests {
             NativeFaultRegistry::new(vec![NativeFaultRegion {
                 native_start: start,
                 native_end: std::ptr::addr_of!(nixe_x86_retry_probe_end).addr(),
-                sites: Arc::from([NativeFaultSite {
+                sites: Box::from([NativeFaultSite {
                     native_start: std::ptr::addr_of!(nixe_x86_retry_probe_fault).addr(),
                     native_end: std::ptr::addr_of!(nixe_x86_retry_probe_fault).addr() + 1,
                     access: NativeMemoryAccess {
@@ -2716,17 +2600,19 @@ mod tests {
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
-            worker.invoke(
-                view,
-                &registry,
-                retry,
-                std::ptr::from_ref(&arena).cast_mut().cast(),
-                NativeInvocation {
-                    gateway,
-                    context: std::ptr::from_mut(&mut context).cast(),
-                    entry: start,
-                },
-            )
+            worker
+                .begin_batch(
+                    view,
+                    &registry,
+                    retry,
+                    std::ptr::from_ref(&arena).cast_mut().cast(),
+                )
+                .unwrap();
+            worker.invoke_active(NativeInvocation {
+                gateway,
+                context: std::ptr::from_mut(&mut context).cast(),
+                entry: start,
+            })
         }
         .unwrap();
 
@@ -2744,7 +2630,7 @@ mod tests {
             NativeFaultRegistry::new(vec![NativeFaultRegion {
                 native_start: start,
                 native_end: std::ptr::addr_of!(nixe_x86_retry_store_probe_end).addr(),
-                sites: Arc::from([NativeFaultSite {
+                sites: Box::from([NativeFaultSite {
                     native_start: std::ptr::addr_of!(nixe_x86_retry_store_probe_fault).addr(),
                     native_end: std::ptr::addr_of!(nixe_x86_retry_store_probe_fault).addr() + 1,
                     access: NativeMemoryAccess {
@@ -2765,17 +2651,19 @@ mod tests {
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
-            worker.invoke(
-                view,
-                &registry,
-                retry_write,
-                std::ptr::from_ref(&arena).cast_mut().cast(),
-                NativeInvocation {
-                    gateway,
-                    context: std::ptr::from_mut(&mut context).cast(),
-                    entry: start,
-                },
-            )
+            worker
+                .begin_batch(
+                    view,
+                    &registry,
+                    retry_write,
+                    std::ptr::from_ref(&arena).cast_mut().cast(),
+                )
+                .unwrap();
+            worker.invoke_active(NativeInvocation {
+                gateway,
+                context: std::ptr::from_mut(&mut context).cast(),
+                entry: start,
+            })
         }
         .unwrap();
 
@@ -2796,7 +2684,7 @@ mod tests {
             NativeFaultRegistry::new(vec![NativeFaultRegion {
                 native_start: start,
                 native_end: std::ptr::addr_of!(nixe_aarch64_retry_probe_end).addr(),
-                sites: Arc::from([NativeFaultSite {
+                sites: Box::from([NativeFaultSite {
                     native_start: std::ptr::addr_of!(nixe_aarch64_retry_probe_fault).addr(),
                     native_end: std::ptr::addr_of!(nixe_aarch64_retry_probe_fault).addr() + 4,
                     access: NativeMemoryAccess {
@@ -2816,17 +2704,19 @@ mod tests {
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
-            worker.invoke(
-                view,
-                &registry,
-                retry,
-                std::ptr::from_ref(&arena).cast_mut().cast(),
-                NativeInvocation {
-                    gateway,
-                    context: std::ptr::from_mut(&mut context).cast(),
-                    entry: start,
-                },
-            )
+            worker
+                .begin_batch(
+                    view,
+                    &registry,
+                    retry,
+                    std::ptr::from_ref(&arena).cast_mut().cast(),
+                )
+                .unwrap();
+            worker.invoke_active(NativeInvocation {
+                gateway,
+                context: std::ptr::from_mut(&mut context).cast(),
+                entry: start,
+            })
         }
         .unwrap();
 
@@ -2844,7 +2734,7 @@ mod tests {
             NativeFaultRegistry::new(vec![NativeFaultRegion {
                 native_start: start,
                 native_end: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_end).addr(),
-                sites: Arc::from([NativeFaultSite {
+                sites: Box::from([NativeFaultSite {
                     native_start: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_fault).addr(),
                     native_end: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_fault).addr() + 4,
                     access: NativeMemoryAccess {
@@ -2865,17 +2755,19 @@ mod tests {
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
-            worker.invoke(
-                view,
-                &registry,
-                retry_write,
-                std::ptr::from_ref(&arena).cast_mut().cast(),
-                NativeInvocation {
-                    gateway,
-                    context: std::ptr::from_mut(&mut context).cast(),
-                    entry: start,
-                },
-            )
+            worker
+                .begin_batch(
+                    view,
+                    &registry,
+                    retry_write,
+                    std::ptr::from_ref(&arena).cast_mut().cast(),
+                )
+                .unwrap();
+            worker.invoke_active(NativeInvocation {
+                gateway,
+                context: std::ptr::from_mut(&mut context).cast(),
+                entry: start,
+            })
         }
         .unwrap();
 
@@ -2893,17 +2785,14 @@ mod tests {
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
-            worker.invoke(
-                view,
-                &registry,
-                escape,
-                std::ptr::null_mut(),
-                NativeInvocation {
-                    gateway,
-                    context: std::ptr::from_mut(&mut context).cast(),
-                    entry: faulting_read as *const () as usize,
-                },
-            )
+            worker
+                .begin_batch(view, &registry, escape, std::ptr::null_mut())
+                .unwrap();
+            worker.invoke_active(NativeInvocation {
+                gateway,
+                context: std::ptr::from_mut(&mut context).cast(),
+                entry: faulting_read as *const () as usize,
+            })
         }
         .unwrap();
         assert_eq!(outcome, InvocationOutcome::Escaped);
@@ -2940,17 +2829,14 @@ mod tests {
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
-            worker.invoke(
-                view,
-                &registry,
-                escape,
-                std::ptr::null_mut(),
-                NativeInvocation {
-                    gateway,
-                    context: std::ptr::from_mut(&mut context).cast(),
-                    entry: faulting_read as *const () as usize,
-                },
-            )
+            worker
+                .begin_batch(view, &registry, escape, std::ptr::null_mut())
+                .unwrap();
+            worker.invoke_active(NativeInvocation {
+                gateway,
+                context: std::ptr::from_mut(&mut context).cast(),
+                entry: faulting_read as *const () as usize,
+            })
         }
         .unwrap();
         assert_eq!(outcome, InvocationOutcome::Escaped);
@@ -3104,33 +2990,28 @@ mod tests {
     }
 
     #[test]
-    fn native_fault_registry_accepts_arbitrary_order_and_rejects_overlap_and_exhaustion() {
-        let registry = NativeFaultRegistry::with_capacity(2).unwrap();
-        registry
-            .publish(Arc::new(fake_region(0x2000, 0x2100)))
-            .unwrap();
-        registry
-            .publish(Arc::new(fake_region(0x1000, 0x1100)))
-            .unwrap();
+    fn native_fault_registry_sorts_regions_and_rejects_overlapping_metadata() {
+        let registry = NativeFaultRegistry::new(vec![
+            fake_region(0x2000, 0x2100),
+            fake_region(0x1000, 0x1100),
+        ])
+        .unwrap();
         assert!(registry.find(0x1018).is_some());
         assert!(registry.find(0x2018).is_some());
         assert!(
-            registry
-                .publish(Arc::new(fake_region(0x1080, 0x1180)))
-                .is_err()
+            NativeFaultRegistry::new(vec![
+                fake_region(0x1000, 0x1100),
+                fake_region(0x1080, 0x1180),
+            ])
+            .is_err()
         );
-        assert!(
-            registry
-                .publish(Arc::new(fake_region(0x3000, 0x3100)))
-                .is_err()
-        );
-
         let invalid = NativeFaultRegion {
             native_start: 0x2000,
             native_end: 0x2100,
-            sites: Arc::from([fake_site(0x2010, 0x2050), fake_site(0x2040, 0x2060)]),
+            sites: Box::from([fake_site(0x2010, 0x2050), fake_site(0x2040, 0x2060)]),
         };
         assert!(NativeFaultRegistry::new(vec![invalid]).is_err());
+        assert!(NativeFaultRegistry::new(vec![fake_region(0x2000, 0x2000)]).is_err());
     }
 
     #[test]
@@ -3286,42 +3167,48 @@ mod tests {
     }
 
     #[test]
-    fn registry_readers_observe_only_complete_published_regions() {
-        const REGIONS: usize = 256;
-        let registry = Arc::new(NativeFaultRegistry::with_capacity(REGIONS).unwrap());
-        let complete = Arc::new(AtomicBool::new(false));
-        let reader_registry = Arc::clone(&registry);
-        let reader_complete = Arc::clone(&complete);
-        let reader = std::thread::spawn(move || {
-            while !reader_complete.load(Ordering::Acquire) {
-                for index in 0..REGIONS {
-                    let start = 0x10_0000 + index * 0x100;
-                    if let Some(site) = reader_registry.find(start + 0x18) {
-                        assert_eq!(site.native_start, start + 0x10);
-                        assert_eq!(site.native_end, start + 0x20);
-                    }
-                }
+    fn immutable_registry_attributes_only_exact_sites_across_pages_and_gaps() {
+        let registry = NativeFaultRegistry::new(vec![
+            NativeFaultRegion {
+                native_start: 0x1000,
+                native_end: 0x4000,
+                sites: Box::from([
+                    fake_site(0x1010, 0x1020),
+                    fake_site(0x1ff8, 0x2008),
+                    fake_site(0x3010, 0x3020),
+                ]),
+            },
+            fake_region(0x4000, 0x4100),
+        ])
+        .unwrap();
+        for (start, end) in [
+            (0x1010, 0x1020),
+            (0x1ff8, 0x2008),
+            (0x3010, 0x3020),
+            (0x4010, 0x4020),
+        ] {
+            for pc in [start, end - 1] {
+                assert_eq!(registry.find(pc), Some(&fake_site(start, end)));
             }
-        });
-        for index in 0..REGIONS {
-            let start = 0x10_0000 + index * 0x100;
-            registry
-                .publish(Arc::new(fake_region(start, start + 0x100)))
-                .unwrap();
+            assert!(registry.find(start - 1).is_none());
+            assert!(registry.find(end).is_none());
         }
-        complete.store(true, Ordering::Release);
-        reader.join().unwrap();
-        for index in 0..REGIONS {
-            let start = 0x10_0000 + index * 0x100;
-            assert!(registry.find(start + 0x18).is_some());
+        for pc in [0, 0xfff, 0x1000, 0x3fff, 0x4000, 0x4100, usize::MAX] {
+            assert!(registry.find(pc).is_none());
         }
+        assert!(
+            NativeFaultRegistry::new(Vec::new())
+                .unwrap()
+                .find(0)
+                .is_none()
+        );
     }
 
     fn fake_region(start: usize, end: usize) -> NativeFaultRegion {
         NativeFaultRegion {
             native_start: start,
             native_end: end,
-            sites: Arc::from([fake_site(start + 0x10, start + 0x20)]),
+            sites: Box::from([fake_site(start + 0x10, start + 0x20)]),
         }
     }
 
@@ -3402,7 +3289,7 @@ mod tests {
                 NativeFaultRegistry::new(vec![NativeFaultRegion {
                     native_start: faulting_read as *const () as usize,
                     native_end: faulting_read as *const () as usize + 256,
-                    sites: Arc::from([]),
+                    sites: Box::from([]),
                 }])
                 .unwrap(),
             )
@@ -3454,17 +3341,14 @@ mod tests {
             panic!("fatal captured fault unexpectedly returned");
         }
         let _ = unsafe {
-            worker.invoke(
-                view,
-                &registry,
-                dispatcher,
-                std::ptr::null_mut(),
-                NativeInvocation {
-                    gateway,
-                    context: std::ptr::from_mut(&mut context).cast(),
-                    entry: faulting_read as *const () as usize,
-                },
-            )
+            worker
+                .begin_batch(view, &registry, dispatcher, std::ptr::null_mut())
+                .unwrap();
+            worker.invoke_active(NativeInvocation {
+                gateway,
+                context: std::ptr::from_mut(&mut context).cast(),
+                entry: faulting_read as *const () as usize,
+            })
         };
         panic!("fatal signal case unexpectedly returned");
     }

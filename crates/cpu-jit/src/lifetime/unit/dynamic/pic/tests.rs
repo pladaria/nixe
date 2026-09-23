@@ -1,26 +1,58 @@
+use super::weak::WeakBridge;
 use super::*;
+use crate::lifetime::Reader;
 use crate::lifetime::unit::dynamic::tests::source;
 use crate::lifetime::unit::tests::{key, process, publish};
 use crate::native::pic::WAYS;
 
-fn install(
+pub(super) fn install(
     reader: &mut Reader,
     process: &Lifetime,
     source: UnitHandle,
     map: u32,
     pc: u64,
-) -> PicHandle {
+) -> WeakBridge {
     let transfer = process
         .prepare_dynamic_bridge(source, map, key(pc))
         .unwrap()
         .unwrap();
-    reader.cache_bridge(transfer).unwrap()
+    cache(reader, transfer).unwrap()
 }
 
-fn cached(process: &Lifetime, handle: PicHandle) -> Option<usize> {
-    if handle.process != process.identity {
-        return None;
-    }
+pub(in crate::lifetime) fn cache(
+    reader: &mut Reader,
+    prepared: PreparedBridge<'_>,
+) -> Result<WeakBridge, Error> {
+    cache_at(reader, prepared.source_code.entries[0].key, prepared)
+}
+
+fn cache_at(
+    reader: &mut Reader,
+    entry: crate::abi::BlockKey,
+    prepared: PreparedBridge<'_>,
+) -> Result<WeakBridge, Error> {
+    let process = Arc::clone(&reader.process);
+    let registered = reader.handle;
+    let key = prepared.key;
+    let mut cpu = nixe_cpu::state::a64::A64State::default();
+    let mut frame = crate::lifetime::unit::tests::frame(&mut cpu);
+    let mut invocation = unsafe { reader.admit(&mut frame, entry) }?.unwrap();
+    let (native_frame, mut lookup) = invocation.frame_and_faults();
+    unsafe { native_frame.suspend_fp() };
+    unsafe { lookup.suspend_native() }.cache_bridge(prepared)?;
+    let state = process.lock();
+    let pic = &state.readers.get(registered).unwrap().pic;
+    let slot = pic.find(key).unwrap();
+    Ok(WeakBridge {
+        site: Site {
+            reader: registered,
+            slot,
+        },
+        generation: pic.way(slot).bridge.as_ref().unwrap().generation,
+    })
+}
+
+fn cached(process: &Lifetime, handle: WeakBridge) -> Option<usize> {
     let state = process.lock();
     let pic = &state.readers.get(handle.site.reader)?.pic;
     // These tests never run native probes concurrently with a table write.
@@ -420,7 +452,8 @@ fn pic_self_edge_and_stale_installation_release_both_adjacencies() {
     process.retire_unit(source).unwrap();
     close_retirements(&process);
     assert!(cached(&process, handle).is_none());
-    assert!(reader.cache_bridge(stale).is_err());
+    publish(&process, &cursor, &[4], Tier::Lcq);
+    assert!(cache_at(&mut reader, key(4), stale).is_err());
     assert!(process.try_shutdown().unwrap());
 }
 
@@ -438,7 +471,7 @@ fn pic_replacement_generation_exhaustion_preserves_existing_root() {
         .unwrap();
     process.lock().bridge_generations = CheckedCounter::exhausted();
     assert!(matches!(
-        reader.cache_bridge(transfer),
+        cache(&mut reader, transfer),
         Err(Error::Exhausted(_))
     ));
     assert!(cached(&process, existing).is_some());

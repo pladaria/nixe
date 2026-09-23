@@ -1,4 +1,5 @@
 use super::*;
+use crate::lifetime::unit::dynamic::pic::tests::cache;
 
 fn changed(owned: bool) -> (Arc<Lifetime>, UnitHandle) {
     let process = process();
@@ -35,7 +36,7 @@ fn backend_negative_is_boundary_scoped_weak_and_suppresses_repeats() {
             let committed = process.cache.usage().unwrap().committed;
             assert_eq!(
                 frozen
-                    .prepare_backend_negative(MemoryInvalidationCursor::new(42))
+                    .prepare_backend_negative()
                     .unwrap()
                     .install()
                     .unwrap(),
@@ -50,10 +51,7 @@ fn backend_negative_is_boundary_scoped_weak_and_suppresses_repeats() {
             );
             let usage = process.cache.usage().unwrap().metadata;
             metadata = Some(usage);
-            assert_eq!(
-                process.lock().units.negatives.get(key).unwrap().reason,
-                Rejection::BackendRejected
-            );
+            assert!(process.lock().units.negatives.get(key).is_some());
         }
         let retired = if owned {
             process
@@ -81,17 +79,15 @@ fn late_pic_root_cancels_backend_negative_with_unchanged_code_and_claims() {
         .unwrap()
         .freeze()
         .unwrap();
-    let prepared = frozen
-        .prepare_backend_negative(MemoryInvalidationCursor::INITIAL)
-        .unwrap();
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, super::key(20))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    let prepared = frozen.prepare_backend_negative().unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, super::key(20))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     frozen.check().unwrap();
     assert_eq!(prepared.install(), Err(Error::StalePublication));
     assert!(process.lock().units.negatives.get(key).is_none());
@@ -113,40 +109,40 @@ fn backend_entry_page_watch_catches_lcq_only_pic_changes_but_not_hits_or_other_p
             .unwrap();
         assert!(
             frozen
-                .prepare_backend_negative(MemoryInvalidationCursor::INITIAL)
+                .prepare_backend_negative()
                 .unwrap()
                 .install()
                 .unwrap()
         );
     };
     install();
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, super::key(0x2000))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, super::key(0x2000))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert!(process.lock().units.negatives.get(key).is_some());
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, super::key(20))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, super::key(20))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert!(process.lock().units.negatives.get(key).is_none());
     install(); // This candidate now includes PC 20 as a public entry.
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, super::key(20))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, super::key(20))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert!(process.lock().units.negatives.get(key).is_some());
     drop(reader);
     assert!(process.lock().units.negatives.get(key).is_none());
@@ -166,7 +162,7 @@ fn backend_negative_missing_input_and_pressure_defer_without_consuming_family_st
             .freeze()
             .unwrap();
         assert!(matches!(
-            frozen.prepare_backend_negative(MemoryInvalidationCursor::INITIAL),
+            frozen.prepare_backend_negative(),
             Err(Error::StalePublication)
         ));
         assert!(process.lock().units.negatives.get(key).is_none());
@@ -179,9 +175,7 @@ fn backend_negative_missing_input_and_pressure_defer_without_consuming_family_st
             .unwrap()
             .freeze()
             .unwrap();
-        let prepared = frozen
-            .prepare_backend_negative(MemoryInvalidationCursor::INITIAL)
-            .unwrap();
+        let prepared = frozen.prepare_backend_negative().unwrap();
         let usage = process.cache.usage().unwrap();
         let pressure = process
             .cache
@@ -199,7 +193,7 @@ fn backend_negative_missing_input_and_pressure_defer_without_consuming_family_st
         .unwrap();
     assert!(
         frozen
-            .prepare_backend_negative(MemoryInvalidationCursor::INITIAL)
+            .prepare_backend_negative()
             .unwrap()
             .install()
             .unwrap()
@@ -219,7 +213,7 @@ fn backend_entry_page_watch_tracks_static_roots_without_an_hcq_owner() {
             .unwrap();
         assert!(
             frozen
-                .prepare_backend_negative(MemoryInvalidationCursor::INITIAL)
+                .prepare_backend_negative()
                 .unwrap()
                 .install()
                 .unwrap()
@@ -256,7 +250,7 @@ fn backend_negative_can_record_a_complete_capped_candidate_and_watches_excluded_
         assert_eq!(frozen.graph().discovery.as_ref().unwrap().len(), 6);
         assert!(
             frozen
-                .prepare_backend_negative(MemoryInvalidationCursor::INITIAL)
+                .prepare_backend_negative()
                 .unwrap()
                 .install()
                 .unwrap()

@@ -299,7 +299,12 @@ fn later_unit_fault_epoch_delays_mixed_root_unlink_and_alias_visibility() {
             done_tx.send(()).unwrap();
         });
         owned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(!ticket.is_complete().unwrap());
+        assert!(
+            !process
+                .lifetime
+                .maintenance_complete(crate::lifetime::Reason::MappingChange, ticket)
+                .unwrap()
+        );
         assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert_eq!(
             process.memory.fetch32(SPACE, TARGET).unwrap().bits,
@@ -312,7 +317,12 @@ fn later_unit_fault_epoch_delays_mixed_root_unlink_and_alias_visibility() {
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         writer.join().unwrap();
     });
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .lifetime
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, ticket)
+            .unwrap()
+    );
     assert_eq!(
         process.memory.fetch32(SPACE, TARGET).unwrap().bits,
         0x91000800

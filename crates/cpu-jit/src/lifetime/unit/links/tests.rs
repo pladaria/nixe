@@ -559,13 +559,14 @@ fn publication_rejects_linkable_observations_and_missing_static_islands() {
             // Keep all terminal metadata/bytes valid but omit its reservation.
             input.code = process
                 .cache
-                .install(
+                .install_with_islands(
                     Output {
                         bytes,
                         alignment: 16,
                         metadata: *old.proofs.take().unwrap(),
                     },
                     Tier::Lcq,
+                    0,
                     |_| None,
                 )
                 .unwrap();
@@ -768,7 +769,7 @@ fn duplicate_registration_preserves_one_record_request_and_charge() {
     assert_ne!(process.pending.load(Ordering::Acquire), 0);
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();
-    transition.discard_pending_link(handle).unwrap();
+    transition.unlink_link(handle).unwrap();
     assert!(
         process
             .lock()
@@ -797,11 +798,8 @@ fn duplicate_registration_preserves_one_record_request_and_charge() {
     );
     assert_ne!(handle, reused);
     assert_eq!(process.cache.usage().unwrap(), usage);
-    assert_eq!(
-        transition.discard_pending_link(handle),
-        Err(Error::StaleUnit)
-    );
-    transition.discard_pending_link(reused).unwrap();
+    assert_eq!(transition.unlink_link(handle), Err(Error::StaleUnit));
+    transition.unlink_link(reused).unwrap();
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
 }
@@ -828,13 +826,19 @@ fn target_and_source_retirement_detach_only_their_pending_adjacency() {
     let keep = transition.register_link(prepared).unwrap();
     // Remove middle, head and tail of an incoming list / FIFO independently.
     for index in [10, 0, 19] {
-        transition.discard_pending_link(handles[index]).unwrap();
+        process.retire_unit(sources[index]).unwrap();
+        assert_eq!(transition.drain_retirements().unwrap(), 1);
     }
     process.retire_unit(sources[5]).unwrap();
     assert_eq!(transition.drain_retirements().unwrap(), 1);
-    assert_eq!(
-        transition.discard_pending_link(handles[5]),
-        Err(Error::StaleUnit)
+    assert!(
+        process
+            .lock()
+            .units
+            .links
+            .records
+            .get(handles[5].0)
+            .is_none()
     );
     process.retire_unit(target).unwrap();
     assert_eq!(transition.drain_retirements().unwrap(), 1);
@@ -854,7 +858,9 @@ fn target_and_source_retirement_detach_only_their_pending_adjacency() {
                 .is_none()
         );
     }
-    transition.discard_pending_link(keep).unwrap();
+    process.retire_unit(unrelated_target).unwrap();
+    assert_eq!(transition.drain_retirements().unwrap(), 1);
+    assert!(process.lock().units.links.records.get(keep.0).is_none());
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
 }
@@ -973,7 +979,7 @@ fn replacement_and_mapping_invalidation_cancel_old_preparations_not_other_units(
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();
     assert_eq!(transition.drain_retirements().unwrap(), 1);
-    assert_eq!(transition.discard_pending_link(old), Err(Error::StaleUnit));
+    assert!(process.lock().units.links.records.get(old.0).is_none());
     // Publication already replaced the uninstalled request. Retiring the old
     // target must leave the successor's roots and queue membership intact.
     let successor = pending(&process);

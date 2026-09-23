@@ -2,9 +2,9 @@
 //! belong to the caller, not to this lowering helper.
 
 use crate::{
+    frontend::Translator,
     jit_error::Error,
-    lowering::IntegerLowering,
-    simd_lowering::{SimdLowering, cast_integer, integer_lane_type, vector_type},
+    simd_lowering::{cast_integer, integer_lane_type, vector_type},
 };
 use cranelift_codegen::ir::{AtomicRmwOp, InstBuilder, Value, types};
 use nixe_cpu::{
@@ -56,14 +56,14 @@ pub(crate) fn split_pair(
 
 // Arm LSE RMW operations, including LDCLR's inverted AND operand.
 // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85#page=438
-pub(crate) fn atomic_rmw_operation<'a>(
-    lowering: &mut impl IntegerLowering<'a>,
+pub(crate) fn atomic_rmw_operation(
+    lowering: &mut Translator<'_>,
     kind: AtomicRmwKind,
     operand: Value,
 ) -> (AtomicRmwOp, Value) {
     match kind {
         AtomicRmwKind::Add => (AtomicRmwOp::Add, operand),
-        AtomicRmwKind::Clear => (AtomicRmwOp::And, lowering.builder().ins().bnot(operand)),
+        AtomicRmwKind::Clear => (AtomicRmwOp::And, lowering.builder.ins().bnot(operand)),
         AtomicRmwKind::Xor => (AtomicRmwOp::Xor, operand),
         AtomicRmwKind::Set => (AtomicRmwOp::Or, operand),
         AtomicRmwKind::SignedMaximum => (AtomicRmwOp::Smax, operand),
@@ -103,8 +103,8 @@ pub(crate) struct PairAddress {
 // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/LDP--Load-pair-of-registers-
 // LDNP/STNP also apply the signed offset (mode 0); only post-index uses base.
 // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab#page=910
-pub(crate) fn pair_address<'a>(
-    lowering: &mut impl IntegerLowering<'a>,
+pub(crate) fn pair_address(
+    lowering: &mut Translator<'_>,
     rn: u8,
     mode: u8,
     immediate: u8,
@@ -112,10 +112,10 @@ pub(crate) fn pair_address<'a>(
 ) -> Result<PairAddress, Error> {
     let base = lowering.read_register(rn, true)?;
     let offset = signed_immediate(u64::from(immediate), 7) * size.bytes() as i64;
-    let updated = lowering.builder().ins().iadd_imm_s(base, offset);
+    let updated = lowering.builder.ins().iadd_imm_s(base, offset);
     let first = if mode == 1 { base } else { updated };
     let second = lowering
-        .builder()
+        .builder
         .ins()
         .iadd_imm_u(first, size.bytes() as i64);
     Ok(PairAddress {
@@ -159,8 +159,8 @@ pub(crate) fn is_single_structure(instruction: fp_simd::Instruction) -> bool {
 // into the active vector width. These are bit transfers, not FP operations.
 // Arm Instruction Set Reference Guide, D6.104-D6.114:
 // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab#page=1363
-pub(crate) fn single_structure_store_value<'a>(
-    lowering: &mut impl SimdLowering<'a>,
+pub(crate) fn single_structure_store_value(
+    lowering: &mut Translator<'_>,
     register: u8,
     shape: SimdMemoryShape,
 ) -> Result<Value, Error> {
@@ -170,8 +170,8 @@ pub(crate) fn single_structure_store_value<'a>(
     structure_lane_store_value(lowering, register, shape.element_size, lane)
 }
 
-pub(crate) fn structure_lane_store_value<'a>(
-    lowering: &mut impl SimdLowering<'a>,
+pub(crate) fn structure_lane_store_value(
+    lowering: &mut Translator<'_>,
     register: u8,
     size: MemoryAccessSize,
     lane: u8,
@@ -179,15 +179,15 @@ pub(crate) fn structure_lane_store_value<'a>(
     let bits = size.bytes() as u32 * 8;
     let ty = vector_type(integer_lane_type(bits)?, bits)?;
     let vector = lowering.read_vector_as(register, ty)?;
-    Ok(lowering.builder().ins().extractlane(vector, lane))
+    Ok(lowering.builder.ins().extractlane(vector, lane))
 }
 
 // Arm LD1/2/3/4 (multiple structures) writes V[t,datasize] after each element.
 // Thus a 64-bit destination clears its upper half at its first successful read,
 // not at instruction completion. Later lanes preserve that already-zero half.
 // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
-pub(crate) fn write_multiple_structure_loaded<'a>(
-    lowering: &mut impl SimdLowering<'a>,
+pub(crate) fn write_multiple_structure_loaded(
+    lowering: &mut Translator<'_>,
     register: u8,
     shape: SimdMemoryShape,
     lane: u8,
@@ -196,20 +196,22 @@ pub(crate) fn write_multiple_structure_loaded<'a>(
     if shape.elements_per_register == 1 {
         // .1D replaces the whole architectural destination (upper half zero).
         // Do not load an old vector which liveness correctly marks as dead.
-        return write_vector_loaded(lowering, register, value);
+        write_vector_loaded(lowering, register, value);
+        return Ok(());
     }
     let bits = shape.element_size.bytes() as u32 * 8;
     let lane_ty = integer_lane_type(bits)?;
     let ty = vector_type(lane_ty, bits)?;
     let previous = lowering.read_vector_as(register, ty)?;
-    let value = cast_integer(lowering.builder(), value, lane_ty, false);
-    let result = lowering.builder().ins().insertlane(previous, value, lane);
+    let value = cast_integer(&mut lowering.builder, value, lane_ty, false);
+    let result = lowering.builder.ins().insertlane(previous, value, lane);
     let result = lowering.finish_vector(result, shape.vector_bytes == 16 || lane != 0);
-    lowering.write_vector(register, result)
+    lowering.write_vector(register, result);
+    Ok(())
 }
 
-pub(crate) fn write_single_structure_loaded<'a>(
-    lowering: &mut impl SimdLowering<'a>,
+pub(crate) fn write_single_structure_loaded(
+    lowering: &mut Translator<'_>,
     register: u8,
     shape: SimdMemoryShape,
     value: Value,
@@ -217,28 +219,29 @@ pub(crate) fn write_single_structure_loaded<'a>(
     let bits = shape.element_size.bytes() as u32 * 8;
     let lane_ty = integer_lane_type(bits)?;
     let ty = vector_type(lane_ty, bits)?;
-    let value = cast_integer(lowering.builder(), value, lane_ty, false);
+    let value = cast_integer(&mut lowering.builder, value, lane_ty, false);
     let result = match shape.mode {
         SimdMemoryMode::Lane(lane) => {
             let previous = lowering.read_vector_as(register, ty)?;
-            let result = lowering.builder().ins().insertlane(previous, value, lane);
+            let result = lowering.builder.ins().insertlane(previous, value, lane);
             lowering.vector_as(result, types::I8X16)
         }
         SimdMemoryMode::Replicate => {
-            let result = lowering.builder().ins().splat(ty, value);
+            let result = lowering.builder.ins().splat(ty, value);
             lowering.finish_vector(result, shape.vector_bytes == 16)
         }
         SimdMemoryMode::Multiple => {
             return Err(Error::internal("multiple mode in single-structure load"));
         }
     };
-    lowering.write_vector(register, result)
+    lowering.write_vector(register, result);
+    Ok(())
 }
 
 /// Call only after all subaccesses have completed. SIMD transfers do not alter
 /// any integer offset register before this writeback, even when Rm equals Rn.
-pub(crate) fn structure_writeback<'a>(
-    lowering: &mut impl IntegerLowering<'a>,
+pub(crate) fn structure_writeback(
+    lowering: &mut Translator<'_>,
     instruction: fp_simd::Instruction,
     base: Value,
     immediate: u8,
@@ -251,14 +254,14 @@ pub(crate) fn structure_writeback<'a>(
         let f = instruction.operands();
         let offset = if f.rm == 31 {
             lowering
-                .builder()
+                .builder
                 .ins()
                 .iconst(types::I64, i64::from(immediate))
         } else {
             lowering.read_register(f.rm, false)?
         };
-        let value = lowering.builder().ins().iadd(base, offset);
-        lowering.write_register_with_sp(f.rn, true, value)?;
+        let value = lowering.builder.ins().iadd(base, offset);
+        lowering.write_register_with_sp(f.rn, true, value);
     }
     Ok(())
 }
@@ -266,8 +269,8 @@ pub(crate) fn structure_writeback<'a>(
 // Arm DDI 0602: SIMD/FP loads zero bits above the transferred element; stores
 // transfer low bits without interpreting them as floating point.
 // https://developer.arm.com/documentation/ddi0602/2024-03/SIMD-FP-Instructions/LDR--immediate--SIMD-FP---Load-SIMD-FP-Register--immediate-offset--
-pub(crate) fn vector_address<'a>(
-    lowering: &mut impl IntegerLowering<'a>,
+pub(crate) fn vector_address(
+    lowering: &mut Translator<'_>,
     instruction: fp_simd::Instruction,
 ) -> Result<VectorAccess, Error> {
     use fp_simd::Instruction::*;
@@ -278,12 +281,12 @@ pub(crate) fn vector_address<'a>(
     let mut writeback = None;
     let address = match instruction {
         MemoryUnsigned(_) => lowering
-            .builder()
+            .builder
             .ins()
             .iadd_imm_u(base, i64::from(f.immediate_12) * size.bytes() as i64),
         MemoryUnscaled(_) | MemoryPreIndex(_) | MemoryPostIndex(_) => {
             let updated = lowering
-                .builder()
+                .builder
                 .ins()
                 .iadd_imm_s(base, signed_immediate(u64::from(f.immediate_9), 9));
             if !matches!(instruction, MemoryUnscaled(_)) {
@@ -311,8 +314,8 @@ pub(crate) fn vector_address<'a>(
     })
 }
 
-pub(crate) fn vector_store_value<'a>(
-    lowering: &mut impl SimdLowering<'a>,
+pub(crate) fn vector_store_value(
+    lowering: &mut Translator<'_>,
     register: u8,
     size: MemoryAccessSize,
 ) -> Result<Value, Error> {
@@ -320,33 +323,29 @@ pub(crate) fn vector_store_value<'a>(
         return lowering.read_vector_as(register, types::I8X16);
     }
     let vector = lowering.read_vector_as(register, types::I64X2)?;
-    let low = lowering.builder().ins().extractlane(vector, 0);
+    let low = lowering.builder.ins().extractlane(vector, 0);
     let ty = cranelift_codegen::ir::Type::int(size.bytes() as u16 * 8).unwrap();
     Ok(if ty == types::I64 {
         low
     } else {
-        lowering.builder().ins().ireduce(ty, low)
+        lowering.builder.ins().ireduce(ty, low)
     })
 }
 
-pub(crate) fn write_vector_loaded<'a>(
-    lowering: &mut impl SimdLowering<'a>,
-    register: u8,
-    value: Value,
-) -> Result<(), Error> {
-    let ty = lowering.builder().func.dfg.value_type(value);
+pub(crate) fn write_vector_loaded(lowering: &mut Translator<'_>, register: u8, value: Value) {
+    let ty = lowering.builder.func.dfg.value_type(value);
     let value = if ty.is_vector() {
         value
     } else {
         let low = if ty == types::I64 {
             value
         } else {
-            lowering.builder().ins().uextend(types::I64, value)
+            lowering.builder.ins().uextend(types::I64, value)
         };
-        lowering.builder().ins().scalar_to_vector(types::I64X2, low)
+        lowering.builder.ins().scalar_to_vector(types::I64X2, low)
     };
     let value = lowering.vector_as(value, types::I8X16);
-    lowering.write_vector(register, value)
+    lowering.write_vector(register, value);
 }
 
 pub(crate) fn is_scalar(instruction: Instruction) -> bool {
@@ -367,8 +366,8 @@ pub(crate) fn is_scalar(instruction: Instruction) -> bool {
 // zero-register and SP interpretation is determined by each operand.
 // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/LDR--immediate---Load-Register--immediate--
 // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/LDR--register---Load-Register--register--
-pub(crate) fn scalar_address<'a>(
-    lowering: &mut impl IntegerLowering<'a>,
+pub(crate) fn scalar_address(
+    lowering: &mut Translator<'_>,
     pc: GuestVirtualAddress,
     instruction: Instruction,
 ) -> Result<ScalarAccess, Error> {
@@ -405,7 +404,7 @@ pub(crate) fn scalar_address<'a>(
             .get()
             .wrapping_add_signed(signed_immediate(u64::from(f.immediate_19), 19) << 2);
         return Ok(ScalarAccess {
-            address: lowering.builder().ins().iconst(types::I64, address as i64),
+            address: lowering.builder.ins().iconst(types::I64, address as i64),
             size,
             transfer: ScalarTransfer::Load(load),
             ordering: MemoryOrdering::Relaxed,
@@ -420,12 +419,12 @@ pub(crate) fn scalar_address<'a>(
     let mut writeback = None;
     let address = match instruction {
         Instruction::Unsigned(_) => lowering
-            .builder()
+            .builder
             .ins()
             .iadd_imm_u(base, i64::from(f.immediate_12) * size.bytes() as i64),
         Instruction::Unscaled(_) | Instruction::PreIndex(_) | Instruction::PostIndex(_) => {
             let updated = lowering
-                .builder()
+                .builder
                 .ins()
                 .iadd_imm_s(base, signed_immediate(u64::from(f.immediate_9), 9));
             if !matches!(instruction, Instruction::Unscaled(_)) {
@@ -456,8 +455,8 @@ pub(crate) fn scalar_address<'a>(
     })
 }
 
-fn register_address<'a>(
-    lowering: &mut impl IntegerLowering<'a>,
+fn register_address(
+    lowering: &mut Translator<'_>,
     base: Value,
     rm: u8,
     option: u8,
@@ -467,11 +466,11 @@ fn register_address<'a>(
     let raw = lowering.read_register(rm, false)?;
     let offset = match option {
         2 | 6 => {
-            let word = lowering.builder().ins().ireduce(types::I32, raw);
+            let word = lowering.builder.ins().ireduce(types::I32, raw);
             if option == 2 {
-                lowering.builder().ins().uextend(types::I64, word)
+                lowering.builder.ins().uextend(types::I64, word)
             } else {
-                lowering.builder().ins().sextend(types::I64, word)
+                lowering.builder.ins().sextend(types::I64, word)
             }
         }
         3 | 7 => raw,
@@ -483,30 +482,30 @@ fn register_address<'a>(
     };
     let offset = if scaled {
         lowering
-            .builder()
+            .builder
             .ins()
             .ishl_imm_u(offset, i64::from(size.bytes().trailing_zeros()))
     } else {
         offset
     };
-    Ok(lowering.builder().ins().iadd(base, offset))
+    Ok(lowering.builder.ins().iadd(base, offset))
 }
 
-pub(crate) fn write_loaded<'a>(
-    lowering: &mut impl IntegerLowering<'a>,
+pub(crate) fn write_loaded(
+    lowering: &mut Translator<'_>,
     register: u8,
     load: LoadSpec,
     value: Value,
-) -> Result<(), Error> {
+) {
     let target = if load.destination_bits == 64 {
         types::I64
     } else {
         types::I32
     };
-    let value = if load.signed && lowering.builder().func.dfg.value_type(value) != target {
-        lowering.builder().ins().sextend(target, value)
+    let value = if load.signed && lowering.builder.func.dfg.value_type(value) != target {
+        lowering.builder.ins().sextend(target, value)
     } else {
         value
     };
-    lowering.write_integer(register, false, value)
+    lowering.write_integer(register, false, value);
 }

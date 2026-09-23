@@ -185,23 +185,12 @@ impl HostFpState {
     ///
     /// # Safety
     /// Same invocation/thread, and the helper succeeded. FP mode replacement
-    /// must use `end`, not resume a segment from the old mode.
+    /// must finish the invocation, not resume a segment from the old mode.
     pub unsafe fn resume(&mut self, fpcr: u32) -> Result<(), UnsupportedFpControl> {
         if self.suspended == 0 {
             return Ok(());
         }
         unsafe { self.ensure(fpcr) }
-    }
-
-    /// Finish a segment without making it resumable. Commit the returned status
-    /// before replacing architectural FPCR/FPSR.
-    ///
-    /// # Safety
-    /// Same requirements as `suspend`.
-    pub unsafe fn end(&mut self) -> u32 {
-        let status = unsafe { self.suspend() };
-        self.suspended = 0;
-        status
     }
 
     /// End the invocation and restore the original caller environment, even
@@ -237,6 +226,7 @@ impl NativeFrame<'_> {
     /// # Safety
     /// Same invocation/thread as `begin_fp`. Canonical FPCR is current and
     /// no general Rust work runs while active.
+    #[cfg(test)]
     pub unsafe fn ensure_fp(&mut self) -> Result<(), UnsupportedFpControl> {
         unsafe { self.host_fp.ensure(*self.canonical.fpcr) }
     }
@@ -255,19 +245,9 @@ impl NativeFrame<'_> {
     ///
     /// # Safety
     /// Same invocation/thread; canonical FPCR is current and unchanged in an
-    /// existing segment. A mode replacement must use `end_fp`.
+    /// existing segment. A mode replacement must finish the native invocation.
     pub unsafe fn resume_fp(&mut self) -> Result<(), UnsupportedFpControl> {
         unsafe { self.host_fp.resume(*self.canonical.fpcr) }
-    }
-
-    /// End the current segment before an FPCR/FPSR replacement.
-    ///
-    /// # Safety
-    /// Same invocation/thread as `begin_fp`; mapped software FPSR is canonical.
-    /// Perform the replacement only afterward.
-    pub unsafe fn end_fp(&mut self) {
-        let status = unsafe { self.host_fp.end() };
-        unsafe { *self.canonical.fpsr |= status };
     }
 
     /// Complete canonical FP writeback and restore the original caller.

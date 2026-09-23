@@ -161,6 +161,7 @@ impl Graph {
 
 mod discovery;
 pub(crate) use discovery::DiscoveryError;
+#[cfg(test)]
 pub(crate) use discovery::StructuralReason;
 pub(crate) mod flow;
 mod trim;

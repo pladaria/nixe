@@ -1,6 +1,7 @@
 use super::super::tests::work;
 use super::*;
 use crate::lifetime::background::tests::{setup, snapshot};
+use crate::lifetime::unit::dynamic::pic::tests::cache;
 use crate::lifetime::unit::{
     EdgeKind,
     links::tests::{source, source_input},
@@ -40,9 +41,9 @@ fn freeze_does_not_export_demanded_internal_leaders_or_create_coverage_slots() {
     assert!(!process.lock().keys.contains_key(&key(8)));
     frozen.validate_locked(&process.lock()).unwrap();
     let analysis = frozen.analyze().unwrap();
-    assert_eq!(analysis.blocks.len(), frozen.graph().blocks.len());
+    assert_eq!(analysis.native.blocks.len(), frozen.graph().blocks.len());
     assert_eq!(
-        analysis.instructions.len(),
+        analysis.native.instructions.len(),
         frozen.graph().instructions.len()
     );
 }
@@ -125,14 +126,14 @@ fn freeze_sees_registered_indirect_and_return_roots() {
         let src =
             crate::lifetime::unit::dynamic::tests::source(&process, &AtomicU64::new(0), 128, kind);
         let mut reader = process.register().unwrap();
-        reader
-            .cache_bridge(
-                process
-                    .prepare_dynamic_bridge(src, 0, key(4))
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
+        cache(
+            &mut reader,
+            process
+                .prepare_dynamic_bridge(src, 0, key(4))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         let work = work(&process, &queue, &mut samples, 0);
         let frozen = work
             .reserve_candidate(Graph::discover(&work).unwrap())
@@ -162,14 +163,14 @@ fn freeze_never_reselects_late_incoming_links_and_rejects_replaced_inputs() {
         .freeze()
         .unwrap();
     assert_eq!(frozen.entries(), &[0]);
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(src, 0, key(4))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(src, 0, key(4))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     // A new demand not affecting any captured input cannot change this list.
     publish_words(&process, 16, &[RET]);
     frozen.check().unwrap();
@@ -196,14 +197,14 @@ fn freeze_cancels_a_new_external_interior_entry_before_backend_work() {
         .unwrap();
     assert_eq!(candidate.graph().blocks.len(), 1);
     publish_words(&process, 4, &[RET]);
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(src, 0, key(4))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(src, 0, key(4))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert!(matches!(candidate.freeze(), Err(CompileError::Cancelled)));
     assert!(process.lock().candidates.entries.is_empty());
     work.check().unwrap();

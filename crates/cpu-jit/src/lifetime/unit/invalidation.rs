@@ -1,7 +1,6 @@
 //! Exact memory targets queued in the existing unit retirement records.
 
 use super::*;
-use crate::lifetime::Ticket;
 use nixe_memory::MemoryInvalidationKind;
 
 #[cfg(test)]
@@ -20,7 +19,7 @@ impl UnitRecord {
         }
         self.lifecycle = Lifecycle::Invalidating;
         // Preserve the earliest request: a newer batch cannot hide unfinished
-        // work from an older one. Existing eviction/cutover tickets also remain
+        // work from an older one. Existing eviction/cutover sequences also remain
         // pending until this same record is unlinked.
         self.invalidation.get_or_insert(sequence);
         if self.retirement.is_none() {
@@ -45,7 +44,7 @@ impl Lifetime {
     pub(crate) fn invalidate_memory(
         &self,
         changes: &[MemoryInvalidationKind],
-    ) -> Result<Ticket<'_>, Error> {
+    ) -> Result<MaintenanceSequence, Error> {
         for change in changes {
             if let MemoryInvalidationKind::Mapping { start, size, .. } = change
                 && u128::from(start.get()) + u128::from(*size) > (1_u128 << 64)
@@ -56,7 +55,7 @@ impl Lifetime {
             }
         }
         let mut state = self.lock();
-        let ticket = self.request_locked(&mut state, Reason::MappingChange)?;
+        let sequence = self.request_locked(&mut state, Reason::MappingChange)?;
         let units = &mut state.units;
         for change in changes {
             match *change {
@@ -71,7 +70,7 @@ impl Lifetime {
                                     dependency.unit.0,
                                     &mut units.retirements,
                                     &mut units.negatives,
-                                    ticket.sequence,
+                                    sequence,
                                 );
                         }
                     }
@@ -96,7 +95,7 @@ impl Lifetime {
                                 handle,
                                 &mut units.retirements,
                                 &mut units.negatives,
-                                ticket.sequence,
+                                sequence,
                             );
                         }
                     }
@@ -108,7 +107,7 @@ impl Lifetime {
                                 handle,
                                 &mut units.retirements,
                                 &mut units.negatives,
-                                ticket.sequence,
+                                sequence,
                             );
                         }
                     }
@@ -140,7 +139,7 @@ impl Lifetime {
                         handle.0,
                         &mut units.retirements,
                         &mut units.negatives,
-                        ticket.sequence,
+                        sequence,
                     );
                 break;
             }
@@ -148,28 +147,6 @@ impl Lifetime {
         let removed = state.units.negatives.take_removed();
         drop(state);
         drop(removed);
-        Ok(ticket)
-    }
-
-    /// Conservative resynchronization after explicit invalidation-history loss.
-    /// The consumer must register this work before advancing its cursor. Like
-    /// exact invalidation, this is not a substitute for the pre-mutation stop.
-    pub(crate) fn invalidate_all_memory(&self) -> Result<Ticket<'_>, Error> {
-        let mut state = self.lock();
-        let ticket = self.request_locked(&mut state, Reason::MappingChange)?;
-        let units = &mut state.units;
-        units.negatives.invalidate_all();
-        for (handle, record) in units.records.iter_mut() {
-            record.invalidate(
-                handle,
-                &mut units.retirements,
-                &mut units.negatives,
-                ticket.sequence,
-            );
-        }
-        let removed = units.negatives.take_removed();
-        drop(state);
-        drop(removed);
-        Ok(ticket)
+        Ok(sequence)
     }
 }

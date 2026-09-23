@@ -1,267 +1,11 @@
 use super::*;
-use canonical::{complete, native, pattern};
+use canonical::native;
 use nixe_cpu::state::a64::A64State;
 
 pub(super) fn landing(abi: HostAbi) -> Vec<u8> {
     match abi {
         HostAbi::X86_64 => vec![0xf3, 0x0f, 0x1e, 0xfa],
         HostAbi::Aarch64 => 0xd50324dfu32.to_le_bytes().to_vec(), // BTI jc
-    }
-}
-
-pub(super) fn compile(bytes: &[u8]) -> (JITModule, cranelift_module::FuncId) {
-    check_host().unwrap();
-    let mut module = JITModule::new(JITBuilder::new(default_libcall_names()).unwrap());
-    let id = module
-        .declare_function("gateway_unit", Linkage::Local, &module.make_signature())
-        .unwrap();
-    module.define_function_bytes(id, 16, bytes, &[]).unwrap();
-    module.finalize_definitions().unwrap();
-    (module, id)
-}
-
-#[test]
-fn real_gateway_links_independent_units_and_completes_canonical_exit() {
-    let _restore = crate::fp_env::tests::RestoreHost::new();
-    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
-        // Both encoders are exercised; only host-compatible bytes execute.
-        for layout in 0..3 {
-            let cycle = layout != 0;
-            for fp in [false, true] {
-                let (mut source, mut entry) = complete(abi);
-                if layout == 2 {
-                    // AArch64 has enough vector registers for this source.
-                    // Place V31 in a fixed spill explicitly so both hosts must
-                    // break the same vector-register/spill cycle at the link.
-                    for bindings in [&mut source.bindings, &mut entry.bindings] {
-                        std::sync::Arc::make_mut(bindings)
-                            .iter_mut()
-                            .find(|b| b.value == GuestValue::Vector(31))
-                            .unwrap()
-                            .location = spill(3264, 16);
-                    }
-                }
-                let mut target = entry.clone();
-                if cycle {
-                    let a = target.bindings[0].location;
-                    std::sync::Arc::make_mut(&mut target.bindings)[0].location =
-                        target.bindings[1].location;
-                    std::sync::Arc::make_mut(&mut target.bindings)[1].location = a;
-                    target.nzcv = NzcvLocation::Host {
-                        carry_inverted: true,
-                    };
-                }
-                if layout == 2 {
-                    // Extend the GPR swap to a three-way GPR/GPR/spill cycle.
-                    // Swap V0 and V31 as a separate 128-bit register/spill cycle.
-                    for (a, b) in [
-                        (GuestValue::General(0), GuestValue::General(30)),
-                        (GuestValue::Vector(0), GuestValue::Vector(31)),
-                    ] {
-                        let a = target.bindings.iter().position(|v| v.value == a).unwrap();
-                        let b = target.bindings.iter().position(|v| v.value == b).unwrap();
-                        assert!(matches!(
-                            target.bindings[a].location,
-                            ValueLocation::Register { .. }
-                        ));
-                        assert!(matches!(
-                            target.bindings[b].location,
-                            ValueLocation::Spill { .. }
-                        ));
-                        let location = target.bindings[a].location;
-                        std::sync::Arc::make_mut(&mut target.bindings)[a].location =
-                            target.bindings[b].location;
-                        std::sync::Arc::make_mut(&mut target.bindings)[b].location = location;
-                    }
-                }
-                let mut exit = source.clone();
-                exit.bindings = target.bindings.clone();
-                exit.nzcv = target.nzcv.clone();
-                exit.site.source = CodeVersion::new(93).unwrap();
-                exit.site.state_map = 0x12345678;
-                exit.host_fpsr_pending = fp;
-                // Compose lazy NZCV materialization with the real cyclic link,
-                // active guest FP and the complete gateway return protocol.
-                if cycle {
-                    source.nzcv = NzcvLocation::Deferred(LazyFlags::Logical {
-                        result: source.bindings[0].location,
-                        width: 64,
-                    });
-                }
-                let reason = if cycle {
-                    NativeExitReason::Control
-                } else {
-                    NativeExitReason::Dispatch
-                };
-                let mut second = landing(abi);
-                second.extend(
-                    emit_canonical_exit(
-                        &exit,
-                        ValueLocation::constant(0xfedcba9876543210),
-                        reason,
-                        0,
-                    )
-                    .unwrap(),
-                );
-                let transfer = emit_chain_transfer(&source, &target).unwrap();
-                assert_eq!(transfer.is_empty(), !cycle);
-                if !native(abi) {
-                    continue;
-                }
-                // This is compiler-owned code, not a dispatch read. Both owners
-                // stay alive through execution; no published dispatch/link root.
-                let (second_owner, second_id) = compile(&second);
-                let target_address = second_owner.get_finalized_function(second_id);
-                let mut first = landing(abi);
-                if fp {
-                    let mut emitter = moves::Emitter::new(abi);
-                    emitter.copy(moves::Copy {
-                        source: ValueLocation::constant(1.0f64.to_bits() as u128),
-                        destination: vector(0),
-                        bytes: 8,
-                    });
-                    emitter.copy(moves::Copy {
-                        source: ValueLocation::constant(0),
-                        destination: vector(1),
-                        bytes: 8,
-                    });
-                    first.extend(emitter.finish());
-                    match abi {
-                        HostAbi::X86_64 => first.extend([0xf2, 0x0f, 0x5e, 0xc1]), // DIVSD xmm0,xmm1
-                        HostAbi::Aarch64 => first.extend(0x1e611800u32.to_le_bytes()), // FDIV d0,d0,d1
-                    }
-                }
-                first.extend(emit_canonical_entry(&entry).unwrap());
-                let mut capture = moves::Emitter::new(abi);
-                for (reg, offset) in [
-                    (abi.reserved().arena, 3504),
-                    (abi.reserved().poll, 3512),
-                    (abi.reserved().frame, 3520),
-                ] {
-                    capture.memory(false, RegisterClass::Integer, reg, offset, 8);
-                }
-                first.extend(capture.finish());
-                // Capture the helper-call stack alignment without changing SP.
-                match abi {
-                    HostAbi::X86_64 => first.extend([0x49, 0x89, 0xe3]), // MOV r11,rsp
-                    HostAbi::Aarch64 => first.extend(0x910003f0u32.to_le_bytes()), // MOV x16,sp
-                }
-                let mut capture = moves::Emitter::new(abi);
-                capture.memory(
-                    false,
-                    RegisterClass::Integer,
-                    abi.reserved().link_scratch[0],
-                    3528,
-                    8,
-                );
-                first.extend(capture.finish());
-                match abi {
-                    HostAbi::X86_64 => first.extend([0x49, 0x83, 0xee, 20]), // SUB r14,20
-                    HostAbi::Aarch64 => first.extend((0xd1000294u32 | (20 << 10)).to_le_bytes()), // SUB x20,x20,20
-                }
-                first.extend(transfer);
-                let mut branch = moves::Emitter::new(abi);
-                let scratch = abi.reserved().link_scratch[0];
-                branch.constant(scratch, target_address as u64, 8);
-                branch.jump_register(scratch);
-                first.extend(branch.finish());
-                let (first_owner, first_id) = compile(&first);
-                let (mut state, _) = pattern(&entry);
-                state.set_fpcr(0);
-                state.set_fpsr(1 << 27);
-                let mut before = state.clone();
-                {
-                    let mut frame = NativeFrame::new(&mut state, PollBudget::new(7, 11).unwrap());
-                    unsafe { frame.begin_fp() };
-                    // Isolated invocation proof: both synthetic owners remain
-                    // alive; the LCQ chain tests exercise real reader admission.
-                    frame.execution_epoch = 7;
-                    let address = first_owner.get_finalized_function(first_id);
-                    let outcome = unsafe {
-                        if fp {
-                            frame.ensure_fp().unwrap();
-                        }
-                        enter_protected(&mut frame, std::ptr::dangling_mut(), address)
-                    }
-                    .unwrap();
-                    assert_eq!(outcome.reason, reason);
-                    assert_eq!(
-                        outcome.poll,
-                        PollOutcome {
-                            sample: !cycle,
-                            exhausted: true
-                        }
-                    );
-                    assert_eq!(
-                        (frame.budget.sample_remaining, frame.budget.slice_remaining),
-                        (4083, -9)
-                    );
-                    assert_eq!(frame.exit_pc, 0xfedcba9876543210);
-                    assert!(
-                        (target_address as usize..target_address as usize + second.len())
-                            .contains(&frame.exit_native_pc)
-                    );
-                    assert_eq!(
-                        (frame.exit_source_version, frame.exit_state_map),
-                        (93, 0x12345678)
-                    );
-                    assert_eq!(frame.execution_epoch, 7);
-                    assert_eq!(frame.gateway_exit, 0);
-                    assert_eq!((frame.host_fp.saved, frame.host_fp.active), (0, 0));
-                    // FP and software state must be complete BEFORE quiescence.
-                    assert_eq!(
-                        unsafe { *frame.canonical.fpsr },
-                        (1 << 27) | if fp { 2 } else { 0 }
-                    );
-                    let mut caller = HostFpState::default();
-                    unsafe {
-                        caller.begin();
-                        caller.finish();
-                    }
-                    assert_eq!(
-                        (caller.saved_control, caller.saved_status),
-                        (frame.host_fp.saved_control, frame.host_fp.saved_status)
-                    );
-                    for (offset, expected) in [
-                        (3504, 1),
-                        (3512, 7),
-                        (3520, &frame as *const NativeFrame as u64),
-                    ] {
-                        let mut bytes = [0; 8];
-                        for (i, byte) in bytes.iter_mut().enumerate() {
-                            *byte = unsafe { frame.spill[offset + i].assume_init() };
-                        }
-                        assert_eq!(u64::from_le_bytes(bytes), expected);
-                    }
-                    assert_eq!(unsafe { frame.spill[3528].assume_init() } & 15, 0);
-                    frame.execution_epoch = 0;
-                }
-                assert_eq!(
-                    state.general_register_storage_mut(),
-                    before.general_register_storage_mut()
-                );
-                for i in 0..32 {
-                    assert_eq!(state.vector(i), before.vector(i));
-                }
-                assert_eq!(
-                    state.stack_pointer_storage_mut(),
-                    before.stack_pointer_storage_mut()
-                );
-                let expected_flags = if cycle {
-                    let value = before.general_register_storage_mut()[0];
-                    ((value >> 63) as u32) << 31 | (u32::from(value == 0) << 30)
-                } else {
-                    before.nzcv().bits()
-                };
-                assert_eq!(state.nzcv().bits(), expected_flags);
-                assert_eq!(state.fpsr(), (1 << 27) | if fp { 2 } else { 0 });
-                assert_eq!(state.pc(), 0xfedcba9876543210);
-                unsafe {
-                    first_owner.free_memory();
-                    second_owner.free_memory();
-                }
-            }
-        }
     }
 }
 
@@ -297,18 +41,12 @@ fn canonical_exit_preserves_dynamic_pc_until_writeback_finishes() {
             spill(2048, 8),
             ValueLocation::constant(0x123456789abcdef0),
         ] {
-            let (mut source, entry) = contracts(abi, &[(GuestValue::General(0), pc, pc)]);
-            // Constant exit sources are valid, constant ingress destinations aren't.
-            let mut code = landing(abi);
-            if !matches!(pc, ValueLocation::Constant(_)) {
-                code.extend(emit_canonical_entry(&entry).unwrap());
-            }
-            source.dirty_live = source.live;
-            code.extend(emit_canonical_exit(&source, pc, NativeExitReason::Control, 0).unwrap());
             if !native(abi) {
                 continue;
             }
+            let (source, entry) = contracts(abi, &[(GuestValue::General(0), pc, pc)]);
             let owner = published::Published::new(|process, cache| {
+                // Constant exit sources are valid, ingress destinations aren't.
                 let ingress = if matches!(pc, ValueLocation::Constant(_)) {
                     contracts(abi, &[]).1
                 } else {
@@ -381,7 +119,7 @@ fn polled_exits_share_writeback_and_preserve_each_cold_entry_contract() {
                 spill(2048, 8),
                 ValueLocation::constant(0x123456789abcdef0),
             ] {
-                let (shared, [_, control]) =
+                let (shared, _) =
                     super::super::canonical::emit_polled_exit(&source, pc, &[], false).unwrap();
                 let dispatch =
                     super::super::canonical::emit_dispatch_fallback(&source, pc, 0).unwrap();
@@ -393,58 +131,90 @@ fn polled_exits_share_writeback_and_preserve_each_cold_entry_contract() {
                 for reason in [NativeExitReason::Dispatch, NativeExitReason::Control] {
                     let mut results = Vec::new();
                     for use_shared in [false, true] {
-                        let mut bytes = landing(abi);
-                        bytes.extend(emit_canonical_entry(&entry).unwrap());
-                        // Initialize the explicit spill PC even when this complete
-                        // map keeps guest X0 in a register rather than that slot.
-                        let mut initialize = Emitter::new(abi);
-                        initialize.copy(Copy {
-                            source: ValueLocation::constant(0xabcdef),
-                            destination: spill(2048, 8),
-                            bytes: 8,
-                        });
-                        bytes.extend(initialize.finish());
-                        if use_shared {
-                            if reason == NativeExitReason::Control {
-                                if abi == HostAbi::X86_64 {
-                                    bytes.push(0xe9);
-                                    bytes.extend((control as i32).to_le_bytes());
-                                } else {
-                                    bytes.extend(
-                                        (0x14000000 | ((control as u32 + 4) / 4)).to_le_bytes(),
-                                    );
+                        let owner = published::Published::new(|process, cache| {
+                            let identity =
+                                process.begin_unit(crate::executable::Tier::Lcq).unwrap();
+                            source.site = ExitSiteKey {
+                                source: identity.version(),
+                                state_map: 0,
+                            };
+                            let (shared, [_, control]) =
+                                super::super::canonical::emit_polled_exit(&source, pc, &[], false)
+                                    .unwrap();
+                            let mut bytes = landing(abi);
+                            bytes.extend(emit_canonical_entry(&entry).unwrap());
+                            // Initialize the explicit spill PC even when this complete
+                            // map keeps guest X0 in a register rather than that slot.
+                            let mut initialize = Emitter::new(abi);
+                            initialize.copy(Copy {
+                                source: ValueLocation::constant(0xabcdef),
+                                destination: spill(2048, 8),
+                                bytes: 8,
+                            });
+                            bytes.extend(initialize.finish());
+                            let exit_offset = bytes.len() as u32;
+                            if use_shared {
+                                if reason == NativeExitReason::Control {
+                                    if abi == HostAbi::X86_64 {
+                                        bytes.push(0xe9);
+                                        bytes.extend((control as i32).to_le_bytes());
+                                    } else {
+                                        bytes.extend(
+                                            (0x14000000 | ((control as u32 + 4) / 4)).to_le_bytes(),
+                                        );
+                                    }
                                 }
+                                bytes.extend_from_slice(&shared);
+                            } else {
+                                bytes.extend(emit_canonical_exit(&source, pc, reason, 0).unwrap());
                             }
-                            bytes.extend_from_slice(&shared);
-                        } else {
-                            bytes.extend(emit_canonical_exit(&source, pc, reason, 0).unwrap());
-                        }
-                        let (owner, id) = compile(&bytes);
+                            published::encoded(
+                                identity,
+                                cache,
+                                bytes,
+                                crate::lifetime::unit::Entry {
+                                    key: published::key(),
+                                    canonical_offset: 0,
+                                    fast_offset: 0,
+                                    contract: entry.clone(),
+                                },
+                                vec![crate::lifetime::unit::StateRecord {
+                                    exit: None,
+                                    transfer: None,
+                                    native_offset: exit_offset,
+                                    state: source.clone(),
+                                }],
+                                Box::new([]),
+                            )
+                        });
+                        let mut reader = owner.process.register().unwrap();
                         let (mut state, _) = canonical::pattern(&entry);
                         state.set_fpcr(0);
                         state.set_fpsr(0);
-                        let address = owner.get_finalized_function(id);
                         {
                             let mut frame =
                                 NativeFrame::new(&mut state, PollBudget::new(77, 1000).unwrap());
-                            frame.execution_epoch = 17;
-                            let result = unsafe {
-                                frame.begin_fp();
-                                enter_protected(&mut frame, std::ptr::null_mut(), address)
-                            }
-                            .unwrap();
+                            let mut invocation =
+                                unsafe { reader.admit(&mut frame, published::key()) }
+                                    .unwrap()
+                                    .unwrap();
+                            let address = invocation.payload().preferred().unwrap().canonical.get()
+                                as *const u8;
+                            let epoch = invocation.frame().execution_epoch;
+                            let frame = invocation.frame();
+                            let result =
+                                unsafe { enter_protected(frame, std::ptr::null_mut(), address) }
+                                    .unwrap();
                             assert_eq!(result.reason, reason);
                             assert_eq!(frame.exit_source_version, source.site.source.get());
                             assert_eq!(frame.exit_state_map, source.site.state_map);
-                            assert_eq!(frame.execution_epoch, 17);
+                            assert_eq!(frame.execution_epoch, epoch);
                             assert_eq!(frame.budget.slice_remaining, 1000);
                             assert_eq!(frame.budget.sample_remaining, 77);
-                            assert!(
-                                (address as usize..address as usize + bytes.len())
-                                    .contains(&frame.exit_native_pc)
-                            );
                         }
                         results.push(state);
+                        drop(reader);
+                        owner.shutdown();
                     }
                     assert_eq!(
                         results[0], results[1],
@@ -461,20 +231,9 @@ fn invalid_native_budget_restores_fp_without_announcing_quiescence() {
     let _restore = crate::fp_env::tests::RestoreHost::new();
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         let (source, entry) = contracts(abi, &[]);
-        let mut code = landing(abi);
         let mut invalid = moves::Emitter::new(abi);
         invalid.constant(abi.reserved().poll, 8, 8); // Armed span is only seven.
         let body = invalid.finish();
-        code.extend(&body);
-        code.extend(
-            emit_canonical_exit(
-                &source,
-                ValueLocation::constant(4),
-                NativeExitReason::Internal,
-                0,
-            )
-            .unwrap(),
-        );
         if !native(abi) {
             continue;
         }

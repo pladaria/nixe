@@ -29,7 +29,7 @@ fn reserved_slots_cannot_be_consumed_by_other_results_and_survive_growth() {
     assert!(matches!(index.reserve_record(), Err(Error::Capacity(_))));
     let mut prepared = record(&process, key, &[owner]);
     assert!(matches!(
-        index.insert(&mut prepared),
+        insert(&mut index, &mut prepared),
         Err(Error::Capacity(_))
     ));
     assert!(prepared.is_some());
@@ -37,7 +37,7 @@ fn reserved_slots_cannot_be_consumed_by_other_results_and_survive_growth() {
     let mut spare = Storage::prepare(&process.cache, records, owners).unwrap();
     index.grow(&mut spare).unwrap();
     assert_eq!(index.reserved, 1);
-    assert!(index.insert(&mut prepared).unwrap());
+    assert!(insert(&mut index, &mut prepared).unwrap());
     index.invalidate_all();
     assert_eq!(index.reserved, 1); // Invalidation never manufactures a spare slot.
     index.release_record();
@@ -195,7 +195,8 @@ fn reserved_installation_consumes_exactly_its_own_slot() {
     let a = boundary(&process, 0);
     let b = boundary(&process, 8);
     let owner = dispatch(&process, 0);
-    let mut index = storage(&process, 2, 1);
+    let mut index = storage(&process, 3, 1);
+    index.reserve_record().unwrap();
     index.reserve_record().unwrap();
     index.reserve_record().unwrap();
     assert!(
@@ -203,10 +204,19 @@ fn reserved_installation_consumes_exactly_its_own_slot() {
             .insert_reserved(&mut record(&process, a, &[owner]))
             .unwrap()
     );
-    assert_eq!(index.reserved, 1);
+    assert_eq!(index.reserved, 2);
     let mut next = record(&process, b, &[owner]);
-    assert!(matches!(index.insert(&mut next), Err(Error::Capacity(_))));
+    assert!(matches!(
+        insert(&mut index, &mut next),
+        Err(Error::Capacity(_))
+    ));
     assert!(index.insert_reserved(&mut next).unwrap());
+    assert_eq!(index.reserved, 1);
+    let mut duplicate = record(&process, a, &[owner]);
+    assert!(!index.insert_reserved(&mut duplicate).unwrap());
+    assert!(duplicate.is_some());
+    assert_eq!(index.reserved, 1);
+    index.release_record(); // The duplicate worker releases its unused slot.
     assert_eq!(index.reserved, 0);
     assert!(index.get(a).is_some());
     assert!(index.get(b).is_some());

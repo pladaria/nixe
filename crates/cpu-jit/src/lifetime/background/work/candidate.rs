@@ -281,6 +281,7 @@ impl Candidate<'_, '_> {
         &self.graph
     }
 
+    #[cfg(test)]
     pub fn check(&self) -> Result<(), Error> {
         self.work.capacity()?;
         self.validate_locked(&self.work.process.lock())

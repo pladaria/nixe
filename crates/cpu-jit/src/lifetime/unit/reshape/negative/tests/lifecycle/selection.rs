@@ -26,9 +26,9 @@ fn lcq_demand_invalidates_only_its_address_space_page_not_empty_reservations() {
     install(&process, a, &[page(0, 1)]);
     install(&process, b, &[page(4096, 1)]);
     install(&process, c, &[page(0, 2)]);
-    let empty = process.reserve(key(1024)).unwrap();
+    process.reserve(key(1024)).unwrap();
     assert!(present(&process, a)); // No published LCQ input yet.
-    process.retire_dispatch(empty).unwrap();
+    process.recover_capacity().unwrap();
     assert!(present(&process, a));
     image(&process, 2048, 1, 1);
     assert!(!present(&process, a));

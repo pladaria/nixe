@@ -82,7 +82,7 @@ impl Translator<'_> {
                         self.builder.ins().iconst(types::I64, value as i64)
                     }
                 };
-                self.write_register(f.rt, value)?;
+                self.write_register(f.rt, value);
             }
             Instruction::WriteRegister(_) => {
                 let value = self.read_register(f.rt, false)?;

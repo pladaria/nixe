@@ -13,6 +13,7 @@ use std::collections::HashSet;
 mod rejection;
 pub(crate) use rejection::DiscoveryError;
 pub(in crate::hcq) use rejection::Structural;
+#[cfg(test)]
 pub(crate) use rejection::StructuralReason;
 
 impl From<Error> for CompileError {

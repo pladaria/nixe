@@ -80,6 +80,126 @@ fn emitted(graph: &Graph, entries: &[usize], abi: HostAbi) -> (Context, Body) {
     (context, body)
 }
 
+fn staged(graph: &Graph, entries: &[usize], abi: HostAbi, version: CodeVersion) -> stage::Staged {
+    let compiler = backend::Compiler::new(abi, 0x10000).unwrap();
+    let mut context = Context::new();
+    let analysis = Analysis::build(graph, entries);
+    let body = compiler
+        .emit(
+            &mut context,
+            &mut FunctionBuilderContext::new(),
+            graph,
+            &analysis,
+            entries,
+        )
+        .unwrap();
+    assert_eq!(
+        body.polls.len(),
+        analysis.backedges.iter().flatten().filter(|&&v| v).count()
+    );
+    compiler.finish(&mut context, body, graph, version).unwrap()
+}
+
+// Exercise native fragments under real dispatch protection, without binding a
+// resolver: external edges retain their production canonical fallback.
+fn published(
+    graph: &Graph,
+    entries: &[usize],
+    abi: HostAbi,
+) -> (
+    std::sync::Arc<crate::lifetime::Lifetime>,
+    crate::lifetime::unit::Snapshot,
+) {
+    use crate::executable::{Cache, Tier};
+    use crate::lifetime::{Lifetime, unit::Input};
+    use std::sync::{Arc, atomic::AtomicU64};
+    crate::native::check_host().unwrap();
+    let cache = Cache::new().unwrap();
+    let process = Arc::new(Lifetime::new(cache.clone()).unwrap());
+    // HCQ replaces resident LCQ images; do not bypass that production invariant.
+    use nixe_cpu::memory::{MemoryPermissions, SyntheticMemory};
+    use nixe_memory::{AddressSpaceId, GuestPhysicalPageId};
+    let mut memory = SyntheticMemory::new();
+    let base = graph.instructions[0].instruction.key.block_key().pc.get() & !4095;
+    let page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(page));
+    for word in &graph.instructions {
+        assert!(memory.initialize_ram(
+            page,
+            (word.instruction.key.block_key().pc.get() - base) as usize,
+            &word.instruction.bits.to_le_bytes()
+        ));
+    }
+    assert!(memory.map_page(
+        AddressSpaceId::new(1),
+        GuestVirtualAddress::new(base),
+        page,
+        MemoryPermissions::READ_EXECUTE
+    ));
+    let mut reader = process.register().unwrap();
+    let mut lcq = crate::lcq::compiler::Compiler::new(abi).unwrap();
+    for block in &graph.blocks {
+        let crate::lifetime::compile::Request::Owner(claim) = reader.claim(block.key).unwrap()
+        else {
+            panic!()
+        };
+        lcq.publish(
+            crate::lcq::Compilation::capture(claim, &memory).unwrap(),
+            &process,
+            &cache,
+            &memory,
+        )
+        .unwrap();
+        process.try_service_links().unwrap();
+    }
+    let identity = process.begin_unit(Tier::Hcq).unwrap();
+    let image = staged(graph, entries, abi, identity.version());
+    let reservations: Vec<_> = image
+        .entries
+        .iter()
+        .map(|entry| process.reserve(entry.key).unwrap())
+        .collect();
+    let islands = image
+        .states
+        .iter()
+        .filter(|state| {
+            state
+                .transfer
+                .as_ref()
+                .is_some_and(|t| t.static_target.is_some())
+        })
+        .count();
+    let code = cache
+        .install_with_islands(image.output, Tier::Hcq, islands, |_| None)
+        .unwrap();
+    let handle = process
+        .prepare_unit(
+            &reservations,
+            Input {
+                identity,
+                code,
+                tier: Tier::Hcq,
+                instructions: graph
+                    .instructions
+                    .iter()
+                    .map(|word| word.instruction)
+                    .collect(),
+                entries: image.entries,
+                dependencies: Box::new([]),
+                cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
+                states: image.states,
+                faults: image.faults,
+            },
+            &AtomicU64::new(0),
+        )
+        .unwrap()
+        .publish()
+        .unwrap();
+    process.try_service_links().unwrap();
+    let snapshot = process.snapshot(handle).unwrap();
+    (process, snapshot)
+}
+
 mod accounting;
 mod entries;
 mod exits;

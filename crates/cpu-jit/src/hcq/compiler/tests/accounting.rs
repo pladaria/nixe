@@ -1,6 +1,5 @@
 use super::*;
 use crate::abi::{NativeFrame, PollBudget};
-use crate::executable::{Cache, Tier};
 use nixe_cpu::state::a64::{A64State, Nzcv};
 
 #[test]
@@ -14,25 +13,9 @@ fn hcq_external_checkpoints_charge_the_executed_path_once_including_overshoot() 
     for terminal in [0x14000004, 0x54000080, 0x94000004, RET] {
         let graph = graph(&[(0, &[ADDS, 0x1400000f]), (64, &[0xd503201f, terminal])]);
         let entries = [0, block(&graph, 64)];
-        let compiler = backend::Compiler::new(abi, 0x10000).unwrap();
-        let mut context = Context::new();
-        let body = compiler
-            .emit(
-                &mut context,
-                &mut FunctionBuilderContext::new(),
-                &graph,
-                &Analysis::build(&graph, &entries),
-                &entries,
-            )
-            .unwrap();
-        let staged = compiler
-            .finish(&mut context, body, &graph, CodeVersion::new(1).unwrap())
-            .unwrap();
-        let owner = Cache::new()
-            .unwrap()
-            .install(staged.output, Tier::Hcq, |_| None)
-            .unwrap();
-        for entry in staged.entries.iter() {
+        let (process, owner) = published(&graph, &entries, abi);
+        let mut reader = process.register().unwrap();
+        for entry in owner.entries.iter() {
             let cost = if entry.key.pc.get() == 0 { 4 } else { 2 };
             for balance in [1, cost, 1000] {
                 for zero in [false, true] {
@@ -46,15 +29,16 @@ fn hcq_external_checkpoints_charge_the_executed_path_once_including_overshoot() 
                             &mut state,
                             PollBudget::new(balance, balance).unwrap(),
                         );
-                        // The fixture owns all unlinked code; no resolver or sample callback.
-                        frame.execution_epoch = 1;
+                        let mut invocation = unsafe { reader.admit(&mut frame, entry.key) }
+                            .unwrap()
+                            .unwrap();
+                        let address = invocation.payload().preferred().unwrap().canonical.get();
+                        let frame = invocation.frame();
                         let result = unsafe {
-                            frame.begin_fp();
                             crate::native::enter_protected(
-                                &mut frame,
+                                frame,
                                 std::ptr::null_mut(),
-                                (owner.allocation.address() + entry.canonical_offset as usize)
-                                    as *const u8,
+                                address as *const u8,
                             )
                         }
                         .unwrap();
@@ -64,7 +48,7 @@ fn hcq_external_checkpoints_charge_the_executed_path_once_including_overshoot() 
                         // Slice exhaustion uses the same source-local canonical
                         // fallback; the caller consumes `poll.exhausted`.
                         assert_eq!(result.reason, NativeExitReason::Dispatch);
-                        frame.execution_epoch = 0;
+                        drop(invocation);
                     }
                     let pc = if terminal == RET {
                         128

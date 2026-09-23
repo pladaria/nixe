@@ -147,6 +147,7 @@ impl Lifetime {
 }
 
 impl<'p> PreparedBridge<'p> {
+    #[cfg(test)]
     pub(crate) fn key(&self) -> BridgeKey {
         self.key
     }
@@ -187,13 +188,6 @@ impl<'p> PreparedBridge<'p> {
 }
 
 impl PreparedTransfer<'_> {
-    // This validation is deliberately separate from emission. The eventual
-    // PIC insertion must hold this same guard through attaching the root and
-    // writing the native record; validating and unlocking first is not enough.
-    pub(in crate::lifetime) fn validate(&self, state: &State) -> Result<(), Error> {
-        self.prepared.validate(state)
-    }
-
     pub(crate) fn address(&self) -> usize {
         self.code.as_ref().map_or_else(
             || {

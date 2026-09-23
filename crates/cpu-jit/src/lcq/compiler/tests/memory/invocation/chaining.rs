@@ -66,7 +66,7 @@ fn retirement_waits_for_a_later_unit_fault_retry_or_escape_before_unlink_and_rec
                 }
                 let ticket = ticket.unwrap();
                 let mut transition = process.try_transition().unwrap().unwrap();
-                let premature = transition.unlink_link(link);
+                let premature = transition.drain_retirements();
                 let reclaimed = process.reclaim_units();
                 rendezvous[1].store(1, Ordering::Release);
                 assert_eq!(premature, Err(crate::lifetime::Error::Closed));
@@ -74,13 +74,17 @@ fn retirement_waits_for_a_later_unit_fault_retry_or_escape_before_unlink_and_rec
                 transition.wait_closed().unwrap();
                 assert!(transition.drain_links().unwrap());
                 assert_eq!(
-                    transition.unlink_link(link),
+                    transition.install_link(link),
                     Err(crate::lifetime::Error::StaleUnit)
                 );
                 assert_eq!(process.reclaim_units().unwrap(), 1);
                 transition.batch().unwrap().complete().unwrap();
                 assert!(transition.try_reopen().unwrap());
-                assert!(ticket.is_complete().unwrap());
+                assert!(
+                    process
+                        .maintenance_complete(crate::lifetime::Reason::Eviction, ticket)
+                        .unwrap()
+                );
                 closed_tx.send(()).unwrap();
             });
             let exit = unsafe {

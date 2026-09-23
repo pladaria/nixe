@@ -1,6 +1,6 @@
 //! Exact lifetime proof; real executable-memory checks live in publication tests.
 use super::*;
-use crate::lifetime::unit::reshape::negative::{Key, Rejection};
+use crate::lifetime::unit::reshape::negative::Key;
 
 fn result_key(process: &Lifetime) -> Key {
     Key {
@@ -30,14 +30,7 @@ fn cap_installation_suppresses_repeats_releases_worker_storage_and_keeps_only_we
         let Err(DiscoveryError::Structural(result)) = Graph::discover(&work) else {
             panic!()
         };
-        assert_eq!(
-            result
-                .prepare(MemoryInvalidationCursor::new(42))
-                .unwrap()
-                .install()
-                .unwrap(),
-            expected
-        );
+        assert_eq!(result.prepare().unwrap().install().unwrap(), expected);
         drop(result);
         drop(work);
         for (input, &references) in inputs.iter().zip(&references) {
@@ -50,9 +43,7 @@ fn cap_installation_suppresses_repeats_releases_worker_storage_and_keeps_only_we
         assert_eq!(usage.committed, committed);
         metadata = Some(usage.metadata);
         let state = process.lock();
-        let record = state.units.negatives.get(result_key).unwrap();
-        assert_eq!(record.reason, Rejection::InstructionLimit);
-        assert_eq!(record.cursor, MemoryInvalidationCursor::new(42));
+        assert!(state.units.negatives.get(result_key).is_some());
     }
     process.retire_unit(inputs[6]).unwrap(); // Cap-excluded input, not an endpoint.
     assert!(process.lock().units.negatives.get(result_key).is_none());
@@ -67,7 +58,7 @@ fn new_interior_leader_rejects_prepared_cap_result_without_changing_endpoint_ver
     let Err(DiscoveryError::Structural(result)) = Graph::discover(&work) else {
         panic!()
     };
-    let prepared = result.prepare(MemoryInvalidationCursor::INITIAL).unwrap();
+    let prepared = result.prepare().unwrap();
     let mut words = vec![NOP; 511];
     words[510] = branch(0x57fc, 0x4000);
     publish_words(&process, 0x5004, &words);
@@ -88,13 +79,7 @@ fn installed_cap_result_watches_pages_not_every_instruction_or_unrelated_demand(
             let Err(DiscoveryError::Structural(result)) = Graph::discover(&work) else {
                 panic!()
             };
-            assert!(
-                result
-                    .prepare(MemoryInvalidationCursor::INITIAL)
-                    .unwrap()
-                    .install()
-                    .unwrap()
-            );
+            assert!(result.prepare().unwrap().install().unwrap());
         }
         publish_words(&process, 0xa000, &[RET]);
         assert!(process.lock().units.negatives.get(result_key).is_some());
@@ -118,7 +103,7 @@ fn structural_installation_pressure_and_shutdown_leave_no_partial_result() {
         let Err(DiscoveryError::Structural(result)) = Graph::discover(&work) else {
             panic!()
         };
-        let prepared = result.prepare(MemoryInvalidationCursor::INITIAL).unwrap();
+        let prepared = result.prepare().unwrap();
         let usage = process.cache.usage().unwrap();
         let pressure = process
             .cache
@@ -132,7 +117,7 @@ fn structural_installation_pressure_and_shutdown_leave_no_partial_result() {
     let Err(DiscoveryError::Structural(result)) = Graph::discover(&work) else {
         panic!()
     };
-    let prepared = result.prepare(MemoryInvalidationCursor::INITIAL).unwrap();
+    let prepared = result.prepare().unwrap();
     process.request_shutdown().unwrap();
     assert!(prepared.install().is_err());
     assert!(process.lock().units.negatives.get(result_key).is_none());

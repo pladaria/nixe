@@ -29,21 +29,8 @@ impl ArchitecturalTimer for FixedTimer {
 #[test]
 fn concrete_interpreter_and_jit_match_at_an_architectural_boundary() {
     let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, SPACE);
-    let mut memory = ExecutionMemory::new();
-    let page = GuestPhysicalPageId::new(1);
-    assert!(memory.add_ram_page(page));
     let code = [0xd503_201f_u32, 0xd420_0000];
-    memory
-        .initialize_ram(
-            page,
-            0,
-            &code
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-    assert!(memory.map_page(SPACE, CODE, page, MemoryPermissions::READ_EXECUTE));
+    let mut memory = executable_memory(&code);
     memory
         .bind_cpu_memory_backend(SPACE, 0x10000, nixe_memory::DirectBackendPolicy::Required)
         .unwrap();
@@ -65,7 +52,7 @@ fn concrete_interpreter_and_jit_match_at_an_architectural_boundary() {
     let mut jit = JitThread::new(jit_process.clone()).unwrap();
 
     let mut interpreter_state = a64_state();
-    let mut jit_state = state();
+    let mut jit_state = a64_state();
     let interpreter_report = interpreter
         .run_slice(
             &mut nixe_cpu_direct_memory::NativeWorker::default(),
@@ -178,10 +165,6 @@ fn executable_memory(code: &[u32]) -> ExecutionMemory {
     memory.initialize_ram(page, 0, &bytes).unwrap();
     assert!(memory.map_page(SPACE, CODE, page, MemoryPermissions::READ_EXECUTE));
     memory
-}
-
-fn state() -> A64State {
-    a64_state()
 }
 
 fn a64_state() -> A64State {

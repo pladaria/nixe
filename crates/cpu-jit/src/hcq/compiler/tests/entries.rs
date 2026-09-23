@@ -1,8 +1,6 @@
 use super::*;
 use crate::abi::{NativeFrame, NzcvLocation, PollBudget};
-use crate::executable::{Cache, Tier, output::Output};
 use crate::frontend::staging;
-use crate::lifetime::unit::Entry;
 use nixe_cpu::state::a64::{A64State, Nzcv};
 
 #[test]
@@ -63,34 +61,6 @@ fn hcq_entry_without_inputs_has_no_fabricated_flag_binding_or_canonical_loads() 
     }
 }
 
-// Finite-body ABI and executed-path accounting through the real staging path.
-// No loops, faults, publication or dispatch linking are exercised here.
-fn finite_image(graph: &Graph, abi: HostAbi) -> (Output, Box<[Entry]>) {
-    let selected: Vec<_> = (0..graph.blocks.len()).collect();
-    assert!(
-        !Analysis::build(graph, &selected)
-            .backedges
-            .iter()
-            .flatten()
-            .any(|&edge| edge)
-    );
-    let compiler = backend::Compiler::new(abi, 0x10000).unwrap();
-    let mut context = Context::new();
-    let body = compiler
-        .emit(
-            &mut context,
-            &mut FunctionBuilderContext::new(),
-            graph,
-            &Analysis::build(graph, &selected),
-            &selected,
-        )
-        .unwrap();
-    assert!(body.faults.is_empty());
-    let version = CodeVersion::new(1).unwrap();
-    let staged = compiler.finish(&mut context, body, graph, version).unwrap();
-    (staged.output, staged.entries)
-}
-
 #[test]
 fn hcq_selected_labels_execute_shared_diamonds_and_fp_continuations_like_interpreter() {
     let abi = if cfg!(target_arch = "x86_64") {
@@ -112,12 +82,10 @@ fn hcq_selected_labels_execute_shared_diamonds_and_fp_continuations_like_interpr
         ]),
     ];
     for graph in graphs {
-        let (output, entries) = finite_image(&graph, abi);
-        let owner = Cache::new()
-            .unwrap()
-            .install(output, Tier::Hcq, |_| None)
-            .unwrap();
-        for entry in entries.iter() {
+        let selected: Vec<_> = (0..graph.blocks.len()).collect();
+        let (process, owner) = published(&graph, &selected, abi);
+        let mut reader = process.register().unwrap();
+        for entry in owner.entries.iter() {
             for nzcv in [0, Nzcv::Z | Nzcv::C, Nzcv::N | Nzcv::V] {
                 let mut initial = A64State::default();
                 initial.set_pc(entry.key.pc.get());
@@ -152,15 +120,16 @@ fn hcq_selected_labels_execute_shared_diamonds_and_fp_continuations_like_interpr
                 {
                     let mut frame =
                         NativeFrame::new(&mut actual, PollBudget::new(4096, 1000).unwrap());
-                    // The test exclusively owns the complete unlinked allocation.
-                    frame.execution_epoch = 1;
+                    let mut invocation = unsafe { reader.admit(&mut frame, entry.key) }
+                        .unwrap()
+                        .unwrap();
+                    let address = invocation.payload().preferred().unwrap().canonical.get();
+                    let frame = invocation.frame();
                     let result = unsafe {
-                        frame.begin_fp();
                         crate::native::enter_protected(
-                            &mut frame,
+                            frame,
                             std::ptr::null_mut(),
-                            (owner.allocation.address() + entry.canonical_offset as usize)
-                                as *const u8,
+                            address as *const u8,
                         )
                     }
                     .unwrap();
@@ -169,7 +138,7 @@ fn hcq_selected_labels_execute_shared_diamonds_and_fp_continuations_like_interpr
                     assert_eq!(frame.budget.slice_remaining, 1000 - steps as i64);
                     assert_eq!(frame.host_fp.active, 0);
                     assert_eq!(frame.host_fp.saved, 0);
-                    frame.execution_epoch = 0;
+                    drop(invocation);
                 }
                 assert_eq!(actual, expected, "entry {:?}", entry.key);
             }

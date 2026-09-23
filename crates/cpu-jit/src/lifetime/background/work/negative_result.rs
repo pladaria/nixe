@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::lifetime::unit::reshape::negative::{self, Owner};
-use nixe_memory::MemoryInvalidationCursor;
 
 pub(super) struct Prepared<'w, 'p> {
     work: &'w Work<'p>,
@@ -17,12 +16,7 @@ pub(crate) struct Rejected<'w, 'p> {
 }
 
 impl<'p> Work<'p> {
-    pub(super) fn prepare_negative(
-        &self,
-        reason: negative::Rejection,
-        cursor: MemoryInvalidationCursor,
-        owners: Vec<Owner>,
-    ) -> Result<Prepared<'_, 'p>, Error> {
+    pub(super) fn prepare_negative(&self, owners: Vec<Owner>) -> Result<Prepared<'_, 'p>, Error> {
         let Observation::Reshape {
             source_block,
             snapshot,
@@ -46,8 +40,6 @@ impl<'p> Work<'p> {
                 source: source_block,
                 boundary: snapshot.key,
             },
-            reason,
-            cursor,
             owners,
         )?;
         let growth = self
@@ -73,14 +65,8 @@ impl<'p> Work<'p> {
     pub(crate) fn prepare_structural<'w>(
         &'w self,
         evidence: &'w DiscoveryEvidence,
-        reason: crate::hcq::StructuralReason,
-        cursor: MemoryInvalidationCursor,
     ) -> Result<Rejected<'w, 'p>, Error> {
         self.capacity()?;
-        let reason = match reason {
-            crate::hcq::StructuralReason::Disconnected => negative::Rejection::Disconnected,
-            crate::hcq::StructuralReason::InstructionLimit => negative::Rejection::InstructionLimit,
-        };
         let mut owners =
             Vec::with_capacity(evidence.owner_capacity() + evidence.selection_capacity() + 6);
         evidence.append_selection(&mut owners);
@@ -94,7 +80,7 @@ impl<'p> Work<'p> {
             job.negative_owners(&mut owners);
         }
         Ok(Rejected {
-            prepared: self.prepare_negative(reason, cursor, owners)?,
+            prepared: self.prepare_negative(owners)?,
             evidence,
         })
     }
@@ -192,13 +178,7 @@ mod tests {
             job.negative_owners(&mut owners);
             // Exercise the common installer separately from the discovery and
             // backend evidence producers, whose validation has its own tests.
-            let prepared = work
-                .prepare_negative(
-                    negative::Rejection::BackendRejected,
-                    MemoryInvalidationCursor::INITIAL,
-                    owners,
-                )
-                .unwrap();
+            let prepared = work.prepare_negative(owners).unwrap();
             process.request(crate::lifetime::Reason::LinkPatch).unwrap();
             let mut stop = process.try_transition().unwrap().unwrap();
             stop.wait_closed().unwrap();

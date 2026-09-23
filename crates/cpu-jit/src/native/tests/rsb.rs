@@ -30,7 +30,7 @@ fn key(wide: bool) -> BlockKey {
 #[test]
 fn shared_cold_exits_update_the_return_stack_exactly_once() {
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
-        let (source, _) = contracts(abi, &[]);
+        let (mut source, entry) = contracts(abi, &[]);
         let target = key(true);
         let pc = ValueLocation::constant(target.pc.get().into());
         for returning in [false, true] {
@@ -40,27 +40,57 @@ fn shared_cold_exits_update_the_return_stack_exactly_once() {
                 emit_push(&source, target).unwrap()
             };
             for indirect in [false, true] {
-                let (shared, [slice, control]) =
+                let (_, [slice, control]) =
                     super::super::canonical::emit_polled_exit(&source, pc, &operation, indirect)
                         .unwrap();
                 if !canonical::native(abi) {
                     continue;
                 }
                 for (path, offset) in [0, slice, control].into_iter().enumerate() {
-                    let mut bytes = gateway::landing(abi);
-                    if indirect && path == 0 {
-                        // The live probe performs the operation before falling
-                        // through on a cache miss; the fallback must not repeat it.
-                        bytes.extend_from_slice(&operation);
-                    }
-                    if abi == HostAbi::X86_64 {
-                        bytes.push(0xe9);
-                        bytes.extend((offset as i32).to_le_bytes());
-                    } else {
-                        bytes.extend((0x14000000 | ((offset as u32 + 4) / 4)).to_le_bytes());
-                    }
-                    bytes.extend_from_slice(&shared);
-                    let (owner, id) = gateway::compile(&bytes);
+                    let owner = published::Published::new(|process, cache| {
+                        let identity = process.begin_unit(crate::executable::Tier::Lcq).unwrap();
+                        source.site = ExitSiteKey {
+                            source: identity.version(),
+                            state_map: 0,
+                        };
+                        let (shared, _) = super::super::canonical::emit_polled_exit(
+                            &source, pc, &operation, indirect,
+                        )
+                        .unwrap();
+                        let mut bytes = gateway::landing(abi);
+                        if indirect && path == 0 {
+                            // The live probe performs the operation before falling
+                            // through on a cache miss; the fallback must not repeat it.
+                            bytes.extend_from_slice(&operation);
+                        }
+                        if abi == HostAbi::X86_64 {
+                            bytes.push(0xe9);
+                            bytes.extend((offset as i32).to_le_bytes());
+                        } else {
+                            bytes.extend((0x14000000 | ((offset as u32 + 4) / 4)).to_le_bytes());
+                        }
+                        let exit_offset = bytes.len() as u32;
+                        bytes.extend_from_slice(&shared);
+                        published::encoded(
+                            identity,
+                            cache,
+                            bytes,
+                            crate::lifetime::unit::Entry {
+                                key: published::key(),
+                                canonical_offset: 0,
+                                fast_offset: 0,
+                                contract: entry.clone(),
+                            },
+                            vec![crate::lifetime::unit::StateRecord {
+                                exit: None,
+                                transfer: None,
+                                native_offset: exit_offset,
+                                state: source.clone(),
+                            }],
+                            Box::new([]),
+                        )
+                    });
+                    let mut reader = owner.process.register().unwrap();
                     let mut stack = ReturnStack {
                         entries: [Continuation::from(target); CAPACITY],
                         head: 2,
@@ -71,14 +101,13 @@ fn shared_cold_exits_update_the_return_stack_exactly_once() {
                         let mut frame =
                             NativeFrame::new(&mut state, PollBudget::new(77, 1000).unwrap())
                                 .with_return_stack(&mut stack);
-                        frame.execution_epoch = 1;
+                        let mut invocation = unsafe { reader.admit(&mut frame, published::key()) }
+                            .unwrap()
+                            .unwrap();
+                        let address = invocation.payload().preferred().unwrap().canonical.get();
+                        let frame = invocation.frame();
                         let result = unsafe {
-                            frame.begin_fp();
-                            enter_protected(
-                                &mut frame,
-                                std::ptr::null_mut(),
-                                owner.get_finalized_function(id),
-                            )
+                            enter_protected(frame, std::ptr::null_mut(), address as *const u8)
                         }
                         .unwrap();
                         assert_eq!(
@@ -94,6 +123,8 @@ fn shared_cold_exits_update_the_return_stack_exactly_once() {
                     assert_eq!(stack.depth, if returning { 1 } else { 3 });
                     assert_eq!(stack.head, stack.depth);
                     assert_eq!(state.pc(), target.pc.get());
+                    drop(reader);
+                    owner.shutdown();
                 }
             }
         }
@@ -130,41 +161,74 @@ fn native_rsb_return_checks_full_keys_pops_and_uses_only_matched_pics() {
                         2 => ValueLocation::constant(target.pc.get().into()),
                         _ => vector(0),
                     };
-                    let probe = emit_return_probe(&source, target, pc).unwrap();
+                    emit_return_probe(&source, target, pc).unwrap();
                     if !canonical::native(abi) {
                         continue;
                     }
-                    let mut hit = gateway::landing(abi);
-                    hit.extend(
-                        emit_canonical_exit(
-                            &source,
-                            ValueLocation::constant(0x4444),
-                            NativeExitReason::Dispatch,
-                            0,
+                    let mut hit_offset = 0;
+                    let owner = published::Published::new(|process, cache| {
+                        let identity = process.begin_unit(crate::executable::Tier::Lcq).unwrap();
+                        source.site = ExitSiteKey {
+                            source: identity.version(),
+                            state_map: 0,
+                        };
+                        let mut bytes = gateway::landing(abi);
+                        bytes.extend(emit_canonical_entry(&entry).unwrap());
+                        bytes.extend(emit_return_probe(&source, target, pc).unwrap());
+                        let miss_offset = bytes.len() as u32;
+                        bytes.extend(
+                            emit_canonical_exit(
+                                &source,
+                                ValueLocation::constant(0x8888),
+                                NativeExitReason::Control,
+                                0,
+                            )
+                            .unwrap(),
+                        );
+                        hit_offset = bytes.len();
+                        bytes.extend(gateway::landing(abi));
+                        let mut hit_state = source.clone();
+                        hit_state.site.state_map = 1;
+                        bytes.extend(
+                            emit_canonical_exit(
+                                &hit_state,
+                                ValueLocation::constant(0x4444),
+                                NativeExitReason::Dispatch,
+                                0,
+                            )
+                            .unwrap(),
+                        );
+                        published::encoded(
+                            identity,
+                            cache,
+                            bytes,
+                            crate::lifetime::unit::Entry {
+                                key: published::key(),
+                                canonical_offset: 0,
+                                fast_offset: 0,
+                                contract: entry.clone(),
+                            },
+                            vec![
+                                crate::lifetime::unit::StateRecord {
+                                    exit: None,
+                                    transfer: None,
+                                    native_offset: miss_offset,
+                                    state: source.clone(),
+                                },
+                                crate::lifetime::unit::StateRecord {
+                                    exit: None,
+                                    transfer: None,
+                                    native_offset: hit_offset as u32,
+                                    state: hit_state,
+                                },
+                            ],
+                            Box::new([]),
                         )
-                        .unwrap(),
-                    );
-                    let (hit_owner, hit_id) = gateway::compile(&hit);
-                    let mut bytes = gateway::landing(abi);
-                    bytes.extend(emit_canonical_entry(&entry).unwrap());
-                    bytes.extend(probe);
-                    bytes.extend(
-                        emit_canonical_exit(
-                            &source,
-                            ValueLocation::constant(0x8888),
-                            NativeExitReason::Control,
-                            0,
-                        )
-                        .unwrap(),
-                    );
-                    let (owner, id) = gateway::compile(&bytes);
+                    });
+                    let mut reader = owner.process.register().unwrap();
                     let table = Table::new();
                     let slot = set_index(source.site, target) * 2;
-                    let mut record = Box::new(Record::new(
-                        source.site,
-                        target,
-                        hit_owner.get_finalized_function(hit_id) as usize,
-                    ));
+                    let mut record = Box::new(Record::new(source.site, target, 0));
                     for case in 0..12 {
                         // 0/1 hit either way; 2 no cached bridge; 3..7 wrong RSB
                         // field; 8 empty RSB; 9 absent RSB; 10 absent PIC;
@@ -228,18 +292,28 @@ fn native_rsb_return_checks_full_keys_pops_and_uses_only_matched_pics() {
                                         {
                                             frame.spill[3400 + i] = MaybeUninit::new(byte);
                                         }
+                                        let mut invocation =
+                                            unsafe { reader.admit(&mut frame, published::key()) }
+                                                .unwrap()
+                                                .unwrap();
+                                        let address = invocation
+                                            .payload()
+                                            .preferred()
+                                            .unwrap()
+                                            .canonical
+                                            .get();
+                                        record.address = address + hit_offset;
+                                        let frame = invocation.frame();
                                         frame.indirect_pic = if case == 10 {
                                             std::ptr::null()
                                         } else {
                                             table.as_ptr()
                                         };
-                                        frame.execution_epoch = 1;
-                                        unsafe { frame.begin_fp() };
                                         let returned = unsafe {
                                             enter_protected(
-                                                &mut frame,
+                                                frame,
                                                 std::ptr::dangling_mut(),
-                                                owner.get_finalized_function(id),
+                                                address as *const u8,
                                             )
                                         }
                                         .unwrap();
@@ -269,6 +343,8 @@ fn native_rsb_return_checks_full_keys_pops_and_uses_only_matched_pics() {
                         table.set(slot, std::ptr::null());
                         table.set(slot + 1, std::ptr::null());
                     }
+                    drop(reader);
+                    owner.shutdown();
                 }
             }
         }
@@ -308,24 +384,25 @@ fn native_rsb_push_wraps_and_saturates_without_changing_guest_state() {
                     let continuations: Vec<_> = (0..count)
                         .map(|index| first.at(first.pc.checked_add(index * 4).unwrap()).unwrap())
                         .collect();
-                    let mut bytes = gateway::landing(abi);
-                    bytes.extend(emit_canonical_entry(&entry).unwrap());
+                    let mut bytes = Vec::new();
                     for continuation in &continuations {
                         bytes.extend(emit_push(&source, *continuation).unwrap());
                     }
-                    bytes.extend(
-                        emit_canonical_exit(
-                            &source,
-                            ValueLocation::constant(0x4444),
-                            NativeExitReason::Dispatch,
-                            0,
-                        )
-                        .unwrap(),
-                    );
                     if !canonical::native(abi) {
                         continue;
                     }
-                    let (owner, id) = gateway::compile(&bytes);
+                    let owner = published::Published::new(|process, cache| {
+                        published::synthetic(
+                            process.begin_unit(crate::executable::Tier::Lcq).unwrap(),
+                            cache,
+                            entry.clone(),
+                            source.clone(),
+                            (bytes, None),
+                            ValueLocation::constant(0x4444),
+                            NativeExitReason::Dispatch,
+                        )
+                    });
+                    let mut reader = owner.process.register().unwrap();
                     for head in [0, 1, 15] {
                         for depth in [0, 1, 15, 16] {
                             for nibble in 0..16 {
@@ -361,13 +438,18 @@ fn native_rsb_push_wraps_and_saturates_without_changing_guest_state() {
                                         PollBudget::new(7, 11).unwrap(),
                                     )
                                     .with_return_stack(&mut stack);
-                                    frame.execution_epoch = 1;
-                                    unsafe { frame.begin_fp() };
+                                    let mut invocation =
+                                        unsafe { reader.admit(&mut frame, published::key()) }
+                                            .unwrap()
+                                            .unwrap();
+                                    let address =
+                                        invocation.payload().preferred().unwrap().canonical.get();
+                                    let frame = invocation.frame();
                                     let returned = unsafe {
                                         enter_protected(
-                                            &mut frame,
+                                            frame,
                                             std::ptr::dangling_mut(),
-                                            owner.get_finalized_function(id),
+                                            address as *const u8,
                                         )
                                     }
                                     .unwrap();
@@ -393,18 +475,19 @@ fn native_rsb_push_wraps_and_saturates_without_changing_guest_state() {
                     {
                         let mut frame =
                             NativeFrame::new(&mut state, PollBudget::new(7, 11).unwrap());
-                        frame.execution_epoch = 1;
-                        unsafe { frame.begin_fp() };
+                        let mut invocation = unsafe { reader.admit(&mut frame, published::key()) }
+                            .unwrap()
+                            .unwrap();
+                        let address = invocation.payload().preferred().unwrap().canonical.get();
+                        let frame = invocation.frame();
                         unsafe {
-                            enter_protected(
-                                &mut frame,
-                                std::ptr::dangling_mut(),
-                                owner.get_finalized_function(id),
-                            )
+                            enter_protected(frame, std::ptr::dangling_mut(), address as *const u8)
                         }
                         .unwrap();
                     }
                     assert_eq!(state, expected);
+                    drop(reader);
+                    owner.shutdown();
                 }
             }
         }

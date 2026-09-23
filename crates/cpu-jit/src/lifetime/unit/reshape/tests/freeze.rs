@@ -2,6 +2,7 @@ use super::discovery::{NOP, RET, owned, owned_entries, reshape};
 use super::*;
 use crate::hcq::Graph;
 use crate::lifetime::background::{Frozen, workers::CompileError};
+use crate::lifetime::unit::dynamic::pic::tests::cache;
 use crate::lifetime::unit::{dynamic, links, tests::publish_words};
 
 fn entries(frozen: &Frozen<'_, '_>) -> Vec<u64> {
@@ -48,7 +49,7 @@ fn reshape_freeze_exports_root_and_required_target_without_exporting_coverage() 
         assert!(!process.lock().keys.contains_key(&key(24)));
         frozen.check().unwrap();
         let analysis = frozen.analyze().unwrap();
-        assert_eq!(analysis.instructions.len(), 5);
+        assert_eq!(analysis.native.instructions.len(), 5);
     }
 }
 
@@ -101,14 +102,14 @@ fn reshape_freeze_finds_indirect_and_return_roots_on_either_tier() {
             }
             let source = dynamic::tests::source(&process, &AtomicU64::new(0), 128, kind);
             let mut reader = process.register().unwrap();
-            reader
-                .cache_bridge(
-                    process
-                        .prepare_dynamic_bridge(source, 0, key(20))
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
+            cache(
+                &mut reader,
+                process
+                    .prepare_dynamic_bridge(source, 0, key(20))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
             let work = reshape(&process, 0, 0, 16);
             let frozen = work
                 .reserve_candidate(Graph::discover(&work).unwrap())
@@ -136,14 +137,14 @@ fn reshape_freeze_cancels_an_uncaptured_late_external_entry() {
         .reserve_candidate(Graph::discover(&work).unwrap())
         .unwrap();
     publish_words(&process, 20, &[RET]);
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, key(20))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, key(20))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     work.check().unwrap();
     assert!(matches!(candidate.freeze(), Err(CompileError::Cancelled)));
     // Cancellation releases the whole candidate, but not its valid family job.
@@ -171,14 +172,14 @@ fn reshape_freeze_does_not_change_entries_for_a_later_pic_root() {
         .freeze()
         .unwrap();
     assert_eq!(entries(&frozen), [0, 16]);
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, key(20))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, key(20))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     frozen.check().unwrap();
     assert_eq!(entries(&frozen), [0, 16]);
     // The newly observed PIC root stays on LCQ: labels are frozen before analysis.
@@ -296,14 +297,14 @@ fn no_op_evidence_rechecks_late_static_and_pic_entries_without_changing_frozen_l
         if static_root {
             links::tests::source(&process, &AtomicU64::new(0), 256, 20);
         } else {
-            reader
-                .cache_bridge(
-                    process
-                        .prepare_dynamic_bridge(source, 0, key(20))
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
+            cache(
+                &mut reader,
+                process
+                    .prepare_dynamic_bridge(source, 0, key(20))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
         }
         // Neither an unrelated static-source publication nor a PIC insertion
         // invalidates the captured code. They change only the no-op entry proof.
@@ -325,14 +326,14 @@ fn no_op_evidence_keeps_a_published_entry_after_its_pic_root_is_removed() {
     owned_entries(&process, &[(0, 0x14000004), (16, NOP), (20, RET)], 3);
     let source = dynamic::tests::source(&process, &AtomicU64::new(0), 128, EdgeKind::Indirect);
     let mut reader = process.register().unwrap();
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, key(20))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, key(20))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     let work = reshape(&process, 0, 0, 16);
     let frozen = work
         .reserve_candidate(Graph::discover(&work).unwrap())
@@ -370,14 +371,14 @@ fn no_op_evidence_detects_new_demand_and_root_at_a_previously_uncaptured_interio
             .any(|input| input.key == key(20))
     );
     publish_words(&process, 20, &[RET]);
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, key(20))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, key(20))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     frozen.check().unwrap();
     assert_eq!(
         frozen.validate_unchanged_locked(&process.lock()),

@@ -224,26 +224,6 @@ impl Samples {
             }
         }
     }
-
-    /// Only the owning vCPU calls this at a cold boundary. Version mismatch
-    /// also resets on observation, so cross-thread invalidation never needs
-    /// mutable access to these tables.
-    pub fn invalidate(&mut self, key: BlockKey) {
-        let set = self.seed_set(key);
-        for seed in &mut self.seeds[set] {
-            if seed.is_some_and(|seed| seed.snapshot.key == key) {
-                *seed = None;
-            }
-        }
-        for boundary in self.boundaries.iter_mut().flatten() {
-            if boundary.is_some_and(|entry| {
-                entry.snapshot.key.source.block_key() == key
-                    || entry.snapshot.key.target.block_key() == key
-            }) {
-                *boundary = None;
-            }
-        }
-    }
 }
 
 impl Seed {

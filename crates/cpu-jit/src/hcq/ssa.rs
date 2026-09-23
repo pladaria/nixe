@@ -3,11 +3,9 @@
 
 use super::{Graph, flow::Analysis};
 use crate::abi::{GuestValue, LazyFlags};
+use crate::frontend::Translator;
 use crate::jit_error::Error;
-use crate::lowering::{
-    IntegerLowering,
-    values::{Values, guest_type, register_operands},
-};
+use crate::lowering::values::{Values, guest_type, register_operands};
 use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilder;
@@ -124,10 +122,11 @@ impl Block {
 
     /// Reconcile only when this destination needs packed bits. Arithmetic
     /// recipes retain their captured operands; no memory/bridge is involved.
-    /// The native flow's dirty mask, not flags.dirty(), governs HCQ observations.
-    pub(super) fn reconcile<'a>(
+    /// The native flow's dirty mask governs HCQ observations independently of
+    /// the recipe's representation.
+    pub(super) fn reconcile(
         &self,
-        lowerer: &mut impl IntegerLowering<'a>,
+        lowerer: &mut Translator<'_>,
         flags: Option<&LazyFlags<ir::Value>>,
     ) -> Result<Option<LazyFlags<ir::Value>>, Error> {
         let Some(required) = &self.flags else {

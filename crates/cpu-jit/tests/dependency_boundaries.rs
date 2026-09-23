@@ -22,8 +22,6 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
         );
     }
     for forbidden in [
-        "cranelift-jit = ",
-        "cranelift-module = ",
         "nixe-cpu-interpreter.workspace",
         "nixe-runtime.workspace",
         "nixe-horizon.workspace",
@@ -43,16 +41,12 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
             .contains("nixe-cpu-interpreter.workspace = true"),
         "the reference interpreter must remain test-only"
     );
-    for forbidden in ["dynasm", "iced-x86"] {
+    for forbidden in ["cranelift-jit", "cranelift-module"] {
         assert!(
             !manifest.contains(forbidden),
-            "unexpected native-code dependency: {forbidden}"
+            "superseded executable owner dependency: {forbidden}"
         );
     }
-
-    let library = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    assert!(library.contains("pub use engine::{JitProcess, JitThread};"));
-    assert!(!library.contains("mod direct;"));
 }
 
 #[test]

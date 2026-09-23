@@ -1,5 +1,4 @@
-//! Test-owned links isolate terminal checkpoint behavior from live patching.
-//! The complete executable allocation stays owned through the gateway.
+//! Real published self-links exercise terminal checkpoints and lazy state.
 use super::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -17,55 +16,18 @@ fn native_loops_charge_once_and_preserve_lazy_flags_at_the_deadline() {
             }, // B.NE/B PC.
         ];
         let memory = memory(&words);
-        let fragment = Fragment::capture(&memory, key()).unwrap();
-        let abi = native_abi();
-        let lowered = Compiler::new(abi)
-            .unwrap()
-            .lower(&fragment, CodeVersion::new(1).unwrap())
-            .unwrap();
-        let mut bytes = lowered.output.bytes.to_vec();
-        let source = lowered
-            .states
-            .iter()
-            .find(|record| {
-                record.exit.unwrap().kind
-                    == if conditional {
-                        EdgeKind::Taken
-                    } else {
-                        EdgeKind::Static
-                    }
-            })
-            .unwrap();
-        let map = lowered
-            .output
-            .metadata
-            .states
-            .iter()
-            .find(|map| !map.entry && map.offset == source.native_offset)
-            .unwrap();
-        // This particular loop carries every writable input. Other dirty flags
-        // are overwritten before observation; this is not a general bridge.
-        let bridge = crate::native::emit_fast_transfer(&source.state, &lowered.entry).unwrap();
-        let bridge_start = append(&mut bytes, &bridge);
-        let jump = bytes.len().next_multiple_of(8);
-        while bytes.len() < jump {
-            bytes.extend(nop(abi));
-        }
-        bytes.resize(jump + usize::from(map.patch_bytes), 0);
-        let mut back = map.clone();
-        back.offset = jump as u32;
-        back.poll = None;
-        back.patch_exit(&mut bytes, 0, u64::from(lowered.fast))
-            .unwrap();
-        map.patch_exit(&mut bytes, 0, bridge_start as u64).unwrap();
-        // Leave the production cold poll intact. Sample deadlines resume this
-        // hot edge, while slice exhaustion/control must leave the native loop.
-        let output = Output {
-            bytes: bytes.into_boxed_slice(),
-            ..lowered.output
-        };
         let cache = Cache::new().unwrap();
-        let owner = cache.install(output, Tier::Lcq, |_| None).unwrap();
+        let process = Arc::new(Lifetime::new(cache.clone()).unwrap());
+        let mut reader = process.register().unwrap();
+        let Request::Owner(claim) = reader.claim(key()).unwrap() else {
+            panic!()
+        };
+        let compilation = Compilation::capture(claim, &memory).unwrap();
+        Compiler::new(native_abi())
+            .unwrap()
+            .publish(compilation, &process, &cache, &memory)
+            .unwrap();
+        process.try_service_links().unwrap();
         let cases = [1, 2, 3, 4, 32, 33, 34, 4096, 8192]
             .into_iter()
             .map(|slice| (4096, slice, None))
@@ -122,23 +84,25 @@ fn native_loops_charge_once_and_preserve_lazy_flags_at_the_deadline() {
             }
             {
                 let mut frame = NativeFrame::new(&mut actual, budget);
+                let mut invocation = unsafe { reader.admit(&mut frame, key()) }.unwrap().unwrap();
+                let address = invocation.payload().preferred().unwrap().canonical.get();
+                let epoch = invocation.frame().execution_epoch;
+                let frame = invocation.frame();
                 if let Some(index) = request {
                     frame.poll_requests[index] = &pending;
                 }
                 frame.exclusive_load.address = 0x4321;
                 frame.exclusive_load.value = [123, 456];
                 frame.exclusive_load.bytes = 16;
-                frame.execution_epoch = 1;
                 let returned = unsafe {
-                    frame.begin_fp();
                     if active_fp {
                         frame.ensure_fp().unwrap();
                         crate::fp_env::tests::divide_by_zero();
                     }
                     crate::native::enter_protected(
-                        &mut frame,
+                        frame,
                         std::ptr::null_mut(),
-                        (owner.allocation.address() + lowered.canonical as usize) as *const u8,
+                        address as *const u8,
                     )
                 }
                 .unwrap();
@@ -160,11 +124,11 @@ fn native_loops_charge_once_and_preserve_lazy_flags_at_the_deadline() {
                 assert_eq!(frame.budget.armed_span, expected_budget.armed_span);
                 assert_eq!(frame.exit_source_version, 1);
                 assert_eq!(frame.host_fp.saved, 0);
-                assert_eq!(frame.execution_epoch, 1);
+                assert_eq!(frame.execution_epoch, epoch);
                 assert_eq!(frame.exclusive_load.address, 0x4321);
                 assert_eq!(frame.exclusive_load.value, [123, 456]);
                 assert_eq!(frame.exclusive_load.bytes, 16);
-                frame.execution_epoch = 0;
+                drop(invocation);
             }
             assert_eq!(
                 pending.load(Ordering::Acquire),
