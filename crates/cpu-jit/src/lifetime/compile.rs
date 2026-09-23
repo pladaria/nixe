@@ -106,7 +106,8 @@ fn remove_empty(
     publication: Publication<'_>,
 ) -> Option<super::DispatchSlot> {
     let slot = state.dispatch.get(publication.slot)?;
-    if slot.compile.is_some()
+    if slot.retired.is_some()
+        || slot.compile.is_some()
         || slot.units != 0
         || slot.optimization.pinned()
         || slot.reshape.pinned()

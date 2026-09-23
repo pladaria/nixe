@@ -1518,16 +1518,26 @@ native-PC records detached and the dispatch/unit/family slots and executable
 span reused.
 
 Normal cold link/cutover maintenance and completed worker jobs collect retired
-units below the cache pressure threshold as well. Use an intrusive pending
-queue, reusing the unlinked record's retirement link, with O(1) enqueue/pop and
-bounded passes (32 records). Still-pinned records rotate to the tail. Do not
-scan the live registry on each publication or add checks to native links;
+units and retired dispatch slots below the cache pressure threshold as well.
+Use intrusive pending queues with O(1) enqueue/pop and bounded passes (at most
+32 units and 32 dispatch slots). Unit records reuse their retirement link;
+dispatch slots retain one cold queue link, included in registry accounting.
+Still-pinned records rotate to the tail, including dispatch-only worker pins
+after their code has gone. Do not scan the live registry on each publication or
+add checks to native links;
 directory detachment retains both epoch grace periods. Pressure/shutdown may
 perform exhaustive collection and free wholly unused segments.
 
 Shutdown closes admission, wakes workers, prevents publication, drains exact
-queued/reserved states, joins workers without holding JIT locks, forces final
-quiescence, unlinks code and releases every segment and metadata allocation.
+queued/reserved states and returns pending while any invocation/fault epoch or
+memory-mutation hold remains. Only then may it join workers, outside JIT,
+cache, queue and memory locks: a compiler capture can itself be waiting for
+that execution or memory owner to return. Terminal closure prevents new native
+admission. After joining, shutdown unlinks code and releases every segment and
+metadata allocation once external compiler/link references also drain. A
+compiler failure remains an actionable terminal error; it is not cleared to
+pretend teardown succeeded. The final process/memory/reference drops release
+failed-state storage after workers have been joined.
 
 At the first terminal shutdown request, debug logging snapshots resident LCQ/HCQ
 unit counts, still-Published HCQ units and each tier's occupied native-span bytes

@@ -30,7 +30,10 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
+mod coordination;
+mod faults;
 mod lifecycle;
+mod mutation;
 mod negative;
 mod replacement;
 mod worker;

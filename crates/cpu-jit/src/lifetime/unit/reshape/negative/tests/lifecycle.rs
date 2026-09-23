@@ -52,6 +52,78 @@ fn retirement_invalidates_exact_unit_evidence_before_snapshot_release() {
 }
 
 #[test]
+fn ordinary_churn_returns_aborted_family_and_negative_record_charges() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let mut steady = None;
+    for _ in 0..32 {
+        let baseline = publish(&process, &cursor, &[0, 4], Tier::Lcq);
+        let publications = [
+            process.reserve(key(0)).unwrap(),
+            process.reserve(key(4)).unwrap(),
+        ];
+        let abandoned = process
+            .prepare_unit(&publications, input(&process, &[0, 4], Tier::Hcq), &cursor)
+            .unwrap();
+        assert!(matches!(
+            process.retire_unit(baseline),
+            Err(Error::PinnedBaseline)
+        ));
+        drop(abandoned);
+        assert_eq!(
+            process
+                .snapshot(baseline)
+                .unwrap()
+                .baseline_pins
+                .load(Ordering::Relaxed),
+            0
+        );
+        let family = publish(&process, &cursor, &[0, 4], Tier::Hcq);
+        let compiler = process.snapshot(family).unwrap();
+        let evidence = boundary(&process, 0);
+        install(
+            &process,
+            evidence,
+            &[Owner::Unit(family), dispatch(&process, 0)],
+        );
+        let charged = process.cache.usage().unwrap().metadata;
+        process.retire_unit(family).unwrap();
+        assert!(!present(&process, evidence));
+        assert!(process.lock().units.negatives.removed.is_none());
+        assert!(process.cache.usage().unwrap().metadata < charged);
+        drain(&process);
+        process.retire_unit(baseline).unwrap();
+        drain(&process);
+        assert!(process.try_service_links().unwrap());
+        drop(compiler);
+        assert!(process.try_service_links().unwrap());
+        let state = process.lock();
+        assert!(state.units.records.is_empty());
+        assert!(state.units.families.is_empty());
+        assert!(state.units.dependencies.entries.is_empty());
+        assert!(state.units.retired_tables.is_empty());
+        assert!(state.dispatch.is_empty());
+        assert_eq!(state.retired_dispatch.len, 0);
+        assert!(state.units.negatives.records.is_empty());
+        assert!(state.units.negatives.keys.is_empty());
+        assert!(state.units.negatives.heads.is_empty());
+        assert!(state.units.negatives.removed.is_none());
+        let capacity = (
+            state.units.negatives.records.capacity(),
+            state.units.negatives.keys.capacity(),
+            state.units.negatives.heads.capacity(),
+        );
+        drop(state);
+        let usage = process.cache.usage().unwrap();
+        // Index/registry capacity remains charged and reusable, but no live
+        // record, directory snapshot or abandoned staging owner accumulates.
+        assert_eq!(*steady.get_or_insert((capacity, usage)), (capacity, usage));
+    }
+    assert!(process.try_shutdown().unwrap());
+    assert_eq!(process.cache.usage().unwrap().committed, 0);
+}
+
+#[test]
 fn publication_invalidates_dispatch_evidence_and_replaced_lcq_units_only() {
     for tier in [Tier::Lcq, Tier::Hcq] {
         let process = process();

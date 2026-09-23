@@ -1,6 +1,49 @@
 use super::*;
 use crate::abi::DispatchPayload;
 
+#[test]
+fn process_owned_staged_hcq_cancels_during_shutdown_with_a_memory_hold() {
+    use crate::lifetime::background::workers::{CompileError, Resources};
+    crate::engine::tests::background::staged_worker_shutdown(|memory, ready, wait| {
+        let compiler = Compiler::new(host(), 0x10000).unwrap();
+        let wait = Mutex::new(wait);
+        let calls = AtomicUsize::new(0);
+        move |resources: &mut Resources, work: Work<'_>| {
+            assert_eq!(
+                calls.fetch_add(1, Ordering::Relaxed),
+                0,
+                "stop must drain queued work"
+            );
+            let frozen = work
+                .reserve_candidate(Graph::discover(&work).unwrap())?
+                .freeze()?;
+            let pause = || {
+                ready.send(()).unwrap();
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+            };
+            let observed = Observed {
+                memory: &memory,
+                runs: Mutex::new(Vec::new()),
+                validations: AtomicUsize::new(0),
+                // One captured run: capture, pre-install validation, then the
+                // final validation after actual W^X/directory preparation.
+                during_validation: Some((2, &pause)),
+            };
+            let result = compiler.publish(
+                &mut resources.context,
+                &mut resources.frontend,
+                &frozen,
+                &observed,
+            );
+            assert!(matches!(result, Err(Failure::Cancelled)), "{result:?}");
+            Err(CompileError::Cancelled)
+        }
+    });
+}
+
 pub(super) fn payload(reader: &mut Reader, pc: u64) -> Option<DispatchPayload> {
     let mut state = A64State::default();
     let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
@@ -40,7 +83,7 @@ pub(super) fn promote_at(
     handle
 }
 
-fn retire(process: &Lifetime, handle: UnitHandle) {
+pub(super) fn retire(process: &Lifetime, handle: UnitHandle) {
     process.retire_unit(handle).unwrap();
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();
@@ -71,6 +114,17 @@ pub(super) fn run(
     reader: &mut Reader,
     pc: u64,
     expected: u64,
+) {
+    run_to(process, memory, reader, pc, expected, (0x5000, 7));
+}
+
+pub(super) fn run_to(
+    process: &Lifetime,
+    memory: &ExecutionMemory,
+    reader: &mut Reader,
+    pc: u64,
+    expected: u64,
+    stop: (u64, u16),
 ) {
     let mut worker = WorkerFaultContext::register().unwrap();
     let mut state = A64State::default();
@@ -104,8 +158,8 @@ pub(super) fn run(
     let invocation::Exit::Native { guest, .. } = exit else {
         panic!("expected a native breakpoint exit")
     };
-    assert_eq!(guest.pc.get(), 0x5000);
-    assert_eq!(guest.kind, EdgeKind::Breakpoint(7));
+    assert_eq!(guest.pc.get(), stop.0);
+    assert_eq!(guest.kind, EdgeKind::Breakpoint(stop.1));
     assert_eq!(state.general_register_storage_mut()[0], expected);
     assert_eq!(returns.depth, 0);
     process.try_service_links().unwrap();

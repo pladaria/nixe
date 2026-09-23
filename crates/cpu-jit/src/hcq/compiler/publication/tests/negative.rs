@@ -3,7 +3,7 @@ use crate::abi::InstructionKey;
 use crate::lifetime::background::Outcome;
 use crate::sampling::{BoundaryKey, FamilyIdentity};
 
-fn real_backend_limit(frozen: &Frozen<'_, '_>) -> Limit {
+pub(super) fn real_backend_limit(frozen: &Frozen<'_, '_>) -> Limit {
     let compiler = Compiler::new(host(), 0x10000).unwrap();
     let mut context = Context::new();
     let mut frontend = FunctionBuilderContext::new();

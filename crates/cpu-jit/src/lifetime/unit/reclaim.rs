@@ -45,6 +45,11 @@ impl Drop for Collector<'_> {
 }
 
 impl Lifetime {
+    #[cfg(test)]
+    pub(crate) fn collection_in_flight(&self) -> bool {
+        self.lock().units.collecting
+    }
+
     /// One synchronous cold LCQ pressure pass over existing charges. No own
     /// reader/lease/compile claim may be retained here. The caller must retry
     /// allocation from a fresh capture: this neither reserves bytes nor promises
@@ -165,7 +170,9 @@ impl Lifetime {
         {
             let mut state = self.lock();
             state.healthy()?;
-            if state.units.collecting || (!full && state.units.reclaim_len == 0) {
+            if state.units.collecting
+                || (!full && state.units.reclaim_len == 0 && state.retired_dispatch.len == 0)
+            {
                 return Ok(0);
             }
             state.units.collecting = true;
@@ -192,6 +199,8 @@ impl Lifetime {
         if full {
             self.collect_dispatch()?;
             self.decommit_unused()?;
+        } else {
+            self.collect_retired_dispatch(32)?;
         }
         Ok(reclaimed)
     }
@@ -624,7 +633,7 @@ impl Transition<'_> {
             // Closing already invalidated compiler publications which reserved
             // these keys. Retained CodeUnit users still postpone slot reuse.
             state.keys.remove(&key);
-            state.dispatch.get_mut(slot).unwrap().retired = Some(epoch);
+            state.retire_dispatch_slot(slot, epoch);
         }
     }
 
@@ -672,6 +681,7 @@ impl Transition<'_> {
         let empty_candidates = crate::lifetime::background::CandidateIndex::new(0);
         let removed = {
             let mut state = self.process.lock();
+            state.retired_dispatch = Default::default();
             // Admission is terminal; resetting empty slab counters cannot
             // make an old handle valid in a new publication.
             (
@@ -797,7 +807,7 @@ impl Transition<'_> {
                     if state.keys.get(&key) == Some(&slot) {
                         state.keys.remove(&key);
                     }
-                    state.dispatch.get_mut(slot).unwrap().retired = Some(retired);
+                    state.retire_dispatch_slot(slot, retired);
                 }
             }
             state

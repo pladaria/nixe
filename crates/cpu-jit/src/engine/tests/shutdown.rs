@@ -1,6 +1,8 @@
 use super::*;
 use nixe_cpu::execution::{ArchitecturalTimer, CpuFaultKind, TimerSnapshot, VcpuEventState};
 
+mod fault;
+
 #[test]
 fn process_stop_wakes_its_real_background_workers() {
     let process =
