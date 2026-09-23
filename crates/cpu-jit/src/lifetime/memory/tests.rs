@@ -27,7 +27,6 @@ mod host_writes;
 mod initialization;
 mod mmio;
 mod publication;
-mod stream;
 mod tracking;
 mod writes;
 
@@ -265,11 +264,23 @@ fn older_batch_does_not_regress_the_last_memory_authoritys_acknowledgement() {
     let second = process.clone().begin(&[]).unwrap();
     let latest = process.request(Reason::MappingChange).unwrap();
     drop(first);
-    assert!(!latest.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::MappingChange, latest)
+            .unwrap()
+    );
     drop(second);
-    assert!(latest.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::MappingChange, latest)
+            .unwrap()
+    );
     batch.complete().unwrap();
-    assert!(latest.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::MappingChange, latest)
+            .unwrap()
+    );
     assert!(transition.try_reopen().unwrap());
 }
 
@@ -466,4 +477,30 @@ fn coordinator_failure_rejects_the_memory_operation_with_its_actual_diagnostic()
     );
     assert!(!memory.mapping_mutation_pending());
     assert_eq!(process.lock().memory_mutations, 0);
+}
+
+#[test]
+fn invalid_mutation_range_releases_its_hold_and_disables_admission() {
+    let (process, _memory) = fixture();
+    let error = process
+        .clone()
+        .begin(&[MemoryInvalidationKind::Mapping {
+            address_space: SPACE,
+            start: GuestVirtualAddress::new(u64::MAX),
+            size: 2,
+        }])
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .0
+            .contains("memory invalidation range exceeds address space")
+    );
+    assert_eq!(process.lock().memory_mutations, 0);
+    assert_eq!(
+        process.reserve(key(0x1000)).err(),
+        Some(Error::InvalidUnit(
+            "memory invalidation range exceeds address space"
+        ))
+    );
 }

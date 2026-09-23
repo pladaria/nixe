@@ -61,12 +61,20 @@ fn real_hcq_publication_crosses_closing_and_late_safety_work_without_losing_its_
             let old_batch = transition.batch().unwrap();
             let late = process.retire_unit(unrelated).unwrap();
             old_batch.complete().unwrap();
-            assert!(!late.is_complete().unwrap());
+            assert!(
+                !process
+                    .maintenance_complete(crate::lifetime::Reason::Eviction, late)
+                    .unwrap()
+            );
             assert!(!transition.try_reopen().unwrap());
             assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
             assert!(transition.drain_links().unwrap());
             transition.batch().unwrap().complete().unwrap();
-            assert!(late.is_complete().unwrap());
+            assert!(
+                process
+                    .maintenance_complete(crate::lifetime::Reason::Eviction, late)
+                    .unwrap()
+            );
             assert!(transition.try_reopen().unwrap());
             drop(transition);
             let successor = result

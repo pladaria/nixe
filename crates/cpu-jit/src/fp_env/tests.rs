@@ -96,11 +96,12 @@ fn native_frame_ends_old_fp_segment_before_architectural_replacement() {
             frame.begin_fp();
             frame.ensure_fp().unwrap();
             divide_by_zero();
-            frame.end_fp();
+            frame.finish_fp();
             let old_fpsr = *frame.canonical.fpsr;
             *frame.canonical.fpsr = 0;
             *frame.canonical.fpcr = 1 << 22;
-            frame.resume_fp().unwrap(); // Ended segments are not resumable.
+            frame.begin_fp();
+            frame.resume_fp().unwrap(); // A new invocation has no suspended segment.
             let resumed = frame.host_fp.active;
             frame.ensure_fp().unwrap();
             let new_status = host::guest_status();

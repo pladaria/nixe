@@ -1,4 +1,4 @@
-//! Canonical slice loop around native LCQ execution. Demand and semantic
+//! Canonical slice loop around native LCQ/HCQ execution. Demand and semantic
 //! completion run only after invocation, FP ownership and memory lease release.
 
 use super::*;

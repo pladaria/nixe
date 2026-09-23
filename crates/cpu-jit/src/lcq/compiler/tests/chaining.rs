@@ -215,7 +215,8 @@ fn selective_bridge_keeps_absent_dirty_state_and_loads_clean_inputs() {
     process.request(Reason::LinkPatch).unwrap();
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();
-    transition.unlink_link(installed).unwrap();
+    process.retire_unit(handle).unwrap();
+    assert_eq!(transition.drain_retirements().unwrap(), 1);
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
     let mut state = integer::initial_state();
@@ -310,7 +311,7 @@ fn request_after_poll_resume_exits_later_unit_before_maintenance_can_close() {
             transition.wait_closed().unwrap();
             assert!(transition.drain_links().unwrap());
             assert_eq!(
-                transition.unlink_link(incoming),
+                transition.install_link(incoming),
                 Err(crate::lifetime::Error::StaleUnit)
             );
             // Both incoming A->B and B's self edge are detached before the
@@ -319,7 +320,11 @@ fn request_after_poll_resume_exits_later_unit_before_maintenance_can_close() {
             closed_tx.send(()).unwrap();
             transition.batch().unwrap().complete().unwrap();
             assert!(transition.try_reopen().unwrap());
-            assert!(ticket.is_complete().unwrap());
+            assert!(
+                process
+                    .maintenance_complete(crate::lifetime::Reason::Eviction, ticket)
+                    .unwrap()
+            );
         });
         let (frame, lookup) = invocation.frame_and_faults();
         let epoch = frame.execution_epoch;

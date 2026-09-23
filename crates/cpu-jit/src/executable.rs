@@ -262,12 +262,6 @@ impl Cache {
         self.base
     }
 
-    /// Bounds first: the final slot represents 15 MiB, not a full 16 MiB.
-    pub fn segment_for_pc(&self, pc: usize) -> Option<usize> {
-        let offset = pc.checked_sub(self.base)?;
-        (offset < WINDOW_BYTES).then_some(offset / SEGMENT_BYTES)
-    }
-
     /// Charge actual metadata storage before transferring it into cache-owned
     /// live/retired records. Replacement keeps both charges until old storage
     /// is freed. Registry/directory owners use this same budget in later steps.
@@ -286,15 +280,6 @@ impl Cache {
             cache: Arc::clone(self),
             bytes,
         })
-    }
-
-    fn allocate(
-        self: &Arc<Self>,
-        size: usize,
-        alignment: usize,
-        tier: Tier,
-    ) -> Result<Allocation, Error> {
-        self.allocate_with_islands(size, alignment, tier, 0)
     }
 
     fn allocate_with_islands(
@@ -448,15 +433,6 @@ impl Cache {
             code_len,
             island_count,
         })
-    }
-
-    pub fn install(
-        self: &Arc<Self>,
-        output: Output,
-        tier: Tier,
-        resolve: impl FnMut(&Target) -> Option<usize>,
-    ) -> Result<Installed, Error> {
-        self.install_with_islands(output, tier, 0, resolve)
     }
 
     /// Reserve the source's complete worst-case set of 16-byte islands while

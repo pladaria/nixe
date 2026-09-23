@@ -79,12 +79,23 @@ fn real_worker_backend_limit_preserves_participants_and_does_not_reject_seed() {
             last_edge: None,
             successors: [None; 4],
         };
-        assert_eq!(
-            process
-                .admit_seed(workers.queue(), &mut Samples::new(), snapshot)
-                .unwrap(),
-            Outcome::Queued
-        );
+        // The consumer's notification precedes the worker's final cleanup.
+        // Nonblocking admission may legitimately defer while that cleanup owns
+        // the state/cache lock; only successful admission completes this step.
+        let start = std::time::Instant::now();
+        let mut samples = Samples::new();
+        loop {
+            match process
+                .admit_seed(workers.queue(), &mut samples, snapshot)
+                .unwrap()
+            {
+                Outcome::Queued => break,
+                Outcome::Deferred if start.elapsed() < Duration::from_secs(10) => {
+                    std::thread::yield_now();
+                }
+                outcome => panic!("unexpected seed admission: {outcome:?}"),
+            }
+        }
         assert_eq!(done.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
         process.try_service_links().unwrap();
         assert!(payload(&mut reader, pc).unwrap().hcq().is_some());

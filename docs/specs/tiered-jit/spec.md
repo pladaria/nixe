@@ -461,6 +461,13 @@ to resolved native links. Lazy-flags recipes remain inline.
 
 ## Native fast-chain ABI
 
+Implementation status: LCQ/HCQ currently emit register/spill locations, dynamic
+FP-mode keys and canonical/packed/deferred NZCV recipes; software FPSR is not a mapped SSA
+operand. Constant locations, exact-FPCR specialization, host-NZCV boundaries and
+FPSR SSA contracts are retained by explicit decision, with production integration
+tracked in [the ABI integration plan](abi-integration-plan.md). Their isolated
+contract tests do not demonstrate a current compiler producer.
+
 The x86-64 ABI requires LAHF/SAHF in 64-bit mode, as documented in
 [host requirements](../../host-requirements.md). Check CPUID support during JIT
 process initialization, not in invocations or links. Unsupported hosts fail
@@ -1087,7 +1094,7 @@ instruction ceiling, the owners remain separate and the direct link remains.
 This is a valid optimized boundary, not permission for overlapping bodies.
 A process-owned, cache-accounted index stores negative results by full boundary
 identity and logical source BlockKey, with exact generational source/dependency
-evidence and its capture cursor. Workers install results under JIT state after
+evidence. Workers install results under JIT state after
 revalidating that evidence; they never mutate per-vCPU sample tables. Admission
 consults the index through the existing nonblocking cold path. Suppression
 survives heat-table eviction and observations from other vCPUs. An unchanged
@@ -1102,9 +1109,10 @@ do not copy persistent rejection state into each vCPU's sample table.
 
 A valid negative is not evicted merely to admit another boundary. Relevant
 endpoint reachability, family version or inspected-source lifecycle/dependency
-changes invalidate it through indexed associations. The capture cursor is not
-an equality check against unrelated global memory activity; history loss
-invalidates the affected evidence. The same unchanged over-cap, disconnected
+changes invalidate it through indexed associations. The bound memory coordinator
+invalidates affected evidence before mutation; overflow of the bounded
+invalidation log alone does not invalidate unrelated evidence. The same
+unchanged over-cap, disconnected
 or no-op shape is not rediscovered every four samples.
 
 Selection-sensitive cap/disconnection evidence also watches inspected virtual
@@ -1206,8 +1214,10 @@ lifecycle and instruction claims close the gap between image validation and publ
 the bound memory coordinator invalidates every affected source unit under the
 same JIT-state mutex before its dependency can change. Strong references alone
 are not validity; superseded, invalidating, retired or replaced inputs cancel
-the candidate even while their storage remains alive. History loss invalidates
-all sources. Cold image validation checks exact owner/mapping/content stamps,
+the candidate even while their storage remains alive. Bounded invalidation-log
+history loss does not flush sources: the bound observer already invalidates
+each affected source before mutation. Cold image validation checks exact
+owner/mapping/content stamps,
 not the unrelated global memory cursor. LCQ and unbound synthetic publications
 retain their speculative admission-epoch/cursor guard. No memory lock is nested
 under JIT state and no per-store compiler check is added.

@@ -33,11 +33,12 @@ fn storage(process: &Lifetime, count: usize, owners: usize) -> Index {
 
 fn record(process: &Lifetime, key: Key, owners: &[Owner]) -> Option<Box<Record>> {
     Some(
-        Record::prepare(
-            &process.cache,
+        Record::prepare_reserved(
+            process
+                .cache
+                .charge_metadata(size_of::<Record>(), Tier::Hcq)
+                .unwrap(),
             key,
-            Rejection::Unchanged,
-            MemoryInvalidationCursor::new(42),
             owners.iter().copied(),
         )
         .unwrap(),
@@ -56,20 +57,16 @@ fn negative_identity_includes_logical_root_and_both_versions() {
     source_version.boundary.source_version = other_versions.boundary.source_version;
     let mut target_version = original;
     target_version.boundary.target_version = other_versions.boundary.target_version;
-    let mut index = storage(&process, 4, 1);
+    let mut index = storage(&process, 5, 1);
     for key in [original, other_root, source_version, target_version] {
-        assert!(index.insert(&mut record(&process, key, &[owner])).unwrap());
+        assert!(insert(&mut index, &mut record(&process, key, &[owner])).unwrap());
     }
     assert_eq!(index.keys.len(), 4);
     for key in [original, other_root, source_version, target_version] {
-        assert_eq!(index.get(key).unwrap().reason, Rejection::Unchanged);
-        assert_eq!(
-            index.get(key).unwrap().cursor,
-            MemoryInvalidationCursor::new(42)
-        );
+        assert!(index.get(key).is_some());
     }
     let mut duplicate = record(&process, original, &[owner]);
-    assert!(!index.insert(&mut duplicate).unwrap());
+    assert!(!insert(&mut index, &mut duplicate).unwrap());
     assert!(duplicate.is_some());
     index.invalidate(owner);
     assert!(index.get(original).is_none());
@@ -101,7 +98,7 @@ fn negative_evidence_is_deduplicated_charged_and_released_after_detach() {
         process.cache.usage().unwrap().metadata,
         before + index_bytes + record_bytes
     );
-    index.insert(&mut prepared).unwrap();
+    insert(&mut index, &mut prepared).unwrap();
     assert!(prepared.is_none());
     index.invalidate(owner);
     assert_eq!(
@@ -125,9 +122,11 @@ fn negative_invalidation_detaches_middle_head_and_tail_associations() {
     let owners: Vec<_> = (0..6).map(|i| dispatch(&process, 64 + i * 4)).collect();
     let mut index = storage(&process, 6, 7);
     for i in 0..6 {
-        index
-            .insert(&mut record(&process, keys[i], &[common, owners[i]]))
-            .unwrap();
+        insert(
+            &mut index,
+            &mut record(&process, keys[i], &[common, owners[i]]),
+        )
+        .unwrap();
     }
     for i in [2, 5, 0] {
         index.invalidate(owners[i]);
@@ -150,11 +149,11 @@ fn negative_capacity_failure_never_evicts_or_partially_attaches() {
     let b = boundary(&process, 8);
     let owner = dispatch(&process, 0);
     let mut index = storage(&process, 1, 1);
-    index.insert(&mut record(&process, a, &[owner])).unwrap();
+    insert(&mut index, &mut record(&process, a, &[owner])).unwrap();
     let old_handle = *index.keys.iter().next().unwrap();
     let mut pending = record(&process, b, &[owner]);
     assert!(matches!(
-        index.insert(&mut pending),
+        insert(&mut index, &mut pending),
         Err(Error::Capacity(_))
     ));
     assert!(pending.is_some());
@@ -162,7 +161,7 @@ fn negative_capacity_failure_never_evicts_or_partially_attaches() {
     assert!(index.get(b).is_none());
     index.invalidate(owner);
     // Reuse registry and hash capacity while retired storage remains charged.
-    assert!(index.insert(&mut pending).unwrap());
+    assert!(insert(&mut index, &mut pending).unwrap());
     let new_handle = *index.keys.iter().next().unwrap();
     assert_ne!(old_handle, new_handle);
     assert!(index.records.get(old_handle).is_none());
@@ -177,13 +176,13 @@ fn negative_growth_preserves_handles_links_and_rejects_stale_plans() {
     let b = boundary(&process, 8);
     let owner = dispatch(&process, 0);
     let mut index = storage(&process, 1, 1);
-    index.insert(&mut record(&process, a, &[owner])).unwrap();
+    insert(&mut index, &mut record(&process, a, &[owner])).unwrap();
     let handle = *index.keys.iter().next().unwrap();
     let mut large = Storage::prepare(&process.cache, 8, 8).unwrap();
     index.grow(&mut large).unwrap();
     drop(large);
     assert!(index.records.get(handle).is_some());
-    index.insert(&mut record(&process, b, &[owner])).unwrap();
+    insert(&mut index, &mut record(&process, b, &[owner])).unwrap();
     let mut stale = Storage::prepare(&process.cache, 2, 2).unwrap();
     assert!(matches!(index.grow(&mut stale), Err(Error::Capacity(_))));
     assert!(index.get(a).is_some());
@@ -198,15 +197,13 @@ fn stale_dispatch_invalidation_cannot_remove_a_reused_generation() {
     let process = process();
     let original = process.reserve(key(0)).unwrap();
     let old = Owner::Dispatch(original.slot);
-    process.retire_dispatch(original).unwrap();
-    assert_eq!(process.collect_dispatch().unwrap(), 1);
+    process.recover_capacity().unwrap();
+    assert!(process.lock().dispatch.get(original.slot).is_none());
     let current = dispatch(&process, 0);
     assert_ne!(old, current);
     let key = boundary(&process, 0);
     let mut index = storage(&process, 1, 1);
-    index
-        .insert(&mut record(&process, key, &[current]))
-        .unwrap();
+    insert(&mut index, &mut record(&process, key, &[current])).unwrap();
     index.invalidate(old);
     assert!(index.get(key).is_some());
     index.invalidate(current);
@@ -223,7 +220,7 @@ fn unit_associations_and_large_garbage_chains_retain_no_code() {
     let mut key = boundary(&process, 0);
     for pc in 0..1024 {
         key.source = crate::lifetime::unit::tests::key(pc * 4);
-        index.insert(&mut record(&process, key, &owners)).unwrap();
+        insert(&mut index, &mut record(&process, key, &owners)).unwrap();
     }
     assert_eq!(
         Arc::strong_count(&process.lock().units.records.get(unit.0).unwrap().code),
@@ -242,7 +239,7 @@ fn metadata_pressure_refuses_new_storage_without_losing_existing_results() {
     let key = boundary(&process, 0);
     let owner = dispatch(&process, 0);
     let mut index = storage(&process, 1, 1);
-    index.insert(&mut record(&process, key, &[owner])).unwrap();
+    insert(&mut index, &mut record(&process, key, &[owner])).unwrap();
     let before = process.cache.usage().unwrap();
     let pressure = process
         .cache
@@ -253,18 +250,25 @@ fn metadata_pressure_refuses_new_storage_without_losing_existing_results() {
         Err(Error::Capacity(_))
     ));
     assert!(matches!(
-        Record::prepare(
-            &process.cache,
-            key,
-            Rejection::Disconnected,
-            MemoryInvalidationCursor::INITIAL,
-            [owner]
-        ),
-        Err(Error::Capacity(_))
+        process
+            .cache
+            .charge_metadata(size_of::<Record>(), Tier::Hcq),
+        Err(crate::executable::Error::Capacity(_))
     ));
     assert!(index.get(key).is_some());
     drop(pressure);
     assert_eq!(process.cache.usage().unwrap().metadata, before.metadata);
     index.invalidate(owner);
     drop(index.take_removed());
+}
+
+/// Fixtures exercise the same reservation/installation pair as a worker.
+/// A failed/duplicate result releases its reservation just as Work::drop does.
+fn insert(index: &mut Index, prepared: &mut Option<Box<Record>>) -> Result<bool, Error> {
+    index.reserve_record()?;
+    let result = index.insert_reserved(prepared);
+    if result != Ok(true) {
+        index.release_record();
+    }
+    result
 }

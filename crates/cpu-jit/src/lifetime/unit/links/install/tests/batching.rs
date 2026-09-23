@@ -143,7 +143,11 @@ fn install_limit_spans_batches_and_owners_but_never_limits_safety_unlinks() {
         transition.batch().unwrap().complete(),
         Err(Error::MaintenancePending)
     );
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
+    );
 
     drop(transition);
     let mut transition = process.try_transition().unwrap().unwrap();
@@ -185,7 +189,11 @@ fn install_limit_spans_batches_and_owners_but_never_limits_safety_unlinks() {
         .complete_with_links_deferred()
         .unwrap();
     assert!(transition.try_reopen().unwrap());
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
+    );
     assert_eq!(execute_at(&process, pcs[0]), 77);
     assert_eq!(execute_at(&process, pcs[INSTALL_LIMIT]), 42);
     drop(transition);
@@ -195,7 +203,11 @@ fn install_limit_spans_batches_and_owners_but_never_limits_safety_unlinks() {
     // leftovers now install with fresh capacity, and that service reopens.
     assert!(process.try_service_links().unwrap());
     assert!(pending(&process).is_empty());
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
+    );
     {
         let state = process.lock();
         assert_eq!(
@@ -244,11 +256,19 @@ fn canonical_link_service_defers_after_the_real_install_limit() {
     drop(transition);
     assert!(process.try_service_links().unwrap());
     assert_eq!(pending(&process).len(), 1);
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
+    );
     assert_eq!(process.lock().phase, crate::lifetime::Phase::Open);
     assert!(process.try_service_links().unwrap());
     assert!(pending(&process).is_empty());
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
+    );
     assert!(process.try_shutdown().unwrap());
 }
 

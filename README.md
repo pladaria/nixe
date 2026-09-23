@@ -55,14 +55,20 @@ background HCQ compiler pool (disabled on hosts with at most two logical CPUs).
 HCQ emits multi-entry regions with shared internal SSA and preserves valid
 compilation across unrelated maintenance stops; publication revalidates exact
 LCQ inputs and ownership under Open authority.
-Family reshaping is not yet active. Development requires the local Cranelift
-override described in
+The same pool performs evidence-driven family reshaping; versioned negative
+results suppress repeated discovery until relevant inputs change. Code and
+metadata share a bounded budget, with coordinated invalidation and reclamation.
+Development requires the local Cranelift override described in
 [Cranelift modifications](docs/cranelift-modifications.md); the checked-in Git
 pin does not include the complete implementation.
 
 ## Running
 
 See [host requirements](docs/host-requirements.md) for the required CPU capabilities.
+Until the fork pin is updated, use the local override for Cargo commands below,
+for example `cargo --config /tmp/nixe-observable-fp-local.toml cli run es2gears`.
+See [override setup](docs/cranelift-modifications.md#baseline-and-revision) to
+create that machine-local file; `--offline` is optional once dependencies are cached.
 
 The default configuration is in [`nixe.toml`](nixe.toml). List available titles with:
 

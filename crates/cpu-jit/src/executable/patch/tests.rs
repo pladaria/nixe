@@ -5,7 +5,7 @@ use crate::executable::tests::permissions;
 fn write_window_closes_rw_on_finish_and_discards_it_on_unwind() {
     for unwind in [false, true] {
         let cache = Cache::new().unwrap();
-        let allocation = cache.allocate(16, 16, Tier::Lcq).unwrap();
+        let allocation = cache.allocate_with_islands(16, 16, Tier::Lcq, 0).unwrap();
         let state = cache.lock().unwrap();
         let rw = state.backing.as_ref().unwrap().rw.as_ref().unwrap();
         let rw_address = rw.base.as_ptr() as usize;

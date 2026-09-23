@@ -7,13 +7,7 @@ fn install(process: &Lifetime) {
         .unwrap()
         .freeze()
         .unwrap();
-    assert!(
-        frozen
-            .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-            .unwrap()
-            .install()
-            .unwrap()
-    );
+    assert!(frozen.prepare_unchanged().unwrap().install().unwrap());
 }
 
 #[test]

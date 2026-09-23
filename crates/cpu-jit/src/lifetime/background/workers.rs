@@ -193,6 +193,7 @@ impl Workers {
         Ok(Some(pool))
     }
 
+    #[cfg(test)]
     pub(crate) fn queue(&self) -> &Queue {
         &self.queue
     }

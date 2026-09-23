@@ -28,6 +28,7 @@ pub(super) struct Published {
 }
 impl Published {
     pub fn new(build: impl FnOnce(&Lifetime, &Arc<Cache>) -> Input) -> Self {
+        check_host().unwrap();
         let cache = Cache::new().unwrap();
         let process = Arc::new(Lifetime::new(Arc::clone(&cache)).unwrap());
         let handle = Self::publish(&process, build(&process, &cache));
@@ -236,44 +237,6 @@ pub(super) fn synthetic(
     bytes.extend(body);
     let offset = bytes.len() as u32;
     bytes.extend(emit_canonical_exit(&exit, pc, reason, 0).unwrap());
-    let code = cache
-        .install(
-            Output {
-                bytes: bytes.into_boxed_slice(),
-                alignment: 16,
-                metadata: Metadata {
-                    abi,
-                    frame_extent: SPILL_BYTES,
-                    entries: Box::new([(cranelift_codegen::ir::Block::from_u32(0), 0)]),
-                    states: Box::new([cranelift_codegen::nixe::StateMap {
-                        id: 0,
-                        offset,
-                        entry: false,
-                        patch_bytes: 0,
-                        fault_bytes: 0,
-                        poll: None,
-                        values: vec![],
-                    }]),
-                    faults: fault_bytes
-                        .map(|bytes| cranelift_codegen::nixe::StateMap {
-                            id: 1,
-                            offset: fault_offset,
-                            entry: false,
-                            patch_bytes: 0,
-                            fault_bytes: bytes,
-                            poll: None,
-                            values: vec![],
-                        })
-                        .into_iter()
-                        .collect(),
-                    traps: Box::new([]),
-                    relocations: Box::new([]),
-                },
-            },
-            Tier::Lcq,
-            |_| None,
-        )
-        .unwrap();
     let mut states = vec![StateRecord {
         exit: None,
         transfer: None,
@@ -304,6 +267,77 @@ pub(super) fn synthetic(
         })
         .into_iter()
         .collect();
+    encoded(
+        identity,
+        cache,
+        bytes,
+        Entry {
+            key: key(),
+            canonical_offset: 0,
+            fast_offset: 0,
+            contract: entry,
+        },
+        states,
+        faults,
+    )
+}
+
+/// Install hand-emitted contracts in the same publication owner as compiler output.
+pub(super) fn encoded(
+    identity: EmissionIdentity,
+    cache: &Arc<Cache>,
+    bytes: Vec<u8>,
+    entry: Entry,
+    states: Vec<StateRecord>,
+    faults: Box<[crate::lifetime::unit::FaultRecord]>,
+) -> Input {
+    let code = cache
+        .install_with_islands(
+            Output {
+                bytes: bytes.into_boxed_slice(),
+                alignment: 16,
+                metadata: Metadata {
+                    abi: entry.contract.abi,
+                    frame_extent: SPILL_BYTES,
+                    entries: Box::new([(
+                        cranelift_codegen::ir::Block::from_u32(0),
+                        entry.fast_offset,
+                    )]),
+                    states: states
+                        .iter()
+                        .map(|record| cranelift_codegen::nixe::StateMap {
+                            id: u64::from(record.state.site.state_map),
+                            offset: record.native_offset,
+                            entry: false,
+                            patch_bytes: 0,
+                            fault_bytes: 0,
+                            poll: None,
+                            values: vec![],
+                        })
+                        .collect(),
+                    faults: faults
+                        .iter()
+                        .map(|fault| cranelift_codegen::nixe::StateMap {
+                            id: u64::from(fault.state_map),
+                            offset: fault.native_start,
+                            entry: false,
+                            patch_bytes: 0,
+                            fault_bytes: (fault.native_end - fault.native_start)
+                                .try_into()
+                                .unwrap(),
+                            poll: None,
+                            values: vec![],
+                        })
+                        .collect(),
+                    traps: Box::new([]),
+                    relocations: Box::new([]),
+                },
+            },
+            Tier::Lcq,
+            0,
+            |_| None,
+        )
+        .unwrap();
     Input {
         identity,
         code,
@@ -312,12 +346,7 @@ pub(super) fn synthetic(
             key: InstructionKey::new(key()).unwrap(),
             bits: 0xd503201f,
         }]),
-        entries: Box::new([Entry {
-            key: key(),
-            canonical_offset: 0,
-            fast_offset: 0,
-            contract: entry,
-        }]),
+        entries: Box::new([entry]),
         dependencies: Box::new([]),
         cursor: MemoryInvalidationCursor::INITIAL,
         states: states.into_boxed_slice(),

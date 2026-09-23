@@ -20,7 +20,7 @@ pub use backend::AllocatedBoundary;
 pub use bridge::emit_chain_transfer;
 pub(crate) use canonical::emit_dispatch_fallback;
 pub(crate) use canonical::emit_polled_exit;
-pub use canonical::{emit_canonical_entry, emit_canonical_exit, emit_canonical_writeback};
+pub use canonical::{emit_canonical_entry, emit_canonical_exit};
 pub(crate) use fp::emit_fp_activation;
 pub use gateway::{NativeReturn, NativeReturnError, check_host, enter_protected};
 pub(crate) use poll::emit_poll;

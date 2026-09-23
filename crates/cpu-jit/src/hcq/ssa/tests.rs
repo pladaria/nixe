@@ -16,46 +16,6 @@ const ADDS: u32 = 0xb1000420;
 const SUBS: u32 = 0xf1000420;
 const RET: u32 = 0xd65f03c0;
 
-// Small scalar harness for the isolated packed-subset execution test. Region
-// tests below use the real HCQ driver and shared native translator.
-struct Emitter<'b, 'a> {
-    builder: &'b mut FunctionBuilder<'a>,
-    values: Values,
-}
-impl<'a> IntegerLowering<'a> for Emitter<'_, 'a> {
-    fn builder(&mut self) -> &mut FunctionBuilder<'a> {
-        self.builder
-    }
-    fn read_register(&mut self, index: u8, sp: bool) -> Result<ir::Value, Error> {
-        if index == 31 && !sp {
-            return Ok(self.builder.ins().iconst(types::I64, 0));
-        }
-        self.values.get(if index == 31 {
-            GuestValue::Sp
-        } else {
-            GuestValue::General(index)
-        })
-    }
-    fn write_register_with_sp(
-        &mut self,
-        index: u8,
-        sp: bool,
-        value: ir::Value,
-    ) -> Result<(), Error> {
-        if index != 31 || sp {
-            self.values.bind(
-                if index == 31 {
-                    GuestValue::Sp
-                } else {
-                    GuestValue::General(index)
-                },
-                value,
-            );
-        }
-        Ok(())
-    }
-}
-
 fn body(graph: &Graph, entries: &[usize]) -> (ir::Function, Ssa) {
     let analysis = Analysis::build(graph, entries);
     let mut context = Context::new();
@@ -259,13 +219,26 @@ fn hcq_ssa_packed_join_retains_the_bit_mask_instead_of_demanding_all_flags() {
 
 #[test]
 fn hcq_ssa_partial_packing_executes_only_the_required_flag_contract() {
-    use cranelift_jit::{JITBuilder, JITModule};
-    use cranelift_module::{Linkage, Module, default_libcall_names};
+    use crate::executable::{
+        Cache, Tier,
+        output::{Metadata, Output},
+    };
     use nixe_cpu::{
         platform::TargetPlatform,
         state::a64::{A64State, Nzcv},
     };
-    let mut module = JITModule::new(JITBuilder::new(default_libcall_names()).unwrap());
+    // This isolated flag calculation uses the host ABI, not a guest entry.
+    // Cache owns the immutable code; no dispatch payload is published.
+    let isa = cranelift_native::builder()
+        .unwrap()
+        .finish(settings::Flags::new(settings::builder()))
+        .unwrap();
+    let abi = if cfg!(target_arch = "x86_64") {
+        crate::abi::HostAbi::X86_64
+    } else {
+        crate::abi::HostAbi::Aarch64
+    };
+    let cache = Cache::new().unwrap();
     for word in [
         0xab020020, 0x6b020020, 0xba020020, 0xfa020020, 0xea020020, 0xfa42102a,
     ] {
@@ -279,20 +252,14 @@ fn hcq_ssa_partial_packing_executes_only_the_required_flag_contract() {
             unreachable!()
         };
         for mask in 1..=15 {
-            let mut context = module.make_context();
+            let mut context = Context::new();
+            context.func.signature.call_conv = isa.default_call_conv();
             context.func.signature.params = vec![
                 AbiParam::new(types::I64),
                 AbiParam::new(types::I64),
                 AbiParam::new(types::I32),
             ];
             context.func.signature.returns = vec![AbiParam::new(types::I32)];
-            let id = module
-                .declare_function(
-                    &format!("subset_{word:x}_{mask}"),
-                    Linkage::Local,
-                    &context.func.signature,
-                )
-                .unwrap();
             let mut frontend = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut context.func, &mut frontend);
             let entry = builder.create_block();
@@ -302,10 +269,14 @@ fn hcq_ssa_partial_packing_executes_only_the_required_flag_contract() {
             let mut values = Values::default();
             values.bind(GuestValue::General(1), args[0]);
             values.bind(GuestValue::General(2), args[1]);
-            let mut emitter = Emitter {
-                builder: &mut builder,
-                values,
-            };
+            let mut emitter = Translator::new(
+                builder,
+                abi,
+                &*isa,
+                None,
+                crate::analysis::StateSet::default(),
+            );
+            emitter.values = values;
             let flags = emitter
                 .emit_integer(
                     graph.blocks[0].key.pc,
@@ -316,12 +287,38 @@ fn hcq_ssa_partial_packing_executes_only_the_required_flag_contract() {
                 .unwrap();
             let packed = emitter.packed_flag_subset(&flags, mask);
             emitter.builder.ins().return_(&[packed]);
-            builder.seal_all_blocks();
-            builder.finalize(module.isa().frontend_config());
-            module.define_function(id, &mut context).unwrap();
-            module.finalize_definitions().unwrap();
+            emitter.builder.seal_all_blocks();
+            emitter.builder.finalize(isa.frontend_config());
+            let compiled = context
+                .compile(&*isa, &mut ControlPlane::default())
+                .unwrap();
+            assert!(compiled.buffer.relocs().is_empty());
+            assert!(compiled.buffer.traps().is_empty());
+            let code = cache
+                .install_with_islands(
+                    Output {
+                        bytes: compiled.buffer.data().into(),
+                        alignment: compiled.buffer.alignment as usize,
+                        metadata: Metadata {
+                            abi,
+                            // No NativeFrame or published Nixe state maps in this host-ABI fixture.
+                            frame_extent: 0,
+                            entries: Box::new([]),
+                            states: Box::new([]),
+                            faults: Box::new([]),
+                            traps: Box::new([]),
+                            relocations: Box::new([]),
+                        },
+                    },
+                    Tier::Lcq,
+                    0,
+                    |_| None,
+                )
+                .unwrap();
+            // SAFETY: host-compatible compiled signature, no external relocations;
+            // the allocation lease stays alive through every call below.
             let function: unsafe extern "C" fn(u64, u64, u32) -> u32 =
-                unsafe { std::mem::transmute(module.get_finalized_function(id)) };
+                unsafe { std::mem::transmute(code.allocation.address()) };
             for (lhs, rhs) in [
                 (0, 0),
                 (u64::MAX, 1),

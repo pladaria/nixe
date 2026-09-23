@@ -1,5 +1,6 @@
 use super::*;
 use crate::lifetime::Reader;
+use crate::lifetime::unit::dynamic::pic::tests::cache;
 
 // Ownership fixture with a static site and an independent dynamic source map.
 // Only the real linker/PIC/publication protocol runs here, not an HCQ compiler.
@@ -38,14 +39,14 @@ fn mixed_source(process: &Lifetime, cursor: &AtomicU64) -> UnitHandle {
 }
 
 fn cache_target(process: &Lifetime, reader: &mut Reader, source: UnitHandle) {
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 1, key(4))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    cache(
+        reader,
+        process
+            .prepare_dynamic_bridge(source, 1, key(4))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
 }
 
 fn pic_addresses(process: &Lifetime, reader: &Reader) -> Vec<usize> {
@@ -178,7 +179,11 @@ fn baseline_only_mapping_invalidation_removes_hcq_and_all_mixed_roots() {
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
     drop(transition);
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, ticket)
+            .unwrap()
+    );
     assert!(matches!(process.snapshot(baseline), Err(Error::StaleUnit)));
     assert!(matches!(process.snapshot(hcq), Err(Error::StaleUnit)));
     assert!(process.snapshot(source).is_ok());

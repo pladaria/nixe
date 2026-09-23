@@ -84,7 +84,7 @@ impl Translator<'_> {
             operation.destination_64,
             operation.signed,
         );
-        self.write_register(f.rd, result)?;
+        self.write_register(f.rd, result);
         Ok(false)
     }
 
@@ -132,7 +132,7 @@ impl Translator<'_> {
             .ins()
             .bitcast(ty, crate::simd_lowering::bitcast_flags(), second);
         let result = self.float_add_values(first, second, operation.operation);
-        self.write_fp_scalar(f.rd, result)?;
+        self.write_fp_scalar(f.rd, result);
         Ok(false)
     }
 
@@ -175,7 +175,7 @@ impl Translator<'_> {
             .ins()
             .bitcast(ty, crate::simd_lowering::bitcast_flags(), second);
         let result = self.fp_divide_value(first, second);
-        self.write_fp_scalar(f.rd, result)?;
+        self.write_fp_scalar(f.rd, result);
         Ok(false)
     }
 
@@ -209,7 +209,7 @@ impl Translator<'_> {
         let second = self.read_vector(f.rm)?;
         let (first, second) = self.fp_vector_divide_operands(first, second, lane_bits, vector_bits);
         let result = self.fp_vector_divide_value(first, second, lane_bits, vector_bits);
-        self.write_vector(f.rd, result)?;
+        self.write_vector(f.rd, result);
         Ok(false)
     }
 
@@ -256,7 +256,7 @@ impl Translator<'_> {
             f.fp_element_lane,
         );
         let result = self.fp_vector_multiply_value(first, second, lane_bits, vector_bits);
-        self.write_vector(f.rd, result)?;
+        self.write_vector(f.rd, result);
         Ok(false)
     }
 
@@ -309,7 +309,7 @@ impl Translator<'_> {
             f.float_multiply_operation
                 .expect("normalized FP multiply operation"),
         );
-        self.write_fp_scalar(f.rd, result)?;
+        self.write_fp_scalar(f.rd, result);
         Ok(false)
     }
 
@@ -373,7 +373,7 @@ impl Translator<'_> {
             .ins()
             .bitcast(ty, crate::simd_lowering::bitcast_flags(), third);
         let result = self.fp_fused_value(first, second, third, operation.operation);
-        self.write_fp_scalar(f.rd, result)?;
+        self.write_fp_scalar(f.rd, result);
         Ok(false)
     }
 
@@ -413,7 +413,7 @@ impl Translator<'_> {
         let source = self.read_vector(f.rn)?;
         let result =
             self.vector_integer_to_fp_value(source, operation.lane_64, vector_bits, signed);
-        self.write_vector(f.rd, result)?;
+        self.write_vector(f.rd, result);
         Ok(false)
     }
 
@@ -441,7 +441,7 @@ impl Translator<'_> {
             operation.destination_64,
             operation.signed,
         );
-        self.write_fp_scalar(f.rd, result)?;
+        self.write_fp_scalar(f.rd, result);
         Ok(false)
     }
 
@@ -470,7 +470,7 @@ impl Translator<'_> {
         Ok(())
     }
 
-    fn write_fp_scalar(&mut self, rd: u8, result: ir::Value) -> Result<(), Error> {
+    fn write_fp_scalar(&mut self, rd: u8, result: ir::Value) {
         let width = self.builder.func.dfg.value_type(result).bits();
         let result = self.builder.ins().bitcast(
             if width == 32 { types::I32 } else { types::I64 },
@@ -479,7 +479,7 @@ impl Translator<'_> {
         );
         let result = self.builder.ins().uextend(types::I128, result);
         let result = self.vector_as(result, types::I8X16);
-        self.write_vector(rd, result)
+        self.write_vector(rd, result);
     }
 
     fn fp_unary(
@@ -541,7 +541,7 @@ impl Translator<'_> {
             bits,
         );
         let result = self.fp_unary_value(value, kind);
-        self.write_fp_scalar(f.rd, result)?;
+        self.write_fp_scalar(f.rd, result);
         Ok(false)
     }
 
@@ -589,7 +589,7 @@ impl Translator<'_> {
         )?;
         self.builder.switch_to_block(native);
         let result = self.native_scalar_round(bits, width, operation.rounding);
-        self.write_vector(f.rd, result)?;
+        self.write_vector(f.rd, result);
         Ok(false)
     }
 

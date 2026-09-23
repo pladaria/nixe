@@ -3,7 +3,8 @@
 use super::discovery::{owned_entries, reshape};
 use super::*;
 use crate::hcq::Graph;
-use crate::lifetime::unit::reshape::negative::{Key, Rejection};
+use crate::lifetime::unit::dynamic::pic::tests::cache;
+use crate::lifetime::unit::reshape::negative::Key;
 use crate::lifetime::unit::{dynamic, tests::publish_words};
 
 mod admission;
@@ -54,11 +55,7 @@ fn unchanged_installation_transfers_budget_suppresses_repeats_and_retains_no_cod
             .unwrap();
         let code_bytes = process.cache.usage().unwrap().committed;
         assert_eq!(
-            frozen
-                .prepare_unchanged(MemoryInvalidationCursor::new(42))
-                .unwrap()
-                .install()
-                .unwrap(),
+            frozen.prepare_unchanged().unwrap().install().unwrap(),
             inserted
         );
         assert_eq!(process.cache.usage().unwrap().committed, code_bytes);
@@ -71,9 +68,7 @@ fn unchanged_installation_transfers_budget_suppresses_repeats_and_retains_no_cod
             references
         );
         let state = process.lock();
-        let record = state.units.negatives.get(key).unwrap();
-        assert_eq!(record.reason, Rejection::Unchanged);
-        assert_eq!(record.cursor, MemoryInvalidationCursor::new(42));
+        assert!(state.units.negatives.get(key).is_some());
     }
     process.retire_unit(family).unwrap();
     assert!(process.lock().units.negatives.get(key).is_none());
@@ -92,17 +87,15 @@ fn late_entry_root_rejects_prepared_negative_and_allows_retry_after_cancellation
         .unwrap()
         .freeze()
         .unwrap();
-    let prepared = frozen
-        .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-        .unwrap();
-    reader
-        .cache_bridge(
-            process
-                .prepare_dynamic_bridge(source, 0, key(20))
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    let prepared = frozen.prepare_unchanged().unwrap();
+    cache(
+        &mut reader,
+        process
+            .prepare_dynamic_bridge(source, 0, key(20))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     frozen.check().unwrap();
     assert_eq!(prepared.install(), Err(Error::StalePublication));
     assert!(process.lock().units.negatives.get(result_key).is_none());
@@ -115,13 +108,7 @@ fn late_entry_root_rejects_prepared_negative_and_allows_retry_after_cancellation
         .unwrap()
         .freeze()
         .unwrap();
-    assert!(
-        frozen
-            .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-            .unwrap()
-            .install()
-            .unwrap()
-    );
+    assert!(frozen.prepare_unchanged().unwrap().install().unwrap());
 }
 
 #[test]
@@ -135,9 +122,7 @@ fn cancelled_prepared_negative_cannot_install_after_retirement_or_shutdown() {
             .unwrap()
             .freeze()
             .unwrap();
-        let prepared = frozen
-            .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-            .unwrap();
+        let prepared = frozen.prepare_unchanged().unwrap();
         if shutdown {
             process.request_shutdown().unwrap();
         } else {
@@ -175,7 +160,7 @@ fn evidence_pressure_and_abandoned_preparation_leave_no_negative_and_allow_retry
                 .charge_metadata(crate::executable::SOFT_BYTES - usage.total() - 1, Tier::Lcq)
                 .unwrap()
         });
-        let prepared = frozen.prepare_unchanged(MemoryInvalidationCursor::INITIAL);
+        let prepared = frozen.prepare_unchanged();
         if pressure {
             assert!(matches!(prepared, Err(Error::Capacity(_))));
         } else {
@@ -191,13 +176,7 @@ fn evidence_pressure_and_abandoned_preparation_leave_no_negative_and_allow_retry
             .unwrap()
             .freeze()
             .unwrap();
-        assert!(
-            frozen
-                .prepare_unchanged(MemoryInvalidationCursor::INITIAL)
-                .unwrap()
-                .install()
-                .unwrap()
-        );
+        assert!(frozen.prepare_unchanged().unwrap().install().unwrap());
     }
 }
 
@@ -223,11 +202,11 @@ fn temporary_competitor_cannot_turn_a_trimmed_candidate_into_a_persistent_no_op(
     assert_eq!(frozen.graph().discovery.as_ref().unwrap().len(), 4);
     assert!(frozen.unchanged());
     assert!(matches!(
-        frozen.prepare_unchanged(MemoryInvalidationCursor::INITIAL),
+        frozen.prepare_unchanged(),
         Err(Error::StalePublication)
     ));
     assert!(matches!(
-        frozen.prepare_backend_negative(MemoryInvalidationCursor::INITIAL),
+        frozen.prepare_backend_negative(),
         Err(Error::StalePublication)
     ));
     // Releasing the competitor makes the larger useful candidate available.
@@ -264,7 +243,7 @@ fn discovery_distinguishes_missing_inputs_from_stable_foreign_frontiers() {
         assert!(frozen.unchanged());
         frozen.check().unwrap(); // The positive candidate contract is unaffected.
         let key = result_key(&process);
-        let prepared = frozen.prepare_unchanged(MemoryInvalidationCursor::INITIAL);
+        let prepared = frozen.prepare_unchanged();
         if foreign {
             assert!(prepared.unwrap().install().unwrap());
             assert!(process.lock().units.negatives.get(key).is_some());

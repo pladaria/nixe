@@ -1,5 +1,5 @@
-//! Process-bound LCQ kernel; the runtime slice/exit loop is built on these
-//! owners, without a legacy compiler, lookup or fault registry.
+//! Process-bound tiered JIT owners: shared lifetime, LCQ demand compilation and
+//! background HCQ workers.
 
 use crate::abi::{BlockKey, FpSpecialization, HostAbi, NativeFrame, PollBudget};
 use crate::executable::Cache;

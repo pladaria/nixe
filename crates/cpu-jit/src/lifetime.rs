@@ -1,6 +1,5 @@
-//! Production admission/publication owner for the tiered JIT. Executable
-//! storage and coupled CodeUnits share its publication/reader protocol;
-//! this protocol does not delegate lifetime to the legacy JITModule path.
+//! Admission/publication owner for the tiered JIT. Executable storage and
+//! coupled CodeUnits share its publication, reader and reclamation protocol.
 
 pub(crate) mod background;
 pub(crate) mod compile;
@@ -32,13 +31,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
-    MemoryInvalidation(nixe_memory::MemoryInvalidationError),
     Exhausted(IdentityExhausted),
     Poisoned,
     Closed,
     Shutdown,
     StalePublication,
-    OccupiedDispatch,
     ActiveReader,
     Capacity(&'static str),
     CacheFailed,
@@ -52,7 +49,6 @@ pub(crate) enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MemoryInvalidation(error) => error.fmt(f),
             Self::UnsupportedHost(detail) => f.write_str(detail),
             Self::Exhausted(error) => error.fmt(f),
             Self::Poisoned => f.write_str("JIT lifetime state poisoned; admission is disabled"),
@@ -61,9 +57,6 @@ impl std::fmt::Display for Error {
             Self::StalePublication => f.write_str(
                 "JIT publication has a stale process, admission, slot or reachability identity",
             ),
-            Self::OccupiedDispatch => {
-                f.write_str("cannot retire a dispatch slot with resident entries")
-            }
             Self::ActiveReader => f.write_str("JIT reader already protects an invocation"),
             Self::Capacity(detail) => write!(f, "JIT capacity: {detail}"),
             Self::CacheFailed => f.write_str("JIT executable cache has failed"),
@@ -228,6 +221,7 @@ impl KeyIndex {
     fn len(&self) -> usize {
         self.entries.len()
     }
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -393,7 +387,7 @@ pub(crate) struct Lifetime {
     pending: AtomicU32,
     cache: Arc<Cache>,
     // Dropped after the state's actual metadata owners and allocations.
-    storage: MetadataLease,
+    _storage: MetadataLease,
 }
 impl Lifetime {
     pub(crate) fn new(cache: Arc<Cache>) -> Result<Self, Error> {
@@ -450,7 +444,7 @@ impl Lifetime {
             directory: directory::Directory::new(cache.executable_base()),
             pending: AtomicU32::new(0),
             cache,
-            storage,
+            _storage: storage,
         })
     }
 
@@ -681,42 +675,10 @@ impl Lifetime {
         Ok(version)
     }
 
-    pub(crate) fn retire_dispatch(&self, publication: Publication<'_>) -> Result<(), Error> {
-        if !std::ptr::eq(self, publication.process) {
-            return Err(Error::StalePublication);
-        }
-        let mut state = self.lock();
-        state.validate(&publication)?;
-        if state
-            .dispatch
-            .get(publication.slot)
-            .unwrap()
-            .snapshot()
-            .preferred()
-            .is_some()
-        {
-            return Err(Error::OccupiedDispatch);
-        }
-        let result = state.executions.next_id();
-        let next = self.checked(&mut state, result)?;
-        state.keys.remove(&publication.key);
-        let retired = state.execution;
-        state.retire_dispatch_slot(publication.slot, retired);
-        state.execution = next;
-        state
-            .units
-            .negatives
-            .invalidate(negative::Owner::Dispatch(publication.slot));
-        let removed = state.units.negatives.take_removed();
-        drop(state);
-        drop(removed);
-        Ok(())
-    }
-
     /// The operation registers its exact target records before announcing its
     /// reason. This requests coordination; the corresponding maintenance owner
     /// performs the unlink, mapping change or reclamation before acknowledgement.
-    pub(crate) fn request(&self, reason: Reason) -> Result<Ticket<'_>, Error> {
+    pub(crate) fn request(&self, reason: Reason) -> Result<MaintenanceSequence, Error> {
         let mut state = self.lock();
         let result = self.request_locked(&mut state, reason);
         let removed = state.units.negatives.take_removed();
@@ -724,7 +686,7 @@ impl Lifetime {
         drop(removed);
         if reason == Reason::Shutdown {
             let closed = self.close_background();
-            return result.and_then(|ticket| closed.map(|()| ticket));
+            return result.and_then(|sequence| closed.map(|()| sequence));
         }
         result
     }
@@ -807,7 +769,11 @@ impl Lifetime {
         transition.try_reopen()
     }
 
-    fn request_locked(&self, state: &mut State, reason: Reason) -> Result<Ticket<'_>, Error> {
+    fn request_locked(
+        &self,
+        state: &mut State,
+        reason: Reason,
+    ) -> Result<MaintenanceSequence, Error> {
         state.healthy()?;
         if state.shutdown {
             return Err(Error::Shutdown);
@@ -829,11 +795,18 @@ impl Lifetime {
         self.pending
             .fetch_or(1 << reason as usize, Ordering::Release);
         self.changed.notify_all();
-        Ok(Ticket {
-            process: self,
-            reason,
-            sequence,
-        })
+        Ok(sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maintenance_complete(
+        &self,
+        reason: Reason,
+        sequence: MaintenanceSequence,
+    ) -> Result<bool, Error> {
+        let state = self.lock();
+        state.healthy()?;
+        Ok(state.completed[reason as usize].is_some_and(|completed| completed >= sequence))
     }
 
     pub(crate) fn try_transition(&self) -> Result<Option<Transition<'_>>, Error> {
@@ -1091,12 +1064,14 @@ impl<'s> Invocation<'_, '_, 's> {
     }
     /// The borrow prevents normal-stack fault dispatch from outliving this
     /// invocation's epoch. No lock, allocation or Arc operation occurs here.
+    #[cfg(test)]
     pub(crate) fn fault(&self, pc: usize) -> Option<directory::Fault<'_>> {
         unsafe { self.reader.process.directory.lookup(pc) }
     }
     pub(crate) fn payload(&self) -> &DispatchPayload {
         self.payload.as_ref().unwrap()
     }
+    #[cfg(test)]
     pub(crate) fn frame(&mut self) -> &mut NativeFrame<'s> {
         self.frame
     }
@@ -1118,19 +1093,6 @@ impl Drop for Invocation<'_, '_, '_> {
         if state.phase == Phase::Closing {
             self.reader.process.changed.notify_all();
         }
-    }
-}
-
-pub(crate) struct Ticket<'a> {
-    process: &'a Lifetime,
-    reason: Reason,
-    sequence: MaintenanceSequence,
-}
-impl Ticket<'_> {
-    pub(crate) fn is_complete(&self) -> Result<bool, Error> {
-        let state = self.process.lock();
-        state.healthy()?;
-        Ok(state.completed[self.reason as usize].is_some_and(|seq| seq >= self.sequence))
     }
 }
 
@@ -1252,10 +1214,10 @@ impl Batch<'_, '_> {
         self.acknowledge(false)
     }
 
-    /// Task 4's installer uses this after its 4096-record limit. Only optional
+    /// The link installer uses this after its 4096-record limit. Only optional
     /// installation may be deferred; safety-critical unlinks are completed as
     /// safety work. Uninstalled links must retain their valid native fallback.
-    /// Their tickets remain incomplete and the control request survives reopen.
+    /// Their sequences remain incomplete and the control request survives reopen.
     pub(crate) fn complete_with_links_deferred(self) -> Result<(), Error> {
         self.acknowledge(true)
     }

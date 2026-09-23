@@ -111,18 +111,6 @@ impl FlagFlow {
         }
         Self { blocks }
     }
-
-    /// Only a packed destination can require conversion. Materialize its
-    /// native live-in mask on this edge, in SSA, never via canonical storage.
-    /// Equal recipes pass operands directly; a dead destination passes none.
-    pub(crate) fn packs_edge(&self, source: usize, target: usize) -> bool {
-        match (&self.blocks[source].output, &self.blocks[target].input) {
-            (_, None) => false,
-            (Some(source), Some(target)) if source == target => false,
-            (Some(_), Some(LazyFlags::Packed(()))) => true,
-            _ => panic!("incompatible HCQ NZCV edge contract"),
-        }
-    }
 }
 
 fn merge(current: &mut Option<LazyFlags<()>>, incoming: &LazyFlags<()>) -> bool {

@@ -273,22 +273,6 @@ fn every_boundary_identity_change_resets_heat() {
 }
 
 #[test]
-fn owner_invalidation_clears_matching_seeds_and_both_boundary_endpoints() {
-    let mut samples = Samples::new();
-    for pc in [0, 4, 8] {
-        samples.seed(key(pc), version(1), None, false);
-        samples.boundary(boundary(pc), false);
-    }
-    samples.invalidate(key(4));
-    assert_eq!(samples.seeds.iter().flatten().flatten().count(), 2);
-    let remaining: Vec<_> = samples.boundaries.iter().flatten().flatten().collect();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].snapshot.key, boundary(8));
-    assert!(samples.seed(key(4), version(1), None, true).is_none());
-    assert_eq!(seed_record(&samples, key(4)).score, 1);
-}
-
-#[test]
 fn overflow_clears_both_tables_and_restarts_at_one_on_either_path() {
     for use_seed in [false, true] {
         let mut samples = Samples::new();

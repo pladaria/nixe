@@ -15,14 +15,6 @@ pub(in crate::lifetime) struct Key {
     pub boundary: BoundaryKey,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::lifetime) enum Rejection {
-    Unchanged,
-    Disconnected,
-    InstructionLimit,
-    BackendRejected,
-}
-
 /// Participant generations and inspected LCQ inputs use their unit identity;
 /// endpoint publication/slot reuse uses the exact dispatch identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -87,8 +79,6 @@ struct Head {
 
 pub(in crate::lifetime) struct Record {
     key: Key,
-    pub reason: Rejection,
-    pub cursor: MemoryInvalidationCursor,
     associations: Box<[Association]>,
     // Intrusive garbage queue: invalidation allocates nothing under JIT state.
     removed_next: Option<Box<Record>>,
@@ -98,27 +88,9 @@ pub(in crate::lifetime) struct Record {
 
 impl Record {
     /// Called outside state. Deduplicate evidence, never retain code or graphs.
-    pub fn prepare(
-        cache: &Arc<Cache>,
-        key: Key,
-        reason: Rejection,
-        cursor: MemoryInvalidationCursor,
-        owners: impl IntoIterator<Item = Owner>,
-    ) -> Result<Box<Self>, Error> {
-        Self::prepare_reserved(
-            cache.charge_metadata(size_of::<Self>(), Tier::Hcq)?,
-            key,
-            reason,
-            cursor,
-            owners,
-        )
-    }
-
     pub fn prepare_reserved(
         mut charge: MetadataLease,
         key: Key,
-        reason: Rejection,
-        cursor: MemoryInvalidationCursor,
         owners: impl IntoIterator<Item = Owner>,
     ) -> Result<Box<Self>, Error> {
         let mut seen = HashSet::new();
@@ -139,8 +111,6 @@ impl Record {
         charge.grow(size_of_val(&*associations), Tier::Hcq)?;
         Ok(Box::new(Self {
             key,
-            reason,
-            cursor,
             associations,
             removed_next: None,
             _charge: charge,
@@ -321,31 +291,11 @@ impl Index {
     /// Caller revalidates all evidence first. False means a matching result
     /// already exists; neither duplicates nor pressure evict a valid negative.
     /// Failure leaves the prepared owner with the caller for out-of-lock drop.
-    pub fn insert(&mut self, prepared: &mut Option<Box<Record>>) -> Result<bool, Error> {
-        self.insert_inner(prepared, false)
-    }
-
     pub fn insert_reserved(&mut self, prepared: &mut Option<Box<Record>>) -> Result<bool, Error> {
         assert_ne!(self.reserved, 0);
-        let inserted = self.insert_inner(prepared, true)?;
-        if inserted {
-            self.release_record();
-        }
-        Ok(inserted)
-    }
-
-    fn insert_inner(
-        &mut self,
-        prepared: &mut Option<Box<Record>>,
-        reserved: bool,
-    ) -> Result<bool, Error> {
         let record = prepared.as_ref().expect("prepared negative owner");
         if self.get(record.key).is_some() {
             return Ok(false);
-        }
-        // Unreserved installation cannot steal a running worker's result slot.
-        if !reserved && self.reservation_growth()?.is_some() {
-            return Err(Error::Capacity("negative result slots are reserved"));
         }
         self.records.check_insertions(1)?;
         let missing = record
@@ -390,6 +340,7 @@ impl Index {
                 );
             }
         }
+        self.release_record();
         Ok(true)
     }
 
@@ -409,7 +360,7 @@ impl Index {
         self.invalidate(Owner::Entries(unit));
     }
 
-    /// History loss and shutdown discard all evidence. Drain each hash table
+    /// Shutdown discards all evidence. Drain each hash table
     /// once, rather than repeatedly searching a sparse table for its next key.
     pub fn invalidate_all(&mut self) {
         self.heads.clear();

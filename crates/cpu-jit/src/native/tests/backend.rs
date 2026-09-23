@@ -1,5 +1,5 @@
 //! Real fork output -> shared contracts -> Nixe adapters -> system gateway.
-//! Unlinked proofs use production publication; linked fixtures await Task 4.
+//! Executed fixtures use the production publication and admission owner.
 use super::*;
 use cranelift_codegen::{
     CompiledCode, Context,
@@ -38,7 +38,9 @@ fn publish_unlinked(
         output.patch_exit(&mut bytes, 0, end as u64).unwrap();
         let start = canonical_ingress(abi, &mut bytes, &contract, input as usize);
         staged.bytes = bytes.into_boxed_slice();
-        let code = cache.install(staged, Tier::Lcq, |_| None).unwrap();
+        let code = cache
+            .install_with_islands(staged, Tier::Lcq, 0, |_| None)
+            .unwrap();
         Input {
             identity,
             code,
@@ -444,112 +446,7 @@ fn append_exit(bytes: &mut Vec<u8>, state: &ExitStateMap) -> usize {
     append(bytes, &exit)
 }
 
-fn run(
-    abi: HostAbi,
-    bytes: &[u8],
-    address_offset: usize,
-    state: &mut A64State,
-    identity: (u64, u32),
-    frame_extent: u32,
-) {
-    if !canonical::native(abi) {
-        return;
-    }
-    let _restore = crate::fp_env::tests::RestoreHost::new();
-    check_host().unwrap();
-    let mut owner = JITModule::new(JITBuilder::new(default_libcall_names()).unwrap());
-    let id = owner
-        .declare_function(
-            "compiled_boundary_proof",
-            Linkage::Local,
-            &owner.make_signature(),
-        )
-        .unwrap();
-    // Patches above are relative within one test-owned allocation, so they
-    // can be applied BEFORE finalization makes this memory executable.
-    owner.define_function_bytes(id, 16, bytes, &[]).unwrap();
-    owner.finalize_definitions().unwrap();
-    {
-        let mut frame = NativeFrame::new(state, PollBudget::new(17, 23).unwrap());
-        frame.spill.fill(MaybeUninit::new(0xa5));
-        unsafe { frame.begin_fp() };
-        // Test-only invocation protection, not Task 2's publication protocol.
-        frame.execution_epoch = 7;
-        let address = unsafe { owner.get_finalized_function(id).add(address_offset) };
-        let result = unsafe {
-            frame.ensure_fp().unwrap();
-            enter_protected(&mut frame, std::ptr::dangling_mut(), address)
-        }
-        .unwrap();
-        assert_eq!(result.reason, NativeExitReason::Dispatch);
-        assert_eq!((frame.exit_source_version, frame.exit_state_map), identity);
-        assert_eq!(
-            (frame.budget.sample_remaining, frame.budget.slice_remaining),
-            (17, 23)
-        );
-        assert_eq!(frame.execution_epoch, 7);
-        assert_eq!(
-            (
-                frame.host_fp.saved,
-                frame.host_fp.active,
-                frame.gateway_exit
-            ),
-            (0, 0, 0)
-        );
-        let mut caller = HostFpState::default();
-        unsafe {
-            caller.begin();
-            caller.finish();
-        }
-        assert_eq!(
-            (caller.saved_control, caller.saved_status),
-            (frame.host_fp.saved_control, frame.host_fp.saved_status)
-        );
-        let word = |offset: usize| {
-            u64::from_le_bytes(std::array::from_fn(|i| unsafe {
-                frame.spill[offset + i].assume_init()
-            }))
-        };
-        assert_eq!(word(1024), 1, "arena pin changed");
-        assert_eq!(word(1032), 17, "poll pin changed");
-        assert_eq!(word(1040), &raw const frame as u64, "frame pin changed");
-        assert_eq!(
-            word(1056),
-            word(1064),
-            "SP changed between ingress and exit"
-        );
-        assert_eq!(word(1056) % 16, 0);
-        // These fixtures use at most 64 bytes for cycle scratch. The rest of
-        // this range is neither adapter scratch nor backend-owned storage.
-        assert!(
-            frame.spill[64..1024]
-                .iter()
-                .all(|byte| unsafe { byte.assume_init() } == 0xa5),
-            "backend or bridge overwrote the reserved transfer partition"
-        );
-        assert!(
-            frame.spill[frame_extent as usize..]
-                .iter()
-                .all(|byte| unsafe { byte.assume_init() } == 0xa5),
-            "backend wrote beyond its reported extent"
-        );
-        frame.execution_epoch = 0;
-        assert_eq!(frame.execution_epoch, 0);
-    }
-    unsafe { owner.free_memory() };
-}
-
-fn execute(
-    abi: HostAbi,
-    bytes: &[u8],
-    address_offset: usize,
-    count: u8,
-    increments: u64,
-    frame_extent: u32,
-) {
-    if !canonical::native(abi) {
-        return;
-    }
+fn execute(unit: &published::Published, count: u8, increments: u64, frame_extent: u32) {
     let mut state = A64State::default();
     for (index, value) in state.general_register_storage_mut().iter_mut().enumerate() {
         *value = 100 + index as u64;
@@ -572,14 +469,7 @@ fn execute(
     expected.set_nzcv(Nzcv::from_bits(Nzcv::Z));
     expected.set_fpsr((1 << 27) | 2);
     expected.set_pc(0x12345678);
-    run(
-        abi,
-        bytes,
-        address_offset,
-        &mut state,
-        (2, 20),
-        frame_extent,
-    );
+    run_unlinked(unit, &mut state, frame_extent);
     assert_eq!(state, expected);
 }
 
@@ -677,48 +567,75 @@ fn one_gateway_crosses_empty_then_cyclic_edges_between_two_compiled_units() {
                         "expected an actual three-GPR cycle"
                     );
                 }
-                let mut bridge = emit_fast_transfer(&b_source, &a_second).unwrap();
-                assert!(!bridge.is_empty());
-                let jump = reserve_branch(abi, &mut bridge);
-                let mut bytes = a.code_buffer().to_vec();
-                let b_offset = append(&mut bytes, b.code_buffer());
-                a_link_map
-                    .map
-                    .patch_exit(
+                if !canonical::native(abi) {
+                    continue;
+                }
+                let unit = published::Published::new(|process, cache| {
+                    let identity = process.begin_unit(crate::executable::Tier::Lcq).unwrap();
+                    let mut bridge = emit_fast_transfer(&b_source, &a_second).unwrap();
+                    assert!(!bridge.is_empty());
+                    let jump = reserve_branch(abi, &mut bridge);
+                    let mut bytes = a.code_buffer().to_vec();
+                    let b_offset = append(&mut bytes, b.code_buffer());
+                    a_link_map
+                        .map
+                        .patch_exit(
+                            &mut bytes,
+                            0,
+                            (b_offset + boundary(abi, &b, 10).map.offset as usize) as u64,
+                        )
+                        .unwrap();
+                    let bridge_offset = append(&mut bytes, &bridge);
+                    branch(
+                        abi,
                         &mut bytes,
-                        0,
-                        (b_offset + boundary(abi, &b, 10).map.offset as usize) as u64,
+                        bridge_offset + jump,
+                        boundary(abi, &a, 30).map.offset as usize,
+                    );
+                    b_map
+                        .map
+                        .patch_exit(
+                            &mut bytes[b_offset..],
+                            b_offset as u64,
+                            bridge_offset as u64,
+                        )
+                        .unwrap();
+                    let final_map = boundary(abi, &a, 20);
+                    let mut final_state =
+                        exit(abi, &final_map, &operands, identity.version().get(), true);
+                    final_state.site.state_map = 0;
+                    let exit_offset = append_exit(&mut bytes, &final_state);
+                    final_map
+                        .map
+                        .patch_exit(&mut bytes, 0, exit_offset as u64)
+                        .unwrap();
+                    let start = canonical_ingress(
+                        abi,
+                        &mut bytes,
+                        &a_first,
+                        boundary(abi, &a, 10).map.offset as usize,
+                    );
+                    published::encoded(
+                        identity,
+                        cache,
+                        bytes,
+                        crate::lifetime::unit::Entry {
+                            key: published::key(),
+                            canonical_offset: start as u32,
+                            fast_offset: boundary(abi, &a, 10).map.offset,
+                            contract: a_first,
+                        },
+                        vec![crate::lifetime::unit::StateRecord {
+                            exit: None,
+                            transfer: None,
+                            native_offset: final_map.map.offset,
+                            state: final_state,
+                        }],
+                        Box::new([]),
                     )
-                    .unwrap();
-                let bridge_offset = append(&mut bytes, &bridge);
-                branch(
-                    abi,
-                    &mut bytes,
-                    bridge_offset + jump,
-                    boundary(abi, &a, 30).map.offset as usize,
-                );
-                b_map
-                    .map
-                    .patch_exit(
-                        &mut bytes[b_offset..],
-                        b_offset as u64,
-                        bridge_offset as u64,
-                    )
-                    .unwrap();
-                let final_map = boundary(abi, &a, 20);
-                let final_state = exit(abi, &final_map, &operands, 2, true);
-                let exit_offset = append_exit(&mut bytes, &final_state);
-                final_map
-                    .map
-                    .patch_exit(&mut bytes, 0, exit_offset as u64)
-                    .unwrap();
-                let start = canonical_ingress(
-                    abi,
-                    &mut bytes,
-                    &a_first,
-                    boundary(abi, &a, 10).map.offset as usize,
-                );
-                execute(abi, &bytes, start, 3, 1, extent(&a).max(extent(&b)));
+                });
+                execute(&unit, 3, 1, extent(&a).max(extent(&b)));
+                unit.shutdown();
             }
         }
     }
@@ -754,41 +671,63 @@ fn final_allocations_drive_empty_and_cyclic_links_through_nixe_gateway() {
                     );
                     let b_entry = entry(abi, &boundary(abi, &b, 10), &operands);
                     let b_map = boundary(abi, &b, 20);
-                    let b_exit = exit(abi, &b_map, &operands, 2, true);
+                    let mut b_exit = exit(abi, &b_map, &operands, 2, true);
                     let transfer = emit_fast_transfer(&a_exit, &b_entry).unwrap();
                     assert_eq!(transfer.is_empty(), !cycle);
-                    let mut bytes = a.code_buffer().to_vec();
-                    let b_offset = append(&mut bytes, b.code_buffer());
-                    let exit_offset = append_exit(&mut bytes, &b_exit);
-                    b_map
-                        .map
-                        .patch_exit(&mut bytes[b_offset..], b_offset as u64, exit_offset as u64)
-                        .unwrap();
-                    let destination = b_offset + boundary(abi, &b, 10).map.offset as usize;
-                    let target = if cycle {
-                        let mut bridge = transfer;
-                        let jump = reserve_branch(abi, &mut bridge);
-                        let offset = append(&mut bytes, &bridge);
-                        branch(abi, &mut bytes, offset + jump, destination);
-                        offset
-                    } else {
-                        destination
-                    };
-                    a_map.map.patch_exit(&mut bytes, 0, target as u64).unwrap();
-                    let address_offset = canonical_ingress(
-                        abi,
-                        &mut bytes,
-                        &a_entry,
-                        boundary(abi, &a, 10).map.offset as usize,
-                    );
-                    execute(
-                        abi,
-                        &bytes,
-                        address_offset,
-                        3,
-                        2,
-                        extent(&a).max(extent(&b)),
-                    );
+                    if !canonical::native(abi) {
+                        continue;
+                    }
+                    let unit = published::Published::new(|process, cache| {
+                        let identity = process.begin_unit(crate::executable::Tier::Lcq).unwrap();
+                        b_exit.site = ExitSiteKey {
+                            source: identity.version(),
+                            state_map: 0,
+                        };
+                        let mut bytes = a.code_buffer().to_vec();
+                        let b_offset = append(&mut bytes, b.code_buffer());
+                        let exit_offset = append_exit(&mut bytes, &b_exit);
+                        b_map
+                            .map
+                            .patch_exit(&mut bytes[b_offset..], b_offset as u64, exit_offset as u64)
+                            .unwrap();
+                        let destination = b_offset + boundary(abi, &b, 10).map.offset as usize;
+                        let target = if cycle {
+                            let mut bridge = transfer;
+                            let jump = reserve_branch(abi, &mut bridge);
+                            let offset = append(&mut bytes, &bridge);
+                            branch(abi, &mut bytes, offset + jump, destination);
+                            offset
+                        } else {
+                            destination
+                        };
+                        a_map.map.patch_exit(&mut bytes, 0, target as u64).unwrap();
+                        let address_offset = canonical_ingress(
+                            abi,
+                            &mut bytes,
+                            &a_entry,
+                            boundary(abi, &a, 10).map.offset as usize,
+                        );
+                        published::encoded(
+                            identity,
+                            cache,
+                            bytes,
+                            crate::lifetime::unit::Entry {
+                                key: published::key(),
+                                canonical_offset: address_offset as u32,
+                                fast_offset: boundary(abi, &a, 10).map.offset,
+                                contract: a_entry,
+                            },
+                            vec![crate::lifetime::unit::StateRecord {
+                                exit: None,
+                                transfer: None,
+                                native_offset: b_offset as u32 + b_map.map.offset,
+                                state: b_exit,
+                            }],
+                            Box::new([]),
+                        )
+                    });
+                    execute(&unit, 3, 2, extent(&a).max(extent(&b)));
+                    unit.shutdown();
                 }
             }
         }

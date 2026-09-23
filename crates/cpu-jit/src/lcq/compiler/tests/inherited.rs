@@ -17,11 +17,18 @@ fn fast_inputs_survive_read_only_use_and_fp_activation() {
         }
         words.push(0xd420_0000);
         let memory = memory(&words);
-        let fragment = Fragment::capture(&memory, key()).unwrap();
+        let cache = Cache::new().unwrap();
+        let process = Arc::new(Lifetime::new(cache.clone()).unwrap());
+        let mut reader = process.register().unwrap();
+        let Request::Owner(claim) = reader.claim(key()).unwrap() else {
+            panic!()
+        };
+        let compilation = Compilation::capture(claim, &memory).unwrap();
+        let fragment = &compilation.fragment;
         let abi = native_abi();
         let mut lowered = Compiler::new(abi)
             .unwrap()
-            .lower(&fragment, CodeVersion::new(1).unwrap())
+            .lower(fragment, compilation.identity.version())
             .unwrap();
         assert_eq!(lowered.entry.live_in.nzcv, crate::analysis::C);
         let mut initial = integer::initial_state();
@@ -102,23 +109,22 @@ fn fast_inputs_survive_read_only_use_and_fp_activation() {
         .patch_exit(&mut bytes, 0, u64::from(lowered.fast))
         .unwrap();
         lowered.output.bytes = bytes.into_boxed_slice();
-        let cache = Cache::new().unwrap();
-        let owner = cache.install(lowered.output, Tier::Lcq, |_| None).unwrap();
+        lowered.canonical = start as u32;
+        Compiler::publish_lowered(compilation, lowered, &process, &cache, &memory).unwrap();
         {
             let mut frame = NativeFrame::new(&mut actual, PollBudget::new(4096, 1000).unwrap());
-            // Isolated copy/state proof: the test owns the complete allocation
-            // until execution and reconstruction finish; no published link.
-            frame.execution_epoch = 1;
+            let mut invocation = unsafe { reader.admit(&mut frame, key()) }.unwrap().unwrap();
+            let address = invocation.payload().preferred().unwrap().canonical.get();
             unsafe {
-                frame.begin_fp();
                 crate::native::enter_protected(
-                    &mut frame,
+                    invocation.frame(),
                     std::ptr::null_mut(),
-                    (owner.allocation.address() + start) as *const u8,
+                    address as *const u8,
                 )
                 .unwrap();
             }
-            frame.execution_epoch = 0;
+            drop(invocation);
+            assert_eq!(frame.execution_epoch, 0);
         }
         assert_eq!(actual, expected, "FP activation: {fp}");
     }

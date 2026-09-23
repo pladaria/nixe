@@ -1,6 +1,5 @@
 use super::*;
 use crate::abi::{NativeFrame, PollBudget};
-use crate::executable::{Cache, Tier};
 use nixe_cpu::state::a64::{A64State, Nzcv};
 use std::sync::atomic::AtomicU32;
 
@@ -10,28 +9,6 @@ fn host() -> HostAbi {
     } else {
         HostAbi::Aarch64
     }
-}
-
-fn staged(graph: &Graph, entries: &[usize], abi: HostAbi) -> stage::Staged {
-    let compiler = backend::Compiler::new(abi, 0x10000).unwrap();
-    let mut context = Context::new();
-    let analysis = Analysis::build(graph, entries);
-    let body = compiler
-        .emit(
-            &mut context,
-            &mut FunctionBuilderContext::new(),
-            graph,
-            &analysis,
-            entries,
-        )
-        .unwrap();
-    assert_eq!(
-        body.polls.len(),
-        analysis.backedges.iter().flatten().filter(|&&v| v).count()
-    );
-    compiler
-        .finish(&mut context, body, graph, CodeVersion::new(1).unwrap())
-        .unwrap()
 }
 
 #[test]
@@ -48,12 +25,9 @@ fn hcq_internal_cycles_resume_samples_and_exit_with_exact_post_state() {
         } else {
             graph(&[(0, &words)])
         };
-        let image = staged(&graph, &[0], host());
-        let entry = image.entries[0].canonical_offset;
-        let owner = Cache::new()
-            .unwrap()
-            .install(image.output, Tier::Hcq, |_| None)
-            .unwrap();
+        let (process, owner) = published(&graph, &[0], host());
+        let entry = owner.entries[0].key;
+        let mut reader = process.register().unwrap();
         for (sample, slice, request) in [
             (4096, 1, None),
             (4096, 32, None),
@@ -93,20 +67,18 @@ fn hcq_internal_cycles_resume_samples_and_exit_with_exact_post_state() {
                 .unwrap();
             let stop = AtomicU32::new(1);
             let mut frame = NativeFrame::new(&mut state, budget);
+            let mut invocation = unsafe { reader.admit(&mut frame, entry) }.unwrap().unwrap();
+            let address = invocation.payload().preferred().unwrap().canonical.get();
+            let frame = invocation.frame();
             if let Some(index) = request {
                 frame.poll_requests[index] = &stop;
             }
-            frame.execution_epoch = 1;
+
             frame.exclusive_load.address = 0x4321;
             frame.exclusive_load.value = [123, 456];
             frame.exclusive_load.bytes = 16;
             let result = unsafe {
-                frame.begin_fp();
-                crate::native::enter_protected(
-                    &mut frame,
-                    std::ptr::null_mut(),
-                    (owner.allocation.address() + entry as usize) as *const u8,
-                )
+                crate::native::enter_protected(frame, std::ptr::null_mut(), address as *const u8)
             }
             .unwrap();
             assert_eq!(
@@ -128,7 +100,7 @@ fn hcq_internal_cycles_resume_samples_and_exit_with_exact_post_state() {
             assert_eq!(frame.exclusive_load.address, 0x4321);
             assert_eq!(frame.exclusive_load.value, [123, 456]);
             assert_eq!(frame.exclusive_load.bytes, 16);
-            frame.execution_epoch = 0;
+            drop(invocation);
             assert_eq!(state, expected);
         }
     }
@@ -144,7 +116,7 @@ fn hcq_irreducible_and_multi_entry_checks_match_the_shared_flow_proof() {
     ]);
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         for entries in [vec![0], vec![block(&graph, 4), block(&graph, 16)]] {
-            let image = staged(&graph, &entries, abi);
+            let image = staged(&graph, &entries, abi, CodeVersion::new(1).unwrap());
             let count = Analysis::build(&graph, &entries)
                 .backedges
                 .iter()
@@ -163,12 +135,10 @@ fn hcq_irreducible_and_multi_entry_checks_match_the_shared_flow_proof() {
             if abi != host() {
                 continue;
             }
-            let owner = Cache::new()
-                .unwrap()
-                .install(image.output, Tier::Hcq, |_| None)
-                .unwrap();
+            let (process, owner) = published(&graph, &entries, abi);
+            let mut reader = process.register().unwrap();
             let analysis = Analysis::build(&graph, &entries);
-            for entry in image.entries.iter() {
+            for entry in owner.entries.iter() {
                 for slice in [31, 8192] {
                     let mut actual = A64State::default();
                     actual.set_pc(entry.key.pc.get());
@@ -205,20 +175,22 @@ fn hcq_irreducible_and_multi_entry_checks_match_the_shared_flow_proof() {
                     {
                         let mut frame =
                             NativeFrame::new(&mut actual, PollBudget::new(1, slice).unwrap());
-                        frame.execution_epoch = 1;
+                        let mut invocation = unsafe { reader.admit(&mut frame, entry.key) }
+                            .unwrap()
+                            .unwrap();
+                        let address = invocation.payload().preferred().unwrap().canonical.get();
+                        let frame = invocation.frame();
                         let result = unsafe {
-                            frame.begin_fp();
                             crate::native::enter_protected(
-                                &mut frame,
+                                frame,
                                 std::ptr::null_mut(),
-                                (owner.allocation.address() + entry.canonical_offset as usize)
-                                    as *const u8,
+                                address as *const u8,
                             )
                         }
                         .unwrap();
                         assert_eq!(result.reason, NativeExitReason::BudgetExhausted);
                         assert_eq!(frame.budget.slice_remaining, slice - completed);
-                        frame.execution_epoch = 0;
+                        drop(invocation);
                     }
                     assert_eq!(actual, expected);
                 }
@@ -305,16 +277,13 @@ fn hcq_internal_sample_callback_preserves_live_ssa_fp_and_precise_failure_state(
     crate::native::check_host().unwrap();
     let words = [0x1e222800, 0x8b040063, 0xf1000400, 0x54ffffa1]; // FADD; ADD; SUBS; B.NE 0
     let graph = graph(&[(0, &words), (16, &[0xd4200000])]);
-    let image = staged(&graph, &[0], host());
-    let entry = image.entries[0].canonical_offset;
-    let poll_index = image
+    let (process, owner) = published(&graph, &[0], host());
+    let entry = owner.entries[0].key;
+    let mut reader = process.register().unwrap();
+    let poll_index = owner
         .states
         .iter()
         .position(|s| s.exit.is_some() && s.transfer.is_none())
-        .unwrap();
-    let owner = Cache::new()
-        .unwrap()
-        .install(image.output, Tier::Hcq, |_| None)
         .unwrap();
     for fail in [false, true] {
         let mut observation = Observation {
@@ -340,16 +309,13 @@ fn hcq_internal_sample_callback_preserves_live_ssa_fp_and_precise_failure_state(
         }
         {
             let mut frame = NativeFrame::new(&mut actual, PollBudget::new(1, 10000).unwrap());
-            frame.execution_epoch = 1;
+            let mut invocation = unsafe { reader.admit(&mut frame, entry) }.unwrap().unwrap();
+            let address = invocation.payload().preferred().unwrap().canonical.get();
+            let frame = invocation.frame();
             frame.dispatch_context = (&mut observation as *mut Observation).cast();
             frame.sample_observer = Some(observe);
             let result = unsafe {
-                frame.begin_fp();
-                crate::native::enter_protected(
-                    &mut frame,
-                    std::ptr::null_mut(),
-                    (owner.allocation.address() + entry as usize) as *const u8,
-                )
+                crate::native::enter_protected(frame, std::ptr::null_mut(), address as *const u8)
             }
             .unwrap();
             assert_eq!(
@@ -363,14 +329,14 @@ fn hcq_internal_sample_callback_preserves_live_ssa_fp_and_precise_failure_state(
             assert_eq!(frame.budget.slice_remaining, 10000 - iterations * 4);
             assert_eq!(frame.host_fp.active, 0);
             assert_eq!(frame.host_fp.saved, 0);
-            frame.execution_epoch = 0;
+            drop(invocation);
         }
         assert_eq!(actual, expected);
         assert_eq!(observation.calls, if fail { 1 } else { 2 });
-        assert_eq!(observation.version, 1);
+        assert_eq!(observation.version, owner.version.get());
         assert_eq!(observation.map as usize, poll_index);
         assert_eq!(observation.destination, 0);
-        assert!(observation.source >= owner.allocation.address());
-        assert!(observation.source < owner.allocation.address() + owner.allocation.len());
+        assert!(observation.source >= owner.code.allocation.address());
+        assert!(observation.source < owner.code.allocation.address() + owner.code.allocation.len());
     }
 }

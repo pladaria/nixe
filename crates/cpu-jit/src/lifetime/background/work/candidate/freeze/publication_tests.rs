@@ -198,7 +198,11 @@ fn frozen_publication_rechecks_claims_and_nonentry_inputs_after_preparation() {
                 process.request_shutdown().unwrap();
             }
             4 => {
-                process.invalidate_all_memory().unwrap();
+                process
+                    .invalidate_memory(&[nixe_memory::MemoryInvalidationKind::InstructionCache {
+                        address_space: key(0).address_space,
+                    }])
+                    .unwrap();
             }
             _ => unreachable!(),
         }

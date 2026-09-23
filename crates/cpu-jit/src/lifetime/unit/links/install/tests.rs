@@ -196,7 +196,11 @@ fn hcq_withdrawal_relinks_live_sources_to_each_retained_baseline_entry() {
     assert!(transition.drain_links().unwrap());
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::Eviction, ticket)
+            .unwrap()
+    );
     drop(transition);
     assert_eq!(execute(&process), 77);
     assert!(process.try_shutdown().unwrap());
@@ -260,7 +264,7 @@ fn cancelling_a_replacement_preserves_the_callable_link_until_its_own_retirement
 }
 
 #[test]
-fn installed_branch_executes_and_explicit_unlink_restores_the_owned_fallback() {
+fn installed_branch_executes_and_retirement_restores_the_owned_fallback() {
     let process = process();
     let cursor = AtomicU64::new(0);
     let target = publish(&process, &cursor, &[4], Tier::Lcq);
@@ -288,17 +292,14 @@ fn installed_branch_executes_and_explicit_unlink_restores_the_owned_fallback() {
     let prepared = transition.prepare_link(src, 0, target, 0, 0).unwrap();
     assert_eq!(transition.register_link(prepared).unwrap(), handle);
     assert!(pending(&process).is_empty());
-    assert!(matches!(
-        transition.discard_pending_link(handle),
-        Err(Error::InvalidUnit(_))
-    ));
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
     assert_eq!(execute(&process), 77);
-    assert_eq!(transition.unlink_link(handle), Err(Error::Closed));
+    assert_eq!(transition.drain_retirements(), Err(Error::Closed));
     let mut transition = stop(&process);
-    transition.unlink_link(handle).unwrap();
-    assert_eq!(transition.unlink_link(handle), Err(Error::StaleUnit));
+    process.retire_unit(target).unwrap();
+    assert_eq!(transition.drain_retirements().unwrap(), 1);
+    assert!(process.lock().units.links.records.get(handle.0).is_none());
     {
         let state = process.lock();
         assert!(state.units.records.get(src.0).unwrap().outgoing.is_none());
@@ -338,7 +339,7 @@ fn target_retirement_unlinks_before_reclaim_and_keeps_compiler_snapshots_alive()
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();
     assert_eq!(transition.drain_retirements().unwrap(), 1);
-    assert_eq!(transition.unlink_link(handle), Err(Error::StaleUnit));
+    assert!(process.lock().units.links.records.get(handle.0).is_none());
     assert_eq!(process.reclaim_units().unwrap(), 0);
     assert_eq!(snapshot.code.allocation.address(), address);
     drop(snapshot);
@@ -397,7 +398,7 @@ fn replacement_invalidation_and_source_retirement_remove_installed_edges() {
         let mut transition = process.try_transition().unwrap().unwrap();
         transition.wait_closed().unwrap();
         assert_eq!(transition.drain_retirements().unwrap(), 1);
-        assert_eq!(transition.unlink_link(handle), Err(Error::StaleUnit));
+        assert!(process.lock().units.links.records.get(handle.0).is_none());
         if mode == 0 {
             assert_eq!(pending(&process).len(), 1);
             transition
@@ -665,7 +666,8 @@ fn failed_safety_unlink_retains_roots_and_permanently_prevents_reopening() {
         .get_mut(handle.0)
         .unwrap()
         .source = foreign;
-    assert_eq!(transition.unlink_link(handle), Err(Error::StaleUnit));
+    process.retire_unit(target).unwrap();
+    assert_eq!(transition.drain_retirements(), Err(Error::StaleUnit));
     assert_eq!(transition.try_reopen(), Err(Error::StaleUnit));
     assert!(matches!(transition.batch(), Err(Error::StaleUnit)));
     let state = process.lock();
@@ -719,7 +721,7 @@ fn far_installed_target(with_bridge: bool) {
     let padding = |bytes| {
         process
             .cache
-            .install(
+            .install_with_islands(
                 Output {
                     bytes: vec![0; bytes].into_boxed_slice(),
                     alignment: 16,
@@ -734,6 +736,7 @@ fn far_installed_target(with_bridge: bool) {
                     },
                 },
                 Tier::Lcq,
+                0,
                 |_| None,
             )
             .unwrap()
@@ -748,7 +751,7 @@ fn far_installed_target(with_bridge: bool) {
         spacers.push(
             process
                 .cache
-                .install(
+                .install_with_islands(
                     Output {
                         bytes: Box::new([0; 16]),
                         alignment: SEGMENT_BYTES,
@@ -763,6 +766,7 @@ fn far_installed_target(with_bridge: bool) {
                         },
                     },
                     Tier::Lcq,
+                    0,
                     |_| None,
                 )
                 .unwrap(),
@@ -780,13 +784,14 @@ fn far_installed_target(with_bridge: bool) {
     .into_boxed_slice();
     input.code = process
         .cache
-        .install(
+        .install_with_islands(
             Output {
                 bytes,
                 alignment: SEGMENT_BYTES,
                 metadata: *old.proofs.unwrap(),
             },
             Tier::Lcq,
+            0,
             |_| None,
         )
         .unwrap();
@@ -843,7 +848,8 @@ fn far_installed_target(with_bridge: bool) {
     assert!(transition.try_reopen().unwrap());
     assert_eq!(execute(&process), 87);
     let mut transition = stop(&process);
-    transition.unlink_link(handle).unwrap();
+    process.retire_unit(target).unwrap();
+    assert_eq!(transition.drain_retirements().unwrap(), 1);
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
     assert_eq!(execute(&process), 42);

@@ -110,7 +110,7 @@ impl<'p> Transition<'p> {
             // Publication retained the old callable edge alongside this pending
             // successor. Restore/synchronize its fallback before releasing the
             // old target/bridge, even if the old baseline remains published.
-            self.unlink_registered_link(previous)?;
+            self.unlink_link(LinkHandle(previous, self.process.identity))?;
         }
         // Preparation/allocation stay off the generated edge. The transfer
         // must include selective canonical writeback,
@@ -197,20 +197,14 @@ impl<'p> Transition<'p> {
         Ok(true)
     }
 
+    /// Shared by link replacement and every unit-retirement path. Do not release
+    /// roots, detach the source map, or mark the target retired before this call.
     pub(crate) fn unlink_link(&mut self, handle: LinkHandle) -> Result<(), Error> {
-        if handle.1 != self.process.identity {
+        let process = self.process;
+        if handle.1 != process.identity {
             return Err(Error::StaleUnit);
         }
-        self.unlink_registered_link(handle.0)
-    }
-
-    /// Shared by explicit unlink and every unit-retirement path. Do not release
-    /// roots, detach the source map, or mark the target retired before this call.
-    pub(in crate::lifetime::unit) fn unlink_registered_link(
-        &mut self,
-        handle: H,
-    ) -> Result<(), Error> {
-        let process = self.process;
+        let handle = handle.0;
         let installed = {
             let mut state = process.lock();
             self.require_closed(&state)?;

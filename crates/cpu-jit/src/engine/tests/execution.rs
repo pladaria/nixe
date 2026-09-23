@@ -320,7 +320,12 @@ fn slice_services_pending_links_on_closed_admission_and_deferred_control_exit() 
             }
             assert_eq!(report.progress, 3); // B, ADD and owned SVC/BRK completion.
             assert_eq!(state.general_register_storage_mut()[0], expected);
-            assert!(ticket.is_complete().unwrap());
+            assert!(
+                process
+                    .lifetime
+                    .maintenance_complete(lifetime::Reason::LinkPatch, ticket)
+                    .unwrap()
+            );
             assert_ne!(
                 unsafe { std::slice::from_raw_parts(patch, width) },
                 fallback
@@ -684,7 +689,12 @@ fn closed_admission_yields_without_acknowledging_maintenance_and_shutdown_is_ter
     assert_eq!(report.stop, CpuExit::Safepoint);
     assert_eq!(report.progress, 0);
     assert_eq!(state, before);
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .lifetime
+            .maintenance_complete(lifetime::Reason::MappingChange, ticket)
+            .unwrap()
+    );
     process
         .lifetime
         .request(lifetime::Reason::Shutdown)

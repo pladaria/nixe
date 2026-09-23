@@ -149,10 +149,10 @@ fn pending_queries_find_older_sequences_beyond_a_newer_list_head() {
     let second = process.invalidate_memory(&[content(8)]).unwrap();
     assert_eq!(pending_units(&process), [new, old]);
     let units = &process.lock().units;
-    assert!(!units.pending_retirement(Reason::MappingChange, eviction.sequence));
-    assert!(units.pending_retirement(Reason::Eviction, eviction.sequence));
-    assert!(units.pending_retirement(Reason::MappingChange, first.sequence));
-    assert!(units.pending_retirement(Reason::MappingChange, second.sequence));
+    assert!(!units.pending_retirement(Reason::MappingChange, eviction));
+    assert!(units.pending_retirement(Reason::Eviction, eviction));
+    assert!(units.pending_retirement(Reason::MappingChange, first));
+    assert!(units.pending_retirement(Reason::MappingChange, second));
 }
 
 #[test]
@@ -169,9 +169,17 @@ fn physical_invalidation_finds_aliases_and_both_pages_without_evicting_unrelated
             second: Some(GuestPhysicalPageId::new(9)),
         }])
         .unwrap();
-    assert!(!ticket.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, ticket)
+            .unwrap()
+    );
     assert_eq!(drain(&process), 3);
-    assert!(ticket.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, ticket)
+            .unwrap()
+    );
     for handle in [first, alias, second] {
         assert!(matches!(process.snapshot(handle), Err(Error::StaleUnit)));
     }
@@ -237,16 +245,40 @@ fn duplicate_requests_and_eviction_keep_each_exact_ticket_pending_until_unlink()
         .invalidate_memory(&[content(7), content(7)])
         .unwrap();
     assert_eq!(batch.complete(), Err(Error::MaintenancePending));
-    assert!(!first.is_complete().unwrap());
-    assert!(!second.is_complete().unwrap());
-    assert!(!eviction.is_complete().unwrap());
+    assert!(
+        !process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, first)
+            .unwrap()
+    );
+    assert!(
+        !process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, second)
+            .unwrap()
+    );
+    assert!(
+        !process
+            .maintenance_complete(crate::lifetime::Reason::Eviction, eviction)
+            .unwrap()
+    );
     assert!(!transition.try_reopen().unwrap());
     assert_eq!(transition.drain_retirements().unwrap(), 1);
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
-    assert!(first.is_complete().unwrap());
-    assert!(second.is_complete().unwrap());
-    assert!(eviction.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, first)
+            .unwrap()
+    );
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, second)
+            .unwrap()
+    );
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::Eviction, eviction)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -262,13 +294,25 @@ fn memory_work_arriving_after_a_batch_snapshot_cannot_be_acknowledged_by_that_ba
     let batch = transition.batch().unwrap();
     let second = process.invalidate_memory(&[content(8)]).unwrap();
     batch.complete().unwrap();
-    assert!(first.is_complete().unwrap());
-    assert!(!second.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, first)
+            .unwrap()
+    );
+    assert!(
+        !process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, second)
+            .unwrap()
+    );
     assert!(!transition.try_reopen().unwrap());
     assert_eq!(transition.drain_retirements().unwrap(), 1);
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
-    assert!(second.is_complete().unwrap());
+    assert!(
+        process
+            .maintenance_complete(crate::lifetime::Reason::MappingChange, second)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -463,16 +507,20 @@ fn stale_inflight_family_retains_storage_without_blocking_memory_invalidation() 
 }
 
 #[test]
-fn history_loss_global_invalidation_includes_old_cutovers_and_every_address_space() {
+fn instruction_cache_invalidation_includes_old_cutovers_but_preserves_other_address_spaces() {
     let process = process();
     let cursor = AtomicU64::new(0);
     let old = publish_image(&process, &cursor, &[0, 4], 1, 7);
-    publish_image(&process, &cursor, &[8], 2, 8);
+    let other = publish_image(&process, &cursor, &[8], 2, 8);
     let new = publish_image(&process, &cursor, &[0], 1, 7); // Queues a tier cutover.
-    process.invalidate_all_memory().unwrap();
-    assert_eq!(drain(&process), 3);
+    process
+        .invalidate_memory(&[MemoryInvalidationKind::InstructionCache {
+            address_space: AddressSpaceId::new(1),
+        }])
+        .unwrap();
+    assert_eq!(drain(&process), 2);
     assert!(matches!(process.snapshot(old), Err(Error::StaleUnit)));
     assert!(matches!(process.snapshot(new), Err(Error::StaleUnit)));
-    assert_eq!(process.reclaim_units().unwrap(), 3);
-    assert!(process.lock().keys.is_empty());
+    assert_eq!(process.reclaim_units().unwrap(), 2);
+    assert!(process.snapshot(other).is_ok());
 }

@@ -2,8 +2,7 @@
 
 use super::*;
 use crate::lifetime::background::work::negative_result::Prepared;
-use crate::lifetime::unit::reshape::negative::{self, Owner};
-use nixe_memory::MemoryInvalidationCursor;
+use crate::lifetime::unit::reshape::negative::Owner;
 
 pub(crate) struct Unchanged<'f, 'w, 'p> {
     frozen: &'f Frozen<'w, 'p>,
@@ -49,10 +48,7 @@ impl<'w, 'p> Frozen<'w, 'p> {
 
     /// Only a typed backend implementation/code-size limit may use this path.
     /// Memory validation precedes preparation and the final install guard.
-    pub(crate) fn prepare_backend_negative(
-        &self,
-        cursor: MemoryInvalidationCursor,
-    ) -> Result<BackendRejected<'_, 'w, 'p>, Error> {
+    pub(crate) fn prepare_backend_negative(&self) -> Result<BackendRejected<'_, 'w, 'p>, Error> {
         let work = self.candidate.work;
         work.capacity()?;
         let evidence = self
@@ -76,20 +72,13 @@ impl<'w, 'p> Frozen<'w, 'p> {
         }
         Ok(BackendRejected {
             frozen: self,
-            prepared: work.prepare_negative(
-                negative::Rejection::BackendRejected,
-                cursor,
-                owners,
-            )?,
+            prepared: work.prepare_negative(owners)?,
         })
     }
 
     /// Caller checks bound executable memory outside JIT state, before
     /// preparation and again immediately before installation.
-    pub(crate) fn prepare_unchanged(
-        &self,
-        cursor: MemoryInvalidationCursor,
-    ) -> Result<Unchanged<'_, 'w, 'p>, Error> {
+    pub(crate) fn prepare_unchanged(&self) -> Result<Unchanged<'_, 'w, 'p>, Error> {
         let work = self.candidate.work;
         work.capacity()?;
         if self.candidate.trimmed {
@@ -115,7 +104,7 @@ impl<'w, 'p> Frozen<'w, 'p> {
         }
         Ok(Unchanged {
             frozen: self,
-            prepared: work.prepare_negative(negative::Rejection::Unchanged, cursor, owners)?,
+            prepared: work.prepare_negative(owners)?,
         })
     }
 }

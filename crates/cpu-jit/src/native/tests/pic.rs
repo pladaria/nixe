@@ -37,11 +37,6 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
             for flags in 0..4 {
                 for operand in 0..4 {
                     let (mut source, mut entry) = canonical::complete(abi);
-                    source.site = ExitSiteKey {
-                        source: CodeVersion::new(if wide { 0xfedc_ba98_7654_3210 } else { 1 })
-                            .unwrap(),
-                        state_map: if wide { 0x9876_5432 } else { 7 },
-                    };
                     if flags < 2 {
                         source.nzcv = NzcvLocation::Host {
                             carry_inverted: flags == 1,
@@ -88,43 +83,79 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                         2 => ValueLocation::constant(target.pc.get().into()),
                         _ => vector(0),
                     };
-                    let bytes = probe::emit(&source, target, pc).unwrap();
+                    probe::emit(&source, target, pc).unwrap();
                     if !canonical::native(abi) {
                         continue;
                     }
-                    let mut hit = gateway::landing(abi);
-                    hit.extend(
-                        emit_canonical_exit(
-                            &source,
-                            ValueLocation::constant(0x4444),
-                            NativeExitReason::Dispatch,
-                            0,
+                    let mut hit_offset = 0;
+                    let owner = published::Published::new(|process, cache| {
+                        let identity = process.begin_unit(crate::executable::Tier::Lcq).unwrap();
+                        source.site = ExitSiteKey {
+                            source: identity.version(),
+                            state_map: 0,
+                        };
+                        let mut bytes = gateway::landing(abi);
+                        bytes.extend(emit_canonical_entry(&entry).unwrap());
+                        bytes.extend(probe::emit(&source, target, pc).unwrap());
+                        let miss_offset = bytes.len() as u32;
+                        bytes.extend(
+                            emit_canonical_exit(
+                                &source,
+                                ValueLocation::constant(0x8888),
+                                NativeExitReason::Control,
+                                0,
+                            )
+                            .unwrap(),
+                        );
+                        hit_offset = bytes.len();
+                        bytes.extend(gateway::landing(abi));
+                        let mut hit_state = source.clone();
+                        hit_state.site.state_map = 1;
+                        bytes.extend(
+                            emit_canonical_exit(
+                                &hit_state,
+                                ValueLocation::constant(0x4444),
+                                NativeExitReason::Dispatch,
+                                0,
+                            )
+                            .unwrap(),
+                        );
+                        published::encoded(
+                            identity,
+                            cache,
+                            bytes,
+                            crate::lifetime::unit::Entry {
+                                key: published::key(),
+                                canonical_offset: 0,
+                                fast_offset: 0,
+                                contract: entry.clone(),
+                            },
+                            vec![
+                                crate::lifetime::unit::StateRecord {
+                                    exit: None,
+                                    transfer: None,
+                                    native_offset: miss_offset,
+                                    state: source.clone(),
+                                },
+                                crate::lifetime::unit::StateRecord {
+                                    exit: None,
+                                    transfer: None,
+                                    native_offset: hit_offset as u32,
+                                    state: hit_state,
+                                },
+                            ],
+                            Box::new([]),
                         )
-                        .unwrap(),
-                    );
-                    let (hit_owner, hit_id) = gateway::compile(&hit);
-                    let hit_address = hit_owner.get_finalized_function(hit_id) as usize;
-                    let mut first = gateway::landing(abi);
-                    first.extend(emit_canonical_entry(&entry).unwrap());
-                    first.extend(bytes);
-                    first.extend(
-                        emit_canonical_exit(
-                            &source,
-                            ValueLocation::constant(0x8888),
-                            NativeExitReason::Control,
-                            0,
-                        )
-                        .unwrap(),
-                    );
-                    let (owner, id) = gateway::compile(&first);
+                    });
+                    let mut reader = owner.process.register().unwrap();
                     let table = Table::new();
                     let slot = set_index(source.site, target) * 2;
                     // Each mutation is made between completed native invocations.
-                    let mut record = Box::new(Record::new(source.site, target, hit_address));
-                    let mut collision = Box::new(Record::new(source.site, target, hit_address));
+                    let mut record = Box::new(Record::new(source.site, target, 0));
+                    let mut collision = Box::new(Record::new(source.site, target, 0));
                     collision.source ^= 1 << 40;
                     for case in 0..14 {
-                        *record = Record::new(source.site, target, hit_address);
+                        *record = Record::new(source.site, target, 0);
                         match case {
                             4 => record.source ^= 1 << 40,
                             5 => record.state_map ^= 1,
@@ -170,18 +201,25 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                                 {
                                     frame.spill[3400 + i] = MaybeUninit::new(byte);
                                 }
+                                let mut invocation =
+                                    unsafe { reader.admit(&mut frame, published::key()) }
+                                        .unwrap()
+                                        .unwrap();
+                                let address =
+                                    invocation.payload().preferred().unwrap().canonical.get();
+                                record.address = address + hit_offset;
+                                collision.address = record.address;
+                                let frame = invocation.frame();
                                 frame.indirect_pic = if case == 3 {
                                     std::ptr::null()
                                 } else {
                                     table.as_ptr()
                                 };
-                                frame.execution_epoch = 1;
-                                unsafe { frame.begin_fp() };
                                 let outcome = unsafe {
                                     enter_protected(
-                                        &mut frame,
+                                        frame,
                                         std::ptr::dangling_mut(),
-                                        owner.get_finalized_function(id),
+                                        address as *const u8,
                                     )
                                 }
                                 .unwrap();
@@ -207,6 +245,8 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                         table.set(slot, std::ptr::null());
                         table.set(slot + 1, std::ptr::null());
                     }
+                    drop(reader);
+                    owner.shutdown();
                 }
             }
         }

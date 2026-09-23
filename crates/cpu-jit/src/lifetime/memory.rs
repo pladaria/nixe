@@ -2,8 +2,7 @@
 
 use super::*;
 use nixe_memory::{
-    ExecutionMutation, ExecutionMutationError, ExecutionMutationObserver, MemoryInvalidationCursor,
-    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationSource,
+    ExecutionMutation, ExecutionMutationError, ExecutionMutationObserver, MemoryInvalidationKind,
 };
 
 #[cfg(test)]
@@ -13,11 +12,6 @@ struct Mutation {
     process: Arc<Lifetime>,
 }
 
-enum Targets<'a> {
-    Exact(&'a [MemoryInvalidationKind]),
-    All,
-}
-
 impl ExecutionMutation for Mutation {}
 
 impl ExecutionMutationObserver for Lifetime {
@@ -25,55 +19,17 @@ impl ExecutionMutationObserver for Lifetime {
         self: Arc<Self>,
         changes: &[MemoryInvalidationKind],
     ) -> Result<Box<dyn ExecutionMutation>, ExecutionMutationError> {
-        self.begin_memory_mutation(Targets::Exact(changes))
+        self.begin_memory_mutation(changes)
             .map(|mutation| Box::new(mutation) as Box<dyn ExecutionMutation>)
             .map_err(memory_error)
     }
 }
 
 impl Lifetime {
-    /// Consume one coherent stream snapshot from canonical mode, with no own
-    /// invocation/lease or memory/cache lock. The runtime owns one cursor for
-    /// this process and source, initially INITIAL; never reuse it for another
-    /// source. Mutation producers must still stop the engine before changing
-    /// memory: this consumer cannot retroactively make an unsafe write safe.
-    /// Later publications remain pending for the next call, even on overrun.
-    pub(crate) fn consume_memory_invalidations(
-        self: &Arc<Self>,
-        source: &dyn MemoryInvalidationSource,
-        cursor: &mut MemoryInvalidationCursor,
-    ) -> Result<(), Error> {
-        self.lock().healthy()?;
-        let mut records = Vec::new();
-        // read_invalidations_since releases the source's log lock before any
-        // coordinator work. Do not poll a second latest cursor after draining.
-        let (through, lost) = match source.read_invalidations_since(*cursor, &mut records) {
-            Ok(through) => (through, false),
-            Err(MemoryInvalidationError::HistoryLost { latest, .. }) => (latest, true),
-            Err(error) => {
-                let error = Error::MemoryInvalidation(error);
-                self.fail(&mut self.lock(), error);
-                return Err(error);
-            }
-        };
-        if through == *cursor && !lost {
-            return Ok(());
-        }
-        let changes: Vec<_> = records.iter().map(|record| record.kind).collect();
-        let mutation = self.clone().begin_memory_mutation(if lost {
-            Targets::All
-        } else {
-            Targets::Exact(&changes)
-        })?;
-        // The same memory hold waits for exact unlinks, not compiler storage pins.
-        // A failed stop/reopen must not acknowledge any part of this snapshot.
-        drop(mutation);
-        self.lock().healthy()?;
-        *cursor = through;
-        Ok(())
-    }
-
-    fn begin_memory_mutation(self: Arc<Self>, targets: Targets<'_>) -> Result<Mutation, Error> {
+    fn begin_memory_mutation(
+        self: Arc<Self>,
+        changes: &[MemoryInvalidationKind],
+    ) -> Result<Mutation, Error> {
         {
             let mut state = self.lock();
             state.healthy()?;
@@ -89,18 +45,15 @@ impl Lifetime {
         };
         // The hold precedes closure, so another transition owner cannot
         // acknowledge MappingChange between registration and quiescence.
-        let ticket = match targets {
-            Targets::Exact(changes) => self.invalidate_memory(changes),
-            Targets::All => self.invalidate_all_memory(),
-        };
-        let result = ticket.and_then(|ticket| {
+        let sequence = self.invalidate_memory(changes);
+        let result = sequence.and_then(|sequence| {
             loop {
                 let mut state = self.lock();
                 state.healthy()?;
                 if state.phase == Phase::Closed
                     && !state
                         .units
-                        .pending_retirement(Reason::MappingChange, ticket.sequence)
+                        .pending_retirement(Reason::MappingChange, sequence)
                 {
                     return Ok(());
                 }

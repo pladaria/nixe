@@ -2,8 +2,8 @@
 
 This document inventories the changes maintained in Nixe's Wasmtime fork and
 explains their purpose in the [tiered JIT](specs/tiered-jit/spec.md). It describes
-the implemented backend capabilities; production integration progresses through
-the specification's tasks. Performance benefits below are design motivations,
+the backend capabilities used by production LCQ/HCQ compilation, native linking
+and family reshaping. Performance benefits below are design motivations,
 not measured speedups.
 
 ## Baseline and revision
@@ -12,7 +12,8 @@ not measured speedups.
   `7bac2c2775808aaec5d4aa5627a5e447b51102cf`.
 - Fork: `pladaria/wasmtime`, branch `nixe`; Nixe currently pins
   `e2a984d96678207094c0fc50057c8b6bcfd68715` in
-  [the JIT manifest](../crates/cpu-jit/Cargo.toml) and the checked-in `Cargo.lock`.
+  [the JIT manifest](../crates/cpu-jit/Cargo.toml). Local path overrides can
+  change the lockfile's resolved sources without updating that portable pin.
 - The pinned changes are in two commits:
   [leaf ABI and canonical multi-entry support][abi-commit], and
   [boundary maps and patchable native exits][boundary-commit].
@@ -22,17 +23,30 @@ Its additional changes, including the terminal checkpoints below, are not in
 that Git pin. Do not remove the override until the maintainer publishes and
 pins the updated fork.
 
-Task 4 validation uses local HEAD `3dabafe6e5cb04b88265b0d3612f88ffe50b7332`
-plus uncommitted backend changes, including `nixe_exit_costs`/terminal polling.
-That HEAD alone is not a reproducible replacement for the local checkout.
+Task 9 development uses local HEAD `0380097992d7d337bdf66873510a8c42a8923c0b`
+on branch `nixe`; the checkout is clean as inspected on 2026-09-24. This includes
+the observable-FP changes and budget checkpoints/precise memory boundaries.
+It is the locally tested revision, not Nixe's portable dependency pin; this
+check does not establish that it is available on the remote.
 On this development machine the checkout is `/home/pladaria/projects/wasmtime`
-and the existing override is used with:
+and `/tmp/nixe-observable-fp-local.toml` contains:
 
-```bash
-cargo --offline --config /tmp/nixe-observable-fp-local.toml cli run es2gears
+```toml
+[patch."https://github.com/pladaria/wasmtime"]
+cranelift-codegen = { path = "/home/pladaria/projects/wasmtime/cranelift/codegen" }
+cranelift-frontend = { path = "/home/pladaria/projects/wasmtime/cranelift/frontend" }
+cranelift-native = { path = "/home/pladaria/projects/wasmtime/cranelift/native" }
+wasmtime-internal-jit-icache-coherence = { path = "/home/pladaria/projects/wasmtime/crates/jit-icache-coherence" }
 ```
 
-The override file is machine-local. Keep override-induced lockfile changes out
+Adjust the checkout paths on another machine. Run with:
+
+```bash
+cargo --config /tmp/nixe-observable-fp-local.toml cli run es2gears
+```
+
+The override file is machine-local and `/tmp` may be cleared. `--offline` is
+optional when dependencies are already cached. Keep override-induced lockfile changes out
 of the dependency-pin handoff; publishing and pinning the updated fork remains
 a separate maintainer action.
 
@@ -189,8 +203,8 @@ patch, including subsequent allocator edits. HCQ emits it only on the shared
 flow analysis's cycle-cutting edges. The cold path reuses native control/budget
 and sample handling; its callback preserves all volatile registers, including
 optimizer temporaries absent from guest maps. No hot-path canonical writeback,
-call, public ingress or link bridge is introduced. Production seed promotion
-and source-aware runtime observation are connected in Task 6.
+call, public ingress or link bridge is introduced. Production seed promotion,
+reshaping and source-aware runtime observation use these checkpoints.
 
 Added `enable_nixe_ibt` for x86-64 `ENDBR64` landings and integrated selected
 entries with the existing AArch64 BTI machinery. Entry offsets point to the
@@ -221,7 +235,7 @@ against them before publication. This addition still requires the local override
 The local `nixe_arena_addr` operation adds a confined I64 offset directly to
 the pinned arena base (r13/x19), as one LEA/ADD without altering flags. x86
 emission bypasses the general arithmetic LEA-to-ADD optimization. The operation
-does not itself validate the offset: LCQ emits confinement using the fixed
+does not itself validate the offset: the shared frontend emits confinement using the fixed
 process arena size before consuming it. Non-Nixe functions cannot use this
 operation. No extra base-register copy or NativeFrame load is emitted.
 The x86 assembler generator now exposes memory-trap annotations for this
@@ -253,11 +267,11 @@ the JIT depends.
 Implementation: `cranelift/codegen/src/{ir,verifier,write.rs,nixe.rs,nixe/}`,
 `cranelift/reader/src/parser.rs`, and `cranelift/jit/tests/nixe_faults.rs`.
 
-## Local Task 3 change awaiting a pinned commit: observable FP effects
+## Observable FP effects (not in the portable pin)
 
 `Function::nixe_observable_fp` opts a function into ordered, observable native
 FP control/status effects, independently of its calling convention. Nixe sets
-it in the production LCQ compiler. Without it, ordinary CLIF
+it in both production LCQ and HCQ compilers. Without it, ordinary CLIF
 semantics allow dropping an unused conversion and losing guest FPSR updates.
 
 The optimizer keeps FP arithmetic/comparisons/rounding/conversions opaque to
@@ -286,9 +300,9 @@ both encoders, optimized constant inputs and discarded-result FPSR execution
 in Nixe on x86-64 and AArch64/QEMU. These edits are local to branch `nixe`;
 the manifest still pins the earlier commit listed above.
 
-## Local Task 3 atomic changes awaiting a pinned commit
+## Atomic lowering (not in the portable pin)
 
-The local Task 3 CAS work also changes AArch64's non-LSE `AtomicCASLoop`:
+The local fork also changes AArch64's non-LSE `AtomicCASLoop`:
 Nixe mode attempts an exclusive store of the observed value on comparison
 mismatch, so guest write-permission faults cannot be bypassed. This emits three
 exact fault sites (one load, two alternative stores) with the same PRE map; no
@@ -329,10 +343,15 @@ management are tracked in [Task 2](specs/tiered-jit/task-02-plan.md), frontend
 cutover in [Task 3](specs/tiered-jit/task-03-plan.md), and production native
 chaining/retirement in [Task 4](specs/tiered-jit/task-04-plan.md). Functional
 cold-path sampling is active; [Task 5](specs/tiered-jit/task-05-plan.md) also
-provides bounded admission and worker ownership. Task 6 connects production seed
-admission and the real HCQ worker consumer; reshape activation follows in Task 7.
-Emitted landing checks and
-QEMU tests do not establish native BTI/CET enforcement.
+provides bounded admission and worker ownership. Production seed admission and
+the HCQ worker consumer are active, as is evidence-driven family reshaping.
+Publication, invalidation and pressure reclamation share one lifetime protocol.
+These consumers use owned backend output and Nixe's segmented W^X cache;
+`cranelift-jit` and `cranelift-module` are not Nixe dependencies, even for tests.
+The remaining cleanup is tracked in [Task 9](specs/tiered-jit/task-09-plan.md).
+Native AArch64 validation remains a [Task 10](specs/tiered-jit/spec.md#task-10-prove-cross-target-conformance)
+handoff. Emitted landing checks and QEMU tests do not establish native BTI/CET
+enforcement or hardware instruction-cache coherence.
 
 [abi-commit]: https://github.com/pladaria/wasmtime/commit/2f8ccabacf
 [boundary-commit]: https://github.com/pladaria/wasmtime/commit/e2a984d96678207094c0fc50057c8b6bcfd68715

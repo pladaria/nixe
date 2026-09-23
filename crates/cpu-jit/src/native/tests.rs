@@ -1,8 +1,7 @@
+use super::canonical::emit_canonical_writeback;
 use super::*;
 use crate::abi::*;
 use crate::analysis::{NZCV, StateSet};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::mem::MaybeUninit;
 
 mod backend;
@@ -429,7 +428,7 @@ fn invoke_inner(abi: HostAbi, mut bytes: Vec<u8>, frame: &mut NativeFrame<'_>, f
     }
     let cache = crate::executable::Cache::new().unwrap();
     let code = cache
-        .install(
+        .install_with_islands(
             crate::executable::output::Output {
                 bytes: bytes.into_boxed_slice(),
                 alignment: 16,
@@ -444,6 +443,7 @@ fn invoke_inner(abi: HostAbi, mut bytes: Vec<u8>, frame: &mut NativeFrame<'_>, f
                 },
             },
             crate::executable::Tier::Lcq,
+            0,
             |_| None,
         )
         .unwrap();

@@ -1,10 +1,10 @@
 //! Private two-way PIC owners. All cold mutation is serialized by JIT state;
-//! insertion additionally requires this vCPU to be quiescent or suspended.
+//! insertion additionally requires this vCPU to be suspended.
 //! Maintenance removal requires Closed before native probes can resume.
 
 use super::*;
 use crate::abi::BridgeGeneration;
-use crate::lifetime::{NativeSuspension, Reader};
+use crate::lifetime::NativeSuspension;
 use crate::native::pic::{Record, Table, set_index};
 
 mod weak;
@@ -20,15 +20,6 @@ pub(in crate::lifetime) struct Registration {
 pub(in crate::lifetime) struct Site {
     pub reader: Handle<Registration>,
     pub slot: usize,
-}
-
-/// Both reader and bridge generations must match; a reused way or vCPU slot
-/// never revives an old handle. No handle alone keeps executable code alive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::lifetime) struct PicHandle {
-    process: u64,
-    site: Site,
-    generation: BridgeGeneration,
 }
 
 pub(in crate::lifetime) struct Bridge {
@@ -270,46 +261,34 @@ impl State {
     }
 }
 
-impl Reader {
-    /// Install at this vCPU's quiescent boundary. In-invocation misses use the
-    /// exclusive native suspension instead; a lock alone does not authorize it.
-    pub(in crate::lifetime) fn cache_bridge(
-        &mut self,
-        prepared: PreparedBridge<'_>,
-    ) -> Result<PicHandle, Error> {
-        if self.announcement.load(Ordering::Acquire) != 0 {
-            return Err(Error::ActiveReader);
-        }
-        self.install_bridge(prepared)
-    }
-
-    // Both callers hold exclusive access to this Reader and prohibit native
-    // probes until insertion finishes: either quiescence or NativeSuspension.
-    fn install_bridge(&mut self, prepared: PreparedBridge<'_>) -> Result<PicHandle, Error> {
-        if !std::ptr::eq(prepared.process, self.process.as_ref()) {
+impl NativeSuspension<'_> {
+    /// Install for future native hits, keeping the current epoch announced.
+    /// Emission may lose a race with closure/retirement; normal preparation and
+    /// final publication checks still apply. Never wait for maintenance here.
+    pub(crate) fn cache_bridge(&mut self, prepared: PreparedBridge<'_>) -> Result<(), Error> {
+        let reader = &mut *self.reader;
+        if !std::ptr::eq(prepared.process, reader.process.as_ref()) {
             return Err(Error::StaleUnit);
         }
         let generation = {
-            let mut state = self.process.lock();
+            let mut state = reader.process.lock();
             prepared.validate(&state)?;
-            if let Some((handle, removed)) =
-                state.reuse_bridge(self.handle, prepared.key, self.process.identity)
-            {
+            if let Some(removed) = state.reuse_bridge(reader.handle, prepared.key) {
                 let negatives = state.units.negatives.take_removed();
                 drop(state);
                 drop(removed);
                 drop(negatives);
-                return Ok(handle);
+                return Ok(());
             }
             // A weak hit avoids emission and W^X installation. Reserve an
             // identity for a real miss in this same state-lock interval.
             let result = state.bridge_generations.next_id();
-            self.process.checked(&mut state, result)?
+            reader.process.checked(&mut state, result)?
         };
         let transfer = prepared.emit()?;
         // Reserve the complete persistent owner outside JIT state. Keep the
         // preparation intact until final revalidation; it pins both contracts.
-        let charge = self.process.cache.charge_metadata(
+        let charge = reader.process.cache.charge_metadata(
             size_of::<Accounted<Bridge>>() + 2 * size_of::<usize>(),
             transfer.prepared.source_code.tier,
         )?;
@@ -328,33 +307,22 @@ impl Reader {
             },
             charge,
         });
-        let (handle, removed, negatives) = {
-            let mut state = self.process.lock();
+        let (removed, negatives) = {
+            let mut state = reader.process.lock();
             prepared.validate(&state)?;
             // Another vCPU may have installed this exact transfer while we
             // emitted. Share that winner; discard our unpublished owner below.
-            let (handle, removed) = state
-                .reuse_bridge(self.handle, prepared.key, self.process.identity)
-                .unwrap_or_else(|| {
-                    state.place_bridge(self.handle, Arc::clone(&bridge), self.process.identity)
-                });
-            (handle, removed, state.units.negatives.take_removed())
+            let removed = state
+                .reuse_bridge(reader.handle, prepared.key)
+                .unwrap_or_else(|| state.place_bridge(reader.handle, Arc::clone(&bridge)));
+            (removed, state.units.negatives.take_removed())
         };
         drop(bridge);
         drop(removed);
         drop(negatives);
-        Ok(handle)
-    }
-}
-
-impl NativeSuspension<'_> {
-    /// Install for future native hits, keeping the current epoch announced.
-    /// Emission may lose a race with closure/retirement; normal preparation and
-    /// final publication checks still apply. Never wait for maintenance here.
-    pub(crate) fn cache_bridge(&mut self, prepared: PreparedBridge<'_>) -> Result<(), Error> {
-        self.reader.install_bridge(prepared).map(|_| ())
+        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::lifetime) mod tests;

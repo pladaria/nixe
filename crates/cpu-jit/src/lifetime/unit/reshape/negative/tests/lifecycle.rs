@@ -1,6 +1,7 @@
 //! Lifecycle fixtures inject index records directly to isolate invalidation.
 //! Worker-result tests cover validated installation and admission separately.
 use super::*;
+use crate::lifetime::unit::dynamic::pic::tests::cache;
 use crate::lifetime::unit::tests::input;
 use nixe_memory::{
     AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationKind,
@@ -13,7 +14,7 @@ fn install(process: &Lifetime, key: Key, owners: &[Owner]) {
     let mut prepared = record(process, key, owners);
     let mut state = process.lock();
     state.units.negatives.grow(&mut spare).unwrap();
-    assert!(state.units.negatives.insert(&mut prepared).unwrap());
+    assert!(insert(&mut state.units.negatives, &mut prepared).unwrap());
     drop(state);
     drop(spare);
 }
@@ -148,12 +149,17 @@ fn publication_invalidates_dispatch_evidence_and_replaced_lcq_units_only() {
 #[test]
 fn dispatch_retirement_and_reuse_do_not_keep_stale_evidence() {
     let process = process();
+    publish(&process, &AtomicU64::new(0), &[32], Tier::Lcq);
+    let survivor_key = boundary(&process, 32);
+    install(&process, survivor_key, &[dispatch(&process, 32)]);
     let old_key = boundary(&process, 0);
     let publication = process.reserve(key(0)).unwrap();
     let old = Owner::Dispatch(publication.slot);
     install(&process, old_key, &[old]);
-    process.retire_dispatch(publication).unwrap();
+    process.recover_capacity().unwrap();
     assert!(!present(&process, old_key));
+    assert!(present(&process, survivor_key));
+    assert!(process.lock().units.negatives.removed.is_none());
     process.collect_dispatch().unwrap();
     let new_key = boundary(&process, 0);
     let new = dispatch(&process, 0);
@@ -263,22 +269,6 @@ fn unlink_invalidates_dispatch_evidence_before_reuse() {
 }
 
 #[test]
-fn history_loss_clears_all_evidence_but_keeps_reusable_index_capacity() {
-    let process = process();
-    let key = boundary(&process, 0);
-    let owner = dispatch(&process, 0);
-    install(&process, key, &[owner]);
-    let capacity = process.lock().units.negatives.records.capacity();
-    process.invalidate_all_memory().unwrap();
-    assert!(!present(&process, key));
-    assert!(process.lock().units.negatives.removed.is_none());
-    assert_eq!(process.lock().units.negatives.records.capacity(), capacity);
-    drain(&process);
-    install(&process, key, &[owner]);
-    assert!(present(&process, key));
-}
-
-#[test]
 fn shutdown_releases_records_then_index_capacity() {
     for direct in [false, true] {
         let process = process();
@@ -345,13 +335,13 @@ fn pic_insert_weak_reuse_and_reader_drop_invalidate_entry_evidence_but_hits_do_n
             .unwrap()
     };
     install(&process, boundary, &[Owner::Entries(family)]);
-    reader.cache_bridge(bridge()).unwrap();
+    cache(&mut reader, bridge()).unwrap();
     assert!(!present(&process, boundary));
     assert!(process.lock().units.negatives.removed.is_none());
     install(&process, boundary, &[Owner::Entries(family)]);
-    reader.cache_bridge(bridge()).unwrap(); // Same private way: no root change.
+    cache(&mut reader, bridge()).unwrap(); // Same private way: no root change.
     assert!(present(&process, boundary));
-    other.cache_bridge(bridge()).unwrap(); // Weak reuse creates a new root.
+    cache(&mut other, bridge()).unwrap(); // Weak reuse creates a new root.
     assert!(!present(&process, boundary));
     assert!(process.lock().units.negatives.removed.is_none());
     install(&process, boundary, &[Owner::Entries(family)]);

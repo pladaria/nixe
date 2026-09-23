@@ -14,19 +14,10 @@ pub(crate) use fp::FpFlow;
 mod flags;
 pub(crate) use flags::FlagFlow;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Point {
-    pub live_before: StateSet,
-    pub live_after: StateSet,
-}
-
 pub(crate) struct Analysis {
     pub native: NativeFlow,
     pub fp: FpFlow,
     pub flags: FlagFlow,
-    pub blocks: Vec<BlockLiveness>,
-    /// Same unique instruction ordinals as Graph.instructions.
-    pub instructions: Vec<Point>,
     /// Edge ordinals: fallthrough then taken for a conditional, otherwise zero.
     /// Only DFS backedges, not every edge to a lower guest address.
     pub backedges: Vec<[bool; 2]>,
@@ -128,28 +119,13 @@ impl Analysis {
                 }
             })
             .collect();
-        let blocks = analysis::liveness(&flow);
         let native = NativeFlow::build(graph, entries, &effects, &flow);
         let fp = FpFlow::build(graph, entries, &flow);
         let flags = FlagFlow::build(graph, entries, &flow, &native);
-        let mut instructions = vec![Point::default(); graph.instructions.len()];
-        for (index, block) in graph.blocks.iter().enumerate() {
-            let mut live = blocks[index].live_out;
-            for ordinal in block.instructions.clone().rev() {
-                let effect = effects[ordinal];
-                let point = &mut instructions[ordinal];
-                point.live_after = live.union(effect.observe_after);
-                live = effect.live_before(live);
-                point.live_before = live;
-            }
-            debug_assert_eq!(live, blocks[index].live_in);
-        }
         Self {
             native,
             fp,
             flags,
-            blocks,
-            instructions,
             backedges,
         }
     }

@@ -98,7 +98,7 @@ impl CpuBackend {
             Self::Jit(process) => match process.try_shutdown() {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(jit_boundary_fault(
-                    "LCQ shutdown still has outstanding execution or compilation owners",
+                    "JIT shutdown still has outstanding execution or compilation owners",
                     &ThreadCpuState::default(),
                 )),
                 Err(error) => Err(jit_boundary_fault(error, &ThreadCpuState::default())),

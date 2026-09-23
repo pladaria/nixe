@@ -15,7 +15,7 @@ type H = Handle<Link>;
 pub(in crate::lifetime) const INSTALL_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LinkHandle(H, u64);
+pub(crate) struct LinkHandle(pub(super) H, pub(super) u64);
 
 /// Strong ownership survives source/target withdrawal while bridge bytes are
 /// prepared outside state. Maps/contracts remain in their immutable unit: no
@@ -33,6 +33,7 @@ pub(crate) struct PreparedLink<'p> {
     reachability: ReachabilityVersion,
 }
 
+#[cfg(test)]
 impl PreparedLink<'_> {
     pub(crate) fn source_state(&self) -> &ExitStateMap {
         &self.source_code.states[self.state_map as usize].state
@@ -361,10 +362,10 @@ impl<'p> Transition<'p> {
             (old, from.static_sites[island].callable)
         };
         if let Some(old) = old {
-            self.unlink_registered_link(old)?;
+            self.unlink_link(LinkHandle(old, self.process.identity))?;
         }
         if let Some(callable) = callable.filter(|handle| Some(*handle) != old) {
-            self.unlink_registered_link(callable)?;
+            self.unlink_link(LinkHandle(callable, self.process.identity))?;
         }
         prepared
             .map(|prepared| self.register_link(prepared))
@@ -514,9 +515,7 @@ impl<'p> Transition<'p> {
                         .records
                         .next_handle()
                         .inspect_err(|error| process.fail(&mut state, *error))?;
-                    let sequence = process
-                        .request_locked(&mut state, Reason::LinkPatch)?
-                        .sequence;
+                    let sequence = process.request_locked(&mut state, Reason::LinkPatch)?;
                     state.units.insert_prepared_link(prepared, handle, sequence);
                     return Ok(LinkHandle(handle, process.identity));
                 }
@@ -534,33 +533,6 @@ impl<'p> Transition<'p> {
             }
             // Old registry storage/charge drops after the state guard.
         }
-    }
-
-    pub(crate) fn discard_pending_link(&mut self, handle: LinkHandle) -> Result<(), Error> {
-        let removed = {
-            let mut state = self.process.lock();
-            self.require_closed(&state)?;
-            if handle.1 != self.process.identity {
-                return Err(Error::StaleUnit);
-            }
-            if state
-                .units
-                .links
-                .records
-                .get(handle.0)
-                .is_some_and(|record| record.installed)
-            {
-                return Err(Error::InvalidUnit(
-                    "installed link requires synchronized unlink",
-                ));
-            }
-            state
-                .units
-                .remove_uninstalled_link(handle.0)
-                .ok_or(Error::StaleUnit)?
-        };
-        drop(removed);
-        Ok(())
     }
 }
 

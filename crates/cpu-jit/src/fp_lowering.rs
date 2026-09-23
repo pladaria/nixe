@@ -1,21 +1,21 @@
 //! Shared native FP predicates and value lowering, independent of execution boundaries.
 
 use crate::jit_error::Error;
-use crate::simd_lowering::{SimdLowering, bitcast_flags};
+use crate::{frontend::Translator, simd_lowering::bitcast_flags};
 use cranelift_codegen::ir::{
     InstBuilder, Value,
     condcodes::{FloatCC, IntCC},
     types,
 };
 
-pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
+impl Translator<'_> {
     /// Advanced SIMD SCVTF/UCVTF in an active guest FP environment. Inactive
     /// lanes are zeroed before conversion so they cannot contribute IXC.
     /// Single-element encodings use scalar CLIF instead of converting unused
     /// lanes and repacking them, particularly expensive for baseline x86 i64.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--vector---Signed-integer-Convert-to-Floating-point--vector--
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UCVTF--vector---Unsigned-integer-Convert-to-Floating-point--vector--
-    fn vector_integer_to_fp_value(
+    pub(crate) fn vector_integer_to_fp_value(
         &mut self,
         value: Value,
         lane_64: bool,
@@ -26,22 +26,22 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         if vector_bits == lane_bits {
             let bits = self.vector_as(value, types::I128);
             let integer_ty = if lane_64 { types::I64 } else { types::I32 };
-            let bits = self.builder().ins().ireduce(types::I64, bits);
+            let bits = self.builder.ins().ireduce(types::I64, bits);
             let result = self.integer_to_fp_value(bits, lane_64, lane_64, signed);
             let bits = self
-                .builder()
+                .builder
                 .ins()
                 .bitcast(integer_ty, bitcast_flags(), result);
-            let bits = self.builder().ins().uextend(types::I128, bits);
+            let bits = self.builder.ins().uextend(types::I128, bits);
             return self.vector_as(bits, types::I8X16);
         }
         let value = self.mask_vector(value, vector_bits);
         let value = self.vector_as(value, if lane_64 { types::I64X2 } else { types::I32X4 });
         let float_ty = if lane_64 { types::F64X2 } else { types::F32X4 };
         let result = if signed {
-            self.builder().ins().fcvt_from_sint(float_ty, value)
+            self.builder.ins().fcvt_from_sint(float_ty, value)
         } else {
-            self.builder().ins().fcvt_from_uint(float_ty, value)
+            self.builder.ins().fcvt_from_uint(float_ty, value)
         };
         let result = self.vector_as(result, types::I8X16);
         self.mask_vector(result, vector_bits)
@@ -53,7 +53,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// unsigned inputs and just-below-minimum fractions use exact completion.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTZS--scalar--integer---Floating-point-Convert-to-Signed-integer--rounding-toward-Zero--scalar--
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTZU--scalar--integer---Floating-point-Convert-to-Unsigned-integer--rounding-toward-Zero--scalar--
-    fn fp_to_integer_domain(
+    pub(crate) fn fp_to_integer_domain(
         &mut self,
         bits: Value,
         width: u32,
@@ -64,26 +64,26 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         let integer_bits = if destination_64 { 64 } else { 32 };
         let limit = (bias + integer_bits - u64::from(signed)) << fraction;
         let sign = 1u64 << (width - 1);
-        let magnitude = self.builder().ins().band_imm_u(bits, (sign - 1) as i64);
+        let magnitude = self.builder.ins().band_imm_u(bits, (sign - 1) as i64);
         let ordered = if signed { magnitude } else { bits };
-        let normal = self.builder().ins().icmp_imm_u(
+        let normal = self.builder.ins().icmp_imm_u(
             IntCC::UnsignedGreaterThanOrEqual,
             ordered,
             1i64 << fraction,
         );
         let below = self
-            .builder()
+            .builder
             .ins()
             .icmp_imm_u(IntCC::UnsignedLessThan, ordered, limit as i64);
-        let in_range = self.builder().ins().band(normal, below);
-        let zero = self.builder().ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
-        let mut direct = self.builder().ins().bor(in_range, zero);
+        let in_range = self.builder.ins().band(normal, below);
+        let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
+        let mut direct = self.builder.ins().bor(in_range, zero);
         if signed {
-            let minimum =
-                self.builder()
-                    .ins()
-                    .icmp_imm_u(IntCC::Equal, bits, (sign | limit) as i64);
-            direct = self.builder().ins().bor(direct, minimum);
+            let minimum = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, bits, (sign | limit) as i64);
+            direct = self.builder.ins().bor(direct, minimum);
         }
         direct
     }
@@ -92,7 +92,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// backend's saturating sequence is used inside its ordinary valid domain;
     /// out-of-domain guest saturation/status/traps belong to exact completion.
     /// W destinations clear their upper half, including signed conversions.
-    fn fp_to_integer_value(
+    pub(crate) fn fp_to_integer_value(
         &mut self,
         bits: Value,
         source_64: bool,
@@ -105,19 +105,16 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         } else {
             types::I32
         };
-        let value = self
-            .builder()
-            .ins()
-            .bitcast(float_ty, bitcast_flags(), bits);
+        let value = self.builder.ins().bitcast(float_ty, bitcast_flags(), bits);
         let result = if signed {
-            self.builder().ins().fcvt_to_sint_sat(integer_ty, value)
+            self.builder.ins().fcvt_to_sint_sat(integer_ty, value)
         } else {
-            self.builder().ins().fcvt_to_uint_sat(integer_ty, value)
+            self.builder.ins().fcvt_to_uint_sat(integer_ty, value)
         };
         if destination_64 {
             result
         } else {
-            self.builder().ins().uextend(types::I64, result)
+            self.builder.ins().uextend(types::I64, result)
         }
     }
 
@@ -126,7 +123,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// conversion rounds and contributes inexact status.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--scalar--integer---Signed-integer-Convert-to-Floating-point--scalar--
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UCVTF--scalar--integer---Unsigned-integer-Convert-to-Floating-point--scalar--
-    fn integer_to_fp_value(
+    pub(crate) fn integer_to_fp_value(
         &mut self,
         value: Value,
         source_64: bool,
@@ -136,7 +133,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         let value = if source_64 {
             value
         } else {
-            self.builder().ins().ireduce(types::I32, value)
+            self.builder.ins().ireduce(types::I32, value)
         };
         let ty = if destination_64 {
             types::F64
@@ -144,9 +141,9 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
             types::F32
         };
         if signed {
-            self.builder().ins().fcvt_from_sint(ty, value)
+            self.builder.ins().fcvt_from_sint(ty, value)
         } else {
-            self.builder().ins().fcvt_from_uint(ty, value)
+            self.builder.ins().fcvt_from_uint(ty, value)
         }
     }
 
@@ -156,43 +153,49 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// lie on the minimum-normal lattice: even cancellation then cannot be
     /// subnormal. This conservative exponent-only bound excludes rare small
     /// domains without computing or rounding an intermediate FP product.
-    fn fp_fused_domain(&mut self, first: Value, second: Value, third: Value, width: u32) -> Value {
+    pub(crate) fn fp_fused_domain(
+        &mut self,
+        first: Value,
+        second: Value,
+        third: Value,
+        width: u32,
+    ) -> Value {
         let mask = ((1u64 << (width - 1)) - 1) as i64;
-        let a = self.builder().ins().band_imm_u(first, mask);
-        let b = self.builder().ins().band_imm_u(second, mask);
-        let c = self.builder().ins().band_imm_u(third, mask);
-        let az = self.builder().ins().icmp_imm_s(IntCC::Equal, a, 0);
-        let bz = self.builder().ins().icmp_imm_s(IntCC::Equal, b, 0);
-        let cz = self.builder().ins().icmp_imm_s(IntCC::Equal, c, 0);
-        let product_zero = self.builder().ins().bor(az, bz);
+        let a = self.builder.ins().band_imm_u(first, mask);
+        let b = self.builder.ins().band_imm_u(second, mask);
+        let c = self.builder.ins().band_imm_u(third, mask);
+        let az = self.builder.ins().icmp_imm_s(IntCC::Equal, a, 0);
+        let bz = self.builder.ins().icmp_imm_s(IntCC::Equal, b, 0);
+        let cz = self.builder.ins().icmp_imm_s(IntCC::Equal, c, 0);
+        let product_zero = self.builder.ins().bor(az, bz);
         let (fraction, bias) = if width == 32 { (23, 127) } else { (52, 1023) };
-        let ae = self.builder().ins().ushr_imm_u(a, fraction);
-        let be = self.builder().ins().ushr_imm_u(b, fraction);
-        let ce = self.builder().ins().ushr_imm_u(c, fraction);
-        let sum = self.builder().ins().iadd(ae, be);
+        let ae = self.builder.ins().ushr_imm_u(a, fraction);
+        let be = self.builder.ins().ushr_imm_u(b, fraction);
+        let ce = self.builder.ins().ushr_imm_u(c, fraction);
+        let sum = self.builder.ins().iadd(ae, be);
         let product_normal =
-            self.builder()
+            self.builder
                 .ins()
                 .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, sum, bias + 1);
-        let no_addend = self.builder().ins().band(cz, product_normal);
+        let no_addend = self.builder.ins().band(cz, product_normal);
         // Product precision is 2*(fraction+1); addend precision is fraction+1.
-        let product_lattice = self.builder().ins().icmp_imm_u(
+        let product_lattice = self.builder.ins().icmp_imm_u(
             IntCC::UnsignedGreaterThanOrEqual,
             sum,
             bias + 2 * fraction + 1,
         );
         let addend_lattice =
-            self.builder()
+            self.builder
                 .ins()
                 .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, ce, fraction + 1);
-        let lattice = self.builder().ins().band(product_lattice, addend_lattice);
-        let safe = self.builder().ins().bor(lattice, no_addend);
-        self.builder().ins().bor(safe, product_zero)
+        let lattice = self.builder.ins().band(product_lattice, addend_lattice);
+        let safe = self.builder.ins().bor(lattice, no_addend);
+        self.builder.ins().bor(safe, product_zero)
     }
 
     /// Apply architectural input sign changes before one fused rounding.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMADD--Floating-point-fused-Multiply-Add-
-    fn fp_fused_value(
+    pub(crate) fn fp_fused_value(
         &mut self,
         first: Value,
         second: Value,
@@ -201,7 +204,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     ) -> Value {
         use nixe_cpu::decode::a64::fp_simd::FloatFusedMultiplyOperation as Op;
         let first = if matches!(operation, Op::MultiplySubtract | Op::NegatedMultiplyAdd) {
-            self.builder().ins().fneg(first)
+            self.builder.ins().fneg(first)
         } else {
             first
         };
@@ -209,11 +212,11 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
             operation,
             Op::NegatedMultiplyAdd | Op::NegatedMultiplySubtract
         ) {
-            self.builder().ins().fneg(third)
+            self.builder.ins().fneg(third)
         } else {
             third
         };
-        self.builder().ins().fma(first, second, third)
+        self.builder.ins().fma(first, second, third)
     }
 
     /// Normal/zero operands are checked separately. On x86, conservatively
@@ -221,39 +224,39 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// product has exponent e1+e2 or e1+e2+1, and the biased exponent sum
     /// being at least bias+1 guarantees it is not tiny. Either zero is safe.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMUL--scalar---Floating-point-Multiply--scalar--
-    fn fp_multiply_domain(&mut self, first: Value, second: Value, width: u32) -> Value {
+    pub(crate) fn fp_multiply_domain(&mut self, first: Value, second: Value, width: u32) -> Value {
         let mask = ((1u64 << (width - 1)) - 1) as i64;
-        let first = self.builder().ins().band_imm_u(first, mask);
-        let second = self.builder().ins().band_imm_u(second, mask);
-        let first_zero = self.builder().ins().icmp_imm_s(IntCC::Equal, first, 0);
-        let second_zero = self.builder().ins().icmp_imm_s(IntCC::Equal, second, 0);
-        let zero = self.builder().ins().bor(first_zero, second_zero);
+        let first = self.builder.ins().band_imm_u(first, mask);
+        let second = self.builder.ins().band_imm_u(second, mask);
+        let first_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, first, 0);
+        let second_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, second, 0);
+        let zero = self.builder.ins().bor(first_zero, second_zero);
         let (fraction, threshold) = if width == 32 { (23, 128) } else { (52, 1024) };
-        let first = self.builder().ins().ushr_imm_u(first, fraction);
-        let second = self.builder().ins().ushr_imm_u(second, fraction);
-        let sum = self.builder().ins().iadd(first, second);
+        let first = self.builder.ins().ushr_imm_u(first, fraction);
+        let second = self.builder.ins().ushr_imm_u(second, fraction);
+        let sum = self.builder.ins().iadd(first, second);
         let non_tiny =
-            self.builder()
+            self.builder
                 .ins()
                 .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, sum, threshold);
-        self.builder().ins().bor(zero, non_tiny)
+        self.builder.ins().bor(zero, non_tiny)
     }
 
     /// FNMUL negates the rounded product, not an input: moving the negation
     /// across FMUL would change directed rounding and NaN sign semantics.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNMUL--Floating-point-Negated-Multiply--scalar--
-    fn fp_multiply_value(
+    pub(crate) fn fp_multiply_value(
         &mut self,
         first: Value,
         second: Value,
         operation: nixe_cpu::decode::a64::fp_simd::FloatMultiplyOperation,
     ) -> Value {
-        let result = self.builder().ins().fmul(first, second);
+        let result = self.builder.ins().fmul(first, second);
         if matches!(
             operation,
             nixe_cpu::decode::a64::fp_simd::FloatMultiplyOperation::NegatedMultiply
         ) {
-            self.builder().ins().fneg(result)
+            self.builder.ins().fneg(result)
         } else {
             result
         }
@@ -265,7 +268,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// For normal operands the quotient exponent is e1-e2 or e1-e2-1, so
     /// e1-e2 >= Emin+1 guarantees a non-tiny result. Zero numerators are safe.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FDIV--Floating-point-Divide--scalar--
-    fn fp_divide_domain(
+    pub(crate) fn fp_divide_domain(
         &mut self,
         first: Value,
         second: Value,
@@ -273,79 +276,70 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         abi: crate::abi::HostAbi,
     ) -> Value {
         let magnitude_mask = (1u64 << (width - 1)) - 1;
-        let second = self
-            .builder()
-            .ins()
-            .band_imm_u(second, magnitude_mask as i64);
-        let nonzero = self.builder().ins().icmp_imm_s(IntCC::NotEqual, second, 0);
+        let second = self.builder.ins().band_imm_u(second, magnitude_mask as i64);
+        let nonzero = self.builder.ins().icmp_imm_s(IntCC::NotEqual, second, 0);
         if abi == crate::abi::HostAbi::Aarch64 {
             return nonzero;
         }
-        let first = self
-            .builder()
-            .ins()
-            .band_imm_u(first, magnitude_mask as i64);
-        let zero = self.builder().ins().icmp_imm_s(IntCC::Equal, first, 0);
+        let first = self.builder.ins().band_imm_u(first, magnitude_mask as i64);
+        let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, first, 0);
         let (fraction_bits, minimum_difference) =
             if width == 32 { (23, -125) } else { (52, -1021) };
-        let first_exponent = self.builder().ins().ushr_imm_u(first, fraction_bits);
-        let second_exponent = self.builder().ins().ushr_imm_u(second, fraction_bits);
-        let difference = self.builder().ins().isub(first_exponent, second_exponent);
-        let non_tiny = self.builder().ins().icmp_imm_s(
+        let first_exponent = self.builder.ins().ushr_imm_u(first, fraction_bits);
+        let second_exponent = self.builder.ins().ushr_imm_u(second, fraction_bits);
+        let difference = self.builder.ins().isub(first_exponent, second_exponent);
+        let non_tiny = self.builder.ins().icmp_imm_s(
             IntCC::SignedGreaterThanOrEqual,
             difference,
             minimum_difference,
         );
-        let safe = self.builder().ins().bor(zero, non_tiny);
-        self.builder().ins().band(nonzero, safe)
+        let safe = self.builder.ins().bor(zero, non_tiny);
+        self.builder.ins().band(nonzero, safe)
     }
 
     /// Eligible scalar division inside the active guest FP segment.
-    fn fp_divide_value(&mut self, first: Value, second: Value) -> Value {
-        self.builder().ins().fdiv(first, second)
+    pub(crate) fn fp_divide_value(&mut self, first: Value, second: Value) -> Value {
+        self.builder.ins().fdiv(first, second)
     }
 
     /// Nonnegative inputs and signed zero; combine with finite/normal guards.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FSQRT--Floating-point-Square-Root--scalar--
-    fn fp_sqrt_domain(&mut self, bits: Value, width: u32) -> Value {
+    pub(crate) fn fp_sqrt_domain(&mut self, bits: Value, width: u32) -> Value {
         let sign_mask = 1u64 << (width - 1);
-        let sign = self.builder().ins().band_imm_u(bits, sign_mask as i64);
-        let positive = self.builder().ins().icmp_imm_s(IntCC::Equal, sign, 0);
-        let magnitude = self
-            .builder()
-            .ins()
-            .band_imm_u(bits, (sign_mask - 1) as i64);
-        let zero = self.builder().ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
-        self.builder().ins().bor(positive, zero)
+        let sign = self.builder.ins().band_imm_u(bits, sign_mask as i64);
+        let positive = self.builder.ins().icmp_imm_s(IntCC::Equal, sign, 0);
+        let magnitude = self.builder.ins().band_imm_u(bits, (sign_mask - 1) as i64);
+        let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
+        self.builder.ins().bor(positive, zero)
     }
 
     /// Arm detects tiny results before rounding. x86 may round a tiny D->S
     /// result up to the minimum normal without UFC, or add IXC when FTZ flushes
     /// an exact tiny result. Keep that narrow input domain on the exact edge.
-    fn fp_demote_domain(&mut self, bits: Value) -> Value {
-        let magnitude = self.builder().ins().band_imm_u(bits, 0x7fff_ffff_ffff_ffff);
-        let normal = self.builder().ins().icmp_imm_u(
+    pub(crate) fn fp_demote_domain(&mut self, bits: Value) -> Value {
+        let magnitude = self.builder.ins().band_imm_u(bits, 0x7fff_ffff_ffff_ffff);
+        let normal = self.builder.ins().icmp_imm_u(
             IntCC::UnsignedGreaterThanOrEqual,
             magnitude,
             (897u64 << 52) as i64,
         );
-        let zero = self.builder().ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
-        self.builder().ins().bor(normal, zero)
+        let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
+        self.builder.ins().bor(normal, zero)
     }
 
     /// Result-only CLIF for the typed unary operations, run inside an eligible
     /// native FP segment. Exception/status policy belongs to the input guards.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVT--Floating-point-Convert-precision--scalar--
-    fn fp_unary_value(&mut self, input: Value, kind: crate::abi::FpUnaryKind) -> Value {
+    pub(crate) fn fp_unary_value(&mut self, input: Value, kind: crate::abi::FpUnaryKind) -> Value {
         use crate::abi::FpUnaryKind;
         use nixe_cpu::decode::a64::fp_simd::FloatConversion;
         match kind {
-            FpUnaryKind::SquareRoot { .. } => self.builder().ins().sqrt(input),
+            FpUnaryKind::SquareRoot { .. } => self.builder.ins().sqrt(input),
             FpUnaryKind::Convert(FloatConversion::SingleToDouble) => {
-                self.builder().ins().fpromote(types::F64, input)
+                self.builder.ins().fpromote(types::F64, input)
             }
             FpUnaryKind::Convert(FloatConversion::DoubleToSingle) => {
-                self.builder().ins().fdemote(types::F32, input)
+                self.builder.ins().fdemote(types::F32, input)
             }
         }
     }
@@ -355,7 +349,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// difference only below exponent-field precision+1 (including the binade
     /// boundary's half-ULP spacing). All other guarded adds remain native.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/Shared-Pseudocode/shared.functions.float.fpadd.FPAdd
-    fn fp_add_status_compatible(
+    pub(crate) fn fp_add_status_compatible(
         &mut self,
         first: Value,
         second: Value,
@@ -365,7 +359,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         abi: crate::abi::HostAbi,
     ) -> Value {
         if abi == crate::abi::HostAbi::Aarch64 {
-            return self.builder().ins().iconst(types::I8, 1);
+            return self.builder.ins().iconst(types::I8, 1);
         }
         let sign_mask = 1u64 << (width - 1);
         let threshold = if width == 32 {
@@ -373,9 +367,9 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         } else {
             54u64 << 52
         };
-        let signs = self.builder().ins().bxor(first, second);
-        let signs = self.builder().ins().band_imm_u(signs, sign_mask as i64);
-        let opposite = self.builder().ins().icmp_imm_s(
+        let signs = self.builder.ins().bxor(first, second);
+        let signs = self.builder.ins().band_imm_u(signs, sign_mask as i64);
+        let opposite = self.builder.ins().icmp_imm_s(
             if matches!(
                 operation,
                 nixe_cpu::decode::a64::fp_simd::FloatAddOperation::Add
@@ -387,34 +381,31 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
             signs,
             0,
         );
-        let first = self
-            .builder()
-            .ins()
-            .band_imm_u(first, (sign_mask - 1) as i64);
+        let first = self.builder.ins().band_imm_u(first, (sign_mask - 1) as i64);
         let second = self
-            .builder()
+            .builder
             .ins()
             .band_imm_u(second, (sign_mask - 1) as i64);
         let small_first =
-            self.builder()
+            self.builder
                 .ins()
                 .icmp_imm_u(IntCC::UnsignedLessThan, first, threshold as i64);
         let small_second =
-            self.builder()
+            self.builder
                 .ins()
                 .icmp_imm_u(IntCC::UnsignedLessThan, second, threshold as i64);
-        let small = self.builder().ins().band(small_first, small_second);
-        let cancellation = self.builder().ins().band(small, opposite);
-        let fz = self.builder().ins().band_imm_u(fpcr, 1 << 24);
-        let fz = self.builder().ins().icmp_imm_s(IntCC::NotEqual, fz, 0);
-        let exact = self.builder().ins().band(cancellation, fz);
-        self.builder().ins().icmp_imm_s(IntCC::Equal, exact, 0)
+        let small = self.builder.ins().band(small_first, small_second);
+        let cancellation = self.builder.ins().band(small, opposite);
+        let fz = self.builder.ins().band_imm_u(fpcr, 1 << 24);
+        let fz = self.builder.ins().icmp_imm_s(IntCC::NotEqual, fz, 0);
+        let exact = self.builder.ins().band(cancellation, fz);
+        self.builder.ins().icmp_imm_s(IntCC::Equal, exact, 0)
     }
 
     /// Native result in an active, eligible guest FP segment. The owner retains
     /// sticky host status until observation or canonical exit.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FADD--Floating-point-Add--scalar--
-    fn float_add_values(
+    pub(crate) fn float_add_values(
         &mut self,
         first: Value,
         second: Value,
@@ -422,15 +413,15 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     ) -> Value {
         use nixe_cpu::decode::a64::fp_simd::FloatAddOperation;
         match operation {
-            FloatAddOperation::Add => self.builder().ins().fadd(first, second),
-            FloatAddOperation::Subtract => self.builder().ins().fsub(first, second),
+            FloatAddOperation::Add => self.builder.ins().fadd(first, second),
+            FloatAddOperation::Subtract => self.builder.ins().fsub(first, second),
         }
     }
     /// AArch64's FRINTN/P/M/Z do not set IXC. Call only on finite normal/zero
     /// inputs under the shared GuardedExact policy; x86 CLIF rounding may leak
     /// precision status and must not use this path.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FRINTN--Floating-point-Round-to-Integral--to-nearest-with-ties-to-even--scalar--
-    fn native_scalar_round(
+    pub(crate) fn native_scalar_round(
         &mut self,
         bits: Value,
         width: u32,
@@ -438,29 +429,29 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     ) -> Value {
         use nixe_cpu::decode::a64::fp_simd::FloatRoundOperation;
         let ty = if width == 32 { types::F32 } else { types::F64 };
-        let value = self.builder().ins().bitcast(ty, bitcast_flags(), bits);
+        let value = self.builder.ins().bitcast(ty, bitcast_flags(), bits);
         let result = match operation {
-            FloatRoundOperation::NearestEven => self.builder().ins().nearest(value),
-            FloatRoundOperation::TowardPositive => self.builder().ins().ceil(value),
-            FloatRoundOperation::TowardNegative => self.builder().ins().floor(value),
-            FloatRoundOperation::TowardZero => self.builder().ins().trunc(value),
+            FloatRoundOperation::NearestEven => self.builder.ins().nearest(value),
+            FloatRoundOperation::TowardPositive => self.builder.ins().ceil(value),
+            FloatRoundOperation::TowardNegative => self.builder.ins().floor(value),
+            FloatRoundOperation::TowardZero => self.builder.ins().trunc(value),
             FloatRoundOperation::NearestAway
             | FloatRoundOperation::Exact
             | FloatRoundOperation::CurrentMode => unreachable!("exact-only rounding"),
         };
         let integer_ty = if width == 32 { types::I32 } else { types::I64 };
         let result = self
-            .builder()
+            .builder
             .ins()
             .bitcast(integer_ty, bitcast_flags(), result);
-        let result = self.builder().ins().uextend(types::I128, result);
+        let result = self.builder.ins().uextend(types::I128, result);
         self.vector_as(result, types::I8X16)
     }
 
-    fn scalar_fp_bits(&mut self, register: u8, width: u32) -> Result<Value, Error> {
+    pub(crate) fn scalar_fp_bits(&mut self, register: u8, width: u32) -> Result<Value, Error> {
         let value = self.read_vector_as(register, types::I128)?;
         Ok(self
-            .builder()
+            .builder
             .ins()
             .ireduce(if width == 32 { types::I32 } else { types::I64 }, value))
     }
@@ -468,53 +459,54 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// True for zero and finite normal values. NaNs, infinities and denormal
     /// inputs use the exact edge because their payload/status contracts differ
     /// between Arm and the host FP ISA.
-    fn fp_finite_or_zero(&mut self, bits: Value, width: u32) -> Value {
+    pub(crate) fn fp_finite_or_zero(&mut self, bits: Value, width: u32) -> Value {
         let (exponent_mask, magnitude_mask) = if width == 32 {
             (0x7f80_0000_u64, 0x7fff_ffff_u64)
         } else {
             (0x7ff0_0000_0000_0000, 0x7fff_ffff_ffff_ffff)
         };
-        let exponent = self.builder().ins().band_imm_u(bits, exponent_mask as i64);
-        let exponent_nonzero = self
-            .builder()
-            .ins()
-            .icmp_imm_s(IntCC::NotEqual, exponent, 0);
+        let exponent = self.builder.ins().band_imm_u(bits, exponent_mask as i64);
+        let exponent_nonzero = self.builder.ins().icmp_imm_s(IntCC::NotEqual, exponent, 0);
         let exponent_finite =
-            self.builder()
+            self.builder
                 .ins()
                 .icmp_imm_s(IntCC::NotEqual, exponent, exponent_mask as i64);
-        let normal = self.builder().ins().band(exponent_nonzero, exponent_finite);
-        let magnitude = self.builder().ins().band_imm_u(bits, magnitude_mask as i64);
-        let zero = self.builder().ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
-        self.builder().ins().bor(zero, normal)
+        let normal = self.builder.ins().band(exponent_nonzero, exponent_finite);
+        let magnitude = self.builder.ins().band_imm_u(bits, magnitude_mask as i64);
+        let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
+        self.builder.ins().bor(zero, normal)
     }
 
-    fn fp_vector_nonfinite_or_subnormal_lanes(&mut self, value: Value, lane_bits: u32) -> Value {
+    pub(crate) fn fp_vector_nonfinite_or_subnormal_lanes(
+        &mut self,
+        value: Value,
+        lane_bits: u32,
+    ) -> Value {
         let (exponent_mask, fraction_mask) = if lane_bits == 32 {
             (0x7f80_0000_u64, 0x007f_ffff_u64)
         } else {
             (0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff)
         };
-        let ty = self.builder().func.dfg.value_type(value);
+        let ty = self.builder.func.dfg.value_type(value);
         let exponent_mask = self.fp_vector_lane_constant(ty, lane_bits, exponent_mask);
         let fraction_mask = self.fp_vector_lane_constant(ty, lane_bits, fraction_mask);
         let zero = self.fp_vector_lane_constant(ty, lane_bits, 0);
-        let exponent = self.builder().ins().band(value, exponent_mask);
-        let fraction = self.builder().ins().band(value, fraction_mask);
-        let exponent_zero = self.builder().ins().icmp(IntCC::Equal, exponent, zero);
+        let exponent = self.builder.ins().band(value, exponent_mask);
+        let fraction = self.builder.ins().band(value, fraction_mask);
+        let exponent_zero = self.builder.ins().icmp(IntCC::Equal, exponent, zero);
         let exponent_ones = self
-            .builder()
+            .builder
             .ins()
             .icmp(IntCC::Equal, exponent, exponent_mask);
-        let fraction_nonzero = self.builder().ins().icmp(IntCC::NotEqual, fraction, zero);
-        let subnormal = self.builder().ins().band(exponent_zero, fraction_nonzero);
-        self.builder().ins().bor(exponent_ones, subnormal)
+        let fraction_nonzero = self.builder.ins().icmp(IntCC::NotEqual, fraction, zero);
+        let subnormal = self.builder.ins().band(exponent_zero, fraction_nonzero);
+        self.builder.ins().bor(exponent_ones, subnormal)
     }
 
     /// Normalize packed FDIV operands without executing FP. CLIF has no F32X2:
     /// use exact 0/1 in its inactive lanes, never 0/0 or poisoned guest bits.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FDIV--vector---Floating-point-Divide--vector--
-    fn fp_vector_divide_operands(
+    pub(crate) fn fp_vector_divide_operands(
         &mut self,
         first: Value,
         second: Value,
@@ -525,7 +517,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         let mut second = self.mask_vector(second, vector_bits);
         if vector_bits == 64 {
             let ones = self.vector_constant(0x3f80_0000_3f80_0000_0000_0000_0000_0000);
-            second = self.builder().ins().bor(second, ones);
+            second = self.builder.ins().bor(second, ones);
         }
         let ty = if lane_bits == 32 {
             types::I32X4
@@ -539,7 +531,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// instructions before activation; keep normal/zero inputs, nonzero
     /// divisors, and on x86 exclude potentially tiny results (Arm tininess/FZ
     /// status differs). Reduce lane predicates once instead of scalarizing.
-    fn fp_vector_divide_domain(
+    pub(crate) fn fp_vector_divide_domain(
         &mut self,
         first: Value,
         second: Value,
@@ -548,39 +540,39 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     ) -> Value {
         let invalid_first = self.fp_vector_nonfinite_or_subnormal_lanes(first, lane_bits);
         let invalid_second = self.fp_vector_nonfinite_or_subnormal_lanes(second, lane_bits);
-        let mut invalid = self.builder().ins().bor(invalid_first, invalid_second);
-        let ty = self.builder().func.dfg.value_type(first);
+        let mut invalid = self.builder.ins().bor(invalid_first, invalid_second);
+        let ty = self.builder.func.dfg.value_type(first);
         let magnitude_mask = (1u64 << (lane_bits - 1)) - 1;
         let magnitude_mask = self.fp_vector_lane_constant(ty, lane_bits, magnitude_mask);
         let zero = self.fp_vector_lane_constant(ty, lane_bits, 0);
-        let second = self.builder().ins().band(second, magnitude_mask);
-        let zero_divisor = self.builder().ins().icmp(IntCC::Equal, second, zero);
-        invalid = self.builder().ins().bor(invalid, zero_divisor);
+        let second = self.builder.ins().band(second, magnitude_mask);
+        let zero_divisor = self.builder.ins().icmp(IntCC::Equal, second, zero);
+        invalid = self.builder.ins().bor(invalid, zero_divisor);
         if abi == crate::abi::HostAbi::X86_64 {
-            let first = self.builder().ins().band(first, magnitude_mask);
-            let first_nonzero = self.builder().ins().icmp(IntCC::NotEqual, first, zero);
+            let first = self.builder.ins().band(first, magnitude_mask);
+            let first_nonzero = self.builder.ins().icmp(IntCC::NotEqual, first, zero);
             let (fraction, minimum) = if lane_bits == 32 {
                 (23, (-125i32) as u32 as u64)
             } else {
                 (52, (-1021i64) as u64)
             };
-            let first_exp = self.builder().ins().ushr_imm_u(first, fraction);
-            let second_exp = self.builder().ins().ushr_imm_u(second, fraction);
-            let difference = self.builder().ins().isub(first_exp, second_exp);
+            let first_exp = self.builder.ins().ushr_imm_u(first, fraction);
+            let second_exp = self.builder.ins().ushr_imm_u(second, fraction);
+            let difference = self.builder.ins().isub(first_exp, second_exp);
             let minimum = self.fp_vector_lane_constant(ty, lane_bits, minimum);
             let tiny = self
-                .builder()
+                .builder
                 .ins()
                 .icmp(IntCC::SignedLessThan, difference, minimum);
-            let tiny = self.builder().ins().band(tiny, first_nonzero);
-            invalid = self.builder().ins().bor(invalid, tiny);
+            let tiny = self.builder.ins().band(tiny, first_nonzero);
+            invalid = self.builder.ins().bor(invalid, tiny);
         }
         let invalid = self.vector_as(invalid, types::I128);
-        self.builder().ins().icmp_imm_s(IntCC::Equal, invalid, 0)
+        self.builder.ins().icmp_imm_s(IntCC::Equal, invalid, 0)
     }
 
     /// One packed divide, with no scalar lane loop or per-lane helper calls.
-    fn fp_vector_divide_value(
+    pub(crate) fn fp_vector_divide_value(
         &mut self,
         first: Value,
         second: Value,
@@ -594,7 +586,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         };
         let first = self.vector_as(first, ty);
         let second = self.vector_as(second, ty);
-        let result = self.builder().ins().fdiv(first, second);
+        let result = self.builder.ins().fdiv(first, second);
         let result = self.vector_as(result, types::I8X16);
         self.mask_vector(result, vector_bits)
     }
@@ -603,7 +595,7 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     /// Inactive numerator lanes are zero; the guarded finite multiplier makes
     /// their products exact zeros, whose sign is cleared by the output mask.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMUL--by-element---Floating-point-Multiply--by-element--
-    fn fp_vector_multiply_element_operands(
+    pub(crate) fn fp_vector_multiply_element_operands(
         &mut self,
         first: Value,
         second: Value,
@@ -619,15 +611,15 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         let first = self.mask_vector(first, vector_bits);
         let first = self.vector_as(first, ty);
         let second = self.vector_as(second, ty);
-        let element = self.builder().ins().extractlane(second, lane);
-        let second = self.builder().ins().splat(ty, element);
+        let element = self.builder.ins().extractlane(second, lane);
+        let second = self.builder.ins().splat(ty, element);
         (first, second)
     }
 
     /// Packed scalar-FMUL domain: combine integer lane predicates once. x86
     /// excludes potential tiny products because Arm detects tininess before
     /// rounding and FZ flushing need not raise IXC. Zero products remain native.
-    fn fp_vector_multiply_domain(
+    pub(crate) fn fp_vector_multiply_domain(
         &mut self,
         first: Value,
         second: Value,
@@ -636,40 +628,40 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     ) -> Value {
         let first_bad = self.fp_vector_nonfinite_or_subnormal_lanes(first, lane_bits);
         let second_bad = self.fp_vector_nonfinite_or_subnormal_lanes(second, lane_bits);
-        let mut invalid = self.builder().ins().bor(first_bad, second_bad);
+        let mut invalid = self.builder.ins().bor(first_bad, second_bad);
         if abi == crate::abi::HostAbi::X86_64 {
-            let ty = self.builder().func.dfg.value_type(first);
+            let ty = self.builder.func.dfg.value_type(first);
             let mask = self.fp_vector_lane_constant(ty, lane_bits, (1u64 << (lane_bits - 1)) - 1);
             let zero = self.fp_vector_lane_constant(ty, lane_bits, 0);
-            let first = self.builder().ins().band(first, mask);
-            let second = self.builder().ins().band(second, mask);
-            let first_nonzero = self.builder().ins().icmp(IntCC::NotEqual, first, zero);
-            let second_nonzero = self.builder().ins().icmp(IntCC::NotEqual, second, zero);
-            let nonzero = self.builder().ins().band(first_nonzero, second_nonzero);
+            let first = self.builder.ins().band(first, mask);
+            let second = self.builder.ins().band(second, mask);
+            let first_nonzero = self.builder.ins().icmp(IntCC::NotEqual, first, zero);
+            let second_nonzero = self.builder.ins().icmp(IntCC::NotEqual, second, zero);
+            let nonzero = self.builder.ins().band(first_nonzero, second_nonzero);
             let (fraction, threshold) = if lane_bits == 32 {
                 (23, 128)
             } else {
                 (52, 1024)
             };
-            let first_exp = self.builder().ins().ushr_imm_u(first, fraction);
-            let second_exp = self.builder().ins().ushr_imm_u(second, fraction);
-            let sum = self.builder().ins().iadd(first_exp, second_exp);
+            let first_exp = self.builder.ins().ushr_imm_u(first, fraction);
+            let second_exp = self.builder.ins().ushr_imm_u(second, fraction);
+            let sum = self.builder.ins().iadd(first_exp, second_exp);
             let threshold = self.fp_vector_lane_constant(ty, lane_bits, threshold);
             // Exponent sums are nonnegative and at most 4094. Signed SIMD
             // comparison avoids the unsigned-order adjustment on baseline x86.
             let tiny = self
-                .builder()
+                .builder
                 .ins()
                 .icmp(IntCC::SignedLessThan, sum, threshold);
-            let tiny = self.builder().ins().band(tiny, nonzero);
-            invalid = self.builder().ins().bor(invalid, tiny);
+            let tiny = self.builder.ins().band(tiny, nonzero);
+            invalid = self.builder.ins().bor(invalid, tiny);
         }
         let invalid = self.vector_as(invalid, types::I128);
-        self.builder().ins().icmp_imm_s(IntCC::Equal, invalid, 0)
+        self.builder.ins().icmp_imm_s(IntCC::Equal, invalid, 0)
     }
 
     /// One packed FMUL inside the active native FP segment.
-    fn fp_vector_multiply_value(
+    pub(crate) fn fp_vector_multiply_value(
         &mut self,
         first: Value,
         second: Value,
@@ -683,12 +675,12 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
         };
         let first = self.vector_as(first, ty);
         let second = self.vector_as(second, ty);
-        let result = self.builder().ins().fmul(first, second);
+        let result = self.builder.ins().fmul(first, second);
         let result = self.vector_as(result, types::I8X16);
         self.mask_vector(result, vector_bits)
     }
 
-    fn fp_vector_lane_constant(
+    pub(crate) fn fp_vector_lane_constant(
         &mut self,
         ty: cranelift_codegen::ir::Type,
         lane_bits: u32,
@@ -705,25 +697,24 @@ pub(crate) trait FpLowering<'a>: SimdLowering<'a> {
     // Ordered S/D comparison: input guards exclude NaNs and subnormals, so
     // this path neither consumes rounding control nor produces FP status.
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCMP--Floating-point-Compare--scalar--
-    fn ordered_fp_compare(&mut self, first_bits: Value, second_bits: Value, width: u32) -> Value {
+    pub(crate) fn ordered_fp_compare(
+        &mut self,
+        first_bits: Value,
+        second_bits: Value,
+        width: u32,
+    ) -> Value {
         let ty = if width == 32 { types::F32 } else { types::F64 };
-        let first = self
-            .builder()
-            .ins()
-            .bitcast(ty, bitcast_flags(), first_bits);
-        let second = self
-            .builder()
-            .ins()
-            .bitcast(ty, bitcast_flags(), second_bits);
-        let equal = self.builder().ins().fcmp(FloatCC::Equal, first, second);
-        let less = self.builder().ins().fcmp(FloatCC::LessThan, first, second);
-        let equal_flags = self.builder().ins().iconst(types::I32, 0x6000_0000);
+        let first = self.builder.ins().bitcast(ty, bitcast_flags(), first_bits);
+        let second = self.builder.ins().bitcast(ty, bitcast_flags(), second_bits);
+        let equal = self.builder.ins().fcmp(FloatCC::Equal, first, second);
+        let less = self.builder.ins().fcmp(FloatCC::LessThan, first, second);
+        let equal_flags = self.builder.ins().iconst(types::I32, 0x6000_0000);
         let less_flags = self
-            .builder()
+            .builder
             .ins()
             .iconst(types::I32, 0x8000_0000_u32 as i64);
-        let greater_flags = self.builder().ins().iconst(types::I32, 0x2000_0000);
-        let ordered = self.builder().ins().select(less, less_flags, greater_flags);
-        self.builder().ins().select(equal, equal_flags, ordered)
+        let greater_flags = self.builder.ins().iconst(types::I32, 0x2000_0000);
+        let ordered = self.builder.ins().select(less, less_flags, greater_flags);
+        self.builder.ins().select(equal, equal_flags, ordered)
     }
 }

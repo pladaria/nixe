@@ -30,28 +30,23 @@ fn ordinary_collection_error_requeues_unit_and_releases_collector_ownership() {
 }
 
 #[test]
-fn dispatch_only_maintenance_is_bounded_and_preserves_active_reader_epochs() {
+fn dispatch_collection_is_bounded_and_waits_for_unit_owners() {
     let process = process();
-    publish(&process, &AtomicU64::new(0), &[0], Tier::Lcq);
-    let mut reader = process.register().unwrap();
-    let mut cpu = A64State::default();
-    let mut frame = frame(&mut cpu);
-    let invocation = unsafe { reader.admit(&mut frame, key(0)) }
-        .unwrap()
-        .unwrap();
-    let retired: Vec<_> = (1..=70)
-        .map(|i| {
-            let publication = process.reserve(key(i * 4)).unwrap();
-            process.retire_dispatch(publication).unwrap();
-            publication
-        })
+    let pcs: Vec<_> = (1..=70).map(|i| i * 4).collect();
+    let unit = publish(&process, &AtomicU64::new(0), &pcs, Tier::Lcq);
+    let hold = process.snapshot(unit).unwrap();
+    let retired: Vec<_> = pcs
+        .iter()
+        .map(|pc| process.reserve(key(*pc)).unwrap())
         .collect();
+    process.retire_unit(unit).unwrap();
+    drain(&process);
     assert!(process.try_service_links().unwrap());
     assert_eq!(process.lock().retired_dispatch.len, 70);
     for publication in &retired {
         assert!(process.lock().dispatch.get(publication.slot).is_some());
     }
-    drop(invocation);
+    drop(hold);
     for remaining in [38, 6, 0] {
         assert!(process.try_service_links().unwrap());
         assert_eq!(process.lock().retired_dispatch.len, remaining);
@@ -66,7 +61,7 @@ fn dispatch_only_maintenance_is_bounded_and_preserves_active_reader_epochs() {
         let replacement = process.reserve(publication.key).unwrap();
         assert_ne!(replacement.slot, publication.slot);
         assert_eq!(
-            process.retire_dispatch(publication),
+            process.lock().validate(&publication),
             Err(Error::StalePublication)
         );
     }
@@ -75,20 +70,23 @@ fn dispatch_only_maintenance_is_bounded_and_preserves_active_reader_epochs() {
 }
 
 #[test]
-fn cancelled_compile_claim_leaves_retired_slot_to_ordinary_collector() {
+fn pressure_reclaims_a_cancelled_compile_reservation_before_its_owner_drops() {
     let process = process();
     let mut reader = process.register().unwrap();
     let crate::lifetime::compile::Request::Owner(claim) = reader.claim(key(0)).unwrap() else {
         panic!()
     };
-    let publication = claim.publication().unwrap();
-    process.retire_dispatch(publication).unwrap();
+    process.request(Reason::Eviction).unwrap();
+    let mut transition = process.try_transition().unwrap().unwrap();
+    transition.wait_closed().unwrap();
+    transition.relieve_pressure(0, Tier::Lcq).unwrap();
+    assert!(claim.publication().is_err());
+    assert!(process.lock().dispatch.is_empty());
+    assert_eq!(process.lock().compilers, 1);
     drop(claim);
     assert_eq!(process.lock().compilers, 0);
-    assert_eq!(process.lock().retired_dispatch.len, 1);
-    assert!(process.try_service_links().unwrap());
-    assert_eq!(process.lock().retired_dispatch.len, 0);
-    assert!(process.lock().dispatch.is_empty());
+    transition.batch().unwrap().complete().unwrap();
+    assert!(transition.try_reopen().unwrap());
     assert!(process.try_shutdown().unwrap());
 }
 
@@ -119,7 +117,7 @@ fn repeated_ordinary_maintenance_reuses_dispatch_family_and_unit_storage() {
             assert!(matches!(process.snapshot(old_hcq), Err(Error::StaleUnit)));
             assert!(process.lock().units.families.get(old_family).is_none());
             assert_eq!(
-                process.retire_dispatch(old_publication),
+                process.lock().validate(&old_publication),
                 Err(Error::StalePublication)
             );
         }

@@ -1,6 +1,6 @@
 //! Shared register-only SIMD lowering. Bit/lane operations do not acquire FP ownership.
 
-use crate::{abi::LazyFlags, jit_error::Error, lowering::IntegerLowering};
+use crate::{abi::LazyFlags, frontend::Translator, jit_error::Error};
 use cranelift_codegen::ir::{
     ConstantData, Endianness, InstBuilder, MemFlagsData, Value, condcodes::IntCC,
     immediates::Ieee128, types,
@@ -51,18 +51,10 @@ pub(crate) fn is_register_simd(instruction: Instruction) -> bool {
     )
 }
 
-pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
-    fn read_vector(&mut self, index: u8) -> Result<Value, Error>;
-    fn write_vector(&mut self, index: u8, value: Value) -> Result<(), Error>;
-    /// Whether CLIF shuffle lowers without a backend libcall. The legacy
-    /// module can resolve libcalls; frameless native units cannot.
-    fn use_clif_shuffle(&self) -> bool {
-        true
-    }
-
+impl Translator<'_> {
     // Arm DDI 0602: scalar bit transfers and Advanced SIMD lane operations.
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions
-    fn emit_register_simd(
+    pub(crate) fn emit_register_simd(
         &mut self,
         instruction: Instruction,
         flags: &LazyFlags<Value>,
@@ -73,11 +65,12 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 let lane_bits = 8_u32 << fields.immediate_5.trailing_zeros();
                 let lane = integer_lane_type(lane_bits)?;
                 let value = self.read_register(fields.rn, false)?;
-                let value = cast_integer(self.builder(), value, lane, false);
+                let value = cast_integer(&mut self.builder, value, lane, false);
                 let vector_ty = vector_type(lane, lane_bits)?;
-                let value = self.builder().ins().splat(vector_ty, value);
+                let value = self.builder.ins().splat(vector_ty, value);
                 let value = self.finish_vector(value, fields.vector_128);
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::DuplicateElement(_) => {
                 let shift = fields.immediate_5.trailing_zeros();
@@ -85,10 +78,11 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 let lane_index = fields.immediate_5 >> (shift + 1);
                 let vector_ty = vector_type(integer_lane_type(lane_bits)?, lane_bits)?;
                 let source = self.read_vector_as(fields.rn, vector_ty)?;
-                let lane = self.builder().ins().extractlane(source, lane_index);
-                let value = self.builder().ins().splat(vector_ty, lane);
+                let lane = self.builder.ins().extractlane(source, lane_index);
+                let value = self.builder.ins().splat(vector_ty, lane);
                 let value = self.finish_vector(value, fields.vector_128);
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::ModifiedImmediate(_) => {
                 let immediate = expand_modified_immediate(
@@ -101,15 +95,16 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 let value = if fields.cmode <= 11 && fields.cmode & 1 != 0 {
                     let previous = self.read_vector(fields.rd)?;
                     if fields.operation_bit {
-                        self.builder().ins().band(previous, immediate)
+                        self.builder.ins().band(previous, immediate)
                     } else {
-                        self.builder().ins().bor(previous, immediate)
+                        self.builder.ins().bor(previous, immediate)
                     }
                 } else {
                     immediate
                 };
                 let value = self.mask_vector(value, if fields.vector_128 { 128 } else { 64 });
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::UnsignedMoveToGeneral(_) => {
                 let shift = fields.immediate_5.trailing_zeros();
@@ -117,14 +112,15 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 let lane_index = fields.immediate_5 >> (shift + 1);
                 let vector_ty = vector_type(integer_lane_type(lane_bits)?, lane_bits)?;
                 let source = self.read_vector_as(fields.rn, vector_ty)?;
-                let value = self.builder().ins().extractlane(source, lane_index);
+                let value = self.builder.ins().extractlane(source, lane_index);
                 let value = if fields.vector_128 {
-                    cast_integer(self.builder(), value, types::I64, false)
+                    cast_integer(&mut self.builder, value, types::I64, false)
                 } else {
-                    let value = cast_integer(self.builder(), value, types::I32, false);
-                    self.builder().ins().uextend(types::I64, value)
+                    let value = cast_integer(&mut self.builder, value, types::I32, false);
+                    self.builder.ins().uextend(types::I64, value)
                 };
-                self.write_register(fields.rd, value)
+                self.write_register(fields.rd, value);
+                Ok(())
             }
             Instruction::InsertElement(_) | Instruction::InsertGeneral(_) => {
                 let shift = fields.immediate_5.trailing_zeros();
@@ -136,17 +132,18 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 let value = if matches!(instruction, Instruction::InsertElement(_)) {
                     let source_lane = fields.immediate_4 >> shift;
                     let source = self.read_vector_as(fields.rn, vector_ty)?;
-                    self.builder().ins().extractlane(source, source_lane)
+                    self.builder.ins().extractlane(source, source_lane)
                 } else {
                     let source = self.read_register(fields.rn, false)?;
-                    cast_integer(self.builder(), source, lane, false)
+                    cast_integer(&mut self.builder, source, lane, false)
                 };
                 let value = self
-                    .builder()
+                    .builder
                     .ins()
                     .insertlane(previous, value, destination_lane);
                 let value = self.vector_as(value, types::I8X16);
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::MoveToGeneral(_) => self.emit_move_to_general(fields),
             Instruction::MoveFromGeneral(_) => self.emit_move_from_general(fields),
@@ -154,7 +151,8 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 let width = scalar_width(fields.opc)?;
                 let value = self.read_vector(fields.rn)?;
                 let value = self.mask_vector(value, width);
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::ScalarAbsolute(_) | Instruction::ScalarNegate(_) => {
                 let width = scalar_width(fields.opc)?;
@@ -162,12 +160,13 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 let source = self.mask_vector(source, width);
                 let sign = self.vector_constant(1_u128 << (width - 1));
                 let value = if matches!(instruction, Instruction::ScalarNegate(_)) {
-                    self.builder().ins().bxor(source, sign)
+                    self.builder.ins().bxor(source, sign)
                 } else {
-                    let sign = self.builder().ins().bnot(sign);
-                    self.builder().ins().band(source, sign)
+                    let sign = self.builder.ins().bnot(sign);
+                    self.builder.ins().band(source, sign)
                 };
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::VectorFloatAbsolute(_) | Instruction::VectorFloatNegate(_) => {
                 let lane_bits = if fields.opc & 1 == 0 { 32 } else { 64 };
@@ -180,12 +179,13 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 let source = self.read_vector(fields.rn)?;
                 let source = self.mask_vector(source, vector_bits);
                 let value = if matches!(instruction, Instruction::VectorFloatNegate(_)) {
-                    self.builder().ins().bxor(source, sign)
+                    self.builder.ins().bxor(source, sign)
                 } else {
-                    let sign = self.builder().ins().bnot(sign);
-                    self.builder().ins().band(source, sign)
+                    let sign = self.builder.ins().bnot(sign);
+                    self.builder.ins().band(source, sign)
                 };
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::Integer(_) => self.emit_integer_vector(fields),
             Instruction::Bitwise(_) => self.emit_bitwise(fields),
@@ -210,9 +210,10 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
             }
             Instruction::CountBits(_) => {
                 let source = self.read_vector(fields.rn)?;
-                let value = self.builder().ins().popcnt(source);
+                let value = self.builder.ins().popcnt(source);
                 let value = self.mask_vector(value, if fields.vector_128 { 128 } else { 64 });
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::AddAcrossVector(_) => self.emit_add_across(fields),
             Instruction::ScalarFloatImmediate(_) | Instruction::VectorFloatImmediate(_) => {
@@ -223,23 +224,24 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                     self.emit_condition(Condition::from_encoding(fields.condition), flags);
                 let first = self.read_vector(fields.rn)?;
                 let second = self.read_vector(fields.rm)?;
-                let selected = self.builder().ins().select(predicate, first, second);
+                let selected = self.builder.ins().select(predicate, first, second);
                 let value = self.mask_vector(selected, if fields.opc == 0 { 32 } else { 64 });
-                self.write_vector(fields.rd, value)
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             _ => Err(Error::internal("instruction is not register-only SIMD")),
         }
     }
 
-    fn vector_as(&mut self, value: Value, ty: cranelift_codegen::ir::Type) -> Value {
-        if self.builder().func.dfg.value_type(value) == ty {
+    pub(crate) fn vector_as(&mut self, value: Value, ty: cranelift_codegen::ir::Type) -> Value {
+        if self.builder.func.dfg.value_type(value) == ty {
             value
         } else {
-            self.builder().ins().bitcast(ty, bitcast_flags(), value)
+            self.builder.ins().bitcast(ty, bitcast_flags(), value)
         }
     }
 
-    fn read_vector_as(
+    pub(crate) fn read_vector_as(
         &mut self,
         index: u8,
         ty: cranelift_codegen::ir::Type,
@@ -248,18 +250,18 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         Ok(self.vector_as(value, ty))
     }
 
-    fn vector_constant(&mut self, value: u128) -> Value {
+    pub(crate) fn vector_constant(&mut self, value: u128) -> Value {
         let constant = self
-            .builder()
+            .builder
             .func
             .dfg
             .constants
             .insert(Ieee128::with_bits(value).into());
-        self.builder().ins().vconst(types::I8X16, constant)
+        self.builder.ins().vconst(types::I8X16, constant)
     }
 
-    fn shuffle_bytes(&mut self, first: Value, second: Value, mask: [u8; 16]) -> Value {
-        if !self.use_clif_shuffle() {
+    pub(crate) fn shuffle_bytes(&mut self, first: Value, second: Value, mask: [u8; 16]) -> Value {
+        if !self.use_clif_shuffle {
             // x86 SSE2 has no PSHUFB. Constant lane extraction/insertion keeps
             // this operation native without raising the host requirement to
             // SSSE3 or allowing a backend-created call across the Nixe ABI.
@@ -267,32 +269,32 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
             for (index, source) in mask.into_iter().enumerate() {
                 if source < 32 {
                     let lane = self
-                        .builder()
+                        .builder
                         .ins()
                         .extractlane(if source < 16 { first } else { second }, source % 16);
-                    result = self.builder().ins().insertlane(result, lane, index as u8);
+                    result = self.builder.ins().insertlane(result, lane, index as u8);
                 }
             }
             return result;
         }
         let mask = self
-            .builder()
+            .builder
             .func
             .dfg
             .immediates
             .push(ConstantData::from(mask.as_slice()));
-        self.builder().ins().shuffle(first, second, mask)
+        self.builder.ins().shuffle(first, second, mask)
     }
 
-    fn mask_vector(&mut self, value: Value, bits: u32) -> Value {
+    pub(crate) fn mask_vector(&mut self, value: Value, bits: u32) -> Value {
         if bits == 128 {
             return value;
         }
         let mask = self.vector_constant((1_u128 << bits) - 1);
-        self.builder().ins().band(value, mask)
+        self.builder.ins().band(value, mask)
     }
 
-    fn finish_vector(&mut self, value: Value, full_width: bool) -> Value {
+    pub(crate) fn finish_vector(&mut self, value: Value, full_width: bool) -> Value {
         let value = self.vector_as(value, types::I8X16);
         if full_width {
             value
@@ -301,62 +303,64 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         }
     }
 
-    fn emit_integer_vector(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_integer_vector(&mut self, fields: Operands) -> Result<(), Error> {
         let lane_bits = 8_u32 << fields.opc;
         let vector_ty = vector_type(integer_lane_type(lane_bits)?, lane_bits)?;
         let lhs = self.read_vector_as(fields.rn, vector_ty)?;
         let rhs = self.read_vector_as(fields.rm, vector_ty)?;
         let result = if fields.subtract {
-            self.builder().ins().isub(lhs, rhs)
+            self.builder.ins().isub(lhs, rhs)
         } else {
-            self.builder().ins().iadd(lhs, rhs)
+            self.builder.ins().iadd(lhs, rhs)
         };
         let result = self.finish_vector(result, fields.vector_128);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_bitwise(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_bitwise(&mut self, fields: Operands) -> Result<(), Error> {
         let first = self.read_vector(fields.rn)?;
         let second = self.read_vector(fields.rm)?;
         let result = match fields
             .bitwise_operation
             .expect("normalized SIMD bitwise operation")
         {
-            BitwiseOperation::And => self.builder().ins().band(first, second),
+            BitwiseOperation::And => self.builder.ins().band(first, second),
             BitwiseOperation::BitClear => {
-                let not_second = self.builder().ins().bnot(second);
-                self.builder().ins().band(first, not_second)
+                let not_second = self.builder.ins().bnot(second);
+                self.builder.ins().band(first, not_second)
             }
-            BitwiseOperation::Or => self.builder().ins().bor(first, second),
+            BitwiseOperation::Or => self.builder.ins().bor(first, second),
             BitwiseOperation::OrNot => {
-                let not_second = self.builder().ins().bnot(second);
-                self.builder().ins().bor(first, not_second)
+                let not_second = self.builder.ins().bnot(second);
+                self.builder.ins().bor(first, not_second)
             }
-            BitwiseOperation::ExclusiveOr => self.builder().ins().bxor(first, second),
+            BitwiseOperation::ExclusiveOr => self.builder.ins().bxor(first, second),
             BitwiseOperation::Select => {
                 let destination = self.read_vector(fields.rd)?;
-                self.builder().ins().bitselect(destination, first, second)
+                self.builder.ins().bitselect(destination, first, second)
             }
             BitwiseOperation::InsertIfTrue => {
                 let destination = self.read_vector(fields.rd)?;
-                self.builder().ins().bitselect(second, first, destination)
+                self.builder.ins().bitselect(second, first, destination)
             }
             BitwiseOperation::InsertIfFalse => {
                 let destination = self.read_vector(fields.rd)?;
-                self.builder().ins().bitselect(second, destination, first)
+                self.builder.ins().bitselect(second, destination, first)
             }
         };
         let result = self.mask_vector(result, if fields.vector_128 { 128 } else { 64 });
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_integer_compare(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_integer_compare(&mut self, fields: Operands) -> Result<(), Error> {
         let lane_bits = 8_u32 << fields.opc;
         let lane = integer_lane_type(lane_bits)?;
         let vector_ty = vector_type(lane, lane_bits)?;
         let lhs = self.read_vector_as(fields.rn, vector_ty)?;
-        let zero = self.builder().ins().iconst(lane, 0);
-        let zero = self.builder().ins().splat(vector_ty, zero);
+        let zero = self.builder.ins().iconst(lane, 0);
+        let zero = self.builder.ins().splat(vector_ty, zero);
         let rhs = if fields.compare_with_zero {
             zero
         } else {
@@ -367,8 +371,8 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
             .expect("normalized SIMD comparison");
         let result = match comparison {
             IntegerComparison::NonzeroBitTest => {
-                let bits = self.builder().ins().band(lhs, rhs);
-                self.builder().ins().icmp(IntCC::NotEqual, bits, zero)
+                let bits = self.builder.ins().band(lhs, rhs);
+                self.builder.ins().icmp(IntCC::NotEqual, bits, zero)
             }
             comparison => {
                 let condition = match comparison {
@@ -383,14 +387,15 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                     IntegerComparison::Equal => IntCC::Equal,
                     IntegerComparison::NonzeroBitTest => unreachable!(),
                 };
-                self.builder().ins().icmp(condition, lhs, rhs)
+                self.builder.ins().icmp(condition, lhs, rhs)
             }
         };
         let result = self.finish_vector(result, fields.vector_128);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_integer_pairwise(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_integer_pairwise(&mut self, fields: Operands) -> Result<(), Error> {
         let lane_bits = 8_u32 << fields.opc;
         let lanes = (if fields.vector_128 { 128 } else { 64 }) / lane_bits;
         let lane_bytes = lane_bits / 8;
@@ -420,10 +425,11 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
             .expect("normalized pairwise operation");
         let result = self.select_pairwise_vector(left, right, operation);
         let result = self.finish_vector(result, fields.vector_128);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_integer_min_max(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_integer_min_max(&mut self, fields: Operands) -> Result<(), Error> {
         let lane_bits = 8_u32 << fields.opc;
         let vector_ty = vector_type(integer_lane_type(lane_bits)?, lane_bits)?;
         let lhs = self.read_vector_as(fields.rn, vector_ty)?;
@@ -433,17 +439,18 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
             .expect("normalized min/max operation");
         let result = self.select_pairwise_vector(lhs, rhs, operation);
         let result = self.finish_vector(result, fields.vector_128);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn select_pairwise_vector(
+    pub(crate) fn select_pairwise_vector(
         &mut self,
         lhs: Value,
         rhs: Value,
         operation: PairwiseOperation,
     ) -> Value {
         match operation {
-            PairwiseOperation::Add => self.builder().ins().iadd(lhs, rhs),
+            PairwiseOperation::Add => self.builder.ins().iadd(lhs, rhs),
             operation => {
                 let condition = match operation {
                     PairwiseOperation::SignedMaximum => IntCC::SignedGreaterThanOrEqual,
@@ -452,13 +459,13 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                     PairwiseOperation::UnsignedMinimum => IntCC::UnsignedLessThanOrEqual,
                     PairwiseOperation::Add => unreachable!(),
                 };
-                let mask = self.builder().ins().icmp(condition, lhs, rhs);
-                self.builder().ins().bitselect(mask, lhs, rhs)
+                let mask = self.builder.ins().icmp(condition, lhs, rhs);
+                self.builder.ins().bitselect(mask, lhs, rhs)
             }
         }
     }
 
-    fn emit_permute(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_permute(&mut self, fields: Operands) -> Result<(), Error> {
         let lane_bits = 8_u32 << fields.opc;
         let lane_count = (if fields.vector_128 { 128 } else { 64 }) / lane_bits;
         let lane_bytes = lane_bits / 8;
@@ -501,10 +508,11 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         }
         let result = self.shuffle_bytes(first, second, mask);
         let result = self.finish_vector(result, fields.vector_128);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_vector_extract(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_vector_extract(&mut self, fields: Operands) -> Result<(), Error> {
         let count = if fields.vector_128 { 16 } else { 8 };
         let first = self.read_vector(fields.rn)?;
         let second = self.read_vector(fields.rm)?;
@@ -519,10 +527,15 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         }
         let result = self.shuffle_bytes(first, second, mask);
         let result = self.finish_vector(result, fields.vector_128);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_narrow(&mut self, instruction: Instruction, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_narrow(
+        &mut self,
+        instruction: Instruction,
+        fields: Operands,
+    ) -> Result<(), Error> {
         let (destination_bits, shift) = if matches!(instruction, Instruction::ShiftRightNarrow(_)) {
             let high = u32::from(fields.shift_immediate >> 3);
             let destination = 8_u32 << (31 - high.leading_zeros());
@@ -538,7 +551,7 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         let source_ty = vector_type(integer_lane_type(source_bits)?, source_bits)?;
         let mut source = self.read_vector_as(fields.rn, source_ty)?;
         if shift != 0 {
-            source = self.builder().ins().ushr_imm_u(source, i64::from(shift));
+            source = self.builder.ins().ushr_imm_u(source, i64::from(shift));
         }
         let source = self.vector_as(source, types::I8X16);
         let source_bytes = source_bits / 8;
@@ -562,10 +575,11 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         } else {
             self.mask_vector(packed, 64)
         };
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_immediate_shift(
+    pub(crate) fn emit_immediate_shift(
         &mut self,
         instruction: Instruction,
         fields: Operands,
@@ -590,24 +604,25 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         let vector_ty = vector_type(lane, lane_bits)?;
         let source = self.read_vector_as(fields.rn, vector_ty)?;
         let result = if right && shift == lane_bits && !fields.operation_bit {
-            self.builder()
+            self.builder
                 .ins()
                 .sshr_imm_u(source, i64::from(lane_bits - 1))
         } else if right && shift == lane_bits {
-            let zero = self.builder().ins().iconst(lane, 0);
-            self.builder().ins().splat(vector_ty, zero)
+            let zero = self.builder.ins().iconst(lane, 0);
+            self.builder.ins().splat(vector_ty, zero)
         } else if right && !fields.operation_bit {
-            self.builder().ins().sshr_imm_u(source, i64::from(shift))
+            self.builder.ins().sshr_imm_u(source, i64::from(shift))
         } else if right {
-            self.builder().ins().ushr_imm_u(source, i64::from(shift))
+            self.builder.ins().ushr_imm_u(source, i64::from(shift))
         } else {
-            self.builder().ins().ishl_imm_u(source, i64::from(shift))
+            self.builder.ins().ishl_imm_u(source, i64::from(shift))
         };
         let result = self.finish_vector(result, !scalar && fields.vector_128);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_shift_left_long(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_shift_left_long(&mut self, fields: Operands) -> Result<(), Error> {
         let immediate = u32::from(fields.shift_immediate);
         let high = immediate >> 3;
         let source_bits = 8_u32 << (31 - high.leading_zeros());
@@ -619,31 +634,32 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         let source_ty = vector_type(source_lane, source_bits)?;
         let destination_ty = vector_type(destination_lane, destination_bits)?;
         let source = self.read_vector_as(fields.rn, source_ty)?;
-        let zero = self.builder().ins().iconst(destination_lane, 0);
-        let mut result = self.builder().ins().splat(destination_ty, zero);
+        let zero = self.builder.ins().iconst(destination_lane, 0);
+        let mut result = self.builder.ins().splat(destination_ty, zero);
         let first = if fields.vector_128 { lane_count } else { 0 };
         for index in 0..lane_count {
             let value = self
-                .builder()
+                .builder
                 .ins()
                 .extractlane(source, (first + index) as u8);
             let value = if fields.operation_bit {
-                self.builder().ins().uextend(destination_lane, value)
+                self.builder.ins().uextend(destination_lane, value)
             } else {
-                self.builder().ins().sextend(destination_lane, value)
+                self.builder.ins().sextend(destination_lane, value)
             };
             let value = if shift == 0 {
                 value
             } else {
-                self.builder().ins().ishl_imm_u(value, i64::from(shift))
+                self.builder.ins().ishl_imm_u(value, i64::from(shift))
             };
-            result = self.builder().ins().insertlane(result, value, index as u8);
+            result = self.builder.ins().insertlane(result, value, index as u8);
         }
         let result = self.vector_as(result, types::I8X16);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_register_shift(
+    pub(crate) fn emit_register_shift(
         &mut self,
         instruction: Instruction,
         fields: Operands,
@@ -653,28 +669,28 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         let vector_ty = vector_type(lane, lane_bits)?;
         let values = self.read_vector_as(fields.rn, vector_ty)?;
         let mut distance = self.read_vector_as(fields.rm, vector_ty)?;
-        let zero = self.builder().ins().iconst(lane, 0);
-        let zero = self.builder().ins().splat(vector_ty, zero);
+        let zero = self.builder.ins().iconst(lane, 0);
+        let zero = self.builder.ins().splat(vector_ty, zero);
         if lane_bits > 8 {
-            let low_byte = self.builder().ins().iconst(lane, 0xff);
-            let low_byte = self.builder().ins().splat(vector_ty, low_byte);
-            distance = self.builder().ins().band(distance, low_byte);
+            let low_byte = self.builder.ins().iconst(lane, 0xff);
+            let low_byte = self.builder.ins().splat(vector_ty, low_byte);
+            distance = self.builder.ins().band(distance, low_byte);
             distance = self
-                .builder()
+                .builder
                 .ins()
                 .ishl_imm_u(distance, i64::from(lane_bits - 8));
             distance = self
-                .builder()
+                .builder
                 .ins()
                 .sshr_imm_u(distance, i64::from(lane_bits - 8));
         }
-        let nonnegative =
-            self.builder()
-                .ins()
-                .icmp(IntCC::SignedGreaterThanOrEqual, distance, zero);
-        let negative = self.builder().ins().ineg(distance);
+        let nonnegative = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedGreaterThanOrEqual, distance, zero);
+        let negative = self.builder.ins().ineg(distance);
         let magnitude = self
-            .builder()
+            .builder
             .ins()
             .bitselect(nonnegative, distance, negative);
         let signed = matches!(instruction, Instruction::VectorSignedShiftRegister(_));
@@ -682,44 +698,42 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
         let mut right = values;
         let mut amount = 1_u32;
         while amount < lane_bits {
-            let bit = self.builder().ins().iconst(lane, i64::from(amount));
-            let bit = self.builder().ins().splat(vector_ty, bit);
-            let selected = self.builder().ins().band(magnitude, bit);
-            let selected = self.builder().ins().icmp(IntCC::NotEqual, selected, zero);
-            let shifted_left = self.builder().ins().ishl_imm_u(left, i64::from(amount));
+            let bit = self.builder.ins().iconst(lane, i64::from(amount));
+            let bit = self.builder.ins().splat(vector_ty, bit);
+            let selected = self.builder.ins().band(magnitude, bit);
+            let selected = self.builder.ins().icmp(IntCC::NotEqual, selected, zero);
+            let shifted_left = self.builder.ins().ishl_imm_u(left, i64::from(amount));
             let shifted_right = if signed {
-                self.builder().ins().sshr_imm_u(right, i64::from(amount))
+                self.builder.ins().sshr_imm_u(right, i64::from(amount))
             } else {
-                self.builder().ins().ushr_imm_u(right, i64::from(amount))
+                self.builder.ins().ushr_imm_u(right, i64::from(amount))
             };
-            left = self.builder().ins().bitselect(selected, shifted_left, left);
-            right = self
-                .builder()
-                .ins()
-                .bitselect(selected, shifted_right, right);
+            left = self.builder.ins().bitselect(selected, shifted_left, left);
+            right = self.builder.ins().bitselect(selected, shifted_right, right);
             amount *= 2;
         }
-        let width = self.builder().ins().iconst(lane, i64::from(lane_bits));
-        let width = self.builder().ins().splat(vector_ty, width);
+        let width = self.builder.ins().iconst(lane, i64::from(lane_bits));
+        let width = self.builder.ins().splat(vector_ty, width);
         let out = self
-            .builder()
+            .builder
             .ins()
             .icmp(IntCC::UnsignedGreaterThanOrEqual, magnitude, width);
         let fill = if signed {
-            self.builder()
+            self.builder
                 .ins()
                 .sshr_imm_u(values, i64::from(lane_bits - 1))
         } else {
             zero
         };
-        left = self.builder().ins().bitselect(out, zero, left);
-        right = self.builder().ins().bitselect(out, fill, right);
-        let result = self.builder().ins().bitselect(nonnegative, left, right);
+        left = self.builder.ins().bitselect(out, zero, left);
+        right = self.builder.ins().bitselect(out, fill, right);
+        let result = self.builder.ins().bitselect(nonnegative, left, right);
         let result = self.finish_vector(result, fields.vector_128);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_add_across(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_add_across(&mut self, fields: Operands) -> Result<(), Error> {
         let lane_bits = 8_u32 << fields.opc;
         let lane_count = (if fields.vector_128 { 128 } else { 64 }) / lane_bits;
         let lane = integer_lane_type(lane_bits)?;
@@ -743,16 +757,17 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
             }
             let paired = self.shuffle_bytes(bytes, bytes, mask);
             let paired = self.vector_as(paired, vector_ty);
-            value = self.builder().ins().iadd(value, paired);
+            value = self.builder.ins().iadd(value, paired);
             distance /= 2;
         }
-        let result = self.builder().ins().extractlane(value, 0);
-        let result = self.builder().ins().uextend(types::I128, result);
+        let result = self.builder.ins().extractlane(value, 0);
+        let result = self.builder.ins().uextend(types::I128, result);
         let result = self.vector_as(result, types::I8X16);
-        self.write_vector(fields.rd, result)
+        self.write_vector(fields.rd, result);
+        Ok(())
     }
 
-    fn emit_float_immediate(
+    pub(crate) fn emit_float_immediate(
         &mut self,
         instruction: Instruction,
         fields: Operands,
@@ -791,53 +806,56 @@ pub(crate) trait SimdLowering<'a>: IntegerLowering<'a> {
                 64
             },
         );
-        self.write_vector(fields.rd, value)
+        self.write_vector(fields.rd, value);
+        Ok(())
     }
 
-    fn emit_move_to_general(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_move_to_general(&mut self, fields: Operands) -> Result<(), Error> {
         let vector = self.read_vector_as(fields.rn, types::I128)?;
         let (width, value) = match (fields.size & 2 != 0, fields.opc) {
-            (false, 0) => (32, self.builder().ins().ireduce(types::I32, vector)),
-            (false, 3) => (32, self.builder().ins().ireduce(types::I16, vector)),
-            (true, 1) => (64, self.builder().ins().ireduce(types::I64, vector)),
+            (false, 0) => (32, self.builder.ins().ireduce(types::I32, vector)),
+            (false, 3) => (32, self.builder.ins().ireduce(types::I16, vector)),
+            (true, 1) => (64, self.builder.ins().ireduce(types::I64, vector)),
             (true, 2) => {
-                let value = self.builder().ins().ushr_imm_u(vector, 64);
-                (64, self.builder().ins().ireduce(types::I64, value))
+                let value = self.builder.ins().ushr_imm_u(vector, 64);
+                (64, self.builder.ins().ireduce(types::I64, value))
             }
             _ => return Err(Error::invalid("invalid FMOV general width")),
         };
-        let value = cast_integer(self.builder(), value, types::I64, false);
+        let value = cast_integer(&mut self.builder, value, types::I64, false);
         let _ = width;
-        self.write_register(fields.rd, value)
+        self.write_register(fields.rd, value);
+        Ok(())
     }
 
-    fn emit_move_from_general(&mut self, fields: Operands) -> Result<(), Error> {
+    pub(crate) fn emit_move_from_general(&mut self, fields: Operands) -> Result<(), Error> {
         let value = self.read_register(fields.rn, false)?;
         let general_64 = fields.size & 2 != 0;
         let value = if general_64 {
             value
         } else {
-            self.builder().ins().ireduce(types::I32, value)
+            self.builder.ins().ireduce(types::I32, value)
         };
-        let value = cast_integer(self.builder(), value, types::I128, false);
+        let value = cast_integer(&mut self.builder, value, types::I128, false);
         let value = match (general_64, fields.opc) {
             (false, 0) => value,
             (false, 3) => {
-                let value = self.builder().ins().ireduce(types::I16, value);
-                self.builder().ins().uextend(types::I128, value)
+                let value = self.builder.ins().ireduce(types::I16, value);
+                self.builder.ins().uextend(types::I128, value)
             }
             (true, 1) => value,
             (true, 2) => {
                 let previous = self.read_vector_as(fields.rd, types::I128)?;
-                let low = self.builder().ins().ireduce(types::I64, previous);
-                let low = self.builder().ins().uextend(types::I128, low);
-                let high = self.builder().ins().ishl_imm_u(value, 64);
-                self.builder().ins().bor(low, high)
+                let low = self.builder.ins().ireduce(types::I64, previous);
+                let low = self.builder.ins().uextend(types::I128, low);
+                let high = self.builder.ins().ishl_imm_u(value, 64);
+                self.builder.ins().bor(low, high)
             }
             _ => return Err(Error::invalid("invalid FMOV general width")),
         };
         let value = self.vector_as(value, types::I8X16);
-        self.write_vector(fields.rd, value)
+        self.write_vector(fields.rd, value);
+        Ok(())
     }
 }
 
