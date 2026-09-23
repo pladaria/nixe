@@ -32,7 +32,7 @@ pub(super) struct Owner<Version = ReachabilityVersion> {
     cell: Arc<Accounted<Cell>>,
     // Accessed only under JIT state. The atomic word is the only part touched
     // after releasing that lock (enqueue, rollback and worker completion).
-    identity: Option<(Option<AdmissionEpoch>, Version)>,
+    identity: Option<Version>,
 }
 
 impl<Version: Copy + Eq> Owner<Version> {
@@ -58,21 +58,11 @@ impl<Version: Copy + Eq> Owner<Version> {
     }
 
     pub(super) fn available(&mut self, version: Version) -> bool {
-        self.available_at(None, version)
-    }
-
-    // Task 7's not-yet-enabled reshape reservations retain their existing
-    // epoch contract. Production seed jobs use exact input versions instead.
-    pub(super) fn available_at(&mut self, epoch: Option<AdmissionEpoch>, version: Version) -> bool {
-        if self.identity != Some((epoch, version)) {
-            // Seed work has no epoch here, so maintenance preserves its live
-            // token. A typed rejection remains version-local for either kind.
-            let rejected = self.identity.is_some_and(|(_, old)| old == version)
-                && self.cell.0.load(Ordering::Acquire) & PHASE_MASK == REJECTED;
-            if !rejected {
-                self.cancel();
-            }
-            self.identity = Some((epoch, version));
+        if self.identity != Some(version) {
+            // Unrelated maintenance preserves live tokens and version-local
+            // rejections. Only a different owner version resets the cell.
+            self.cancel();
+            self.identity = Some(version);
         }
         self.cell.0.load(Ordering::Acquire) == 0
     }
@@ -104,6 +94,10 @@ pub(super) struct Reservation {
 }
 
 impl Reservation {
+    pub(super) fn token(&self) -> u64 {
+        self.word & !PHASE_MASK
+    }
+
     pub(super) fn is_current(&self, phase: u64) -> bool {
         self.word & PHASE_MASK == phase && self.cell.0.load(Ordering::Acquire) == self.word
     }
@@ -199,6 +193,8 @@ impl From<unit::reshape::ReshapeJob> for Job {
 pub(crate) enum Outcome {
     Queued,
     Duplicate,
+    /// A validated process-owned negative covers this exact reshape boundary.
+    Suppressed,
     Deferred,
     Stale,
 }
@@ -415,7 +411,7 @@ impl Lifetime {
 mod work;
 pub(crate) use work::candidate::Frozen;
 pub(super) use work::candidate::Index as CandidateIndex;
-pub(crate) use work::{Demanded, Observation, Work};
+pub(crate) use work::{Demanded, DiscoveryEvidence, Observation, Rejected, Work};
 pub(crate) mod workers;
 
 #[cfg(test)]

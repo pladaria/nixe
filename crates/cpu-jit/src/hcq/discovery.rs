@@ -1,4 +1,4 @@
-//! Deterministic seed discovery. Only Work performs registry reads; graph work
+//! Deterministic seed/reshape discovery. Only Work performs registry reads; graph work
 //! runs on owned LCQ images outside state, with no guest-memory fetches.
 
 use super::*;
@@ -9,6 +9,11 @@ use crate::lifetime::background::{
 use crate::sampling::Successor;
 use std::cmp::Reverse;
 use std::collections::HashSet;
+
+mod rejection;
+pub(crate) use rejection::DiscoveryError;
+pub(in crate::hcq) use rejection::Structural;
+pub(crate) use rejection::StructuralReason;
 
 impl From<Error> for CompileError {
     fn from(error: Error) -> Self {
@@ -21,27 +26,85 @@ impl From<Error> for CompileError {
 }
 
 impl Graph {
-    pub fn discover(work: &Work<'_>) -> Result<Self, CompileError> {
-        let Observation::Seed(snapshot) = work.observation() else {
-            return Err(Error::InvalidInput("HCQ seed discovery received a reshape job").into());
+    pub fn discover<'w, 'p>(work: &'w Work<'p>) -> Result<Self, DiscoveryError<'w, 'p>> {
+        if let Some(anchor) = work.reshape_anchor() {
+            match Self::discover_from(work, anchor) {
+                // A dynamic predecessor or the cap can make its old root
+                // unsuitable. Retry discovery once from the actual observation,
+                // before claims/backend work, not from an invented CFG edge.
+                Err(DiscoveryError::Structural(_)) => {}
+                result => return result,
+            }
+        }
+        Self::discover_from(work, work.observation().root())
+    }
+
+    fn discover_from<'w, 'p>(
+        work: &'w Work<'p>,
+        (root, version): (BlockKey, crate::abi::ReachabilityVersion),
+    ) -> Result<Self, DiscoveryError<'w, 'p>> {
+        let observation = work.observation();
+        let observed = observation.successors();
+        let boundary = match observation {
+            Observation::Seed(_) => None,
+            Observation::Reshape { snapshot, .. } => Some(snapshot.key),
         };
-        let mut pending = Worklist::new(snapshot.key);
-        let mut builder = Builder::new(snapshot.key);
+        let mut pending = Worklist::new(root);
+        let mut builder = Builder::new(root);
+        if let Some(boundary) = boundary {
+            let source = observation.root().0;
+            builder.leader(source)?;
+            pending.push(source, 1, 0, 0);
+            // The source instruction may have no demand slot of its own; its
+            // words then come from source_block's immutable LCQ image. Neither
+            // endpoint priority nor a leader creates a missing dispatch entry.
+            for endpoint in [boundary.source, boundary.target] {
+                builder.leader(endpoint.block_key())?;
+                pending.push(endpoint.block_key(), 1, 0, 0);
+            }
+        }
         let mut inputs = Vec::new();
+        let mut inspected = boundary.map(|_| Vec::new());
+        let mut blocked = Vec::new();
+        let mut leaders = Vec::new();
+        let mut missing = false;
+        let mut limited = false;
         while let Some(key) = pending.pop() {
-            // At the ceiling, only overlapping demanded entries can still add
-            // identity/leader information without increasing instruction count.
-            if builder.words.len() == MAX_INSTRUCTIONS && !builder.words.contains_key(&key.pc.get())
+            // Seeds can skip exterior queries at the ceiling. Reshape must
+            // distinguish a demanded input excluded by the cap from a missing
+            // input, and retain weak evidence even if no word will fit.
+            if boundary.is_none()
+                && builder.words.len() == MAX_INSTRUCTIONS
+                && !builder.words.contains_key(&key.pc.get())
             {
                 continue;
             }
             let Some(input) = work.lcq(key)? else {
+                if boundary.is_some()
+                    && let Some(owner) = work.blocker(key)?
+                {
+                    blocked.push(owner);
+                    continue;
+                }
+                // An undemanded interior label already covered by captured
+                // words adds no unknown input. An exterior miss does.
+                missing |= !builder.words.contains_key(&key.pc.get());
                 continue;
             };
-            if key == snapshot.key && input.version != snapshot.version {
-                return Err(CompileError::Cancelled);
+            if (key == root && input.version != version)
+                || boundary.is_some_and(|boundary| {
+                    key == boundary.target.block_key() && input.version != boundary.target_version
+                })
+            {
+                return Err(CompileError::Cancelled.into());
             }
             let extent = work.extent(&input)?;
+            if let Some(inspected) = &mut inspected {
+                inspected.push(input.inspection(&extent, &mut leaders));
+                if let Some(owner) = extent.blocked {
+                    blocked.push(owner);
+                }
+            }
             if extent.instructions == 0 {
                 continue;
             }
@@ -68,9 +131,11 @@ impl Graph {
             // Samples have no per-successor edge kind. Validate them against the
             // captured seed terminator, not the snapshot's optional last edge:
             // earlier samples may describe calls even after a non-edge sample.
-            let successors: Vec<_> = if key == snapshot.key && complete_image {
-                snapshot
-                    .successors
+            let successors: Vec<_> = if key == observation.root().0
+                && complete_image
+                && boundary.is_none_or(|boundary| boundary.source == last.key)
+            {
+                observed
                     .iter()
                     .flatten()
                     .copied()
@@ -80,7 +145,7 @@ impl Graph {
                 Vec::new()
             };
             for successor in &successors {
-                if snapshot.key.at(successor.target.pc) == Some(successor.target) {
+                if root.at(successor.target.pc) == Some(successor.target) {
                     builder.leader(successor.target)?;
                 }
             }
@@ -91,6 +156,7 @@ impl Graph {
                 builder.leader(target)?;
             }
             let count = select_prefix(&builder, key, words(), MAX_INSTRUCTIONS)?;
+            limited |= count != extent.instructions;
             if count == 0 {
                 continue;
             }
@@ -105,7 +171,7 @@ impl Graph {
             )?;
             for &leader in &extent.leaders {
                 if leader.pc.get().wrapping_sub(key.pc.get()) / 4 < count as u64 {
-                    pending.push(leader, 2, 0, 0);
+                    pending.push(leader, 3, 0, 0);
                 }
             }
             if count == extent.instructions && complete_image {
@@ -120,7 +186,47 @@ impl Graph {
             });
         }
         work.check()?;
-        Self::finish(builder, inputs).map_err(Into::into)
+        let mut graph = Self::finish(builder, inputs)?;
+        if let Some(inspected) = inspected {
+            graph.discovery = Some(work.discovery_evidence(inspected, blocked, leaders, !missing)?);
+        }
+        if let Some(boundary) = boundary {
+            let source = graph
+                .instructions
+                .binary_search_by_key(&boundary.source.block_key().pc.get(), |word| {
+                    word.instruction.key.block_key().pc.get()
+                })
+                .ok()
+                .and_then(|index| graph.instructions.get(index))
+                .filter(|word| word.instruction.key == boundary.source);
+            let Some(source) = source else {
+                return Err(rejection::finish(work, graph, missing, limited));
+            };
+            let key = boundary.source.block_key();
+            let exit = terminal(key, &source.decoded).unwrap_or_else(|| {
+                Exit::Fallthrough(Target::External(
+                    key.at(GuestVirtualAddress::new(key.pc.get().wrapping_add(4)))
+                        .unwrap(),
+                ))
+            });
+            if !permits_sample(&exit, boundary.target.block_key()) {
+                // Calls/returns/runtime boundaries never become region edges,
+                // even if a queued observation names a demanded destination.
+                return Err(rejection::finish(work, graph, missing, limited));
+            }
+            // A mandatory queue item is not proof of root connectivity. Use
+            // the same captured-graph traversal as collision trimming; no live
+            // lookup, extra body or speculative indirect edge is introduced.
+            let blocked = vec![false; graph.instructions.len()];
+            graph = graph.trim(&blocked, &observed, Some(boundary.source))?;
+            if !graph.contains(boundary.source) || !graph.contains(boundary.target) {
+                // Preserve the reason and complete acquired-input ledger,
+                // without passing a disconnected graph into reservations.
+                return Err(rejection::finish(work, graph, missing, limited));
+            }
+            work.check()?;
+        }
+        Ok(graph)
     }
 }
 
@@ -151,20 +257,20 @@ impl Worklist {
     }
 
     fn sample(&mut self, successor: Successor) {
-        self.push(successor.target, 1, successor.count, successor.sequence);
+        self.push(successor.target, 2, successor.count, successor.sequence);
     }
 
     fn successors(&mut self, exit: &Exit) {
         match *exit {
             Exit::Fallthrough(Target::External(key)) | Exit::Jump(Target::External(key)) => {
-                self.push(key, 2, 0, 0)
+                self.push(key, 3, 0, 0)
             }
             Exit::Conditional {
                 fallthrough: Target::External(no),
                 taken: Target::External(yes),
             } => {
-                self.push(no, 3, 0, 0);
-                self.push(yes, 4, 0, 0);
+                self.push(no, 4, 0, 0);
+                self.push(yes, 5, 0, 0);
             }
             _ => {}
         }

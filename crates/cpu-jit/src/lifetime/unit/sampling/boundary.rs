@@ -104,17 +104,23 @@ impl Lifetime {
                 return Ok(());
             }
             if unit.tier == Tier::Hcq || source_family.is_some() || target.family.is_some() {
-                samples.boundary(
-                    BoundaryKey {
-                        source: instruction,
-                        target: InstructionKey::new(key).unwrap(),
-                        source_version: source.payload.reachability(),
-                        target_version: target.payload.reachability(),
-                        source_family,
-                        target_family: target.family,
-                    },
-                    false,
-                ); // Reshape admission starts with its real Task 7 consumer.
+                let boundary = BoundaryKey {
+                    source: instruction,
+                    target: InstructionKey::new(key).unwrap(),
+                    source_version: source.payload.reachability(),
+                    target_version: target.payload.reachability(),
+                    source_family,
+                    target_family: target.family,
+                };
+                let queue = state.background_queue.upgrade();
+                // Carry only verified value identities across admission. Its
+                // capacity/queue/state try-locks must not nest under this guard.
+                drop(state);
+                if let Some(snapshot) = samples.boundary(boundary, queue.is_some())
+                    && let Some(queue) = queue
+                {
+                    self.admit_reshape(&queue, samples, block, snapshot)?;
+                }
                 return Ok(());
             }
         }

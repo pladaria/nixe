@@ -15,6 +15,7 @@ use crate::abi::{
 use crate::executable::{Accounted, Installed, MetadataLease, SEGMENTS, Tier};
 use nixe_cpu::memory::CodePageDependency;
 use nixe_memory::MemoryInvalidationCursor;
+use reshape::negative;
 use std::hash::{BuildHasher, RandomState};
 use std::mem::{size_of, size_of_val};
 use std::num::NonZeroUsize;
@@ -299,9 +300,11 @@ impl UnitRecord {
         &mut self,
         handle: Handle<UnitRecord>,
         pending: &mut Retirements,
+        negatives: &mut negative::Index,
         reason: Reason,
         sequence: MaintenanceSequence,
     ) {
+        negatives.invalidate_unit(self.code.registered_handle().unwrap());
         if self.retirement.is_none() {
             let head = pending.head_mut(self.code.tier);
             self.retirement_next = *head;
@@ -392,8 +395,13 @@ pub(super) struct Units {
     links: links::Links,
     static_sites: links::StaticSites,
     retirements: Retirements,
+    // Retired records reuse retirement_next after leaving the unlink queue.
+    reclaim_head: Option<Handle<UnitRecord>>,
+    reclaim_tail: Option<Handle<UnitRecord>>,
+    reclaim_len: usize,
     families: Registry<Arc<Accounted<Family>>>,
     family_owners: ownership::FamilyOwners,
+    pub(super) negatives: negative::Index,
     ids: CheckedCounter<CodeUnitId>,
     versions: CheckedCounter<CodeVersion>,
     family_ids: CheckedCounter<HcqFamilyId>,
@@ -421,8 +429,12 @@ impl Default for Units {
             links: links::Links::default(),
             static_sites: links::StaticSites::new(0),
             retirements: Retirements::default(),
+            reclaim_head: None,
+            reclaim_tail: None,
+            reclaim_len: 0,
             families: Registry::default(),
             family_owners: ownership::FamilyOwners::new(0),
+            negatives: negative::Index::new(),
             ids: CheckedCounter::default(),
             versions: CheckedCounter::default(),
             family_ids: CheckedCounter::default(),
@@ -444,6 +456,15 @@ impl Default for Units {
     }
 }
 impl Units {
+    /// Weak identity of a currently live membership owner. Retirement revokes
+    /// evidence immediately, before maintenance removes the ownership entries.
+    pub(super) fn active_family_owner(&self, key: InstructionKey) -> Option<UnitHandle> {
+        let family = self.families.get(self.family_owners.get(key)?)?;
+        let handle = family.unit.registered_handle()?;
+        let record = self.records.get(handle.0)?;
+        (record.lifecycle == Lifecycle::Published && record.retirement.is_none()).then_some(handle)
+    }
+
     pub(super) fn instruction_available(
         &self,
         key: InstructionKey,
@@ -487,6 +508,21 @@ impl Units {
             })
     }
 
+    /// Borrow a previously inspected baseline without adding a compiler pin.
+    pub(super) fn inspected_lcq(
+        &self,
+        owner: UnitEntry,
+        key: BlockKey,
+        entry: PublishedEntry,
+        captured: UnitHandle,
+    ) -> Option<&InstructionImage> {
+        if owner.unit != captured {
+            return None;
+        }
+        self.lcq_record(owner, key, entry)
+            .map(|record| &record.code.instructions)
+    }
+
     fn lcq_record(
         &self,
         owner: UnitEntry,
@@ -505,6 +541,20 @@ impl Units {
                 .get(owner.index)
                 .is_some_and(|root| root.key == key))
         .then_some(record)
+    }
+
+    pub(super) fn pin_inspected_lcq(
+        &self,
+        owner: UnitEntry,
+        key: BlockKey,
+        entry: PublishedEntry,
+        captured: UnitHandle,
+    ) -> Option<Snapshot> {
+        if owner.unit != captured {
+            return None;
+        }
+        self.lcq_record(owner, key, entry)
+            .map(|record| Snapshot::retain(&record.code))
     }
 
     pub(super) fn seed_source(
@@ -568,11 +618,41 @@ impl Units {
         record.invalidation = None;
     }
 
+    fn enqueue_reclaim(&mut self, handle: Handle<UnitRecord>) {
+        let record = self.records.get(handle).unwrap();
+        debug_assert!(matches!(record.lifecycle, Lifecycle::Retired(_)));
+        debug_assert!(record.retirement.is_none() && record.retirement_next.is_none());
+        if let Some(tail) = self.reclaim_tail {
+            self.records.get_mut(tail).unwrap().retirement_next = Some(handle);
+        } else {
+            self.reclaim_head = Some(handle);
+        }
+        self.reclaim_tail = Some(handle);
+        self.reclaim_len += 1;
+    }
+
+    fn pop_reclaim(&mut self) -> Option<Handle<UnitRecord>> {
+        let head = self.reclaim_head?;
+        self.reclaim_head = self.records.get_mut(head).unwrap().retirement_next.take();
+        if self.reclaim_head.is_none() {
+            self.reclaim_tail = None;
+        }
+        self.reclaim_len -= 1;
+        Some(head)
+    }
+
     pub(super) fn mark_shutdown(&mut self, sequence: MaintenanceSequence) {
+        self.negatives.invalidate_all();
         for (handle, record) in self.records.iter_mut() {
             if !matches!(record.lifecycle, Lifecycle::Retired(_)) {
                 record.lifecycle = Lifecycle::Invalidating;
-                record.queue_retirement(handle, &mut self.retirements, Reason::Shutdown, sequence);
+                record.queue_retirement(
+                    handle,
+                    &mut self.retirements,
+                    &mut self.negatives,
+                    Reason::Shutdown,
+                    sequence,
+                );
             }
         }
     }
@@ -965,15 +1045,23 @@ impl Lifetime {
         let static_sites = input.source_sites();
         let bytes = size_of_val(&*static_sites);
         let static_sites = self.cache.account(static_sites, bytes, input.tier)?;
+        let ownership_count = if let Some(candidate) = candidate {
+            let state = self.lock();
+            candidate.validate_locked(&state)?;
+            state
+                .units
+                .family_owners
+                .additional(input.instructions.iter().copied())
+        } else if input.tier == Tier::Hcq {
+            input.instructions.len()
+        } else {
+            0
+        };
         self.grow_units(
             input.tier,
             input.dependencies.len(),
             static_sites.len(),
-            if input.tier == Tier::Hcq {
-                input.instructions.len()
-            } else {
-                0
-            },
+            ownership_count,
         )?;
         self.reserve_publication_links(input.tier, static_sites.len(), &input.entries)?;
         let publications = publications.to_vec().into_boxed_slice();
@@ -1017,11 +1105,12 @@ impl Lifetime {
                 return Err(error);
             }
             if input.tier == Tier::Hcq {
-                // Family discovery/reshape is later work. Initial family
-                // publication already rejects overlap and pins each baseline.
-                if state
-                    .units
-                    .overlaps_family(input.instructions.iter().copied())
+                // Candidate validation permits only its reserved predecessors;
+                // unbound publication still cannot replace any family.
+                if candidate.is_none()
+                    && state
+                        .units
+                        .overlaps_family(input.instructions.iter().copied())
                 {
                     return Err(Error::InvalidUnit(
                         "HCQ overlap requires coordinated family replacement",
@@ -1192,6 +1281,10 @@ impl Lifetime {
         let reshape = (tier == Tier::Hcq)
             .then(|| super::background::Owner::new(&self.cache, Tier::Hcq))
             .transpose()?;
+        let fallbacks = candidate
+            .map(|candidate| candidate.replacement().prepare_payloads(self))
+            .transpose()?
+            .flatten();
         Ok(PreparedUnit {
             process: self,
             candidate,
@@ -1205,6 +1298,7 @@ impl Lifetime {
             payloads: payload_boxes,
             slots: Some(slots),
             static_sites: Some(static_sites),
+            fallbacks,
         })
     }
 
@@ -1450,11 +1544,13 @@ pub(crate) struct PreparedUnit<'a> {
     reshape: Option<super::background::Owner<FamilyVersion>>,
     previous_table: Option<Arc<Accounted<Table>>>,
     table: Option<Arc<Accounted<Table>>>,
-    payloads: Accounted<Box<[Option<OwnedPayload>]>>,
+    payloads: StagedPayloads,
     slots: Option<Accounted<Box<[Handle<DispatchSlot>]>>>,
     static_sites: Option<Accounted<Box<[links::SourceSite]>>>,
+    fallbacks: Option<StagedPayloads>,
 }
 type OwnedPayload = Box<Accounted<DispatchPayload>>;
+type StagedPayloads = Accounted<Box<[Option<OwnedPayload>]>>;
 impl PreparedUnit<'_> {
     pub(crate) fn publish(mut self) -> Result<UnitHandle, Error> {
         loop {
@@ -1500,11 +1596,19 @@ impl PreparedUnit<'_> {
         let candidate = self.candidate.unwrap();
         candidate.check()?;
         let unit = self.unit.as_ref().unwrap();
+        let ownership_count = {
+            let state = self.process.lock();
+            candidate.validate_locked(&state)?;
+            state
+                .units
+                .family_owners
+                .additional(unit.instructions.iter())
+        };
         self.process.grow_units(
             unit.tier,
             unit.dependencies.len(),
             self.static_sites.as_ref().unwrap().len(),
-            unit.instructions.len(),
+            ownership_count,
         )?;
         self.process.reserve_publication_links(
             unit.tier,
@@ -1563,7 +1667,10 @@ impl PreparedUnit<'_> {
             || (self.family.is_some()
                 && state.units.family_owners.entries.capacity()
                     - state.units.family_owners.entries.len()
-                    < unit.instructions.len())
+                    < state
+                        .units
+                        .family_owners
+                        .additional(unit.instructions.iter()))
             || !same_snapshot(&state.units.tables[segment], &self.previous_table)
             || state.units.dependencies.entries.capacity() - state.units.dependencies.entries.len()
                 < unit.dependencies.len()
@@ -1585,7 +1692,7 @@ impl PreparedUnit<'_> {
                 .families
                 .next_handle()
                 .inspect_err(|error| process.publication_failure(&mut state, *error, tier))?;
-            if state.units.overlaps_family(unit.instructions.iter()) {
+            if self.candidate.is_none() && state.units.overlaps_family(unit.instructions.iter()) {
                 return Err(Error::StalePublication);
             }
         }
@@ -1611,16 +1718,19 @@ impl PreparedUnit<'_> {
         let retired = state.execution;
         let result = state.executions.next_id();
         let next_epoch = process.publication_identity(&mut state, result, tier)?;
-        let cutover = if tier == Tier::Lcq
-            && self.publications.iter().any(|publication| {
-                state
-                    .dispatch
-                    .get(publication.slot)
-                    .unwrap()
-                    .snapshot()
-                    .lcq()
-                    .is_some()
-            }) {
+        let predecessors = self.candidate.map(|candidate| candidate.replacement());
+        let replacing = predecessors.is_some_and(|replacement| replacement.has_predecessors());
+        let cutover = if replacing
+            || (tier == Tier::Lcq
+                && self.publications.iter().any(|publication| {
+                    state
+                        .dispatch
+                        .get(publication.slot)
+                        .unwrap()
+                        .snapshot()
+                        .lcq()
+                        .is_some()
+                })) {
             Some(
                 process
                     .request_locked(&mut state, Reason::TierCutover)?
@@ -1684,13 +1794,27 @@ impl PreparedUnit<'_> {
             self.insert_waiting_links(&mut state, source, &unit, sequence);
         }
         if self.family.is_some() {
+            // Retire whole predecessors, withdraw discarded membership and
+            // transfer selected words in place below, under the same guard.
+            // Old native roots stay callable until the TierCutover at Closed.
+            if let Some(candidate) = self.candidate {
+                candidate
+                    .replacement()
+                    .retire(&mut state, cutover, candidate.graph());
+            }
             let family = state
                 .units
                 .families
                 .insert(&mut self.family)
                 .expect("validated family insertion");
             state.units.records.get_mut(handle).unwrap().family = Some(family);
+            let mut previous = None;
             for instruction in unit.instructions.iter() {
+                let page = negative::SelectionPage::of(instruction.key.block_key());
+                if previous != Some(page) {
+                    state.units.negatives.invalidate_selection(page);
+                    previous = Some(page);
+                }
                 state.units.family_owners.publish(instruction.key, family);
             }
         }
@@ -1716,6 +1840,17 @@ impl PreparedUnit<'_> {
             .zip(self.payloads.value.iter_mut())
             .enumerate()
         {
+            state.units.invalidate_entry_negatives(publication.key);
+            if tier == Tier::Lcq {
+                state
+                    .units
+                    .negatives
+                    .invalidate_selection(negative::SelectionPage::of(publication.key));
+            }
+            state
+                .units
+                .negatives
+                .invalidate(negative::Owner::Dispatch(publication.slot));
             let slot = state.dispatch.get_mut(publication.slot).unwrap();
             slot.units += 1;
             let previous = slot.owners;
@@ -1725,7 +1860,8 @@ impl PreparedUnit<'_> {
                 index,
             });
             let old = slot.replace(payload.take().unwrap(), owners);
-            if let Some(sequence) = cutover
+            if tier == Tier::Lcq
+                && let Some(sequence) = cutover
                 && let Some(old) = previous[0]
             {
                 let handle = old.unit.0;
@@ -1735,20 +1871,31 @@ impl PreparedUnit<'_> {
                 record.queue_retirement(
                     handle,
                     &mut units.retirements,
+                    &mut units.negatives,
                     Reason::TierCutover,
                     sequence,
                 );
             }
             *payload = Some(old);
         }
+        if let Some(replacement) = predecessors {
+            replacement.publish_fallbacks(&mut state, self.fallbacks.as_mut());
+        }
         process.changed.notify_all();
         // No publication can fail here. Old payload owners drop only
         // after unlocking state; the unit registry now owns all executable bytes.
+        let removed_negatives = state.units.negatives.take_removed();
         drop(state);
+        drop(removed_negatives);
         if let Some((family, version)) = replacement {
             let seed = unit.entries[0].key;
+            let action = if predecessors.is_some_and(|old| old.has_predecessors()) {
+                "replacement"
+            } else {
+                "promotion"
+            };
             log::debug!(
-                "HCQ promotion: family={} version={} address_space={} seed={:#x} instructions={} entries={} native_bytes={}",
+                "HCQ {action}: family={} version={} address_space={} seed={:#x} instructions={} entries={} native_bytes={}",
                 family.get(),
                 version.get(),
                 seed.address_space.get(),

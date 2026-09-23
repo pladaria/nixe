@@ -182,7 +182,9 @@ fn hcq_discovery_merges_interior_demands_but_cancels_conflicting_captured_words(
         if conflict {
             assert!(matches!(
                 result,
-                Err(crate::lifetime::background::workers::CompileError::Cancelled)
+                Err(crate::hcq::DiscoveryError::Interrupted(
+                    crate::lifetime::background::workers::CompileError::Cancelled
+                ))
             ));
         } else {
             let graph = result.unwrap();

@@ -96,6 +96,8 @@ impl Compiler {
         graph: &Graph,
         version: CodeVersion,
     ) -> Result<stage::Staged, Failure> {
+        #[cfg(test)]
+        tests::add_extra_slots(context);
         let result = (|| {
             for (index, exit) in body.exits.iter().enumerate() {
                 if exit.reason == NativeExitReason::Dispatch {
@@ -120,4 +122,4 @@ impl Compiler {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::hcq) mod tests;

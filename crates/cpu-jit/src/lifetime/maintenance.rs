@@ -42,6 +42,8 @@ impl Lifetime {
                 return Ok(false);
             }
             if state.phase == Phase::Open && state.pending.iter().all(Option::is_none) {
+                drop(state);
+                self.reclaim_retired()?;
                 return Ok(true);
             }
             // Completion and reopening are separate operations. An owner may
@@ -72,6 +74,7 @@ impl Lifetime {
         // transition may reopen admission; new readers cannot enter meanwhile.
         transition.wait_closed()?;
         let finished = transition.drain_links()?;
+        self.reclaim_retired()?;
         let batch = transition.batch()?;
         if batch.reasons().any(|reason| !execution_owned(reason)) {
             return Ok(false);

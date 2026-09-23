@@ -91,7 +91,7 @@ fn pending_units(process: &Lifetime) -> Vec<UnitHandle> {
         units
             .records
             .values()
-            .filter(|r| r.retirement.is_none())
+            .filter(|r| r.retirement.is_none() && !matches!(r.lifecycle, Lifecycle::Retired(_)))
             .all(|r| r.retirement_next.is_none())
     );
     handles

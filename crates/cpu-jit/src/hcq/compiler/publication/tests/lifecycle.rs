@@ -1,7 +1,7 @@
 use super::*;
 use crate::abi::DispatchPayload;
 
-fn payload(reader: &mut Reader, pc: u64) -> Option<DispatchPayload> {
+pub(super) fn payload(reader: &mut Reader, pc: u64) -> Option<DispatchPayload> {
     let mut state = A64State::default();
     let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
     unsafe { reader.admit(&mut frame, key(pc)) }
@@ -10,7 +10,16 @@ fn payload(reader: &mut Reader, pc: u64) -> Option<DispatchPayload> {
 }
 
 fn promote(process: &Lifetime, memory: &ExecutionMemory, reader: &mut Reader) -> UnitHandle {
-    let work = work(process, reader);
+    promote_at(process, memory, reader, 0x1000)
+}
+
+pub(super) fn promote_at(
+    process: &Lifetime,
+    memory: &ExecutionMemory,
+    reader: &mut Reader,
+    pc: u64,
+) -> UnitHandle {
+    let work = work_at(process, reader, pc);
     let frozen = work
         .reserve_candidate(Graph::discover(&work).unwrap())
         .unwrap()
@@ -40,7 +49,7 @@ fn retire(process: &Lifetime, handle: UnitHandle) {
     assert!(transition.try_reopen().unwrap());
 }
 
-fn demand(process: &Lifetime, memory: &ExecutionMemory, reader: &mut Reader, pc: u64) {
+pub(super) fn demand(process: &Lifetime, memory: &ExecutionMemory, reader: &mut Reader, pc: u64) {
     let Request::Owner(claim) = reader.claim(key(pc)).unwrap() else {
         panic!("expected a real LCQ demand")
     };
@@ -56,7 +65,13 @@ fn demand(process: &Lifetime, memory: &ExecutionMemory, reader: &mut Reader, pc:
     process.try_service_links().unwrap();
 }
 
-fn run(process: &Lifetime, memory: &ExecutionMemory, reader: &mut Reader, pc: u64, expected: u64) {
+pub(super) fn run(
+    process: &Lifetime,
+    memory: &ExecutionMemory,
+    reader: &mut Reader,
+    pc: u64,
+    expected: u64,
+) {
     let mut worker = WorkerFaultContext::register().unwrap();
     let mut state = A64State::default();
     state.set_pc(pc);

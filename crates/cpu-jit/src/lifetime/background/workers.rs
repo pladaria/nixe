@@ -1,5 +1,5 @@
-//! Fixed background compiler owners. Startup requires an explicit consumer;
-//! production supplies it in Task 6, never a placeholder that discards jobs.
+//! Fixed background compiler owners. Production supplies the real seed/reshape
+//! consumer; each thread owns its reusable backend scratch.
 
 use super::{Queue, work::Work};
 use crate::jit_error::Error;
@@ -13,7 +13,7 @@ use std::thread::JoinHandle;
 pub(crate) const MAX_INSTRUCTIONS: usize = 2048;
 
 /// Expected abandonment is neither implementation failure nor permanent seed
-/// rejection. Task 6's consumer can propagate lifetime checks with `?`.
+/// rejection. The consumer can propagate lifetime checks with `?`.
 #[derive(Debug)]
 pub(crate) enum CompileError {
     Cancelled,
@@ -140,6 +140,10 @@ impl Workers {
                             Err(CompileError::Failed(error)) => return Err(error),
                         }
                         resources.clear();
+                        // The completed Work has released its predecessor pins.
+                        // Collect already unlinked units without initiating a
+                        // new stop, including when execution has become idle.
+                        process.reclaim_retired().map_err(fail)?;
                     }
                     Ok(())
                 }))

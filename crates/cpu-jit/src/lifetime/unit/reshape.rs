@@ -1,14 +1,19 @@
 //! Existing-owner reshape admission. Family reservations serialize competing
-//! boundaries; candidate membership and replacement remain Task 7 work.
+//! boundaries and supply the token for exact candidate claims across unrelated
+//! maintenance. Publication revalidates those claims under current Open authority.
 
 use super::*;
-use crate::abi::{AdmissionEpoch, BlockKey};
+use crate::abi::{BlockKey, ReachabilityVersion};
 use crate::lifetime::{
     Phase, State,
     background::{Observation, Outcome, Pin, QUEUED, Queue, RUNNING, Reservation},
 };
 use crate::sampling::{FamilyIdentity, ReshapeSnapshot, Samples};
 use std::sync::TryLockError;
+
+pub(in crate::lifetime) mod negative;
+mod replacement;
+pub(in crate::lifetime) use replacement::Replacement;
 
 #[derive(Clone, Copy)]
 struct Participant {
@@ -25,10 +30,12 @@ struct EndpointPin {
 
 pub(crate) struct ReshapeJob {
     process: u64,
-    admission: AdmissionEpoch,
     // The source instruction need not itself have a dispatch slot. Keep the
     // actual logical block that supplied source_version for worker validation.
     source_block: BlockKey,
+    // Keep a useful source-family root across interior observations. Discovery
+    // may fall back to the observation root if this anchor cannot cover the edge.
+    anchor: Option<(BlockKey, ReachabilityVersion)>,
     snapshot: ReshapeSnapshot,
     endpoints: [EndpointPin; 2],
     participants: [Option<Participant>; 2],
@@ -36,6 +43,43 @@ pub(crate) struct ReshapeJob {
 }
 
 impl ReshapeJob {
+    pub(in crate::lifetime) fn anchor(&self) -> Option<(BlockKey, ReachabilityVersion)> {
+        self.anchor
+    }
+    /// Called only after validating this job. Endpoint generations and immutable
+    /// participant ownership must invalidate negatives even outside graph coverage.
+    pub(in crate::lifetime) fn negative_owners(&self, owners: &mut Vec<negative::Owner>) {
+        for endpoint in &self.endpoints {
+            owners.extend([
+                negative::Owner::Unit(endpoint.unit),
+                negative::Owner::Dispatch(endpoint.slot),
+            ]);
+        }
+        owners.extend(
+            self.participants
+                .iter()
+                .flatten()
+                .map(|participant| negative::Owner::Unit(participant.unit)),
+        );
+    }
+
+    /// Caller has validated this job under the same state guard. Retain only
+    /// its deduplicated participants, not a registry scan or copied membership.
+    pub(in crate::lifetime) fn predecessors(&self, state: &State) -> [Option<Snapshot>; 2] {
+        self.participants.map(|participant| {
+            participant.map(|participant| {
+                Snapshot::retain(&state.units.records.get(participant.unit.0).unwrap().code)
+            })
+        })
+    }
+
+    pub(in crate::lifetime) fn token(&self) -> u64 {
+        self.reservations[0]
+            .as_ref()
+            .expect("reshape reserves at least its first owner")
+            .token()
+    }
+
     pub(in crate::lifetime) fn process(&self) -> u64 {
         self.process
     }
@@ -49,7 +93,6 @@ impl ReshapeJob {
 
     pub(in crate::lifetime) fn valid(&self, state: &State, process: u64, phase: u64) -> bool {
         if self.process != process
-            || self.admission != state.admission
             || !self
                 .reservations
                 .iter()
@@ -59,6 +102,15 @@ impl ReshapeJob {
             return false;
         }
         let key = self.snapshot.key;
+        if self.anchor.is_some_and(|(key, version)| {
+            state
+                .keys
+                .get(&key)
+                .and_then(|slot| state.dispatch.get(*slot))
+                .is_none_or(|slot| slot.snapshot().reachability() != version)
+        }) {
+            return false;
+        }
         for (pin, key, version) in [
             (&self.endpoints[0], self.source_block, key.source_version),
             (
@@ -207,6 +259,27 @@ impl Lifetime {
                 return Ok(Err(Outcome::Stale));
             }
         }
+        // Cold, nonblocking admission only. Lifecycle hooks keep the shared
+        // evidence current under this same guard; do not scan inputs here or
+        // allocate a token, pins or a job for an already rejected boundary.
+        if state
+            .units
+            .negatives
+            .get(negative::Key {
+                source: block,
+                boundary: key,
+            })
+            .is_some()
+        {
+            return Ok(Err(Outcome::Suppressed));
+        }
+        let anchor = participant(&state, key.source).and_then(|owner| {
+            let root = state.units.records.get(owner.unit.0).unwrap().code.entries[0].key;
+            (root != block).then(|| {
+                let slot = state.dispatch.get(*state.keys.get(&root).unwrap()).unwrap();
+                (root, slot.snapshot().reachability())
+            })
+        });
         let mut participants = [
             participant(&state, key.source),
             participant(&state, key.target),
@@ -224,7 +297,6 @@ impl Lifetime {
         {
             participants[1] = None;
         }
-        let admission = state.admission;
         let result = state.background_tokens.next();
         let token = self.checked(&mut state, result)?;
         let mut reservations = [None, None];
@@ -232,7 +304,7 @@ impl Lifetime {
             // No family owns either endpoint. Its source dispatch owner
             // serializes reshapes independently of ordinary seed rejection.
             let owner = &mut state.dispatch.get_mut(source_slot).unwrap().reshape;
-            if !owner.available_at(Some(admission), key.source_version) {
+            if !owner.available(key.source_version) {
                 return Ok(Err(Outcome::Deferred));
             }
             reservations[0] = Some(owner.reserve(token).unwrap());
@@ -251,7 +323,7 @@ impl Lifetime {
                     .reshape
                     .as_mut()
                     .unwrap();
-                if !owner.available_at(Some(admission), participant.identity.version) {
+                if !owner.available(participant.identity.version) {
                     return Ok(Err(Outcome::Deferred));
                 }
                 reservations[index] = Some(owner.reserve(token).unwrap());
@@ -264,8 +336,8 @@ impl Lifetime {
         };
         Ok(Ok(ReshapeJob {
             process: self.identity,
-            admission,
             source_block: block,
+            anchor,
             snapshot,
             endpoints: [pin(source_slot, source.unit), pin(target_slot, target.unit)],
             participants,

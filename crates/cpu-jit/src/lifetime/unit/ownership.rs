@@ -1,7 +1,8 @@
 //! Current HCQ instruction ownership under the JIT-state lock. This weak,
 //! generational point index is not a callable root or an in-flight reservation.
-//! Publication preallocates/account-charges storage outside the lock; unlink
-//! removes membership before family or code reclamation can reuse their slots.
+//! Publication preallocates/account-charges storage outside the lock and
+//! transfers replacement membership in place. Unlink removes only matching old
+//! owners before family or code reclamation can reuse their slots.
 
 use super::*;
 
@@ -46,10 +47,28 @@ impl FamilyOwners {
     }
 
     pub fn publish(&mut self, instruction: InstructionKey, family: Owner) {
+        // The publisher has validated either no owner or its exact reserved
+        // predecessor. Update shared words in place: deleting/reinserting them
+        // could leave hash-table tombstones and force growth under JIT state.
+        if let Some(entry) = self
+            .entries
+            .find_mut(self.hash.hash_one(instruction), |entry| {
+                entry.instruction == instruction
+            })
+        {
+            entry.family = family;
+            return;
+        }
         self.insert(Membership {
             instruction,
             family,
         });
+    }
+
+    pub fn additional(&self, instructions: impl Iterator<Item = Instruction>) -> usize {
+        instructions
+            .filter(|word| self.get(word.key).is_none())
+            .count()
     }
 
     pub fn remove(&mut self, instruction: InstructionKey, family: Owner) -> bool {

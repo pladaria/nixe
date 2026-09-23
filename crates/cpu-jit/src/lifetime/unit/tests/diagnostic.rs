@@ -58,6 +58,94 @@ fn hcq_promotion_diagnostic_is_once_per_successful_unit_outside_state() {
     assert_eq!(lines, [expected]); // Neither LCQ nor failed HCQ logged a promotion.
 }
 
+#[test]
+fn hcq_replacement_diagnostic_reports_successor_size_outside_state() {
+    use crate::lifetime::background::{Outcome, Queue};
+    use crate::sampling::{BoundaryKey, FamilyIdentity, Samples};
+
+    logger();
+    let process = process();
+    publish_words(&process, 0, &[0x14000004]); // B 16
+    publish_words(&process, 16, &[0xd65f03c0]); // RET
+    let mut initial = input(&process, &[16], Tier::Hcq);
+    initial.instructions[0].bits = 0xd65f03c0;
+    process
+        .prepare_unit(
+            &[process.reserve(key(16)).unwrap()],
+            initial,
+            &AtomicU64::new(0),
+        )
+        .unwrap()
+        .publish()
+        .unwrap();
+    process.try_service_links().unwrap();
+    let boundary = {
+        let state = process.lock();
+        let source = state
+            .dispatch
+            .get(*state.keys.get(&key(0)).unwrap())
+            .unwrap()
+            .snapshot();
+        let target = state
+            .dispatch
+            .get(*state.keys.get(&key(16)).unwrap())
+            .unwrap()
+            .snapshot();
+        let family = target.hcq().unwrap();
+        BoundaryKey {
+            source: InstructionKey::new(key(0)).unwrap(),
+            target: InstructionKey::new(key(16)).unwrap(),
+            source_version: source.reachability(),
+            target_version: target.reachability(),
+            source_family: None,
+            target_family: Some(FamilyIdentity {
+                id: family.family,
+                version: family.family_version,
+            }),
+        }
+    };
+    let queue = Queue::new(1, &process).unwrap().unwrap();
+    let mut samples = Samples::new();
+    let snapshot = (0..4)
+        .filter_map(|_| samples.boundary(boundary, true))
+        .last()
+        .unwrap();
+    assert_eq!(
+        process
+            .admit_reshape(&queue, &mut samples, key(0), snapshot)
+            .unwrap(),
+        Outcome::Queued
+    );
+    let work = process
+        .accept_background(queue.pop().unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    let frozen = work
+        .reserve_candidate(crate::hcq::Graph::discover(&work).unwrap())
+        .unwrap()
+        .freeze()
+        .unwrap();
+    let mut output = input(&process, &[0, 16], Tier::Hcq);
+    output.instructions = frozen
+        .graph()
+        .instructions
+        .iter()
+        .map(|word| word.instruction)
+        .collect();
+    let cursor = AtomicU64::new(0);
+    let prepared = frozen.prepare(output, &cursor).unwrap();
+    let family = prepared.family.as_ref().unwrap();
+    let expected = format!(
+        "HCQ replacement: family={} version={} address_space=1 seed=0x0 instructions=2 entries=2 native_bytes=16",
+        family.id.get(),
+        family.version.get(),
+    );
+    CAPTURE.set(Some((process.clone(), Vec::new())));
+    prepared.publish().unwrap();
+    let (_, lines) = CAPTURE.take().unwrap();
+    assert_eq!(lines, [expected]);
+}
+
 fn logger() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {

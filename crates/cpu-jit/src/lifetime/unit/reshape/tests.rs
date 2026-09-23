@@ -3,6 +3,27 @@ use crate::lifetime::background::Job;
 use crate::lifetime::unit::tests::{input, key, process, publish};
 use crate::sampling::BoundaryKey;
 
+mod discovery;
+mod freeze;
+mod negative;
+mod publication;
+
+fn assert_suppressed(process: &Lifetime, source: BlockKey, boundary: BoundaryKey) {
+    let queue = Queue::new(1, process).unwrap().unwrap();
+    let mut samples = Samples::new();
+    let snapshot = heat(&mut samples, boundary);
+    let before = process.cache.usage().unwrap();
+    assert_eq!(
+        process
+            .admit_reshape(&queue, &mut samples, source, snapshot)
+            .unwrap(),
+        Outcome::Suppressed
+    );
+    assert!(queue.pop().unwrap().is_none());
+    assert_eq!(process.cache.usage().unwrap().metadata, before.metadata);
+    assert_eq!(process.cache.usage().unwrap().committed, before.committed);
+}
+
 fn instruction(pc: u64) -> InstructionKey {
     InstructionKey::new(key(pc)).unwrap()
 }
@@ -123,7 +144,6 @@ fn fourth_boundary_sample_admits_zero_one_or_two_versioned_families() {
         assert_eq!(job.snapshot, snapshot);
         assert_eq!(job.source_block, crate::lifetime::unit::tests::key(0));
         assert_eq!(job.process, process.identity);
-        assert_eq!(job.admission, process.lock().admission);
         assert_eq!(job.participants.iter().flatten().count(), count);
         assert_eq!(job.reservations.iter().flatten().count(), count.max(1));
         if count == 2 {
@@ -263,7 +283,7 @@ fn queue_fullness_releases_both_family_claims_and_keeps_score_three() {
 }
 
 #[test]
-fn stale_first_or_second_family_cannot_enqueue_or_release_a_new_epoch_claim() {
+fn stale_first_or_second_family_releases_only_its_claim_before_readmission() {
     for retired_index in [0, 1] {
         let process = process();
         for pc in [0, 4] {
@@ -292,13 +312,21 @@ fn stale_first_or_second_family_cannot_enqueue_or_release_a_new_epoch_claim() {
         optimize(&process, &[retired_index as u64 * 4], 1);
         let mut samples = Samples::new();
         let current = heat(&mut samples, boundary(&process, 0, 0, 4));
+        // The surviving participant still holds the old job's exact token.
+        // A maintenance epoch must not reset it to admit overlapping work.
+        assert_eq!(
+            process
+                .admit_reshape(&queue, &mut samples, key(0), current)
+                .unwrap(),
+            Outcome::Deferred
+        );
+        assert_eq!(queue.enqueue(old).unwrap(), Outcome::Stale);
         assert_eq!(
             process
                 .admit_reshape(&queue, &mut samples, key(0), current)
                 .unwrap(),
             Outcome::Queued
         );
-        assert_eq!(queue.enqueue(old).unwrap(), Outcome::Stale);
         assert_eq!(
             process
                 .admit_reshape(&queue, &mut samples, key(0), current)

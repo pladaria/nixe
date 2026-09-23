@@ -4,8 +4,14 @@
 
 use super::*;
 use crate::sampling::ReshapeSnapshot;
+use std::sync::atomic::AtomicBool;
 
 pub(super) mod candidate;
+mod evidence;
+mod negative_result;
+use evidence::Blocked;
+pub(crate) use evidence::DiscoveryEvidence;
+pub(crate) use negative_result::Rejected;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Observation {
@@ -14,6 +20,36 @@ pub(crate) enum Observation {
         source_block: BlockKey,
         snapshot: ReshapeSnapshot,
     },
+}
+
+impl Observation {
+    pub fn root(self) -> (BlockKey, crate::abi::ReachabilityVersion) {
+        match self {
+            Self::Seed(seed) => (seed.key, seed.version),
+            Self::Reshape {
+                source_block,
+                snapshot,
+            } => (source_block, snapshot.key.source_version),
+        }
+    }
+
+    /// Only immutable queued observations, never a live vCPU profile. Reshape
+    /// supplies one observed edge; its count cannot affect relative priority.
+    pub fn successors(self) -> [Option<crate::sampling::Successor>; 4] {
+        match self {
+            Self::Seed(seed) => seed.successors,
+            Self::Reshape { snapshot, .. } => [
+                Some(crate::sampling::Successor {
+                    target: snapshot.key.target.block_key(),
+                    count: 1,
+                    sequence: snapshot.sequence,
+                }),
+                None,
+                None,
+                None,
+            ],
+        }
+    }
 }
 
 pub(crate) struct Demanded {
@@ -27,11 +63,18 @@ pub(crate) struct Demanded {
 pub(crate) struct Extent {
     pub instructions: usize,
     pub leaders: Vec<BlockKey>,
+    pub blocked: Option<Blocked>,
 }
 
 pub(crate) struct Work<'a> {
     process: &'a Lifetime,
     job: Job,
+    // Owns one index slot and its header budget before reshape discovery. Drop
+    // releases the slot under state, then the charge after unlocking.
+    negative_header: Mutex<Option<MetadataLease>>,
+    // Header ownership moves into a prepared result before final validation;
+    // the slot stays reserved until installation succeeds or Work is dropped.
+    negative_reserved: AtomicBool,
 }
 
 impl Lifetime {
@@ -61,16 +104,80 @@ impl Lifetime {
                 .compilers
                 .checked_add(1)
                 .ok_or(Error::Capacity("too many live compiler claims"))?;
-            work = Work { process: self, job };
+            work = Work {
+                process: self,
+                job,
+                negative_header: Mutex::new(None),
+                negative_reserved: AtomicBool::new(false),
+            };
             work.job.valid(&state, self.identity, QUEUED) && work.job.start()
         };
-        Ok(accepted.then_some(work))
+        if !accepted {
+            return Ok(None);
+        }
+        if matches!(work.observation(), Observation::Reshape { .. }) {
+            match work.reserve_negative() {
+                Ok(()) => {}
+                // Pressure/racing maintenance is a deferral, not a worker
+                // failure or a structural rejection of the boundary.
+                Err(Error::Capacity(_) | Error::StalePublication | Error::Shutdown) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Some(work))
     }
 }
 
 impl Work<'_> {
+    fn reserve_negative(&mut self) -> Result<(), Error> {
+        let header = self
+            .process
+            .cache
+            .charge_metadata(size_of::<negative::Record>(), Tier::Hcq)?;
+        let growth = {
+            let mut state = self.process.lock();
+            self.validate(&state)?;
+            let growth = state.units.negatives.reservation_growth()?;
+            if growth.is_none() {
+                state.units.negatives.reserve_record()?;
+                *self.negative_header.get_mut().unwrap() = Some(header);
+                *self.negative_reserved.get_mut() = true;
+                return Ok(());
+            }
+            growth.unwrap()
+        };
+        // Both allocations and destruction of replaced storage stay outside
+        // state. A concurrent grow may make this preparation unnecessary.
+        let mut spare = negative::Storage::prepare(&self.process.cache, growth.0, growth.1)?;
+        let mut state = self.process.lock();
+        self.validate(&state)?;
+        if state.units.negatives.reservation_growth()?.is_some() {
+            state.units.negatives.grow(&mut spare)?;
+        }
+        state.units.negatives.reserve_record()?;
+        *self.negative_header.get_mut().unwrap() = Some(header);
+        *self.negative_reserved.get_mut() = true;
+        Ok(())
+    }
+
     pub fn observation(&self) -> Observation {
         self.job.observation()
+    }
+
+    pub(crate) fn reshape_anchor(&self) -> Option<(BlockKey, ReachabilityVersion)> {
+        match &self.job {
+            Job::Reshape(job) => job.anchor(),
+            Job::Seed(_) => None,
+        }
+    }
+
+    pub(super) fn root_version(&self, key: BlockKey) -> Option<ReachabilityVersion> {
+        [Some(self.observation().root()), self.reshape_anchor()]
+            .into_iter()
+            .flatten()
+            .find_map(|(root, version)| (root == key).then_some(version))
     }
 
     /// A named, already demanded baseline only. Missing/foreign membership is
@@ -80,10 +187,7 @@ impl Work<'_> {
         self.capacity()?;
         let state = self.process.lock();
         self.validate(&state)?;
-        let root = match self.observation() {
-            Observation::Seed(snapshot) => snapshot.key,
-            Observation::Reshape { source_block, .. } => source_block,
-        };
+        let (root, _) = self.observation().root();
         if root.at(key.pc) != Some(key) {
             return Ok(None);
         }
@@ -133,8 +237,12 @@ impl Work<'_> {
         }
         let allowed = self.allowed_families();
         let mut instructions = 0;
+        let mut blocked = None;
         for word in input.unit.instructions.iter() {
             if !state.units.instruction_available(word.key, allowed) {
+                if matches!(self.observation(), Observation::Reshape { .. }) {
+                    blocked = Some(Blocked::capture(&state, word.key)?);
+                }
                 break;
             }
             let key = word.key.block_key();
@@ -151,7 +259,29 @@ impl Work<'_> {
         Ok(Extent {
             instructions,
             leaders,
+            blocked,
         })
+    }
+
+    /// A missing LCQ lookup alone is not stable rejection evidence. A live
+    /// foreign family can independently prove a boundary, even for an interior
+    /// instruction with no dispatch slot. Capture only that cold weak identity.
+    pub fn blocker(&self, key: BlockKey) -> Result<Option<Blocked>, Error> {
+        let state = self.process.lock();
+        self.validate(&state)?;
+        if self.observation().root().0.at(key.pc) != Some(key) {
+            return Ok(None);
+        }
+        let instruction = crate::abi::InstructionKey::new(key)
+            .ok_or(Error::InvalidUnit("unaligned discovery frontier"))?;
+        if state
+            .units
+            .instruction_available(instruction, self.allowed_families())
+        {
+            Ok(None)
+        } else {
+            Blocked::capture(&state, instruction).map(Some)
+        }
     }
 
     fn allowed_families(&self) -> [Option<crate::sampling::FamilyIdentity>; 2] {
@@ -191,6 +321,9 @@ impl Work<'_> {
 impl Drop for Work<'_> {
     fn drop(&mut self) {
         let mut state = self.process.lock();
+        if *self.negative_reserved.get_mut() {
+            state.units.negatives.release_record();
+        }
         state.compilers -= 1;
         self.process.changed.notify_all();
         // Job fields (exact-token cleanup and pins) drop after this mutex guard.

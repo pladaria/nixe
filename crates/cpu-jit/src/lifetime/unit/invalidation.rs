@@ -12,6 +12,7 @@ impl UnitRecord {
         &mut self,
         handle: Handle<UnitRecord>,
         pending: &mut Retirements,
+        negatives: &mut negative::Index,
         sequence: MaintenanceSequence,
     ) {
         if matches!(self.lifecycle, Lifecycle::Unlinked | Lifecycle::Retired(_)) {
@@ -23,7 +24,9 @@ impl UnitRecord {
         // pending until this same record is unlinked.
         self.invalidation.get_or_insert(sequence);
         if self.retirement.is_none() {
-            self.queue_retirement(handle, pending, Reason::MappingChange, sequence);
+            self.queue_retirement(handle, pending, negatives, Reason::MappingChange, sequence);
+        } else {
+            negatives.invalidate_unit(self.code.registered_handle().unwrap());
         }
     }
 }
@@ -67,6 +70,7 @@ impl Lifetime {
                                 .invalidate(
                                     dependency.unit.0,
                                     &mut units.retirements,
+                                    &mut units.negatives,
                                     ticket.sequence,
                                 );
                         }
@@ -88,14 +92,24 @@ impl Lifetime {
                             let pc = u128::from(key.pc.get());
                             key.address_space == address_space && pc < end && start < pc + 4
                         }) {
-                            record.invalidate(handle, &mut units.retirements, ticket.sequence);
+                            record.invalidate(
+                                handle,
+                                &mut units.retirements,
+                                &mut units.negatives,
+                                ticket.sequence,
+                            );
                         }
                     }
                 }
                 MemoryInvalidationKind::InstructionCache { address_space } => {
                     for (handle, record) in units.records.iter_mut() {
                         if record.code.entries[0].key.address_space == address_space {
-                            record.invalidate(handle, &mut units.retirements, ticket.sequence);
+                            record.invalidate(
+                                handle,
+                                &mut units.retirements,
+                                &mut units.negatives,
+                                ticket.sequence,
+                            );
                         }
                     }
                 }
@@ -122,10 +136,18 @@ impl Lifetime {
                     .records
                     .get_mut(handle.0)
                     .ok_or(Error::StaleUnit)?
-                    .invalidate(handle.0, &mut units.retirements, ticket.sequence);
+                    .invalidate(
+                        handle.0,
+                        &mut units.retirements,
+                        &mut units.negatives,
+                        ticket.sequence,
+                    );
                 break;
             }
         }
+        let removed = state.units.negatives.take_removed();
+        drop(state);
+        drop(removed);
         Ok(ticket)
     }
 
@@ -136,9 +158,18 @@ impl Lifetime {
         let mut state = self.lock();
         let ticket = self.request_locked(&mut state, Reason::MappingChange)?;
         let units = &mut state.units;
+        units.negatives.invalidate_all();
         for (handle, record) in units.records.iter_mut() {
-            record.invalidate(handle, &mut units.retirements, ticket.sequence);
+            record.invalidate(
+                handle,
+                &mut units.retirements,
+                &mut units.negatives,
+                ticket.sequence,
+            );
         }
+        let removed = units.negatives.take_removed();
+        drop(state);
+        drop(removed);
         Ok(ticket)
     }
 }

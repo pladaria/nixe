@@ -68,6 +68,8 @@ pub(crate) struct Block {
 }
 
 pub(crate) struct Graph {
+    /// Reshape-only weak inspection ledger, preserved when inputs are trimmed.
+    pub discovery: Option<crate::lifetime::background::DiscoveryEvidence>,
     /// Immutable owners survive registry withdrawal; distinct units held once.
     pub units: Vec<Snapshot>,
     pub inputs: Vec<Input>,
@@ -148,6 +150,7 @@ impl Graph {
         }
         let (instructions, blocks) = builder.finish()?;
         Ok(Self {
+            discovery: None,
             units,
             inputs: demands.into_values().collect(),
             instructions,
@@ -157,7 +160,10 @@ impl Graph {
 }
 
 mod discovery;
+pub(crate) use discovery::DiscoveryError;
+pub(crate) use discovery::StructuralReason;
 pub(crate) mod flow;
+mod trim;
 
 /// All keys are checked against one execution context before address indexing.
 /// BTree order is canonical output order, not the discovery inclusion priority.
