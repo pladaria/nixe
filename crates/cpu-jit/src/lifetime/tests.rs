@@ -402,7 +402,7 @@ fn readers_and_empty_dispatch_churn_reuse_bounded_slots() {
         let reader = process.register().unwrap();
         let publication = process.reserve(key(i * 4)).unwrap();
         process.retire_dispatch(publication).unwrap();
-        assert_eq!(process.collect_dispatch().unwrap(), 1);
+        assert!(process.try_service_links().unwrap());
         drop(reader);
     }
     let state = process.lock();

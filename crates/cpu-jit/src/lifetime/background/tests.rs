@@ -267,7 +267,7 @@ fn cancelled_unqueued_job_pins_the_actual_slot_until_exact_cleanup() {
         slot
     );
     drop(job);
-    assert_eq!(process.collect_dispatch().unwrap(), 1);
+    assert!(process.try_service_links().unwrap());
     assert!(process.lock().dispatch.get(slot).is_none());
     assert_eq!(
         process

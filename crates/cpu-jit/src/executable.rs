@@ -230,6 +230,13 @@ impl Cache {
         Ok(self.lock()?.usage)
     }
 
+    #[cfg(test)]
+    // Pause real cold allocation/destruction without adding runtime hooks.
+    pub(crate) fn with_lock_held<T>(&self, action: impl FnOnce() -> T) -> T {
+        let _guard = self.lock().unwrap();
+        action()
+    }
+
     /// Cold, nonblocking background admission. This is a snapshot, not a byte
     /// reservation; actual allocations still enforce their tier's limits.
     pub(crate) fn try_usage(&self) -> Result<Option<Usage>, Error> {

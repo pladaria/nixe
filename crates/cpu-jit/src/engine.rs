@@ -47,7 +47,14 @@ impl JitProcess {
     /// still retain inputs; pending is not successful teardown.
     pub fn try_shutdown(&self) -> Result<bool, Error> {
         let stopped = self.request_stop();
-        // Even a recorded failure must not skip joining our compiler threads.
+        // A worker may be awaiting a capture/mutation gate owned by an active
+        // invocation or memory producer. Never join while that owner still
+        // needs this caller to return and release it. Closure is already terminal.
+        if !self.lifetime.shutdown_quiescent() {
+            stopped?;
+            return Ok(false);
+        }
+        // Even a recorded failure must not skip joining once owners drain.
         let joined = self.join_background();
         stopped?;
         if !joined? {
@@ -310,4 +317,4 @@ impl JitThread {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -4,6 +4,8 @@ use nixe_cpu::execution::{
     ArchitecturalTimer, CpuExit, CpuFaultKind, TimerSnapshot, VcpuEventState,
 };
 
+mod phases;
+
 struct Timer;
 impl ArchitecturalTimer for Timer {
     fn snapshot(&self) -> TimerSnapshot {

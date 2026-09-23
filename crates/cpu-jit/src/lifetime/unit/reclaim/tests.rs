@@ -3,6 +3,8 @@ use super::*;
 use crate::executable::{HARD_BYTES, SEGMENT_BYTES, SOFT_BYTES};
 use nixe_cpu::state::a64::A64State;
 
+mod ordinary;
+
 fn drain(process: &Lifetime) {
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();

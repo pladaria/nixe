@@ -9,7 +9,7 @@ use nixe_memory::{AddressSpaceId, DirectBackendPolicy, GuestPhysicalPageId};
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
 const PC: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);
 
-mod background;
+pub(crate) mod background;
 mod budget;
 mod capacity;
 mod completion;

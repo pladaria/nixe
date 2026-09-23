@@ -5,6 +5,7 @@
 pub(crate) mod background;
 pub(crate) mod compile;
 mod directory;
+mod dispatch_reclaim;
 mod maintenance;
 mod memory;
 pub(crate) use directory::Fault;
@@ -126,6 +127,7 @@ struct DispatchSlot {
     // Never read by generated code or published as a separate atomic payload.
     owners: [Option<unit::UnitEntry>; 2],
     retired: Option<ExecutionEpoch>,
+    retired_next: Option<Handle<DispatchSlot>>,
     units: usize,
     compile: Option<compile::Identity>,
     optimization: background::Owner,
@@ -162,6 +164,7 @@ impl DispatchSlot {
             payload: AtomicPtr::new(Box::into_raw(payload)),
             owners: [None; 2],
             retired: None,
+            retired_next: None,
             units: 0,
             compile: None,
             optimization,
@@ -313,6 +316,7 @@ struct State {
     // only on error paths; ordinary native/control checks use failure/pending.
     background_failure: Option<crate::jit_error::Error>,
     dispatch: Registry<DispatchSlot>,
+    retired_dispatch: dispatch_reclaim::Queue,
     keys: KeyIndex,
     readers: Registry<pic::Registration>,
     weak_shards: Vec<Handle<pic::Registration>>,
@@ -432,6 +436,7 @@ impl Lifetime {
                 failure: None,
                 background_failure: None,
                 dispatch: Registry::default(),
+                retired_dispatch: dispatch_reclaim::Queue::default(),
                 keys: KeyIndex::with_capacity(0),
                 readers: Registry::default(),
                 weak_shards: Vec::new(),
@@ -696,7 +701,7 @@ impl Lifetime {
         let next = self.checked(&mut state, result)?;
         state.keys.remove(&publication.key);
         let retired = state.execution;
-        state.dispatch.get_mut(publication.slot).unwrap().retired = Some(retired);
+        state.retire_dispatch_slot(publication.slot, retired);
         state.execution = next;
         state
             .units
@@ -708,31 +713,9 @@ impl Lifetime {
         Ok(())
     }
 
-    pub(crate) fn collect_dispatch(&self) -> Result<usize, Error> {
-        let mut count = 0;
-        let mut cursor = 0;
-        loop {
-            let removed = {
-                let mut state = self.lock();
-                state.healthy()?;
-                let Some(handle) = state.dispatch.find_from(&mut cursor, |slot| {
-                    slot.units == 0
-                        && !slot.optimization.pinned()
-                        && !slot.reshape.pinned()
-                        && slot.retired.is_some_and(|epoch| state.quiescent(epoch))
-                }) else {
-                    return Ok(count);
-                };
-                state.dispatch.remove(handle).unwrap()
-            };
-            drop(removed);
-            count += 1;
-        }
-    }
-
     /// The operation registers its exact target records before announcing its
-    /// reason. Until their consumers are implemented, this is only coordination
-    /// and does not pretend to patch code, alter mappings or release storage.
+    /// reason. This requests coordination; the corresponding maintenance owner
+    /// performs the unlink, mapping change or reclamation before acknowledgement.
     pub(crate) fn request(&self, reason: Reason) -> Result<Ticket<'_>, Error> {
         let mut state = self.lock();
         let result = self.request_locked(&mut state, reason);
@@ -782,6 +765,14 @@ impl Lifetime {
         let queue = self.lock().background_queue.upgrade();
         // Queue cleanup releases pins after both locks have been released.
         queue.map_or(Ok(()), |queue| queue.close().map(drop))
+    }
+
+    /// Terminal closure prevents new admission. Joining a compiler before
+    /// existing execution/memory owners drain could wait on the caller itself:
+    /// the compiler may still be capturing instructions through that gate.
+    pub(crate) fn shutdown_quiescent(&self) -> bool {
+        let state = self.lock();
+        state.idle() && state.memory_mutations == 0
     }
 
     /// One cold shutdown pass, with no own invocation or memory lease. False

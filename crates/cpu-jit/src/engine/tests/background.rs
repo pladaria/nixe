@@ -8,6 +8,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod production;
+mod shutdown;
+
+pub(crate) use shutdown::staged_worker_shutdown;
 
 fn process(
     count: usize,
@@ -26,10 +29,14 @@ fn process(
 }
 
 fn enqueue(thread: &mut JitThread, worker: &mut NativeWorker) {
-    assert!(matches!(thread.demand(PC).unwrap(), Demand::Ready));
+    enqueue_at(thread, worker, PC);
+}
+
+fn enqueue_at(thread: &mut JitThread, worker: &mut NativeWorker, pc: GuestVirtualAddress) {
+    assert!(matches!(thread.demand(pc).unwrap(), Demand::Ready));
     thread.process.lifetime.try_service_links().unwrap();
     let mut state = A64State::default();
-    state.set_pc(PC.get());
+    state.set_pc(pc.get());
     thread
         .invoke(
             &mut crate::ReturnStack::default(),
@@ -41,7 +48,7 @@ fn enqueue(thread: &mut JitThread, worker: &mut NativeWorker) {
         .unwrap();
     let observed = thread
         .samples
-        .seed_snapshot(thread.key(PC).unwrap())
+        .seed_snapshot(thread.key(pc).unwrap())
         .unwrap()
         .0;
     let started = Instant::now();
