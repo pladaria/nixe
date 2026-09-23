@@ -368,7 +368,7 @@ next operation that requires new LCQ publication or lifecycle transition.
 Reserve the unit identity before emitting native exits that embed its
 CodeVersion. Publication consumes that identity unchanged; it must not relabel
 state maps after emission. LCQ captures the admission epoch as its speculative
-publication guard. Initial HCQ instead retains exact LCQ input identities and
+publication guard. Initial and reshape HCQ instead retain exact LCQ input identities and
 exclusive instruction claims across unrelated maintenance; it publishes only
 under current Open authority after revalidating those inputs. Abandoned emission
 identities are never reused.
@@ -780,6 +780,8 @@ empty/lowest-score/oldest-sequence/lowest-way replacement rule. Four samples
 copy an immutable ReshapeSnapshot into a queue cell. Queue contention keeps the
 score at three. This table covers HCQ-to-LCQ, HCQ-to-HCQ and a retained-LCQ
 entry into an HCQ-owned instruction; it is the only late-entry/reshape counter.
+Persistent negative reshape results belong to the process-owned index described
+below, not to these evictable per-vCPU heat records.
 
 Sample-sequence overflow has no semantic meaning. At u64::MAX, the owning vCPU
 clears both bounded tables at the same cold poll and restarts its sequence at
@@ -1042,6 +1044,11 @@ Selected public entries are:
 - every included sampled dynamic target; and
 - every explicitly demanded interior entry which caused a reshape.
 
+A reshape also retains predecessor public entries whose instructions remain
+in its candidate. A changing observation must not toggle already-published
+labels on an otherwise unchanged body. This adds no entries for coverage that
+was not previously public and does not retain entries outside the new body.
+
 All other blocks are internal. A final dispatch/link-index sweep freezes real
 external entries before lowering; it does not create dispatch slots for every
 instruction.
@@ -1078,11 +1085,65 @@ Four samples of the same generation-valid boundary request a reshape:
 If a useful candidate containing both endpoints cannot be formed within the
 instruction ceiling, the owners remain separate and the direct link remains.
 This is a valid optimized boundary, not permission for overlapping bodies.
-The BoundaryTable stores a negative result keyed by both owner versions and the
-dependency cursor. It cannot retry the same over-cap or disconnected shape
-until an endpoint ReachabilityVersion, participating family version or code
-dependency changes; it does not rediscover the same rejected graph every four
-samples.
+A process-owned, cache-accounted index stores negative results by full boundary
+identity and logical source BlockKey, with exact generational source/dependency
+evidence and its capture cursor. Workers install results under JIT state after
+revalidating that evidence; they never mutate per-vCPU sample tables. Admission
+consults the index through the existing nonblocking cold path. Suppression
+survives heat-table eviction and observations from other vCPUs. An unchanged
+single-family membership/public-entry set is also a no-op negative; temporary
+claims, unavailable inputs, pressure and stale work are deferrals/cancellations.
+
+A negative hit is a suppressed admission, not a queued job or a busy-owner
+deferral. Check it under current Open authority after identity validation and
+before reserving participants or pinning inputs. Preserve the saturated heat
+so a subsequent sample can retry as soon as relevant evidence is invalidated;
+do not copy persistent rejection state into each vCPU's sample table.
+
+A valid negative is not evicted merely to admit another boundary. Relevant
+endpoint reachability, family version or inspected-source lifecycle/dependency
+changes invalidate it through indexed associations. The capture cursor is not
+an equality check against unrelated global memory activity; history loss
+invalidates the affected evidence. The same unchanged over-cap, disconnected
+or no-op shape is not rediscovered every four samples.
+
+Selection-sensitive cap/disconnection evidence also watches inspected virtual
+code pages, keyed by address space and guest page number, in the same owner-head
+index. LCQ demand publication/removal and HCQ membership publication/removal
+invalidate those associations. This catches new interior leaders or ownership
+cuts without a watch per instruction or another index. A nearby change on the
+same page may conservatively permit retry. Page watches supplement, not replace,
+final selection revalidation and exact code/owner evidence; they add no native
+execution checks.
+
+Backend-limit negatives also depend on the selected public-entry set. Revalidate
+that set at installation and watch static/PIC root changes by page in the same
+association index, including LCQ-only coverage. Keep these entry-page watches
+separate from structural selection watches so root churn does not invalidate
+unrelated cap/disconnection evidence. Existing native PIC hits do not change
+root evidence. Missing discovery inputs or temporary claim trimming cannot
+justify a persistent backend negative; known cap-excluded inputs remain part
+of its validated dependencies. Never mark the seed or whole family rejected
+because a particular reshape exceeded a typed backend limit.
+
+Use expected O(1) boundary lookup and O(1) removal per reverse association;
+bulk invalidation visits affected results and their associations, not the whole
+table or cache. Deduplicate evidence and store weak generational identities,
+not graphs, instruction/state-map copies or strong code pins. Account allocated
+capacity and association storage, reuse slots, and avoid worst-case per-record
+preallocation. Workers prepare charged capacity outside JIT state; insufficient
+capacity defers work rather than silently losing suppression or invalidation
+evidence. Normal source/owner retirement releases associated results. No new
+lookup or generation check is added to native direct links.
+
+For a source already owned by a family, first discover from that family's
+current first public entry, capturing its reachability version alongside the
+logical observation source. Still require both observed endpoints and export
+the logical source entry. If that root cannot form a connected candidate within
+the ceiling, retry once from the logical observation source before reservation
+or compilation. Do not invent a CFG edge from the old root to that source.
+This prevents observation-driven prefix shrink/grow oscillation without
+forbidding a repartition which actually needs a different root.
 
 Thus the first hot root does not permanently partition the graph. Region shape
 can grow, shrink, merge or repartition according to execution, while active
@@ -1140,8 +1201,8 @@ before completing. No pre-IC candidate can publish after that closure/reopen.
 
 Host/device executable-content publication and mapping/permission changes use
 the same coordinator before becoming visible; they do not wait for guest IC.
-For initial HCQ, exact captured LCQ identities, their Published lifecycle and
-instruction claims close the gap between image validation and publication:
+For initial and reshape HCQ, exact captured LCQ identities, their Published
+lifecycle and instruction claims close the gap between image validation and publication:
 the bound memory coordinator invalidates every affected source unit under the
 same JIT-state mutex before its dependency can change. Strong references alone
 are not validity; superseded, invalidating, retired or replaced inputs cancel
@@ -1151,10 +1212,14 @@ not the unrelated global memory cursor. LCQ and unbound synthetic publications
 retain their speculative admission-epoch/cursor guard. No memory lock is nested
 under JIT state and no per-store compiler check is added.
 
-Initial HCQ jobs and exact-token instruction reservations survive unrelated
-Closing/Closed intervals. Completed output waits for Open using the coordinator's
+Initial and reshape HCQ jobs and exact-token instruction reservations survive
+unrelated Closing/Closed intervals. Completed output waits for Open using the coordinator's
 condition variable, without holding a guest lease or execution epoch. Shutdown
-wakes and cancels it. Concurrent directory publication or capacity growth
+wakes and cancels it. Reshape additionally validates both endpoint slot/unit
+identities and reachabilities, participating family generations and exact
+reservation tokens. Its reservation identity does not include an admission
+epoch: affected-source or participant invalidation cancels the job, not an
+unrelated stop. Concurrent directory publication or capacity growth
 rebuilds only the cold publication metadata; do not repeat backend compilation
 or replace the already emitted CodeVersion. Backend output remains in a
 worker-owned nonexecutable staging buffer until it has its final size and
@@ -1305,7 +1370,7 @@ Open admission epoch only after the observed sequence is fully accounted for.
 ### Code and mapping invalidation
 
 Every gateway and speculative LCQ publication must observe the same Open epoch
-before and after resolving its entry/reservation. Initial HCQ validates retained
+before and after resolving its entry/reservation. Initial and reshape HCQ validate retained
 source identities and claims under current Open authority instead. The page indexes return every
 intersecting resident or retired-but-callable CodeUnit. A MappingChange request
 uses this order:
@@ -1331,12 +1396,12 @@ uses this order:
 8. reopen admission with a new Open epoch.
 
 An LCQ compiler or linker which captured an older admission epoch fails
-revalidation and drops only its exact generational handles. An initial HCQ
-worker survives an unrelated stop, but cannot publish while Closed or after
+revalidation and drops only its exact generational handles. An initial or reshape
+HCQ worker survives an unrelated stop, but cannot publish while Closed or after
 any captured source was invalidated. It uses the existing maintenance service
 and never bypasses the coordinator to reopen the process. Mapping changes
-therefore cannot publish code for stale mappings. The provisional reshape-job
-admission remains epoch-bound until Task 7 supplies its real consumer.
+therefore cannot publish code for stale mappings. Reshape also cancels if an
+endpoint or participating family no longer matches its captured identity.
 
 An executable-page write caught by host protection leaves native code before
 the write occurs. The writing vCPU does not wait for its own active epoch: it
@@ -1451,6 +1516,14 @@ incoming native root has been cut, and every compiler, linker and fault
 dispatcher strong reference has been released. Only then are dependency and
 native-PC records detached and the dispatch/unit/family slots and executable
 span reused.
+
+Normal cold link/cutover maintenance and completed worker jobs collect retired
+units below the cache pressure threshold as well. Use an intrusive pending
+queue, reusing the unlinked record's retirement link, with O(1) enqueue/pop and
+bounded passes (32 records). Still-pinned records rotate to the tail. Do not
+scan the live registry on each publication or add checks to native links;
+directory detachment retains both epoch grace periods. Pressure/shutdown may
+perform exhaustive collection and free wholly unused segments.
 
 Shutdown closes admission, wakes workers, prevents publication, drains exact
 queued/reserved states, joins workers without holding JIT locks, forces final
@@ -1658,9 +1731,10 @@ opt_level=speed and backtracking. Calls remain external.
 
 Implement exclusive in-flight InstructionKey batch reservations after discovery
 and before liveness/backend work. Revalidate captured inputs and acquire the
-whole candidate or none under the short JIT-state lock. Until Task 7 adds
-collision trimming, any foreign membership/reservation race defers the whole
-candidate without waiting, immediate retry loops or permanent seed rejection.
+whole candidate or none under the short JIT-state lock. Task 6's initial
+checkpoint defers the whole candidate on a foreign membership/reservation race;
+Task 7 replaces that policy with successor trimming as specified above. Neither
+policy waits, spins in immediate retry loops or permanently rejects the seed.
 Retain exact reservations through publication and release only the build's own
 tokens on abandonment. Revalidate them in the publication transaction.
 
@@ -1686,8 +1760,11 @@ four-sample replacement transaction for zero, one or two adjacent families.
 Keep predecessor versions callable until the maintenance rendezvous has cut
 every incoming root.
 
-Connect production reshape admission once this real replacement consumer is
-available; do not consume and discard reshape requests in the interim.
+Production reshape admission feeds the real replacement consumer in the existing
+fixed worker pool. The cold sampler admits a generation-valid boundary after
+four samples; workers publish either its replacement or a validated negative
+result. Temporary contention, pressure or stale evidence do not become persistent
+negatives. Native direct links retain their existing ABI and hot path.
 
 **Exit criterion:** unrelated workers execute backend compilation in parallel;
 no unrelated candidates begin backend work with the same InstructionKey; a

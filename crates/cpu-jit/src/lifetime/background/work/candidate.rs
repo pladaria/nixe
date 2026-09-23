@@ -1,4 +1,4 @@
-//! Exclusive initial-region claims. Keys carry one unique work token, independent
+//! Exclusive region claims. Keys carry one unique work token, independent
 //! of execution maintenance; no callable pointers or per-instruction owners.
 
 use super::*;
@@ -63,21 +63,78 @@ pub(crate) struct Candidate<'w, 'p> {
     work: &'w Work<'p>,
     graph: Graph,
     token: u64,
+    // Competing claims/ownership shortened the discovered graph. Such a no-op
+    // is not stable evidence for suppressing future discovery.
+    trimmed: bool,
 }
 
 impl<'p> Work<'p> {
     pub fn reserve_candidate(&self, graph: Graph) -> Result<Candidate<'_, 'p>, CompileError> {
         self.capacity()?;
-        // Graph owns the words and baseline snapshots before taking state. No
-        // failure/drop under that lock can release the last charged code owner.
-        let (needed, capacity) = {
+        let discovered = graph.instructions.len();
+        let (graph, needed, capacity) = self.trim_candidate(graph)?;
+        let trimmed = graph.instructions.len() != discovered;
+        if let Observation::Reshape { snapshot, .. } = self.observation()
+            && (!graph.contains(snapshot.key.source) || !graph.contains(snapshot.key.target))
+        {
+            return Err(CompileError::Deferred);
+        }
+        self.reserve_trimmed_candidate(graph, needed, capacity, trimmed)
+    }
+
+    fn trim_candidate(&self, graph: Graph) -> Result<(Graph, usize, usize), CompileError> {
+        let mut blocked = vec![false; graph.instructions.len()];
+        let mut collision = false;
+        let (used, capacity) = {
             let state = self.process.lock();
-            self.validate_graph(&state, &graph)?;
+            self.validate_root(&state, &graph)?;
+            let seed = graph.blocks[0].key;
+            for (word, blocked) in graph.instructions.iter().zip(&mut blocked) {
+                let key = word.instruction.key;
+                *blocked = !state
+                    .units
+                    .instruction_available(key, self.allowed_families())
+                    || state.candidates.get(key).is_some();
+                if *blocked && key.block_key() == seed {
+                    return Err(CompileError::Deferred);
+                }
+                collision |= *blocked;
+            }
+            // A successor promotion can change a now-excluded input's payload.
+            // Validate all remaining inputs after trimming, not the discarded set.
+            if !collision {
+                self.validate_graph(&state, &graph)?;
+            }
             (
-                self.candidate_space(&state, &graph)?,
+                state.candidates.entries.len(),
                 state.candidates.entries.capacity(),
             )
         };
+        let graph = if collision {
+            let observation = self.observation();
+            let source = match observation {
+                Observation::Seed(_) => None,
+                Observation::Reshape { snapshot, .. } => Some(snapshot.key.source),
+            };
+            graph.trim(&blocked, &observation.successors(), source)?
+        } else {
+            graph
+        };
+        let needed = used
+            .checked_add(graph.instructions.len())
+            .ok_or(Error::Capacity("HCQ candidate index overflow"))?;
+        Ok((graph, needed, capacity))
+    }
+
+    fn reserve_trimmed_candidate(
+        &self,
+        graph: Graph,
+        needed: usize,
+        capacity: usize,
+        trimmed: bool,
+    ) -> Result<Candidate<'_, 'p>, CompileError> {
+        // Graph owns the words and baseline snapshots before taking state. No
+        // failure/drop under that lock can release the last charged code owner.
         let mut prepared = if needed > capacity {
             let mut index = Index::new(needed.max(capacity.saturating_mul(2)).max(16));
             index.charge = Some(
@@ -108,10 +165,10 @@ impl<'p> Work<'p> {
                 }
                 std::mem::swap(&mut state.candidates, next);
             }
-            let Job::Seed(job) = &self.job else {
-                return Err(Error::InvalidUnit("initial candidate requires a seed job").into());
+            let token = match &self.job {
+                Job::Seed(job) => job.reservation.token(),
+                Job::Reshape(job) => job.token(),
             };
-            let token = job.reservation.word & !PHASE_MASK;
             // All validation and capacity checks precede the first insertion.
             // No fallible operation remains in this atomic batch.
             for word in &graph.instructions {
@@ -128,15 +185,16 @@ impl<'p> Work<'p> {
             work: self,
             graph,
             token,
+            trimmed,
         })
     }
 
-    fn validate_graph(&self, state: &State, graph: &Graph) -> Result<(), Error> {
+    fn validate_root(&self, state: &State, graph: &Graph) -> Result<(), Error> {
         self.validate(state)?;
-        let Observation::Seed(seed) = self.observation() else {
-            return Err(Error::InvalidUnit("initial candidate requires a seed job"));
-        };
-        if graph.blocks.first().map(|block| block.key) != Some(seed.key)
+        if graph
+            .blocks
+            .first()
+            .is_none_or(|block| self.root_version(block.key).is_none())
             || graph.instructions.is_empty()
             || graph.instructions.len() > MAX_INSTRUCTIONS
         {
@@ -144,7 +202,22 @@ impl<'p> Work<'p> {
                 "candidate does not match its seed or instruction ceiling",
             ));
         }
+        if let Observation::Reshape { snapshot, .. } = self.observation()
+            && (!graph.contains(snapshot.key.source) || !graph.contains(snapshot.key.target))
+        {
+            return Err(Error::InvalidUnit(
+                "reshape candidate is missing a mandatory endpoint",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_graph(&self, state: &State, graph: &Graph) -> Result<(), Error> {
+        self.validate_root(state, graph)?;
+        let root = graph.blocks[0].key;
+        let version = self.root_version(root).unwrap();
         let mut has_seed = false;
+        let mut has_target = !matches!(self.observation(), Observation::Reshape { .. });
         for input in &graph.inputs {
             let captured = graph
                 .units
@@ -164,10 +237,16 @@ impl<'p> Work<'p> {
             {
                 return Err(Error::StalePublication);
             }
-            has_seed |= input.key == seed.key && input.version == seed.version;
+            has_seed |= input.key == root && input.version == version;
+            if let Observation::Reshape { snapshot, .. } = self.observation() {
+                has_target |= input.key == snapshot.key.target.block_key()
+                    && input.version == snapshot.key.target_version;
+            }
         }
-        if !has_seed {
-            return Err(Error::InvalidUnit("candidate has no captured seed"));
+        if !has_seed || !has_target {
+            return Err(Error::InvalidUnit(
+                "candidate has no captured root or reshape target",
+            ));
         }
         Ok(())
     }
@@ -176,7 +255,10 @@ impl<'p> Work<'p> {
         let mut needed = state.candidates.entries.len();
         for word in &graph.instructions {
             let key = word.instruction.key;
-            if !state.units.instruction_available(key, [None; 2]) {
+            if !state
+                .units
+                .instruction_available(key, self.allowed_families())
+            {
                 return Err(CompileError::Deferred);
             }
             match state.candidates.get(key) {
@@ -215,7 +297,7 @@ impl Candidate<'_, '_> {
                 .is_some_and(|claim| claim.token == self.token)
                 || !state
                     .units
-                    .instruction_available(word.instruction.key, [None; 2])
+                    .instruction_available(word.instruction.key, self.work.allowed_families())
             {
                 return Err(Error::StalePublication);
             }

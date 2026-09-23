@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    abi::{NativeFrame, PollBudget},
+    abi::{CodeVersion, NativeFrame, PollBudget},
     executable::Cache,
     hcq::tests::key,
     lcq::{Compilation, compiler::Compiler as Lcq, invocation},
@@ -31,6 +31,9 @@ use std::sync::{
 };
 
 mod lifecycle;
+mod negative;
+mod replacement;
+mod worker;
 
 fn host() -> HostAbi {
     if cfg!(target_arch = "x86_64") {
@@ -92,15 +95,19 @@ fn setup() -> (Arc<Lifetime>, ExecutionMemory, Reader) {
 }
 
 fn work<'a>(process: &'a Lifetime, reader: &mut Reader) -> Work<'a> {
+    work_at(process, reader, 0x1000)
+}
+
+fn work_at<'a>(process: &'a Lifetime, reader: &mut Reader, pc: u64) -> Work<'a> {
     let mut state = A64State::default();
     let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
-    let version = unsafe { reader.admit(&mut frame, key(0x1000)) }
+    let version = unsafe { reader.admit(&mut frame, key(pc)) }
         .unwrap()
         .unwrap()
         .payload()
         .reachability();
     let snapshot = AdmissionSnapshot {
-        key: key(0x1000),
+        key: key(pc),
         version,
         sequence: 8,
         last_edge: None,
@@ -114,6 +121,135 @@ fn work<'a>(process: &'a Lifetime, reader: &mut Reader) -> Work<'a> {
         .accept_background(queue.pop().unwrap().unwrap())
         .unwrap()
         .unwrap()
+}
+
+#[test]
+fn hcq_trimmed_candidate_publishes_and_executes_a_native_cross_family_edge() {
+    let (process, memory, mut reader) = setup();
+    let first = work(&process, &mut reader);
+    let graph = Graph::discover(&first).unwrap();
+    let second = work_at(&process, &mut reader, 0x2000);
+    let second = second
+        .reserve_candidate(Graph::discover(&second).unwrap())
+        .unwrap()
+        .freeze()
+        .unwrap();
+    let first = first.reserve_candidate(graph).unwrap().freeze().unwrap();
+    assert_eq!(first.graph().instructions.len(), 2);
+    assert_eq!(first.graph().units.len(), 1);
+    assert_eq!(first.dependencies().len(), 1);
+    assert_eq!(first.entries().len(), 1);
+    assert_eq!(
+        first.graph().blocks[0].exit,
+        crate::hcq::Exit::Jump(crate::hcq::Target::External(key(0x2000)))
+    );
+    let compiler = Compiler::new(host(), 0x10000).unwrap();
+    for frozen in [&second, &first] {
+        compiler
+            .publish(
+                &mut Context::new(),
+                &mut FunctionBuilderContext::new(),
+                frozen,
+                &memory,
+            )
+            .unwrap();
+    }
+    process.try_service_links().unwrap();
+    let mut state = A64State::default();
+    state.set_pc(0x1000);
+    state.general_register_storage_mut()[2] = 0x5000;
+    let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
+    for pc in [0x1000, 0x2000] {
+        assert!(
+            unsafe { reader.admit(&mut frame, key(pc)) }
+                .unwrap()
+                .unwrap()
+                .payload()
+                .hcq()
+                .is_some()
+        );
+    }
+    let exit = unsafe {
+        invocation::run(
+            &mut Samples::new(),
+            &mut reader,
+            &mut frame,
+            &memory,
+            &mut WorkerFaultContext::register().unwrap(),
+            &mut ExclusiveMonitorState::default(),
+            key(0x1000),
+        )
+    }
+    .unwrap()
+    .unwrap();
+    let invocation::Exit::Native { guest, .. } = exit else {
+        panic!()
+    };
+    assert_eq!(guest.pc.get(), 0x5000);
+    assert_eq!(guest.kind, EdgeKind::Breakpoint(7));
+    assert_eq!(state.general_register_storage_mut()[0], 3);
+}
+
+#[test]
+fn hcq_disjoint_claims_after_trimming_allow_parallel_backend_compilation() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (process, _, mut reader) = setup();
+    let first = work(&process, &mut reader);
+    let graph = Graph::discover(&first).unwrap();
+    let second = work_at(&process, &mut reader, 0x2000);
+    let second = second
+        .reserve_candidate(Graph::discover(&second).unwrap())
+        .unwrap()
+        .freeze()
+        .unwrap();
+    let first = first.reserve_candidate(graph).unwrap().freeze().unwrap();
+    let compiler = Compiler::new(host(), 0x10000).unwrap();
+    std::thread::scope(|scope| {
+        let (ready, received) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut joins = Vec::new();
+        for frozen in [&first, &second] {
+            let compiler = &compiler;
+            let ready = ready.clone();
+            let (release, wait) = mpsc::channel();
+            releases.push(release);
+            joins.push(scope.spawn(move || {
+                let analysis = frozen.analyze().unwrap();
+                let mut context = Context::new();
+                let body = compiler
+                    .emit(
+                        &mut context,
+                        &mut FunctionBuilderContext::new(),
+                        frozen.graph(),
+                        &analysis,
+                        frozen.entries(),
+                    )
+                    .unwrap();
+                ready.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                let staged = compiler
+                    .finish(
+                        &mut context,
+                        body,
+                        frozen.graph(),
+                        CodeVersion::new(1).unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(staged.entries.len(), 1);
+                frozen.check().unwrap();
+            }));
+        }
+        for _ in 0..2 {
+            received.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        // Both real frontends reached the backend with disjoint live claims;
+        // finish one while the other still holds its compiler state and claims.
+        releases.pop().unwrap().send(()).unwrap();
+        joins.pop().unwrap().join().unwrap();
+        releases.pop().unwrap().send(()).unwrap();
+        joins.pop().unwrap().join().unwrap();
+    });
 }
 
 struct Observed<'a> {

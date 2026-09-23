@@ -165,6 +165,7 @@ impl Units {
         for island in 0..self.records.get(source.0).unwrap().static_sites.len() {
             let handle = SiteHandle { source, island };
             let key = self.source_target(handle);
+            self.invalidate_entry_negatives(key);
             let hash = self.static_sites.hash.hash_one(key);
             let next = match self
                 .static_sites
@@ -190,6 +191,7 @@ impl Units {
         // known association never searches the other sources in its bucket.
         for island in 0..self.records.get(source.0).unwrap().static_sites.len() {
             let handle = SiteHandle { source, island };
+            self.invalidate_entry_negatives(self.source_target(handle));
             let site = self.source_site_mut(handle);
             debug_assert!(
                 site.link.is_none() && site.callable.is_none(),

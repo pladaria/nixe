@@ -12,6 +12,69 @@ fn drain(process: &Lifetime) {
 }
 
 #[test]
+fn ordinary_maintenance_collects_retired_storage_without_pressure_or_shutdown() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let pinned = publish(&process, &cursor, &[0], Tier::Lcq);
+    let hold = process.snapshot(pinned).unwrap();
+    let units: Vec<_> = (1..=70)
+        .map(|i| publish(&process, &cursor, &[i * 4], Tier::Lcq))
+        .collect();
+    process.retire_unit(pinned).unwrap();
+    for &unit in &units {
+        process.retire_unit(unit).unwrap();
+    }
+    drain(&process);
+    assert!(process.cache.usage().unwrap().total() < SOFT_BYTES);
+    assert_eq!(process.lock().units.reclaim_len, 71);
+    assert!(process.try_service_links().unwrap());
+    let remaining = process.lock().units.reclaim_len;
+    assert!((39..=40).contains(&remaining)); // At most 32 retired records visited.
+    for _ in 0..3 {
+        assert!(process.try_service_links().unwrap());
+    }
+    {
+        let state = process.lock();
+        assert_eq!(state.units.reclaim_len, 1);
+        assert!(state.units.records.get(pinned.0).is_some());
+        for unit in units {
+            assert!(state.units.records.get(unit.0).is_none());
+        }
+    }
+    drop(hold);
+    assert!(process.try_service_links().unwrap());
+    assert_eq!(process.lock().units.reclaim_len, 0);
+    assert!(process.lock().units.records.get(pinned.0).is_none());
+    assert!(process.try_shutdown().unwrap());
+}
+
+#[test]
+fn ordinary_collection_preserves_the_directory_readers_second_grace_period() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let old = publish(&process, &cursor, &[0], Tier::Lcq);
+    publish(&process, &cursor, &[4], Tier::Lcq);
+    let address = process.snapshot(old).unwrap().code.allocation.address();
+    process.retire_unit(old).unwrap();
+    drain(&process);
+    let mut reader = process.register().unwrap();
+    let mut cpu = A64State::default();
+    let mut frame = frame(&mut cpu);
+    let invocation = unsafe { reader.admit(&mut frame, key(4)) }
+        .unwrap()
+        .unwrap();
+    let fault = invocation.fault(address + 12).unwrap();
+    assert!(process.try_service_links().unwrap());
+    assert!(invocation.fault(address + 12).is_none());
+    assert_eq!(fault.unit.code.allocation.address(), address);
+    assert_eq!(process.lock().units.reclaim_len, 1);
+    drop(invocation);
+    assert!(process.try_service_links().unwrap());
+    assert!(process.lock().units.records.get(old.0).is_none());
+    assert_eq!(process.lock().units.reclaim_len, 0);
+}
+
+#[test]
 fn cold_pressure_waits_for_memory_authority_without_owning_its_transition() {
     use nixe_memory::ExecutionMutationObserver;
     for stop in [false, true] {

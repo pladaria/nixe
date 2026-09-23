@@ -29,7 +29,7 @@ pub(super) struct Body {
 
 pub(super) mod backend;
 mod poll;
-mod publication;
+pub(in crate::hcq) mod publication;
 mod stage;
 
 impl Body {

@@ -137,9 +137,13 @@ impl Lifetime {
         record.queue_retirement(
             handle.0,
             &mut units.retirements,
+            &mut units.negatives,
             Reason::Eviction,
             ticket.sequence,
         );
+        let removed = state.units.negatives.take_removed();
+        drop(state);
+        drop(removed);
         Ok(ticket)
     }
 
@@ -147,100 +151,118 @@ impl Lifetime {
     /// owns each removed slot until dropping code has returned its actual span.
     /// Concurrent callers leave the single cold collector to finish its scan.
     pub(crate) fn reclaim_units(&self) -> Result<usize, Error> {
+        self.collect_units(usize::MAX, true)
+    }
+
+    /// Ordinary cold maintenance visits only retired records, never the live
+    /// code registry. Blocked epochs/references rotate to the tail so one pin
+    /// cannot prevent unrelated storage reuse. No per-unit queue allocation.
+    pub(crate) fn reclaim_retired(&self) -> Result<usize, Error> {
+        self.collect_units(32, false)
+    }
+
+    fn collect_units(&self, limit: usize, full: bool) -> Result<usize, Error> {
         {
             let mut state = self.lock();
             state.healthy()?;
-            if state.units.collecting {
+            if state.units.collecting || (!full && state.units.reclaim_len == 0) {
                 return Ok(0);
             }
             state.units.collecting = true;
         }
         let _collector = Collector(self);
         self.collect_tables()?;
-        self.retire_rootless()?;
-        // Detach candidates one at a time. A short-lived strong reference
-        // protects their code while replacement tables are built outside state.
-        let mut cursor = 0;
-        loop {
-            let candidate = {
-                let state = self.lock();
-                let handle = state.units.records.find_from(&mut cursor, |record| {
-                    matches!(record.lifecycle, Lifecycle::Retired(epoch) if state.quiescent(epoch))
-                        && record.detached_epoch.is_none()
-                        && record.reshape.as_ref().is_none_or(|owner| !owner.pinned())
-                        && Arc::strong_count(&record.code) == 1
-                });
-                handle.map(|handle| {
-                    let record = state.units.records.get(handle).unwrap();
-                    (
-                        handle,
-                        Arc::clone(&record.code),
-                        state.units.tables[record.code.code.allocation.segment].clone(),
-                    )
-                })
-            };
-            let Some((handle, code, table)) = candidate else {
-                break;
-            };
-            if !self.detach_directory(handle, &code, table)? {
-                break;
-            }
+        if full {
+            self.retire_rootless()?;
         }
         let mut reclaimed = 0;
-        let mut cursor = 0;
-        loop {
-            let removed = {
-                let mut state = self.lock();
-                let handle = state.units.records.find_from(&mut cursor, |record| {
-                    record
-                        .detached_epoch
-                        .is_some_and(|epoch| state.quiescent(epoch))
-                        && record.reshape.as_ref().is_none_or(|owner| !owner.pinned())
-                        && Arc::strong_count(&record.code) == 1
-                });
-                let Some(handle) = handle else {
-                    break;
-                };
-                let record = state.units.records.take_held(handle).unwrap();
-                state.units.segment_records[record.code.code.allocation.segment] -= 1;
-                state.units.segment_retired[record.code.code.allocation.segment] -= 1;
-                for page in &*record.code.dependencies {
-                    let hash = state.units.dependencies.hash.hash_one(page.page);
-                    if let Ok(entry) = state.units.dependencies.entries.find_entry(hash, |entry| {
-                        entry.unit == UnitHandle(handle, self.identity) && entry.page == *page
-                    }) {
-                        entry.remove();
-                    }
-                }
-                (handle, record)
-            };
-            let (handle, record) = removed;
-            let UnitRecord {
-                code,
-                slots,
-                family,
-                detached_table,
-                ..
-            } = record;
-            drop(detached_table);
-            drop(code); // Returns the span under cache only, BEFORE releasing slots.
-            {
-                let mut state = self.lock();
-                for slot in slots.iter() {
-                    state.dispatch.get_mut(*slot).unwrap().units -= 1;
-                }
-                assert!(state.units.records.release_held(handle));
-                if let Some(family) = family {
-                    assert!(state.units.families.release_held(family));
+        let count = self.lock().units.reclaim_len.min(limit);
+        for _ in 0..count {
+            let handle = self.lock().units.pop_reclaim().unwrap();
+            match self.collect_retired_unit(handle) {
+                Ok(true) => reclaimed += 1,
+                result => {
+                    // Also retain the queue entry on a fallible directory rebuild.
+                    self.lock().units.enqueue_reclaim(handle);
+                    result?;
                 }
             }
-            drop(slots);
-            reclaimed += 1;
         }
         self.collect_tables()?;
-        self.collect_dispatch()?;
-        self.decommit_unused()?;
+        if full {
+            self.collect_dispatch()?;
+            self.decommit_unused()?;
+        }
         Ok(reclaimed)
+    }
+
+    fn collect_retired_unit(&self, handle: Handle<UnitRecord>) -> Result<bool, Error> {
+        let candidate = {
+            let state = self.lock();
+            let record = state.units.records.get(handle).unwrap();
+            if !matches!(record.lifecycle, Lifecycle::Retired(epoch) if state.quiescent(epoch))
+                || record.reshape.as_ref().is_some_and(|owner| owner.pinned())
+                || Arc::strong_count(&record.code) != 1
+            {
+                return Ok(false);
+            }
+            record.detached_epoch.is_none().then(|| {
+                (
+                    Arc::clone(&record.code),
+                    state.units.tables[record.code.code.allocation.segment].clone(),
+                )
+            })
+        };
+        if let Some((code, table)) = candidate
+            && !self.detach_directory(handle, &code, table)?
+        {
+            return Ok(false);
+        }
+        let record = {
+            let mut state = self.lock();
+            let record = state.units.records.get(handle).unwrap();
+            if !record
+                .detached_epoch
+                .is_some_and(|epoch| state.quiescent(epoch))
+                || record.reshape.as_ref().is_some_and(|owner| owner.pinned())
+                || Arc::strong_count(&record.code) != 1
+            {
+                return Ok(false);
+            }
+            let record = state.units.records.take_held(handle).unwrap();
+            state.units.segment_records[record.code.code.allocation.segment] -= 1;
+            state.units.segment_retired[record.code.code.allocation.segment] -= 1;
+            for page in &*record.code.dependencies {
+                let hash = state.units.dependencies.hash.hash_one(page.page);
+                if let Ok(entry) = state.units.dependencies.entries.find_entry(hash, |entry| {
+                    entry.unit == UnitHandle(handle, self.identity) && entry.page == *page
+                }) {
+                    entry.remove();
+                }
+            }
+            record
+        };
+        let UnitRecord {
+            code,
+            slots,
+            family,
+            detached_table,
+            ..
+        } = record;
+        drop(detached_table);
+        drop(code); // Returns the span under cache only, BEFORE releasing slots.
+        {
+            let mut state = self.lock();
+            for slot in slots.iter() {
+                state.dispatch.get_mut(*slot).unwrap().units -= 1;
+            }
+            assert!(state.units.records.release_held(handle));
+            if let Some(family) = family {
+                assert!(state.units.families.release_held(family));
+            }
+        }
+        drop(slots);
+        Ok(true)
     }
 
     fn retire_rootless(&self) -> Result<(), Error> {
@@ -254,6 +276,9 @@ impl Lifetime {
                     && !rooted(&state, record)
             });
             let Some(handle) = handle else {
+                let removed = state.units.negatives.take_removed();
+                drop(state);
+                drop(removed);
                 return Ok(());
             };
             let record = state.units.records.get(handle).unwrap();
@@ -272,6 +297,7 @@ impl Lifetime {
                 units.records.get_mut(handle).unwrap().queue_retirement(
                     handle,
                     &mut units.retirements,
+                    &mut units.negatives,
                     Reason::TierCutover,
                     sequence,
                 );
@@ -288,6 +314,7 @@ impl Lifetime {
             record.lifecycle = Lifecycle::Retired(retired);
             let segment = record.code.code.allocation.segment;
             state.units.segment_retired[segment] += 1;
+            state.units.enqueue_reclaim(handle);
         }
     }
 
@@ -672,6 +699,8 @@ impl Transition<'_> {
         while let Some(unlinked) = self.unlink_next()? {
             count += usize::from(unlinked);
         }
+        let removed = self.process.lock().units.negatives.take_removed();
+        drop(removed);
         self.process.changed.notify_all();
         Ok(count)
     }
@@ -749,6 +778,16 @@ impl Transition<'_> {
                     continue;
                 }
                 let empty = lcq.is_none() && hcq.is_none();
+                if lcq != payload.lcq() {
+                    state
+                        .units
+                        .negatives
+                        .invalidate_selection(negative::SelectionPage::of(key));
+                }
+                state
+                    .units
+                    .negatives
+                    .invalidate(negative::Owner::Dispatch(slot));
                 state
                     .dispatch
                     .get_mut(slot)
@@ -767,8 +806,19 @@ impl Transition<'_> {
             let units = &mut state.units;
             let record = units.records.get(handle).unwrap();
             if let Some(family) = record.family {
+                let mut previous = None;
                 for instruction in record.code.instructions.iter() {
-                    assert!(units.family_owners.remove(instruction.key, family));
+                    // Replacement publication already withdrew this complete
+                    // partition. Never remove a successor's ownership or
+                    // invalidate its negatives during delayed predecessor cleanup.
+                    if !units.family_owners.remove(instruction.key, family) {
+                        continue;
+                    }
+                    let page = negative::SelectionPage::of(instruction.key.block_key());
+                    if previous != Some(page) {
+                        units.negatives.invalidate_selection(page);
+                        previous = Some(page);
+                    }
                 }
             }
             let record = state.units.records.get_mut(handle).unwrap();
@@ -782,6 +832,7 @@ impl Transition<'_> {
             let segment = record.code.code.allocation.segment;
             state.units.segment_retired[segment] += 1;
             state.units.finish_retirement(handle);
+            state.units.enqueue_reclaim(handle);
             state.execution = next;
             (
                 family.map(|family| state.units.families.take_held(family).unwrap()),

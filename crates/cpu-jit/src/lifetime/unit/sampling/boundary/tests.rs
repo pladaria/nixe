@@ -349,3 +349,66 @@ fn source_instruction_must_belong_to_the_exact_lcq_image_and_context() {
     );
     assert!(samples.seed_snapshot(key(0)).is_none());
 }
+
+#[test]
+fn boundary_admission_unlocks_state_and_retries_busy_family_at_score_three() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let baseline = publish(&process, &cursor, &[0, 4], Tier::Lcq);
+    publish(&process, &cursor, &[16], Tier::Lcq);
+    hcq(&process, &cursor, &[16], 1);
+    let baseline = process.snapshot(baseline).unwrap();
+    let queue = Arc::new(Queue::new(1, &process).unwrap().unwrap());
+    process.lock().background_queue = Arc::downgrade(&queue);
+    let mut samples = Samples::new();
+    for score in 1..=4 {
+        process
+            .sample_lcq(&baseline, &mut samples, Some(edge(16)))
+            .unwrap();
+        assert_eq!(
+            samples
+                .boundary_snapshot(instruction(4), instruction(16))
+                .unwrap()
+                .1,
+            score
+        );
+        if score < 4 {
+            assert!(queue.pop().unwrap().is_none());
+        }
+    }
+    let work = process
+        .accept_background(
+            queue
+                .pop()
+                .unwrap()
+                .expect("fourth sample admits after unlock"),
+        )
+        .unwrap()
+        .unwrap();
+    let crate::lifetime::background::Observation::Reshape {
+        source_block,
+        snapshot,
+    } = work.observation()
+    else {
+        panic!("expected reshape");
+    };
+    assert_eq!(source_block, key(0));
+    assert_eq!(snapshot.key.source, instruction(4));
+    assert_eq!(snapshot.key.target, instruction(16));
+    process
+        .sample_lcq(&baseline, &mut samples, Some(edge(16)))
+        .unwrap();
+    assert_eq!(
+        samples
+            .boundary_snapshot(instruction(4), instruction(16))
+            .unwrap()
+            .1,
+        3
+    );
+    assert!(queue.pop().unwrap().is_none());
+    drop(work);
+    process
+        .sample_lcq(&baseline, &mut samples, Some(edge(16)))
+        .unwrap();
+    assert!(queue.pop().unwrap().is_some());
+}

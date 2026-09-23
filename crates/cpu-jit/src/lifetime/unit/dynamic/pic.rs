@@ -207,10 +207,12 @@ impl State {
         if let Some(next) = way.incoming.next {
             self.pic_way_mut(next).incoming.prev = way.incoming.prev;
         }
+        self.units.invalidate_entry_negatives(bridge.key.target);
         Some(bridge)
     }
 
     fn insert_pic_way(&mut self, site: Site, bridge: Arc<Accounted<Bridge>>) {
+        self.units.invalidate_entry_negatives(bridge.key.target);
         let outgoing = self
             .units
             .records
@@ -293,8 +295,10 @@ impl Reader {
             if let Some((handle, removed)) =
                 state.reuse_bridge(self.handle, prepared.key, self.process.identity)
             {
+                let negatives = state.units.negatives.take_removed();
                 drop(state);
                 drop(removed);
+                drop(negatives);
                 return Ok(handle);
             }
             // A weak hit avoids emission and W^X installation. Reserve an
@@ -324,19 +328,21 @@ impl Reader {
             },
             charge,
         });
-        let (handle, removed) = {
+        let (handle, removed, negatives) = {
             let mut state = self.process.lock();
             prepared.validate(&state)?;
             // Another vCPU may have installed this exact transfer while we
             // emitted. Share that winner; discard our unpublished owner below.
-            state
+            let (handle, removed) = state
                 .reuse_bridge(self.handle, prepared.key, self.process.identity)
                 .unwrap_or_else(|| {
                     state.place_bridge(self.handle, Arc::clone(&bridge), self.process.identity)
-                })
+                });
+            (handle, removed, state.units.negatives.take_removed())
         };
         drop(bridge);
         drop(removed);
+        drop(negatives);
         Ok(handle)
     }
 }

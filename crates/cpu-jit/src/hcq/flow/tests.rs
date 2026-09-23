@@ -14,6 +14,7 @@ pub(in crate::hcq) fn graph(inputs: &[(u64, &[u32])]) -> Graph {
     }
     let (instructions, blocks) = builder.finish().unwrap();
     Graph {
+        discovery: None,
         units: Vec::new(),
         inputs: Vec::new(),
         instructions,

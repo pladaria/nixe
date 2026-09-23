@@ -2,6 +2,41 @@ use super::*;
 use crate::hcq::flow::tests::graph;
 use cranelift_codegen::settings::{OptLevel, RegallocAlgorithm};
 
+std::thread_local! {
+    // Thread-local, one-shot injection: parallel workers/tests cannot affect
+    // each other. No flag, branch or added slot exists in production builds.
+    static EXTRA_SLOT_BYTES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+pub(in crate::hcq) fn with_extra_slots<T>(bytes: u32, action: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXTRA_SLOT_BYTES.set(None);
+        }
+    }
+    assert!(EXTRA_SLOT_BYTES.replace(Some(bytes)).is_none());
+    let _reset = Reset;
+    let result = action();
+    assert!(
+        EXTRA_SLOT_BYTES.get().is_none(),
+        "test did not reach the backend"
+    );
+    result
+}
+
+pub(super) fn add_extra_slots(context: &mut Context) {
+    if let Some(bytes) = EXTRA_SLOT_BYTES.replace(None) {
+        for _ in 0..2 {
+            context.func.create_sized_stack_slot(ir::StackSlotData::new(
+                ir::StackSlotKind::ExplicitSlot,
+                bytes,
+                4,
+            ));
+        }
+    }
+}
+
 #[test]
 fn hcq_repeated_guest_accesses_keep_distinct_fault_sites() {
     for words in [

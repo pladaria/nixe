@@ -2,7 +2,7 @@
 //! capture/revalidation never holds JIT state, a guest lease or execution epoch.
 
 use super::{
-    backend::{Compiler, Failure},
+    backend::{Compiler, Failure, Limit},
     *,
 };
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
     lifetime::{
         self,
         background::Frozen,
-        unit::{Input, UnitHandle},
+        unit::{Input, Instruction, UnitHandle},
     },
 };
 use nixe_cpu::memory::{ExecutableMemory, InstructionImage};
@@ -40,35 +40,19 @@ impl Image {
                 })
                 .count();
             let (run, rest) = words.split_at(count);
-            let key = run[0].instruction.key.block_key();
-            let image = memory.capture_instructions(
-                key.address_space,
-                key.pc,
-                NonZeroU16::new(u16::try_from(count).map_err(|_| {
-                    Failure::Failed(Error::internal("HCQ capture exceeds instruction ceiling"))
-                })?)
-                .unwrap(),
-                &|_, _| false,
-            );
-            if image.fault().is_some()
-                || image.words().len() != run.len()
-                || image
-                    .words()
-                    .iter()
-                    .zip(run)
-                    .any(|(a, b)| a.bits != b.instruction.bits)
-                || image.dependencies().any(|dependency| {
+            let image = Self::capture_run(
+                memory,
+                run.iter().map(|word| word.instruction),
+                |dependency| {
                     frozen
                         .dependencies()
                         .binary_search_by_key(
                             &(dependency.page.get(), dependency.mapping_generation.get()),
                             |dep| (dep.page.get(), dep.mapping_generation.get()),
                         )
-                        .is_err()
-                })
-            {
-                return Err(Failure::Cancelled);
-            }
+                        .is_ok()
+                },
+            )?;
             runs.push(image);
             words = rest;
         }
@@ -77,6 +61,77 @@ impl Image {
         frozen.check()?;
         let image = Self { runs, cursor };
         image.validate(memory)?;
+        Ok(image)
+    }
+
+    fn capture_structural(
+        result: &crate::hcq::discovery::Structural<'_, '_>,
+        memory: &(impl ExecutableMemory + MemoryInvalidationSource),
+    ) -> Result<Self, Failure> {
+        let image = Self::capture_inputs(result.capture_inputs()?, memory)?;
+        result.check()?;
+        image.validate(memory)?;
+        result.check()?;
+        Ok(image)
+    }
+
+    fn capture_inputs(
+        inputs: crate::executable::Accounted<Vec<crate::lifetime::unit::Snapshot>>,
+        memory: &(impl ExecutableMemory + MemoryInvalidationSource),
+    ) -> Result<Self, Failure> {
+        let cursor = memory.invalidation_cursor();
+        let mut runs = Vec::new();
+        for input in inputs.iter() {
+            // LCQ images are contiguous. Chunking also handles the largest
+            // resident image without truncating its u16 capture length.
+            let mut start = 0;
+            while start < input.instructions.len() {
+                let count = (input.instructions.len() - start).min(usize::from(u16::MAX));
+                runs.push(Self::capture_run(
+                    memory,
+                    input.instructions.iter().skip(start).take(count),
+                    |dependency| input.dependencies.contains(&dependency),
+                )?);
+                start += count;
+            }
+        }
+        // Strong code pins and their vector charge end before final checks.
+        Ok(Self { runs, cursor })
+    }
+
+    fn capture_run(
+        memory: &impl ExecutableMemory,
+        mut words: impl ExactSizeIterator<Item = Instruction>,
+        mut dependency: impl FnMut(nixe_cpu::memory::CodePageDependency) -> bool,
+    ) -> Result<InstructionImage, Failure> {
+        let count = NonZeroU16::new(
+            u16::try_from(words.len())
+                .map_err(|_| Failure::Failed(Error::internal("HCQ capture exceeds run limit")))?,
+        )
+        .ok_or_else(|| Failure::Failed(Error::internal("empty HCQ capture run")))?;
+        let first = words.next().unwrap();
+        let key = first.key.block_key();
+        let image = memory.capture_instructions(key.address_space, key.pc, count, &|_, _| false);
+        if image.fault().is_some()
+            || image.words().len() != usize::from(count.get())
+            || image
+                .words()
+                .iter()
+                .zip(std::iter::once(first).chain(words))
+                .enumerate()
+                .any(|(index, (actual, expected))| {
+                    actual.bits != expected.bits
+                        || key
+                            .pc
+                            .get()
+                            .checked_add(index as u64 * 4)
+                            .and_then(|pc| key.at(GuestVirtualAddress::new(pc)))
+                            != Some(expected.key.block_key())
+                })
+            || image.dependencies().any(|page| !dependency(page))
+        {
+            return Err(Failure::Cancelled);
+        }
         Ok(image)
     }
 
@@ -95,8 +150,46 @@ impl Image {
     }
 }
 
+/// No backend emission, unit identity or executable allocation for a validated
+/// no-op. Reuse the positive publisher's memory capture and exact-image checks.
+pub(in crate::hcq) fn record_unchanged(
+    frozen: &Frozen<'_, '_>,
+    memory: &(impl ExecutableMemory + MemoryInvalidationSource),
+) -> Result<bool, Failure> {
+    let image = Image::capture(frozen, memory)?;
+    let prepared = frozen.prepare_unchanged(image.cursor)?;
+    image.validate(memory)?;
+    prepared.install().map_err(Into::into)
+}
+
+/// Rejected discovery still needs exact memory and selection proof, including
+/// discarded inputs. No candidate claims or backend emission are required.
+pub(in crate::hcq) fn record_structural(
+    result: &crate::hcq::discovery::Structural<'_, '_>,
+    memory: &(impl ExecutableMemory + MemoryInvalidationSource),
+) -> Result<bool, Failure> {
+    let image = Image::capture_structural(result, memory)?;
+    let prepared = result.prepare(image.cursor)?;
+    image.validate(memory)?;
+    prepared.install().map_err(Into::into)
+}
+
+/// A typed optimization limit is not a compiler failure, a seed rejection or
+/// cache pressure. Validate all inspected inputs, not just emitted membership.
+pub(in crate::hcq) fn record_backend_rejection(
+    frozen: &Frozen<'_, '_>,
+    _limit: Limit,
+    memory: &(impl ExecutableMemory + MemoryInvalidationSource),
+) -> Result<bool, Failure> {
+    let image = Image::capture_inputs(frozen.capture_backend_inputs()?, memory)?;
+    image.validate(memory)?;
+    let prepared = frozen.prepare_backend_negative(image.cursor)?;
+    image.validate(memory)?;
+    prepared.install().map_err(Into::into)
+}
+
 impl Compiler {
-    /// Compile and publish one frozen initial region. The caller must use the
+    /// Compile and publish one frozen initial or replacement region. The caller must use the
     /// executable-memory authority bound to this candidate's Lifetime. Workers
     /// handle typed backend rejection separately from cancellation/pressure.
     pub(in crate::hcq) fn publish(

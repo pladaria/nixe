@@ -751,6 +751,19 @@ impl<T> std::ops::Deref for Accounted<T> {
     }
 }
 impl MetadataLease {
+    /// Extend a worker's prepaid header with its now-known evidence. Keep one
+    /// lease in the resident owner; failure preserves the original reservation.
+    pub(crate) fn grow(&mut self, bytes: usize, tier: Tier) -> Result<(), Error> {
+        let mut state = self.cache.lock()?;
+        state.usage.check(bytes, tier)?;
+        if state.backing.is_none() {
+            return Err(Error::Closed);
+        }
+        state.usage.metadata += bytes;
+        self.bytes += bytes; // Bounded by the checked total cache usage above.
+        Ok(())
+    }
+
     fn reduce(&mut self, bytes: usize) {
         assert!(bytes <= self.bytes);
         if let Ok(mut state) = self.cache.lock() {

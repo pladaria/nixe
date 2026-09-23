@@ -44,7 +44,7 @@ pub(crate) struct FamilyIdentity {
     pub version: FamilyVersion,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct BoundaryKey {
     pub source: InstructionKey,
     pub target: InstructionKey,
@@ -75,6 +75,11 @@ pub(crate) struct Samples {
 }
 
 impl Samples {
+    #[cfg(test)]
+    pub(crate) fn same_boundary_set(&self, a: BoundaryKey, b: BoundaryKey) -> bool {
+        self.boundary_set(a) == self.boundary_set(b)
+    }
+
     #[cfg(test)]
     pub(crate) fn boundary_snapshot(
         &self,

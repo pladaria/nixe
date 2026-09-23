@@ -9,6 +9,7 @@ mod maintenance;
 mod memory;
 pub(crate) use directory::Fault;
 use unit::dynamic::pic;
+use unit::reshape::negative;
 mod registry;
 #[cfg(test)]
 mod tests;
@@ -655,16 +656,22 @@ impl Lifetime {
             std::mem::size_of::<Accounted<DispatchPayload>>(),
             tier,
         )?);
-        let old = {
+        let (old, removed) = {
             let mut state = self.lock();
             state.validate(&publication)?;
             state
+                .units
+                .negatives
+                .invalidate(negative::Owner::Dispatch(publication.slot));
+            let old = state
                 .dispatch
                 .get_mut(publication.slot)
                 .unwrap()
-                .replace(payload, [None; 2])
+                .replace(payload, [None; 2]);
+            (old, state.units.negatives.take_removed())
         };
         drop(old);
+        drop(removed);
         self.changed.notify_all();
         Ok(version)
     }
@@ -691,6 +698,13 @@ impl Lifetime {
         let retired = state.execution;
         state.dispatch.get_mut(publication.slot).unwrap().retired = Some(retired);
         state.execution = next;
+        state
+            .units
+            .negatives
+            .invalidate(negative::Owner::Dispatch(publication.slot));
+        let removed = state.units.negatives.take_removed();
+        drop(state);
+        drop(removed);
         Ok(())
     }
 
@@ -722,7 +736,9 @@ impl Lifetime {
     pub(crate) fn request(&self, reason: Reason) -> Result<Ticket<'_>, Error> {
         let mut state = self.lock();
         let result = self.request_locked(&mut state, reason);
+        let removed = state.units.negatives.take_removed();
         drop(state);
+        drop(removed);
         if reason == Reason::Shutdown {
             let closed = self.close_background();
             return result.and_then(|ticket| closed.map(|()| ticket));
@@ -750,7 +766,9 @@ impl Lifetime {
             }
             Ok(())
         })();
+        let removed = state.units.negatives.take_removed();
         drop(state);
+        drop(removed);
         if let Some(summary) = summary {
             summary.log(self.identity, &self.cache);
         }
@@ -949,10 +967,11 @@ impl Drop for Reader {
                 let Some(slot) = state.readers.get(self.handle).and_then(|r| r.pic.head) else {
                     break;
                 };
-                state.remove_pic_way(pic::Site {
+                let bridge = state.remove_pic_way(pic::Site {
                     reader: self.handle,
                     slot,
-                })
+                });
+                (bridge, state.units.negatives.take_removed())
             };
             drop(removed);
         }

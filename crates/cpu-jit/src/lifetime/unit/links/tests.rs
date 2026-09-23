@@ -5,6 +5,24 @@ use cranelift_codegen::{ir, nixe::StateMap};
 
 mod mixed;
 
+pub(in crate::lifetime) fn assert_callable_target(
+    process: &Lifetime,
+    source: UnitHandle,
+    target: UnitHandle,
+) {
+    let state = process.lock();
+    let site = &state.units.records.get(source.0).unwrap().static_sites[0];
+    let link = state
+        .units
+        .links
+        .records
+        .get(site.callable.unwrap())
+        .unwrap();
+    assert!(link.installed);
+    assert_eq!(link.source, source);
+    assert_eq!(link.target, target);
+}
+
 #[test]
 fn static_refresh_retargets_installed_links_while_the_old_baseline_stays_live() {
     let process = process();
