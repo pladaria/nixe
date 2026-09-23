@@ -15,7 +15,36 @@ use std::mem::offset_of;
 // the ABI-owned transfer partition. BORROW_SAVE and SCRATCH_SLOT remain separate.
 pub(super) const RESULT: u32 = crate::abi::TRANSFER_BYTES - 64;
 const SAVES: u32 = RESULT - 32;
-const HOST_BITS: u32 = RESULT - 8;
+
+/// Preserve the native representation across infrastructure, without converting
+/// to guest NZCV and back. RESULT is private to this non-reentrant cold sequence.
+/// MOV/LAHF/SETcc leave the producer flags intact; only reserved scratch or a
+/// saved RAX is used. Intel SDM LAHF/SAHF/SETcc/ADD:
+/// https://cdrdv2-public.intel.com/782151/253667-sdm-vol-2b.pdf
+pub(super) fn save_host(e: &mut Emitter) {
+    if e.abi == HostAbi::X86_64 {
+        e.memory(false, Integer, 0, SAVES, 8);
+        e.code.extend([0x9f, 0x0f, 0x90, 0xc0]); // LAHF; SETO AL
+        e.memory(false, Integer, 0, RESULT, 4); // AH=SF/ZF/CF, AL=OF
+        e.memory(true, Integer, 0, SAVES, 8);
+    } else {
+        e.word(0xd53b4210); // MRS x16,NZCV
+        e.memory(false, Integer, 16, RESULT, 4);
+    }
+}
+
+pub(super) fn restore_host(e: &mut Emitter) {
+    if e.abi == HostAbi::X86_64 {
+        e.memory(false, Integer, 0, SAVES, 8);
+        e.memory(true, Integer, 0, RESULT, 4);
+        // AL=0/1 -> 0x7f/0x80 sets OF exactly; the byte ADD leaves AH intact.
+        e.code.extend([0x04, 0x7f, 0x9e]); // ADD AL,0x7f; SAHF
+        e.memory(true, Integer, 0, SAVES, 8);
+    } else {
+        e.memory(true, Integer, 16, RESULT, 4);
+        e.word(0xd51b4210); // MSR NZCV,x16
+    }
+}
 
 /// Install the protected packed result after all physical input copies. Only
 /// link scratch is clobbered on AArch64. x86-64 borrows and restores RAX;
@@ -94,48 +123,14 @@ enum Cond {
 /// before reusing the transfer partition. Only requested architectural bits
 /// (NZCV nibble order) are computed; other packed bits are zero.
 pub(super) fn materialize(emitter: &mut Emitter, location: &NzcvLocation, bits: u8) {
+    if let NzcvLocation::Host { carry_inverted } = location {
+        materialize_host(emitter, bits, *carry_inverted);
+        return;
+    }
     for reg in 0..3 {
         emitter.memory(false, Integer, reg, SAVES + u32::from(reg) * 8, 8);
     }
-    if let NzcvLocation::Host { carry_inverted } = location {
-        if emitter.abi == HostAbi::Aarch64 {
-            emitter.word(0xd53b4200); // MRS x0,NZCV
-            if *carry_inverted {
-                emitter.constant(1, 1 << 29, 4);
-                emitter.logic(Op::Xor, 0, 1, 4);
-            }
-            emitter.constant(1, u64::from(bits) << 28, 4);
-            emitter.logic(Op::And, 0, 1, 4);
-            emitter.memory(false, Integer, 0, RESULT, 4);
-        } else {
-            // SETcc and MOVZX are flag transparent. Capture every requested
-            // condition BEFORE arithmetic can destroy the native producer.
-            for (bit, cond) in [
-                (3, Cond::Negative),
-                (2, Cond::Eq),
-                (1, Cond::Carry),
-                (0, Cond::Overflow),
-            ] {
-                if bits & (1 << bit) != 0 {
-                    emitter.condition(0, cond);
-                    emitter.x64(&[], false, &[0x88], 0, 15, Some(HOST_BITS + bit));
-                }
-            }
-            emitter.constant(0, 0, 4);
-            emitter.memory(false, Integer, 0, RESULT, 4);
-            for bit in 0..4 {
-                if bits & (1 << bit) == 0 {
-                    continue;
-                }
-                emitter.byte_load(0, HOST_BITS + bit);
-                if bit == 1 && *carry_inverted {
-                    emitter.constant(1, 1, 4);
-                    emitter.logic(Op::Xor, 0, 1, 4);
-                }
-                accumulate(emitter, bit);
-            }
-        }
-    } else if matches!(
+    if matches!(
         location,
         NzcvLocation::Canonical
             | NzcvLocation::Packed(_)
@@ -183,6 +178,58 @@ pub(super) fn materialize(emitter: &mut Emitter, location: &NzcvLocation, bits: 
     for reg in 0..3 {
         emitter.memory(true, Integer, reg, SAVES + u32::from(reg) * 8, 8);
     }
+}
+
+/// Pack only requested guest bits. Native preservation uses save_host instead;
+/// this conversion belongs at a real packed/canonical consumer, not each poll.
+fn materialize_host(e: &mut Emitter, bits: u8, carry_inverted: bool) {
+    if e.abi == HostAbi::Aarch64 {
+        e.word(0xd53b4210); // MRS x16,NZCV
+        if carry_inverted && bits & 2 != 0 {
+            e.constant(17, 1 << 29, 4);
+            e.logic(Op::Xor, 16, 17, 4);
+        }
+        e.constant(17, u64::from(bits) << 28, 4);
+        e.logic(Op::And, 16, 17, 4);
+        e.memory(false, Integer, 16, RESULT, 4);
+        return;
+    }
+    e.memory(false, Integer, 0, SAVES, 8);
+    if bits.count_ones() == 1 {
+        let bit = bits.trailing_zeros();
+        let condition = match bit {
+            3 => Cond::Negative,
+            2 => Cond::Eq,
+            1 if carry_inverted => Cond::Ge,
+            1 => Cond::Carry,
+            0 => Cond::Overflow,
+            _ => unreachable!("NZCV mask"),
+        };
+        e.condition(0, condition);
+        e.shift(0, bit as u8 + 28, true, 4);
+    } else {
+        // Snapshot SF/ZF/CF in AH and OF in AL before changing host flags.
+        e.code.extend([0x9f, 0x0f, 0x90, 0xc0]); // LAHF; SETO AL
+        e.memory(false, Integer, 0, RESULT, 4);
+        e.x64(&[], false, &[0x81], 4, 0, None); // AND EAX,N/Z mask
+        e.word(u32::from(bits & 12) << 12);
+        e.shift(0, 16, true, 4);
+        for (bit, mask, shift) in [(2, 0x100, 21), (1, 1, 28)] {
+            if bits & bit != 0 {
+                e.memory(true, Integer, 11, RESULT, 4);
+                e.x64(&[], false, &[0x81], 4, 11, None);
+                e.word(mask);
+                e.shift(11, shift, true, 4);
+                e.logic(Op::Or, 0, 11, 4);
+            }
+        }
+        if carry_inverted && bits & 2 != 0 {
+            e.x64(&[], false, &[0x81], 6, 0, None); // XOR EAX,guest C
+            e.word(1 << 29);
+        }
+    }
+    e.memory(false, Integer, 0, RESULT, 4);
+    e.memory(true, Integer, 0, SAVES, 8);
 }
 
 fn accumulate(emitter: &mut Emitter, bit: u32) {

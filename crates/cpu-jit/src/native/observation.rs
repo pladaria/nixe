@@ -28,7 +28,7 @@ pub(crate) struct Preservation {
 /// from the frame; it must not mutate any architectural or saved state.
 ///
 /// Host NZCV is supported only if `save` runs before any flag-clobbering poll
-/// arithmetic. Native poll maps instead carry packed/deferred NZCV.
+/// arithmetic, or after the cold poll has restored its explicit flag input.
 /// Restore must run on both success and failure before a source continuation or
 /// canonical exit. FP pause/resume and call/return belong to the callback veneer.
 pub(crate) fn emit(
@@ -110,11 +110,9 @@ fn preservation(
         },
         bytes: 8,
     });
-    if source.live.nzcv != 0
-        && let NzcvLocation::Host { carry_inverted } = source.nzcv
-    {
-        flags::materialize(&mut save, &source.nzcv, source.live.nzcv);
-        flags::install_host(&mut restore, carry_inverted);
+    if source.live.nzcv != 0 && matches!(source.nzcv, NzcvLocation::Host { .. }) {
+        flags::save_host(&mut save);
+        flags::restore_host(&mut restore);
     }
     Ok(Preservation {
         save: save.finish(),
@@ -133,11 +131,7 @@ pub(crate) fn emit_callback(
     destination: ValueLocation,
     internal: bool,
 ) -> Result<(Vec<u8>, [u32; 2]), TransferError> {
-    if source.flags_to_preserve(crate::analysis::NZCV) != 0 {
-        return Err(TransferError::InvalidContract(
-            "sampling after poll arithmetic requires packed or deferred NZCV",
-        ));
-    }
+    let host_flags = source.flags_to_preserve(crate::analysis::NZCV) != 0;
     let preservation = if internal {
         preservation(source, destination, true)?
     } else {
@@ -189,11 +183,12 @@ pub(crate) fn emit_callback(
         e.word(0xd63f0200); // BLR X16; native continuations do not use X30
         e.word(0x2a0003f0); // MOV W16,W0: preserve callback result across X0 restore
     }
-    // Success and failure restore the same image once. Host flags are forbidden
-    // above, so these are only flag-transparent moves/loads. An absent callback
-    // bypasses restoration: saving values and the destination modified only
-    // transfer storage and reserved link scratch, never a mapped register.
-    e.code.extend_from_slice(&preservation.restore);
+    // A host-flag restore destroys the callback's success condition (and Arm's
+    // scratch result register). Select the continuation first in that case.
+    // Other contracts share their flag-transparent register restore as before.
+    if !host_flags {
+        e.code.extend_from_slice(&preservation.restore);
+    }
     if source.abi == HostAbi::X86_64 {
         e.code.extend([0x0f, 0x84]); // JZ failure
     }
@@ -203,6 +198,9 @@ pub(crate) fn emit_callback(
     let mut patches = [0; 2];
     for index in 0..2 {
         labels[index] = e.code.len();
+        if host_flags {
+            e.code.extend_from_slice(&preservation.restore);
+        }
         while !e.code.len().is_multiple_of(8) {
             if source.abi == HostAbi::X86_64 {
                 e.code_byte(0x90);

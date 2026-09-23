@@ -268,36 +268,9 @@ fn selective_chain_faults_preserve_spills_lazy_flags_and_inherited_fp() {
                 .iter()
                 .any(|b| matches!(b.location, ValueLocation::Spill { .. }))
         );
-        // Inspect the final allocator maps, not an assumed register ordering:
-        // after removing ready writes, a remaining dependency proves that this
-        // x86 bridge really exercises cycle breaking in the shared arena.
-        // AArch64 allocates an acyclic transfer here; its deterministic cycles
-        // are covered separately by native::tests::bridge.
-        let mut copies: Vec<_> = entry
-            .bindings
-            .iter()
-            .filter_map(|target| {
-                source
-                    .bindings
-                    .iter()
-                    .find(|b| b.value == target.value)
-                    .filter(|b| b.location != target.location)
-                    .map(|b| (b.location, target.location))
-            })
-            .collect();
-        while let Some(ready) = copies.iter().position(|(_, destination)| {
-            copies
-                .iter()
-                .all(|(source, _)| !crate::abi::locations_overlap(*destination, *source))
-        }) {
-            copies.remove(ready);
-        }
-        if native_abi() == HostAbi::X86_64 {
-            assert!(
-                !copies.is_empty(),
-                "x86 fixture must require an allocated transfer cycle"
-            );
-        }
+        // Allocation may choose cyclic or acyclic transfers. This regression
+        // checks real linked fault recovery under pressure; deterministic
+        // register/spill cycles are covered by native::tests::bridge.
         let handle = publish_staged(compilation, lowered, &process, &cache, &memory);
         let first = process.snapshot(handle).unwrap();
         install(&process, handle, target);

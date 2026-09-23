@@ -552,7 +552,20 @@ fn emit_operands(emitter: &mut Emitter, abi: HostAbi, load: bool, mut operands: 
             ValueLocation::Register { class, index } => {
                 emitter.memory_at(load, class, index, pointer, operand.offset, operand.bytes)
             }
-            ValueLocation::Spill { .. } | ValueLocation::Constant(_) => {
+            ValueLocation::Constant(value) => {
+                assert!(!load, "validated ingress cannot be a constant");
+                let part = operand.bytes.min(8);
+                for delta in (0..operand.bytes).step_by(usize::from(part)) {
+                    emitter.store_constant(
+                        pointer,
+                        operand.offset + u32::from(delta),
+                        (value.get() >> (delta * 8)) as u64,
+                        part,
+                        temporary,
+                    );
+                }
+            }
+            ValueLocation::Spill { offset, .. } => {
                 let part = operand.bytes.min(8);
                 for delta in (0..operand.bytes).step_by(usize::from(part)) {
                     if load {
@@ -565,21 +578,13 @@ fn emit_operands(emitter: &mut Emitter, abi: HostAbi, load: bool, mut operands: 
                             part,
                         );
                     } else {
-                        match operand.location {
-                            ValueLocation::Spill { offset, .. } => emitter.memory(
-                                true,
-                                RegisterClass::Integer,
-                                temporary,
-                                offset + u32::from(delta),
-                                part,
-                            ),
-                            ValueLocation::Constant(value) => emitter.constant(
-                                temporary,
-                                (value.get() >> (delta * 8)) as u64,
-                                part,
-                            ),
-                            _ => unreachable!(),
-                        }
+                        emitter.memory(
+                            true,
+                            RegisterClass::Integer,
+                            temporary,
+                            offset + u32::from(delta),
+                            part,
+                        );
                     }
                     if load {
                         let ValueLocation::Spill { offset, .. } = operand.location else {

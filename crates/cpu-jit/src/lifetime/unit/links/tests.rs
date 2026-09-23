@@ -661,6 +661,7 @@ pub(in crate::lifetime) fn source_input(process: &Lifetime, pc: u64, target: u64
                         patch_bytes: width,
                         fault_bytes: 0,
                         poll: None,
+                        subtract_flags: false,
                         values: Vec::new(),
                     }]),
                     faults: Box::new([]),

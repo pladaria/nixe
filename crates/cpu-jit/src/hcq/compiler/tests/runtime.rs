@@ -20,7 +20,139 @@ use std::sync::Arc;
 
 const ARENA: usize = 0x10000;
 
+mod flags;
 mod memory;
+
+#[test]
+fn hcq_constant_maps_cross_native_links_and_exit_canonically() {
+    // Integer/vector literals cross the published HCQ -> LCQ link directly.
+    let graph = graph(&[(
+        0x1000,
+        &[
+            0xd280_0540, // MOVZ X0,#42
+            0x9100_0400, // ADD X0,X0,#1 (folded by HCQ)
+            0x4f07_e7e0, // MOVI V0.16B,#0xff
+            0x1400_0005, // B 0x1020 (external LCQ)
+        ],
+    )]);
+    let extra = [(0x1020, &[0x9100_0401, 0x4ea0_1c01, 0xd420_0000][..])];
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        let (context, body) = emitted(&graph, &[0], abi);
+        let code = context.compiled_code().unwrap();
+        let mut found = false;
+        for (index, exit) in body.exits.iter().enumerate() {
+            let map = code
+                .buffer
+                .nixe_states
+                .iter()
+                .find(|map| !map.entry && map.id == index as u64 + 1)
+                .unwrap();
+            let state = exit
+                .state
+                .allocate(
+                    abi,
+                    CodeVersion::new(1).unwrap(),
+                    index as u32,
+                    &AllocatedBoundary::new(abi, code, map).unwrap(),
+                )
+                .unwrap();
+            if let Some(binding) = state
+                .bindings
+                .iter()
+                .find(|b| b.value == GuestValue::General(0))
+            {
+                assert_eq!(binding.location, crate::abi::ValueLocation::constant(43));
+                found = true;
+            }
+        }
+        assert!(found);
+    }
+    let (mut reader, memory) = fixture(&graph, &[0], &extra);
+    let mut worker = WorkerFaultContext::register().unwrap();
+    let mut state = A64State::default();
+    state.set_pc(0x1000);
+    let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
+    let exit = unsafe {
+        invocation::run(
+            &mut Samples::new(),
+            &mut reader,
+            &mut frame,
+            &memory,
+            &mut worker,
+            &mut ExclusiveMonitorState::default(),
+            key(0x1000),
+        )
+    }
+    .unwrap()
+    .unwrap();
+    let invocation::Exit::Native {
+        returned, guest, ..
+    } = exit
+    else {
+        panic!()
+    };
+    assert_eq!(returned.reason, NativeExitReason::Architectural);
+    assert_eq!(guest.pc.get(), 0x1028);
+    assert_eq!(frame.budget.slice_remaining, 94);
+    assert_eq!(state.general_register_storage_mut()[0], 43);
+    assert_eq!(state.general_register_storage_mut()[1], 44);
+    assert_eq!(state.vector(0), Some(u128::MAX));
+    assert_eq!(state.vector(1), Some(u128::MAX));
+}
+
+#[test]
+fn hcq_constant_maps_reconstruct_the_prefix_on_native_fault() {
+    let graph = graph(&[(
+        0x1000,
+        &[0xd280_0540, 0x4f07_e7e0, 0xf940_0022, 0xd420_0000],
+    )]);
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        let (context, _) = emitted(&graph, &[0], abi);
+        let code = context.compiled_code().unwrap();
+        assert_eq!(code.buffer.nixe_faults.len(), 1);
+        let map = &code.buffer.nixe_faults[0];
+        for bits in [[42, 0], [u64::MAX; 2]] {
+            assert!(
+                map.values.iter().any(
+                    |value| value.location == cranelift_codegen::nixe::Location::Constant(bits)
+                )
+            );
+        }
+    }
+    let (mut reader, memory) = fixture(&graph, &[0], &[]);
+    let mut worker = WorkerFaultContext::register().unwrap();
+    let mut state = A64State::default();
+    state.set_pc(0x1000);
+    state.general_register_storage_mut()[1] = 0x4000; // Unmapped, inside the arena.
+    state.general_register_storage_mut()[2] = 0x1234;
+    let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
+    let exit = unsafe {
+        invocation::run(
+            &mut Samples::new(),
+            &mut reader,
+            &mut frame,
+            &memory,
+            &mut worker,
+            &mut ExclusiveMonitorState::default(),
+            key(0x1000),
+        )
+    }
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        exit,
+        invocation::Exit::Memory {
+            outcome: invocation::MemoryExit::Fault(_),
+            ..
+        }
+    ));
+    assert_eq!(frame.execution_epoch, 0);
+    assert_eq!(frame.budget.slice_remaining, 98);
+    assert_eq!(state.pc(), 0x1008);
+    assert_eq!(state.general_register_storage_mut()[0], 42);
+    assert_eq!(state.general_register_storage_mut()[2], 0x1234);
+    assert_eq!(state.vector(0), Some(u128::MAX));
+}
 
 // Publish real code through existing lifetime machinery, without activating
 // background admission or the production HCQ publication consumer (steps 6/7).

@@ -1,13 +1,15 @@
 //! Bounded native cold control. No guest memory, host calls, FP instructions or
 //! stack changes: the active FP segment and exclusive reservation survive.
-//! All mapped SSA registers survive; infrastructure condition flags are dead.
+//! All mapped SSA registers survive. Explicit host NZCV is preserved on the
+//! cold path only; infrastructure arithmetic must not replace guest flags.
 //! Requests arriving after their acquire load wait at most another interval.
 //! The active epoch/lease prevents maintenance mutation until a genuine exit;
 //! this leaf neither acknowledges requests nor waits for a maintenance owner.
 
 use super::moves::Emitter;
 use crate::abi::{
-    HostAbi, NativeFrame, PollBudget, RegisterClass::Integer, SAMPLE_INTERVAL, TRANSFER_BYTES,
+    ExitStateMap, HostAbi, NativeFrame, NzcvLocation, PollBudget, RegisterClass::Integer,
+    SAMPLE_INTERVAL, TRANSFER_BYTES,
 };
 use std::mem::offset_of;
 
@@ -24,8 +26,13 @@ const _: () = assert!(SAMPLE_INTERVAL == 4096); // AArch64 shifted ADD immediate
 /// charge zero: the gateway reconciles the still-unmodified budget. Only the
 /// resumable sample-only path updates both balances here. The callback must not
 /// reconcile or repeat the deadline; slice/control paths bypass it entirely.
-pub(crate) fn emit_poll(abi: HostAbi) -> (Vec<u8>, [u32; 3]) {
+pub(crate) fn emit_poll(source: &ExitStateMap) -> (Vec<u8>, [u32; 3]) {
+    let abi = source.abi;
     let mut e = Emitter::new(abi);
+    let host_flags = matches!(source.nzcv, NzcvLocation::Host { .. }) && source.live.nzcv != 0;
+    if host_flags {
+        super::flags::save_host(&mut e);
+    }
     let scratch = abi.reserved().link_scratch[0];
     // Two borrowed GPRs on x86, one on Arm. Transfer scratch is disjoint from
     // allocator spills. Neither helper calls nor a transfer can overlap this leaf.
@@ -102,6 +109,9 @@ pub(crate) fn emit_poll(abi: HostAbi) -> (Vec<u8>, [u32; 3]) {
         e.memory(true, Integer, 0, SAVE, 8);
         if abi == HostAbi::X86_64 {
             e.memory(true, Integer, 1, SAVE + 8, 8);
+        }
+        if host_flags {
+            super::flags::restore_host(&mut e);
         }
         while !e.code.len().is_multiple_of(8) {
             if abi == HostAbi::X86_64 {

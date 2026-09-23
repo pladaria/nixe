@@ -35,6 +35,7 @@ fn source_with_binding(
             patch_bytes: width,
             fault_bytes: 0,
             poll: None,
+            subtract_flags: false,
             values: Vec::new(),
         })
         .collect();

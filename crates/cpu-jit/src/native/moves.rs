@@ -83,6 +83,33 @@ impl Emitter {
                     index,
                 },
             ) => {
+                if self.abi == HostAbi::X86_64
+                    && (value.get() == 0 || (bytes == 16 && value.get() == u128::MAX))
+                {
+                    // SSE2 PXOR/PCMPEQD self: exact zero/ones, no GPR flag changes.
+                    self.x64(
+                        &[0x66],
+                        false,
+                        &[0x0f, if value.get() == 0 { 0xef } else { 0x76 }],
+                        index,
+                        index,
+                        None,
+                    );
+                    return;
+                }
+                if self.abi == HostAbi::Aarch64 && bytes == 16 {
+                    let byte = value.get() as u8;
+                    if value.get() == u128::from(byte) * 0x0101_0101_0101_0101_0101_0101_0101_0101 {
+                        // MOVI Vd.16B,#imm8, independent of FP mode/status and NZCV.
+                        self.word(
+                            0x4f00e400
+                                | (u32::from(byte >> 5) << 16)
+                                | (u32::from(byte & 31) << 5)
+                                | u32::from(index),
+                        );
+                        return;
+                    }
+                }
                 self.copy(Copy {
                     source: Constant(value),
                     destination: Spill {
@@ -99,7 +126,14 @@ impl Emitter {
                 for delta in (0..bytes).step_by(usize::from(part)) {
                     match source {
                         Constant(value) => {
-                            self.constant(scratch, (value.get() >> (delta * 8)) as u64, part)
+                            self.store_constant(
+                                self.abi.reserved().frame,
+                                offset + u32::from(delta),
+                                (value.get() >> (delta * 8)) as u64,
+                                part,
+                                scratch,
+                            );
+                            continue;
                         }
                         Spill { offset, .. } => {
                             self.memory(true, Integer, scratch, offset + u32::from(delta), part)
@@ -218,6 +252,12 @@ impl Emitter {
 
     pub fn constant(&mut self, register: u8, value: u64, bytes: u8) {
         if self.abi == HostAbi::X86_64 {
+            // MOV r32, imm32 zero-extends without changing condition flags.
+            let bytes = if bytes == 8 && value <= u64::from(u32::MAX) {
+                4
+            } else {
+                bytes
+            };
             let rex = 0x40 | (u8::from(bytes == 8) << 3) | (register >> 3);
             if rex != 0x40 {
                 self.code.push(rex);
@@ -240,6 +280,19 @@ impl Emitter {
                     );
                 }
             }
+        }
+    }
+
+    pub fn store_constant(&mut self, base: u8, offset: u32, value: u64, bytes: u8, scratch: u8) {
+        // MOV r/m64, imm32 sign-extends; unlike XOR, neither MOV form clobbers flags.
+        if self.abi == HostAbi::X86_64
+            && (bytes == 4 || (bytes == 8 && value == value as i32 as i64 as u64))
+        {
+            self.x64(&[], bytes == 8, &[0xc7], 0, base, Some(offset));
+            self.code.extend_from_slice(&(value as u32).to_le_bytes());
+        } else {
+            self.constant(scratch, value, bytes);
+            self.memory_at(false, Integer, scratch, base, offset, bytes);
         }
     }
 

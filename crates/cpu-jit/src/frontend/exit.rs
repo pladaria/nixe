@@ -183,7 +183,7 @@ pub(crate) fn append_poll(
     targets: [u32; 3],
 ) -> Result<usize, Error> {
     let [resume, slice, control] = targets;
-    let (poll, branches) = crate::native::emit_poll(state.abi);
+    let (poll, branches) = crate::native::emit_poll(state);
     let start = append(bytes, &poll);
     let mut branch = map.clone();
     branch.poll = None;

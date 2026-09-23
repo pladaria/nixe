@@ -104,6 +104,7 @@ fn fast_inputs_survive_read_only_use_and_fp_activation() {
             patch_bytes: if abi == HostAbi::X86_64 { 8 } else { 4 },
             fault_bytes: 0,
             poll: None,
+            subtract_flags: false,
             values: vec![],
         }
         .patch_exit(&mut bytes, 0, u64::from(lowered.fast))

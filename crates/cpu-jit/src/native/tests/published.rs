@@ -312,6 +312,7 @@ pub(super) fn encoded(
                             patch_bytes: 0,
                             fault_bytes: 0,
                             poll: None,
+                            subtract_flags: false,
                             values: vec![],
                         })
                         .collect(),
@@ -326,6 +327,7 @@ pub(super) fn encoded(
                                 .try_into()
                                 .unwrap(),
                             poll: None,
+                            subtract_flags: false,
                             values: vec![],
                         })
                         .collect(),

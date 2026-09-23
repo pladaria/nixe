@@ -118,6 +118,7 @@ pub(crate) fn emit(
         patch_bytes: width as u8,
         fault_bytes: 0,
         poll: None,
+        subtract_flags: false,
         values: Vec::new(),
     }
     .patch_exit(&mut branch.patch, source, destination)
