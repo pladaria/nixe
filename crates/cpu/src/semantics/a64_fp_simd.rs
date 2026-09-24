@@ -1396,6 +1396,16 @@ fn convert_finite_format(
         };
     }
 
+    // Arm FPRound flushes a tiny result before rounding when FZ is set,
+    // contributing UFC alone even if rounding would produce a normal or zero.
+    // https://developer.arm.com/documentation/ddi0602/2025-12/Shared-Pseudocode/shared.functions.float.fpround.FPRound
+    if control.flush_to_zero {
+        status.underflow = true;
+        return FpLaneOutcome {
+            bits: sign_bits,
+            status,
+        };
+    }
     let minimum_subnormal = minimum_normal - destination_format.fraction_bits as i32;
     let scale_difference = source.scale - minimum_subnormal;
     let (fraction, inexact) = if scale_difference >= 0 {
@@ -1413,13 +1423,6 @@ fn convert_finite_format(
     if fraction == 1_u64 << destination_format.fraction_bits {
         return FpLaneOutcome {
             bits: sign_bits | (1_u64 << destination_format.fraction_bits),
-            status,
-        };
-    }
-    if control.flush_to_zero && fraction != 0 {
-        status.underflow = true;
-        return FpLaneOutcome {
-            bits: sign_bits,
             status,
         };
     }
@@ -1749,37 +1752,44 @@ pub fn exact_scalar_float_fused_multiply_add(
         addend.bits ^= format.sign_mask();
         addend.sign = !addend.sign;
     }
+    if negate_product {
+        multiplicand.bits ^= format.sign_mask();
+        multiplicand.sign = !multiplicand.sign;
+    }
 
     let control = FpAddControl::from_fpcr(fpcr);
     let mut status = FpStatus::default();
-    let mut invalid_product = (multiplicand.is_infinite(format) && multiplier.is_zero())
-        || (multiplier.is_infinite(format) && multiplicand.is_zero());
-    if multiplicand.is_nan(format) || multiplier.is_nan(format) || addend.is_nan(format) {
-        status.invalid_operation = invalid_product
-            || multiplicand.is_signaling_nan(format)
-            || multiplier.is_signaling_nan(format)
-            || addend.is_signaling_nan(format);
-        let bits = propagate_nan_three(
-            multiplicand,
-            multiplier,
-            addend,
-            format,
-            control.default_nan,
-        );
-        return ExactFpOutcome {
-            bits: u128::from(bits),
-            status,
-        };
-    }
-
+    // Unpack/flush all inputs before NaN processing. Sign changes also precede
+    // NaN selection; Arm's FPMulAdd operand priority is addend, rn, rm.
     for operand in [&mut multiplicand, &mut multiplier, &mut addend] {
         if control.flush_to_zero && operand.is_subnormal() {
             status.input_denormal = true;
             *operand = DecodedFloat::new(operand.bits & format.sign_mask(), format);
         }
     }
-    invalid_product = (multiplicand.is_infinite(format) && multiplier.is_zero())
+    let invalid_product = (multiplicand.is_infinite(format) && multiplier.is_zero())
         || (multiplier.is_infinite(format) && multiplicand.is_zero());
+    if multiplicand.is_nan(format) || multiplier.is_nan(format) || addend.is_nan(format) {
+        status.invalid_operation = invalid_product
+            || multiplicand.is_signaling_nan(format)
+            || multiplier.is_signaling_nan(format)
+            || addend.is_signaling_nan(format);
+        let bits = if invalid_product && !addend.is_signaling_nan(format) {
+            format.default_nan()
+        } else {
+            propagate_nan_three(
+                multiplicand,
+                multiplier,
+                addend,
+                format,
+                control.default_nan,
+            )
+        };
+        return ExactFpOutcome {
+            bits: u128::from(bits),
+            status,
+        };
+    }
 
     if invalid_product {
         status.invalid_operation = true;
@@ -1789,7 +1799,7 @@ pub fn exact_scalar_float_fused_multiply_add(
         };
     }
 
-    let product_sign = multiplicand.sign ^ multiplier.sign ^ negate_product;
+    let product_sign = multiplicand.sign ^ multiplier.sign;
     let product_is_infinite = multiplicand.is_infinite(format) || multiplier.is_infinite(format);
     if product_is_infinite {
         if addend.is_infinite(format) && addend.sign != product_sign {
@@ -1902,12 +1912,12 @@ fn propagate_nan_three(
     if default_nan {
         return format.default_nan();
     }
-    for operand in [first, second, third] {
+    for operand in [third, first, second] {
         if operand.is_signaling_nan(format) {
             return operand.bits | format.quiet_nan_bit();
         }
     }
-    for operand in [first, second, third] {
+    for operand in [third, first, second] {
         if operand.is_nan(format) {
             return operand.bits;
         }
@@ -2370,6 +2380,17 @@ fn pack_float_sum(
         };
     }
 
+    // FZ flushes the tiny exact sum/product before rounding. Inexact is not
+    // raised by that flush, even if gradual rounding would produce zero or a
+    // normal result. Shared by add, multiply and fused multiply-add.
+    // https://developer.arm.com/documentation/ddi0602/2025-12/Shared-Pseudocode/shared.functions.float.fpround.FPRound
+    if control.flush_to_zero {
+        status.underflow = true;
+        return FpLaneOutcome {
+            bits: sign_bits,
+            status,
+        };
+    }
     let minimum_subnormal = minimum_normal - format.fraction_bits as i32;
     let shift = minimum_subnormal - scale;
     let (mut fraction, remainder, denominator) = scale_integer_for_pack(magnitude, shift);
@@ -2382,13 +2403,6 @@ fn pack_float_sum(
     if fraction == 1_u64 << format.fraction_bits {
         return FpLaneOutcome {
             bits: sign_bits | (1_u64 << format.fraction_bits),
-            status,
-        };
-    }
-    if control.flush_to_zero && fraction != 0 {
-        status.underflow = true;
-        return FpLaneOutcome {
-            bits: sign_bits,
             status,
         };
     }
@@ -2922,6 +2936,16 @@ fn divide_finite(
         };
     }
 
+    // FZ handles tiny exact quotients before rounding and contributes only
+    // UFC, including when gradual rounding would produce a normal or zero.
+    // https://developer.arm.com/documentation/ddi0602/2025-12/Shared-Pseudocode/shared.functions.float.fpround.FPRound
+    if control.flush_to_zero {
+        status.underflow = true;
+        return FpLaneOutcome {
+            bits: sign_bits,
+            status,
+        };
+    }
     let minimum_subnormal = minimum_normal - format.fraction_bits as i32;
     let shift = rhs.scale - lhs.scale + minimum_subnormal;
     let (mut fraction, remainder, denominator) =
@@ -2941,13 +2965,6 @@ fn divide_finite(
     if fraction == 1_u64 << format.fraction_bits {
         return FpLaneOutcome {
             bits: sign_bits | (1_u64 << format.fraction_bits),
-            status,
-        };
-    }
-    if control.flush_to_zero && fraction != 0 {
-        status.underflow = true;
-        return FpLaneOutcome {
-            bits: sign_bits,
             status,
         };
     }
@@ -3610,7 +3627,197 @@ fn integer_compare(
 
 #[cfg(test)]
 mod tests {
-    use super::{align_fused_operands, integer_square_root, shift_lane};
+    use super::{
+        align_fused_operands, exact_float_convert, exact_scalar_float_divide, fp_status_bits,
+        integer_square_root, shift_lane,
+    };
+
+    #[test]
+    fn fused_nan_priority_sign_changes_and_invalid_product_are_architectural() {
+        use super::exact_scalar_float_fused_multiply_add as fused;
+        use crate::decode::a64::fp_simd::FloatFusedMultiplyOperation as Op;
+        for width in [32, 64] {
+            let (qnan, one, infinity, sign, epsilon_squared) = if width == 32 {
+                (
+                    0x7fc0_0000,
+                    1.0f32.to_bits() as u64,
+                    f32::INFINITY.to_bits() as u64,
+                    1 << 31,
+                    (2.0f32).powi(-46).to_bits() as u64,
+                )
+            } else {
+                (
+                    0x7ff8_0000_0000_0000,
+                    1.0f64.to_bits(),
+                    f64::INFINITY.to_bits(),
+                    1 << 63,
+                    (2.0f64).powi(-104).to_bits(),
+                )
+            };
+            let snan = qnan ^ (if width == 32 { 1 << 22 } else { 1 << 51 });
+            for (op, np, na) in [
+                (Op::MultiplyAdd, false, false),
+                (Op::MultiplySubtract, true, false),
+                (Op::NegatedMultiplyAdd, true, true),
+                (Op::NegatedMultiplySubtract, false, true),
+            ] {
+                let ns = if np { sign } else { 0 };
+                let cs = if na { sign } else { 0 };
+                for (a, b, c, result, status) in [
+                    (qnan | 1, qnan | 2, qnan | 3, (qnan | 3) ^ cs, 0),
+                    (snan | 1, one, qnan | 3, (qnan | 1) ^ ns, 1),
+                    (snan | 1, snan | 2, snan | 3, (qnan | 3) ^ cs, 1),
+                    (infinity, 0, qnan | 3, qnan, 1),
+                    (infinity, 0, snan | 3, (qnan | 3) ^ cs, 1),
+                ] {
+                    let outcome = fused(a, b, c, width, op, 0);
+                    assert_eq!(outcome.bits, u128::from(result));
+                    assert_eq!(fp_status_bits(outcome.status), status);
+                }
+                let c = one | if np == na { sign } else { 0 };
+                let outcome = fused(one + 1, one - 2, c, width, op, 0);
+                assert_eq!(
+                    outcome.bits,
+                    u128::from(epsilon_squared | if np { 0 } else { sign })
+                );
+                assert_eq!(fp_status_bits(outcome.status), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn multiplication_flushes_before_rounding_and_negates_after_rounding() {
+        use super::exact_scalar_float_multiply;
+        use crate::decode::a64::fp_simd::FloatMultiplyOperation::{Multiply, NegatedMultiply};
+        for width in [32, 64] {
+            let (minimum, half, one, one_half, sign) = if width == 32 {
+                (
+                    f32::MIN_POSITIVE.to_bits() as u64,
+                    0.5f32.to_bits() as u64,
+                    1.0f32.to_bits() as u64,
+                    1.5f32.to_bits() as u64,
+                    1 << 31,
+                )
+            } else {
+                (
+                    f64::MIN_POSITIVE.to_bits(),
+                    0.5f64.to_bits(),
+                    1.0f64.to_bits(),
+                    1.5f64.to_bits(),
+                    1 << 63,
+                )
+            };
+            for (first, second) in [
+                (minimum, half),
+                (minimum + 1, half),
+                (2 * minimum - 1, half),
+                (minimum, minimum),
+            ] {
+                for mode in 0..4 {
+                    for negative in [0, sign] {
+                        for op in [Multiply, NegatedMultiply] {
+                            let result = exact_scalar_float_multiply(
+                                first | negative,
+                                second,
+                                width,
+                                op,
+                                (mode << 22) | (1 << 24),
+                            );
+                            assert_eq!(
+                                result.bits,
+                                u128::from(negative ^ if op == NegatedMultiply { sign } else { 0 })
+                            );
+                            assert_eq!(fp_status_bits(result.status), 1 << 3);
+                        }
+                    }
+                }
+            }
+            let gradual = exact_scalar_float_multiply(2 * minimum - 1, half, width, Multiply, 0);
+            assert_eq!(gradual.bits, u128::from(minimum));
+            assert_eq!(fp_status_bits(gradual.status), 0x18);
+            let directed =
+                exact_scalar_float_multiply(one_half, one + 1, width, NegatedMultiply, 1 << 22);
+            assert_eq!(directed.bits, u128::from(sign | (one_half + 2)));
+            assert_eq!(fp_status_bits(directed.status), 1 << 4);
+        }
+    }
+
+    #[test]
+    fn division_flushes_tiny_results_before_rounding_without_inexact() {
+        for width in [32, 64] {
+            let (minimum, two, three, max, sign) = if width == 32 {
+                (
+                    f32::MIN_POSITIVE.to_bits() as u64,
+                    2.0f32.to_bits() as u64,
+                    3.0f32.to_bits() as u64,
+                    f32::MAX.to_bits() as u64,
+                    1 << 31,
+                )
+            } else {
+                (
+                    f64::MIN_POSITIVE.to_bits(),
+                    2.0f64.to_bits(),
+                    3.0f64.to_bits(),
+                    f64::MAX.to_bits(),
+                    1 << 63,
+                )
+            };
+            for (first, second) in [
+                (minimum, two),         // Exactly representable tiny quotient.
+                (minimum + 1, three),   // Inexact tiny quotient.
+                (2 * minimum - 1, two), // Rounds up to minimum normal.
+                (minimum, max),         // Rounds down to zero.
+            ] {
+                for mode in 0..4 {
+                    for sign in [0, sign] {
+                        let result = exact_scalar_float_divide(
+                            first | sign,
+                            second,
+                            width,
+                            (mode << 22) | (1 << 24),
+                        );
+                        assert_eq!(result.bits, u128::from(sign));
+                        assert_eq!(fp_status_bits(result.status), 1 << 3); // UFC only.
+                    }
+                }
+            }
+            let gradual = exact_scalar_float_divide(2 * minimum - 1, two, width, 0);
+            assert_eq!(gradual.bits, u128::from(minimum));
+            assert_eq!(fp_status_bits(gradual.status), (1 << 3) | (1 << 4));
+            let exact = exact_scalar_float_divide(minimum, two, width, 0);
+            assert_eq!(exact.bits, u128::from(minimum >> 1));
+            assert_eq!(fp_status_bits(exact.status), 0);
+        }
+    }
+
+    #[test]
+    fn precision_conversion_flushes_tiny_results_before_rounding_without_inexact() {
+        use crate::decode::a64::fp_simd::FloatConversion;
+        let minimum = f64::from(f32::MIN_POSITIVE).to_bits();
+        for bits in [
+            minimum - 1, // Would round up to a normal under nearest rounding.
+            f64::from(f32::from_bits(1)).to_bits(), // Exactly representable tiny.
+            f64::MIN_POSITIVE.to_bits(), // Would round down to zero.
+        ] {
+            for mode in 0..4 {
+                for sign in [0, 1u64 << 63] {
+                    let result = exact_float_convert(
+                        bits | sign,
+                        FloatConversion::DoubleToSingle,
+                        (mode << 22) | (1 << 24),
+                    );
+                    assert_eq!(result.bits, u128::from(sign >> 32));
+                    assert_eq!(fp_status_bits(result.status), 1 << 3); // UFC, not IXC.
+                }
+            }
+        }
+        let gradual = exact_float_convert(minimum - 1, FloatConversion::DoubleToSingle, 0);
+        assert_eq!(gradual.bits, u128::from(f32::MIN_POSITIVE.to_bits()));
+        assert_eq!(fp_status_bits(gradual.status), (1 << 3) | (1 << 4));
+        let normal = exact_float_convert(minimum, FloatConversion::DoubleToSingle, 1 << 24);
+        assert_eq!(normal.bits, u128::from(f32::MIN_POSITIVE.to_bits()));
+        assert_eq!(fp_status_bits(normal.status), 0);
+    }
 
     #[test]
     fn variable_shift_lane_handles_direction_signedness_and_extreme_distances() {

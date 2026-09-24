@@ -135,6 +135,62 @@ fn one_slice_flows_through_a_scheduler_lease() {
 }
 
 #[test]
+fn one_host_worker_alternates_cpu_backends_and_retires_either_process_first() {
+    use crate::CpuBackendConfig::{Interpreter, Jit};
+    use crate::process::tests::synthetic_memory_loop_process;
+
+    for interpreter_first in [true, false] {
+        for retire_first in [true, false] {
+            let mut coordinator = RuntimeCoordinator::new(profile());
+            let backends = if interpreter_first {
+                [Interpreter, Jit]
+            } else {
+                [Jit, Interpreter]
+            };
+            let mut ids = Vec::new();
+            for (index, backend) in backends.into_iter().enumerate() {
+                ids.push(
+                    coordinator
+                        .register_process(
+                            synthetic_memory_loop_process(index as u64 + 1, backend),
+                            registration(&coordinator),
+                        )
+                        .unwrap(),
+                );
+            }
+            let mut observed = std::collections::BTreeSet::new();
+            for _ in 0..8 {
+                let execution = coordinator.run_next(8).unwrap().unwrap();
+                observed.insert(execution.lease.process);
+                assert!(matches!(
+                    execution.report.stop,
+                    ExecutionStop::Scheduled {
+                        request: SchedulerRequest::Yield,
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(observed, ids.iter().copied().collect());
+            let removed = usize::from(!retire_first);
+            drop(coordinator.remove_process(ids[removed]).unwrap());
+            for _ in 0..3 {
+                let execution = coordinator.run_next(8).unwrap().unwrap();
+                assert_eq!(execution.lease.process, ids[1 - removed]);
+                assert!(matches!(
+                    execution.report.stop,
+                    ExecutionStop::Scheduled {
+                        request: SchedulerRequest::Yield,
+                        ..
+                    }
+                ));
+            }
+            drop(coordinator.remove_process(ids[1 - removed]).unwrap());
+            coordinator.shutdown().unwrap();
+        }
+    }
+}
+
+#[test]
 fn scheduler_hints_use_vcpu_owned_event_and_interrupt_state() {
     const WFE: u32 = 0xd503_205f;
     const WFI: u32 = 0xd503_207f;

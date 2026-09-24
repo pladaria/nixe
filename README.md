@@ -27,7 +27,45 @@ supported through the emulated HID services.
   </tr>
 </table>
 
+## Modified Cranelift backend
+
+Nixe uses a modified [Cranelift](https://cranelift.dev/) compiler to translate console instructions into native CPU code. Main changes:
+
+- **Less repeated setup:** entering and leaving a chain of compiled blocks shares one setup and cleanup step for the whole chain.
+- **Context kept close:** dedicated CPU registers keep frequently needed emulator data ready to use, for example, the guest-memory base address, the remaining instruction budget, a pointer to shared working space and more.
+- **Shared working space:** blocks use a fixed area for temporary values without growing the host stack.
+- **Multiple entry points:** execution can enter an optimized region at selected positions without duplicating its code.
+- **Fewer data transfers:** blocks know where their inputs and outputs live, so transitions move only what is needed.
+- **Direct links:** jumps in generated machine code can be patched to point directly to compiled destinations, so linked blocks jump straight to one another without returning to the emulator's control code or repeating destination lookups.
+- **Precise fault recovery data:** memory accesses carry the information needed to reconstruct the emulated CPU state if they fault.
+- **Easier maintenance:** readable compiler output and focused tests help catch regressions when updating Cranelift.
+
+See [Cranelift modifications](docs/cranelift-modifications.md) for implementation details.
+
+The production JIT uses synchronous, straight-line LCQ compilation with a
+bounded code cache and fault-aware native gateway. Resolved static branches,
+per-vCPU indirect-cache hits and matched guest returns stay native across
+blocks under one execution epoch. Replacement and invalidation unlink targets
+before reclaiming their storage. Cold misses, semantic helpers, faults and
+control boundaries retain their required canonical paths.
+
+Functional hotness sampling is active on cold paths, with fixed per-vCPU
+tables. Hot LCQ seeds are admitted to a bounded queue and promoted by a fixed
+background HCQ compiler pool (disabled on hosts with at most two logical CPUs).
+HCQ emits multi-entry regions with shared internal SSA and preserves valid
+compilation across unrelated maintenance stops; publication revalidates exact
+LCQ inputs and ownership under Open authority.
+The same pool performs evidence-driven family reshaping; versioned negative
+results suppress repeated discovery until relevant inputs change. Code and
+metadata share a bounded budget, with coordinated invalidation and reclamation.
+Cranelift comes from the published `nixe` branch of the Wasmtime fork, with the
+exact revision recorded in `Cargo.lock`. No local checkout or override is
+required. See [Cranelift modifications](docs/cranelift-modifications.md).
+
 ## Running
+
+See [host requirements](docs/host-requirements.md) for required CPU and memory
+capabilities. `--offline` is optional once dependencies are cached.
 
 The default configuration is in [`nixe.toml`](nixe.toml). List available titles with:
 

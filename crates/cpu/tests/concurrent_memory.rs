@@ -524,7 +524,9 @@ fn atomic_code_writes_wait_for_instruction_cache_maintenance() {
     let mut memory = ExecutionMemory::new();
     let page = GuestPhysicalPageId::new(77);
     assert!(memory.add_ram_page(page));
-    assert!(memory.initialize_ram(page, 0, &1_u32.to_le_bytes()));
+    memory
+        .initialize_ram(page, 0, &1_u32.to_le_bytes())
+        .unwrap();
     assert!(memory.map_page(SPACE, PRIMARY, page, MemoryPermissions::READ_WRITE_EXECUTE,));
     let cursor = memory.invalidation_cursor();
     let access = MemoryAccess::new(

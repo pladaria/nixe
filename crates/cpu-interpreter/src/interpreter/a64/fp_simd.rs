@@ -23,7 +23,7 @@ use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
 type MemoryStep = Result<(), MemoryStepError>;
 
 pub(super) fn execute(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
@@ -152,7 +152,7 @@ pub(super) fn execute(
 // ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--register---Floating-point-Move-register--
 fn vector_pair(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
 ) -> MemoryStep {
@@ -160,10 +160,12 @@ fn vector_pair(
         .expect("allocation validation rejects invalid SIMD pair sizes");
     let base = read(state, fields.rn, 64, true);
     let offset = sign_extend(u64::from(fields.immediate_7), 7) * size.bytes() as i64;
-    let transfer_base = if matches!(fields.mode, 2 | 3) {
-        base.wrapping_add_signed(offset)
-    } else {
+    // SIMD LDNP/STNP also use their signed offset without base writeback.
+    // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab#page=1083
+    let transfer_base = if fields.mode == 1 {
         base
+    } else {
+        base.wrapping_add_signed(offset)
     };
     let first = GuestVirtualAddress::new(transfer_base);
     let second = first.wrapping_add(size.bytes() as u64);
@@ -183,59 +185,40 @@ fn vector_pair(
 }
 
 fn vector_multiple_structures(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     shape: SimdMemoryShape,
     post_index: bool,
 ) -> MemoryStep {
-    let vector_size = if shape.vector_bytes == 16 {
-        MemoryAccessSize::Quadword
-    } else {
-        MemoryAccessSize::Doubleword
-    };
     let base = read(state, fields.rn, 64, true);
     let mut address = GuestVirtualAddress::new(base);
-    if shape.structure_registers == 1 {
-        for repetition in 0..shape.repetitions {
-            let register = fields.rd.wrapping_add(repetition) & 31;
-            if fields.load {
-                let value = read_vector(context, address, vector_size)?;
-                assert!(state.set_vector(register, value));
-            } else {
-                write_vector(context, address, vector_size, state, register)?;
-            }
-            address = address.wrapping_add(u64::from(shape.vector_bytes));
-        }
-    } else {
-        let lane_bits = shape.element_size.bytes() as u32 * 8;
-        for lane in 0..shape.elements_per_register {
-            for register_offset in 0..shape.structure_registers {
-                let register = fields.rd.wrapping_add(register_offset) & 31;
-                if fields.load {
-                    let value = read_vector(context, address, shape.element_size)?;
-                    insert_lane(state, register, lane, lane_bits, value);
-                } else {
-                    write_lane(
-                        context,
-                        address,
-                        shape.element_size,
-                        vector_lane(state, register, lane, lane_bits),
-                    )?;
-                }
-                address = address.wrapping_add(shape.element_size.bytes() as u64);
-            }
-        }
-        if !fields.vector_128 && fields.load {
-            for register_offset in 0..shape.structure_registers {
-                let register = fields.rd.wrapping_add(register_offset) & 31;
-                let value = state
-                    .vector(register)
-                    .expect("normalized multiple-structure destination register")
-                    & u128::from(u64::MAX);
+    let lane_bits = shape.element_size.bytes() as u32 * 8;
+    // LD1 also commits each element, not each complete vector. In
+    // particular, a page-boundary fault can leave a partially loaded Vt.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85#page=1544
+    for index in 0..shape.transfer_bytes / shape.element_size.bytes() as u8 {
+        let (register_offset, lane) = shape.multiple_element(index);
+        let register = fields.rd.wrapping_add(register_offset) & 31;
+        if fields.load {
+            let value = read_vector(context, address, shape.element_size)?;
+            insert_lane(state, register, lane, lane_bits, value);
+            // V[t,datasize] is written per successful element, including
+            // clearing bits above datasize before any later access faults.
+            // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+            if !fields.vector_128 && lane == 0 {
+                let value = state.vector(register).unwrap() & u128::from(u64::MAX);
                 assert!(state.set_vector(register, value));
             }
+        } else {
+            write_lane(
+                context,
+                address,
+                shape.element_size,
+                vector_lane(state, register, lane, lane_bits),
+            )?;
         }
+        address = address.wrapping_add(shape.element_size.bytes() as u64);
     }
     if post_index {
         let offset = if fields.rm == 31 {
@@ -249,7 +232,7 @@ fn vector_multiple_structures(
 }
 
 fn vector_single_structure(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     shape: SimdMemoryShape,
@@ -313,7 +296,7 @@ fn insert_lane(state: &mut A64State, register: u8, lane: u8, lane_bits: u32, val
 }
 
 fn write_lane(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     value: u128,
@@ -329,7 +312,7 @@ fn write_lane(
 }
 
 fn vector_transfer(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     address: GuestVirtualAddress,
@@ -345,7 +328,7 @@ fn vector_transfer(
 }
 
 fn read_vector(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
 ) -> Result<u128, MemoryStepError> {
@@ -360,7 +343,7 @@ fn read_vector(
 }
 
 fn write_vector(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     state: &A64State,

@@ -66,7 +66,7 @@ impl TestServices {
         &'a self,
         process: ProcessCpuContext,
         memory: &'a dyn CpuMemory,
-    ) -> InterpreterContext<'a> {
+    ) -> InterpreterContext<'a, 'a> {
         InterpreterContext::new(process, memory, &self.monitor, &self.timer, &self.events)
     }
 }
@@ -2911,6 +2911,67 @@ fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
 }
 
 #[test]
+fn a64_interleaved_load_fault_retains_completed_lanes_and_clears_upper_bits() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(55);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(102);
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.initialize_ram(PAGE, 0, &[0x12; 4096]));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE
+    ));
+    let services = TestServices::default();
+    let context = services.context(
+        ProcessCpuContext::new(TargetPlatform::Switch1, SPACE),
+        &memory,
+    );
+    for (opcode, count) in [(8, 2), (4, 3), (0, 4)] {
+        for size in 0..3 {
+            // Fail at every element boundary in the 64-bit form. This includes
+            // failure before a register's first read and after later lanes.
+            let bytes = 1_usize << size;
+            for completed in 0..count * (8 / bytes) {
+                let mut state = A64State::default();
+                state.set_pc(0x100);
+                for register in 0..32 {
+                    assert!(state.set_vector(register, u128::MAX));
+                }
+                let base = 0x2000 - (completed * bytes) as u64;
+                state.general_register_storage_mut()[1] = base;
+                let word = 0x0cdf_003f | (opcode << 12) | (size << 10);
+                assert!(matches!(
+                    execute_one_with_context(context, &mut state, word).unwrap(),
+                    InstructionStep::Exit(CpuExit::DataFault { .. })
+                ));
+                assert_eq!(state.pc(), 0x100);
+                assert_eq!(state.general_register_storage_mut()[1], base);
+                let mut expected = [u128::MAX; 32];
+                for index in 0..completed {
+                    let register = (31 + index % count) & 31;
+                    let lane = index / count;
+                    for byte in 0..bytes {
+                        let shift = (lane * bytes + byte) * 8;
+                        expected[register] =
+                            (expected[register] & !(0xff_u128 << shift)) | (0x12_u128 << shift);
+                    }
+                    expected[register] &= u128::from(u64::MAX);
+                }
+                for (register, value) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        state.vector(register as u8),
+                        Some(value),
+                        "opcode={opcode} size={size} completed={completed} V{register}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a64_simd_ld1_st1_single_structure_transfers_selected_lanes() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(55);
     const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(102);
@@ -3215,6 +3276,85 @@ fn a64_simd_ld1_st1_multiple_structures_transfer_consecutive_registers() {
 }
 
 #[test]
+fn a64_simd_contiguous_structures_commit_each_element_before_abort() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(53);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(100);
+    // Independent expected byte layout, not the shared structure-index helper.
+    for (opcode, registers) in [(7, 1), (10, 2), (6, 3), (2, 4)] {
+        for full in [false, true] {
+            for size in 0..4 {
+                let vector_bytes = if full { 16 } else { 8 };
+                let element_bytes = 1 << size;
+                let elements = registers * vector_bytes / element_bytes;
+                for load in [false, true] {
+                    for completed in 0..elements {
+                        let mut memory = SyntheticMemory::new();
+                        assert!(memory.add_ram_page(PAGE));
+                        assert!(memory.initialize_ram(PAGE, 0, &[0x92; 4096]));
+                        assert!(memory.map_page(
+                            SPACE,
+                            GuestVirtualAddress::new(0x1000),
+                            PAGE,
+                            MemoryPermissions::READ_WRITE
+                        ));
+                        let services = TestServices::default();
+                        let context = services.context(
+                            ProcessCpuContext::new(TargetPlatform::Switch1, SPACE),
+                            &memory,
+                        );
+                        let mut state = A64State::default();
+                        state.set_pc(0x4000);
+                        let prefix = completed * element_bytes;
+                        let base = 0x2000 - prefix as u64;
+                        state.write_x(x(1), base);
+                        for register in 0..32 {
+                            state.set_vector(
+                                register,
+                                u128::from_le_bytes(std::array::from_fn(|byte| {
+                                    0x40 + byte as u8 + register
+                                })),
+                            );
+                        }
+                        let mut expected = state.clone();
+                        let mut expected_bytes = vec![0x92; prefix];
+                        for (byte, expected_byte) in expected_bytes.iter_mut().enumerate() {
+                            let register = ((31 + byte / vector_bytes) & 31) as u8;
+                            let lane_byte = byte % vector_bytes;
+                            if load {
+                                let mut vector = expected.vector(register).unwrap().to_le_bytes();
+                                vector[lane_byte] = 0x92;
+                                if !full {
+                                    vector[8..].fill(0);
+                                }
+                                expected.set_vector(register, u128::from_le_bytes(vector));
+                            } else {
+                                *expected_byte =
+                                    expected.vector(register).unwrap().to_le_bytes()[lane_byte];
+                            }
+                        }
+                        let word = 0x0c9f_003f
+                            | (u32::from(full) << 30)
+                            | (u32::from(load) << 22)
+                            | (opcode << 12)
+                            | (size << 10);
+                        assert!(matches!(
+                            execute_one_with_context(context, &mut state, word).unwrap(),
+                            InstructionStep::Exit(CpuExit::DataFault { .. })
+                        ));
+                        assert_eq!(state, expected, "word={word:08x} completed={completed}");
+                        let mut observed = vec![0; prefix];
+                        memory
+                            .read_bytes(SPACE, GuestVirtualAddress::new(base), &mut observed)
+                            .unwrap();
+                        assert_eq!(observed, expected_bytes);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a64_simd_ld1_post_index_suppresses_writeback_on_data_abort() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(53);
     const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(100);
@@ -3493,6 +3633,65 @@ fn a64_memory_reference_semantics_use_process_address_space_and_report_faults() 
             .value,
         MemoryValue::U8(0xab),
     );
+}
+
+#[test]
+fn a64_non_temporal_pairs_apply_offsets_for_scalar_and_vector_transfers() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(45);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(92);
+    let process = ProcessCpuContext::new(TargetPlatform::Switch1, SPACE);
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE
+    ));
+    assert!(memory.initialize_ram(PAGE, 8, &0x1122_3344_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(PAGE, 12, &0xaabb_ccdd_u32.to_le_bytes()));
+    let services = TestServices::default();
+    for vector in [false, true] {
+        let mut state = A64State::default();
+        state.write_x(x(1), 0x1000);
+        let form = if vector { 0x2c00_0000 } else { 0x2800_0000 };
+        // LDNP W0,W2 / S0,S2,[X1,#8]. Offset is applied without writeback.
+        execute_one_with_context(
+            services.context(process, &memory),
+            &mut state,
+            form | (1 << 22) | (2 << 15) | (2 << 10) | (1 << 5),
+        )
+        .unwrap();
+        if vector {
+            assert_eq!(state.vector(0), Some(0x1122_3344));
+            assert_eq!(state.vector(2), Some(0xaabb_ccdd));
+        } else {
+            assert_eq!(state.read_x(x(0)), 0x1122_3344);
+            assert_eq!(state.read_x(x(2)), 0xaabb_ccdd);
+        }
+        assert_eq!(state.read_x(x(1)), 0x1000);
+        // STNP to #24; the old bug overwrote the zero bytes at the base.
+        execute_one_with_context(
+            services.context(process, &memory),
+            &mut state,
+            form | (6 << 15) | (2 << 10) | (1 << 5),
+        )
+        .unwrap();
+        for (offset, expected) in [(0, 0), (4, 0), (24, 0x1122_3344), (28, 0xaabb_ccdd)] {
+            assert_eq!(
+                memory
+                    .read(
+                        SPACE,
+                        GuestVirtualAddress::new(0x1000 + offset),
+                        MemoryAccess::normal(MemoryAccessSize::Word)
+                    )
+                    .unwrap()
+                    .value,
+                MemoryValue::U32(expected)
+            );
+        }
+        assert_eq!(state.read_x(x(1)), 0x1000);
+    }
 }
 
 #[test]

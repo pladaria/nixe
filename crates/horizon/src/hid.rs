@@ -156,9 +156,11 @@ impl HidSystem {
             let Some(address) = base.checked_add(offset as u64) else {
                 return Err(HandleError::InvalidRange);
             };
-            if !memory.overwrite_mapped_ram(address_space, address, &bytes) {
-                return Err(HandleError::InvalidRange);
-            }
+            memory
+                .overwrite_mapped_ram(address_space, address, &bytes)
+                .map_err(|error| {
+                    HandleError::MemoryWrite(format!("host memory write failed: {error:?}").into())
+                })?;
         }
         Ok(())
     }
@@ -369,6 +371,44 @@ mod tests {
     use nixe_input::{EmulatedButtonState, MotionVector, StickState};
 
     use super::*;
+
+    #[test]
+    fn synchronization_preserves_the_memory_coordinator_failure() {
+        use nixe_cpu::memory::{MemoryMappingPurpose, MemoryPermissions, ProcessMemory};
+        use nixe_memory::{ExecutionMutation, ExecutionMutationError, ExecutionMutationObserver};
+        use std::sync::Arc;
+        struct Reject;
+        impl ExecutionMutationObserver for Reject {
+            fn begin(
+                self: Arc<Self>,
+                _: &[nixe_memory::MemoryInvalidationKind],
+            ) -> Result<Box<dyn ExecutionMutation>, ExecutionMutationError> {
+                Err(ExecutionMutationError(
+                    "HID host write stop rejected".into(),
+                ))
+            }
+        }
+        let space = AddressSpaceId::new(1);
+        let base = GuestVirtualAddress::new(0x1000);
+        let memory = ExecutionMemory::new();
+        memory
+            .resize_zeroed_mapping(
+                space,
+                base,
+                0,
+                HID_SHARED_MEMORY_SIZE as u64,
+                MemoryPermissions::READ_EXECUTE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        memory.set_mutation_observer(Arc::new(Reject)).unwrap();
+        let mut hid = HidSystem::new();
+        hid.register_mapping(space, base);
+        let error = hid.synchronize(&memory).unwrap_err();
+        assert!(matches!(&error, HandleError::MemoryWrite(_)));
+        assert!(error.to_string().contains("HID host write stop rejected"));
+        assert!(!memory.mapping_mutation_pending());
+    }
 
     fn read_u32(memory: &SharedMemoryObject, offset: usize) -> u32 {
         let mut bytes = [0; 4];

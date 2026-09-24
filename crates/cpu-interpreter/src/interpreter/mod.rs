@@ -61,16 +61,16 @@ impl InstructionStep {
 
 /// Concrete services available to every production interpreter instruction.
 #[derive(Clone, Copy)]
-pub struct InterpreterContext<'a> {
+pub struct InterpreterContext<'a, 'worker> {
     process: ProcessCpuContext,
     memory: &'a dyn CpuMemory,
     exclusive_monitor: &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
     architectural_timer: &'a dyn ArchitecturalTimer,
     events: &'a VcpuEventState,
-    direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
+    direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemorySlice<'worker>>>,
 }
 
-impl<'a> InterpreterContext<'a> {
+impl<'a, 'worker> InterpreterContext<'a, 'worker> {
     #[must_use]
     pub const fn new(
         process: ProcessCpuContext,
@@ -91,7 +91,7 @@ impl<'a> InterpreterContext<'a> {
 
     pub(crate) const fn with_direct_memory(
         mut self,
-        direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
+        direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemorySlice<'worker>>>,
     ) -> Self {
         self.direct_memory = direct_memory;
         self
@@ -127,7 +127,7 @@ impl<'a> InterpreterContext<'a> {
     #[must_use]
     pub(crate) const fn direct_memory(
         self,
-    ) -> Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>> {
+    ) -> Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemorySlice<'worker>>> {
         self.direct_memory
     }
 }
@@ -218,7 +218,7 @@ pub fn execute_one(
 
 /// Executes one instruction with process address-space and memory services.
 pub fn execute_one_with_context(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     encoding: u32,
 ) -> Result<InstructionStep, InterpreterError> {
@@ -252,7 +252,7 @@ pub fn execute_one_with_context(
 }
 
 pub(crate) fn execute_decoded(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> Result<InstructionStep, InterpreterError> {

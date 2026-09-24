@@ -13,7 +13,7 @@ use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
 use nixe_cpu::execution::SchedulerRequest;
 
 pub(super) fn execute(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
@@ -58,7 +58,7 @@ fn execute_hint(fields: Operands) -> bool {
 }
 
 fn execute_architectural_hint(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     operation: HintOperation,
@@ -102,7 +102,11 @@ fn execute_architectural_hint(
     Ok(InstructionStep::Continue)
 }
 
-fn execute_mrs(context: InterpreterContext<'_>, state: &mut A64State, fields: Operands) -> bool {
+fn execute_mrs(
+    context: InterpreterContext<'_, '_>,
+    state: &mut A64State,
+    fields: Operands,
+) -> bool {
     let value = match fields.system_key {
         0xd53b_4200 => u64::from(state.nzcv().bits()),
         0xd53b_4400 => u64::from(state.fpcr()),
@@ -143,7 +147,7 @@ fn execute_msr(state: &mut A64State, fields: Operands) -> bool {
     true
 }
 
-fn execute_barrier(context: InterpreterContext<'_>, fields: Operands) -> bool {
+fn execute_barrier(context: InterpreterContext<'_, '_>, fields: Operands) -> bool {
     let Some(operation) =
         nixe_cpu::semantics::a64::barrier_operation(fields.barrier_opcode, fields.barrier_option)
     else {
@@ -154,7 +158,7 @@ fn execute_barrier(context: InterpreterContext<'_>, fields: Operands) -> bool {
 }
 
 fn execute_system(
-    context: InterpreterContext<'_>,
+    context: InterpreterContext<'_, '_>,
     state: &A64State,
     fields: Operands,
 ) -> Result<bool, nixe_cpu::memory::DataAccessFault> {

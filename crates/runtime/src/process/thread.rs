@@ -52,6 +52,8 @@ pub struct GuestThread {
     pub(crate) object: ThreadObject,
     pub(crate) exit: Option<ThreadExit>,
     pub(crate) state: Option<ThreadCpuState>,
+    /// Moves with architectural state, not with the worker/vCPU's JIT cache.
+    pub(crate) jit_returns: Option<Box<nixe_cpu_jit::ReturnStack>>,
     pub handle: u32,
     pub stack_bottom: GuestVirtualAddress,
     pub stack_top: GuestVirtualAddress,
@@ -94,15 +96,25 @@ impl GuestThread {
             .expect("thread state is unavailable only while its scheduler lease runs")
     }
 
-    pub(crate) fn take_state(&mut self) -> Option<ThreadCpuState> {
-        self.state.take()
+    pub(crate) fn take_state(
+        &mut self,
+    ) -> Option<(ThreadCpuState, Option<Box<nixe_cpu_jit::ReturnStack>>)> {
+        self.state
+            .take()
+            .map(|state| (state, self.jit_returns.take()))
     }
 
-    pub(crate) fn restore_state(&mut self, state: ThreadCpuState) {
+    pub(crate) fn restore_state(
+        &mut self,
+        state: ThreadCpuState,
+        returns: Option<Box<nixe_cpu_jit::ReturnStack>>,
+    ) {
         assert!(
             self.state.replace(state).is_none(),
             "a scheduler lease restores thread state exactly once"
         );
+        assert!(self.jit_returns.is_none());
+        self.jit_returns = returns;
     }
 }
 
@@ -203,6 +215,7 @@ mod tests {
             object: ThreadObject::new(id),
             exit: None,
             state: Some(ThreadCpuState::default()),
+            jit_returns: None,
             handle: 0,
             stack_bottom: GuestVirtualAddress::new(0),
             stack_top: GuestVirtualAddress::new(0),
@@ -210,6 +223,28 @@ mod tests {
             abi_context: None,
             loader_return: None,
         }
+    }
+
+    #[test]
+    fn architectural_and_prediction_owners_are_taken_and_restored_together() {
+        let mut guest = thread(7);
+        guest.jit_returns = Some(Box::default());
+        let original = std::ptr::from_ref(guest.jit_returns.as_deref().unwrap());
+        let copy = guest.clone();
+        assert_ne!(
+            std::ptr::from_ref(copy.jit_returns.as_deref().unwrap()),
+            original
+        );
+        let (state, returns) = guest.take_state().unwrap();
+        assert!(guest.take_state().is_none());
+        assert!(guest.jit_returns.is_none());
+        assert_eq!(std::ptr::from_ref(returns.as_deref().unwrap()), original);
+        guest.restore_state(state, returns);
+        assert_eq!(
+            std::ptr::from_ref(guest.jit_returns.as_deref().unwrap()),
+            original
+        );
+        assert_eq!(guest, copy);
     }
 
     #[test]

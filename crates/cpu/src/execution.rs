@@ -108,7 +108,6 @@ pub struct RunRequest<'a> {
     /// Exact instruction limit for the interpreter. The normal JIT uses
     /// control-driven entry and backedge synchronization instead.
     pub instruction_budget: u64,
-    pub loader_return: Option<GuestVirtualAddress>,
     pub timer: &'a dyn ArchitecturalTimer,
     pub events: VcpuEventState,
 }
@@ -149,6 +148,8 @@ pub enum CpuExit {
         source: LocationDescriptor,
         fault: DataAccessFault,
     },
+    /// Runtime classification of a completed loader-stub SVC. CPU backends
+    /// report the ordinary SupervisorCall and do not recognize loader addresses.
     LoaderReturn {
         source: LocationDescriptor,
         result_code: u64,
@@ -266,8 +267,9 @@ impl Display for CpuExit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionReport {
-    /// Backend-defined coarse forward progress. The interpreter reports exact
-    /// instructions; the normal JIT reports completed native boundaries.
+    /// Completed guest instructions. The interpreter checks its budget after
+    /// each instruction; the JIT accounts at block/observation boundaries and
+    /// may overshoot a slice budget by the remaining work in a bounded block.
     pub progress: u64,
     pub stop: CpuExit,
     /// Exact architectural state at the reported stop, when the frontend can
