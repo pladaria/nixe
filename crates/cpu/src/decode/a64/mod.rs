@@ -52,7 +52,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0022..=0x0000_002f | 0x0000_005e..=0x0000_005f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a1 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a2 => {
             A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -171,5 +171,56 @@ mod tests {
                 assert_eq!(support, pattern.decoder);
             }
         }
+    }
+
+    #[test]
+    fn fmla_element_decodes_cube_operands_and_rejects_reserved_double_shapes() {
+        let platform = TargetPlatform::Switch1;
+        let location =
+            LocationDescriptor::new(GuestVirtualAddress::new(0x7100_2064), platform.profile_id());
+        for (word, wide, full, lane, subtract) in [
+            (0x4f99_12fb, false, true, 0, false),
+            (0x0fb9_5afb, false, false, 3, true),
+            (0x4fd9_1afb, true, true, 1, false),
+        ] {
+            let DecodeResult::Decoded(decoded) =
+                decode(platform, location, InstructionEncoding::from_u32(word))
+            else {
+                panic!("{word:08x}")
+            };
+            let A64Instruction::FpSimd(fp_simd::Instruction::VectorFloatFusedElement(fields)) =
+                normalize(&decoded.instruction, InstructionEncoding::from_u32(word))
+            else {
+                panic!("{decoded:?}")
+            };
+            assert_eq!((fields.rd, fields.rn, fields.rm), (27, 23, 25));
+            assert_eq!(fields.opc, u8::from(wide));
+            assert_eq!(fields.vector_128, full);
+            assert_eq!(fields.fp_element_lane, lane);
+            assert_eq!(fields.subtract, subtract);
+        }
+        for word in [0x0fd9_12fb, 0x4ff9_12fb] {
+            let decoded = decode(platform, location, InstructionEncoding::from_u32(word));
+            assert!(
+                !matches!(decoded, DecodeResult::Decoded(_)),
+                "{word:08x}: {decoded:?}"
+            );
+            assert!(matches!(
+                crate::decode::allocation::validate_a64(
+                    crate::coverage::CoverageId::new(0xa2),
+                    word
+                ),
+                crate::decode::table::AllocationStatus::Reserved(_)
+            ));
+        }
+        // Optional half-precision must not accidentally execute as binary32.
+        assert!(!matches!(
+            decode(
+                platform,
+                location,
+                InstructionEncoding::from_u32(0x4f19_12fb)
+            ),
+            DecodeResult::Decoded(_)
+        ));
     }
 }

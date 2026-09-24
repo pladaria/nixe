@@ -916,6 +916,18 @@ pub struct VectorFpMultiplyElementOperation {
     pub lane: u8,
 }
 
+/// Exact FMLA/FMLS reads the accumulator from Rd in canonical PRE-state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VectorFpFusedElementOperation {
+    pub rn: u8,
+    pub rm: u8,
+    pub rd: u8,
+    pub lane_64: bool,
+    pub vector_128: bool,
+    pub lane: u8,
+    pub subtract: bool,
+}
+
 /// Typed exact scalar FMUL/FNMUL over canonical PRE-state operands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FpMultiplyOperation {

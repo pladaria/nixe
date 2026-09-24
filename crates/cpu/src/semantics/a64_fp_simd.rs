@@ -259,6 +259,26 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             state.set_fpsr(state.fpsr() | fp_status_bits(status));
             Ok(())
         }
+        Instruction::VectorFloatFusedElement(_) => {
+            let outcome = exact_vector_float_fused_element(
+                state.vector(fields.rn).unwrap(),
+                state.vector(fields.rm).unwrap(),
+                state.vector(fields.rd).unwrap(),
+                (
+                    if fields.opc == 0 { 32 } else { 64 },
+                    if fields.vector_128 { 128 } else { 64 },
+                ),
+                fields.fp_element_lane,
+                fields.subtract,
+                state.fpcr(),
+            );
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(A64FpSimdError::Trap);
+            }
+            assert!(state.set_vector(fields.rd, outcome.bits));
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+            Ok(())
+        }
         Instruction::VectorFloatImmediate(_) => {
             vector_float_immediate(state, fields);
             Ok(())
@@ -1524,6 +1544,50 @@ pub fn exact_vector_float_divide(
     }
 }
 
+/// FMLA/FMLS perform one fused rounding per active lane, reading the full Rm
+/// before writing any destination lane. The shape is (lane bits, vector bits).
+/// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMLA--by-element---Floating-point-fused-Multiply-Add-to-accumulator--by-element--
+pub fn exact_vector_float_fused_element(
+    lhs: u128,
+    rhs: u128,
+    accumulator: u128,
+    shape: (u8, u8),
+    lane: u8,
+    subtract: bool,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let (lane_bits, vector_bits) = shape;
+    let mask = if lane_bits == 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    let multiplier = (rhs >> (u32::from(lane) * u32::from(lane_bits))) as u64 & mask;
+    let operation = if subtract {
+        FloatFusedMultiplyOperation::MultiplySubtract
+    } else {
+        FloatFusedMultiplyOperation::MultiplyAdd
+    };
+    let mut result = 0;
+    let mut status = FpStatus::default();
+    for shift in (0..u32::from(vector_bits)).step_by(usize::from(lane_bits)) {
+        let outcome = exact_scalar_float_fused_multiply_add(
+            (lhs >> shift) as u64 & mask,
+            multiplier,
+            (accumulator >> shift) as u64 & mask,
+            lane_bits,
+            operation,
+            fpcr,
+        );
+        result |= outcome.bits << shift;
+        merge_fp_status(&mut status, outcome.status);
+    }
+    ExactFpOutcome {
+        bits: result,
+        status,
+    }
+}
+
 fn vector_float_multiply_element(
     state: &A64State,
     fields: crate::decode::a64::fp_simd::Operands,
@@ -1876,6 +1940,14 @@ fn align_fused_operands(
     addend: u128,
     addend_scale: i32,
 ) -> (u128, u128, i32) {
+    // Zero has no significant exponent. Do not shift it by the potentially
+    // unbounded exponent distance of the other operand.
+    if product == 0 {
+        return (0, addend, addend_scale);
+    }
+    if addend == 0 {
+        return (product, 0, product_scale);
+    }
     let exact_scale = product_scale.min(addend_scale);
     let product_shift = (product_scale - exact_scale) as u32;
     let addend_shift = (addend_scale - exact_scale) as u32;
@@ -3683,6 +3755,45 @@ mod tests {
                 assert_eq!(fp_status_bits(outcome.status), 0);
             }
         }
+    }
+
+    #[test]
+    fn fused_zero_alignment_does_not_shift_by_an_unbounded_exponent() {
+        assert_eq!(align_fused_operands(0, -2000, 1, 1000), (0, 1, 1000));
+        assert_eq!(align_fused_operands(1, 1000, 0, -2000), (1, 0, 1000));
+        assert_eq!(align_fused_operands(0, 1000, 1, -2000), (0, 1, -2000));
+        assert_eq!(align_fused_operands(1, -2000, 0, 1000), (1, 0, -2000));
+    }
+
+    #[test]
+    fn fused_element_rounds_once_and_ignores_inactive_nan_lanes() {
+        let pack = |a: u32, b: u32| u128::from(a) | (u128::from(b) << 32);
+        let first = pack(0x3f80_0001, 0x3f80_0001) | (u128::MAX << 64);
+        let second = u128::from(0x3f7f_fffe_u32) << 96;
+        let accumulator = pack((-1.0_f32).to_bits(), (-1.0_f32).to_bits()) | (u128::MAX << 64);
+        let result = super::exact_vector_float_fused_element(
+            first,
+            second,
+            accumulator,
+            (32, 64),
+            3,
+            false,
+            0,
+        );
+        let expected = (-2.0_f32.powi(-46)).to_bits();
+        assert_eq!(result.bits, pack(expected, expected));
+        assert_eq!(fp_status_bits(result.status), 0);
+        let result = super::exact_vector_float_fused_element(
+            first,
+            second,
+            pack(1.0_f32.to_bits(), 1.0_f32.to_bits()),
+            (32, 64),
+            3,
+            true,
+            0,
+        );
+        let expected = 2.0_f32.powi(-46).to_bits();
+        assert_eq!(result.bits, pack(expected, expected));
     }
 
     #[test]

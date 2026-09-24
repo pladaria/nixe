@@ -183,6 +183,13 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
             }
         }
         0x0000_009c | 0x0000_009d | 0x0000_00a1 => validate_a64_simd_float_vector(bits),
+        0x0000_00a2 => {
+            if bits & (1 << 22) != 0 && bits & (1 << 21) != 0 {
+                AllocationStatus::Reserved("double-precision by-element FMA requires L=0")
+            } else {
+                validate_a64_simd_float_vector(bits)
+            }
+        }
         0x0000_009e | 0x0000_009f => {
             let scale = ((bits >> 10) & 0x3f) as u8;
             if !sf && scale < 32 {

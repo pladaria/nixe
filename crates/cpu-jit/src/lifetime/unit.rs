@@ -124,6 +124,7 @@ pub(crate) enum EdgeKind {
     FpDivide(crate::abi::FpDivideOperation),
     VectorFpDivide(crate::abi::VectorFpDivideOperation),
     VectorFpMultiplyElement(crate::abi::VectorFpMultiplyElementOperation),
+    VectorFpFusedElement(crate::abi::VectorFpFusedElementOperation),
     FpMultiply(crate::abi::FpMultiplyOperation),
     FpFused(crate::abi::FpFusedOperation),
     FpUnary(crate::abi::FpUnaryOperation),

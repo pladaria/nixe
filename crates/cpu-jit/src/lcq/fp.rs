@@ -41,6 +41,7 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
                 | Instruction::ScalarFloatDivide(_)
                 | Instruction::VectorFloatDivide(_)
                 | Instruction::VectorFloatMultiplyElement(_)
+                | Instruction::VectorFloatFusedElement(_)
                 | Instruction::ScalarFloatMultiply(_)
                 | Instruction::ScalarFloatFusedMultiplyAdd(_)
                 | Instruction::ScalarFloatSquareRoot(_)
@@ -385,6 +386,43 @@ pub(crate) fn complete_vector_multiply_element(
         if operation.lane_64 { 64 } else { 32 },
         if operation.vector_128 { 128 } else { 64 },
         operation.lane,
+        state.fpcr(),
+    );
+    if fp_status_traps(result.status, state.fpcr()) {
+        return Err(CompletionError::Trap(result.status));
+    }
+    state.set_vector(operation.rd, result.bits);
+    state.set_fpsr(state.fpsr() | fp_status_bits(result.status));
+    state.set_pc(state.pc().wrapping_add(4));
+    Ok(())
+}
+
+/// Complete all FMLA/FMLS lanes atomically after leaving the native FP region.
+/// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMLA--by-element---Floating-point-fused-Multiply-Add-to-accumulator--by-element--
+pub(crate) fn complete_vector_fused_element(
+    operation: crate::abi::VectorFpFusedElementOperation,
+    state: &mut A64State,
+) -> Result<(), CompletionError> {
+    if operation.rn >= 32
+        || operation.rm >= 32
+        || operation.rd >= 32
+        || (operation.lane_64 && !operation.vector_128)
+        || operation.lane >= if operation.lane_64 { 2 } else { 4 }
+    {
+        return Err(CompletionError::Invalid(Error::internal(
+            "invalid exact vector FMA operands",
+        )));
+    }
+    let result = nixe_cpu::semantics::a64_fp_simd::exact_vector_float_fused_element(
+        state.vector(operation.rn).unwrap(),
+        state.vector(operation.rm).unwrap(),
+        state.vector(operation.rd).unwrap(),
+        (
+            if operation.lane_64 { 64 } else { 32 },
+            if operation.vector_128 { 128 } else { 64 },
+        ),
+        operation.lane,
+        operation.subtract,
         state.fpcr(),
     );
     if fp_status_traps(result.status, state.fpcr()) {

@@ -24,6 +24,79 @@ mod flags;
 mod memory;
 
 #[test]
+fn hcq_fused_element_reads_and_updates_the_vector_accumulator() {
+    #[cfg(target_arch = "x86_64")]
+    if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
+        // Baseline x86 terminates capture at each exact FMA boundary, covered
+        // by the LCQ typed-completion tests instead of this native HCQ graph.
+        return;
+    }
+    use nixe_cpu_interpreter::execute_one;
+    let words = [0x4f99_12fb, 0x4f99_5afb, 0xd420_0000];
+    let graph = graph(&[(0x1000, &words)]);
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        if abi == HostAbi::X86_64 && !cfg!(target_arch = "x86_64") {
+            // A foreign baseline x86 target has no FMA feature. Its exact
+            // boundaries are not the native multi-instruction graph tested here.
+            continue;
+        }
+        let _ = staged(&graph, &[0], abi, CodeVersion::new(1).unwrap());
+    }
+    let (mut reader, memory) = fixture(&graph, &[0], &[]);
+    let mut worker = WorkerFaultContext::register().unwrap();
+    let mut state = A64State::default();
+    state.set_pc(0x1000);
+    state.set_fpsr(1 << 27);
+    let pack = |lanes: [f32; 4]| {
+        lanes
+            .into_iter()
+            .enumerate()
+            .fold(0, |v, (i, x)| v | (u128::from(x.to_bits()) << (32 * i)))
+    };
+    state.set_vector(23, pack([1.5, 2.5, 3.5, 4.5]));
+    state.set_vector(25, pack([2.0, 3.0, 4.0, 5.0]));
+    state.set_vector(27, pack([0.5; 4]));
+    let mut expected = state.clone();
+    for word in &words[..2] {
+        execute_one(
+            &nixe_cpu::platform::TargetPlatform::Switch1,
+            &mut expected,
+            *word,
+        )
+        .unwrap();
+    }
+    loop {
+        let entry = key(state.pc());
+        let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
+        let exit = unsafe {
+            invocation::run(
+                &mut Samples::new(),
+                &mut reader,
+                &mut frame,
+                &memory,
+                &mut worker,
+                &mut ExclusiveMonitorState::default(),
+                entry,
+            )
+        }
+        .unwrap()
+        .unwrap();
+        let invocation::Exit::Native { guest, .. } = exit else {
+            panic!("expected native exit")
+        };
+        match guest.kind {
+            EdgeKind::VectorFpFusedElement(operation) => {
+                crate::lcq::fp::complete_vector_fused_element(operation, &mut state).unwrap()
+            }
+            EdgeKind::Breakpoint(0) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(state, expected);
+    assert_eq!(state.vector(27), Some(pack([-2.5, -4.5, -6.5, -8.5])));
+}
+
+#[test]
 fn hcq_constant_maps_cross_native_links_and_exit_canonically() {
     // Integer/vector literals cross the published HCQ -> LCQ link directly.
     let graph = graph(&[(

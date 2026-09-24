@@ -34,6 +34,7 @@ mod shape;
 mod simd;
 mod system;
 mod vector_fp_divide;
+mod vector_fp_fused_element;
 mod vector_fp_multiply_element;
 mod vector_integer_to_fp;
 

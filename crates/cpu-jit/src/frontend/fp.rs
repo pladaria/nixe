@@ -29,6 +29,9 @@ impl Translator<'_> {
             }
             Instruction::ScalarFloatMultiply(_) => self.fp_multiply(pc, instruction, flags),
             Instruction::ScalarFloatFusedMultiplyAdd(_) => self.fp_fused(pc, instruction, flags),
+            Instruction::VectorFloatFusedElement(_) => {
+                self.vector_fp_fused_element(pc, instruction, flags)
+            }
             Instruction::SignedIntToFloat(_) | Instruction::UnsignedIntToFloat(_) => {
                 self.integer_to_fp(pc, instruction, flags)
             }
@@ -256,6 +259,80 @@ impl Translator<'_> {
             f.fp_element_lane,
         );
         let result = self.fp_vector_multiply_value(first, second, lane_bits, vector_bits);
+        self.write_vector(f.rd, result);
+        Ok(false)
+    }
+
+    fn vector_fp_fused_element(
+        &mut self,
+        pc: GuestVirtualAddress,
+        instruction: Instruction,
+        flags: &mut LazyFlags<ir::Value>,
+    ) -> Result<bool, Error> {
+        let f = instruction.operands();
+        let lane_bits = scalar_width(f.opc)?;
+        let vector_bits = if f.vector_128 { 128 } else { 64 };
+        let edge = EdgeKind::VectorFpFusedElement(crate::abi::VectorFpFusedElementOperation {
+            rn: f.rn,
+            rm: f.rm,
+            rd: f.rd,
+            lane_64: lane_bits == 64,
+            vector_128: f.vector_128,
+            lane: f.fp_element_lane,
+            subtract: f.subtract,
+        });
+        if !self.native_fma {
+            self.constant_exit(pc, pc, edge, NativeExitReason::Architectural, flags)?;
+            return Ok(true);
+        }
+        let first = self.read_vector(f.rn)?;
+        let second = self.read_vector(f.rm)?;
+        let third = self.read_vector(f.rd)?;
+        let (first, second) = self.fp_vector_multiply_element_operands(
+            first,
+            second,
+            lane_bits,
+            vector_bits,
+            f.fp_element_lane,
+        );
+        let third = self.mask_vector(third, vector_bits);
+        let ty = self.builder.func.dfg.value_type(first);
+        let third = self.vector_as(third, ty);
+        let direct = self.fp_vector_fused_domain(first, second, third, lane_bits);
+        self.native_fp_path(pc, edge, direct, flags)?;
+        // FP-region activation starts fresh SSA inputs, including Rd's accumulator.
+        let first = self.read_vector(f.rn)?;
+        let second = self.read_vector(f.rm)?;
+        let third = self.read_vector(f.rd)?;
+        let (first, second) = self.fp_vector_multiply_element_operands(
+            first,
+            second,
+            lane_bits,
+            vector_bits,
+            f.fp_element_lane,
+        );
+        let third = self.mask_vector(third, vector_bits);
+        let ty = if lane_bits == 32 {
+            types::F32X4
+        } else {
+            types::F64X2
+        };
+        let first = self.vector_as(first, ty);
+        let second = self.vector_as(second, ty);
+        let third = self.vector_as(third, ty);
+        use nixe_cpu::decode::a64::fp_simd::FloatFusedMultiplyOperation as Op;
+        let result = self.fp_fused_value(
+            first,
+            second,
+            third,
+            if f.subtract {
+                Op::MultiplySubtract
+            } else {
+                Op::MultiplyAdd
+            },
+        );
+        let result = self.vector_as(result, types::I8X16);
+        let result = self.mask_vector(result, vector_bits);
         self.write_vector(f.rd, result);
         Ok(false)
     }
