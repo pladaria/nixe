@@ -28,6 +28,296 @@ struct RuntimeOwner {
     runtime: Mutex<Box<dyn NeutralBackendRuntime>>,
 }
 
+fn backed_color_image(
+    format: ImageFormat,
+    width: u32,
+    height: u32,
+    pages: &[CanonicalBackingPage],
+) -> (
+    Vec<BackendResourceCreateInfo>,
+    BackingView,
+    ImageId,
+    ImageSubresourceRange,
+) {
+    let id = ImageId::new(701);
+    let allocation = GpuAllocationId::new(701);
+    let size = pages.iter().map(|p| p.size() as u64).sum();
+    let allocation_description = GpuAllocationDescription::new(size, 4).unwrap();
+    let range = CanonicalBackingRange::new(
+        pages
+            .iter()
+            .map(|p| {
+                CanonicalBackingSegment::new(
+                    p.clone(),
+                    0,
+                    p.size() as u64,
+                    MemoryPermissions::READ_WRITE,
+                    MappingGeneration::INITIAL,
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let backing = BackingView::new(allocation, allocation_description, 0, range).unwrap();
+    let description = ImageDescription::new(
+        ImageDimension::Two,
+        ImageExtent::new(width, height, 1).unwrap(),
+        format,
+        ImageKind::Color,
+        1,
+        1,
+        SampleCount::One,
+    )
+    .unwrap();
+    let subresources = ImageSubresourceRange {
+        plane: 0,
+        mip_level: 0,
+        base_layer: 0,
+        layer_count: 1,
+    };
+    let layout = ImageMemoryLayout::PitchLinear {
+        row_pitch: u64::from(width) * u64::from(format.plane_bytes_per_texel(0).unwrap()),
+        layer_stride: size,
+    };
+    let view = ImageView::new(
+        id,
+        description,
+        Swizzle::IDENTITY,
+        vec![(subresources, layout, backing.clone())],
+    )
+    .unwrap();
+    (
+        vec![
+            BackendResourceCreateInfo::Allocation {
+                id: allocation,
+                description: allocation_description,
+            },
+            BackendResourceCreateInfo::Image {
+                id,
+                description,
+                view: Some(view),
+            },
+        ],
+        backing,
+        id,
+        subresources,
+    )
+}
+
+fn color_clear_submission(
+    id: ImageId,
+    subresources: ImageSubresourceRange,
+    format: ImageFormat,
+    width: u32,
+    height: u32,
+    color: [f32; 4],
+    serial: u64,
+) -> OperationSubmission {
+    OperationSubmission::new(
+        FrontendSubmissionId::new(serial),
+        vec![],
+        vec![GpuOperation::new(
+            GpuCommand::Clear(
+                ClearOperation::image(
+                    nixe_gpu::ImageRegion {
+                        image: id,
+                        subresources,
+                        origin: nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 },
+                        extent: ImageExtent::new(width, height, 1).unwrap(),
+                    },
+                    ImageKind::Color,
+                    format,
+                    SampleCount::One,
+                    ClearValue::Color(color),
+                )
+                .unwrap(),
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+    )
+    .unwrap()
+}
+
+#[test]
+fn partial_float32_clear_writes_unblended_values() {
+    let _guard = accelerated_test_guard();
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(701),
+        NonCpuDeviceId::new(701),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
+        return;
+    };
+    let page = initialized_page(&[0; 8 * 8 * 16]);
+    let (creations, backing, image, subresources) =
+        backed_color_image(ImageFormat::Rgba32Float, 8, 8, &[page]);
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let mut operations = color_clear_submission(
+        image,
+        subresources,
+        ImageFormat::Rgba32Float,
+        6,
+        6,
+        [0.25, 0.5, 0.75, 1.0],
+        700,
+    )
+    .operations()
+    .to_vec();
+    operations.extend_from_slice(
+        color_clear_submission(
+            image,
+            subresources,
+            ImageFormat::Rgba32Float,
+            4,
+            4,
+            [2.0, -1.0, 0.5, 1.0],
+            701,
+        )
+        .operations(),
+    );
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &OperationSubmission::new(FrontendSubmissionId::new(701), vec![], operations).unwrap(),
+        )
+        .unwrap();
+    let mut pixel = [0; 16];
+    backing.range().read(0, &mut pixel).unwrap();
+    let values = pixel
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(values, [2.0, -1.0, 0.5, 1.0]);
+    backing.range().read(5 * 16, &mut pixel).unwrap();
+    let values = pixel
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(values, [0.25, 0.5, 0.75, 1.0]);
+    backing.range().read(7 * 16, &mut pixel).unwrap();
+    assert_eq!(pixel, [0; 16]);
+}
+
+#[test]
+fn partial_float16_clear_replaces_nan() {
+    let _guard = accelerated_test_guard();
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(703),
+        NonCpuDeviceId::new(703),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
+        return;
+    };
+    let page = initialized_page(&[0x00, 0x7e].repeat(8 * 8 * 4));
+    let (creations, backing, image, subresources) =
+        backed_color_image(ImageFormat::Rgba16Float, 8, 8, &[page]);
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rgba16Float,
+                4,
+                4,
+                [2.0, -1.0, 0.5, 1.0],
+                703,
+            ),
+        )
+        .unwrap();
+    let mut pixel = [0; 8];
+    backing.range().read(0, &mut pixel).unwrap();
+    assert_eq!(pixel, [0x00, 0x40, 0x00, 0xbc, 0x00, 0x38, 0x00, 0x3c]);
+}
+
+#[test]
+fn partial_clear_after_cpu_write_and_full_clear() {
+    let _guard = accelerated_test_guard();
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(704),
+        NonCpuDeviceId::new(704),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
+        return;
+    };
+    let page = initialized_page(&[0, 255, 0, 255].repeat(64));
+    let (creations, backing, image, subresources) =
+        backed_color_image(ImageFormat::Rgba8Unorm, 8, 8, std::slice::from_ref(&page));
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                4,
+                4,
+                [1.0, 0.0, 0.0, 1.0],
+                704,
+            ),
+        )
+        .unwrap();
+    page.prepare_write().unwrap();
+    let generation = page.content_generation();
+    page.write_preflighted(0, &[0, 0, 255, 255], generation, generation.next().unwrap())
+        .unwrap();
+    let generation_after_cpu_write = page.content_generation();
+    runtime
+        .runtime()
+        .submit(
+            &[],
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                8,
+                8,
+                [1.0, 0.0, 0.0, 1.0],
+                705,
+            ),
+        )
+        .unwrap();
+    runtime
+        .runtime()
+        .submit(
+            &[],
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                4,
+                4,
+                [1.0, 1.0, 0.0, 1.0],
+                706,
+            ),
+        )
+        .unwrap();
+    let mut pixel = [0; 4];
+    assert_eq!(
+        page.content_generation(),
+        generation_after_cpu_write,
+        "full clear must supersede dirty CPU bytes without a readback"
+    );
+    backing.range().read(7 * 4, &mut pixel).unwrap();
+    assert_eq!(pixel, [255, 0, 0, 255]);
+}
+
 #[test]
 fn cpu_authored_rgb565_is_converted_by_a_reusable_gpu_import() {
     let _guard = accelerated_test_guard();
@@ -146,6 +436,90 @@ fn cpu_authored_rgb565_is_converted_by_a_reusable_gpu_import() {
     );
 }
 
+#[test]
+fn partial_clear_initializes_a_new_image_from_a_device_authored_alias() {
+    let _guard = accelerated_test_guard();
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(705),
+        NonCpuDeviceId::new(705),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
+        return;
+    };
+    let page = initialized_page(&[0, 255, 0, 255].repeat(64));
+    let (creations, backing, image, subresources) =
+        backed_color_image(ImageFormat::Rgba8Unorm, 8, 8, &[page]);
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                8,
+                8,
+                [1.0, 0.0, 0.0, 1.0],
+                705,
+            ),
+        )
+        .unwrap();
+    let BackendResourceCreateInfo::Image {
+        description,
+        view: Some(view),
+        ..
+    } = &creations[1]
+    else {
+        unreachable!()
+    };
+    let alias = ImageId::new(702);
+    let alias_view = ImageView::new(
+        alias,
+        *description,
+        Swizzle::IDENTITY,
+        vec![(subresources, view.bindings()[0].layout(), backing.clone())],
+    )
+    .unwrap();
+    runtime
+        .runtime()
+        .submit(
+            &[BackendResourceCreateInfo::Image {
+                id: alias,
+                description: *description,
+                view: Some(alias_view),
+            }],
+            &[],
+            &color_clear_submission(
+                alias,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                4,
+                4,
+                [1.0, 1.0, 0.0, 1.0],
+                706,
+            ),
+        )
+        .unwrap();
+    let mut pixels = [0; 8 * 8 * 4];
+    backing.range().read(0, &mut pixels).unwrap();
+    for y in 0..8 {
+        for x in 0..8 {
+            let offset = (y * 8 + x) * 4;
+            assert_eq!(
+                &pixels[offset..offset + 4],
+                if x < 4 && y < 4 {
+                    &[255, 255, 0, 255]
+                } else {
+                    &[255, 0, 0, 255]
+                }
+            );
+        }
+    }
+}
+
 struct RuntimeRequester(Weak<RuntimeOwner>);
 
 impl BackendVisibilityRequester for RuntimeRequester {
@@ -170,7 +544,9 @@ impl RuntimeOwner {
         let requester: Arc<dyn BackendVisibilityRequester> =
             Arc::new(RuntimeRequester(Arc::downgrade(&owner)));
         owner
-            .runtime()
+            .runtime
+            .try_lock()
+            .expect("GPU owner must resolve its own visibility inline")
             .bind_visibility_requester(requester)
             .unwrap();
         owner
@@ -192,6 +568,119 @@ fn initialized_page(bytes: &[u8]) -> CanonicalBackingPage {
         ContentGeneration::INITIAL,
     )
     .unwrap()
+}
+
+fn read_presented_rgba(
+    presentation: &nixe_gpu_wgpu::WgpuPresentationContext,
+    resident: &nixe_gpu::ResidentImage,
+) -> Vec<u8> {
+    let texture = resident_texture(resident).unwrap();
+    let extent = resident.description().extent();
+    let pitch = (extent.width * 4).div_ceil(256) * 256;
+    let buffer = presentation
+        .device()
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Presentation assertion"),
+            size: u64::from(pitch * extent.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+    let mut encoder = presentation
+        .device()
+        .create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch),
+                rows_per_image: Some(extent.height),
+            },
+        },
+        wgpu::Extent3d {
+            width: extent.width,
+            height: extent.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    presentation.queue().submit([encoder.finish()]);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+        sender.send(result).unwrap()
+    });
+    presentation
+        .device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = buffer.get_mapped_range(..).unwrap();
+    mapped
+        .chunks_exact(pitch as usize)
+        .flat_map(|row| row[..extent.width as usize * 4].iter().copied())
+        .collect()
+}
+
+#[test]
+fn presentation_reconciles_mixed_cpu_and_device_pages() {
+    let _guard = accelerated_test_guard();
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(706),
+        NonCpuDeviceId::new(706),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let pages = [initialized_page(&[0; 4096]), initialized_page(&[0; 4096])];
+    let (creations, backing, image, subresources) =
+        backed_color_image(ImageFormat::Rgba8Unorm, 64, 32, &pages);
+    let presentation = initialized.presentation_context();
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                64,
+                32,
+                [1.0, 0.0, 0.0, 1.0],
+                706,
+            ),
+        )
+        .unwrap();
+    backing.range().read(0, &mut [0; 4]).unwrap();
+    assert!(matches!(
+        backing.range().segments()[0].visibility_state(),
+        nixe_memory::VisibilityState::Clean
+    ));
+    assert!(matches!(
+        backing.range().segments()[1].visibility_state(),
+        nixe_memory::VisibilityState::GpuNewer { .. }
+    ));
+    let request = PresentationImageRequest {
+        cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(backing.range()).unwrap(),
+        backing,
+        width: 64,
+        height: 32,
+        format: PresentationImageFormat::Rgba8,
+        layout: ImageMemoryLayout::PitchLinear {
+            row_pitch: 256,
+            layer_stride: 8192,
+        },
+        row_pitch: 256,
+    };
+    let resident = runtime
+        .runtime()
+        .acquire_presentable_image(request)
+        .unwrap();
+    assert_eq!(
+        read_presented_rgba(&presentation, &resident),
+        [255, 0, 0, 255].repeat(64 * 32)
+    );
 }
 
 fn accelerated_test_guard() -> MutexGuard<'static, ()> {
@@ -532,6 +1021,290 @@ fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
     let mut bytes = [0; 64];
     destination_backing.range().read(0, &mut bytes).unwrap();
     assert_eq!(bytes, [0x3c; 64]);
+}
+
+#[test]
+fn partial_image_clear_preserves_texels_and_reuses_device_authored_presentation() {
+    let _guard = accelerated_test_guard();
+    let device_id = NonCpuDeviceId::new(0x16);
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(0x16),
+        device_id,
+        WgpuBackendConfiguration::default(),
+    ) else {
+        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
+        return;
+    };
+    const WIDTH: u32 = 8;
+    const HEIGHT: u32 = 8;
+    let presentation = initialized.presentation_context();
+    let initial = [0, 255, 0, 255].repeat((WIDTH * HEIGHT) as usize);
+    let page = initialized_page(&initial);
+    let allocation = GpuAllocationId::new(0x16);
+    let presentation_allocation = GpuAllocationId::new(0x18);
+    let allocation_description =
+        GpuAllocationDescription::new(u64::from(WIDTH * HEIGHT * 4), 4).unwrap();
+    let image_backing = backing(allocation, allocation_description, &page);
+    let presentation_backing = backing(presentation_allocation, allocation_description, &page);
+    let image = ImageId::new(0x16);
+    let image_description = ImageDescription::new(
+        ImageDimension::Two,
+        ImageExtent::new(WIDTH, HEIGHT, 1).unwrap(),
+        ImageFormat::Rgba8Unorm,
+        ImageKind::Color,
+        1,
+        1,
+        SampleCount::One,
+    )
+    .unwrap();
+    let subresources = ImageSubresourceRange {
+        plane: 0,
+        mip_level: 0,
+        base_layer: 0,
+        layer_count: 1,
+    };
+    let creations = vec![
+        BackendResourceCreateInfo::Allocation {
+            id: allocation,
+            description: allocation_description,
+        },
+        BackendResourceCreateInfo::Allocation {
+            id: presentation_allocation,
+            description: allocation_description,
+        },
+        BackendResourceCreateInfo::Image {
+            id: image,
+            description: image_description,
+            view: Some(
+                ImageView::new(
+                    image,
+                    image_description,
+                    Swizzle::IDENTITY,
+                    vec![(
+                        subresources,
+                        ImageMemoryLayout::PitchLinear {
+                            row_pitch: u64::from(WIDTH * 4),
+                            layer_stride: u64::from(WIDTH * HEIGHT * 4),
+                        },
+                        image_backing.clone(),
+                    )],
+                )
+                .unwrap(),
+            ),
+        },
+    ];
+    let clear = ClearOperation::image(
+        nixe_gpu::ImageRegion {
+            image,
+            subresources,
+            origin: nixe_gpu::ImageOrigin { x: 2, y: 3, z: 0 },
+            extent: ImageExtent::new(3, 2, 1).unwrap(),
+        },
+        ImageKind::Color,
+        ImageFormat::Rgba8Unorm,
+        SampleCount::One,
+        ClearValue::Color([1.0, 0.0, 0.0, 1.0]),
+    )
+    .unwrap();
+    let submission = OperationSubmission::new(
+        FrontendSubmissionId::new(0x16),
+        vec![],
+        vec![GpuOperation::new(
+            GpuCommand::Clear(clear),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+    )
+    .unwrap();
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(&creations, &[], &submission)
+        .unwrap();
+
+    let mut pixels = vec![0; initial.len()];
+    image_backing.range().read(0, &mut pixels).unwrap();
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let offset = ((y * WIDTH + x) * 4) as usize;
+            let pixel = &pixels[offset..offset + 4];
+            if (2..5).contains(&x) && (3..5).contains(&y) {
+                assert_eq!(pixel, [255, 0, 0, 255], "pixel ({x}, {y})");
+            } else {
+                assert_eq!(pixel, [0, 255, 0, 255], "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    let presentation_request = |backing: BackingView, cpu_writes| PresentationImageRequest {
+        backing,
+        width: WIDTH,
+        height: HEIGHT,
+        format: PresentationImageFormat::Rgba8,
+        layout: ImageMemoryLayout::PitchLinear {
+            row_pitch: u64::from(WIDTH * 4),
+            layer_stride: u64::from(WIDTH * HEIGHT * 4),
+        },
+        row_pitch: WIDTH * 4,
+        cpu_writes,
+    };
+    let first_presentation_writes =
+        nixe_memory::CanonicalCpuWriteDependency::capture(image_backing.range()).unwrap();
+    let first_resident = runtime
+        .runtime()
+        .acquire_presentable_image(presentation_request(
+            image_backing.clone(),
+            first_presentation_writes.clone(),
+        ))
+        .unwrap();
+    assert!(resident_texture(&first_resident).is_some());
+
+    let generation = page.content_generation();
+    page.prepare_write().unwrap();
+    page.write_preflighted(0, &[0, 0, 255, 255], generation, generation.next().unwrap())
+        .unwrap();
+    assert!(!first_presentation_writes.remains_current());
+    let second_presentation_writes =
+        nixe_memory::CanonicalCpuWriteDependency::capture(presentation_backing.range()).unwrap();
+
+    let second_clear = ClearOperation::image(
+        nixe_gpu::ImageRegion {
+            image,
+            subresources,
+            origin: nixe_gpu::ImageOrigin { x: 4, y: 4, z: 0 },
+            extent: ImageExtent::new(2, 2, 1).unwrap(),
+        },
+        ImageKind::Color,
+        ImageFormat::Rgba8Unorm,
+        SampleCount::One,
+        ClearValue::Color([1.0, 1.0, 0.0, 1.0]),
+    )
+    .unwrap();
+    let second_submission = OperationSubmission::new(
+        FrontendSubmissionId::new(0x18),
+        vec![submission.id()],
+        vec![GpuOperation::new(
+            GpuCommand::Clear(second_clear),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+    )
+    .unwrap();
+    runtime
+        .runtime()
+        .submit(&[], &[], &second_submission)
+        .unwrap();
+    let resident = runtime
+        .runtime()
+        .acquire_presentable_image(presentation_request(
+            presentation_backing,
+            second_presentation_writes,
+        ))
+        .unwrap();
+    let pixels = read_presented_rgba(&presentation, &resident);
+    assert_eq!(&pixels[..4], &[0, 0, 255, 255]);
+    assert_eq!(
+        &pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4],
+        &[255, 255, 0, 255]
+    );
+}
+
+#[test]
+fn partial_depth_stencil_clear_modes_are_accepted() {
+    let _guard = accelerated_test_guard();
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(0x17),
+        NonCpuDeviceId::new(0x17),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
+        return;
+    };
+    let image = ImageId::new(0x17);
+    let description = ImageDescription::new(
+        ImageDimension::Two,
+        ImageExtent::new(8, 8, 1).unwrap(),
+        ImageFormat::Depth24UnormStencil8Uint,
+        ImageKind::DepthStencil,
+        1,
+        1,
+        SampleCount::One,
+    )
+    .unwrap();
+    let subresources = ImageSubresourceRange {
+        plane: 0,
+        mip_level: 0,
+        base_layer: 0,
+        layer_count: 1,
+    };
+    let clear = |origin, extent, value| {
+        GpuOperation::new(
+            GpuCommand::Clear(
+                ClearOperation::image(
+                    nixe_gpu::ImageRegion {
+                        image,
+                        subresources,
+                        origin,
+                        extent,
+                    },
+                    ImageKind::DepthStencil,
+                    ImageFormat::Depth24UnormStencil8Uint,
+                    SampleCount::One,
+                    value,
+                )
+                .unwrap(),
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )
+    };
+    let operations = vec![
+        clear(
+            nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 },
+            ImageExtent::new(8, 8, 1).unwrap(),
+            ClearValue::DepthStencil {
+                depth: 1.0,
+                stencil: 0,
+            },
+        ),
+        clear(
+            nixe_gpu::ImageOrigin { x: 1, y: 1, z: 0 },
+            ImageExtent::new(6, 6, 1).unwrap(),
+            ClearValue::Depth(0.25),
+        ),
+        clear(
+            nixe_gpu::ImageOrigin { x: 2, y: 2, z: 0 },
+            ImageExtent::new(4, 4, 1).unwrap(),
+            ClearValue::Stencil(0x5a),
+        ),
+        clear(
+            nixe_gpu::ImageOrigin { x: 3, y: 3, z: 0 },
+            ImageExtent::new(2, 2, 1).unwrap(),
+            ClearValue::DepthStencil {
+                depth: 0.75,
+                stencil: 0xa5,
+            },
+        ),
+    ];
+    let submission =
+        OperationSubmission::new(FrontendSubmissionId::new(0x17), vec![], operations).unwrap();
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let mut owner = runtime.runtime();
+    owner
+        .submit(
+            &[BackendResourceCreateInfo::Image {
+                id: image,
+                description,
+                view: None,
+            }],
+            &[],
+            &submission,
+        )
+        .unwrap();
+    assert!(owner.wait_for_completion().unwrap().is_some());
 }
 
 #[test]

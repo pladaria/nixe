@@ -134,6 +134,9 @@ struct CanonicalCpuWriteDependencyInner {
     volatile: AtomicBool,
 }
 
+/// Logical offsets and copied bytes from a canonical dependency snapshot.
+pub type CanonicalByteSnapshots = Vec<(u64, Box<[u8]>)>;
+
 /// Cloneable page-granular observation of CPU writes.
 ///
 /// Capturing establishes a read-only baseline through every direct alias.
@@ -265,7 +268,7 @@ impl CanonicalCpuWriteDependency {
         &self,
         range: &CanonicalBackingRange,
         alignment: u64,
-    ) -> Result<Vec<(u64, Box<[u8]>)>, CanonicalRangeAccessError> {
+    ) -> Result<CanonicalByteSnapshots, CanonicalRangeAccessError> {
         self.snapshot_bytes(range, CpuWriteSnapshotSelection::DirtyPages, alignment)
     }
 
@@ -301,7 +304,24 @@ impl CanonicalCpuWriteDependency {
         range: &CanonicalBackingRange,
         selection: CpuWriteSnapshotSelection,
         alignment: u64,
-    ) -> Result<Vec<(u64, Box<[u8]>)>, CanonicalRangeAccessError> {
+    ) -> Result<CanonicalByteSnapshots, CanonicalRangeAccessError> {
+        self.snapshot_with_resolver(range, selection, alignment, &mut |coordinator, request| {
+            coordinator.make_cpu_visible(request)
+        })
+    }
+
+    /// Takes a snapshot using an explicit visibility resolver. Device owners
+    /// must resolve their own writes inline instead of waiting for a request
+    /// queued to the thread which is currently taking this snapshot.
+    /// The resolver runs without page locks or execution mutation guards.
+    /// Call outside native execution and without a memory lease or cache lock.
+    pub fn snapshot_with_resolver(
+        &self,
+        range: &CanonicalBackingRange,
+        selection: CpuWriteSnapshotSelection,
+        alignment: u64,
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<CanonicalByteSnapshots, CanonicalRangeAccessError> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(CanonicalRangeAccessError::InvalidAlignment(alignment));
         }
@@ -362,8 +382,12 @@ impl CanonicalCpuWriteDependency {
                 drop(transitions);
                 for page in &self.inner.pages {
                     page.page
-                        .prepare_cpu_access()
-                        .map_err(CanonicalRangeAccessError::Backing)?;
+                        .ensure_cpu_visible_with(resolve)
+                        .map_err(|error| {
+                            CanonicalRangeAccessError::Backing(CanonicalPageError::Visibility(
+                                error,
+                            ))
+                        })?;
                 }
                 continue;
             }
@@ -450,10 +474,14 @@ impl CanonicalCpuWriteDependency {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum CpuWriteSnapshotSelection {
+/// Which bytes a CPU-write dependency snapshot must materialize.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuWriteSnapshotSelection {
+    /// Only intersections with pages whose CPU-write epochs changed.
     DirtyPages,
+    /// The entire range if any observed page changed.
     WholeIfDirty,
+    /// The entire range, including its initial contents.
     All,
 }
 
@@ -1502,5 +1530,50 @@ mod tests {
                 visible_at: DeviceVisibilityPoint::new(2),
             }
         );
+    }
+
+    #[test]
+    fn device_owner_snapshot_resolves_visibility_inline_and_rearms() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(1),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        range
+            .publish_device_write(declaration, coordinator)
+            .unwrap();
+        let mut requests = 0;
+        let snapshots = dependency
+            .snapshot_with_resolver(
+                &range,
+                CpuWriteSnapshotSelection::All,
+                1,
+                &mut |_, request| {
+                    requests += 1;
+                    assert_eq!(request.page, range.segments()[0].page());
+                    assert_eq!(request.visible_at, DeviceVisibilityPoint::new(2));
+                    Ok(vec![0x5a; request.size].into_boxed_slice())
+                },
+            )
+            .unwrap();
+        assert_eq!(requests, 1);
+        assert_eq!(snapshots[0].1.as_ref(), &[0x5a; 0x1000]);
+        assert!(dependency.remains_current());
+        assert_eq!(
+            range.segments()[0].visibility_state(),
+            VisibilityState::Clean
+        );
+        allocation.write(0, &[0x33]).unwrap();
+        assert!(!dependency.remains_current());
     }
 }

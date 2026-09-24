@@ -4,6 +4,14 @@ use std::fmt::{Display, Formatter};
 
 use crate::{CanonicalPageId, DeviceVisibilityPoint, GenerationExhausted, NonCpuDeviceId};
 
+/// Inline visibility resolution, with the page's coordinator available for
+/// requests owned by a different device.
+pub type CpuVisibilityResolver<'a> = dyn FnMut(
+        &dyn VisibilityCoordinator,
+        CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError>
+    + 'a;
+
 /// Conservative authority state shared by every alias of a canonical page.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VisibilityState {

@@ -1339,18 +1339,38 @@ fn copy_accesses(copy: &CopyOperation) -> Vec<ResourceAccess> {
 }
 
 fn clear_accesses(clear: &ClearOperation) -> Vec<ResourceAccess> {
-    let target = match clear {
-        ClearOperation::Buffer { target, .. } => target.target(),
-        ClearOperation::Image { target, .. } => target.target(),
-    };
-    vec![ResourceAccess::new(
-        target,
-        scope(
+    let (target, stages, mode, usage) = match clear {
+        ClearOperation::Buffer { target, .. } => (
+            target.target(),
             PipelineStages::COPY,
             AccessMode::Write,
             ResourceUsage::TransferDestination,
         ),
-    )]
+        // Image access targets are subresource-granular, while an image clear
+        // can cover only a texel rectangle. Conservatively retain the read so
+        // backends materialize the texels outside that rectangle.
+        ClearOperation::Image {
+            target,
+            kind: ImageKind::Color,
+            ..
+        } => (
+            target.target(),
+            PipelineStages::COLOR_OUTPUT,
+            AccessMode::ReadWrite,
+            ResourceUsage::ColorAttachment,
+        ),
+        ClearOperation::Image {
+            target,
+            kind: ImageKind::DepthStencil,
+            ..
+        } => (
+            target.target(),
+            PipelineStages::EARLY_DEPTH_STENCIL.union(PipelineStages::LATE_DEPTH_STENCIL),
+            AccessMode::ReadWrite,
+            ResourceUsage::DepthStencilAttachment,
+        ),
+    };
+    vec![ResourceAccess::new(target, scope(stages, mode, usage))]
 }
 
 fn draw_accesses(draw: &DrawOperation) -> Vec<ResourceAccess> {
@@ -1651,6 +1671,30 @@ mod tests {
                 ClearValue::Depth(f32::NAN),
             ),
             Err(CommandDescriptionError::NonFiniteClearValue)
+        );
+    }
+
+    #[test]
+    fn image_clear_retains_a_read_for_texels_outside_its_region() {
+        let clear = ClearOperation::image(
+            image(1),
+            ImageKind::Color,
+            ImageFormat::Rgba8Unorm,
+            SampleCount::One,
+            ClearValue::Color([1.0, 0.0, 0.0, 1.0]),
+        )
+        .unwrap();
+        let operation = GpuOperation::new(
+            GpuCommand::Clear(clear),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        );
+
+        assert_eq!(operation.accesses().len(), 1);
+        assert_eq!(
+            operation.accesses()[0].scope().mode(),
+            AccessMode::ReadWrite
         );
     }
 
