@@ -693,6 +693,12 @@ fn register_access_fp_simd_vector(
             read(accessed, fields.ra);
             write(accessed, dirty, fields.rd);
         }
+        fp_simd::Instruction::VectorFloatFusedElement(_) => {
+            read(accessed, fields.rn);
+            read(accessed, fields.rm);
+            read(accessed, fields.rd);
+            write(accessed, dirty, fields.rd);
+        }
         fp_simd::Instruction::ScalarMove(_)
         | fp_simd::Instruction::ScalarAbsolute(_)
         | fp_simd::Instruction::ScalarNegate(_)

@@ -24,6 +24,92 @@ const RUNNER_SOURCE: &str = concat!(
 );
 static QEMU_GDB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+#[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
+fn qemu_a64_fused_element_matches_rounding_nan_and_accumulator_semantics() {
+    for (wide, full) in [(false, false), (false, true), (true, true)] {
+        let bits = |value: f64| {
+            if wide {
+                value.to_bits()
+            } else {
+                u64::from((value as f32).to_bits())
+            }
+        };
+        let minimum = bits(if wide {
+            f64::MIN_POSITIVE
+        } else {
+            f64::from(f32::MIN_POSITIVE)
+        });
+        let snan = bits(f64::INFINITY) | 1;
+        let pack = |values: [u64; 4]| {
+            if wide {
+                u128::from(values[0]) | (u128::from(values[1]) << 64)
+            } else {
+                values
+                    .into_iter()
+                    .enumerate()
+                    .fold(0, |v, (i, x)| v | (u128::from(x as u32) << (32 * i)))
+            }
+        };
+        for subtract in [false, true] {
+            let mut fixture = A64OracleFixture::new();
+            let word = 0x0f82_1820
+                | (u32::from(full) << 30)
+                | (u32::from(wide) << 22)
+                | (u32::from(!wide) << 21)
+                | (u32::from(subtract) << 14);
+            fixture.oracle.write_instruction(fixture.slot, word);
+            for (a, b, c) in [
+                (bits(1.1), bits(-1.1), bits(0.75)),
+                (bits(1.0) + 1, bits(1.0) - 2, bits(-1.0)),
+                (minimum, bits(0.5), 0),
+                (0, bits(-2.0), bits(-0.0)),
+                (bits(f64::INFINITY), 0, bits(1.0)),
+                (snan, bits(f64::NAN), snan + 1),
+                (bits(2.0), bits(2.0), snan),
+                (1, bits(1.0), 0),
+            ] {
+                for mode in 0..16 {
+                    let mut expected = A64State::default();
+                    expected.set_pc(fixture.slot);
+                    expected.set_fpcr(mode << 22);
+                    expected.set_fpsr(1 << 27);
+                    expected.set_vector(0, pack([c; 4]));
+                    expected.set_vector(1, pack([a; 4]));
+                    let mut multiplier = [snan; 4];
+                    multiplier[if wide { 1 } else { 3 }] = b;
+                    expected.set_vector(2, pack(multiplier));
+                    for register in 0..3 {
+                        fixture.oracle.write_raw_register(
+                            34 + register,
+                            &expected.vector(register as u8).unwrap().to_le_bytes(),
+                        );
+                    }
+                    fixture
+                        .oracle
+                        .write_raw_register(A64_FPCR_REGISTER, &expected.fpcr().to_le_bytes());
+                    fixture
+                        .oracle
+                        .write_raw_register(A64_FPSR_REGISTER, &expected.fpsr().to_le_bytes());
+                    fixture.oracle.write_register(A64_PC_REGISTER, fixture.slot);
+                    execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap();
+                    fixture.oracle.step("FMLA/FMLS by element", word);
+                    assert_eq!(
+                        &fixture.oracle.read_raw_register(34)[..16],
+                        expected.vector(0).unwrap().to_le_bytes(),
+                        "{word:08x}, a={a:x}, b={b:x}, c={c:x}, mode={mode}"
+                    );
+                    assert_eq!(
+                        fixture.oracle.read_raw_register(A64_FPSR_REGISTER),
+                        expected.fpsr().to_le_bytes(),
+                        "status: {word:08x}, mode={mode}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 struct A64OracleFixture {
     _serial: MutexGuard<'static, ()>,
     temporary: TestDirectory,

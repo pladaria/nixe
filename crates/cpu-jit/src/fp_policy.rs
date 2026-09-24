@@ -42,8 +42,10 @@ pub(crate) fn fp_lowering_disposition(instruction: Instruction) -> FpLoweringDis
     // demanded capture stops at the exact boundary instead of fetching a
     // successor for an operation that would require a backend libcall.
     #[cfg(target_arch = "x86_64")]
-    if matches!(instruction, Instruction::ScalarFloatFusedMultiplyAdd(_))
-        && !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma"))
+    if matches!(
+        instruction,
+        Instruction::ScalarFloatFusedMultiplyAdd(_) | Instruction::VectorFloatFusedElement(_)
+    ) && !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma"))
     {
         return FpLoweringDisposition::Exact;
     }
@@ -83,6 +85,7 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::ScalarVectorUnsignedIntToFloat(_)
         | Instruction::VectorFloatDivide(_)
         | Instruction::VectorFloatMultiplyElement(_)
+        | Instruction::VectorFloatFusedElement(_)
         | Instruction::ScalarFloatConvert(_)
         | Instruction::ScalarFloatDivide(_)
         | Instruction::ScalarFloatAdd(_)

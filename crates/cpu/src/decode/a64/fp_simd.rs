@@ -718,6 +718,18 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
     )
     .fixture32(0x4f96_93fb),
+    // Arm FMLA/FMLS (vector, by element), single/double precision.
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMLA--by-element---Floating-point-fused-Multiply-Add-to-accumulator--by-element--
+    // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.75)
+    pattern(
+        "simd-floating-point-fused-multiply-element",
+        0xbf80_b400,
+        0x0f80_1000,
+        0x0000_00a2,
+        212,
+        &[],
+    )
+    .fixture32(0x4f99_12fb),
     // Arm A64 FMOV (scalar, immediate), including the optional half-precision
     // form, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--scalar--immediate---Floating-point-Move-immediate--scalar--
@@ -1378,6 +1390,7 @@ instructions!(
     ScalarVectorUnsignedIntToFloat,
     VectorFloatDivide,
     VectorFloatMultiplyElement,
+    VectorFloatFusedElement,
     VectorFloatImmediate,
     ScalarFloatImmediate,
     ScalarFloatConvert,
@@ -1397,7 +1410,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         rm: ((bits >> 16) & 0x1f) as u8,
         ra: ((bits >> 10) & 0x1f) as u8,
         size: (bits >> 30) as u8,
-        opc: if instruction_id == 0x0000_00a1 {
+        opc: if matches!(instruction_id, 0x0000_00a1 | 0x0000_00a2) {
             ((bits >> 22) & 1) as u8
         } else {
             ((bits >> 22) & 3) as u8
@@ -1409,7 +1422,13 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         load: bits & (1 << 22) != 0,
         quad: bits & (1 << 23) != 0,
         vector_128: bits & (1 << 30) != 0,
-        subtract: bits & (1 << 29) != 0,
+        subtract: bits
+            & (1 << if instruction_id == 0x0000_00a2 {
+                14
+            } else {
+                29
+            })
+            != 0,
         scaled: bits & (1 << 12) != 0,
         immediate_5: ((bits >> 16) & 0x1f) as u8,
         rt2: ((bits >> 10) & 0x1f) as u8,
@@ -1438,7 +1457,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         condition: ((bits >> 12) & 0xf) as u8,
         element_size: ((bits >> 10) & 3) as u8,
         fp_immediate_8: ((bits >> 13) & 0xff) as u8,
-        fp_element_lane: if instruction_id == 0x0000_00a1 {
+        fp_element_lane: if matches!(instruction_id, 0x0000_00a1 | 0x0000_00a2) {
             if bits & (1 << 22) == 0 {
                 (((bits >> 21) & 1) | (((bits >> 11) & 1) << 1)) as u8
             } else {
@@ -1553,6 +1572,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_008b => Instruction::ScalarVectorUnsignedIntToFloat(operands),
         0x0000_006c => Instruction::VectorFloatDivide(operands),
         0x0000_00a1 => Instruction::VectorFloatMultiplyElement(operands),
+        0x0000_00a2 => Instruction::VectorFloatFusedElement(operands),
         0x0000_0086 => Instruction::VectorFloatImmediate(operands),
         0x0000_006d..=0x0000_006e => Instruction::ScalarFloatImmediate(operands),
         0x0000_006f..=0x0000_0070 => Instruction::ScalarFloatConvert(operands),

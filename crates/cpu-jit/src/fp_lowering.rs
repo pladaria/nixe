@@ -660,6 +660,69 @@ impl Translator<'_> {
         self.builder.ins().icmp_imm_s(IntCC::Equal, invalid, 0)
     }
 
+    /// Packed FMLA/FMLS guard. Like scalar FMA, x86 requires an exact
+    /// minimum-normal lattice bound to exclude pre-rounding tiny results.
+    /// No intermediate floating-point product is rounded or raises status.
+    /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMLA--by-element---Floating-point-fused-Multiply-Add-to-accumulator--by-element--
+    pub(crate) fn fp_vector_fused_domain(
+        &mut self,
+        first: Value,
+        second: Value,
+        third: Value,
+        lane_bits: u32,
+    ) -> Value {
+        let a_bad = self.fp_vector_nonfinite_or_subnormal_lanes(first, lane_bits);
+        let b_bad = self.fp_vector_nonfinite_or_subnormal_lanes(second, lane_bits);
+        let c_bad = self.fp_vector_nonfinite_or_subnormal_lanes(third, lane_bits);
+        let invalid = self.builder.ins().bor(a_bad, b_bad);
+        let mut invalid = self.builder.ins().bor(invalid, c_bad);
+        if self.abi == crate::abi::HostAbi::X86_64 {
+            let ty = self.builder.func.dfg.value_type(first);
+            let mask = self.fp_vector_lane_constant(ty, lane_bits, (1u64 << (lane_bits - 1)) - 1);
+            let zero = self.fp_vector_lane_constant(ty, lane_bits, 0);
+            let a = self.builder.ins().band(first, mask);
+            let b = self.builder.ins().band(second, mask);
+            let c = self.builder.ins().band(third, mask);
+            let az = self.builder.ins().icmp(IntCC::Equal, a, zero);
+            let bz = self.builder.ins().icmp(IntCC::Equal, b, zero);
+            let cz = self.builder.ins().icmp(IntCC::Equal, c, zero);
+            let product_zero = self.builder.ins().bor(az, bz);
+            let (fraction, bias) = if lane_bits == 32 {
+                (23, 127)
+            } else {
+                (52, 1023)
+            };
+            let ae = self.builder.ins().ushr_imm_u(a, fraction);
+            let be = self.builder.ins().ushr_imm_u(b, fraction);
+            let ce = self.builder.ins().ushr_imm_u(c, fraction);
+            let sum = self.builder.ins().iadd(ae, be);
+            let normal = self.fp_vector_lane_constant(ty, lane_bits, bias + 1);
+            let product_normal =
+                self.builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, sum, normal);
+            let no_addend = self.builder.ins().band(cz, product_normal);
+            let product_bound =
+                self.fp_vector_lane_constant(ty, lane_bits, bias + 2 * fraction as u64 + 1);
+            let addend_bound = self.fp_vector_lane_constant(ty, lane_bits, fraction as u64 + 1);
+            let product_lattice =
+                self.builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, sum, product_bound);
+            let addend_lattice =
+                self.builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, ce, addend_bound);
+            let lattice = self.builder.ins().band(product_lattice, addend_lattice);
+            let safe = self.builder.ins().bor(lattice, no_addend);
+            let safe = self.builder.ins().bor(safe, product_zero);
+            let tiny = self.builder.ins().bnot(safe);
+            invalid = self.builder.ins().bor(invalid, tiny);
+        }
+        let invalid = self.vector_as(invalid, types::I128);
+        self.builder.ins().icmp_imm_s(IntCC::Equal, invalid, 0)
+    }
+
     /// One packed FMUL inside the active native FP segment.
     pub(crate) fn fp_vector_multiply_value(
         &mut self,
