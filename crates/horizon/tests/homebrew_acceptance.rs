@@ -73,6 +73,15 @@ fn materialize_fixture(path: &Path) -> Vec<u8> {
 
 #[test]
 fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
+    minimal_nro_loader_return(CpuBackendConfig::Interpreter);
+}
+
+#[test]
+fn jit_minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
+    minimal_nro_loader_return(CpuBackendConfig::Jit);
+}
+
+fn minimal_nro_loader_return(backend: CpuBackendConfig) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("minimal-a64.nro");
     fs::write(
@@ -81,7 +90,12 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     )
     .unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
+    let mut process = ScheduledProcess::new(
+        ProcessBuilder::default()
+            .with_cpu_backend(backend)
+            .build(&plan)
+            .unwrap(),
+    );
     let state = process.main_thread().state();
     assert_ne!(
         state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
@@ -113,9 +127,12 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     );
 
     let second = process.run_slice(16).unwrap();
+    let stub = process.main_thread().loader_return.unwrap();
+    assert_eq!(second.progress, 4); // MOV, LDP, RET, then the loader's SVC.
+    assert_eq!(second.context.as_ref().unwrap().pc, stub);
     assert!(matches!(
         second.stop,
-        ExecutionStop::LoaderReturn { result_code: 0, .. }
+        ExecutionStop::LoaderReturn { source, result_code: 0 } if source.pc == stub
     ));
     assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
     assert_eq!(

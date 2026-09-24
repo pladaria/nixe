@@ -60,6 +60,10 @@ pub enum WorkerFailure {
         fault: Box<nixe_cpu::execution::CpuFault>,
     },
     TeardownTimedOut(VirtualCpuId),
+    NativeWorkerTeardownFailed {
+        vcpu: VirtualCpuId,
+        message: Box<str>,
+    },
 }
 
 enum WorkerCommand {
@@ -84,7 +88,7 @@ enum WorkerCommand {
 struct WorkerHandle {
     commands: SyncSender<WorkerCommand>,
     results: Receiver<WorkerResult>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<Result<(), nixe_cpu_direct_memory::FaultRuntimeError>>>,
     shutdown_sent: bool,
 }
 
@@ -295,11 +299,18 @@ impl VcpuWorkerPool {
                 std::thread::park_timeout(Duration::from_millis(1));
             }
             match worker.thread.take() {
-                Some(thread) if thread.is_finished() => {
-                    if thread.join().is_err() {
+                Some(thread) if thread.is_finished() => match thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        failure.get_or_insert(WorkerFailure::NativeWorkerTeardownFailed {
+                            vcpu: *vcpu,
+                            message: error.to_string().into_boxed_str(),
+                        });
+                    }
+                    Err(_) => {
                         failure.get_or_insert(WorkerFailure::Lost(*vcpu));
                     }
-                }
+                },
                 Some(thread) => {
                     worker.thread = Some(thread);
                     failure.get_or_insert(WorkerFailure::TeardownTimedOut(*vcpu));
@@ -321,7 +332,8 @@ fn worker_main(
     commands: Receiver<WorkerCommand>,
     results: SyncSender<WorkerResult>,
     global_permit: Option<Arc<Mutex<()>>>,
-) {
+) -> Result<(), nixe_cpu_direct_memory::FaultRuntimeError> {
+    let mut native_worker = nixe_cpu_direct_memory::NativeWorker::default();
     let mut cpu_threads = BTreeMap::new();
     while let Ok(command) = commands.recv() {
         let mut request = match command {
@@ -380,7 +392,7 @@ fn worker_main(
                     process: request.cpu_thread.cpu_process,
                 },
             )?;
-            request.execution.run(thread)
+            request.execution.run(&mut native_worker, thread)
         };
         let outcome = if let Some(permit) = &global_permit {
             let _permit = permit
@@ -401,6 +413,8 @@ fn worker_main(
             break;
         }
     }
+    drop(cpu_threads);
+    native_worker.finish()
 }
 
 fn catch_worker_panic(

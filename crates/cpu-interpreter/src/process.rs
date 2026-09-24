@@ -80,33 +80,7 @@ pub struct InterpreterThread {
     memory_backend: Option<InterpreterMemoryBackend>,
     exclusive_monitor: RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
     control: CpuControl,
-    direct_memory: Option<RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
-}
-
-struct InterpreterDirectSlice<'a> {
-    frontend: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
-}
-
-impl<'a> InterpreterDirectSlice<'a> {
-    fn begin(
-        frontend: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemoryFrontend>>,
-    ) -> Result<Self, nixe_cpu_direct_memory::FaultRuntimeError> {
-        if let Some(frontend) = frontend {
-            frontend.borrow_mut().begin_slice()?;
-        }
-        Ok(Self { frontend })
-    }
-}
-
-impl Drop for InterpreterDirectSlice<'_> {
-    fn drop(&mut self) {
-        if let Some(frontend) = self.frontend {
-            frontend
-                .borrow_mut()
-                .end_slice()
-                .expect("active interpreter direct-memory slice ends on its worker TID");
-        }
-    }
+    direct_memory: Option<nixe_cpu_direct_memory::DirectMemoryFrontend>,
 }
 
 pub struct InterpreterRunRequest<'a> {
@@ -115,7 +89,6 @@ pub struct InterpreterRunRequest<'a> {
     pub memory_lease: Option<ExecutionMemoryLease<'a>>,
     pub state: &'a mut A64State,
     pub instruction_budget: u64,
-    pub loader_return: Option<GuestVirtualAddress>,
     pub timer: &'a dyn ArchitecturalTimer,
     pub events: VcpuEventState,
 }
@@ -130,10 +103,10 @@ impl InterpreterThread {
             Some(InterpreterMemoryBackend::LinuxDirect {
                 address_space,
                 view,
-            }) => Some(RefCell::new(
+            }) => Some(
                 unsafe { nixe_cpu_direct_memory::DirectMemoryFrontend::new(view, address_space) }
                     .map_err(|error| backend_fault(error.to_string()))?,
-            )),
+            ),
             Some(InterpreterMemoryBackend::Checked) | None => None,
         };
         Ok(Self {
@@ -153,13 +126,18 @@ impl InterpreterThread {
 
     pub fn run_slice(
         &mut self,
+        worker: &mut nixe_cpu_direct_memory::NativeWorker,
         request: InterpreterRunRequest<'_>,
     ) -> Result<ExecutionReport, CpuFault> {
         let mut remaining = request.instruction_budget;
         let mut executed = 0_u64;
         self.validate_memory_backend(request.memory)?;
         self.validate_memory_lease(request.memory, request.memory_lease.as_ref())?;
-        let _direct_slice = InterpreterDirectSlice::begin(self.direct_memory.as_ref())
+        let direct_slice = self
+            .direct_memory
+            .as_mut()
+            .map(|frontend| frontend.begin_slice(worker).map(RefCell::new))
+            .transpose()
             .map_err(|error| instruction_fault(CpuFaultKind::Internal, 0, request.state, error))?;
         let context = InterpreterContext::new(
             self.cpu,
@@ -168,23 +146,11 @@ impl InterpreterThread {
             request.timer,
             &request.events,
         )
-        .with_direct_memory(self.direct_memory.as_ref());
+        .with_direct_memory(direct_slice.as_ref());
         loop {
-            if let Some((source, result_code)) =
-                loader_return_observation(self.cpu, request.state, request.loader_return)
-            {
-                return Ok(self.report(
-                    executed,
-                    CpuExit::LoaderReturn {
-                        source,
-                        result_code,
-                    },
-                    request.state,
-                ));
-            }
             let pending_interrupts = request.events.take_pending_interrupts();
             if pending_interrupts != 0 {
-                return Ok(self.report(
+                return Ok(Self::report(
                     executed,
                     CpuExit::PendingEvent {
                         mask: pending_interrupts,
@@ -195,12 +161,16 @@ impl InterpreterThread {
             if let Some(control) = self.control.take_pending() {
                 self.control.acknowledge(control);
                 if control.contains(ControlRequest::Preempt) {
-                    return Ok(self.report(executed, CpuExit::Safepoint, request.state));
+                    return Ok(Self::report(executed, CpuExit::Safepoint, request.state));
                 }
                 continue;
             }
             if remaining == 0 {
-                return Ok(self.report(executed, CpuExit::BudgetExhausted, request.state));
+                return Ok(Self::report(
+                    executed,
+                    CpuExit::BudgetExhausted,
+                    request.state,
+                ));
             }
             let source = LocationDescriptor::new(
                 GuestVirtualAddress::new(request.state.pc()),
@@ -213,7 +183,11 @@ impl InterpreterThread {
             let encoding = match encoding {
                 Ok(encoding) => encoding,
                 Err(fault) => {
-                    return Ok(self.report(executed, CpuExit::FetchFault { fault }, request.state));
+                    return Ok(Self::report(
+                        executed,
+                        CpuExit::FetchFault { fault },
+                        request.state,
+                    ));
                 }
             };
             let decoded = match decode::decode(self.cpu.decoder(), source, encoding) {
@@ -254,7 +228,7 @@ impl InterpreterThread {
             match step {
                 InstructionStep::Continue => continue,
                 InstructionStep::Exit(stop) => {
-                    return Ok(self.report(executed, stop, request.state));
+                    return Ok(Self::report(executed, stop, request.state));
                 }
             };
         }
@@ -323,7 +297,7 @@ impl InterpreterThread {
         Ok(())
     }
 
-    fn report(&self, progress: u64, stop: CpuExit, state: &A64State) -> ExecutionReport {
+    fn report(progress: u64, stop: CpuExit, state: &A64State) -> ExecutionReport {
         ExecutionReport {
             progress,
             stop,
@@ -355,19 +329,4 @@ fn backend_fault(message: impl ToString) -> CpuFault {
         message: message.to_string().into(),
         context: Box::new(A64State::default().register_context()),
     }
-}
-
-fn loader_return_observation(
-    cpu: ProcessCpuContext,
-    state: &A64State,
-    loader_return: Option<GuestVirtualAddress>,
-) -> Option<(LocationDescriptor, u64)> {
-    let return_address = loader_return?;
-    (state.pc() == return_address.get()).then(|| {
-        let source = LocationDescriptor::new(return_address, cpu.profile_id());
-        let result_code = state.read_x(nixe_cpu::state::a64::A64Register::General(
-            nixe_cpu::state::a64::A64GeneralRegister::new(0).expect("valid result register"),
-        ));
-        (source, result_code)
-    })
 }

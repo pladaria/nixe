@@ -3079,7 +3079,9 @@ fn prepare_resources(
         };
         let cpu_writes = match resource {
             MaxwellThreeDResolvedResource::Buffer(_) => None,
-            MaxwellThreeDResolvedResource::Image(value) => value.cpu_write_dependency().cloned(),
+            MaxwellThreeDResolvedResource::Image(value) => {
+                Some(value.cpu_write_dependency().clone())
+            }
         };
         let dependency = match resource {
             MaxwellThreeDResolvedResource::Buffer(value) => {
@@ -4246,7 +4248,7 @@ fn color_representation_record(
             })
             .collect::<Vec<_>>()
             .into_boxed_slice(),
-        cpu_writes: image.cpu_write_dependency().cloned(),
+        cpu_writes: Some(image.cpu_write_dependency().clone()),
     }
 }
 

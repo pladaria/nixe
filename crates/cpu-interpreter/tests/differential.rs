@@ -51,15 +51,17 @@ fn concrete_thread_matches_direct_single_step_state_counts_and_stops() {
         let mut process = InterpreterProcess::new(cpu);
         let mut thread = process.create_thread(CpuThreadId::new(1)).unwrap();
         let report = thread
-            .run_slice(InterpreterRunRequest {
-                memory: &memory,
-                memory_lease: None,
-                state: &mut adapted,
-                instruction_budget: 1,
-                loader_return: None,
-                timer: &FixedTimer,
-                events: nixe_cpu::execution::VcpuEventState::default(),
-            })
+            .run_slice(
+                &mut nixe_cpu_direct_memory::NativeWorker::default(),
+                InterpreterRunRequest {
+                    memory: &memory,
+                    memory_lease: None,
+                    state: &mut adapted,
+                    instruction_budget: 1,
+                    timer: &FixedTimer,
+                    events: nixe_cpu::execution::VcpuEventState::default(),
+                },
+            )
             .unwrap();
         assert_eq!(adapted, direct);
         assert_eq!(report.progress, 1);
@@ -106,7 +108,10 @@ fn linux_direct_interpreter_stores_continue_after_the_first_protected_write() {
         let mut state = direct_state(DATA, first);
 
         let first_report = thread
-            .run_slice(direct_request(&memory, &mut state))
+            .run_slice(
+                &mut nixe_cpu_direct_memory::NativeWorker::default(),
+                direct_request(&memory, &mut state),
+            )
             .unwrap();
         assert_eq!(first_report.stop, CpuExit::BudgetExhausted);
         assert_eq!(read_value(&memory, DATA, size), first);
@@ -114,7 +119,10 @@ fn linux_direct_interpreter_stores_continue_after_the_first_protected_write() {
         state.set_pc(CODE);
         write_register(&mut state, 0, second);
         let second_report = thread
-            .run_slice(direct_request(&memory, &mut state))
+            .run_slice(
+                &mut nixe_cpu_direct_memory::NativeWorker::default(),
+                direct_request(&memory, &mut state),
+            )
             .unwrap();
         assert_eq!(second_report.stop, CpuExit::BudgetExhausted);
         assert_eq!(read_value(&memory, DATA, size), second);
@@ -136,11 +144,13 @@ fn linux_direct_interpreter_reads_directly_mapped_values() {
     ] {
         let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, AddressSpaceId::new(1));
         let mut memory = direct_memory(encoding, DATA);
-        assert!(memory.initialize_ram(
-            GuestPhysicalPageId::new(2),
-            0,
-            &value.to_le_bytes()[..size.bytes()],
-        ));
+        memory
+            .initialize_ram(
+                GuestPhysicalPageId::new(2),
+                0,
+                &value.to_le_bytes()[..size.bytes()],
+            )
+            .unwrap();
         let binding = direct_binding(&memory);
         let mut process = InterpreterProcess::new(cpu);
         process.bind_memory(binding).unwrap();
@@ -148,7 +158,10 @@ fn linux_direct_interpreter_reads_directly_mapped_values() {
         let mut state = direct_state(DATA, 0);
 
         let report = thread
-            .run_slice(direct_request(&memory, &mut state))
+            .run_slice(
+                &mut nixe_cpu_direct_memory::NativeWorker::default(),
+                direct_request(&memory, &mut state),
+            )
             .unwrap();
         assert_eq!(report.stop, CpuExit::BudgetExhausted);
         assert_eq!(read_register(&state, 0), value);
@@ -169,7 +182,10 @@ fn linux_direct_interpreter_executes_same_page_unaligned_accesses_natively() {
     let mut state = direct_state(address, value);
 
     let report = thread
-        .run_slice(direct_request(&memory, &mut state))
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            direct_request(&memory, &mut state),
+        )
         .unwrap();
     assert_eq!(report.stop, CpuExit::BudgetExhausted);
     let access = MemoryAccess::new(
@@ -200,11 +216,13 @@ fn linux_direct_interpreter_cross_page_store_is_all_or_nothing() {
     for page in 1..=3 {
         assert!(memory.add_ram_page(GuestPhysicalPageId::new(page)));
     }
-    assert!(memory.initialize_ram(
-        GuestPhysicalPageId::new(1),
-        0,
-        &0xf900_0020_u32.to_le_bytes(),
-    ));
+    memory
+        .initialize_ram(
+            GuestPhysicalPageId::new(1),
+            0,
+            &0xf900_0020_u32.to_le_bytes(),
+        )
+        .unwrap();
     assert!(memory.map_page(
         space,
         GuestVirtualAddress::new(CODE),
@@ -233,7 +251,10 @@ fn linux_direct_interpreter_cross_page_store_is_all_or_nothing() {
     let mut state = direct_state(address, 0xa5c3_9678_1234_fedc);
 
     let report = thread
-        .run_slice(direct_request(&memory, &mut state))
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            direct_request(&memory, &mut state),
+        )
         .unwrap();
     let CpuExit::DataFault { fault, .. } = report.stop else {
         panic!("cross-page store did not report the second-page permission fault");
@@ -259,7 +280,10 @@ fn linux_direct_interpreter_rejects_a_replacement_arena_before_native_entry() {
     let mut state = direct_state(DATA, 0);
 
     let error = thread
-        .run_slice(direct_request(&replacement, &mut state))
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            direct_request(&replacement, &mut state),
+        )
         .unwrap_err();
     assert_eq!(error.kind, nixe_cpu::execution::CpuFaultKind::Internal);
     assert!(
@@ -280,15 +304,17 @@ fn linux_direct_interpreter_requires_a_live_mapping_lease() {
     let mut state = direct_state(DATA, 0);
 
     let error = thread
-        .run_slice(InterpreterRunRequest {
-            memory: &memory,
-            memory_lease: None,
-            state: &mut state,
-            instruction_budget: 1,
-            loader_return: None,
-            timer: &FixedTimer,
-            events: nixe_cpu::execution::VcpuEventState::default(),
-        })
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            InterpreterRunRequest {
+                memory: &memory,
+                memory_lease: None,
+                state: &mut state,
+                instruction_budget: 1,
+                timer: &FixedTimer,
+                events: nixe_cpu::execution::VcpuEventState::default(),
+            },
+        )
         .unwrap_err();
     assert_eq!(error.kind, nixe_cpu::execution::CpuFaultKind::Internal);
     assert!(error.message.contains("requires its live mapping lease"));
@@ -301,7 +327,9 @@ fn linux_direct_interpreter_reports_unmapped_fault_with_exact_prefault_state() {
     let mut memory = ExecutionMemory::new();
     let code_page = GuestPhysicalPageId::new(1);
     assert!(memory.add_ram_page(code_page));
-    assert!(memory.initialize_ram(code_page, 0, &0xf940_0020_u32.to_le_bytes()));
+    memory
+        .initialize_ram(code_page, 0, &0xf940_0020_u32.to_le_bytes())
+        .unwrap();
     assert!(memory.map_page(
         AddressSpaceId::new(1),
         GuestVirtualAddress::new(CODE),
@@ -322,7 +350,10 @@ fn linux_direct_interpreter_reports_unmapped_fault_with_exact_prefault_state() {
     let before = state.clone();
 
     let report = thread
-        .run_slice(direct_request(&memory, &mut state))
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            direct_request(&memory, &mut state),
+        )
         .unwrap();
     let CpuExit::DataFault { source, fault } = report.stop else {
         panic!("unmapped direct load did not produce a guest data fault");
@@ -345,7 +376,10 @@ fn native_store_through_an_alias_invalidates_exclusive_reservations() {
     let mut state = direct_state(ALIAS, 0x11);
 
     thread
-        .run_slice(direct_request(&memory, &mut state))
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            direct_request(&memory, &mut state),
+        )
         .unwrap();
     let access = MemoryAccess::normal(MemoryAccessSize::Byte);
     let (_, reservation) = memory
@@ -359,7 +393,10 @@ fn native_store_through_an_alias_invalidates_exclusive_reservations() {
     state.set_pc(CODE);
     write_register(&mut state, 0, 0x22);
     thread
-        .run_slice(direct_request(&memory, &mut state))
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            direct_request(&memory, &mut state),
+        )
         .unwrap();
     let (_, stored) = memory
         .store_exclusive(
@@ -386,12 +423,18 @@ fn executable_physical_alias_uses_the_same_direct_store_path() {
     let mut state = direct_state(DATA, 0x44);
 
     thread
-        .run_slice(direct_request(&memory, &mut state))
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            direct_request(&memory, &mut state),
+        )
         .unwrap();
     state.set_pc(CODE);
     write_register(&mut state, 0, 0x55);
     thread
-        .run_slice(direct_request(&memory, &mut state))
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            direct_request(&memory, &mut state),
+        )
         .unwrap();
 
     assert_eq!(read_value(&memory, DATA, MemoryAccessSize::Byte), 0x55);
@@ -403,7 +446,9 @@ fn direct_memory(encoding: u32, data: u64) -> ExecutionMemory {
     let data_page = GuestPhysicalPageId::new(2);
     assert!(memory.add_ram_page(code_page));
     assert!(memory.add_ram_page(data_page));
-    assert!(memory.initialize_ram(code_page, 0, &encoding.to_le_bytes()));
+    memory
+        .initialize_ram(code_page, 0, &encoding.to_le_bytes())
+        .unwrap();
     assert!(memory.map_page(
         AddressSpaceId::new(1),
         GuestVirtualAddress::new(CODE),
@@ -440,7 +485,9 @@ fn direct_memory_with_alias(
     let data_page = GuestPhysicalPageId::new(2);
     assert!(memory.add_ram_page(code_page));
     assert!(memory.add_ram_page(data_page));
-    assert!(memory.initialize_ram(code_page, 0, &encoding.to_le_bytes()));
+    memory
+        .initialize_ram(code_page, 0, &encoding.to_le_bytes())
+        .unwrap();
     assert!(memory.map_page(
         AddressSpaceId::new(1),
         GuestVirtualAddress::new(CODE),
@@ -499,7 +546,6 @@ fn direct_request<'a>(
         memory_lease: Some(memory.acquire_execution_lease()),
         state,
         instruction_budget: 1,
-        loader_return: None,
         timer: &FixedTimer,
         events: nixe_cpu::execution::VcpuEventState::default(),
     }

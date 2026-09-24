@@ -794,6 +794,7 @@ pub enum FramebufferError {
     Unsupported(&'static str),
     Backend(Box<str>),
     NvMap(crate::NvMapViewError),
+    Memory(nixe_memory::CanonicalRangeAccessError),
 }
 
 impl Display for FramebufferError {
@@ -805,6 +806,9 @@ impl Display for FramebufferError {
             }
             Self::Backend(reason) => write!(formatter, "GPU presentation export failed: {reason}"),
             Self::NvMap(error) => write!(formatter, "queued nvmap image access failed: {error}"),
+            Self::Memory(error) => {
+                write!(formatter, "queued image memory observation failed: {error}")
+            }
         }
     }
 }
@@ -1366,9 +1370,8 @@ fn presentable_image_request(
         backing,
     )
     .map_err(|_| FramebufferError::Malformed("queued presentation view is invalid"))?;
-    let cpu_writes = CanonicalCpuWriteDependency::capture(backing.range()).ok_or(
-        FramebufferError::Malformed("queued presentation dependency could not be captured"),
-    )?;
+    let cpu_writes =
+        CanonicalCpuWriteDependency::capture(backing.range()).map_err(FramebufferError::Memory)?;
     Ok(PresentationImageRequest {
         backing,
         width: plane.width,

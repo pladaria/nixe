@@ -23,6 +23,23 @@ struct CanonicalBackingStoreInner {
     host: OnceLock<HostMappedStore>,
 }
 
+/// Cold executable-content observation. Dirty epochs detect direct CPU stores
+/// which intentionally do not increment a generation on every hot access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutableObservation {
+    generation: ContentGeneration,
+    visibility: u64,
+    dirty: u64,
+}
+
+/// Result of a bounded instruction read. Retry requirements are distinct from
+/// backing failures and never return bytes without an armed write observation.
+pub enum ExecutableRead {
+    Copied(ExecutableObservation),
+    NeedsTracking,
+    NeedsReconciliation,
+}
+
 /// Shared authority for every canonical page in one backing store.
 ///
 /// Content generations identify cold canonical/device revisions. Ordinary CPU
@@ -138,6 +155,44 @@ pub struct CanonicalBackingPage {
     inner: Arc<CanonicalPageInner>,
 }
 
+/// Checked RAM access while visibility and dirty tracking cannot change.
+/// Callbacks must run after dropping this guard. Multiple pages are locked in
+/// CanonicalPageId order, once per physical page (including virtual aliases).
+pub struct CanonicalCpuAccess<'a> {
+    page: &'a CanonicalBackingPage,
+    state: std::sync::MutexGuard<'a, CanonicalPageState>,
+}
+
+impl CanonicalCpuAccess<'_> {
+    pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), CanonicalPageError> {
+        self.page.checked_end(offset, output.len())?;
+        self.page.load_bytes_quiescent(offset, output);
+        Ok(())
+    }
+
+    /// Finish fallible backing/protection work on every affected page before
+    /// copying any bytes of a cross-page store. Keep all guards until completion.
+    pub fn prepare_write(&mut self) -> Result<(), CanonicalPageError> {
+        self.page.ensure_backing()?;
+        self.page.prepare_cpu_write_locked(&mut self.state)
+    }
+
+    /// Copy after prepare_write, without dropping the page guard between the
+    /// dirty transition and these bytes. No generation is added per CPU store.
+    pub fn write_prepared(
+        &mut self,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), CanonicalPageError> {
+        self.page.checked_end(offset, bytes.len())?;
+        if self.page.inner.backing.get().is_none() {
+            return Err(CanonicalPageError::ResourceExhausted);
+        }
+        self.page.copy_bytes(offset, bytes);
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for CanonicalBackingPage {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -159,6 +214,16 @@ impl PartialEq for CanonicalBackingPage {
 impl Eq for CanonicalBackingPage {}
 
 impl CanonicalBackingPage {
+    /// None requests device reconciliation outside all mapping/page locks.
+    /// Successful access never calls a device, takes the execution gate, or
+    /// rearms tracking; ordinary CPU writes only perform the first dirty change.
+    pub fn try_cpu_access(&self) -> Result<Option<CanonicalCpuAccess<'_>>, CanonicalPageError> {
+        let state = self.lock_state();
+        if !Self::cpu_visible_locked(&state)? {
+            return Ok(None);
+        }
+        Ok(Some(CanonicalCpuAccess { page: self, state }))
+    }
     /// Creates a lazily materialized, zero-filled canonical page.
     pub fn zeroed(
         store: &CanonicalBackingStore,
@@ -228,7 +293,7 @@ impl CanonicalBackingPage {
         self.inner.identity
     }
 
-    /// Permanently connects device-originated writes on this physical page to
+    /// Permanently connects canonical and device writes on this physical page to
     /// the process-memory invalidation source which owns executable aliases.
     /// Repeating the same subscription is idempotent; a page cannot belong to
     /// two process-memory streams.
@@ -262,6 +327,56 @@ impl CanonicalBackingPage {
         ContentGeneration::new(self.inner.generation.load(Ordering::Acquire))
     }
 
+    /// Copies demanded instruction bytes under memory exclusion. An unarmed
+    /// page additionally requires a mutation hold to change protection. Release
+    /// the guard and mapping locks before retrying with tracking authority or
+    /// reconciling a device-owned page; no untracked bytes are returned.
+    pub fn read_executable(
+        &self,
+        guard: &crate::ExecutionMutationGuard<'_>,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<ExecutableRead, CanonicalPageError> {
+        assert!(guard.protects(self.store().execution_gate()));
+        self.checked_end(offset, output.len())?;
+        if guard.permits_tracking() {
+            self.ensure_backing()?;
+        }
+        let mut state = self.lock_state();
+        if !Self::cpu_visible_locked(&state)? {
+            return Ok(ExecutableRead::NeedsReconciliation);
+        }
+        if !state.cpu_dirty_observer_armed {
+            if !guard.permits_tracking() {
+                return Ok(ExecutableRead::NeedsTracking);
+            }
+            self.arm_cpu_dirty_observer_locked(&mut state)?;
+        }
+        // Checked atomics retain physical backing outside the mapping lock.
+        // Copy and stamp under one page lock, shared with their actual CAS;
+        // an old word must never receive the dirty epoch of a later write.
+        self.load_bytes_quiescent(offset, output);
+        Ok(ExecutableRead::Copied(
+            self.executable_observation_locked(&state),
+        ))
+    }
+
+    /// Revalidation is cold and must be paired with the publisher's admission
+    /// protocol; this observation alone is not permission to publish code.
+    #[must_use]
+    pub fn executable_observation(&self) -> ExecutableObservation {
+        let state = self.lock_state();
+        self.executable_observation_locked(&state)
+    }
+
+    fn executable_observation_locked(&self, state: &CanonicalPageState) -> ExecutableObservation {
+        ExecutableObservation {
+            generation: self.content_generation(),
+            visibility: state.visibility_epoch,
+            dirty: self.cpu_dirty_epoch(),
+        }
+    }
+
     /// Returns the page-granular clean-to-dirty observation epoch.
     #[must_use]
     pub(crate) fn cpu_dirty_epoch(&self) -> u64 {
@@ -273,6 +388,13 @@ impl CanonicalBackingPage {
     pub(crate) fn arm_cpu_dirty_observer_quiescent(&self) -> Result<u64, CanonicalPageError> {
         self.ensure_backing()?;
         let mut state = self.lock_state();
+        self.arm_cpu_dirty_observer_locked(&mut state)
+    }
+
+    fn arm_cpu_dirty_observer_locked(
+        &self,
+        state: &mut CanonicalPageState,
+    ) -> Result<u64, CanonicalPageError> {
         match state.visibility {
             PageVisibility::Clean | PageVisibility::CpuNewer | PageVisibility::GpuNewer { .. } => {}
             PageVisibility::Conflicting => {
@@ -288,7 +410,7 @@ impl CanonicalBackingPage {
         }
         if !state.cpu_dirty_observer_armed {
             state.cpu_dirty_observer_armed = true;
-            if let Err(error) = self.publish_direct_alias_protection(&mut state) {
+            if let Err(error) = self.publish_direct_alias_protection(state) {
                 state.cpu_dirty_observer_armed = false;
                 return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
                     error.to_string().into_boxed_str(),
@@ -388,18 +510,26 @@ impl CanonicalBackingPage {
     /// Atomically reads one naturally aligned scalar from canonical storage.
     pub fn atomic_load(&self, offset: usize, size: usize) -> Result<u128, CanonicalPageError> {
         self.checked_end(offset, size)?;
-        self.prepare_cpu_access()?;
         self.ensure_backing()?;
-        self.inner
-            .backing
-            .get()
-            .expect("atomic access materialized canonical backing")
-            .atomic_load(offset, size)
-            .map_err(|error| {
-                CanonicalPageError::Visibility(VisibilityError::HostMemory(
-                    error.to_string().into_boxed_str(),
-                ))
-            })
+        loop {
+            let state = self.lock_state();
+            if !Self::cpu_visible_locked(&state)? {
+                drop(state);
+                self.prepare_cpu_access()?;
+                continue;
+            }
+            return self
+                .inner
+                .backing
+                .get()
+                .expect("atomic access materialized canonical backing")
+                .atomic_load(offset, size)
+                .map_err(|error| {
+                    CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                        error.to_string().into_boxed_str(),
+                    ))
+                });
+        }
     }
 
     /// Atomically compares and conditionally replaces one naturally aligned
@@ -412,22 +542,35 @@ impl CanonicalBackingPage {
         replacement: u128,
     ) -> Result<(u128, bool), CanonicalPageError> {
         self.checked_end(offset, size)?;
-        self.prepare_cpu_write()?;
-        self.inner
-            .backing
-            .get()
-            .expect("atomic access materialized canonical backing")
-            .atomic_compare_exchange(offset, size, expected, replacement)
-            .map_err(|error| {
-                CanonicalPageError::Visibility(VisibilityError::HostMemory(
-                    error.to_string().into_boxed_str(),
-                ))
-            })
+        self.ensure_backing()?;
+        loop {
+            let mut state = self.lock_state();
+            if !Self::cpu_visible_locked(&state)? {
+                drop(state);
+                self.prepare_cpu_access()?;
+                continue;
+            }
+            // Keep dirty publication and the hardware CAS indivisible with
+            // tracking rearm/snapshots. Native atomics use their execution lease
+            // instead; this lock is only on the checked/cold backing path.
+            self.prepare_cpu_write_locked(&mut state)?;
+            return self
+                .inner
+                .backing
+                .get()
+                .expect("atomic access materialized canonical backing")
+                .atomic_compare_exchange(offset, size, expected, replacement)
+                .map_err(|error| {
+                    CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                        error.to_string().into_boxed_str(),
+                    ))
+                });
+        }
     }
 
     /// Copies bytes while the caller holds this store's execution gate
-    /// exclusively. No ordinary writer can overlap, so no per-store sequence
-    /// observation is needed.
+    /// exclusively. The gate excludes native writers; the page lock also
+    /// orders retained checked atomics with the byte copy.
     pub(crate) fn read_quiescent(
         &self,
         offset: usize,
@@ -455,7 +598,11 @@ impl CanonicalBackingPage {
     /// Reports whether canonical bytes may be copied while the caller holds
     /// this store's execution gate exclusively.
     pub(crate) fn cpu_visible_quiescent(&self) -> Result<bool, CanonicalPageError> {
-        match self.lock_state().visibility {
+        Self::cpu_visible_locked(&self.lock_state())
+    }
+
+    fn cpu_visible_locked(state: &CanonicalPageState) -> Result<bool, CanonicalPageError> {
+        match state.visibility {
             PageVisibility::Clean | PageVisibility::CpuNewer => Ok(true),
             PageVisibility::GpuNewer { .. } => Ok(false),
             PageVisibility::Conflicting => Err(CanonicalPageError::Visibility(
@@ -535,27 +682,20 @@ impl CanonicalBackingPage {
         self.prepare_cpu_access()?;
         self.ensure_backing()?;
         let mut state = self.lock_state();
-        self.require_cpu_authority(&mut state)
-            .map_err(CanonicalPageError::Visibility)?;
-        if matches!(state.visibility, PageVisibility::Clean) {
-            self.publish_visibility(&mut state, PageVisibility::CpuNewer)
-                .map_err(CanonicalPageError::Visibility)?;
-        }
-        self.publish_cpu_dirty(&mut state)
+        self.prepare_cpu_write_locked(&mut state)
     }
 
-    /// Commits bytes after [`Self::prepare_cpu_write`] validated the page.
-    pub fn write_cpu_prepared(
+    fn prepare_cpu_write_locked(
         &self,
-        offset: usize,
-        bytes: &[u8],
+        state: &mut CanonicalPageState,
     ) -> Result<(), CanonicalPageError> {
-        self.checked_end(offset, bytes.len())?;
-        if self.inner.backing.get().is_none() {
-            return Err(CanonicalPageError::ResourceExhausted);
+        self.require_cpu_authority(state)
+            .map_err(CanonicalPageError::Visibility)?;
+        if matches!(state.visibility, PageVisibility::Clean) {
+            self.publish_visibility(state, PageVisibility::CpuNewer)
+                .map_err(CanonicalPageError::Visibility)?;
         }
-        self.copy_bytes(offset, bytes);
-        Ok(())
+        self.publish_cpu_dirty(state)
     }
 
     /// Establishes canonical CPU visibility without reading or modifying bytes.
@@ -1070,6 +1210,24 @@ fn allocate_backing(
         .map_err(|_| CanonicalPageError::ResourceExhausted)
 }
 
+fn executable_write_logs<'a>(
+    pages: impl Iterator<Item = &'a CanonicalBackingPage>,
+) -> BTreeMap<usize, (Arc<MemoryInvalidationLog>, Vec<MemoryInvalidationKind>)> {
+    let mut logs = BTreeMap::new();
+    for page in pages {
+        if let Some(log) = page.inner.executable_invalidations.get() {
+            let (_, kinds) = logs
+                .entry(Arc::as_ptr(log).addr())
+                .or_insert_with(|| (log.clone(), Vec::new()));
+            kinds.push(MemoryInvalidationKind::ExecutableContent {
+                first: page.identity().page(),
+                second: None,
+            });
+        }
+    }
+    logs
+}
+
 struct PendingCanonicalPageWrite {
     backing: CanonicalBackingPage,
     expected_generation: ContentGeneration,
@@ -1309,6 +1467,8 @@ impl CanonicalWriteBatch {
     }
 
     /// Stages one checked logical write. Discard the batch if this fails.
+    /// The first snapshot of a physical page arms tracking under the engine
+    /// rendezvous. Call without a native epoch, execution lease or cache lock.
     pub fn stage(
         &mut self,
         range: &CanonicalBackingRange,
@@ -1334,25 +1494,39 @@ impl CanonicalWriteBatch {
         loop {
             self.prepare_unstaged_cpu_visible(range, offset, end)?;
 
-            // Acquire every involved store in stable identity order. Native
-            // CPU writers are quiescent for the whole multi-page snapshot, so
-            // pages can compose their final protection directly. Dropping
-            // these uncommitted guards
-            // preserves the mapping epoch: staging changes no mapping or
-            // guest byte.
+            // Only newly captured pages touch canonical storage or arm tracking.
+            // Existing staged pages are owned bytes, even if their backing has
+            // since changed. Acquire new stores in stable identity order, with
+            // no page/log mutex surviving into the engine rendezvous.
             let mut stores = BTreeMap::new();
+            let mut logical_start = 0_u64;
             for segment in range.segments() {
-                stores
-                    .entry(segment.page().store())
-                    .or_insert_with(|| segment.backing().store().clone());
+                let logical_end = logical_start
+                    .checked_add(segment.size())
+                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                if offset.max(logical_start) < end.min(logical_end)
+                    && !self.pages.contains_key(&segment.page())
+                {
+                    stores
+                        .entry(segment.page().store())
+                        .or_insert_with(|| segment.backing().store().clone());
+                }
+                logical_start = logical_end;
+                if logical_start >= end {
+                    break;
+                }
             }
             let _transitions = stores
                 .values()
-                .map(|store| store.execution_gate().acquire_exclusive())
-                .collect::<Vec<_>>();
+                .map(|store| store.execution_gate().acquire_mutation(&[]))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CanonicalWriteBatchError::ExecutionMutation)?;
             if !self.unstaged_cpu_visible_quiescent(range, offset, end)? {
                 continue;
             }
+            // The JIT coordinator supplies fresh admission after this stop.
+            // Staging changes neither virtual mappings nor byte generations;
+            // retain the memory mapping epoch as before.
 
             let mut logical_start = 0_u64;
             let mut copied = 0_usize;
@@ -1419,6 +1593,16 @@ impl CanonicalWriteBatch {
 
     /// Publishes every staged byte mutation and advances each page once.
     pub fn commit(self) -> Result<(), CanonicalWriteBatchError> {
+        self.commit_checked(|| Ok(()))
+    }
+
+    /// Validate a virtual owner's retained translation after quiescence, before
+    /// publishing bytes. Ordinary retained physical ranges need no retranslation.
+    /// The callback must not recursively acquire a backing store's execution gate.
+    pub fn commit_checked(
+        self,
+        validate: impl FnOnce() -> Result<(), CanonicalWriteBatchError>,
+    ) -> Result<(), CanonicalWriteBatchError> {
         struct Write {
             expected_generation: ContentGeneration,
             expected_visibility_epoch: u64,
@@ -1436,8 +1620,38 @@ impl CanonicalWriteBatch {
         }
         let _transitions = stores
             .values()
-            .map(|store| store.execution_gate().acquire_exclusive())
-            .collect::<Vec<_>>();
+            .map(|store| {
+                store.execution_gate().acquire_write(|| {
+                    self.pages
+                        .values()
+                        .filter_map(|pending| {
+                            (pending.backing.store().identity() == store.identity()
+                                && pending
+                                    .backing
+                                    .inner
+                                    .executable_invalidations
+                                    .get()
+                                    .is_some())
+                            .then_some(MemoryInvalidationKind::ExecutableContent {
+                                first: pending.backing.identity().page(),
+                                second: None,
+                            })
+                        })
+                        .collect()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CanonicalWriteBatchError::ExecutionMutation)?;
+        validate()?;
+
+        // Reserve each stream once, in stable order, only after the engine has
+        // drained. A reservation owns the log mutex and cannot span rendezvous.
+        let logs = executable_write_logs(self.pages.values().map(|pending| &pending.backing));
+        let reservations = logs
+            .values()
+            .map(|(log, kinds)| log.reserve_many_from(kinds, MemoryInvalidationOrigin::HostWrite))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CanonicalWriteBatchError::Invalidation)?;
 
         let mut backings = Vec::new();
         let mut writes = Vec::new();
@@ -1509,6 +1723,10 @@ impl CanonicalWriteBatch {
                 .store(write.next_generation.get(), Ordering::Release);
             state.visibility_epoch = write.next_visibility_epoch;
         }
+        drop(states);
+        for reservation in reservations {
+            reservation.commit();
+        }
         Ok(())
     }
 }
@@ -1516,6 +1734,8 @@ impl CanonicalWriteBatch {
 /// Failure while staging or atomically committing canonical writes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanonicalWriteBatchError {
+    ExecutionMutation(crate::ExecutionMutationError),
+    Invalidation(crate::MemoryInvalidationError),
     RangeOverflow,
     OutOfBounds {
         offset: u64,
@@ -1537,6 +1757,8 @@ pub enum CanonicalWriteBatchError {
 impl Display for CanonicalWriteBatchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ExecutionMutation(error) => error.fmt(formatter),
+            Self::Invalidation(error) => error.fmt(formatter),
             Self::RangeOverflow => formatter.write_str("canonical write batch range overflows"),
             Self::OutOfBounds {
                 offset,
@@ -1628,7 +1850,6 @@ struct CanonicalAllocationInner {
     size: usize,
     page_size: usize,
     pages: Box<[CanonicalBackingPage]>,
-    transaction: Mutex<()>,
 }
 
 /// Retained canonical allocation suitable for kernel objects and future
@@ -1674,7 +1895,6 @@ impl CanonicalAllocation {
                 size,
                 page_size,
                 pages: pages.into_boxed_slice(),
-                transaction: Mutex::new(()),
             }),
         })
     }
@@ -1700,7 +1920,6 @@ impl CanonicalAllocation {
     /// Copies a checked logical range out of canonical backing.
     pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), CanonicalAllocationError> {
         let end = self.checked_end(offset, output.len())?;
-        let _transaction = self.lock_transaction();
         if output.is_empty() {
             return Ok(());
         }
@@ -1740,7 +1959,6 @@ impl CanonicalAllocation {
     /// page generation once.
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), CanonicalAllocationError> {
         let end = self.checked_end(offset, bytes.len())?;
-        let _transaction = self.lock_transaction();
         if bytes.is_empty() {
             return Ok(());
         }
@@ -1751,7 +1969,24 @@ impl CanonicalAllocation {
                 .map_err(CanonicalAllocationError::Page)?;
         }
         let _execution = loop {
-            let execution = self.inner.store.execution_gate().acquire_exclusive();
+            let execution = self
+                .inner
+                .store
+                .execution_gate()
+                .acquire_write(|| {
+                    self.inner.pages[first_page..=last_page]
+                        .iter()
+                        .filter_map(|page| {
+                            page.inner.executable_invalidations.get().map(|_| {
+                                MemoryInvalidationKind::ExecutableContent {
+                                    first: page.identity().page(),
+                                    second: None,
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .map_err(CanonicalAllocationError::ExecutionMutation)?;
             if self.inner.pages[first_page..=last_page]
                 .iter()
                 .map(CanonicalBackingPage::cpu_visible_quiescent)
@@ -1768,6 +2003,14 @@ impl CanonicalAllocation {
                     .map_err(CanonicalAllocationError::Page)?;
             }
         };
+        // The gate owns byte serialization, including retained-range writers.
+        // Reserve only after rendezvous, and publish before reopening admission.
+        let logs = executable_write_logs(self.inner.pages[first_page..=last_page].iter());
+        let reservations = logs
+            .values()
+            .map(|(log, kinds)| log.reserve_many_from(kinds, MemoryInvalidationOrigin::HostWrite))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CanonicalAllocationError::Invalidation)?;
         let mut generations = Vec::new();
         generations
             .try_reserve_exact(last_page - first_page + 1)
@@ -1777,7 +2020,29 @@ impl CanonicalAllocation {
             let next = current
                 .next()
                 .map_err(CanonicalAllocationError::GenerationExhausted)?;
-            generations.push((current, next));
+            generations.push(next);
+        }
+        let mut states = self.inner.pages[first_page..=last_page]
+            .iter()
+            .map(CanonicalBackingPage::lock_state)
+            .collect::<Vec<_>>();
+        // Finish fallible protection/dirty work for every page before copying
+        // any bytes. No full-page snapshot or rollback buffer is needed.
+        for (page, state) in self.inner.pages[first_page..=last_page]
+            .iter()
+            .zip(&mut states)
+        {
+            page.require_cpu_authority(state).map_err(|error| {
+                CanonicalAllocationError::Page(CanonicalPageError::Visibility(error))
+            })?;
+            if matches!(state.visibility, PageVisibility::Clean) {
+                page.publish_visibility(state, PageVisibility::CpuNewer)
+                    .map_err(|error| {
+                        CanonicalAllocationError::Page(CanonicalPageError::Visibility(error))
+                    })?;
+            }
+            page.publish_cpu_dirty(state)
+                .map_err(CanonicalAllocationError::Page)?;
         }
         let mut cursor = offset;
         let mut copied = 0;
@@ -1785,12 +2050,18 @@ impl CanonicalAllocation {
             let page_index = cursor / self.inner.page_size;
             let page_offset = cursor % self.inner.page_size;
             let count = (self.inner.page_size - page_offset).min(end - cursor);
-            let (current, next) = generations[page_index - first_page];
-            self.inner.pages[page_index]
-                .write_preflighted(page_offset, &bytes[copied..copied + count], current, next)
-                .map_err(CanonicalAllocationError::Page)?;
+            let page = &self.inner.pages[page_index];
+            page.store_bytes(page_offset, &bytes[copied..copied + count]);
+            page.inner.generation.store(
+                generations[page_index - first_page].get(),
+                Ordering::Release,
+            );
             cursor += count;
             copied += count;
+        }
+        drop(states);
+        for reservation in reservations {
+            reservation.commit();
         }
         Ok(())
     }
@@ -1800,7 +2071,6 @@ impl CanonicalAllocation {
         &self,
         permissions: MemoryPermissions,
     ) -> Result<CanonicalBackingRange, CanonicalAllocationError> {
-        let _transaction = self.lock_transaction();
         let mut segments = Vec::new();
         segments
             .try_reserve_exact(self.inner.pages.len())
@@ -1829,18 +2099,13 @@ impl CanonicalAllocation {
             .filter(|end| *end <= self.inner.size)
             .ok_or(CanonicalAllocationError::InvalidRange)
     }
-
-    fn lock_transaction(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.inner
-            .transaction
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 }
 
 /// Failure while creating or accessing a retained canonical allocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanonicalAllocationError {
+    ExecutionMutation(crate::ExecutionMutationError),
+    Invalidation(crate::MemoryInvalidationError),
     InvalidSize,
     InvalidRange,
     ResourceExhausted,
@@ -1853,6 +2118,8 @@ pub enum CanonicalAllocationError {
 impl Display for CanonicalAllocationError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ExecutionMutation(error) => error.fmt(formatter),
+            Self::Invalidation(error) => error.fmt(formatter),
             Self::InvalidSize => formatter.write_str("canonical allocation size is invalid"),
             Self::InvalidRange => {
                 formatter.write_str("canonical allocation range is out of bounds")
@@ -1880,6 +2147,61 @@ mod tests {
         CanonicalCpuWriteDependency, DeviceVisibilityPoint, DirectArena, DirectMapRequest,
         DirectProtection, GenerationKind, VisibilityCoordinatorError, VisibilityState,
     };
+
+    #[test]
+    fn checked_writes_and_executable_copy_stamps_are_coherent() {
+        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let page = &allocation.inner.pages[0];
+        let start = Barrier::new(2);
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                start.wait();
+                let mut previous = 0;
+                for value in 1..=8000_u128 {
+                    let next = value | (value << 64);
+                    if value % 2 == 0 {
+                        let mut access = page.try_cpu_access().unwrap().unwrap();
+                        access.prepare_write().unwrap();
+                        access.write_prepared(0, &next.to_le_bytes()).unwrap();
+                    } else {
+                        assert_eq!(
+                            page.atomic_compare_exchange(0, 16, previous, next).unwrap(),
+                            (previous, true)
+                        );
+                    }
+                    previous = next;
+                    thread::yield_now();
+                }
+            });
+            start.wait();
+            for _ in 0..2000 {
+                // A cold retained atomic need not own an execution lease.
+                // The page lock, not this gate alone, orders its actual CAS.
+                let guard = page.store().execution_gate().acquire_capture(true).unwrap();
+                let mut copied = [0; 16];
+                let ExecutableRead::Copied(observation) =
+                    page.read_executable(&guard, 0, &mut copied).unwrap()
+                else {
+                    panic!("CPU-visible page has tracking authority");
+                };
+                assert_eq!(&copied[..8], &copied[8..]);
+                let state = page.lock_state();
+                if page.executable_observation_locked(&state) == observation {
+                    let mut current = [0; 16];
+                    page.load_bytes_quiescent(0, &mut current);
+                    assert_eq!(
+                        copied, current,
+                        "old bytes must not carry a later write's stamp"
+                    );
+                }
+                drop(state);
+                drop(guard);
+                thread::yield_now();
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(page.content_generation(), ContentGeneration::INITIAL);
+    }
 
     #[derive(Default)]
     struct RecordingCoordinator {
@@ -2581,6 +2903,101 @@ mod tests {
     }
 
     #[test]
+    fn canonical_batch_groups_logs_and_keeps_them_unlocked_during_rendezvous() {
+        use crate::{ExecutionMutation, ExecutionMutationError, ExecutionMutationObserver};
+
+        struct Observer(
+            Vec<Arc<MemoryInvalidationLog>>,
+            std::sync::atomic::AtomicUsize,
+        );
+        struct Hold(Vec<Arc<MemoryInvalidationLog>>, bool);
+        impl ExecutionMutation for Hold {}
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                // Tracking-only staging publishes nothing; actual commit must
+                // publish every stream before any participant reopens.
+                for log in &self.0 {
+                    assert_eq!(log.cursor().get() > 0, self.1);
+                    log.read_since(log.cursor(), &mut Vec::new()).unwrap();
+                }
+            }
+        }
+        impl ExecutionMutationObserver for Observer {
+            fn begin(
+                self: Arc<Self>,
+                changes: &[MemoryInvalidationKind],
+            ) -> Result<Box<dyn ExecutionMutation>, ExecutionMutationError> {
+                let call = self.1.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(changes.len(), usize::from(call >= 2));
+                for log in &self.0 {
+                    assert_eq!(log.cursor().get(), 0);
+                    log.read_since(log.cursor(), &mut Vec::new()).unwrap();
+                }
+                Ok(Box::new(Hold(self.0.clone(), !changes.is_empty())))
+            }
+        }
+        for shared_log in [true, false] {
+            let first_log = Arc::new(MemoryInvalidationLog::default());
+            let second_log = if shared_log {
+                first_log.clone()
+            } else {
+                Arc::new(MemoryInvalidationLog::default())
+            };
+            let logs = vec![first_log, second_log];
+            let observer = Arc::new(Observer(
+                logs.clone(),
+                std::sync::atomic::AtomicUsize::new(0),
+            ));
+            let mut segments = Vec::new();
+            for (index, log) in logs.iter().enumerate() {
+                let store = CanonicalBackingStore::allocate().unwrap();
+                store
+                    .execution_gate()
+                    .set_mutation_observer(observer.clone())
+                    .unwrap();
+                let page = CanonicalBackingPage::zeroed(
+                    &store,
+                    GuestPhysicalPageId::new(index as u64 + 1),
+                    4,
+                    ContentGeneration::INITIAL,
+                )
+                .unwrap();
+                assert!(page.observe_executable_content(log.clone()));
+                segments.push(
+                    CanonicalBackingSegment::new(
+                        page,
+                        0,
+                        4,
+                        MemoryPermissions::READ_WRITE,
+                        MappingGeneration::INITIAL,
+                    )
+                    .unwrap(),
+                );
+            }
+            let range = CanonicalBackingRange::new(segments).unwrap();
+            let mut batch = CanonicalWriteBatch::new();
+            batch.stage(&range, 0, &[7; 8]).unwrap();
+            assert_eq!(observer.1.load(Ordering::Relaxed), 2);
+            batch.commit().unwrap();
+            assert_eq!(observer.1.load(Ordering::Relaxed), 4);
+            for log in &logs {
+                let mut records = Vec::new();
+                log.read_since(crate::MemoryInvalidationCursor::new(0), &mut records)
+                    .unwrap();
+                assert_eq!(records.len(), if shared_log { 2 } else { 1 });
+                assert!(
+                    records
+                        .iter()
+                        .all(|record| record.origin == MemoryInvalidationOrigin::HostWrite)
+                );
+            }
+            let mut bytes = [0; 8];
+            range.read(0, &mut bytes).unwrap();
+            assert_eq!(bytes, [7; 8]);
+        }
+    }
+
+    #[test]
     fn canonical_write_batch_rejects_every_page_after_a_concurrent_mutation() {
         let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
         let range = allocation
@@ -2603,6 +3020,198 @@ mod tests {
     }
 
     #[test]
+    fn allocation_write_drains_readers_and_publishes_before_releasing_observer() {
+        use crate::{ExecutionMutation, ExecutionMutationError, ExecutionMutationObserver};
+        struct Observer {
+            allocation: std::sync::Weak<CanonicalAllocationInner>,
+            log: Arc<MemoryInvalidationLog>,
+            entered: std::sync::mpsc::Sender<()>,
+        }
+        struct Hold(Arc<Observer>);
+        impl ExecutionMutation for Hold {}
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                let allocation = self.0.allocation.upgrade().unwrap();
+                assert!(allocation.store.execution_gate().transition_pending());
+                let mut records = Vec::new();
+                self.0
+                    .log
+                    .read_since(crate::MemoryInvalidationCursor::new(0), &mut records)
+                    .unwrap();
+                assert_eq!(records.len(), 2);
+                let mut byte = [0];
+                allocation.pages[0].read(3, &mut byte).unwrap();
+                assert_eq!(byte, [7]);
+                allocation.pages[1].read(0, &mut byte).unwrap();
+                assert_eq!(byte, [8]);
+            }
+        }
+        impl ExecutionMutationObserver for Observer {
+            fn begin(
+                self: Arc<Self>,
+                changes: &[MemoryInvalidationKind],
+            ) -> Result<Box<dyn ExecutionMutation>, ExecutionMutationError> {
+                assert_eq!(
+                    changes,
+                    &[
+                        MemoryInvalidationKind::ExecutableContent {
+                            first: GuestPhysicalPageId::new(1),
+                            second: None
+                        },
+                        MemoryInvalidationKind::ExecutableContent {
+                            first: GuestPhysicalPageId::new(2),
+                            second: None
+                        },
+                    ]
+                );
+                // Retaining immutable backing and reading the log cannot be
+                // blocked by an allocation/log mutex owned by the writer.
+                CanonicalAllocation {
+                    inner: self.allocation.upgrade().unwrap(),
+                }
+                .backing_range(MemoryPermissions::READ)
+                .unwrap();
+                self.log
+                    .read_since(self.log.cursor(), &mut Vec::new())
+                    .unwrap();
+                self.entered.send(()).unwrap();
+                Ok(Box::new(Hold(self)))
+            }
+        }
+        let allocation = CanonicalAllocation::zeroed(12, 4).unwrap();
+        let log = Arc::new(MemoryInvalidationLog::default());
+        for page in &allocation.inner.pages {
+            assert!(page.observe_executable_content(log.clone()));
+        }
+        let (entered, receiving) = std::sync::mpsc::channel();
+        allocation
+            .inner
+            .store
+            .execution_gate()
+            .set_mutation_observer(Arc::new(Observer {
+                allocation: Arc::downgrade(&allocation.inner),
+                log: log.clone(),
+                entered,
+            }))
+            .unwrap();
+        allocation.write(0, &[]).unwrap();
+        assert_eq!(
+            allocation.write(12, &[1]),
+            Err(CanonicalAllocationError::InvalidRange)
+        );
+        assert!(receiving.try_recv().is_err());
+        let lease = allocation.inner.store.execution_gate().acquire_shared();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| allocation.write(3, &[7, 8]));
+            receiving
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(log.cursor().get(), 0);
+            assert_eq!(
+                allocation.inner.pages[0].content_generation(),
+                ContentGeneration::INITIAL
+            );
+            drop(lease);
+            writer.join().unwrap().unwrap();
+        });
+        assert!(!allocation.inner.store.execution_gate().transition_pending());
+        for page in &allocation.inner.pages[..2] {
+            assert_eq!(
+                page.content_generation(),
+                ContentGeneration::INITIAL.next().unwrap()
+            );
+        }
+        assert_eq!(
+            allocation.inner.pages[2].content_generation(),
+            ContentGeneration::INITIAL
+        );
+        let mut bytes = [0; 12];
+        allocation.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0, 0, 7, 8, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn allocation_write_rejection_preserves_bytes_and_diagnostic() {
+        use crate::{ExecutionMutation, ExecutionMutationError, ExecutionMutationObserver};
+        struct Reject;
+        impl ExecutionMutationObserver for Reject {
+            fn begin(
+                self: Arc<Self>,
+                _: &[MemoryInvalidationKind],
+            ) -> Result<Box<dyn ExecutionMutation>, ExecutionMutationError> {
+                Err(ExecutionMutationError("allocation stop rejected".into()))
+            }
+        }
+        let allocation = CanonicalAllocation::zeroed(8, 4).unwrap();
+        allocation
+            .inner
+            .store
+            .execution_gate()
+            .set_mutation_observer(Arc::new(Reject))
+            .unwrap();
+        // Unobserved data does not invoke the engine observer.
+        allocation.write(0, &[1; 8]).unwrap();
+        let log = Arc::new(MemoryInvalidationLog::default());
+        assert!(allocation.inner.pages[0].observe_executable_content(log.clone()));
+        let generation = allocation.inner.pages[0].content_generation();
+        assert_eq!(
+            allocation.write(0, &[2; 8]),
+            Err(CanonicalAllocationError::ExecutionMutation(
+                ExecutionMutationError("allocation stop rejected".into())
+            ))
+        );
+        assert_eq!(allocation.inner.pages[0].content_generation(), generation);
+        assert_eq!(log.cursor().get(), 0);
+        let mut bytes = [0; 8];
+        allocation.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [1; 8]);
+    }
+
+    #[test]
+    fn allocation_write_finishes_fallible_page_work_before_copying_any_bytes() {
+        let allocation = CanonicalAllocation::zeroed(8, 4).unwrap();
+        let second = &allocation.inner.pages[1];
+        second
+            .inner
+            .cpu_dirty_epoch
+            .store(u64::MAX, Ordering::Release);
+        second.lock_state().cpu_dirty_observer_armed = true;
+        assert_eq!(
+            allocation.write(3, &[1, 2]),
+            Err(CanonicalAllocationError::Page(
+                CanonicalPageError::CpuDirtyEpochExhausted
+            ))
+        );
+        let mut first = [0xff; 4];
+        allocation.read(0, &mut first).unwrap();
+        assert_eq!(first, [0; 4]);
+        for page in &allocation.inner.pages {
+            assert_eq!(page.content_generation(), ContentGeneration::INITIAL);
+        }
+        assert!(!allocation.inner.store.execution_gate().transition_pending());
+    }
+
+    #[test]
+    fn allocation_reads_and_writes_remain_atomic_without_a_transaction_mutex() {
+        let allocation = CanonicalAllocation::zeroed(8, 4).unwrap();
+        std::thread::scope(|scope| {
+            for value in [1, 2] {
+                let allocation = &allocation;
+                scope.spawn(move || {
+                    for _ in 0..200 {
+                        allocation.write(0, &[value; 8]).unwrap();
+                    }
+                });
+            }
+            for _ in 0..200 {
+                let mut bytes = [0; 8];
+                allocation.read(0, &mut bytes).unwrap();
+                assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+            }
+        });
+    }
+
+    #[test]
     fn canonical_write_batch_rejects_a_native_cpu_write_after_its_snapshot() {
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         allocation.write(0, &[1]).unwrap();
@@ -2614,7 +3223,9 @@ mod tests {
         batch.stage(&range, 0, &[2]).unwrap();
 
         assert!(page.resolve_direct_write_fault().unwrap());
-        page.write_cpu_prepared(0, &[3]).unwrap();
+        let lease = page.store().execution_gate().acquire_shared();
+        page.copy_bytes(0, &[3]); // Simulate the repaired native store.
+        drop(lease);
 
         assert_eq!(
             batch.commit(),

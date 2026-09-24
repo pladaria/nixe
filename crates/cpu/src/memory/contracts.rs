@@ -803,6 +803,9 @@ pub enum DirectFaultResolution {
     /// Host protection and page state have been repaired; retry the exact
     /// native instruction with its captured host context.
     Retry,
+    /// Valid access requires typed completion after leaving native execution.
+    /// No device read/write or guest operation has been performed by resolution.
+    Cold,
     /// Guest-visible invalid access. The raw operation is not completed.
     Fault(DataAccessFault),
     /// A CPU-visible eligible mapping faulted despite its published host view.
@@ -869,8 +872,9 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         None
     }
 
-    /// Classifies one attributed native fault without executing MMIO or the
-    /// guest operation a second time.
+    /// Classifies the complete original subaccess, not the host's first failing
+    /// byte. The caller retains its execution lease and checks guest alignment
+    /// first. Resolution never executes MMIO or the guest operation itself.
     fn resolve_direct_fault(
         &self,
         address_space: AddressSpaceId,
@@ -886,6 +890,18 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
                 "memory backend cannot resolve a native direct fault".into(),
             ),
         ))
+    }
+
+    /// Resolve an atomic read/write fault without executing the transaction.
+    /// Validate read and write permissions before repairing RAM. The caller
+    /// retains its execution lease and checks natural alignment first.
+    fn resolve_direct_atomic_fault(
+        &self,
+        _address_space: AddressSpaceId,
+        _address: GuestVirtualAddress,
+        _size: MemoryAccessSize,
+    ) -> DirectFaultResolution {
+        DirectFaultResolution::Cold
     }
 
     /// Performs one complete architectural read.
@@ -971,6 +987,30 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         access: MemoryAccess,
     ) -> Result<(DataReadResult, crate::exclusive::ExclusiveReservation), DataAccessFault>;
 
+    /// Resolve the physical identity of an exclusive load already completed by
+    /// native code, retaining exactly `value`, without reading memory again.
+    /// The caller must keep mappings stable from the native load until this
+    /// method returns (the same execution lease), and must have performed the
+    /// load's required ordering. Resolve before releasing that lease, not when
+    /// a later store consumes the reservation: the virtual address may remap.
+    /// This is an exit-side operation, not a generated RAM-access helper.
+    fn resolve_exclusive_load(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        value: MemoryValue,
+    ) -> Result<crate::exclusive::ExclusiveReservation, DataAccessFault> {
+        let _ = value;
+        Err(DataAccessFault::new(
+            address_space,
+            address,
+            DataAccessKind::Read,
+            DataAccessFaultReason::HostBacking(
+                "native exclusive-load identity resolution is not implemented".into(),
+            ),
+        ))
+    }
+
     /// Conditionally stores through a local physical reservation when the
     /// current value still equals the value observed by the exclusive load.
     /// A change-and-restore ABA sequence is intentionally accepted.
@@ -1047,8 +1087,9 @@ pub trait ProcessMemory: CpuMemory {
     ) -> Result<(), MemoryProtectionError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryAliasErrorReason {
+    ExecutionMutation(nixe_memory::ExecutionMutationError),
     InvalidRange,
     SourceStateMismatch,
     DestinationStateMismatch,
@@ -1058,15 +1099,16 @@ pub enum MemoryAliasErrorReason {
 }
 
 /// Pointer-free reason an atomic virtual alias transition was rejected.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MemoryAliasError {
     pub address_space: AddressSpaceId,
     pub address: GuestVirtualAddress,
     pub reason: MemoryAliasErrorReason,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryMappingErrorReason {
+    ExecutionMutation(nixe_memory::ExecutionMutationError),
     InvalidRange,
     AlreadyMapped,
     MappingStateMismatch,
@@ -1076,15 +1118,16 @@ pub enum MemoryMappingErrorReason {
 }
 
 /// Pointer-free reason a runtime mapping resize was rejected.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MemoryMappingError {
     pub address_space: AddressSpaceId,
     pub address: GuestVirtualAddress,
     pub reason: MemoryMappingErrorReason,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryProtectionErrorReason {
+    ExecutionMutation(nixe_memory::ExecutionMutationError),
     InvalidRange,
     Unmapped,
     WritableExecutable,
@@ -1094,7 +1137,7 @@ pub enum MemoryProtectionErrorReason {
 }
 
 /// Pointer-free reason a runtime mapping-protection operation was rejected.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MemoryProtectionError {
     pub address_space: AddressSpaceId,
     pub address: GuestVirtualAddress,

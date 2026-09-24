@@ -165,4 +165,33 @@ pub(crate) fn synthetic_svc_process_for_coordinator(process_id: u64) -> Runnable
     process
 }
 
+pub(crate) fn synthetic_memory_loop_process(
+    process_id: u64,
+    backend: crate::CpuBackendConfig,
+) -> RunnableProcess {
+    // ADR X1,.; LDR X0,[X1]; YIELD; B entry. The load reads this process's
+    // executable mapping on every loop, through the selected native frontend.
+    let mut bytes = synthetic_nro();
+    for (index, word) in [0x10000001_u32, 0xf9400020, 0xd503203f, 0x17fffffd]
+        .into_iter()
+        .enumerate()
+    {
+        put_u32(&mut bytes, 0x80 + index * 4, word);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("memory-loop.nro");
+    fs::write(&path, bytes).unwrap();
+    let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
+    ProcessBuilder::default()
+        .with_cpu_backend(backend)
+        .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
+        .with_config(ProcessBuildConfig {
+            process_id,
+            address_space_id: AddressSpaceId::new(process_id),
+            ..ProcessBuildConfig::default()
+        })
+        .build(&plan)
+        .unwrap()
+}
+
 mod run;
