@@ -1,6 +1,13 @@
 # Task 10 implementation plan
 
-Status: step 1 complete; steps 2–8 open. Native Arm host reachable as `ssh pi5`.
+Status: step 1 setup/build checkpoint complete; steps 2–8 open. ARM host
+development and native validation deferred by maintainer decision. Current
+validation focus is AMD64; cross-target conformance is not complete.
+
+Dependency handoff: normal builds now use the published Wasmtime `nixe` branch
+at `70b65893caf8222f65bf8484f35c915523847c39`, pinned by `Cargo.lock`. Use
+`--locked` without the local override for subsequent validation. Step 1's
+override-based results below remain historical evidence, not new test results.
 
 Working checklist for [Task 10](spec.md#task-10-prove-cross-target-conformance).
 Follow [CONTRIBUTING.md](../../../CONTRIBUTING.md). Code and this active plan
@@ -8,6 +15,17 @@ define the work; completed plans are evidence, not competing implementations.
 Update each step in place with findings, fixes and actual validation results.
 
 ## Scope
+
+**Scope update:** retain the cross-target checklist below for future resumption,
+but do not start further ARM work or build a custom Pi kernel. The successful
+ARM build/CLI-help checkpoint did not establish guest-launch capability:
+`hello-world` subsequently failed reserving canonical backing on the Pi's
+4 KiB/39-bit kernel. Both canonical backing and the full guest arena require
+more virtual address space than this kernel can provide. The deferred
+[segmented-arena work](next.md#1-segmented-arenas-for-limited-host-virtual-address-space)
+records the proposed resolution, separately from 16 KiB-page support. Keep
+existing ARM code; no NCE replacement or removal has been approved. AMD64-only
+results must not be reported as passing the ARM or full cross-target gates.
 
 Validate the surviving tiered JIT on native Linux x86-64 and AArch64. Reuse
 conventional tests and production compilation, publication and admission.
@@ -81,8 +99,9 @@ for the tested build, not another baseline-verification tool.
   untracked files; do not copy x86 build products or unrelated private data.
   The maintainer explicitly authorized transferring `keys/` and
   `roms/homebrew/` to this Pi; keep key contents out of logs and Git.
-  Configure the existing local override with Pi-local paths and confirm Cargo
-  resolves the intended fork. Compare source inputs on both machines; a Git
+  Confirm Cargo resolves the published fork revision in `Cargo.lock` without
+  an override (the initial checkpoint below used a local fork). Compare source
+  inputs on both machines; a Git
   clone of HEAD alone omits the currently pending Nixe work. Use `--offline`
   only after dependencies have been fetched. No QEMU runner on the Pi.
 
@@ -132,7 +151,8 @@ for the tested build, not another baseline-verification tool.
   not established by this check.
   No homebrew or native regression suite was run for this checkpoint. Step 2
   remains responsible for test execution. The override is temporary and must
-  be recreated if `/tmp` is cleared; portable dependency pins are unchanged.
+  be recreated if `/tmp` is cleared when doing local fork development. This
+  was the state before the published dependency handoff recorded above.
 
 - [ ] **2. Establish the native regression baseline and coverage gaps.**
 
@@ -281,7 +301,7 @@ for the tested build, not another baseline-verification tool.
   explicitly deferred, with commands and log locations. Update the host/Arm
   guides with real native instructions; retain QEMU as a supplementary tool.
   Remove temporary probes and resolved finding notes, not useful regressions.
-  Keep the local override/pin handoff explicit and preserve unrelated changes.
+  Keep the locked fork revision explicit and preserve unrelated changes.
 
   **Exit:** all technical criteria and the external performance gate pass on
   both native hosts, or an approved scope change states precisely what remains
@@ -291,15 +311,15 @@ for the tested build, not another baseline-verification tool.
 
 ## Baseline commands
 
-Run from each host's Nixe checkout, with its own validated override file. These
+Run from each host's Nixe checkout, using the checked-in lockfile without a
+local fork override. These
 are native commands on both machines: no cross-linker or QEMU runner options.
 Use `CARGO_BUILD_JOBS=1` initially on the Pi. Redirect full output to a separate
 log per command and inspect failures; do not suppress stderr or pipeline status.
 
 ```bash
 ulimit -c 0
-# Set NIXE_CRANELIFT_OVERRIDE to this host's actual Cargo override file.
-task10_cargo=(--config "${NIXE_CRANELIFT_OVERRIDE:?set the local override path}" -q)
+task10_cargo=(--locked -q)
 cargo test "${task10_cargo[@]}" -p nixe-cpu-jit --lib --tests
 cargo test "${task10_cargo[@]}" -p nixe-cpu -p nixe-memory -p nixe-cpu-direct-memory -p nixe-cpu-interpreter -p nixe-runtime --lib
 cargo clippy "${task10_cargo[@]}" -p nixe-cpu-jit -p nixe-cpu-direct-memory --lib --tests --no-deps -- -D warnings

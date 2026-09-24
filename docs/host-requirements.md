@@ -10,10 +10,17 @@ return `4096`). Its LinuxDirect memory backend maps and protects individual
 4 KiB guest pages through host mappings. Hosts with 16 KiB or 64 KiB pages are
 rejected; there is no automatic checked-memory fallback for the JIT.
 
-On Raspberry Pi 5, select an installed 4 KiB kernel such as `kernel8.img`
-instead of the default 16 KiB `kernel_2712.img`, and verify the page size after
-reboot. This is a host setup option, not support for larger host pages. The
-separate [16 KiB portability follow-up](specs/tiered-jit/next.md) remains open.
+Page size is not the only requirement: canonical backing reserves 512 GiB of
+contiguous virtual space, and a 39-bit guest needs another 512 GiB plus guards
+for its direct arena. These reservations do not populate that much RAM, but
+require sufficient host virtual address space.
+
+The tested Pi 5 `kernel8.img` has 4 KiB pages and only 39-bit virtual addresses;
+it cannot launch guests with the current backend. Switching from the default
+16 KiB kernel therefore does not suffice. ARM host development/validation is
+deferred; current work focuses on AMD64. The
+[portability follow-up](specs/tiered-jit/next.md) separates segmented arenas
+for limited virtual space from support for larger host pages.
 
 ## x86-64
 

@@ -3,6 +3,11 @@
 Status: steps 1 and 3 complete; step 2 deferred; step 4 pending.
 Approved during the Task 9 export audit.
 
+Dependency handoff: the fork changes used below are now published on branch
+`nixe`, locked at `70b65893caf8222f65bf8484f35c915523847c39`. Normal builds no
+longer need the local override. Override commands below describe historical
+validation, not a current setup requirement.
+
 Keep the four contracts below; their consumers and focused tests already exist.
 LCQ/HCQ produce constant maps and subtraction-flag terminal maps; exact-FPCR
 specializations and software-FPSR SSA remain pending/deferred as specified below.
@@ -61,9 +66,9 @@ No new runtime framework or parallel compiler path is required.
   not imply a cheaper boundary or a faster workload. The fork regression also
   verifies that 80 boundary-only literals add no native instructions or spill
   extent versus an empty exit. No cycle/latency benchmark, homebrew or perf run
-  was performed; no application speedup is claimed. Fork changes remain local
-  on top of 0380097992d7d337bdf66873510a8c42a8923c0b; retain the override until
-  publishing/pinning them separately. Native Arm hardware validation is pending.
+  was performed; no application speedup is claimed. This checkpoint used local
+  changes on top of 0380097992d7d337bdf66873510a8c42a8923c0b; they are now
+  published as noted above. Native Arm hardware validation is deferred.
 
 - [ ] **2. Carry software FPSR in SSA where it is live.**
   Connect `GuestValue::Fpsr` through shared frontend values and HCQ flow/SSA.
@@ -164,7 +169,8 @@ No new runtime framework or parallel compiler path is required.
   This closes the selected subtraction-terminal integration. Do not extend
   host-flag ownership to more producers or entry/fault maps without a concrete
   lowering benefit and explicit backend proof; unsupported producers keep
-  recipes. No homebrews ran, and the local fork override is still required.
+  recipes. No homebrews ran. This checkpoint used the local fork override;
+  the changes are now available in the published dependency.
 
 - [ ] **4. Select and publish exact-FPCR specializations.**
   Add an explicit HCQ selection policy, based on observed FPCR and a demonstrated

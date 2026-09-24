@@ -109,9 +109,10 @@ commit as changes accumulate. On another machine, use a clone of the same fork
 and its `nixe` branch; the local path is not a build dependency.
 
 The release commit identifies the upstream base; the tested commit on `nixe`
-identifies the evolving Nixe backend. Pin Nixe's Cargo dependencies to that exact
-fork commit using `rev`, and update `Cargo.lock` with dependency changes. Do
-not use a floating branch dependency or commit a machine-local path override.
+identifies the evolving Nixe backend. Cargo dependencies select branch `nixe`;
+commit `Cargo.lock` to pin the exact tested fork revision and update it with
+deliberate dependency changes. Use `--locked` for reproducible validation. Do
+not commit a machine-local path override or its path-based lockfile changes.
 The backend changes required by Task 1 are made in this fork.
 
 See [Cranelift modifications](../../cranelift-modifications.md) for the
@@ -1832,6 +1833,14 @@ no callable legacy route. Production contains no implementation-detail
 measurement fields or test-driven compatibility branches.
 
 ### Task 10: prove cross-target conformance
+
+Current scope: ARM host development and native validation are deferred by
+maintainer decision; current work focuses on AMD64. Preserve the ARM
+implementation, but do not claim native cross-target conformance. See the
+[Task 10 plan](task-10-plan.md) and deferred
+[host-memory portability work](next.md) for the Pi's address-space blocker and
+the proposed segmented-arena investigation. The full exit criterion below
+remains unfulfilled while ARM validation is deferred.
 
 Run focused differential, concurrency and native-shape tests throughout the
 work, then execute the complete final matrix on native Linux x86-64 and native
