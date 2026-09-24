@@ -388,6 +388,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "cranelift-assembler-x64-meta",
 ]
@@ -395,6 +396,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64-meta"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "cranelift-srcgen",
 ]
@@ -402,6 +404,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bforest"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -410,6 +413,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bitset"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "wasmtime-internal-core",
 ]
@@ -417,6 +421,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -442,6 +447,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-meta"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "cranelift-assembler-x64-meta",
  "cranelift-codegen-shared",
@@ -452,10 +458,12 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-shared"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 
 [[package]]
 name = "cranelift-control"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "arbitrary",
 ]
@@ -463,6 +471,7 @@ dependencies = [
 [[package]]
 name = "cranelift-entity"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "cranelift-bitset",
  "wasmtime-internal-core",
@@ -471,6 +480,7 @@ dependencies = [
 [[package]]
 name = "cranelift-frontend"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "cranelift-codegen",
  "hashbrown 0.17.1",
@@ -482,10 +492,12 @@ dependencies = [
 [[package]]
 name = "cranelift-isle"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 
 [[package]]
 name = "cranelift-native"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -495,6 +507,7 @@ dependencies = [
 [[package]]
 name = "cranelift-srcgen"
 version = "0.135.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 
 [[package]]
 name = "crossbeam-utils"
@@ -2597,6 +2610,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-core"
 version = "48.0.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "hashbrown 0.17.1",
  "libm",
@@ -2605,6 +2619,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
 version = "48.0.1"
+source = "git+https://github.com/pladaria/wasmtime?branch=nixe#70b65893caf8222f65bf8484f35c915523847c39"
 dependencies = [
  "libc",
  "wasmtime-internal-core",

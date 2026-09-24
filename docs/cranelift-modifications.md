@@ -10,28 +10,22 @@ not measured speedups.
 
 - Upstream: Wasmtime `v48.0.1`, Cranelift `0.135.1`, commit
   `7bac2c2775808aaec5d4aa5627a5e447b51102cf`.
-- Fork: `pladaria/wasmtime`, branch `nixe`; Nixe currently pins
-  `e2a984d96678207094c0fc50057c8b6bcfd68715` in
-  [the JIT manifest](../crates/cpu-jit/Cargo.toml). Local path overrides can
-  change the lockfile's resolved sources without updating that portable pin.
-- The pinned changes are in two commits:
+- Fork: `pladaria/wasmtime`, branch `nixe` in
+  [the JIT manifest](../crates/cpu-jit/Cargo.toml). `Cargo.lock` records the
+  published revision `70b65893caf8222f65bf8484f35c915523847c39`.
+- The original ABI changes are in two commits:
   [leaf ABI and canonical multi-entry support][abi-commit], and
   [boundary maps and patchable native exits][boundary-commit].
 
-Development still uses the local `nixe` checkout and Cargo override.
-Its additional changes, including the terminal checkpoints below, are not in
-that Git pin. Do not remove the override until the maintainer publishes and
-pins the updated fork.
+The published revision includes all modifications below, including constant
+boundary maps and explicit subtraction-flag terminals. Normal builds use
+`cargo cli run es2gears` without a local override. Commit `Cargo.lock` with
+dependency updates; normal builds retain its revision even when the branch
+advances. Use `--locked` to require the checked-in resolution.
 
-Task 9 used local HEAD `0380097992d7d337bdf66873510a8c42a8923c0b`
-on branch `nixe`. ABI integration steps 1 and 3 add uncommitted literal-boundary
-support and explicit subtraction-flag terminals on top of that revision
-(2026-09-24). The committed revision includes
-the observable-FP changes and budget checkpoints/precise memory boundaries.
-It is the locally tested revision, not Nixe's portable dependency pin; this
-check does not establish that it is available on the remote.
-On this development machine the checkout is `/home/pladaria/projects/wasmtime`
-and `/tmp/nixe-observable-fp-local.toml` contains:
+For new fork development only, an optional machine-local override can point to
+`/home/pladaria/projects/wasmtime`. For example,
+`/tmp/nixe-observable-fp-local.toml` may contain:
 
 ```toml
 [patch."https://github.com/pladaria/wasmtime"]
@@ -47,14 +41,13 @@ Adjust the checkout paths on another machine. Run with:
 cargo --config /tmp/nixe-observable-fp-local.toml cli run es2gears
 ```
 
-The override file is machine-local and `/tmp` may be cleared. `--offline` is
-optional when dependencies are already cached. Keep override-induced lockfile changes out
-of the dependency-pin handoff; publishing and pinning the updated fork remains
-a separate maintainer action.
+The optional override file is machine-local and `/tmp` may be cleared. Do not
+commit its path-based lockfile changes. Omit `--config` to return to the
+published fork and restore the Git dependency resolution before committing.
 
-The [pinned diff][fork-diff] covers only the pinned commits, not the later local
-changes. Paths below are relative to that Wasmtime checkout. Update this document when advancing the dependency
-pin, including any changes removed because upstream now supplies them.
+The [locked-revision diff][fork-diff] covers the published changes. Paths below
+are relative to the Wasmtime checkout. Update this document when advancing the
+locked revision, including changes removed because upstream now supplies them.
 
 ## Implemented modifications and benefits
 
@@ -195,7 +188,7 @@ That preservation retains raw native flags; guest NZCV packing is reserved for
 architectural consumers, not repeated around each cold operation.
 Entry/marker/fault maps do not acquire this flag proof. Dead-code elimination
 removes comparison metadata along with costs; invalid inputs fail before
-optimization. This requires the local override, like the constant-map changes.
+optimization. These changes are included in the locked fork revision.
 
 Checkpoint costs are validated before optimization. When constant-branch
 simplification makes an exit unreachable, unreachable-code elimination removes
@@ -253,7 +246,7 @@ length, zero for non-fault maps. x86-64 records completion of each individual
 assembler instruction, including its prefixes; AArch64 records four bytes per
 instruction. Compound sequences do not share an approximate interval. Nixe
 preserves these extents in owned output and checks semantic fault intervals
-against them before publication. This addition still requires the local override.
+against them before publication. This addition is included in the locked fork revision.
 The local `nixe_arena_addr` operation adds a confined I64 offset directly to
 the pinned arena base (r13/x19), as one LEA/ADD without altering flags. x86
 emission bypasses the general arithmetic LEA-to-ADD optimization. The operation
@@ -338,7 +331,7 @@ LSE lowering rule now selects SWPAL for CLIF atomic exchange, retaining the
 exclusive-loop fallback on non-LSE hosts. Regression tests independently decode
 the narrow comparisons and single-instruction exchange with both allocators;
 Nixe's execution tests exercise all RMW kinds/widths under both Arm host profiles.
-These changes remain in the local override, not the pinned revision above.
+These changes are included in the locked fork revision above.
 
 CASP X adds AArch64 lowering for CLIF `atomic_cas.i128`: CASPAL with LSE,
 otherwise a validating LDAXP/STLXP loop, including an observed-pair store on
@@ -377,4 +370,4 @@ enforcement or hardware instruction-cache coherence.
 
 [abi-commit]: https://github.com/pladaria/wasmtime/commit/2f8ccabacf
 [boundary-commit]: https://github.com/pladaria/wasmtime/commit/e2a984d96678207094c0fc50057c8b6bcfd68715
-[fork-diff]: https://github.com/pladaria/wasmtime/compare/7bac2c2775808aaec5d4aa5627a5e447b51102cf...e2a984d96678207094c0fc50057c8b6bcfd68715
+[fork-diff]: https://github.com/pladaria/wasmtime/compare/7bac2c2775808aaec5d4aa5627a5e447b51102cf...70b65893caf8222f65bf8484f35c915523847c39

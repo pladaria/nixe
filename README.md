@@ -58,17 +58,14 @@ LCQ inputs and ownership under Open authority.
 The same pool performs evidence-driven family reshaping; versioned negative
 results suppress repeated discovery until relevant inputs change. Code and
 metadata share a bounded budget, with coordinated invalidation and reclamation.
-Development requires the local Cranelift override described in
-[Cranelift modifications](docs/cranelift-modifications.md); the checked-in Git
-pin does not include the complete implementation.
+Cranelift comes from the published `nixe` branch of the Wasmtime fork, with the
+exact revision recorded in `Cargo.lock`. No local checkout or override is
+required. See [Cranelift modifications](docs/cranelift-modifications.md).
 
 ## Running
 
-See [host requirements](docs/host-requirements.md) for the required CPU capabilities.
-Until the fork pin is updated, use the local override for Cargo commands below,
-for example `cargo --config /tmp/nixe-observable-fp-local.toml cli run es2gears`.
-See [override setup](docs/cranelift-modifications.md#baseline-and-revision) to
-create that machine-local file; `--offline` is optional once dependencies are cached.
+See [host requirements](docs/host-requirements.md) for required CPU and memory
+capabilities. `--offline` is optional once dependencies are cached.
 
 The default configuration is in [`nixe.toml`](nixe.toml). List available titles with:
 

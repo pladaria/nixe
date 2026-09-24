@@ -50,12 +50,12 @@ host kernel, compiler or guest sysroot, and does not promise bit-identical build
 Install the Rust target with `rustup target add aarch64-unknown-linux-gnu`.
 The cross linker and guest sysroot come from `gcc-aarch64-linux-gnu` and
 `libc6-dev-arm64-cross` on Debian/Ubuntu. From the Nixe repository, with Cargo
-dependencies already fetched and the [local Cranelift override](cranelift-modifications.md#baseline-and-revision)
-configured (required until the portable fork pin is updated):
+dependencies already fetched (the published fork in `Cargo.lock` needs no
+local override):
 
 ```bash
 /usr/local/bin/qemu-aarch64 --version
-cargo test --offline --config /tmp/nixe-observable-fp-local.toml -p nixe-cpu-jit --lib \
+cargo test --locked --offline -p nixe-cpu-jit --lib \
   --target aarch64-unknown-linux-gnu \
   --config 'target.aarch64-unknown-linux-gnu.linker="aarch64-linux-gnu-gcc"' \
   --config 'target.aarch64-unknown-linux-gnu.runner=["/usr/local/bin/qemu-aarch64", "-cpu", "max", "-L", "/usr/aarch64-linux-gnu"]' \
