@@ -46,12 +46,13 @@ pub use invalidation::{
     MemoryInvalidationOrigin, MemoryInvalidationReservation, MemoryInvalidationSource,
 };
 pub use range::{
-    CanonicalBackingRange, CanonicalBackingSegment, CanonicalCpuWriteDependency,
-    CanonicalRangeAccessError, CanonicalRangeError, CanonicalRangeTranslationError,
-    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
+    CanonicalBackingRange, CanonicalBackingSegment, CanonicalByteSnapshots,
+    CanonicalCpuWriteDependency, CanonicalRangeAccessError, CanonicalRangeError,
+    CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
+    CpuWriteSnapshotSelection,
 };
 pub use visibility::{
-    CpuVisibilityRequest, DeviceVisibilityRequest, VisibilityCoordinator,
+    CpuVisibilityRequest, CpuVisibilityResolver, DeviceVisibilityRequest, VisibilityCoordinator,
     VisibilityCoordinatorError, VisibilityError, VisibilityState,
 };
 

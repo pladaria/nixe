@@ -150,6 +150,21 @@ impl WgpuVisibilityCoordinator {
         &self,
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+        self.completed_page(request, false)
+    }
+
+    pub(crate) fn copy_completed_page(
+        &self,
+        request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+        self.completed_page(request, true)
+    }
+
+    fn completed_page(
+        &self,
+        request: CpuVisibilityRequest,
+        retain: bool,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
         let mut pages = self
             .pages
             .lock()
@@ -169,6 +184,9 @@ impl WgpuVisibilityCoordinator {
             return Err(VisibilityCoordinatorError::new(
                 "wgpu page mirror has an unexpected size",
             ));
+        }
+        if retain {
+            return Ok(page.bytes.clone());
         }
         Ok(pages
             .remove(&request.page)

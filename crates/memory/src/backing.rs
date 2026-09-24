@@ -907,6 +907,15 @@ impl CanonicalBackingPage {
     }
 
     fn ensure_cpu_visible(&self) -> Result<(), VisibilityError> {
+        self.ensure_cpu_visible_with(&mut |coordinator, request| {
+            coordinator.make_cpu_visible(request)
+        })
+    }
+
+    pub(crate) fn ensure_cpu_visible_with(
+        &self,
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<(), VisibilityError> {
         loop {
             let (device, visible_at, coordinator, epoch, next_generation) = {
                 let mut state = self.lock_state();
@@ -946,7 +955,7 @@ impl CanonicalBackingPage {
                 device,
                 visible_at,
             };
-            let writeback = coordinator.make_cpu_visible(request);
+            let writeback = resolve(coordinator.as_ref(), request);
             let mut state = self.lock_state();
             if state.visibility_epoch != epoch {
                 match state.visibility {

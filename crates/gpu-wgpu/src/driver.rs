@@ -18,7 +18,8 @@ use nixe_gpu::{
     VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use nixe_memory::{
-    CanonicalCpuWriteDependency, CanonicalPageId, CpuVisibilityRequest, VisibilityState,
+    CanonicalCpuWriteDependency, CanonicalPageId, CpuVisibilityRequest, CpuWriteSnapshotSelection,
+    VisibilityState,
 };
 use wgpu::util::StagingBelt;
 use wgpu::{
@@ -30,11 +31,11 @@ use wgpu::{
     PipelineCache, PipelineCompilationOptions, PolygonMode, PrimitiveState, Queue,
     RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
     RenderPipeline, RenderPipelineDescriptor, ShaderModule, ShaderModuleDescriptor, ShaderSource,
-    StencilState, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo,
-    Texture, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
-    TextureViewDescriptor, TextureViewDimension, VertexAttribute as WgpuVertexAttribute,
-    VertexBufferLayout as WgpuVertexBufferLayout, VertexFormat as WgpuVertexFormat, VertexState,
-    VertexStepMode as WgpuVertexStepMode,
+    StencilFaceState, StencilOperation, StencilState, StoreOp, TexelCopyBufferInfo,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, TextureViewDimension,
+    VertexAttribute as WgpuVertexAttribute, VertexBufferLayout as WgpuVertexBufferLayout,
+    VertexFormat as WgpuVertexFormat, VertexState, VertexStepMode as WgpuVertexStepMode,
 };
 
 use crate::{
@@ -43,6 +44,121 @@ use crate::{
 
 // WebGPU and Maxwell expose at most eight simultaneous color attachments.
 const MAX_COLOR_ATTACHMENTS: usize = 8;
+
+const PARTIAL_CLEAR_SHADER: &str = r#"
+@vertex
+fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let positions = array(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    return vec4<f32>(positions[index], 0.0, 1.0);
+}
+
+@group(0) @binding(0) var<uniform> clear_color: vec4<f32>;
+
+@fragment
+fn color() -> @location(0) vec4<f32> {
+    return clear_color;
+}
+
+@fragment
+fn depth_stencil() {}
+"#;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PartialClearKind {
+    Color,
+    Depth,
+    Stencil,
+    DepthStencil,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PartialClearPipelineKey {
+    kind: PartialClearKind,
+    format: ImageFormat,
+    samples: SampleCount,
+}
+
+struct PartialClearParameters {
+    layout: wgpu::BindGroupLayout,
+    buffer: Buffer,
+    binding: BindGroup,
+    stride: u64,
+    next: u64,
+}
+
+impl PartialClearParameters {
+    fn new(device: &Device) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Nixe partial clear parameters"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: BufferSize::new(16),
+                },
+                count: None,
+            }],
+        });
+        let stride = u64::from(device.limits().min_uniform_buffer_offset_alignment).max(16);
+        let (buffer, binding) = Self::allocate(device, &layout, stride * 64);
+        Self {
+            layout,
+            buffer,
+            binding,
+            stride,
+            next: 0,
+        }
+    }
+
+    fn allocate(device: &Device, layout: &wgpu::BindGroupLayout, size: u64) -> (Buffer, BindGroup) {
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("Nixe partial clear parameters"),
+            size,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let binding = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Nixe partial clear parameters"),
+            layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buffer,
+                    offset: 0,
+                    size: BufferSize::new(16),
+                }),
+            }],
+        });
+        (buffer, binding)
+    }
+
+    fn reserve(&mut self, device: &Device) -> Result<u32, BackendDriverError> {
+        // Each encoded clear retains distinct parameter bytes until submission.
+        // Dynamic offsets reuse the binding and arena without allocating a
+        // uniform buffer or bind group per draw.
+        if self.next + self.stride > self.buffer.size() {
+            let size = self
+                .buffer
+                .size()
+                .checked_mul(2)
+                .filter(|size| {
+                    *size <= device.limits().max_buffer_size && *size <= MAX_RESIDENT_RESOURCE_BYTES
+                })
+                .ok_or_else(|| unsupported("partial clear parameter storage exhausted"))?;
+            (self.buffer, self.binding) = Self::allocate(device, &self.layout, size);
+            self.next = 0;
+        }
+        let offset = self.next as u32;
+        self.next += self.stride;
+        Ok(offset)
+    }
+}
 
 enum Resource {
     Allocation,
@@ -108,6 +224,23 @@ struct PresentationImageKey {
     width: u32,
     height: u32,
     format: PresentationImageFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PresentationSourceKey {
+    first_page: CanonicalPageId,
+    first_offset: u64,
+    source_size: u64,
+    layout: ImageMemoryLayout,
+    width: u32,
+    height: u32,
+    format: PresentationImageFormat,
+}
+
+struct PresentationSource {
+    range: nixe_memory::CanonicalBackingRange,
+    handle: BackendResourceHandle,
+    binding: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -629,7 +762,7 @@ fn alpha_test_entry_point(alpha_test: Option<AlphaTest>) -> &'static str {
     }
 }
 
-fn presentation_image_key(info: &BackendResourceCreateInfo) -> Option<PresentationImageKey> {
+fn presentation_image_key(info: &BackendResourceCreateInfo) -> Option<PresentationSourceKey> {
     let BackendResourceCreateInfo::Image {
         description,
         view: Some(view),
@@ -644,13 +777,13 @@ fn presentation_image_key(info: &BackendResourceCreateInfo) -> Option<Presentati
     view.bindings()
         .iter()
         .enumerate()
-        .find_map(|(binding, _)| presentation_binding_key(info, binding))
+        .find_map(|(index, _)| presentation_binding_key(info, index))
 }
 
 fn presentation_binding_key(
     info: &BackendResourceCreateInfo,
     binding: usize,
-) -> Option<PresentationImageKey> {
+) -> Option<PresentationSourceKey> {
     let BackendResourceCreateInfo::Image {
         description,
         view: Some(view),
@@ -668,26 +801,114 @@ fn presentation_binding_key(
     {
         return None;
     }
-    let extent = description.extent();
-    Some(PresentationImageKey {
-        allocation: binding.backing().allocation(),
-        allocation_offset: binding.backing().allocation_offset(),
-        width: extent.width,
-        height: extent.height,
-        format: presentation_format(description.format())?,
-    })
+    Some(presentation_source_key(
+        binding.backing(),
+        binding.layout(),
+        description.extent().width,
+        description.extent().height,
+        presentation_format(description.format())?,
+    ))
 }
 
-fn direct_presentation_key(request: &PresentationImageRequest) -> Option<PresentationImageKey> {
-    let mut key = PresentationImageKey::from(request);
-    key.format = match request.format {
+fn presentation_source_key(
+    backing: &BackingView,
+    layout: ImageMemoryLayout,
+    width: u32,
+    height: u32,
+    format: PresentationImageFormat,
+) -> PresentationSourceKey {
+    let first = &backing.range().segments()[0];
+    PresentationSourceKey {
+        first_page: first.page(),
+        first_offset: first.offset(),
+        source_size: backing.size(),
+        layout,
+        width,
+        height,
+        format,
+    }
+}
+
+fn direct_presentation_source_key(
+    request: &PresentationImageRequest,
+) -> Option<PresentationSourceKey> {
+    let format = match request.format {
         PresentationImageFormat::Rgba8 | PresentationImageFormat::Rgbx8 => {
             PresentationImageFormat::Rgba8
         }
         PresentationImageFormat::Bgra8 => PresentationImageFormat::Bgra8,
         PresentationImageFormat::Rgb565 | PresentationImageFormat::Rgba4444 => return None,
     };
-    Some(key)
+    Some(presentation_source_key(
+        &request.backing,
+        request.layout,
+        request.width,
+        request.height,
+        format,
+    ))
+}
+
+fn canonical_ranges_match(
+    left: &nixe_memory::CanonicalBackingRange,
+    right: &nixe_memory::CanonicalBackingRange,
+) -> bool {
+    if std::ptr::eq(left.segments(), right.segments()) {
+        return true;
+    }
+    if left.size() != right.size() {
+        return false;
+    }
+    let mut left_segments = left.segments().iter();
+    let mut right_segments = right.segments().iter();
+    let Some(mut left_segment) = left_segments.next() else {
+        return false;
+    };
+    let Some(mut right_segment) = right_segments.next() else {
+        return false;
+    };
+    let mut left_offset = 0;
+    let mut right_offset = 0;
+    loop {
+        if left_segment.page() != right_segment.page()
+            || left_segment.offset() + left_offset != right_segment.offset() + right_offset
+        {
+            return false;
+        }
+        let left_remaining = left_segment.size() - left_offset;
+        let right_remaining = right_segment.size() - right_offset;
+        let matched = left_remaining.min(right_remaining);
+        left_offset += matched;
+        right_offset += matched;
+        if left_offset == left_segment.size() {
+            let Some(next) = left_segments.next() else {
+                return right_offset == right_segment.size() && right_segments.next().is_none();
+            };
+            left_segment = next;
+            left_offset = 0;
+        }
+        if right_offset == right_segment.size() {
+            let Some(next) = right_segments.next() else {
+                return left_offset == left_segment.size() && left_segments.next().is_none();
+            };
+            right_segment = next;
+            right_offset = 0;
+        }
+    }
+}
+
+fn device_owns_presentation_source(
+    request: &PresentationImageRequest,
+    device: nixe_memory::NonCpuDeviceId,
+) -> bool {
+    request.backing.range().segments().iter().all(|segment| {
+        matches!(
+            segment.visibility_state(),
+            VisibilityState::GpuNewer {
+                device: owner,
+                ..
+            } if owner == device
+        )
+    })
 }
 
 const fn presentation_bytes_per_texel(format: PresentationImageFormat) -> u32 {
@@ -796,9 +1017,14 @@ pub(crate) struct WgpuBackendDriver {
     queue_access: WgpuQueueAccess,
     visibility: Arc<WgpuVisibilityCoordinator>,
     resources: Vec<Option<WgpuResourceSlot>>,
-    presentation_images: HashMap<PresentationImageKey, Vec<BackendResourceHandle>>,
+    // One last writer per exact canonical range, not one entry per guest
+    // resource incarnation. The prefix key keeps unrelated images out of the
+    // bucket; exact range comparisons disambiguate shared-prefix mappings.
+    presentation_images: HashMap<PresentationSourceKey, Vec<PresentationSource>>,
     presentation_imports: HashMap<PresentationImportKey, PresentationImport>,
     presentation_import_pipeline: Option<ComputePipeline>,
+    partial_clear_pipelines: HashMap<PartialClearPipelineKey, RenderPipeline>,
+    partial_clear_parameters: PartialClearParameters,
     submissions: HashMap<BackendSubmissionToken, HostSubmission>,
     completion_sender: std::sync::mpsc::Sender<BackendSubmissionToken>,
     completion_receiver: std::sync::mpsc::Receiver<BackendSubmissionToken>,
@@ -859,6 +1085,7 @@ impl WgpuBackendDriver {
         }));
         let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
         let upload_staging = StagingBelt::new(device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
+        let partial_clear_parameters = PartialClearParameters::new(&device);
         Self {
             backend,
             device,
@@ -869,6 +1096,8 @@ impl WgpuBackendDriver {
             presentation_images: HashMap::new(),
             presentation_imports: HashMap::new(),
             presentation_import_pipeline: None,
+            partial_clear_pipelines: HashMap::new(),
+            partial_clear_parameters,
             submissions: HashMap::new(),
             completion_sender,
             completion_receiver,
@@ -938,6 +1167,7 @@ impl WgpuBackendDriver {
         self.presentation_images.clear();
         self.presentation_imports.clear();
         self.presentation_import_pipeline = None;
+        self.partial_clear_pipelines.clear();
         self.submissions.clear();
         self.readback_pool.clear();
         self.uploaded_inputs.clear();
@@ -1065,6 +1295,38 @@ impl WgpuBackendDriver {
             }
         };
         for operation in accepted.submission().operations() {
+            if let GpuCommand::Clear(ClearOperation::Image { target, .. }) = operation.command() {
+                let handle =
+                    dependency_handle(dependencies, ResourceDependency::Image(target.image))?;
+                let Resource::Image { description, .. } = self.resource(handle)? else {
+                    return Err(kind_mismatch(handle));
+                };
+                if image_region_is_full(*description, *target)? {
+                    // A complete clear overwrites the subresource, so its
+                    // conservative neutral read does not require residency.
+                    let record = self.resource_record(handle)?;
+                    if let (
+                        Some(content),
+                        BackendResourceCreateInfo::Image {
+                            view: Some(view), ..
+                        },
+                    ) = (&record.content, &record.immutable)
+                    {
+                        for (binding, dependency) in view.bindings().iter().zip(&content.cpu_writes)
+                        {
+                            if binding.subresources() != target.subresources {
+                                continue;
+                            }
+                            if !dependency.remains_current() {
+                                dependency.rearm().map_err(|error| {
+                                    BackendDriverError::failure(error.to_string())
+                                })?;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             for access in operation.accesses() {
                 if !access.scope().mode().reads() {
                     continue;
@@ -1139,18 +1401,16 @@ impl WgpuBackendDriver {
                 cpu_writes,
             )
         };
-        let snapshots = if initialized {
-            cpu_writes
-                .snapshot_dirty_pages(view.backing().range(), 4)
-                .map_err(|error| BackendDriverError::failure(error.to_string()))?
-        } else {
-            vec![(
-                0,
-                cpu_writes
-                    .snapshot_all(view.backing().range())
-                    .map_err(|error| BackendDriverError::failure(error.to_string()))?,
-            )]
-        };
+        let snapshots = self.snapshot_input(
+            &cpu_writes,
+            view.backing().range(),
+            if initialized {
+                CpuWriteSnapshotSelection::DirtyPages
+            } else {
+                CpuWriteSnapshotSelection::All
+            },
+            4,
+        )?;
         if snapshots.is_empty() {
             return Ok(());
         }
@@ -1180,6 +1440,34 @@ impl WgpuBackendDriver {
             subtract_buffer_write_range(&mut content.device_writes, *range, None);
         }
         Ok(())
+    }
+
+    fn snapshot_input(
+        &mut self,
+        dependency: &CanonicalCpuWriteDependency,
+        range: &nixe_memory::CanonicalBackingRange,
+        selection: CpuWriteSnapshotSelection,
+        alignment: u64,
+    ) -> Result<nixe_memory::CanonicalByteSnapshots, BackendDriverError> {
+        // Avoid rebuilding the snapshot's page sets and mutation plan on the
+        // steady-state resident path. The immutable binding already fixes the
+        // dependency's range; only dirty epochs need inspection here.
+        if selection != CpuWriteSnapshotSelection::All && dependency.remains_current() {
+            return Ok(Vec::new());
+        }
+        dependency
+            .snapshot_with_resolver(range, selection, alignment, &mut |coordinator, request| {
+                if request.device == self.visibility.device() {
+                    // Submission already prepared the page mirrors. Retain them
+                    // for publication of this submission's subsequent GPU writes.
+                    self.materialize_cpu_page(request, true).map_err(|error| {
+                        nixe_memory::VisibilityCoordinatorError::new(error.to_string())
+                    })
+                } else {
+                    coordinator.make_cpu_visible(request)
+                }
+            })
+            .map_err(|error| BackendDriverError::failure(error.to_string()))
     }
 
     fn upload_image(
@@ -1221,17 +1509,19 @@ impl WgpuBackendDriver {
             .map_err(|_| BackendDriverError::failure("image upload snapshots exhausted"))?;
         for (binding, dependency) in cpu_writes.iter().enumerate() {
             let range = view.bindings()[binding].backing().range();
-            let bytes = if initialized {
-                dependency
-                    .snapshot_whole_if_dirty(range)
-                    .map_err(|error| BackendDriverError::failure(error.to_string()))?
-            } else {
-                Some(
-                    dependency
-                        .snapshot_all(range)
-                        .map_err(|error| BackendDriverError::failure(error.to_string()))?,
-                )
-            };
+            let bytes = self
+                .snapshot_input(
+                    dependency,
+                    range,
+                    if initialized {
+                        CpuWriteSnapshotSelection::WholeIfDirty
+                    } else {
+                        CpuWriteSnapshotSelection::All
+                    },
+                    1,
+                )?
+                .pop()
+                .map(|(_, bytes)| bytes);
             if let Some(bytes) = bytes {
                 dirty_bindings.push((binding, bytes));
             }
@@ -1490,8 +1780,9 @@ impl WgpuBackendDriver {
             ClearOperation::Image {
                 target,
                 kind,
+                format,
+                samples,
                 value,
-                ..
             } => {
                 let handle =
                     dependency_handle(dependencies, ResourceDependency::Image(target.image))?;
@@ -1503,7 +1794,17 @@ impl WgpuBackendDriver {
                 else {
                     return Err(kind_mismatch(handle));
                 };
-                require_full_image_region(*description, *target)?;
+                let texture = texture.clone();
+                let description = *description;
+                if description.kind() != *kind
+                    || description.format() != *format
+                    || description.samples() != *samples
+                {
+                    return Err(unsupported("image clear description mismatch"));
+                }
+                if !image_region_is_full(description, *target)? {
+                    return self.encode_partial_image_clear(encoder, &texture, description, clear);
+                }
                 let view = texture.create_view(&texture_view_descriptor(target.subresources));
                 match (kind, value) {
                     (nixe_gpu::ImageKind::Color, ClearValue::Color(color)) => {
@@ -1566,6 +1867,249 @@ impl WgpuBackendDriver {
                 Ok(())
             }
         }
+    }
+
+    fn encode_partial_image_clear(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        texture: &Texture,
+        description: ImageDescription,
+        clear: &ClearOperation,
+    ) -> Result<(), BackendDriverError> {
+        let ClearOperation::Image {
+            target,
+            kind,
+            format,
+            samples,
+            value,
+        } = clear
+        else {
+            unreachable!();
+        };
+        if target.extent.depth != 1 || target.origin.z != 0 {
+            return Err(unsupported("partial three-dimensional image clear"));
+        }
+        let (clear_kind, color, depth, stencil_reference) = match (*kind, *value) {
+            (nixe_gpu::ImageKind::Color, ClearValue::Color(color)) => {
+                (PartialClearKind::Color, Some(color), None, None)
+            }
+            (nixe_gpu::ImageKind::DepthStencil, ClearValue::Depth(depth)) => {
+                (PartialClearKind::Depth, None, Some(depth), None)
+            }
+            (nixe_gpu::ImageKind::DepthStencil, ClearValue::Stencil(stencil)) => (
+                PartialClearKind::Stencil,
+                None,
+                None,
+                Some(u32::from(stencil)),
+            ),
+            (nixe_gpu::ImageKind::DepthStencil, ClearValue::DepthStencil { depth, stencil }) => (
+                PartialClearKind::DepthStencil,
+                None,
+                Some(depth),
+                Some(u32::from(stencil)),
+            ),
+            _ => return Err(unsupported("image clear value")),
+        };
+        if matches!(
+            clear_kind,
+            PartialClearKind::Stencil | PartialClearKind::DepthStencil
+        ) && *format != ImageFormat::Depth24UnormStencil8Uint
+        {
+            return Err(unsupported("stencil clear format"));
+        }
+        let pipeline = self.partial_clear_pipeline(PartialClearPipelineKey {
+            kind: clear_kind,
+            format: *format,
+            samples: *samples,
+        })?;
+        let color_offset = if let Some(color) = color {
+            let mut bytes = [0; 16];
+            for (output, component) in bytes.chunks_exact_mut(4).zip(color) {
+                output.copy_from_slice(&component.to_ne_bytes());
+            }
+            let offset = self.partial_clear_parameters.reserve(&self.device)?;
+            self.stage_buffer_upload(
+                encoder,
+                &self.partial_clear_parameters.buffer.clone(),
+                u64::from(offset),
+                &bytes,
+            )?;
+            Some(offset)
+        } else {
+            None
+        };
+        let view = texture.create_view(&texture_view_descriptor(target.subresources));
+        let color_attachments = [Some(RenderPassColorAttachment {
+            view: &view,
+            resolve_target: None,
+            ops: Operations {
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            },
+            depth_slice: None,
+        })];
+        let depth_stencil_attachment = RenderPassDepthStencilAttachment {
+            view: &view,
+            depth_ops: matches!(
+                clear_kind,
+                PartialClearKind::Depth | PartialClearKind::DepthStencil
+            )
+            .then_some(Operations {
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            }),
+            stencil_ops: matches!(
+                clear_kind,
+                PartialClearKind::Stencil | PartialClearKind::DepthStencil
+            )
+            .then_some(Operations {
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            }),
+        };
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Nixe partial image clear"),
+            color_attachments: if clear_kind == PartialClearKind::Color {
+                &color_attachments
+            } else {
+                &[]
+            },
+            depth_stencil_attachment: (clear_kind != PartialClearKind::Color)
+                .then_some(depth_stencil_attachment),
+            ..Default::default()
+        });
+        pass.set_pipeline(&pipeline);
+        if let Some(offset) = color_offset {
+            pass.set_bind_group(0, &self.partial_clear_parameters.binding, &[offset]);
+        }
+        if let Some(depth) = depth {
+            if !(0.0..=1.0).contains(&depth) {
+                return Err(unsupported("depth clear value outside normalized range"));
+            }
+            let extent = description
+                .mip_extent(target.subresources.mip_level)
+                .ok_or_else(|| unsupported("invalid image region mip"))?;
+            pass.set_viewport(
+                0.0,
+                0.0,
+                extent.width as f32,
+                extent.height as f32,
+                depth,
+                depth,
+            );
+        }
+        if let Some(reference) = stencil_reference {
+            pass.set_stencil_reference(reference);
+        }
+        pass.set_scissor_rect(
+            target.origin.x,
+            target.origin.y,
+            target.extent.width,
+            target.extent.height,
+        );
+        pass.draw(0..3, 0..1);
+        Ok(())
+    }
+
+    fn partial_clear_pipeline(
+        &mut self,
+        key: PartialClearPipelineKey,
+    ) -> Result<RenderPipeline, BackendDriverError> {
+        if let Some(pipeline) = self.partial_clear_pipelines.get(&key) {
+            return Ok(pipeline.clone());
+        }
+        let format = texture_format(key.format).ok_or_else(|| unsupported("image format"))?;
+        let scope = self.device.push_error_scope(ErrorFilter::Validation);
+        let module = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Nixe partial clear shader"),
+            source: ShaderSource::Wgsl(PARTIAL_CLEAR_SHADER.into()),
+        });
+        let color_targets = [Some(ColorTargetState {
+            format,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        })];
+        let uses_depth = matches!(
+            key.kind,
+            PartialClearKind::Depth | PartialClearKind::DepthStencil
+        );
+        let uses_stencil = matches!(
+            key.kind,
+            PartialClearKind::Stencil | PartialClearKind::DepthStencil
+        );
+        let stencil_face = StencilFaceState {
+            compare: CompareFunction::Always,
+            fail_op: StencilOperation::Keep,
+            depth_fail_op: StencilOperation::Keep,
+            pass_op: StencilOperation::Replace,
+        };
+        let depth_stencil = (key.kind != PartialClearKind::Color).then_some(DepthStencilState {
+            format,
+            depth_write_enabled: Some(uses_depth),
+            depth_compare: Some(CompareFunction::Always),
+            stencil: if uses_stencil {
+                StencilState {
+                    front: stencil_face,
+                    back: stencil_face,
+                    read_mask: 0xff,
+                    write_mask: 0xff,
+                }
+            } else {
+                StencilState::default()
+            },
+            bias: wgpu::DepthBiasState::default(),
+        });
+        let fragment_entry = match key.kind {
+            PartialClearKind::Color => "color",
+            PartialClearKind::Depth
+            | PartialClearKind::Stencil
+            | PartialClearKind::DepthStencil => "depth_stencil",
+        };
+        let bindings = [Some(&self.partial_clear_parameters.layout)];
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Nixe partial clear pipeline"),
+                bind_group_layouts: if key.kind == PartialClearKind::Color {
+                    &bindings
+                } else {
+                    &[]
+                },
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("Nixe partial clear pipeline"),
+                layout: Some(&layout),
+                vertex: VertexState {
+                    module: &module,
+                    entry_point: Some("vertex"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: PrimitiveState::default(),
+                depth_stencil,
+                multisample: MultisampleState {
+                    count: key.samples as u32,
+                    ..Default::default()
+                },
+                fragment: Some(FragmentState {
+                    module: &module,
+                    entry_point: Some(fragment_entry),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: if key.kind == PartialClearKind::Color {
+                        &color_targets
+                    } else {
+                        &[]
+                    },
+                }),
+                multiview_mask: None,
+                cache: self.pipeline_cache.as_ref(),
+            });
+        self.capture_error_scope(scope)?;
+        self.partial_clear_pipelines.insert(key, pipeline.clone());
+        Ok(pipeline)
     }
 
     fn encode_render_pass(
@@ -2622,15 +3166,58 @@ impl WgpuBackendDriver {
     fn index_presentable_image(
         &mut self,
         handle: BackendResourceHandle,
-        info: &BackendResourceCreateInfo,
+        target: nixe_gpu::AccessTarget,
     ) {
-        let Some(key) = presentation_image_key(info) else {
+        let nixe_gpu::AccessTarget::Image { subresources, .. } = target else {
             return;
         };
-        self.presentation_images
-            .entry(key)
-            .or_default()
-            .push(handle);
+        let Ok(record) = self.resource_record(handle) else {
+            return;
+        };
+        let Some(key) = presentation_image_key(&record.immutable) else {
+            return;
+        };
+        let BackendResourceCreateInfo::Image {
+            view: Some(view), ..
+        } = &record.immutable
+        else {
+            return;
+        };
+        let Some(content) = &record.content else {
+            return;
+        };
+        let Some(binding) = content
+            .device_writes
+            .iter()
+            .find_map(|write| match write.region {
+                DeviceWriteRegion::ImageBinding(binding)
+                    if image_subresources_overlap(
+                        view.bindings()[binding].subresources(),
+                        subresources,
+                    ) && presentation_binding_key(&record.immutable, binding) == Some(key) =>
+                {
+                    Some(binding)
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let range = view.bindings()[binding].backing().range().clone();
+        let sources = self.presentation_images.entry(key).or_default();
+        if let Some(source) = sources
+            .iter_mut()
+            .find(|source| source.handle == handle || canonical_ranges_match(&source.range, &range))
+        {
+            source.handle = handle;
+            source.binding = binding;
+        } else {
+            sources.push(PresentationSource {
+                range,
+                handle,
+                binding,
+            });
+        }
     }
 
     fn remove_resource_record(&mut self, handle: BackendResourceHandle) -> Option<ResourceRecord> {
@@ -2643,12 +3230,12 @@ impl WgpuBackendDriver {
             .take()
             .expect("validated WGPU resource slot")
             .record;
-        if let Some(key) = presentation_image_key(&record.immutable)
-            && let Some(handles) = self.presentation_images.get_mut(&key)
+        if let Some(shape) = presentation_image_key(&record.immutable)
+            && let Some(handles) = self.presentation_images.get_mut(&shape)
         {
-            handles.retain(|candidate| *candidate != handle);
+            handles.retain(|candidate| candidate.handle != handle);
             if handles.is_empty() {
-                self.presentation_images.remove(&key);
+                self.presentation_images.remove(&shape);
             }
         }
         if record.host.is_some() {
@@ -2675,37 +3262,28 @@ impl WgpuBackendDriver {
         self.require_device()?;
         validate_presentation_request(&request)?;
         let import_key = PresentationImportKey::from(&request);
-        let cpu_contents_unchanged = self
-            .presentation_imports
-            .get(&import_key)
-            .filter(|import| import.initialized)
-            .map_or_else(
-                || request.cpu_writes.remains_current(),
-                |import| import.cpu_writes.remains_current(),
-            );
-        if cpu_contents_unchanged
-            && let Some(key) = direct_presentation_key(&request)
+        let device_owns_source =
+            device_owns_presentation_source(&request, self.visibility.device());
+        // CPU-write observers describe import freshness, not which producer
+        // currently owns the bytes. Device authority selects direct export.
+        if device_owns_source
+            && let Some(shape) = direct_presentation_source_key(&request)
             && let Some((description, texture)) = self
                 .presentation_images
-                .get(&key)
+                .get(&shape)
                 .into_iter()
                 .flatten()
-                .filter_map(|handle| {
-                    let record = self.resource_record(*handle).ok()?;
+                .find_map(|source| {
+                    if !canonical_ranges_match(&source.range, request.backing.range()) {
+                        return None;
+                    }
+                    let record = self.resource_record(source.handle).ok()?;
                     let content = record.content.as_ref()?;
-                    let newest_write = content
-                        .device_writes
-                        .iter()
-                        .filter_map(|write| match write.region {
-                            DeviceWriteRegion::ImageBinding(binding)
-                                if presentation_binding_key(&record.immutable, binding)
-                                    == Some(key) =>
-                            {
-                                Some(write.serial)
-                            }
-                            _ => None,
-                        })
-                        .max()?;
+                    if !content.device_writes.iter().any(|write| {
+                        write.region == DeviceWriteRegion::ImageBinding(source.binding)
+                    }) {
+                        return None;
+                    }
                     let Resource::Image {
                         texture,
                         description,
@@ -2714,10 +3292,8 @@ impl WgpuBackendDriver {
                     else {
                         return None;
                     };
-                    Some((newest_write, *description, texture.clone()))
+                    Some((*description, texture.clone()))
                 })
-                .max_by_key(|candidate| candidate.0)
-                .map(|(_, description, texture)| (description, texture))
         {
             return Ok(ResidentImage::new(
                 self.backend,
@@ -2884,17 +3460,11 @@ impl WgpuBackendDriver {
         import: &mut PresentationImport,
     ) -> Result<Texture, BackendDriverError> {
         import.last_used = self.take_resource_use()?;
-        if import.initialized && import.cpu_writes.remains_current() {
-            return Ok(import.texture.clone());
-        }
+        let mut device_authored = false;
         for segment in request.backing.range().segments() {
             match segment.visibility_state() {
                 VisibilityState::Clean | VisibilityState::CpuNewer => {}
-                VisibilityState::GpuNewer { .. } => {
-                    return Err(unsupported(
-                        "device-authored presentation source has no compatible resident image",
-                    ));
-                }
+                VisibilityState::GpuNewer { .. } => device_authored = true,
                 VisibilityState::Conflicting => {
                     return Err(unsupported(
                         "presentation source has conflicting authorities",
@@ -2905,20 +3475,13 @@ impl WgpuBackendDriver {
                 }
             }
         }
-        let snapshots = if import.initialized {
-            import
-                .cpu_writes
-                .snapshot_dirty_pages(request.backing.range(), 4)
-                .map_err(|error| BackendDriverError::failure(error.to_string()))?
+        let selection = if import.initialized && !device_authored {
+            CpuWriteSnapshotSelection::DirtyPages
         } else {
-            vec![(
-                0,
-                import
-                    .cpu_writes
-                    .snapshot_all(request.backing.range())
-                    .map_err(|error| BackendDriverError::failure(error.to_string()))?,
-            )]
+            CpuWriteSnapshotSelection::All
         };
+        let snapshots =
+            self.snapshot_input(&import.cpu_writes, request.backing.range(), selection, 4)?;
         if snapshots.is_empty() {
             return Ok(import.texture.clone());
         }
@@ -3150,6 +3713,7 @@ impl WgpuBackendDriver {
     fn materialize_cpu_page(
         &mut self,
         request: CpuVisibilityRequest,
+        retain_mirror: bool,
     ) -> Result<Box<[u8]>, BackendDriverError> {
         let mut demanded = Vec::new();
         for slot in self.resources.iter().flatten() {
@@ -3237,9 +3801,12 @@ impl WgpuBackendDriver {
         self.visibility
             .mark_page_completed(request.page, request.visible_at)
             .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-        self.visibility
-            .take_completed_page(request)
-            .map_err(|error| BackendDriverError::failure(error.to_string()))
+        if retain_mirror {
+            self.visibility.copy_completed_page(request)
+        } else {
+            self.visibility.take_completed_page(request)
+        }
+        .map_err(|error| BackendDriverError::failure(error.to_string()))
     }
 }
 
@@ -3306,7 +3873,6 @@ impl BackendDriver for WgpuBackendDriver {
                 resident_bytes,
             },
         });
-        self.index_presentable_image(handle, info);
         self.resident_resources += 1;
         self.resident_resource_bytes = self
             .resident_resource_bytes
@@ -3358,6 +3924,7 @@ impl BackendDriver for WgpuBackendDriver {
         let dependencies = accepted.resources();
         self.ensure_resident(dependencies)?;
         self.upload_bytes = 0;
+        self.partial_clear_parameters.next = 0;
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
@@ -3399,6 +3966,7 @@ impl BackendDriver for WgpuBackendDriver {
                 if let Ok(record) = self.resource_record_mut(handle) {
                     record_device_write(record, access.target(), use_serial)?;
                 }
+                self.index_presentable_image(handle, access.target());
             }
         }
         Ok(())
@@ -3480,7 +4048,7 @@ impl BackendDriver for WgpuBackendDriver {
                 "CPU visibility request targets another device",
             ));
         }
-        self.materialize_cpu_page(request)
+        self.materialize_cpu_page(request, false)
     }
 
     fn acquire_presentable_image(
@@ -3745,20 +4313,49 @@ fn sampled_texture_view_descriptor(
     }
 }
 
-fn require_full_image_region(
+fn image_region_is_full(
     description: ImageDescription,
     region: ImageRegion,
-) -> Result<(), BackendDriverError> {
+) -> Result<bool, BackendDriverError> {
     let extent = description
         .mip_extent(region.subresources.mip_level)
         .ok_or_else(|| unsupported("invalid image region mip"))?;
-    if region.origin != (ImageOrigin { x: 0, y: 0, z: 0 })
-        || region.extent != extent
-        || region.subresources.layer_count != 1
-    {
-        return Err(unsupported("partial image clear"));
+    if region.subresources.plane != 0 || region.subresources.layer_count != 1 {
+        return Err(unsupported("image clear subresources"));
     }
-    Ok(())
+    let end_layer = region
+        .subresources
+        .base_layer
+        .checked_add(region.subresources.layer_count)
+        .ok_or_else(|| unsupported("image clear layer overflow"))?;
+    if end_layer > description.array_layers() {
+        return Err(unsupported("image clear layer outside image"));
+    }
+    let end_x = region
+        .origin
+        .x
+        .checked_add(region.extent.width)
+        .ok_or_else(|| unsupported("image clear region overflow"))?;
+    let end_y = region
+        .origin
+        .y
+        .checked_add(region.extent.height)
+        .ok_or_else(|| unsupported("image clear region overflow"))?;
+    let end_z = region
+        .origin
+        .z
+        .checked_add(region.extent.depth)
+        .ok_or_else(|| unsupported("image clear region overflow"))?;
+    if region.extent.width == 0
+        || region.extent.height == 0
+        || region.extent.depth == 0
+        || end_x > extent.width
+        || end_y > extent.height
+        || end_z > extent.depth
+    {
+        return Err(unsupported("image clear region outside image"));
+    }
+    Ok(region.origin == (ImageOrigin { x: 0, y: 0, z: 0 }) && region.extent == extent)
 }
 
 fn color_operations(
@@ -4480,6 +5077,9 @@ fn kind_mismatch(handle: BackendResourceHandle) -> BackendDriverError {
 }
 
 #[cfg(test)]
+mod clear_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
@@ -4507,6 +5107,63 @@ mod tests {
         let records = HashMap::from([(11_u32, 40_u64), (22, 10), (33, 30)]);
 
         assert_eq!(least_recent_key(&records, |last_used| *last_used), Some(22));
+    }
+
+    #[test]
+    fn presentation_index_uses_physical_storage_and_checks_shared_prefixes_exactly() {
+        use nixe_gpu::{
+            BackingView, GpuAllocationDescription, GpuAllocationId, PresentationImageFormat,
+        };
+        use nixe_memory::CanonicalBackingRange;
+        let allocation = CanonicalAllocation::zeroed(0x3000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let first = range.snapshot_subrange(0, 0x2000).unwrap();
+        let mut segments = first.segments().to_vec();
+        segments[1] = range.segments()[2].clone();
+        let different_tail = CanonicalBackingRange::new(segments).unwrap();
+        let backing = |id, range| {
+            BackingView::new(
+                GpuAllocationId::new(id),
+                GpuAllocationDescription::new(0x2000, 4).unwrap(),
+                0,
+                range,
+            )
+            .unwrap()
+        };
+        let layout = ImageMemoryLayout::PitchLinear {
+            row_pitch: 256,
+            layer_stride: 0x2000,
+        };
+        let key = |backing: &BackingView| {
+            super::presentation_source_key(backing, layout, 64, 32, PresentationImageFormat::Rgba8)
+        };
+        let original = backing(1, first.clone());
+        let alias = backing(2, first.clone());
+        let collision = backing(3, different_tail.clone());
+        assert_eq!(key(&original), key(&alias));
+        assert_eq!(key(&original), key(&collision));
+        assert!(super::canonical_ranges_match(
+            original.range(),
+            alias.range()
+        ));
+        assert!(!super::canonical_ranges_match(
+            original.range(),
+            collision.range()
+        ));
+        let other = backing(4, range.snapshot_subrange(0x1000, 0x2000).unwrap());
+        assert_ne!(key(&original), key(&other));
+        let mut split = first
+            .snapshot_subrange(0, 0x100)
+            .unwrap()
+            .segments()
+            .to_vec();
+        split.extend_from_slice(first.snapshot_subrange(0x100, 0x1f00).unwrap().segments());
+        assert!(super::canonical_ranges_match(
+            &first,
+            &CanonicalBackingRange::new(split).unwrap()
+        ));
     }
 
     #[test]
