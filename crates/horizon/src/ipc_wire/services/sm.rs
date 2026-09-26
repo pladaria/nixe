@@ -192,16 +192,23 @@ fn connect_service(
                     initial_operation_mode,
                 )))
         }
-        ServiceKind::Hid => process
-            .handles_mut()
-            .insert(HorizonIpcObject::Hid(HidSession::new(
-                host_systems.hid.shared_memory(),
-            ))),
-        ServiceKind::Time => time_environment.create_service().and_then(|session| {
-            process
-                .handles_mut()
-                .insert(HorizonIpcObject::Time(session))
-        }),
+        ServiceKind::Hid => host_systems
+            .hid
+            .shared_memory(process.memory())
+            .and_then(|memory| {
+                process
+                    .handles_mut()
+                    .insert(HorizonIpcObject::Hid(HidSession::new(memory)))
+            }),
+        ServiceKind::Time => {
+            time_environment
+                .create_service(process.memory())
+                .and_then(|session| {
+                    process
+                        .handles_mut()
+                        .insert(HorizonIpcObject::Time(session))
+                })
+        }
         // libnx opens acc:u0 for application account sessions. Retain the
         // real session identity while unsupported commands remain fail-fast.
         ServiceKind::Account => process

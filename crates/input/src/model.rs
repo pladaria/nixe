@@ -418,7 +418,7 @@ pub struct MotionState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControllerState {
     pub id: ControllerId,
-    pub name: String,
+    pub name: std::sync::Arc<str>,
     pub kind: ControllerKind,
     pub buttons: ButtonSet,
     pub button_labels: FaceButtonLabels,
@@ -427,11 +427,6 @@ pub struct ControllerState {
     pub right_stick: StickState,
     pub triggers: TriggerState,
     pub motion: MotionState,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct InputSnapshot {
-    pub controllers: Vec<ControllerState>,
 }
 
 #[cfg(test)]

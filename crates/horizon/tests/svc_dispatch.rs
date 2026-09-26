@@ -2418,7 +2418,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         ..EmulatedControllerState::default()
     };
     dispatcher
-        .advance_input(&process, Some(&controller), Duration::from_millis(5))
+        .advance_input(Some(&controller), Duration::from_millis(5))
         .unwrap();
     assert_eq!(
         read_guest_u32(&process, mapping_address.checked_add(0x9a00).unwrap()),
@@ -2433,7 +2433,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         1 | 1 << 10
     );
     dispatcher
-        .advance_input(&process, None, Duration::from_millis(5))
+        .advance_input(None, Duration::from_millis(5))
         .unwrap();
     assert_eq!(
         read_guest_u32(&process, mapping_address.checked_add(0x9a00).unwrap()),

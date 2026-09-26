@@ -587,6 +587,15 @@ impl VideoSystem {
         result
     }
 
+    /// Next host deadline for servicing the guest display clock.
+    pub fn next_display_deadline(&self) -> Duration {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .display_clock
+            .next_boundary()
+    }
+
     /// Advances guest display timing independently from host monitor VSync.
     pub fn advance(&self, elapsed: Duration) -> Result<u64, FramebufferError> {
         let mut state = self
@@ -1468,6 +1477,17 @@ mod tests {
     use nixe_video::FrameNotifier;
 
     use super::*;
+
+    #[test]
+    fn display_deadline_advances_without_input_samples() {
+        let video = VideoSystem::default();
+        let first = video.next_display_deadline();
+        assert!(first > Duration::ZERO);
+        assert_eq!(video.advance(first - Duration::from_nanos(1)).unwrap(), 0);
+        assert_eq!(video.next_display_deadline(), first);
+        assert_eq!(video.advance(first).unwrap(), 1);
+        assert_eq!(video.next_display_deadline(), first * 2);
+    }
 
     fn rgba_pitch_buffer(nvmap_id: u32) -> GraphicBuffer {
         GraphicBuffer {

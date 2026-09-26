@@ -839,8 +839,11 @@ impl TimeEnvironment {
         })
     }
 
-    pub(crate) fn create_service(&self) -> Result<TimeServiceSession, nixe_runtime::HandleError> {
-        TimeServiceSession::new(self.clone())
+    pub(crate) fn create_service(
+        &self,
+        memory: &nixe_cpu::memory::ExecutionMemory,
+    ) -> Result<TimeServiceSession, nixe_runtime::HandleError> {
+        TimeServiceSession::new(self.clone(), memory)
     }
 
     pub(crate) fn clock(&self) -> VirtualClock {
@@ -976,8 +979,12 @@ pub(crate) enum TimeObject {
 }
 
 impl TimeServiceSession {
-    fn new(environment: TimeEnvironment) -> Result<Self, nixe_runtime::HandleError> {
-        let shared_memory = SharedMemoryObject::zeroed_with_remote_permissions(
+    fn new(
+        environment: TimeEnvironment,
+        memory: &nixe_cpu::memory::ExecutionMemory,
+    ) -> Result<Self, nixe_runtime::HandleError> {
+        let shared_memory = SharedMemoryObject::for_process(
+            memory,
             TIME_SHARED_MEMORY_SIZE,
             nixe_cpu::memory::MemoryPermissions::READ,
         )?;
@@ -2468,7 +2475,9 @@ mod time_tests {
             "Europe/Madrid",
         )
         .unwrap();
-        let service = environment.create_service().unwrap();
+        let service = environment
+            .create_service(&nixe_cpu::memory::ExecutionMemory::new())
+            .unwrap();
         let user_clock = service.system_clock(SystemClockKind::User);
 
         assert_eq!(user_clock.current_time(), 1_704_067_200);
@@ -2530,7 +2539,9 @@ mod time_tests {
 
     #[test]
     fn time_domain_retains_every_child_interface_until_close() {
-        let service = TimeEnvironment::default().create_service().unwrap();
+        let service = TimeEnvironment::default()
+            .create_service(&nixe_cpu::memory::ExecutionMemory::new())
+            .unwrap();
 
         assert!(!service.is_domain());
         assert_eq!(service.convert_to_domain(), IPC_ROOT_OBJECT_ID);

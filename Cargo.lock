@@ -1248,6 +1248,7 @@ dependencies = [
 name = "nixe-input"
 version = "0.1.0"
 dependencies = [
+ "log",
  "sdl3",
  "sdl3-sys",
  "serde",

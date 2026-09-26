@@ -229,19 +229,17 @@ pub struct SharedMemoryObject {
 }
 
 impl SharedMemoryObject {
-    pub fn zeroed(size: usize) -> Result<Self, HandleError> {
-        Self::zeroed_with_remote_permissions(size, MemoryPermissions::READ_WRITE)
-    }
-
-    pub fn zeroed_with_remote_permissions(
+    pub fn for_process(
+        memory: &nixe_cpu::memory::ExecutionMemory,
         size: usize,
         remote_permissions: MemoryPermissions,
     ) -> Result<Self, HandleError> {
         if size > MAX_SHARED_MEMORY_BYTES {
             return Err(HandleError::ObjectTooLarge(size));
         }
-        let backing =
-            CanonicalAllocation::zeroed(size, 4096).map_err(|_| HandleError::AllocationFailed)?;
+        let backing = memory
+            .allocate_shared_backing(size)
+            .map_err(|_| HandleError::AllocationFailed)?;
         Ok(Self {
             backing,
             size,
@@ -249,6 +247,10 @@ impl SharedMemoryObject {
         })
     }
 
+    #[must_use]
+    pub fn backing(&self) -> &CanonicalAllocation {
+        &self.backing
+    }
     #[must_use]
     pub const fn size(&self) -> usize {
         self.size
@@ -259,26 +261,13 @@ impl SharedMemoryObject {
         self.remote_permissions
     }
 
-    /// Reports whether two objects refer to the same temporary backing.
-    #[must_use]
-    pub fn same_backing(&self, other: &Self) -> bool {
-        self.backing.same_backing(&other.backing)
-    }
-
-    /// Returns a retained canonical route for future CPU/device mappings.
-    pub fn backing_range(&self) -> Result<CanonicalBackingRange, HandleError> {
-        self.backing
-            .backing_range(self.remote_permissions)
-            .map_err(|_| HandleError::BackingAccess)
-    }
-
     /// Copies bytes into canonical backing shared by every duplicate handle.
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), HandleError> {
         self.backing
             .write(offset, bytes)
             .map_err(|error| match error {
                 nixe_memory::CanonicalAllocationError::InvalidRange => HandleError::InvalidRange,
-                _ => HandleError::BackingAccess,
+                error => HandleError::MemoryWrite(error.to_string().into()),
             })
     }
 
@@ -537,18 +526,31 @@ mod tests {
     }
 
     #[test]
-    fn temporary_shared_memory_is_bounded_and_has_shared_identity() {
-        let memory = SharedMemoryObject::zeroed(0x1000).unwrap();
+    fn shared_memory_is_bounded_and_has_shared_identity() {
+        let process = nixe_cpu::memory::ExecutionMemory::new();
+        let memory =
+            SharedMemoryObject::for_process(&process, 0x1000, MemoryPermissions::READ_WRITE)
+                .unwrap();
         let duplicate = memory.clone();
         assert_eq!(memory.size(), 0x1000);
-        assert!(memory.same_backing(&duplicate));
-        let range = memory.backing_range().unwrap();
+        assert_eq!(memory.backing().store(), duplicate.backing().store());
+        let range = memory
+            .backing()
+            .backing_range(memory.remote_permissions())
+            .unwrap();
         let cpu_writes = nixe_memory::CanonicalCpuWriteDependency::capture(&range).unwrap();
         assert_eq!(range.size(), 0x1000);
         memory.write(3, &[0x5a]).unwrap();
+        let mut byte = [0];
+        duplicate.read(3, &mut byte).unwrap();
+        assert_eq!(byte, [0x5a]);
         assert!(!cpu_writes.remains_current());
         assert!(matches!(
-            SharedMemoryObject::zeroed(MAX_SHARED_MEMORY_BYTES + 1),
+            SharedMemoryObject::for_process(
+                &process,
+                MAX_SHARED_MEMORY_BYTES + 1,
+                MemoryPermissions::READ_WRITE
+            ),
             Err(HandleError::ObjectTooLarge(_))
         ));
     }

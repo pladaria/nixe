@@ -42,6 +42,8 @@ impl ExternalEventSequence {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExternalEvent {
     HostStop,
+    /// Wakes the host coordinator without making a guest thread runnable.
+    HostService(ExternalEventSource),
     Wake {
         source: ExternalEventSource,
         token: WakeToken,
@@ -130,6 +132,19 @@ impl std::fmt::Debug for ExternalWaitGroup {
 }
 
 impl ExternalEventSender {
+    /// Coalescing is owned by the producer's mailbox. Overflow is reported by
+    /// the coordinator instead of silently losing a host service notification.
+    pub fn notify_host_service(&self, source: ExternalEventSource) {
+        if let Err(error) = self.submit(ExternalEvent::HostService(source))
+            && matches!(
+                error,
+                ExternalEventSendError::Full | ExternalEventSendError::SequenceExhausted
+            )
+        {
+            self.overflowed.store(true, Ordering::Release);
+        }
+    }
+
     pub fn submit(&self, event: ExternalEvent) -> Result<(), ExternalEventSendError> {
         self.publication
             .lock()
@@ -298,6 +313,22 @@ impl Error for ExternalEventSendError {}
 mod tests {
     use super::*;
     use nixe_scheduler::{GuestThreadId, WakeGeneration};
+
+    #[test]
+    fn host_service_overflow_is_reported_to_the_consumer() {
+        let inbox = ExternalEventInbox::bounded(1).unwrap();
+        let sender = inbox.sender();
+        sender.notify_host_service(ExternalEventSource::Input);
+        sender.notify_host_service(ExternalEventSource::Input);
+        assert_eq!(
+            inbox.try_recv_sequenced(),
+            Err(ExternalEventSendError::Full)
+        );
+        assert_eq!(
+            inbox.try_recv_sequenced().unwrap().unwrap().event,
+            ExternalEvent::HostService(ExternalEventSource::Input)
+        );
+    }
 
     #[test]
     fn bounded_inbox_reports_backpressure_without_blocking() {

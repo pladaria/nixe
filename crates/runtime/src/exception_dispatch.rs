@@ -311,10 +311,28 @@ impl<'a> ExceptionProcessContext<'a> {
         self.cpu
     }
 
-    /// Returns the current process memory through the portable CPU contract.
+    /// Returns the current process's canonical execution memory.
     #[must_use]
-    pub const fn memory(&self) -> &dyn ProcessMemory {
+    pub const fn memory(&self) -> &ExecutionMemory {
         self.memory
+    }
+
+    pub fn map_shared_memory(
+        &self,
+        start: nixe_memory::GuestVirtualAddress,
+        object: &crate::SharedMemoryObject,
+        permissions: MemoryPermissions,
+    ) -> Result<(), MemoryMappingError> {
+        self.mapping_control.request_mapping_safepoint();
+        self.memory.map_shared_backing(
+            self.cpu.address_space_id(),
+            start,
+            object.backing(),
+            permissions,
+        )?;
+        self.mapping_control
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
+        Ok(())
     }
 
     pub fn resize_memory_mapping(
@@ -334,6 +352,19 @@ impl<'a> ExceptionProcessContext<'a> {
             permissions,
             purpose,
         )?;
+        self.mapping_control
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
+        Ok(())
+    }
+
+    pub fn unmap_shared_memory(
+        &self,
+        start: nixe_memory::GuestVirtualAddress,
+        object: &crate::SharedMemoryObject,
+    ) -> Result<(), MemoryMappingError> {
+        self.mapping_control.request_mapping_safepoint();
+        self.memory
+            .unmap_shared_backing(self.cpu.address_space_id(), start, object.backing())?;
         self.mapping_control
             .publish_memory_invalidation(self.memory.invalidation_cursor());
         Ok(())

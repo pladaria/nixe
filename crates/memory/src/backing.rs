@@ -1861,7 +1861,7 @@ struct CanonicalAllocationInner {
     pages: Box<[CanonicalBackingPage]>,
 }
 
-/// Retained canonical allocation suitable for kernel objects and future
+/// Retained canonical allocation shared by kernel objects, CPU aliases and
 /// device mappings.
 #[derive(Clone, Debug)]
 pub struct CanonicalAllocation {
@@ -1871,11 +1871,22 @@ pub struct CanonicalAllocation {
 impl CanonicalAllocation {
     /// Creates a zero-filled allocation divided into fixed-size canonical pages.
     pub fn zeroed(size: usize, page_size: usize) -> Result<Self, CanonicalAllocationError> {
+        let store = CanonicalBackingStore::allocate()
+            .map_err(CanonicalAllocationError::IdentityExhausted)?;
+        Self::zeroed_in(store, GuestPhysicalPageId::new(1), size, page_size)
+    }
+
+    /// Allocates pages in an existing ownership domain. The owner must reserve
+    /// these physical identities before calling this method.
+    pub fn zeroed_in(
+        store: CanonicalBackingStore,
+        first_page: GuestPhysicalPageId,
+        size: usize,
+        page_size: usize,
+    ) -> Result<Self, CanonicalAllocationError> {
         if size == 0 || page_size == 0 || !page_size.is_power_of_two() {
             return Err(CanonicalAllocationError::InvalidSize);
         }
-        let store = CanonicalBackingStore::allocate()
-            .map_err(CanonicalAllocationError::IdentityExhausted)?;
         let page_count = size.div_ceil(page_size);
         let mut pages = Vec::new();
         pages
@@ -1884,7 +1895,7 @@ impl CanonicalAllocation {
         for index in 0..page_count {
             let local_id = u64::try_from(index)
                 .ok()
-                .and_then(|index| index.checked_add(1))
+                .and_then(|index| index.checked_add(first_page.get()))
                 .ok_or(CanonicalAllocationError::IdentityExhausted(
                     BackingIdentityExhausted,
                 ))?;
@@ -1920,10 +1931,10 @@ impl CanonicalAllocation {
         self.inner.size
     }
 
-    /// Returns whether two values retain the same allocation.
+    /// Canonical pages retained by both kernel objects and CPU mappings.
     #[must_use]
-    pub fn same_backing(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+    pub fn pages(&self) -> &[CanonicalBackingPage] {
+        &self.inner.pages
     }
 
     /// Copies a checked logical range out of canonical backing.
@@ -1973,6 +1984,59 @@ impl CanonicalAllocation {
         }
         let first_page = offset / self.inner.page_size;
         let last_page = (end - 1) / self.inner.page_size;
+        if first_page == last_page {
+            // Kernel producers predominantly update short records. Keep this
+            // route allocation-free for non-executable data, while retaining
+            // the same rendezvous, tracking and executable invalidations.
+            let page = &self.inner.pages[first_page];
+            loop {
+                page.prepare_write()
+                    .map_err(CanonicalAllocationError::Page)?;
+                let _execution = self
+                    .inner
+                    .store
+                    .execution_gate()
+                    .acquire_write(|| {
+                        page.inner
+                            .executable_invalidations
+                            .get()
+                            .map(|_| MemoryInvalidationKind::ExecutableContent {
+                                first: page.identity().page(),
+                                second: None,
+                            })
+                            .into_iter()
+                            .collect()
+                    })
+                    .map_err(CanonicalAllocationError::ExecutionMutation)?;
+                if !page
+                    .cpu_visible_quiescent()
+                    .map_err(CanonicalAllocationError::Page)?
+                {
+                    continue;
+                }
+                let changes = [MemoryInvalidationKind::ExecutableContent {
+                    first: page.identity().page(),
+                    second: None,
+                }];
+                let reservation = page
+                    .inner
+                    .executable_invalidations
+                    .get()
+                    .map(|log| log.reserve_many_from(&changes, MemoryInvalidationOrigin::HostWrite))
+                    .transpose()
+                    .map_err(CanonicalAllocationError::Invalidation)?;
+                let generation = page.content_generation();
+                let next = generation
+                    .next()
+                    .map_err(CanonicalAllocationError::GenerationExhausted)?;
+                page.write_preflighted(offset % self.inner.page_size, bytes, generation, next)
+                    .map_err(CanonicalAllocationError::Page)?;
+                if let Some(reservation) = reservation {
+                    reservation.commit();
+                }
+                return Ok(());
+            }
+        }
         for page in &self.inner.pages[first_page..=last_page] {
             page.prepare_write()
                 .map_err(CanonicalAllocationError::Page)?;

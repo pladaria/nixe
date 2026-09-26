@@ -20,8 +20,7 @@ use nixe_horizon::{
     switch_1_machine_profile,
 };
 use nixe_input::{
-    ControllerId, EmulatedButtonState, GamepadProfiles, InputManager, ProfiledControllerState,
-    sdl::SdlInputBackend,
+    ControllerId, EmulatedButtonState, GamepadProfiles, InputWorker, ProfiledControllerState,
 };
 use nixe_loader_title::NacpLanguage;
 use nixe_memory::NonCpuDeviceId;
@@ -37,7 +36,6 @@ use crate::logging::LogLevel;
 
 use super::load_config;
 
-const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const EXECUTION_RATE_COMPLETIONS: u64 = 1024;
 const EXECUTION_RATE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAXWELL_PUSHBUFFER_DUMP_DIRECTORY: &str = "dump";
@@ -469,22 +467,24 @@ fn execute_worker(
         .expect("CLI process and verified Switch 1 scheduler profile are compatible");
     let execution_started = Instant::now();
     let execution_video = video_system.clone();
-    let mut execution = SdlInputBackend::new()
-        .map_err(|error| error.to_string())
-        .and_then(|backend| {
-            let mut input = InputManager::with_profiles(backend, gamepad_profiles);
-            let mut scheduled = ScheduledProcess {
-                coordinator: &mut coordinator,
-                process_id,
-            };
-            execute(
-                &mut scheduled,
-                horizon_environment,
-                execution_video,
-                &mut input,
-                trace_interpreter,
-            )
-        });
+    let input_events = coordinator.event_sender();
+    let mut execution = InputWorker::with_profiles(gamepad_profiles, move || {
+        input_events.notify_host_service(nixe_runtime::ExternalEventSource::Input);
+    })
+    .map_err(|error| format!("cannot start input worker: {error}"))
+    .and_then(|mut input| {
+        let mut scheduled = ScheduledProcess {
+            coordinator: &mut coordinator,
+            process_id,
+        };
+        execute(
+            &mut scheduled,
+            horizon_environment,
+            execution_video,
+            &mut input,
+            trace_interpreter,
+        )
+    });
     log::debug!(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
@@ -579,7 +579,7 @@ fn execute(
     scheduled: &mut ScheduledProcess<'_>,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
-    input: &mut InputManager<SdlInputBackend>,
+    input: &mut InputWorker<Option<ProfiledControllerState>>,
     trace_interpreter: bool,
 ) -> Result<ExecutionSummary, String> {
     let coordinator = &mut *scheduled.coordinator;
@@ -597,8 +597,7 @@ fn execute(
     let mut last_rate_completions = 0_u64;
     let mut last_rate_elapsed = Duration::ZERO;
     let mut rejected = BTreeSet::new();
-    let mut next_input_poll = Duration::ZERO;
-    let mut last_input_poll = Duration::ZERO;
+    let mut last_input_sample: Option<Instant> = None;
     let mut active_input = None;
     let mut input_observed = false;
     let mut active_buttons = EmulatedButtonState::default();
@@ -621,13 +620,13 @@ fn execute(
         dispatcher
             .advance_video(elapsed)
             .map_err(|error| error.to_string())?;
-        if elapsed >= next_input_poll {
-            let profiled = input
-                .read_profiled_input()
-                .map_err(|error| error.to_string())?;
-            report_input_change(&mut active_input, &profiled, input_observed);
+        if let Some(sample) = input.take_latest().map_err(|error| error.to_string())? {
+            // The input worker owns the only sampling timer. Publish each
+            // consumed sample once, using capture time rather than host delay.
+            report_input_change(&mut active_input, &sample.state, input_observed);
+            input_observed = true;
+            let profiled = sample.state.as_ref();
             let current_buttons = profiled
-                .as_ref()
                 .map_or_else(EmulatedButtonState::default, |controller| {
                     controller.state.buttons
                 });
@@ -640,18 +639,15 @@ fn execute(
                 }
             }
             active_buttons = current_buttons;
-            input_observed = true;
             dispatcher
                 .advance_input(
-                    coordinator
-                        .process_mut(process_id)
-                        .expect("registered process remains available"),
-                    profiled.as_ref().map(|controller| &controller.state),
-                    elapsed.saturating_sub(last_input_poll),
+                    profiled.map(|controller| &controller.state),
+                    last_input_sample.map_or(Duration::ZERO, |previous| {
+                        sample.captured_at.saturating_duration_since(previous)
+                    }),
                 )
                 .map_err(|error| format!("cannot publish Horizon HID state: {error}"))?;
-            last_input_poll = elapsed;
-            next_input_poll = elapsed.saturating_add(INPUT_POLL_INTERVAL);
+            last_input_sample = Some(sample.captured_at);
         }
         let executions = match coordinator.execution_mode() {
             VcpuExecutionMode::Deterministic => coordinator
@@ -661,8 +657,10 @@ fn execute(
         }
         .map_err(|error| error.to_string())?;
         if executions.is_empty() {
-            let host_wait =
-                host_service_wait_duration(execution_started.elapsed(), next_input_poll);
+            let host_wait = host_service_wait_duration(
+                execution_started.elapsed(),
+                dispatcher.next_video_deadline(),
+            );
             coordinator
                 .wait_for_external_event_for(host_wait)
                 .map_err(|error| error.to_string())?;
@@ -821,8 +819,8 @@ fn write_nv_push_dump_words(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ActiveInput {
     controller_id: ControllerId,
-    device: String,
-    profile_name: String,
+    device: std::sync::Arc<str>,
+    profile_name: std::sync::Arc<str>,
 }
 
 fn report_input_change(
@@ -847,13 +845,13 @@ fn report_input_change(
         None if previously_observed && active.is_some() => {
             log::info!("mapped gamepad disconnected; player one is now disconnected");
         }
-        None => log::debug!("no matching first-gamepad input profile; player one is disconnected"),
+        None => log::warn!("no matching first-gamepad input profile; player one is disconnected"),
     }
     *active = next;
 }
 
-fn host_service_wait_duration(now: Duration, next_input_poll: Duration) -> Duration {
-    next_input_poll.saturating_sub(now)
+fn host_service_wait_duration(now: Duration, next_video_deadline: Duration) -> Duration {
+    next_video_deadline.saturating_sub(now)
 }
 
 fn button_transitions(
@@ -1036,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn host_service_wait_is_bounded_by_the_next_input_deadline() {
+    fn host_service_wait_is_bounded_by_the_next_video_deadline() {
         assert_eq!(
             host_service_wait_duration(Duration::from_millis(7), Duration::from_millis(12)),
             Duration::from_millis(5)
