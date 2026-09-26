@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use nixe_input::{
-    Axis, Button, ControllerState, InputManager, MotionSensor, MotionVector, sdl::SdlInputBackend,
-};
+use nixe_input::{Axis, Button, ControllerState, InputWorker, MotionSensor, MotionVector};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -17,16 +15,18 @@ pub fn run() -> Result<(), String> {
     }
 
     let interrupted = install_interrupt_handler()?;
-    let backend = SdlInputBackend::new().map_err(|error| error.to_string())?;
-    let mut input = InputManager::new(backend);
+    let mut input =
+        InputWorker::unmapped().map_err(|error| format!("cannot start input worker: {error}"))?;
     let _terminal = TerminalSession::enter()?;
+    render(&None)?;
     let mut previous = None;
 
     while !interrupted.load(Ordering::Acquire) {
-        let state = input.read_input().map_err(|error| error.to_string())?;
-        if previous.as_ref() != Some(&state) {
-            render(&state)?;
-            previous = Some(state);
+        if let Some(sample) = input.take_latest().map_err(|error| error.to_string())?
+            && previous.as_ref() != Some(&sample.state)
+        {
+            render(&sample.state)?;
+            previous = Some(sample.state);
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -191,7 +191,7 @@ mod tests {
         buttons.set(Button::South, true);
         let state = ControllerState {
             id: ControllerId::new(1),
-            name: "Test pad".to_owned(),
+            name: "Test pad".into(),
             kind: ControllerKind::Standard,
             buttons,
             button_labels: FaceButtonLabels::default(),

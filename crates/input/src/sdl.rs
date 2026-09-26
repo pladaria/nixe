@@ -1,9 +1,12 @@
 //! SDL3 host gamepad backend.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sdl3::{
-    GamepadSubsystem, Sdl,
+    EventSubsystem, GamepadSubsystem, Sdl,
+    event::{Event, EventType, EventWatch, EventWatchCallback},
     gamepad::{Axis, Button as SdlButton, ButtonLabel as SdlButtonLabel, Gamepad, GamepadType},
     joystick::JoystickId,
     sensor::SensorType,
@@ -11,8 +14,7 @@ use sdl3::{
 
 use crate::{
     Button, ButtonLabel, ButtonSet, ControllerId, ControllerKind, ControllerState, DPadState,
-    FaceButtonLabels, HostInputBackend, InputSnapshot, MotionState, MotionVector, StickState,
-    TriggerState,
+    FaceButtonLabels, HostInputBackend, MotionState, MotionVector, StickState, TriggerState,
 };
 
 // SDL's position-based button and trigger conventions are defined here:
@@ -21,7 +23,7 @@ use crate::{
 // https://github.com/vhspace/sdl3-rs/tree/v0.18.4
 
 #[derive(Debug)]
-pub struct SdlInputError {
+pub(crate) struct SdlInputError {
     operation: &'static str,
     message: String,
 }
@@ -50,16 +52,38 @@ impl std::error::Error for SdlInputError {}
 struct OpenGamepad {
     joystick_id: JoystickId,
     controller_id: ControllerId,
-    name: String,
+    name: Arc<str>,
+    kind: ControllerKind,
+    labels: FaceButtonLabels,
+    sensors: [bool; 6],
     gamepad: Gamepad,
 }
 
-/// Main-thread SDL3 backend for host gamepads.
+struct DeviceChanges(Arc<AtomicBool>);
+
+impl EventWatchCallback for DeviceChanges {
+    fn callback(&mut self, event: Event) {
+        if matches!(
+            event,
+            Event::ControllerDeviceAdded { .. }
+                | Event::ControllerDeviceRemoved { .. }
+                | Event::ControllerDeviceRemapped { .. }
+        ) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Thread-affine SDL3 backend for host gamepads.
 ///
 /// SDL owns its gamepad subsystem on the creating thread, so this backend
 /// deliberately does not claim `Send` or `Sync`.
-pub struct SdlInputBackend {
+pub(crate) struct SdlInputBackend {
     open_gamepads: Vec<OpenGamepad>,
+    failed_gamepads: Vec<JoystickId>,
+    devices_changed: Arc<AtomicBool>,
+    _device_watch: EventWatch<DeviceChanges>,
+    events: EventSubsystem,
     gamepad_subsystem: GamepadSubsystem,
     next_controller_id: u64,
     _sdl: Sdl,
@@ -68,17 +92,40 @@ pub struct SdlInputBackend {
 impl SdlInputBackend {
     pub fn new() -> Result<Self, SdlInputError> {
         let sdl = sdl3::init().map_err(|error| SdlInputError::new("initialization", error))?;
-        Self::from_sdl(sdl)
-    }
-
-    /// Uses a caller-created SDL context so another frontend can initialize
-    /// its video and audio subsystems before transferring context ownership.
-    pub fn from_sdl(sdl: Sdl) -> Result<Self, SdlInputError> {
+        let events = sdl
+            .event()
+            .map_err(|error| SdlInputError::new("event initialization", error))?;
+        // Callbacks can run on another thread. Only mark topology dirty here;
+        // all device operations remain on the input thread.
+        // https://wiki.libsdl.org/SDL3/SDL_AddEventWatch
+        let devices_changed = Arc::new(AtomicBool::new(true));
+        let device_watch = events.add_event_watch(DeviceChanges(Arc::clone(&devices_changed)));
         let gamepad_subsystem = sdl
             .gamepad()
             .map_err(|error| SdlInputError::new("gamepad initialization", error))?;
+        // Controls are sampled, not handled as events. Keep device events for
+        // hotplug, including the joystick events SDL uses to discover gamepads.
+        for event in [
+            EventType::JoyAxisMotion,
+            EventType::JoyHatMotion,
+            EventType::JoyButtonDown,
+            EventType::JoyButtonUp,
+            EventType::ControllerAxisMotion,
+            EventType::ControllerButtonDown,
+            EventType::ControllerButtonUp,
+            EventType::ControllerTouchpadDown,
+            EventType::ControllerTouchpadMotion,
+            EventType::ControllerTouchpadUp,
+            EventType::ControllerSensorUpdated,
+        ] {
+            EventSubsystem::set_event_enabled(event, false);
+        }
         Ok(Self {
             open_gamepads: Vec::new(),
+            failed_gamepads: Vec::new(),
+            devices_changed,
+            _device_watch: device_watch,
+            events,
             gamepad_subsystem,
             next_controller_id: 1,
             _sdl: sdl,
@@ -87,18 +134,52 @@ impl SdlInputBackend {
 
     fn reconcile_gamepads(&mut self) -> Result<(), SdlInputError> {
         self.gamepad_subsystem.update();
+        // Watchers already observed hotplug. Do not accumulate an unused SDL
+        // input event queue; flushing does not pump events or poll devices.
+        // https://wiki.libsdl.org/SDL3/SDL_FlushEvents
+        self.events.flush_events(
+            sdl3_sys::events::SDL_EVENT_JOYSTICK_AXIS_MOTION.0,
+            sdl3_sys::events::SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED.0,
+        );
+        if !self.devices_changed.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
         let attached = self
             .gamepad_subsystem
             .gamepads()
             .map_err(|error| SdlInputError::new("controller enumeration", error))?;
 
+        self.reconcile_attached_gamepads(&attached)
+    }
+
+    fn reconcile_attached_gamepads(
+        &mut self,
+        attached: &[JoystickId],
+    ) -> Result<(), SdlInputError> {
         self.open_gamepads
             .retain(|entry| entry.gamepad.connected() && attached.contains(&entry.joystick_id));
-        for joystick_id in attached {
-            if self
-                .open_gamepads
-                .iter()
-                .any(|entry| entry.joystick_id == joystick_id)
+        // An SDL instance ID lasts for one connection. Replugging gets a new ID,
+        // even when both hotplug events occur between polls. Ignore a failed
+        // instance to avoid repeating blocking handshakes and logs every poll.
+        // https://wiki.libsdl.org/SDL3/SDL_JoystickID
+        self.failed_gamepads.retain(|id| attached.contains(id));
+        // Remapping may change SDL's type and labels without reconnecting.
+        // Refresh only on topology/remapping notifications, never per sample.
+        for open in &mut self.open_gamepads {
+            if let Some(name) = open.gamepad.name()
+                && name != *open.name
+            {
+                open.name = name.into();
+            }
+            open.kind = controller_kind(open.gamepad.r#type());
+            open.labels = face_button_labels(&open.gamepad);
+        }
+        for &joystick_id in attached {
+            if self.failed_gamepads.contains(&joystick_id)
+                || self
+                    .open_gamepads
+                    .iter()
+                    .any(|entry| entry.joystick_id == joystick_id)
             {
                 continue;
             }
@@ -106,11 +187,19 @@ impl SdlInputBackend {
                 .gamepad_subsystem
                 .name_for_id(joystick_id)
                 .unwrap_or_else(|_| "Unknown gamepad".to_owned());
-            let gamepad = self
-                .gamepad_subsystem
-                .open(joystick_id)
-                .map_err(|error| SdlInputError::new("controller open", error))?;
-            enable_available_sensors(&gamepad);
+            let gamepad = match self.gamepad_subsystem.open(joystick_id) {
+                Ok(gamepad) => gamepad,
+                Err(error) => {
+                    log::error!(
+                        "SDL controller open failed: name={name:?}, instance_id={}: {error}; \
+                         ignoring this controller until it is disconnected and reconnected",
+                        joystick_id.0
+                    );
+                    self.failed_gamepads.push(joystick_id);
+                    continue;
+                }
+            };
+            let sensors = enable_available_sensors(&gamepad);
             let controller_id = ControllerId::new(self.next_controller_id);
             self.next_controller_id = self.next_controller_id.checked_add(1).ok_or_else(|| {
                 SdlInputError::new(
@@ -121,7 +210,10 @@ impl SdlInputBackend {
             self.open_gamepads.push(OpenGamepad {
                 joystick_id,
                 controller_id,
-                name,
+                name: name.into(),
+                kind: controller_kind(gamepad.r#type()),
+                labels: face_button_labels(&gamepad),
+                sensors,
                 gamepad,
             });
         }
@@ -132,28 +224,27 @@ impl SdlInputBackend {
 impl HostInputBackend for SdlInputBackend {
     type Error = SdlInputError;
 
-    fn poll(&mut self) -> Result<InputSnapshot, Self::Error> {
+    fn poll(&mut self) -> Result<Option<ControllerState>, Self::Error> {
         self.reconcile_gamepads()?;
-        let controllers = self.open_gamepads.iter().map(controller_state).collect();
-        Ok(InputSnapshot { controllers })
+        Ok(self.open_gamepads.first_mut().map(controller_state))
     }
 }
 
-fn controller_state(open: &OpenGamepad) -> ControllerState {
+fn controller_state(open: &mut OpenGamepad) -> ControllerState {
     let gamepad = &open.gamepad;
     let (buttons, dpad, left_stick, right_stick, triggers) =
         map_controls(|button| gamepad.button(button), |axis| gamepad.axis(axis));
     ControllerState {
         id: open.controller_id,
         name: open.name.clone(),
-        kind: controller_kind(gamepad.r#type()),
+        kind: open.kind,
         buttons,
-        button_labels: face_button_labels(gamepad),
+        button_labels: open.labels,
         dpad,
         left_stick,
         right_stick,
         triggers,
-        motion: motion_state(gamepad),
+        motion: motion_state(gamepad, &mut open.sensors),
     }
 }
 
@@ -195,10 +286,10 @@ fn map_controls(
     (
         buttons,
         DPadState {
-            up: button(SdlButton::DPadUp),
-            down: button(SdlButton::DPadDown),
-            left: button(SdlButton::DPadLeft),
-            right: button(SdlButton::DPadRight),
+            up: buttons.contains(Button::DPadUp),
+            down: buttons.contains(Button::DPadDown),
+            left: buttons.contains(Button::DPadLeft),
+            right: buttons.contains(Button::DPadRight),
         },
         StickState {
             x: axis(Axis::LeftX),
@@ -247,32 +338,61 @@ const SENSOR_TYPES: [SensorType; 6] = [
     SensorType::AccelerometerRight,
 ];
 
-fn enable_available_sensors(gamepad: &Gamepad) {
-    for sensor_type in SENSOR_TYPES {
+fn enable_available_sensors(gamepad: &Gamepad) -> [bool; 6] {
+    SENSOR_TYPES.map(|sensor_type| {
         // The gamepad is open and remains alive for this entire query.
         if unsafe { gamepad.has_sensor(sensor_type) } {
-            let _ = gamepad.sensor_set_enabled(sensor_type, true);
+            match gamepad.sensor_set_enabled(sensor_type, true) {
+                Ok(()) => return true,
+                Err(error) => log::warn!("cannot enable gamepad sensor {sensor_type:?}: {error}"),
+            }
         }
-    }
+        false
+    })
 }
 
-fn motion_state(gamepad: &Gamepad) -> MotionState {
+fn motion_state(gamepad: &Gamepad, enabled: &mut [bool; 6]) -> MotionState {
+    let [
+        gyroscope,
+        accelerometer,
+        left_gyroscope,
+        right_gyroscope,
+        left_accelerometer,
+        right_accelerometer,
+    ] = std::array::from_fn(|index| read_sensor(gamepad, SENSOR_TYPES[index], &mut enabled[index]));
     MotionState {
-        gyroscope: read_sensor(gamepad, SensorType::Gyroscope),
-        accelerometer: read_sensor(gamepad, SensorType::Accelerometer),
-        left_gyroscope: read_sensor(gamepad, SensorType::GyroscopeLeft),
-        right_gyroscope: read_sensor(gamepad, SensorType::GyroscopeRight),
-        left_accelerometer: read_sensor(gamepad, SensorType::AccelerometerLeft),
-        right_accelerometer: read_sensor(gamepad, SensorType::AccelerometerRight),
+        gyroscope,
+        accelerometer,
+        left_gyroscope,
+        right_gyroscope,
+        left_accelerometer,
+        right_accelerometer,
     }
 }
 
-fn read_sensor(gamepad: &Gamepad, sensor_type: SensorType) -> Option<MotionVector> {
-    if !gamepad.sensor_enabled(sensor_type) {
+fn read_sensor(
+    gamepad: &Gamepad,
+    sensor_type: SensorType,
+    enabled: &mut bool,
+) -> Option<MotionVector> {
+    if !*enabled {
         return None;
     }
     let mut data = [0.0; 3];
-    gamepad.sensor_get_data(sensor_type, &mut data).ok()?;
+    if let Err(error) = gamepad.sensor_get_data(sensor_type, &mut data) {
+        log::warn!(
+            "cannot read gamepad sensor {sensor_type:?}: {error}; disabling it until reconnection"
+        );
+        *enabled = false;
+        return None;
+    }
+    if !data.iter().all(|value| value.is_finite()) {
+        log::warn!(
+            "non-finite gamepad sensor data for {sensor_type:?}; disabling it until reconnection"
+        );
+        *enabled = false;
+        return None;
+    }
     Some(MotionVector {
         x: data[0],
         y: data[1],
@@ -366,8 +486,94 @@ mod tests {
     }
 
     #[test]
-    fn vendored_headless_backend_initializes_and_polls() {
+    fn backend_ignores_open_failures_and_recognizes_reconnections() {
+        use sdl3::joystick::{JoystickType, VirtualJoystickDescription};
+
         let mut backend = SdlInputBackend::new().unwrap();
+        assert!(!EventSubsystem::event_enabled(
+            EventType::ControllerButtonDown
+        ));
+        assert!(!EventSubsystem::event_enabled(
+            EventType::ControllerButtonUp
+        ));
+        assert!(!EventSubsystem::event_enabled(
+            EventType::ControllerAxisMotion
+        ));
+        assert!(EventSubsystem::event_enabled(
+            EventType::ControllerDeviceAdded
+        ));
+        assert!(EventSubsystem::event_enabled(
+            EventType::ControllerDeviceRemoved
+        ));
         backend.poll().unwrap();
+        let joystick = backend._sdl.joystick().unwrap();
+        let attach = || {
+            joystick
+                .attach_virtual_joystick(
+                    VirtualJoystickDescription::new()
+                        .name("Nixe hotplug test")
+                        .joystick_type(JoystickType::Gamepad)
+                        .with_button(SdlButton::South)
+                        .with_axis(Axis::LeftX),
+                )
+                .unwrap()
+        };
+        let connected = attach();
+        // An invalid SDL instance produces a real open failure. Supply the
+        // enumeration explicitly to exercise a failed and a healthy device
+        // together, independently of hardware attached to the test host.
+        let failed = sdl3_sys::joystick::SDL_JoystickID(0);
+        let attached = [failed, connected.id()];
+        backend.reconcile_attached_gamepads(&attached).unwrap();
+        assert_eq!(backend.failed_gamepads.len(), 1);
+        assert_eq!(backend.failed_gamepads[0].0, failed.0);
+        assert_eq!(backend.open_gamepads.len(), 1);
+        let controller_id = backend.open_gamepads[0].controller_id;
+
+        // A repeated poll must not even attempt to open the failed instance:
+        // another SDL open failure would overwrite this thread's error string.
+        sdl3::set_error("open was not retried").unwrap();
+        backend.reconcile_attached_gamepads(&attached).unwrap();
+        assert_eq!(sdl3::get_error().to_string(), "open was not retried");
+        assert_eq!(backend.failed_gamepads.len(), 1);
+        assert_eq!(backend.open_gamepads[0].controller_id, controller_id);
+
+        // The failed connection disappears and a working connection arrives
+        // between polls. Its new SDL instance must be opened immediately.
+        let recovered = attach();
+        backend
+            .reconcile_attached_gamepads(&[connected.id(), recovered.id()])
+            .unwrap();
+        assert!(backend.failed_gamepads.is_empty());
+        assert_eq!(backend.open_gamepads.len(), 2);
+        assert_eq!(backend.open_gamepads[0].controller_id, controller_id);
+        let recovered_id = backend.open_gamepads[1].controller_id;
+        assert_ne!(controller_id, recovered_id);
+
+        // Exercise real SDL enumeration, detachment, reattachment and snapshots.
+        joystick
+            .open(recovered.id())
+            .unwrap()
+            .set_virtual_button(0, true)
+            .unwrap();
+        joystick
+            .open(recovered.id())
+            .unwrap()
+            .set_virtual_axis(0, 12345)
+            .unwrap();
+        drop(connected);
+        let snapshot = backend.poll().unwrap().unwrap();
+        assert_ne!(snapshot.id, controller_id);
+        assert_eq!(snapshot.id, recovered_id);
+        assert!(snapshot.buttons.contains(Button::South));
+        assert_eq!(snapshot.left_stick.x, 12345);
+        let old_instance = recovered.id().0;
+        drop(recovered);
+        let reconnected = attach();
+        assert_ne!(reconnected.id().0, old_instance);
+        let snapshot = backend.poll().unwrap().unwrap();
+        assert_ne!(snapshot.id, recovered_id);
+        assert_ne!(snapshot.id, controller_id);
+        assert_eq!(&*snapshot.name, "Nixe hotplug test");
     }
 }

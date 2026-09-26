@@ -1,8 +1,8 @@
 //! Checked CMIF response encoding, scalar decoding, and guest-memory access.
 
 use nixe_cpu::memory::{
-    DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess, MemoryAccessSize,
-    MemoryPermissions, MemoryRegionKind, MemoryValue,
+    CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess,
+    MemoryAccessSize, MemoryPermissions, MemoryRegionKind, MemoryValue, ProcessMemory,
 };
 use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::ExceptionProcessContext;

@@ -163,6 +163,7 @@ impl RuntimeCoordinator {
         report.last_sequence = Some(event.sequence);
         match event.event {
             ExternalEvent::HostStop => self.host_stop_requested = true,
+            ExternalEvent::HostService(_) => {}
             ExternalEvent::Wake { token, .. } => {
                 if self.apply_wake(token, false)? {
                     report.woken += 1;

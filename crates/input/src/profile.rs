@@ -74,14 +74,15 @@ pub struct EmulatedControllerState {
     pub right_stick: StickState,
     pub gyroscope: Option<MotionVector>,
     pub accelerometer: Option<MotionVector>,
+    pub motion: Option<crate::MotionEstimate>,
 }
 
 /// Identifies the source and profile used to produce an emulated state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfiledControllerState {
     pub controller_id: ControllerId,
-    pub device: String,
-    pub profile_name: String,
+    pub device: std::sync::Arc<str>,
+    pub profile_name: std::sync::Arc<str>,
     pub state: EmulatedControllerState,
 }
 
@@ -114,21 +115,6 @@ impl GamepadProfiles {
                 profile.device == device && profile.controller_type == controller_type
             })
             .map(|(name, profile)| (name.as_str(), profile))
-    }
-
-    #[must_use]
-    pub fn map_first_controller(
-        &self,
-        controllers: &[ControllerState],
-    ) -> Option<ProfiledControllerState> {
-        let controller = controllers.first()?;
-        let (profile_name, profile) = self.matching_profile(&controller.name, controller.kind)?;
-        Some(ProfiledControllerState {
-            controller_id: controller.id,
-            device: controller.name.clone(),
-            profile_name: profile_name.to_owned(),
-            state: profile.map(controller),
-        })
     }
 }
 
@@ -171,6 +157,7 @@ impl GamepadProfile {
             accelerometer: self
                 .accelerometer
                 .and_then(|sensor| motion(controller, sensor)),
+            motion: None,
         }
     }
 }
@@ -260,7 +247,7 @@ mod tests {
         buttons.set(Button::Guide, true);
         ControllerState {
             id: ControllerId::new(7),
-            name: name.to_owned(),
+            name: name.into(),
             kind: ControllerKind::SwitchPro,
             buttons,
             button_labels: FaceButtonLabels::default(),
@@ -288,22 +275,25 @@ mod tests {
     }
 
     #[test]
-    fn selects_only_the_first_controller_and_requires_an_exact_selector() {
+    fn requires_an_exact_selector() {
         let profiles = GamepadProfiles::new(BTreeMap::from([("switch-pro".to_owned(), profile())]));
         assert!(
             profiles
-                .map_first_controller(&[
-                    controller("Another controller"),
-                    controller("Nintendo Switch Pro Controller"),
-                ])
+                .matching_profile("Another controller", ControllerKind::SwitchPro)
                 .is_none()
         );
-
-        let mapped = profiles
-            .map_first_controller(&[controller("Nintendo Switch Pro Controller")])
-            .unwrap();
-        assert_eq!(mapped.profile_name, "switch-pro");
-        assert_eq!(mapped.controller_id, ControllerId::new(7));
+        assert!(
+            profiles
+                .matching_profile("Nintendo Switch Pro Controller", ControllerKind::Standard)
+                .is_none()
+        );
+        assert_eq!(
+            profiles
+                .matching_profile("Nintendo Switch Pro Controller", ControllerKind::SwitchPro)
+                .unwrap()
+                .0,
+            "switch-pro"
+        );
     }
 
     #[test]

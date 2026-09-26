@@ -12,7 +12,6 @@ use nixe_gpu::{
     DEFAULT_PIPELINE_CACHE_ENTRIES, DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE,
     DEFAULT_SHADER_CACHE_ENTRIES, GpuCacheConfiguration,
 };
-use nixe_input::{ControllerKind, InputSnapshot};
 use nixe_loader_title::{DirectoryScanOptions, NacpLanguage};
 use serde::Deserialize;
 
@@ -270,33 +269,6 @@ pub enum CpuBackendSelection {
 pub struct InputConfig {
     #[serde(default)]
     pub profiles: BTreeMap<String, GamepadProfile>,
-}
-
-impl InputConfig {
-    /// Finds the unique profile matching an SDL device name and controller type.
-    #[must_use]
-    pub fn matching_profile(
-        &self,
-        device: &str,
-        controller_type: ControllerKind,
-    ) -> Option<(&str, &GamepadProfile)> {
-        self.profiles
-            .iter()
-            .find(|(_, profile)| {
-                profile.device == device && profile.controller_type == controller_type
-            })
-            .map(|(name, profile)| (name.as_str(), profile))
-    }
-
-    /// Matches only the first attached controller, never a later controller.
-    #[must_use]
-    pub fn matching_first_controller(
-        &self,
-        snapshot: &InputSnapshot,
-    ) -> Option<(&str, &GamepadProfile)> {
-        let controller = snapshot.controllers.first()?;
-        self.matching_profile(&controller.name, controller.kind)
-    }
 }
 
 /// Errors produced while locating or loading shared configuration.
@@ -691,10 +663,7 @@ fn user_config_path() -> Option<PathBuf> {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use nixe_input::{
-        Axis, Button, ButtonSet, ControllerId, ControllerState, DPadState, FaceButtonLabels,
-        MotionSensor, MotionState, StickState, TriggerState,
-    };
+    use nixe_input::{Axis, Button, ControllerKind, MotionSensor};
 
     use super::*;
 
@@ -720,21 +689,6 @@ mod tests {
     impl Drop for TemporaryConfig {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.directory).unwrap();
-        }
-    }
-
-    fn controller(name: &str, kind: ControllerKind) -> ControllerState {
-        ControllerState {
-            id: ControllerId::new(1),
-            name: name.to_owned(),
-            kind,
-            buttons: ButtonSet::default(),
-            button_labels: FaceButtonLabels::default(),
-            dpad: DPadState::default(),
-            left_stick: StickState::default(),
-            right_stick: StickState::default(),
-            triggers: TriggerState::default(),
-            motion: MotionState::default(),
         }
     }
 
@@ -971,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_and_matches_a_typed_gamepad_profile() {
+    fn loads_a_typed_gamepad_profile() {
         let file = TemporaryConfig::new(
             r#"
                 version = 2
@@ -993,45 +947,14 @@ mod tests {
         );
 
         let config = NixeConfig::load(&file.path).unwrap();
-        let (name, profile) = config
-            .input
-            .matching_profile("Nintendo Switch Pro Controller", ControllerKind::SwitchPro)
-            .unwrap();
-
-        assert_eq!(name, "switch-pro");
+        let profile = &config.input.profiles["switch-pro"];
+        assert_eq!(profile.device, "Nintendo Switch Pro Controller");
+        assert_eq!(profile.controller_type, ControllerKind::SwitchPro);
         assert_eq!(profile.a, Some(Button::East));
         assert_eq!(profile.plus, Some(Button::Start));
         assert_eq!(profile.zl, Some(Axis::LeftTrigger));
         assert_eq!(profile.leftx, Some(Axis::LeftX));
         assert_eq!(profile.gyroscope, Some(MotionSensor::Gyroscope));
-        assert!(
-            config
-                .input
-                .matching_profile("Another controller", ControllerKind::SwitchPro)
-                .is_none()
-        );
-
-        let snapshot = InputSnapshot {
-            controllers: vec![
-                controller("Another controller", ControllerKind::Standard),
-                controller("Nintendo Switch Pro Controller", ControllerKind::SwitchPro),
-            ],
-        };
-        assert!(config.input.matching_first_controller(&snapshot).is_none());
-
-        let snapshot = InputSnapshot {
-            controllers: vec![controller(
-                "Nintendo Switch Pro Controller",
-                ControllerKind::SwitchPro,
-            )],
-        };
-        assert_eq!(
-            config
-                .input
-                .matching_first_controller(&snapshot)
-                .map(|(name, _)| name),
-            Some("switch-pro")
-        );
     }
 
     #[test]

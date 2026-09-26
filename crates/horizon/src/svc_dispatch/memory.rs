@@ -360,7 +360,6 @@ fn allows_memory_alias_source(purpose: MemoryMappingPurpose) -> bool {
 
 pub(super) fn map_shared_memory(
     context: &mut ExceptionDispatchContext<'_>,
-    hid_system: &mut crate::HidSystem,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
     let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
@@ -409,86 +408,12 @@ pub(super) fn map_shared_memory(
         result(context, HorizonKernelResult::INVALID_STATE);
         return resume();
     }
-    let mapping_permissions = if permissions == MemoryPermissions::READ {
-        MemoryPermissions::READ_WRITE
-    } else {
-        permissions
-    };
-    match context.process().resize_memory_mapping(
-        start,
-        0,
-        size,
-        mapping_permissions,
-        MemoryMappingPurpose::SharedMemory,
-    ) {
+    match context
+        .process()
+        .map_shared_memory(start, &shared_memory, permissions)
+    {
         Ok(()) => {
-            let mut backing = vec![0_u8; shared_memory.size()];
-            if shared_memory.read(0, &mut backing).is_err() {
-                let _ = context.process().resize_memory_mapping(
-                    start,
-                    size,
-                    0,
-                    mapping_permissions,
-                    MemoryMappingPurpose::SharedMemory,
-                );
-                return reject(
-                    context,
-                    HorizonSvcFault::InternalRuntime {
-                        operation: "reading a shared-memory backing at its declared size",
-                    },
-                );
-            }
-            for (offset, byte) in backing
-                .into_iter()
-                .enumerate()
-                .filter(|(_, byte)| *byte != 0)
-            {
-                let Some(address) = start.checked_add(offset as u64) else {
-                    unreachable!("validated shared-memory range contains every backing byte")
-                };
-                if let Err(fault) = context.process().memory().write(
-                    context.process().cpu().address_space_id(),
-                    address,
-                    MemoryAccess::normal(MemoryAccessSize::Byte),
-                    MemoryValue::U8(byte),
-                ) {
-                    let _ = context.process().resize_memory_mapping(
-                        start,
-                        size,
-                        0,
-                        mapping_permissions,
-                        MemoryMappingPurpose::SharedMemory,
-                    );
-                    return reject(
-                        context,
-                        HorizonSvcFault::GuestMemory {
-                            immediate: 0x13,
-                            fault,
-                        },
-                    );
-                }
-            }
-            if permissions != mapping_permissions
-                && let Err(fault) =
-                    context
-                        .process()
-                        .set_memory_permissions(start, size, permissions)
-            {
-                let _ = context.process().resize_memory_mapping(
-                    start,
-                    size,
-                    0,
-                    mapping_permissions,
-                    MemoryMappingPurpose::SharedMemory,
-                );
-                return reject(context, HorizonSvcFault::MemoryProtection { fault });
-            }
-            log::debug!(
-                "mapped temporary shared memory handle {handle:#x} at {start} ({size:#x} bytes)"
-            );
-            if hid_system.owns(&shared_memory) {
-                hid_system.register_mapping(context.process().cpu().address_space_id(), start);
-            }
+            log::debug!("mapped shared memory handle {handle:#x} at {start} ({size:#x} bytes)");
             result(context, HorizonKernelResult::SUCCESS);
             resume()
         }
@@ -575,7 +500,6 @@ pub(super) fn create_transfer_memory(
 
 pub(super) fn unmap_shared_memory(
     context: &mut ExceptionDispatchContext<'_>,
-    hid_system: &mut crate::HidSystem,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
     let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
@@ -600,33 +524,9 @@ pub(super) fn unmap_shared_memory(
         result(context, HorizonKernelResult::INVALID_ADDRESS);
         return resume();
     }
-    let query = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
-        start,
-        GuestVirtualAddress::new(context.process().address_space_limit()),
-    );
-    let Some(query) = query.filter(|mapping| {
-        mapping.base == start
-            && mapping.size == size
-            && mapping.purpose == MemoryMappingPurpose::SharedMemory
-    }) else {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
-    };
-    match context.process().resize_memory_mapping(
-        start,
-        size,
-        0,
-        query.permissions,
-        MemoryMappingPurpose::SharedMemory,
-    ) {
+    match context.process().unmap_shared_memory(start, &shared_memory) {
         Ok(()) => {
-            if hid_system.owns(&shared_memory) {
-                hid_system.unregister_mapping(context.process().cpu().address_space_id(), start);
-            }
-            log::debug!(
-                "unmapped temporary shared memory handle {handle:#x} from {start} ({size:#x} bytes)"
-            );
+            log::debug!("unmapped shared memory handle {handle:#x} from {start} ({size:#x} bytes)");
             result(context, HorizonKernelResult::SUCCESS);
             resume()
         }

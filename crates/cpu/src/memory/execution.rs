@@ -824,6 +824,178 @@ impl Default for ExecutionMemory {
 }
 
 impl ExecutionMemory {
+    /// Reserves retained kernel-object storage in this process's canonical
+    /// ownership domain, including its execution/mutation rendezvous.
+    pub fn allocate_shared_backing(
+        &self,
+        size: usize,
+    ) -> Result<nixe_memory::CanonicalAllocation, nixe_memory::CanonicalAllocationError> {
+        use nixe_memory::{CanonicalAllocation, CanonicalAllocationError};
+        if size == 0 || !size.is_multiple_of(SYNTHETIC_PAGE_SIZE) {
+            return Err(CanonicalAllocationError::InvalidSize);
+        }
+        let store = self
+            .backing_store
+            .clone()
+            .ok_or(CanonicalAllocationError::ResourceExhausted)?;
+        let mut inner = self.lock_inner();
+        let mut first = inner.next_page_id;
+        loop {
+            let end = first
+                .checked_add((size / SYNTHETIC_PAGE_SIZE) as u64)
+                .ok_or(CanonicalAllocationError::ResourceExhausted)?;
+            if let Some((&occupied, _)) = inner
+                .slots_by_id
+                .range(GuestPhysicalPageId::new(first)..GuestPhysicalPageId::new(end))
+                .next_back()
+            {
+                first = occupied
+                    .get()
+                    .checked_add(1)
+                    .ok_or(CanonicalAllocationError::ResourceExhausted)?;
+            } else {
+                inner.next_page_id = end;
+                break;
+            }
+        }
+        CanonicalAllocation::zeroed_in(
+            store,
+            GuestPhysicalPageId::new(first),
+            size,
+            SYNTHETIC_PAGE_SIZE,
+        )
+    }
+
+    /// Maps retained shared pages directly; no shadow RAM or synchronization
+    /// copy is involved. All aliases retain the same canonical identity.
+    pub fn map_shared_backing(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        backing: &nixe_memory::CanonicalAllocation,
+        permissions: MemoryPermissions,
+    ) -> Result<(), MemoryMappingError> {
+        let error = |reason| MemoryMappingError {
+            address_space,
+            address: start,
+            reason,
+        };
+        let range = PageRange::new(start, backing.size() as u64)
+            .filter(|range| !range.is_empty())
+            .ok_or_else(|| error(MemoryMappingErrorReason::InvalidRange))?;
+        if self
+            .backing_store
+            .as_ref()
+            .map(CanonicalBackingStore::identity)
+            != Some(backing.store())
+            || !matches!(
+                permissions,
+                MemoryPermissions::READ | MemoryPermissions::READ_WRITE
+            )
+            || backing
+                .pages()
+                .iter()
+                .any(|page| page.size() != SYNTHETIC_PAGE_SIZE)
+        {
+            return Err(error(MemoryMappingErrorReason::MappingStateMismatch));
+        }
+        let kind = MemoryInvalidationKind::Mapping {
+            address_space,
+            start,
+            size: backing.size() as u64,
+        };
+        let mut mutation = self
+            .begin_mapping_mutation(&[kind])
+            .map_err(|cause| error(MemoryMappingErrorReason::ExecutionMutation(cause)))?;
+        let mut inner = self.lock_inner();
+        for page in range.first..range.end {
+            if inner.mappings.get(address_space, page).is_some() {
+                return Err(error(MemoryMappingErrorReason::AlreadyMapped));
+            }
+        }
+        let invalidation = self
+            .invalidations
+            .reserve(kind)
+            .map_err(|_| error(MemoryMappingErrorReason::ResourceExhausted))?;
+        let generation = take_mapping_generation(&mut inner.next_mapping_generation)
+            .ok_or_else(|| error(MemoryMappingErrorReason::GenerationExhausted))?;
+        for (virtual_page, page) in (range.first..range.end).zip(backing.pages()) {
+            let physical_page = page.identity().page();
+            let slot = match inner.slots_by_id.get(&physical_page) {
+                Some(&slot) => slot,
+                None => inner
+                    .push_page(physical_page, ExecutionPhysicalPage::Ram(page.clone()))
+                    .expect("reserved canonical identity is unique"),
+            };
+            inner.insert_mapping_unpublished(
+                address_space,
+                virtual_page,
+                ExecutionMapping {
+                    physical_page,
+                    physical_slot: slot,
+                    mapping_generation: generation,
+                    permissions,
+                    purpose: MemoryMappingPurpose::SharedMemory,
+                    attributes: MemoryAttributes::NONE,
+                },
+            );
+        }
+        inner.publish_direct_mapping_range(address_space, range.first, range.end);
+        mutation.commit();
+        invalidation.commit();
+        Ok(())
+    }
+
+    /// Unmaps only aliases of the supplied kernel object's exact pages.
+    pub fn unmap_shared_backing(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        backing: &nixe_memory::CanonicalAllocation,
+    ) -> Result<(), MemoryMappingError> {
+        let error = |reason| MemoryMappingError {
+            address_space,
+            address: start,
+            reason,
+        };
+        let range = PageRange::new(start, backing.size() as u64)
+            .filter(|range| !range.is_empty())
+            .ok_or_else(|| error(MemoryMappingErrorReason::InvalidRange))?;
+        let kind = MemoryInvalidationKind::Mapping {
+            address_space,
+            start,
+            size: backing.size() as u64,
+        };
+        let mut mutation = self
+            .begin_mapping_mutation(&[kind])
+            .map_err(|cause| error(MemoryMappingErrorReason::ExecutionMutation(cause)))?;
+        let mut inner = self.lock_inner();
+        for (virtual_page, page) in (range.first..range.end).zip(backing.pages()) {
+            if !inner.mapping_at(address_space, page_address(virtual_page)).is_some_and(|mapping| {
+                mapping.purpose == MemoryMappingPurpose::SharedMemory && matches!(inner.page(mapping.physical_slot),
+                    Some(ExecutionPhysicalPage::Ram(mapped)) if mapped.identity() == page.identity())
+            }) {
+                return Err(error(MemoryMappingErrorReason::MappingStateMismatch));
+            }
+        }
+        let invalidation = self
+            .invalidations
+            .reserve(kind)
+            .map_err(|_| error(MemoryMappingErrorReason::ResourceExhausted))?;
+        inner.revoke_direct_mapping_range(address_space, range.first, range.end);
+        for virtual_page in range.first..range.end {
+            let mapping = inner
+                .remove_mapping_unpublished(address_space, virtual_page)
+                .expect("validated shared alias");
+            if inner.mapping_count(mapping.physical_slot) == 0 {
+                inner.remove_page(mapping.physical_page, mapping.physical_slot);
+            }
+        }
+        mutation.commit();
+        invalidation.commit();
+        Ok(())
+    }
+
     /// Creates an empty production process address space.
     #[must_use]
     pub fn new() -> Self {
@@ -3871,6 +4043,76 @@ mod tests {
     use super::*;
     mod checked;
     mod mmio;
+
+    #[test]
+    fn shared_backing_aliases_are_live_readonly_and_survive_unmapping() {
+        for policy in [DirectBackendPolicy::Disabled, DirectBackendPolicy::Required] {
+            let mut memory = ExecutionMemory::new();
+            let space = AddressSpaceId::new(1);
+            let first = GuestVirtualAddress::new(0x1000);
+            let second = GuestVirtualAddress::new(0x4000);
+            // Explicitly installed pages also reserve identities.
+            assert!(memory.add_ram_page(GuestPhysicalPageId::new(1)));
+            let shared = memory.allocate_shared_backing(0x2000).unwrap();
+            assert_ne!(
+                shared.pages()[0].identity().page(),
+                GuestPhysicalPageId::new(1)
+            );
+            memory
+                .bind_cpu_memory_backend(space, 0x10000, policy)
+                .unwrap();
+            memory
+                .map_shared_backing(space, first, &shared, MemoryPermissions::READ)
+                .unwrap();
+            memory
+                .map_shared_backing(space, second, &shared, MemoryPermissions::READ_WRITE)
+                .unwrap();
+            shared.write(0xfff, &[0x11, 0x22]).unwrap();
+            let mut bytes = [0; 2];
+            memory
+                .read_bytes(space, first.checked_add(0xfff).unwrap(), &mut bytes)
+                .unwrap();
+            assert_eq!(bytes, [0x11, 0x22]);
+            assert!(memory.write_bytes(space, first, &[0x33]).is_err());
+            memory.write_bytes(space, second, &[0x44]).unwrap();
+            shared.read(0, &mut bytes[..1]).unwrap();
+            assert_eq!(bytes[0], 0x44);
+            let retained = memory
+                .translate_canonical_range(space, first, 0x2000, MemoryPermissions::READ)
+                .unwrap();
+            assert_eq!(retained.segments()[0].page(), shared.pages()[0].identity());
+            if let Some(view) = memory.direct_address_space_view(space) {
+                let _lease = memory.acquire_execution_lease();
+                // The direct JIT view and checked accesses alias the same bytes.
+                assert_eq!(
+                    unsafe { ((view.base + first.get() as usize) as *const u8).read() },
+                    0x44
+                );
+            }
+            let unrelated = memory.allocate_shared_backing(0x2000).unwrap();
+            assert!(
+                memory
+                    .unmap_shared_backing(space, first, &unrelated)
+                    .is_err()
+            );
+            memory.unmap_shared_backing(space, first, &shared).unwrap();
+            shared.write(0, &[0x55]).unwrap();
+            memory.read_bytes(space, second, &mut bytes[..1]).unwrap();
+            assert_eq!(bytes[0], 0x55);
+            memory.unmap_shared_backing(space, second, &shared).unwrap();
+            memory
+                .map_shared_backing(space, first, &shared, MemoryPermissions::READ)
+                .unwrap();
+            memory.read_bytes(space, first, &mut bytes[..1]).unwrap();
+            assert_eq!(bytes[0], 0x55);
+            let foreign = ExecutionMemory::new();
+            assert!(
+                foreign
+                    .map_shared_backing(space, second, &shared, MemoryPermissions::READ)
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn initialization_waits_for_retained_readers_and_publishes_one_generation() {

@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::memory::{
-    DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize, MemoryAliasError,
-    MemoryAliasErrorReason, MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason,
-    MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
-    MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory,
+    CpuMemory, DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize,
+    MemoryAliasError, MemoryAliasErrorReason, MemoryAttributes, MemoryMappingError,
+    MemoryMappingErrorReason, MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions,
+    MemoryProtectionError, MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind,
+    MemoryValue, ProcessMemory,
 };
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
@@ -534,15 +535,17 @@ impl HorizonSvcDispatcher {
         self.video_system.advance(elapsed)
     }
 
+    pub fn next_video_deadline(&self) -> Duration {
+        self.video_system.next_display_deadline()
+    }
+
     /// Publishes the latest player-one controller state to Horizon HID.
     pub fn advance_input(
         &mut self,
-        process: &nixe_runtime::RunnableProcess,
         state: Option<&nixe_input::EmulatedControllerState>,
         delta: Duration,
     ) -> Result<(), nixe_runtime::HandleError> {
-        self.hid_system.publish(state, delta)?;
-        self.hid_system.synchronize(process.memory())
+        self.hid_system.publish(state, delta)
     }
 
     #[must_use]
@@ -1055,8 +1058,8 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             }
             0x11 => event_signal(context),
             0x12 => event_clear(context),
-            0x13 => map_shared_memory(context, &mut self.hid_system),
-            0x14 => unmap_shared_memory(context, &mut self.hid_system),
+            0x13 => map_shared_memory(context),
+            0x14 => unmap_shared_memory(context),
             0x15 => create_transfer_memory(context),
             0x16 => close_handle(self, context),
             0x17 => reset_signal(context),

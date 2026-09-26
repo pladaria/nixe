@@ -111,6 +111,21 @@ fn bounded_external_wait_expires_without_fabricating_guest_readiness() {
         coordinator.scheduler().thread(thread).unwrap().lifecycle,
         nixe_scheduler::ThreadLifecycle::Waiting
     );
+
+    coordinator
+        .event_sender()
+        .notify_host_service(crate::ExternalEventSource::Input);
+    let report = coordinator
+        .wait_for_external_event_for(std::time::Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.received, 1);
+    assert_eq!(report.woken, 0);
+    assert!(!coordinator.host_stop_requested());
+    assert_eq!(
+        coordinator.scheduler().thread(thread).unwrap().lifecycle,
+        nixe_scheduler::ThreadLifecycle::Waiting
+    );
 }
 
 #[test]
