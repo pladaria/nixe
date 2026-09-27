@@ -86,10 +86,13 @@ impl Log for NixeLogger {
             (Level::Warn, true) => {
                 eprintln!("\x1b[33m[nixe] warning: {}\x1b[0m", record.args());
             }
+            (Level::Info, _) => eprintln!("[nixe] info: {}", record.args()),
             (Level::Error, false) => eprintln!("[nixe] error: {}", record.args()),
             (Level::Warn, false) => eprintln!("[nixe] warning: {}", record.args()),
-            (Level::Info, _) => eprintln!("[nixe] {}", record.args()),
-            (Level::Debug, _) => eprintln!("[nixe] debug: {}", record.args()),
+            (Level::Debug, true) => {
+                eprintln!("\x1b[90m[nixe] debug: {}\x1b[0m", record.args());
+            }
+            (Level::Debug, false) => eprintln!("[nixe] debug: {}", record.args()),
             (Level::Trace, _) => eprintln!("[nixe] trace: {}", record.args()),
         }
     }
