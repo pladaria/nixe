@@ -17,6 +17,9 @@ use serde::Deserialize;
 
 pub use nixe_input::GamepadProfile;
 
+mod window_state;
+pub use window_state::WindowState;
+
 /// Configuration file name used during automatic discovery.
 pub const CONFIG_FILE_NAME: &str = "nixe.toml";
 
@@ -134,6 +137,11 @@ impl NixeConfig {
     /// Returns the absolute path of the file from which this value was loaded.
     pub fn source_path(&self) -> &Path {
         &self.source_path
+    }
+
+    /// Returns the machine-managed window state file beside `nixe.toml`.
+    pub fn window_state_path(&self) -> PathBuf {
+        self.source_path.with_file_name(window_state::FILE_NAME)
     }
 }
 
@@ -690,6 +698,35 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.directory).unwrap();
         }
+    }
+
+    #[test]
+    fn window_state_round_trips_and_rejects_other_versions() {
+        let file = TemporaryConfig::new("");
+        let path = file.path.with_file_name(window_state::FILE_NAME);
+        let state = WindowState {
+            width: 1280,
+            height: 720,
+            position: Some((-160, 48)),
+        };
+
+        assert_eq!(WindowState::load(&path).unwrap(), None);
+        state.save(&path).unwrap();
+        assert_eq!(WindowState::load(&path).unwrap(), Some(state));
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0..4].copy_from_slice(&2_u32.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            WindowState::load(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        fs::write(&path, [1, 2, 3]).unwrap();
+        assert_eq!(
+            WindowState::load(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

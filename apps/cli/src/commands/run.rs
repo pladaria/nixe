@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use nixe_cli::library::{Library, LibraryTitleSource};
 use nixe_config::{
     CpuBackendSelection, CpuConfig, DiagnosticsConfig, GuestLogsLevel, InitialOperationMode,
-    TimeMode,
+    TimeMode, WindowState,
 };
 use nixe_gpu::BackendInstanceId;
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
@@ -252,7 +252,30 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             trace_interpreter,
         ));
     };
-    let frontend = frontend.with_gpu_context(presentation_context);
+    let window_state_path = config.window_state_path();
+    let saved_window_state = match WindowState::load(&window_state_path) {
+        Ok(Some(state)) => {
+            log::info!("read window configuration {}", window_state_path.display());
+            Some(state)
+        }
+        Ok(None) => {
+            log::info!(
+                "window configuration {} does not exist; using defaults",
+                window_state_path.display()
+            );
+            None
+        }
+        Err(error) => {
+            log::warn!(
+                "cannot use window configuration {}: {error}; discarding its contents and using defaults",
+                window_state_path.display()
+            );
+            None
+        }
+    };
+    let frontend = frontend
+        .with_gpu_context(presentation_context)
+        .with_window_state(saved_window_state);
 
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");
@@ -272,13 +295,22 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
 
     let frontend_result = frontend.run().map_err(|error| error.to_string());
+    if let Ok(Some(state)) = &frontend_result {
+        match state.save(&window_state_path) {
+            Ok(()) => log::info!("wrote window configuration {}", window_state_path.display()),
+            Err(error) => log::warn!(
+                "cannot write window configuration {}: {error}; discarding unsaved window state",
+                window_state_path.display()
+            ),
+        }
+    }
     frontend_stop_requested.store(true, Ordering::Release);
     let _ = external_events.submit(nixe_runtime::ExternalEvent::HostStop);
     let worker_result = worker
         .join()
         .map_err(|_| "guest execution worker panicked".to_owned())?;
     let execution_result = finish_execution(worker_result);
-    frontend_result.and(execution_result)
+    frontend_result.map(|_| ()).and(execution_result)
 }
 
 const fn system_language(language: NacpLanguage) -> SystemLanguage {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use nixe_config::WindowState;
 use nixe_gpu_wgpu::{WgpuPresentationContext, WgpuQueueAccess, resident_texture};
 use nixe_video::{FrameMailbox, FrameNotifier, PresentationFrame};
 use wgpu::{
@@ -18,9 +19,10 @@ use wgpu::{
     TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +114,8 @@ impl WindowFrontend {
                 context: None,
                 presenter: None,
                 failure: None,
+                initial_window_state: None,
+                last_window_state: None,
             },
             control: FrontendControl {
                 proxy,
@@ -137,18 +141,27 @@ impl WindowFrontend {
         self
     }
 
+    /// Restores saved window geometry when the native window is created.
+    #[must_use]
+    pub fn with_window_state(mut self, state: Option<WindowState>) -> Self {
+        self.application.initial_window_state = state;
+        self
+    }
+
     /// Runs native event dispatch and WGPU presentation on the calling thread.
-    pub fn run(self) -> Result<(), WindowError> {
+    pub fn run(self) -> Result<Option<WindowState>, WindowError> {
         let Self {
             event_loop,
             mut application,
             control: _,
         } = self;
         let event_result = event_loop.run_app(&mut application);
+        application.capture_window_state();
         if let Some(error) = application.failure.take() {
             return Err(error);
         }
-        event_result.map_err(WindowError::event_loop)
+        event_result.map_err(WindowError::event_loop)?;
+        Ok(application.last_window_state)
     }
 }
 
@@ -334,6 +347,24 @@ impl Presenter {
         self.surface_configuration.width = width;
         self.surface_configuration.height = height;
         self.surface_reconfigure_pending = true;
+    }
+
+    fn resize_to_frame(&mut self) {
+        let Some((width, height)) = self.frame_dimensions else {
+            return;
+        };
+        let minimum = LogicalSize::new(320.0, 180.0).to_physical::<u32>(self.window.scale_factor());
+        self.window.set_min_inner_size(Some(PhysicalSize::new(
+            minimum.width.min(width),
+            minimum.height.min(height),
+        )));
+        if let Some(size) = self
+            .window
+            .request_inner_size(PhysicalSize::new(width, height))
+        {
+            self.resize(size.width, size.height);
+            self.window.request_redraw();
+        }
     }
 
     fn configure_surface_if_pending(&mut self) {
@@ -606,9 +637,38 @@ struct PresenterApplication {
     context: Option<WgpuPresentationContext>,
     presenter: Option<Presenter>,
     failure: Option<WindowError>,
+    initial_window_state: Option<WindowState>,
+    last_window_state: Option<WindowState>,
 }
 
 impl PresenterApplication {
+    fn capture_window_state(&mut self) {
+        let Some(presenter) = &self.presenter else {
+            return;
+        };
+        let size = presenter.window.inner_size();
+        // Minimization can report a zero-sized client area. Keep the last
+        // usable size instead of replacing it with one we cannot reopen.
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let position = presenter
+            .window
+            .outer_position()
+            .ok()
+            .map(|position| (position.x, position.y))
+            .or_else(|| {
+                self.last_window_state
+                    .or(self.initial_window_state)
+                    .and_then(|state| state.position)
+            });
+        self.last_window_state = Some(WindowState {
+            width: size.width,
+            height: size.height,
+            position,
+        });
+    }
+
     fn redraw(&mut self) -> Result<(), WindowError> {
         let Some(presenter) = &mut self.presenter else {
             return Ok(());
@@ -630,10 +690,16 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
         if self.presenter.is_some() || self.failure.is_some() {
             return;
         }
-        let attributes = WindowAttributes::default()
+        let mut attributes = WindowAttributes::default()
             .with_title("Nixe")
             .with_inner_size(LogicalSize::new(1280.0, 720.0))
             .with_min_inner_size(LogicalSize::new(320.0, 180.0));
+        if let Some(state) = self.initial_window_state {
+            attributes = attributes.with_inner_size(PhysicalSize::new(state.width, state.height));
+            if let Some((x, y)) = state.position {
+                attributes = attributes.with_position(PhysicalPosition::new(x, y));
+            }
+        }
         let result = (|| {
             let window = Arc::new(
                 event_loop
@@ -644,6 +710,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 WindowError::device("accelerated presentation context was not configured")
             })?;
             self.presenter = Some(Presenter::new(window, context)?);
+            self.capture_window_state();
             if let Some(presenter) = &self.presenter {
                 presenter.window.request_redraw();
             }
@@ -668,6 +735,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 // Drop the surface, device, queue and all presentation
                 // resources before leaving the event loop. This event is sent
                 // only after guest-process and guest-graphics teardown.
+                self.capture_window_state();
                 self.presenter = None;
                 event_loop.exit();
             }
@@ -690,6 +758,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
         match event {
             WindowEvent::CloseRequested => {
                 self.stop_requested.store(true, Ordering::Release);
+                self.capture_window_state();
                 self.presenter = None;
                 // Returning from `run_app` lets the CLI publish HostStop and
                 // join the guest worker through the normal teardown path.
@@ -703,11 +772,34 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                     presenter.resize(size.width, size.height);
                     presenter.window.request_redraw();
                 }
+                self.capture_window_state();
+            }
+            WindowEvent::Moved(position) => {
+                self.capture_window_state();
+                if let Some(state) = &mut self.last_window_state {
+                    state.position = Some((position.x, position.y));
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(
+                        event.physical_key,
+                        PhysicalKey::Code(KeyCode::Digit1 | KeyCode::Numpad1)
+                    ) =>
+            {
+                if let Some(presenter) = &mut self.presenter {
+                    if presenter.window.has_focus() {
+                        presenter.resize_to_frame();
+                        self.capture_window_state();
+                    }
+                }
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.redraw() {
                     self.failure = Some(error);
                     self.stop_requested.store(true, Ordering::Release);
+                    self.capture_window_state();
                     self.presenter = None;
                 }
             }
@@ -717,6 +809,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.worker_completion.is_finished() {
+            self.capture_window_state();
             self.presenter = None;
             event_loop.exit();
             return;
