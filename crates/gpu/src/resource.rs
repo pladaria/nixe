@@ -142,6 +142,10 @@ pub enum ImageFormat {
     Rgba8Srgb,
     Bgra8Unorm,
     Bgra8Srgb,
+    Bc1RgbUnorm,
+    Bc1RgbSrgb,
+    Bc1RgbaUnorm,
+    Bc1RgbaSrgb,
     R16Float,
     Rg16Float,
     Rgba16Float,
@@ -155,6 +159,37 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
+    /// Dimensions of one independently stored compression block, in texels.
+    /// BC1 stores sixteen texels in eight bytes:
+    /// https://registry.khronos.org/OpenGL/extensions/EXT/EXT_texture_compression_s3tc.txt
+    #[must_use]
+    pub const fn block_extent(self) -> [u32; 2] {
+        match self {
+            Self::Bc1RgbUnorm | Self::Bc1RgbSrgb | Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => [4, 4],
+            _ => [1, 1],
+        }
+    }
+
+    /// Bytes in one storage block, or one texel for uncompressed formats.
+    #[must_use]
+    pub const fn plane_bytes_per_block(self, plane: u8) -> Option<u8> {
+        if plane != 0 {
+            return None;
+        }
+        match self {
+            Self::Bc1RgbUnorm | Self::Bc1RgbSrgb | Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => {
+                Some(8)
+            }
+            _ => self.plane_bytes_per_texel(plane),
+        }
+    }
+
+    /// Whether the BC1 decoder must return one for alpha, including selector 3.
+    #[must_use]
+    pub const fn has_opaque_bc1_alpha(self) -> bool {
+        matches!(self, Self::Bc1RgbUnorm | Self::Bc1RgbSrgb)
+    }
+
     /// Returns the number of separately addressable planes.
     #[must_use]
     pub const fn plane_count(self) -> u8 {
@@ -173,13 +208,17 @@ impl ImageFormat {
         )
     }
 
-    /// Returns the packed bytes per texel for the selected plane.
+    /// Returns the packed bytes per texel for the selected uncompressed plane.
+    /// Compressed formats have no integral bytes-per-texel representation.
     #[must_use]
     pub const fn plane_bytes_per_texel(self, plane: u8) -> Option<u8> {
         if plane != 0 {
             return None;
         }
         Some(match self {
+            Self::Bc1RgbUnorm | Self::Bc1RgbSrgb | Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => {
+                return None;
+            }
             Self::R8Unorm => 1,
             Self::Rg8Unorm | Self::R16Float | Self::Depth16Unorm => 2,
             Self::Rgba8Unorm

@@ -34,7 +34,8 @@ use super::{
         MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD, MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
         MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE, MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD,
         MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET, MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET,
-        MAXWELL_THREE_D_COLOR_TARGET_STRIDE,
+        MAXWELL_THREE_D_COLOR_TARGET_STRIDE, MAXWELL_THREE_D_DEPTH_TARGET_LAYER_METHOD,
+        MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET,
     },
 };
 
@@ -95,6 +96,7 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
             Some(MAXWELL_THREE_D_POLYGON_MODE_RESET)
         }
         MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD => Some(MAXWELL_THREE_D_WINDOW_ORIGIN_RESET),
+        MAXWELL_THREE_D_DEPTH_TARGET_LAYER_METHOD => Some(MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET),
         raw if raw >= MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD
             && raw
                 < MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD
@@ -835,6 +837,10 @@ impl MaxwellThreeDViewportState {
 /// so queued operations do not retain or copy command-decoding state.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDState {
+    // Revisions are local to one register-file lifetime. Retain a namespace
+    // across snapshots so shared caches cannot confuse two channels whose
+    // independent revision counters happen to have the same numeric value.
+    cache_scope: Arc<()>,
     draw_state_revision: u64,
     render_target_revision: u64,
     vertex_resource_revision: u64,
@@ -868,8 +874,9 @@ pub struct MaxwellThreeDState {
 ///
 /// State domains unrelated to resource resolution deliberately do not advance
 /// the retained revisions or invalidate this identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct MaxwellThreeDResourceStateIdentity {
+    scope: Arc<()>,
     render_targets: Option<u64>,
     vertex_resources: Option<u64>,
     constant_buffers: Option<u64>,
@@ -877,32 +884,36 @@ pub(crate) struct MaxwellThreeDResourceStateIdentity {
     sample_mode: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct MaxwellThreeDShaderStateIdentity {
+    scope: Arc<()>,
     revision: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct MaxwellThreeDDrawStateIdentity {
+    scope: Arc<()>,
     revision: u64,
 }
 
 impl MaxwellThreeDDrawStateIdentity {
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        self.revision == state.draw_state_revision
+        Arc::ptr_eq(&self.scope, &state.cache_scope) && self.revision == state.draw_state_revision
     }
 }
 
 impl MaxwellThreeDShaderStateIdentity {
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        self.revision == state.shader_revision
+        Arc::ptr_eq(&self.scope, &state.cache_scope) && self.revision == state.shader_revision
     }
 }
 
 impl MaxwellThreeDResourceStateIdentity {
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        self.render_targets
-            .is_none_or(|revision| revision == state.render_target_revision)
+        Arc::ptr_eq(&self.scope, &state.cache_scope)
+            && self
+                .render_targets
+                .is_none_or(|revision| revision == state.render_target_revision)
             && self
                 .vertex_resources
                 .is_none_or(|revision| revision == state.vertex_resource_revision)
@@ -956,6 +967,7 @@ impl Default for MaxwellThreeDFrontendState {
             MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD,
+            MAXWELL_THREE_D_DEPTH_TARGET_LAYER_METHOD,
         ] {
             let reset = verified_raw_register_reset(GpuMethodId(method))
                 .expect("listed Maxwell register reset must be verified");
@@ -1045,8 +1057,9 @@ impl MaxwellThreeDFrontendState {
 }
 
 impl MaxwellThreeDState {
-    pub(crate) const fn draw_state_identity(&self) -> MaxwellThreeDDrawStateIdentity {
+    pub(crate) fn draw_state_identity(&self) -> MaxwellThreeDDrawStateIdentity {
         MaxwellThreeDDrawStateIdentity {
+            scope: Arc::clone(&self.cache_scope),
             revision: self.draw_state_revision,
         }
     }
@@ -1092,6 +1105,7 @@ impl MaxwellThreeDState {
                 )
             });
         MaxwellThreeDResourceStateIdentity {
+            scope: Arc::clone(&self.cache_scope),
             render_targets: needs_render_targets.then_some(self.render_target_revision),
             vertex_resources: needs_vertex_resources.then_some(self.vertex_resource_revision),
             constant_buffers: needs_constant_buffers.then_some(self.constant_buffer_revision),
@@ -1102,6 +1116,7 @@ impl MaxwellThreeDState {
 
     pub(crate) fn shader_state_identity(&self) -> MaxwellThreeDShaderStateIdentity {
         MaxwellThreeDShaderStateIdentity {
+            scope: Arc::clone(&self.cache_scope),
             revision: self.shader_revision,
         }
     }
@@ -1224,7 +1239,7 @@ impl MaxwellThreeDState {
             .vertex_input
             .primitive()
             .active_begin()
-            .is_some_and(|begin| matches!(begin.topology(), 4..=6));
+            .is_some_and(|begin| matches!(begin.topology(), 4..=7));
         let non_fill_polygon_mode = [
             MaxwellThreeDFixedFunctionRegister::FrontPolygonMode,
             MaxwellThreeDFixedFunctionRegister::BackPolygonMode,
@@ -1717,8 +1732,7 @@ impl MaxwellThreeDStateWrite {
             | Self::ColorReduction(_)
             | Self::ConstantColorRendering(_)
             | Self::Coverage(_)
-            | Self::Line(_)
-            | Self::ZCull(_) => true,
+            | Self::Line(_) => true,
             Self::RenderTarget(write) => !matches!(
                 write,
                 MaxwellThreeDRenderTargetWrite::ClearColor { .. }
@@ -1735,6 +1749,9 @@ impl MaxwellThreeDStateWrite {
                     | MaxwellThreeDVertexInputWrite::GlobalBaseInstanceIndex { .. }
             ),
             Self::InlineToMemory(_)
+            // Z-cull only describes the guest's hierarchical cache. The
+            // neutral draw always uses its ordinary depth/stencil tests.
+            | Self::ZCull(_)
             | Self::ShaderBinding(_)
             | Self::L2Cache(_)
             | Self::ReportSemaphore(_)

@@ -26,6 +26,88 @@ static QEMU_GDB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 #[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
+fn qemu_a64_vector_multiply_matches_rounding_nan_and_lane_semantics() {
+    for (wide, full) in [(false, false), (false, true), (true, true)] {
+        let bits = |value: f64| {
+            if wide {
+                value.to_bits()
+            } else {
+                u64::from((value as f32).to_bits())
+            }
+        };
+        let minimum = bits(if wide {
+            f64::MIN_POSITIVE
+        } else {
+            f64::from(f32::MIN_POSITIVE)
+        });
+        let maximum = bits(if wide { f64::MAX } else { f64::from(f32::MAX) });
+        let snan = bits(f64::INFINITY) | 1;
+        let pack = |values: [u64; 4]| {
+            if wide {
+                u128::from(values[0]) | (u128::from(values[1]) << 64)
+            } else {
+                values
+                    .into_iter()
+                    .enumerate()
+                    .fold(0, |v, (i, x)| v | (u128::from(x as u32) << (32 * i)))
+            }
+        };
+        let mut fixture = A64OracleFixture::new();
+        // Use the reported Rd=Rn alias, also for the 2S and 2D forms.
+        let word = 0x2e3c_dfbd | (u32::from(full) << 30) | (u32::from(wide) << 22);
+        fixture.oracle.write_instruction(fixture.slot, word);
+        for (a, b) in [
+            (bits(1.1), bits(-1.1)),
+            (minimum, bits(0.5)),
+            (2 * minimum - 1, bits(0.5)),
+            (maximum, bits(2.0)),
+            (bits(-0.0), bits(-2.0)),
+            (bits(f64::INFINITY), 0),
+            (snan, bits(f64::NAN)),
+            (1, bits(1.0)),
+        ] {
+            for mode in 0..16 {
+                let mut expected = A64State::default();
+                expected.set_pc(fixture.slot);
+                expected.set_fpcr(mode << 22);
+                expected.set_fpsr(1 << 27);
+                expected.set_vector(29, pack([a, b, snan, bits(2.0)]));
+                expected.set_vector(28, pack([b, a, bits(-2.0), bits(3.0)]));
+                for register in [28u8, 29] {
+                    fixture.oracle.write_raw_register(
+                        34 + u32::from(register),
+                        &expected.vector(register).unwrap().to_le_bytes(),
+                    );
+                }
+                fixture
+                    .oracle
+                    .write_raw_register(A64_FPCR_REGISTER, &expected.fpcr().to_le_bytes());
+                fixture
+                    .oracle
+                    .write_raw_register(A64_FPSR_REGISTER, &expected.fpsr().to_le_bytes());
+                fixture.oracle.write_register(A64_PC_REGISTER, fixture.slot);
+                assert_eq!(
+                    execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap(),
+                    InstructionStep::Continue
+                );
+                fixture.oracle.step("FMUL vector", word);
+                assert_eq!(
+                    &fixture.oracle.read_raw_register(34 + 29)[..16],
+                    expected.vector(29).unwrap().to_le_bytes(),
+                    "{word:08x}, a={a:x}, b={b:x}, mode={mode}"
+                );
+                assert_eq!(
+                    fixture.oracle.read_raw_register(A64_FPSR_REGISTER),
+                    expected.fpsr().to_le_bytes(),
+                    "status: {word:08x}, a={a:x}, b={b:x}, mode={mode}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
 fn qemu_a64_fused_element_matches_rounding_nan_and_accumulator_semantics() {
     for (wide, full) in [(false, false), (false, true), (true, true)] {
         let bits = |value: f64| {

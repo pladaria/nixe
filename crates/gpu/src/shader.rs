@@ -1952,6 +1952,18 @@ fn emit_wgsl_resources(
                 ));
             }
         }
+        if matches!(
+            resource.kind,
+            ShaderResourceKind::SampledImage | ShaderResourceKind::SampledImage2DArray
+        ) {
+            // BC1 RGB uses the native BC1 RGBA decoder but must return alpha
+            // one even for the transparent selector. Specialize per binding;
+            // the default introduces no runtime branch for other formats.
+            source.push_str(&format!(
+                "override nixe_texture_opaque_{}: bool = false;\n",
+                resource.binding
+            ));
+        }
     }
     if !ir.resources.is_empty() {
         source.push('\n');
@@ -2568,6 +2580,10 @@ fn emit_wgsl_operation(
                 coordinates[1].index(),
             ));
             for output in outputs {
+                if output.component() == 3 {
+                    source.push_str(&format!("  registers[{}] = bitcast<u32>(select({sample}.w, 1.0, nixe_texture_opaque_{image_binding}));\n", output.destination().index()));
+                    continue;
+                }
                 source.push_str(&format!(
                     "  registers[{}] = bitcast<u32>({sample}{});\n",
                     output.destination().index(),
@@ -2590,6 +2606,10 @@ fn emit_wgsl_operation(
                 array_index.index(),
             ));
             for output in outputs {
+                if output.component() == 3 {
+                    source.push_str(&format!("  registers[{}] = bitcast<u32>(select({sample}.w, 1.0, nixe_texture_opaque_{image_binding}));\n", output.destination().index()));
+                    continue;
+                }
                 source.push_str(&format!(
                     "  registers[{}] = bitcast<u32>({sample}{});\n",
                     output.destination().index(),

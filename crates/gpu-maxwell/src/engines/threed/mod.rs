@@ -134,12 +134,13 @@ pub use render_targets::{
     MaxwellThreeDClearSurface, MaxwellThreeDClearSurfaceControl, MaxwellThreeDColorCompressionMode,
     MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetSelection,
     MaxwellThreeDColorTargetState, MaxwellThreeDCompressionThreshold,
-    MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
-    MaxwellThreeDDepthTargetCount, MaxwellThreeDImageKind, MaxwellThreeDImageLayout,
-    MaxwellThreeDRawValue, MaxwellThreeDRectangle, MaxwellThreeDRenderTargetIndexOffset,
-    MaxwellThreeDRenderTargetLayer, MaxwellThreeDRenderTargetLayerControl,
-    MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
-    MaxwellThreeDSeparateFragmentData, MaxwellThreeDZCompressionMode,
+    MaxwellThreeDDepthArrayControl, MaxwellThreeDDepthStencilFormat,
+    MaxwellThreeDDepthStencilTargetState, MaxwellThreeDDepthTargetCount, MaxwellThreeDImageKind,
+    MaxwellThreeDImageLayout, MaxwellThreeDRawValue, MaxwellThreeDRectangle,
+    MaxwellThreeDRenderTargetIndexOffset, MaxwellThreeDRenderTargetLayer,
+    MaxwellThreeDRenderTargetLayerControl, MaxwellThreeDRenderTargetState,
+    MaxwellThreeDRenderTargetWrite, MaxwellThreeDSeparateFragmentData,
+    MaxwellThreeDZCompressionMode,
 };
 pub(crate) use resource::MaxwellThreeDResolvedResourceCache;
 #[cfg(test)]
@@ -199,9 +200,11 @@ pub use vertex::{
     MaxwellThreeDVertexStreamSubstituteState,
 };
 pub use zcull::{
-    MaxwellThreeDZCullBounds, MaxwellThreeDZCullCriterion, MaxwellThreeDZCullEnable,
-    MaxwellThreeDZCullRegionId, MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite,
-    MaxwellThreeDZCullStatsEnable, MaxwellThreeDZCullStencilFunction,
+    MaxwellThreeDZCullAxis, MaxwellThreeDZCullBounds, MaxwellThreeDZCullCriterion,
+    MaxwellThreeDZCullDepthFormat, MaxwellThreeDZCullDirectionFormat, MaxwellThreeDZCullEnable,
+    MaxwellThreeDZCullRegionFormat, MaxwellThreeDZCullRegionId, MaxwellThreeDZCullRegionLocation,
+    MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
+    MaxwellThreeDZCullStencilFunction, MaxwellThreeDZCullSubregion,
 };
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
@@ -295,6 +298,8 @@ enum MethodAction {
     NoOperation,
     DecompressSurface,
     WaitForIdle,
+    PixelShaderBarrier,
+    DiscardRenderTarget,
     MmeShadowRamControl,
     MutableMethodControl,
     FalconFirmwareCall4,
@@ -365,6 +370,14 @@ enum MethodAction {
     CsaaEnable,
     AliasedLineWidthEnable,
     ActiveZCullRegion,
+    ZCullRegionLocation,
+    ZCullRegionAliquots,
+    ZCullRegionFormat,
+    ZCullRegionSize(MaxwellThreeDZCullAxis),
+    ZCullRegionPixelOffset(MaxwellThreeDZCullAxis),
+    ZCullSubregion,
+    ZCullDirectionFormat,
+    ZCullMaintenance,
     ZCullStatsEnable,
     ZPassPixelCountEnable,
     ZCullCriterion,
@@ -874,6 +887,20 @@ methods!(
         u32::MAX,
         MethodAction::WaitForIdle
     ),
+    PIXEL_SHADER_BARRIER => (
+        0x0de0,
+        "PIXEL_SHADER_BARRIER",
+        0x0000_0001,
+        MethodAction::PixelShaderBarrier
+    ),
+    // Bit 0 selects depth/stencil; bits 4..6 select a color target.
+    // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/engine_3d.def#L250-L253
+    DISCARD_RENDER_TARGET => (
+        0x0f78,
+        "DISCARD_RENDER_TARGET",
+        0x0000_0071,
+        MethodAction::DiscardRenderTarget
+    ),
     SET_FALCON04 => (
         0x2310,
         "SET_FALCON04",
@@ -951,6 +978,51 @@ methods!(
         "SET_ZCULL_STATS",
         0x0000_0001,
         MethodAction::ZCullStatsEnable
+    ),
+    SET_ZCULL_REGION_LOCATION => (
+        0x07e0, "SET_ZCULL_REGION_LOCATION", u32::MAX, MethodAction::ZCullRegionLocation
+    ),
+    SET_ZCULL_REGION_ALIQUOTS => (
+        0x07e4, "SET_ZCULL_REGION_ALIQUOTS", 0xffff, MethodAction::ZCullRegionAliquots
+    ),
+    SET_ZCULL_REGION_FORMAT => (
+        0x15c8, "SET_ZCULL_REGION_FORMAT", 0xf, MethodAction::ZCullRegionFormat
+    ),
+    SET_ZCULL_REGION_SIZE_A => (
+        0x07c0, "SET_ZCULL_REGION_SIZE_A", 0xffff,
+        MethodAction::ZCullRegionSize(MaxwellThreeDZCullAxis::Width)
+    ),
+    SET_ZCULL_REGION_SIZE_B => (
+        0x07c4, "SET_ZCULL_REGION_SIZE_B", 0xffff,
+        MethodAction::ZCullRegionSize(MaxwellThreeDZCullAxis::Height)
+    ),
+    SET_ZCULL_REGION_SIZE_C => (
+        0x07c8, "SET_ZCULL_REGION_SIZE_C", 0xffff,
+        MethodAction::ZCullRegionSize(MaxwellThreeDZCullAxis::Depth)
+    ),
+    SET_ZCULL_REGION_PIXEL_OFFSET_A => (
+        0x15fc, "SET_ZCULL_REGION_PIXEL_OFFSET_A", 0xffff,
+        MethodAction::ZCullRegionPixelOffset(MaxwellThreeDZCullAxis::Width)
+    ),
+    SET_ZCULL_REGION_PIXEL_OFFSET_B => (
+        0x1600, "SET_ZCULL_REGION_PIXEL_OFFSET_B", 0xffff,
+        MethodAction::ZCullRegionPixelOffset(MaxwellThreeDZCullAxis::Height)
+    ),
+    SET_ZCULL_REGION_PIXEL_OFFSET_C => (
+        0x07cc, "SET_ZCULL_REGION_PIXEL_OFFSET_C", 0xffff,
+        MethodAction::ZCullRegionPixelOffset(MaxwellThreeDZCullAxis::Depth)
+    ),
+    SET_ZCULL_SUBREGION => (
+        0x02e8, "SET_ZCULL_SUBREGION", 0x0fff_fff1, MethodAction::ZCullSubregion
+    ),
+    SET_ZCULL_DIR_FORMAT => (
+        0x0dbc, "SET_ZCULL_DIR_FORMAT", u32::MAX, MethodAction::ZCullDirectionFormat
+    ),
+    CLEAR_ZCULL_REGION => (
+        0x12c8, "CLEAR_ZCULL_REGION", 0x001f_ffff, MethodAction::ZCullMaintenance
+    ),
+    INVALIDATE_ZCULL => (
+        0x1958, "INVALIDATE_ZCULL", 0, MethodAction::ZCullMaintenance
     ),
     SET_ZPASS_PIXEL_COUNT => (
         0x1514,
@@ -1304,6 +1376,30 @@ fn preflight_register(
     let (operation, writes_state) =
         match declaration.action {
             MethodAction::NoOperation => no_operation(),
+            MethodAction::DiscardRenderTarget => {
+                // A discard relinquishes preservation of the selected target's
+                // contents; it is not a clear, unbind, deallocation, or barrier.
+                // Retaining those contents is valid. Our resident-image path
+                // keeps them without adding a host pass, readback, resource
+                // lookup, or pipeline invalidation. Do not mark an uninitialized
+                // compressed image as materialized merely because it was discarded.
+                // The caller supplies any required fragment ordering separately.
+                // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L514-L530
+                // Discard/invalidation permits retained contents, not a required
+                // replacement value: https://registry.khronos.org/OpenGL/specs/gl/glspec43.core.pdf section 17.4.4.
+                no_operation()
+            }
+            MethodAction::ZCullMaintenance => {
+                // These commands maintain only Maxwell's hierarchical Z-cull
+                // metadata, never the depth/stencil attachment. We retain no
+                // such cache: neutral draws perform their own depth/stencil
+                // tests. All documented selectors therefore require no host
+                // work, memory writes, or pipeline invalidation. In particular,
+                // deko3d clears conservatively (0x19) after changing targets.
+                // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2091-L2108
+                // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/clear_buffers.mme#L26-L37
+                no_operation()
+            }
             MethodAction::DecompressSurface => {
                 let request = MaxwellThreeDDecompressSurface::parse(source.argument()).ok_or(
                     MaxwellEngineDispatchError::InvalidMethodValue {
@@ -1358,6 +1454,12 @@ fn preflight_register(
             MethodAction::WaitForIdle => {
                 synchronization_operation(MaxwellThreeDSynchronizationTrigger::WaitForIdle {
                     value: source.argument(),
+                    source,
+                })
+            }
+            MethodAction::PixelShaderBarrier => {
+                synchronization_operation(MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier {
+                    system_memory_barrier: source.argument() & 1 != 0,
                     source,
                 })
             }
@@ -2231,6 +2333,78 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
+                state_write()
+            }
+            MethodAction::ZCullRegionLocation => {
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::RegionLocation {
+                        value: MaxwellThreeDZCullRegionLocation::parse(source.argument()),
+                        source,
+                    },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullRegionAliquots => {
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::RegionAliquots {
+                        value: source.argument() as u16,
+                        source,
+                    },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullRegionSize(axis) => {
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::RegionSize {
+                        axis,
+                        value: source.argument() as u16,
+                        source,
+                    },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullRegionPixelOffset(axis) => {
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::RegionPixelOffset {
+                        axis,
+                        value: source.argument() as u16,
+                        source,
+                    },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullRegionFormat => {
+                let value = MaxwellThreeDZCullRegionFormat::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodEncoding {
+                        source,
+                        method_name: "SET_ZCULL_REGION_FORMAT",
+                        reason: "reserved Z-cull region format",
+                    },
+                )?;
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::RegionFormat { value, source },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullSubregion => {
+                let value = MaxwellThreeDZCullSubregion::parse(source.argument())
+                    .expect("validated Z-cull subregion mask");
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::Subregion { value, source },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullDirectionFormat => {
+                let value = MaxwellThreeDZCullDirectionFormat::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodEncoding {
+                        source,
+                        method_name: "SET_ZCULL_DIR_FORMAT",
+                        reason: "reserved Z-cull direction or depth format",
+                    },
+                )?;
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::DirectionFormat { value, source },
+                ));
                 state_write()
             }
             MethodAction::ZCullStatsEnable => {
@@ -3698,15 +3872,15 @@ fn preflight_output_state(
             ))
         }
         0x1230 if raw & !0x1ffff == 0 => {
-            let kind = if raw & 0x1_0000 != 0 {
-                MaxwellThreeDImageKind::Array
+            let control = if raw & 0x1_0000 != 0 {
+                MaxwellThreeDDepthArrayControl::ArraySizeIsOne
             } else {
-                MaxwellThreeDImageKind::ThreeDimensional
+                MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize
             };
             Some((
                 MaxwellThreeDRenderTargetWrite::DepthThirdDimension {
                     value: raw as u16,
-                    kind,
+                    control,
                     source,
                 },
                 "SET_ZT_SIZE_C",

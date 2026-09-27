@@ -4,6 +4,9 @@
 //! Switch profiles and Maxwell packets deliberately remain outside this layer.
 
 mod driver;
+mod page_resources;
+mod quad_indices;
+mod texture_sampling;
 mod visibility;
 
 use std::fmt::{Display, Formatter};
@@ -370,7 +373,10 @@ async fn initialize_backend_async(
 }
 
 fn requested_device_features(adapter_features: wgpu::Features) -> wgpu::Features {
-    adapter_features & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::PIPELINE_CACHE)
+    adapter_features
+        & (wgpu::Features::FLOAT32_FILTERABLE
+            | wgpu::Features::PIPELINE_CACHE
+            | wgpu::Features::TEXTURE_COMPRESSION_BC)
 }
 
 const PIPELINE_CACHE_MAGIC: &[u8] = b"NIXE-WGPU-CACHE\x01";
@@ -465,6 +471,10 @@ fn cache_error(path: &Path, error: std::io::Error) -> WgpuBackendInitializationE
 
 fn required_features_for_image_format(format: ImageFormat) -> wgpu::Features {
     match format {
+        ImageFormat::Bc1RgbUnorm
+        | ImageFormat::Bc1RgbSrgb
+        | ImageFormat::Bc1RgbaUnorm
+        | ImageFormat::Bc1RgbaSrgb => wgpu::Features::TEXTURE_COMPRESSION_BC,
         // The neutral format capability currently covers every supported use of
         // a format. Keep the float32 family out of that contract unless wgpu can
         // also represent its filtered sampled-image use exactly.
@@ -509,7 +519,11 @@ fn capabilities(
     )
 }
 
-const ALL_IMAGE_FORMATS: [ImageFormat; 16] = [
+const ALL_IMAGE_FORMATS: [ImageFormat; 20] = [
+    ImageFormat::Bc1RgbUnorm,
+    ImageFormat::Bc1RgbSrgb,
+    ImageFormat::Bc1RgbaUnorm,
+    ImageFormat::Bc1RgbaSrgb,
     ImageFormat::R8Unorm,
     ImageFormat::Rg8Unorm,
     ImageFormat::Rgba8Unorm,
@@ -606,6 +620,31 @@ mod tests {
         }
         assert!(required_features_for_image_format(ImageFormat::Rgba16Float).is_empty());
         assert!(required_features_for_image_format(ImageFormat::Rgba8Unorm).is_empty());
+    }
+
+    #[test]
+    fn bc1_formats_require_native_compression_but_not_render_attachment_usage() {
+        assert_eq!(
+            requested_device_features(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            wgpu::Features::TEXTURE_COMPRESSION_BC
+        );
+        for format in [
+            ImageFormat::Bc1RgbUnorm,
+            ImageFormat::Bc1RgbSrgb,
+            ImageFormat::Bc1RgbaUnorm,
+            ImageFormat::Bc1RgbaSrgb,
+        ] {
+            assert_eq!(
+                required_features_for_image_format(format),
+                wgpu::Features::TEXTURE_COMPRESSION_BC
+            );
+            assert_eq!(
+                driver::required_texture_usages(format),
+                wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+            );
+        }
     }
 
     #[test]

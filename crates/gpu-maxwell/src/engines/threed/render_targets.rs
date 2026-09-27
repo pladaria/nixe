@@ -13,6 +13,8 @@ pub(super) const MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET: u32 = 0;
 pub(super) const MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD: u32 = 0x19e0;
 pub(super) const MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE: u32 = 4;
 pub(super) const MAXWELL_THREE_D_COLOR_COMPRESSION_RESET: u32 = 0;
+pub(super) const MAXWELL_THREE_D_DEPTH_TARGET_LAYER_METHOD: u32 = 0x179c;
+pub(super) const MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET: u32 = 0;
 
 /// Whether the viewport index offsets the selected render-target index.
 ///
@@ -169,6 +171,15 @@ pub enum MaxwellThreeDImageLayout {
 pub enum MaxwellThreeDImageKind {
     Array,
     ThreeDimensional,
+}
+
+/// Layer-count interpretation in SET_ZT_SIZE_C, independent of color-target
+/// volume layout. Neither value denotes a three-dimensional depth texture.
+/// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MaxwellThreeDDepthArrayControl {
+    ThirdDimensionDefinesArraySize,
+    ArraySizeIsOne,
 }
 
 /// A verified Maxwell color-target format encoding.
@@ -621,7 +632,7 @@ impl MaxwellThreeDColorTargetState {
 }
 
 /// One unresolved depth/stencil attachment.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDDepthStencilTargetState {
     address_upper: MaxwellThreeDRegister<u8>,
     address_lower: MaxwellThreeDRegister<u32>,
@@ -630,10 +641,37 @@ pub struct MaxwellThreeDDepthStencilTargetState {
     width: MaxwellThreeDRegister<u32>,
     height: MaxwellThreeDRegister<u32>,
     third_dimension: MaxwellThreeDRegister<u16>,
-    kind: MaxwellThreeDRegister<MaxwellThreeDImageKind>,
+    array_control: MaxwellThreeDRegister<MaxwellThreeDDepthArrayControl>,
     array_pitch: MaxwellThreeDRegister<u32>,
     layer: MaxwellThreeDRegister<u16>,
     compression: MaxwellThreeDRegister<MaxwellThreeDZCompressionMode>,
+}
+
+impl Default for MaxwellThreeDDepthStencilTargetState {
+    fn default() -> Self {
+        // SET_ZT_LAYER starts at zero, like SET_COLOR_TARGET_LAYER. Deko3d's
+        // depth-target binding leaves it unwritten. Model only this verified
+        // reset, not a fallback that would hide other incomplete target fields.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3180-L3181
+        // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/engines/maxwell_3d.cpp#L45-L127
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L267-L297
+        Self {
+            address_upper: MaxwellThreeDRegister::default(),
+            address_lower: MaxwellThreeDRegister::default(),
+            format: MaxwellThreeDRegister::default(),
+            layout: MaxwellThreeDRegister::default(),
+            width: MaxwellThreeDRegister::default(),
+            height: MaxwellThreeDRegister::default(),
+            third_dimension: MaxwellThreeDRegister::default(),
+            array_control: MaxwellThreeDRegister::default(),
+            array_pitch: MaxwellThreeDRegister::default(),
+            layer: MaxwellThreeDRegister::verified_reset(
+                MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET,
+                Some(MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET as u16),
+            ),
+            compression: MaxwellThreeDRegister::default(),
+        }
+    }
 }
 
 impl MaxwellThreeDDepthStencilTargetState {
@@ -666,8 +704,8 @@ impl MaxwellThreeDDepthStencilTargetState {
         &self.third_dimension
     }
     #[must_use]
-    pub const fn kind(&self) -> &MaxwellThreeDRegister<MaxwellThreeDImageKind> {
-        &self.kind
+    pub const fn array_control(&self) -> &MaxwellThreeDRegister<MaxwellThreeDDepthArrayControl> {
+        &self.array_control
     }
     #[must_use]
     pub const fn array_pitch(&self) -> &MaxwellThreeDRegister<u32> {
@@ -989,10 +1027,11 @@ impl MaxwellThreeDRenderTargetState {
             MaxwellThreeDRenderTargetWrite::DepthHeight { value, .. } => {
                 self.depth_stencil.height = MaxwellThreeDRegister::programmed(raw, value, source)
             }
-            MaxwellThreeDRenderTargetWrite::DepthThirdDimension { value, kind, .. } => {
+            MaxwellThreeDRenderTargetWrite::DepthThirdDimension { value, control, .. } => {
                 self.depth_stencil.third_dimension =
                     MaxwellThreeDRegister::programmed(raw, value, source);
-                self.depth_stencil.kind = MaxwellThreeDRegister::programmed(raw, kind, source);
+                self.depth_stencil.array_control =
+                    MaxwellThreeDRegister::programmed(raw, control, source);
             }
             MaxwellThreeDRenderTargetWrite::DepthArrayPitch { value, .. } => {
                 self.depth_stencil.array_pitch =
@@ -1136,7 +1175,7 @@ pub enum MaxwellThreeDRenderTargetWrite {
     },
     DepthThirdDimension {
         value: u16,
-        kind: MaxwellThreeDImageKind,
+        control: MaxwellThreeDDepthArrayControl,
         source: MaxwellMethodSource,
     },
     DepthArrayPitch {

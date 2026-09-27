@@ -52,7 +52,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0022..=0x0000_002f | 0x0000_005e..=0x0000_005f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a2 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a3 => {
             A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -170,6 +170,48 @@ mod tests {
                 assert_eq!(coverage_id, pattern.coverage_id);
                 assert_eq!(support, pattern.decoder);
             }
+        }
+    }
+
+    #[test]
+    fn fmul_vector_decodes_cube_operands_and_validates_shapes() {
+        for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+            let location = LocationDescriptor::new(
+                GuestVirtualAddress::new(0x7100_132c),
+                platform.profile_id(),
+            );
+            for (word, wide, full) in [
+                (0x6e3c_dfbd, false, true),
+                (0x2e3c_dfbd, false, false),
+                (0x6e7c_dfbd, true, true),
+            ] {
+                let encoding = InstructionEncoding::from_u32(word);
+                let DecodeResult::Decoded(decoded) = decode(platform, location, encoding) else {
+                    panic!("{word:08x}")
+                };
+                let A64Instruction::FpSimd(fp_simd::Instruction::VectorFloatMultiply(fields)) =
+                    normalize(&decoded.instruction, encoding)
+                else {
+                    panic!("{decoded:?}")
+                };
+                assert_eq!((fields.rd, fields.rn, fields.rm), (29, 29, 28));
+                assert_eq!(fields.opc, u8::from(wide));
+                assert_eq!(fields.vector_128, full);
+            }
+            // Reserved 1D and unsupported FP16/FMULX must not decode as FMUL S/D.
+            for word in [0x2e7c_dfbd, 0x6e5c_1fbd, 0x4e3c_dfbd] {
+                assert!(!matches!(
+                    decode(platform, location, InstructionEncoding::from_u32(word)),
+                    DecodeResult::Decoded(_)
+                ));
+            }
+            assert!(matches!(
+                crate::decode::allocation::validate_a64(
+                    crate::coverage::CoverageId::new(0xa3),
+                    0x2e7c_dfbd
+                ),
+                crate::decode::table::AllocationStatus::Reserved(_)
+            ));
         }
     }
 

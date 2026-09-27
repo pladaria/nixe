@@ -24,6 +24,80 @@ mod flags;
 mod memory;
 
 #[test]
+fn hcq_vector_multiply_executes_all_shapes_natively() {
+    use nixe_cpu_interpreter::execute_one;
+    for (word, wide, full) in [
+        (0x6e3c_dfbd, false, true),
+        (0x2e3c_dfbd, false, false),
+        (0x6e7c_dfbd, true, true),
+    ] {
+        let words = [word, word, 0xd420_0000];
+        let graph = graph(&[(0x1000, &words)]);
+        for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+            let _ = staged(&graph, &[0], abi, CodeVersion::new(1).unwrap());
+        }
+        let (mut reader, memory) = fixture(&graph, &[0], &[]);
+        let mut worker = WorkerFaultContext::register().unwrap();
+        let mut state = A64State::default();
+        state.set_pc(0x1000);
+        state.set_fpsr(1 << 27);
+        let pack = |values: [f64; 4]| {
+            if wide {
+                u128::from(values[0].to_bits()) | (u128::from(values[1].to_bits()) << 64)
+            } else {
+                values.into_iter().enumerate().fold(0, |v, (i, x)| {
+                    v | (u128::from((x as f32).to_bits()) << (32 * i))
+                })
+            }
+        };
+        state.set_vector(29, pack([1.5, -2.0, 3.0, -0.0]));
+        state.set_vector(28, pack([2.0, 4.0, -0.5, -2.0]));
+        if !wide && !full {
+            state.set_vector(29, state.vector(29).unwrap() | (u128::MAX << 64));
+            state.set_vector(28, state.vector(28).unwrap() | (u128::MAX << 64));
+        }
+        let mut expected = state.clone();
+        for &word in &words[..2] {
+            execute_one(
+                &nixe_cpu::platform::TargetPlatform::Switch1,
+                &mut expected,
+                word,
+            )
+            .unwrap();
+        }
+        let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
+        let exit = unsafe {
+            invocation::run(
+                &mut Samples::new(),
+                &mut reader,
+                &mut frame,
+                &memory,
+                &mut worker,
+                &mut ExclusiveMonitorState::default(),
+                key(0x1000),
+            )
+        }
+        .unwrap()
+        .unwrap();
+        let invocation::Exit::Native { guest, .. } = exit else {
+            panic!("expected native exit")
+        };
+        assert_eq!(guest.kind, EdgeKind::Breakpoint(0));
+        assert_eq!(state, expected);
+        let mask = if full {
+            u128::MAX
+        } else {
+            u128::from(u64::MAX)
+        };
+        assert_eq!(
+            state.vector(29),
+            Some(pack([6.0, -32.0, 0.75, -0.0]) & mask)
+        );
+        assert_eq!(state.fpsr(), 1 << 27);
+    }
+}
+
+#[test]
 fn hcq_fused_element_reads_and_updates_the_vector_accumulator() {
     #[cfg(target_arch = "x86_64")]
     if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {

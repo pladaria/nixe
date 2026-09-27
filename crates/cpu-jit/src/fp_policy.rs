@@ -84,6 +84,7 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::ScalarVectorSignedIntToFloat(_)
         | Instruction::ScalarVectorUnsignedIntToFloat(_)
         | Instruction::VectorFloatDivide(_)
+        | Instruction::VectorFloatMultiply(_)
         | Instruction::VectorFloatMultiplyElement(_)
         | Instruction::VectorFloatFusedElement(_)
         | Instruction::ScalarFloatConvert(_)

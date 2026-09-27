@@ -1720,18 +1720,20 @@ fn effective_polygon_smoothing_and_stipple_are_topology_aware() {
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
     program_three_d(&mut channel, 0x1700, 0x1234_5678);
-
-    program_three_d(&mut channel, 0x0db4, 1);
-    assert!(matches!(
-        preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedPolygonSmoothSemantics)
-    ));
-    program_three_d(&mut channel, 0x0db4, 0);
-    program_three_d(&mut channel, 0x168c, 1);
-    assert!(matches!(
-        preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedPolygonStippleSemantics)
-    ));
+    for topology in [4, 7] {
+        program_three_d(&mut channel, 0x1618, topology);
+        program_three_d(&mut channel, 0x0db4, 1);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::UnsupportedPolygonSmoothSemantics)
+        ));
+        program_three_d(&mut channel, 0x0db4, 0);
+        program_three_d(&mut channel, 0x168c, 1);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::UnsupportedPolygonStippleSemantics)
+        ));
+    }
 
     program_three_d(&mut channel, 0x1618, 0);
     assert!(matches!(

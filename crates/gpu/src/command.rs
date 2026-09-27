@@ -180,6 +180,9 @@ pub enum PrimitiveTopology {
     Triangles,
     TriangleStrip,
     TriangleFan,
+    /// Independent groups of four perimeter-ordered vertices, with the fourth
+    /// vertex supplying constant interpolants. Incomplete groups are discarded.
+    Quads,
     Patches,
 }
 

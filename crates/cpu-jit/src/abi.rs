@@ -905,15 +905,15 @@ pub struct VectorFpDivideOperation {
     pub vector_128: bool,
 }
 
-/// Packed FMUL by one selected element of the full source vector, even for 2S.
+/// Packed FMUL, optionally by one selected element of the full Rm (even for 2S).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VectorFpMultiplyElementOperation {
+pub struct VectorFpMultiplyOperation {
     pub rn: u8,
     pub rm: u8,
     pub rd: u8,
     pub lane_64: bool,
     pub vector_128: bool,
-    pub lane: u8,
+    pub lane: Option<u8>,
 }
 
 /// Exact FMLA/FMLS reads the accumulator from Rd in canonical PRE-state.

@@ -1,5 +1,11 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
+#[path = "accelerated/compressed_textures.rs"]
+mod compressed_textures;
+
+#[path = "accelerated/resource_lifetime.rs"]
+mod resource_lifetime;
+
 use nixe_gpu::{
     AttachmentLoad, AttachmentStore, BackendInstanceId, BackendResourceCreateInfo,
     BackendVisibilityRequester, BackingView, BlockLinearLayout, BufferDescription, BufferId,
@@ -1309,6 +1315,18 @@ fn partial_depth_stencil_clear_modes_are_accepted() {
 
 #[test]
 fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract() {
+    accelerated_polygon_draw(
+        PrimitiveTopology::Triangles,
+        ShaderInterpolation::Perspective,
+    );
+}
+
+#[test]
+fn accelerated_quads_cover_both_triangles_with_the_last_vertex_color() {
+    accelerated_polygon_draw(PrimitiveTopology::Quads, ShaderInterpolation::Constant);
+}
+
+fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderInterpolation) {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x12);
     let Ok(initialized) = initialize_backend(
@@ -1370,15 +1388,29 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     });
 
     let mut vertex_bytes = Vec::new();
-    for component in [
+    let triangle_vertices = [
         -0.5_f32, -0.5, 0.0, 1.0, 0.0, 0.0, 0.5, -0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
         1.0,
-    ] {
+    ];
+    let quad_vertices = [
+        // An unused prefix tests a nonzero, non-quad-aligned first vertex.
+        0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, -0.5, -0.5, 0.0, 1.0, 0.0, 0.0, 0.5, -0.5, 0.0, 0.0, 1.0,
+        0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0, -0.5, 0.5, 0.0, 1.0, 1.0, 0.0,
+        // An incomplete trailing quad must not add any coverage.
+        -1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+    ];
+    let vertices: &[f32] = if topology == PrimitiveTopology::Quads {
+        &quad_vertices
+    } else {
+        &triangle_vertices
+    };
+    for component in vertices {
         vertex_bytes.extend_from_slice(&component.to_le_bytes());
     }
+    let vertex_size = vertex_bytes.len() as u64;
     let vertex_page = initialized_page(&vertex_bytes);
     let vertex_allocation = GpuAllocationId::new(3);
-    let vertex_allocation_description = GpuAllocationDescription::new(72, 4).unwrap();
+    let vertex_allocation_description = GpuAllocationDescription::new(vertex_size, 4).unwrap();
     creations.push(BackendResourceCreateInfo::Allocation {
         id: vertex_allocation,
         description: vertex_allocation_description,
@@ -1391,11 +1423,11 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     let vertex_buffer = BufferId::new(3);
     creations.push(BackendResourceCreateInfo::Buffer {
         id: vertex_buffer,
-        description: BufferDescription::new(72).unwrap(),
+        description: BufferDescription::new(vertex_size).unwrap(),
         view: Some(
             BufferView::new(
                 vertex_buffer,
-                BufferDescription::new(72).unwrap(),
+                BufferDescription::new(vertex_size).unwrap(),
                 0,
                 vertex_backing.clone(),
             )
@@ -1410,14 +1442,14 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
         description: ShaderDescription {
             stage: ShaderStage::Vertex,
         },
-        module: triangle_vertex_module(),
+        module: interpolated_vertex_module(interpolation),
     });
     creations.push(BackendResourceCreateInfo::Shader {
         id: fragment,
         description: ShaderDescription {
             stage: ShaderStage::Fragment,
         },
-        module: triangle_fragment_module(),
+        module: interpolated_fragment_module(interpolation),
     });
     let pipeline = PipelineId::new(1);
     creations.push(BackendResourceCreateInfo::Pipeline {
@@ -1452,13 +1484,13 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     let prepared = PreparedDraw::new(
         pipeline,
         render_pass,
-        PrimitiveTopology::Triangles,
+        topology,
         vec![],
         vec![
             VertexBufferLayout::new(
                 BufferRegion {
                     buffer: vertex_buffer,
-                    range: BufferRange::new(0, 72).unwrap(),
+                    range: BufferRange::new(0, vertex_size).unwrap(),
                 },
                 24,
                 VertexStepMode::Vertex,
@@ -1486,10 +1518,14 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     let draw = DrawOperation::new(
         Arc::new(prepared),
         DrawArguments::NonIndexed {
-            first_vertex: 0,
-            vertex_count: 3,
-            first_instance: 0,
-            instance_count: 1,
+            first_vertex: u32::from(topology == PrimitiveTopology::Quads),
+            vertex_count: if topology == PrimitiveTopology::Quads {
+                7
+            } else {
+                3
+            },
+            first_instance: 2,
+            instance_count: 2,
         },
     )
     .unwrap();
@@ -1556,6 +1592,20 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     assert_eq!(clear[3], 255);
     assert_eq!(pixel(WIDTH - 1, HEIGHT - 1), clear);
 
+    if topology == PrimitiveTopology::Quads {
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let expected = if (8..24).contains(&x) && (8..24).contains(&y) {
+                    [255, 255, 0, 255]
+                } else {
+                    clear
+                };
+                assert_eq!(pixel(x, y), expected, "pixel ({x}, {y})");
+            }
+        }
+        return;
+    }
+
     let top = pixel(16, 10);
     let bottom_left = pixel(10, 22);
     let bottom_right = pixel(22, 22);
@@ -1575,7 +1625,7 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     assert!((100..=160).contains(&drawn), "drawn pixels={drawn}");
 }
 
-fn triangle_vertex_module() -> nixe_gpu::ShaderBackendModule {
+fn interpolated_vertex_module(interpolation: ShaderInterpolation) -> nixe_gpu::ShaderBackendModule {
     let inputs = (0..2)
         .flat_map(|location| (0..3).map(move |component| (location, component)))
         .map(|(location, component)| {
@@ -1592,8 +1642,13 @@ fn triangle_vertex_module() -> nixe_gpu::ShaderBackendModule {
         .map(|component| (ShaderIoLocation::Position, component))
         .chain((0..3).map(|component| (ShaderIoLocation::Generic(0), component)))
         .map(|(location, component)| {
-            ShaderInterfaceElement::new(location, component, ShaderScalarType::Float32, None)
-                .unwrap()
+            ShaderInterfaceElement::new(
+                location,
+                component,
+                ShaderScalarType::Float32,
+                matches!(location, ShaderIoLocation::Generic(_)).then_some(interpolation),
+            )
+            .unwrap()
         })
         .collect();
     let verified = VerifiedShaderIr::verify(ShaderIr::new(
@@ -1614,14 +1669,16 @@ fn triangle_vertex_module() -> nixe_gpu::ShaderBackendModule {
     lower_shader_ir_to_wgsl(&verified).unwrap()
 }
 
-fn triangle_fragment_module() -> nixe_gpu::ShaderBackendModule {
+fn interpolated_fragment_module(
+    interpolation: ShaderInterpolation,
+) -> nixe_gpu::ShaderBackendModule {
     let inputs = (0..3)
         .map(|component| {
             ShaderInterfaceElement::new(
                 ShaderIoLocation::Generic(0),
                 component,
                 ShaderScalarType::Float32,
-                Some(ShaderInterpolation::Perspective),
+                Some(interpolation),
             )
             .unwrap()
         })

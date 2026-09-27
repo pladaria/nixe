@@ -591,17 +591,17 @@ impl Translator<'_> {
         self.mask_vector(result, vector_bits)
     }
 
-    /// FMUL by element selects Rm's lane before masking the destination shape.
-    /// Inactive numerator lanes are zero; the guarded finite multiplier makes
-    /// their products exact zeros, whose sign is cleared by the output mask.
-    /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMUL--by-element---Floating-point-Multiply--by-element--
-    pub(crate) fn fp_vector_multiply_element_operands(
+    /// FMUL selects Rm's element (if indexed) before masking the vector shape.
+    /// Otherwise mask both sources: inactive NaNs must not affect eligibility
+    /// or status. The inactive products are exact zeros in either form.
+    /// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.82–83)
+    pub(crate) fn fp_vector_multiply_operands(
         &mut self,
         first: Value,
         second: Value,
         lane_bits: u32,
         vector_bits: u32,
-        lane: u8,
+        lane: Option<u8>,
     ) -> (Value, Value) {
         let ty = if lane_bits == 32 {
             types::I32X4
@@ -610,9 +610,14 @@ impl Translator<'_> {
         };
         let first = self.mask_vector(first, vector_bits);
         let first = self.vector_as(first, ty);
-        let second = self.vector_as(second, ty);
-        let element = self.builder.ins().extractlane(second, lane);
-        let second = self.builder.ins().splat(ty, element);
+        let second = if let Some(lane) = lane {
+            let second = self.vector_as(second, ty);
+            let element = self.builder.ins().extractlane(second, lane);
+            self.builder.ins().splat(ty, element)
+        } else {
+            let second = self.mask_vector(second, vector_bits);
+            self.vector_as(second, ty)
+        };
         (first, second)
     }
 

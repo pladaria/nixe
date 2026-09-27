@@ -2136,6 +2136,101 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
 }
 
 #[test]
+fn depth_layer_reset_is_shared_by_live_state_and_mme_shadow_replay() {
+    let mut channel = three_d_channel();
+    let reset_state = channel.three_d().clone();
+    let layer = reset_state.render_targets().depth_stencil().layer();
+    assert_eq!(layer.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+    assert_eq!(layer.raw(), Some(0));
+    assert_eq!(layer.value(), Some(&0));
+    assert_eq!(layer.source(), None);
+    let raw = channel
+        .three_d_mut()
+        .raw_register(GpuMethodId(0x179c))
+        .unwrap();
+    assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+    assert_eq!(raw.raw(), Some(0));
+    // Shadow storage is sparse: an unwritten entry resolves through the shared
+    // reset table, as exercised by replay below, without allocating an entry.
+    assert!(
+        channel
+            .three_d_mut()
+            .mme()
+            .shadow_register(GpuMethodId(0x179c))
+            .is_none()
+    );
+    // The reset is not a target binding and does not initialize other fields.
+    assert_eq!(
+        reset_state
+            .render_targets()
+            .depth_stencil()
+            .format()
+            .origin(),
+        MaxwellThreeDRegisterOrigin::Unset
+    );
+    assert!(
+        resolve_maxwell_three_d_resources(&reset_state, &resource_address_space())
+            .unwrap()
+            .resources()
+            .is_empty()
+    );
+
+    program_three_d(&mut channel, 0x0124, 2);
+    program_three_d(&mut channel, 0x179c, 3);
+    assert_eq!(
+        channel
+            .three_d()
+            .render_targets()
+            .depth_stencil()
+            .layer()
+            .value(),
+        Some(&3)
+    );
+    program_three_d(&mut channel, 0x0124, 3);
+    let replay = dispatch_method(&mut channel, 0x179c / 4, u32::MAX).unwrap();
+    assert_eq!(replay.methods()[0].method().source().argument(), 0);
+    assert_eq!(
+        channel
+            .three_d()
+            .render_targets()
+            .depth_stencil()
+            .layer()
+            .value(),
+        Some(&0)
+    );
+
+    // An explicitly tracked layer still overrides the reset on later replay.
+    program_three_d(&mut channel, 0x0124, 0);
+    program_three_d(&mut channel, 0x179c, 2);
+    program_three_d(&mut channel, 0x0124, 2);
+    program_three_d(&mut channel, 0x179c, 4);
+    program_three_d(&mut channel, 0x0124, 3);
+    program_three_d(&mut channel, 0x179c, u32::MAX);
+    assert_eq!(
+        channel
+            .three_d()
+            .render_targets()
+            .depth_stencil()
+            .layer()
+            .value(),
+        Some(&2)
+    );
+    assert_eq!(
+        reset_state.render_targets().depth_stencil().layer().value(),
+        Some(&0)
+    );
+    assert_eq!(
+        three_d_channel()
+            .three_d()
+            .render_targets()
+            .depth_stencil()
+            .layer()
+            .value(),
+        Some(&0)
+    );
+}
+
+#[test]
 fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_replay() {
     let mut channel = three_d_channel();
     let initial = [

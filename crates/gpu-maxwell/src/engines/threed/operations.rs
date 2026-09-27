@@ -508,6 +508,12 @@ pub enum MaxwellThreeDSynchronizationTrigger {
         value: u32,
         source: MaxwellMethodSource,
     },
+    /// Order fragment work, optionally including a system-memory barrier.
+    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1079-L1082
+    PixelShaderBarrier {
+        system_memory_barrier: bool,
+        source: MaxwellMethodSource,
+    },
     InvalidateShaderCaches {
         request: MaxwellThreeDShaderCacheInvalidation,
         source: MaxwellMethodSource,
@@ -548,6 +554,7 @@ impl MaxwellThreeDSynchronizationTrigger {
         match self {
             Self::DecompressSurface { source, .. }
             | Self::WaitForIdle { source, .. }
+            | Self::PixelShaderBarrier { source, .. }
             | Self::InvalidateShaderCaches { source, .. }
             | Self::InvalidateShaderCachesNoWfi { source, .. }
             | Self::InvalidateTextureCacheNoWfi { source, .. }
@@ -572,6 +579,9 @@ pub enum MaxwellThreeDSynchronizationPlan {
     /// Orders every earlier channel operation before later work.
     WaitForIdle {
         prior_work_pending: bool,
+    },
+    PixelShaderBarrier {
+        system_memory_barrier: bool,
     },
     InvalidateShaderCaches {
         request: MaxwellThreeDShaderCacheInvalidation,
@@ -740,6 +750,12 @@ pub fn lower_maxwell_three_d_synchronization(
         MaxwellThreeDSynchronizationTrigger::WaitForIdle { .. } => {
             Ok(MaxwellThreeDSynchronizationPlan::WaitForIdle { prior_work_pending })
         }
+        MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier {
+            system_memory_barrier,
+            ..
+        } => Ok(MaxwellThreeDSynchronizationPlan::PixelShaderBarrier {
+            system_memory_barrier,
+        }),
         MaxwellThreeDSynchronizationTrigger::InvalidateShaderCaches { request, source } => {
             if request.locks() {
                 return Err(
