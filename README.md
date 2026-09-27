@@ -62,7 +62,11 @@ See the [tiered JIT design](docs/specs/tiered-jit/spec.md) and
 See [host requirements](docs/host-requirements.md) for required CPU and memory
 capabilities. `--offline` is optional once dependencies are cached.
 
-The default configuration is in [`nixe.toml`](nixe.toml). List available titles with:
+The default configuration is in [`nixe.toml`](nixe.toml). Window size and
+position are remembered in a versioned binary `nixe.cfg` beside the selected
+`nixe.toml`; it is managed by Nixe.
+
+List available titles with:
 
 ```bash
 cargo cli list
@@ -73,6 +77,9 @@ Run a title by its ID or name:
 ```bash
 cargo cli run <id | name>
 ```
+
+Press `1` while the window is focused to resize its image area to the current
+frame resolution.
 
 ## Testing
 

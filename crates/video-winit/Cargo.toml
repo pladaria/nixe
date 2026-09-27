@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 bytemuck.workspace = true
 log.workspace = true
+nixe-config.workspace = true
 nixe-gpu.workspace = true
 nixe-gpu-wgpu.workspace = true
 nixe-video.workspace = true

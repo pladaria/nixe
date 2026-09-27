@@ -1337,6 +1337,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "log",
+ "nixe-config",
  "nixe-gpu",
  "nixe-gpu-wgpu",
  "nixe-video",

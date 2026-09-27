@@ -32,6 +32,7 @@ Thumbs.db
 /keys/
 /cache/
 /storage/
+/nixe.cfg
 
 # Debug
 /perf.*
