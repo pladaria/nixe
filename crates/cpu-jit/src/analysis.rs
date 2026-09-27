@@ -678,6 +678,7 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::VectorSignedShiftRegister(_)
         | fp_simd::Instruction::VectorUnsignedShiftRegister(_)
         | fp_simd::Instruction::VectorFloatDivide(_)
+        | fp_simd::Instruction::VectorFloatMultiply(_)
         | fp_simd::Instruction::VectorFloatMultiplyElement(_)
         | fp_simd::Instruction::ScalarFloatDivide(_)
         | fp_simd::Instruction::ScalarFloatAdd(_)

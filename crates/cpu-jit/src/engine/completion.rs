@@ -118,7 +118,7 @@ impl JitThread {
                     | EdgeKind::FpAdd(_)
                     | EdgeKind::FpDivide(_)
                     | EdgeKind::VectorFpDivide(_)
-                    | EdgeKind::VectorFpMultiplyElement(_)
+                    | EdgeKind::VectorFpMultiply(_)
                     | EdgeKind::VectorFpFusedElement(_)
                     | EdgeKind::FpMultiply(_)
                     | EdgeKind::FpFused(_)
@@ -132,8 +132,8 @@ impl JitThread {
                             EdgeKind::FpAdd(op) => fp::complete_add(op, state),
                             EdgeKind::FpDivide(op) => fp::complete_divide(op, state),
                             EdgeKind::VectorFpDivide(op) => fp::complete_vector_divide(op, state),
-                            EdgeKind::VectorFpMultiplyElement(op) => {
-                                fp::complete_vector_multiply_element(op, state)
+                            EdgeKind::VectorFpMultiply(op) => {
+                                fp::complete_vector_multiply(op, state)
                             }
                             EdgeKind::VectorFpFusedElement(op) => {
                                 fp::complete_vector_fused_element(op, state)

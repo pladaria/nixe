@@ -1,5 +1,5 @@
 use super::*;
-use crate::lcq::fp::{CompletionError, complete_vector_multiply_element};
+use crate::lcq::fp::{CompletionError, complete_vector_multiply};
 use nixe_cpu::{exception::ExceptionKind, execution::CpuExit};
 use nixe_cpu_interpreter::{InstructionStep, execute_one};
 
@@ -60,10 +60,10 @@ fn check(word: u32, first: u128, second: u128, fpcr: u32, baseline: bool) -> Edg
     }
     let (_, exit) = execute_compiler(&memory, words.len(), &mut actual, compiler);
     match exit.kind {
-        EdgeKind::VectorFpMultiplyElement(operation) => {
+        EdgeKind::VectorFpMultiply(operation) => {
             assert_eq!(actual, prestate);
             assert_eq!(exit.pc.get(), PC + 12);
-            match complete_vector_multiply_element(operation, &mut actual) {
+            match complete_vector_multiply(operation, &mut actual) {
                 Ok(()) => {
                     assert_eq!(reference, InstructionStep::Continue);
                     assert_eq!(actual, expected);
@@ -93,9 +93,124 @@ fn check(word: u32, first: u128, second: u128, fpcr: u32, baseline: bool) -> Edg
     }
     assert_eq!(
         actual, expected,
-        "{word:08x}, {first:x} * element({second:x}), FPCR={fpcr:x}"
+        "{word:08x}, lhs={first:x}, rhs={second:x}, FPCR={fpcr:x}"
     );
     exit.kind
+}
+
+#[test]
+fn multiply_vector_matches_shapes_rounding_exceptions_and_aliases() {
+    for (wide, full) in [(false, false), (false, true), (true, true)] {
+        let bits = |v: f64| {
+            if wide {
+                v.to_bits()
+            } else {
+                u64::from((v as f32).to_bits())
+            }
+        };
+        let minimum = bits(if wide {
+            f64::MIN_POSITIVE
+        } else {
+            f64::from(f32::MIN_POSITIVE)
+        });
+        let maximum = bits(if wide { f64::MAX } else { f64::from(f32::MAX) });
+        let snan = bits(f64::INFINITY) | 1;
+        let word = 0x2e22_dc20 | (u32::from(full) << 30) | (u32::from(wide) << 22);
+        for (a, b) in [
+            (bits(1.1), bits(-1.1)),
+            (0, bits(-2.0)),
+            (bits(-0.0), bits(-2.0)),
+            (maximum, bits(2.0)),
+            (minimum, bits(0.5)),
+            (minimum + 1, bits(0.5)),
+            (2 * minimum - 1, bits(0.5)),
+            (minimum, minimum),
+            (bits(f64::INFINITY), 0),
+            (bits(2.0), bits(f64::INFINITY)),
+            (snan, bits(f64::NAN)),
+            (bits(f64::NAN), snan),
+            (1, bits(1.0)),
+            (bits(1.0), 1),
+        ] {
+            for lane in 0..if wide || !full { 2 } else { 4 } {
+                let mut first = [bits(2.0), bits(3.0), bits(4.0), bits(5.0)];
+                let mut second = [bits(-3.0), bits(0.5), bits(-2.0), bits(1.0)];
+                first[lane] = a;
+                second[lane] = b;
+                if !wide && !full {
+                    first[2..].copy_from_slice(&[snan, 1]);
+                    second[2..].copy_from_slice(&[snan, bits(f64::INFINITY)]);
+                }
+                for mode in 0..16 {
+                    check(
+                        word,
+                        pack(first, wide),
+                        pack(second, wide),
+                        mode << 22,
+                        false,
+                    );
+                }
+                for fpcr in [1 << 8, 1 << 10, 1 << 11, 1 << 12, (1 << 24) | (1 << 15)] {
+                    check(word, pack(first, wide), pack(second, wide), fpcr, false);
+                }
+            }
+        }
+        // Baseline hosts must also use one packed native operation; upper 2S
+        // source lanes may contain exceptional values and are never consumed.
+        let first = pack([bits(2.0), bits(3.0), snan, 1], wide);
+        let second = pack([bits(-3.0), bits(0.5), snan, 1], wide);
+        if wide || !full {
+            assert_eq!(check(word, first, second, 0, true), EdgeKind::Breakpoint(0));
+        }
+        for alias in [
+            word,
+            (word & !31) | 1,
+            (word & !31) | 2,
+            (word & !31) | 31,
+            (word & !(31 << 5)) | (31 << 5),
+            (word & !(31 << 16)) | (31 << 16),
+            (word & !((31 << 5) | (31 << 16))) | (31 << 5) | (31 << 16) | 31,
+        ] {
+            assert_eq!(
+                check(
+                    alias,
+                    pack([bits(1.1); 4], wide),
+                    pack([bits(-1.1); 4], wide),
+                    0,
+                    true
+                ),
+                EdgeKind::Breakpoint(0)
+            );
+            check(
+                alias,
+                pack([snan; 4], wide),
+                pack([bits(2.0); 4], wide),
+                0,
+                false,
+            );
+        }
+    }
+}
+
+#[test]
+fn cube_vector_multiply_is_native_and_preserves_independent_lanes() {
+    let words = [0x6e3c_dfbd, 0xd420_0000];
+    let mut state = A64State::default();
+    state.set_pc(PC);
+    state.set_fpsr(1 << 27);
+    let vector = |values: [f32; 4]| pack(values.map(|v| u64::from(v.to_bits())), false);
+    state.set_vector(29, vector([1.5, -2.0, 3.0, -0.0]));
+    state.set_vector(28, vector([2.0, 4.0, -0.5, -2.0]));
+    let mut expected = state.clone();
+    assert_eq!(
+        execute_one(&TargetPlatform::Switch1, &mut expected, words[0]).unwrap(),
+        InstructionStep::Continue
+    );
+    let (_, exit) = execute_memory(&memory(&words), words.len(), &mut state);
+    assert_eq!(exit.kind, EdgeKind::Breakpoint(0));
+    assert_eq!(state, expected);
+    assert_eq!(state.vector(29), Some(vector([3.0, -8.0, -1.5, 0.0])));
+    assert_eq!(state.fpsr(), 1 << 27);
 }
 
 #[test]
@@ -222,7 +337,7 @@ fn overwritten_multiply_element_keeps_status_and_precise_maps() {
             .iter()
             .find(|s| {
                 s.exit.is_some_and(|e| {
-                    e.pc.get() == PC + 8 && matches!(e.kind, EdgeKind::VectorFpMultiplyElement(_))
+                    e.pc.get() == PC + 8 && matches!(e.kind, EdgeKind::VectorFpMultiply(_))
                 })
             })
             .unwrap();
@@ -241,10 +356,10 @@ fn overwritten_multiply_element_keeps_status_and_precise_maps() {
     let (_, exit) = execute_memory(&memory, words.len(), &mut actual);
     assert_eq!(actual, expected);
     assert_eq!(actual.fpsr(), 1 << 4);
-    let EdgeKind::VectorFpMultiplyElement(operation) = exit.kind else {
+    let EdgeKind::VectorFpMultiply(operation) = exit.kind else {
         panic!("{exit:?}")
     };
-    complete_vector_multiply_element(operation, &mut actual).unwrap();
+    complete_vector_multiply(operation, &mut actual).unwrap();
     execute_one(&TargetPlatform::Switch1, &mut expected, words[2]).unwrap();
     assert_eq!(actual, expected);
     assert_eq!(actual.fpsr(), 0x11);
@@ -253,7 +368,7 @@ fn overwritten_multiply_element_keeps_status_and_precise_maps() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn multiply_element_exact_semantics_match_arm_instructions() {
-    use nixe_cpu::semantics::a64_fp_simd::{exact_vector_float_multiply_element, fp_status_bits};
+    use nixe_cpu::semantics::a64_fp_simd::{exact_vector_float_multiply, fp_status_bits};
     macro_rules! arm {
         ($instruction:literal, $first:expr, $second:expr, $fpcr:expr) => {{
             let mut result = 0u128;
@@ -312,12 +427,12 @@ fn multiply_element_exact_semantics_match_arm_instructions() {
                     (64, 128) => arm!("fmul v0.2d, v1.2d, v2.d[1]", first, second, fpcr),
                     _ => unreachable!(),
                 };
-                let expected = exact_vector_float_multiply_element(
+                let expected = exact_vector_float_multiply(
                     first,
                     second,
                     lane_bits,
                     vector_bits,
-                    lane,
+                    Some(lane),
                     fpcr,
                 );
                 assert_eq!(

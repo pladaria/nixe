@@ -1,14 +1,190 @@
 //! Typed `MAXWELL_B` Z-cull state.
 //!
 //! These 3D-engine registers are deliberately separate from the channel
-//! Z-cull binding and from immutable GPU-profile capabilities. Selecting a
-//! region does not by itself establish its storage or geometry, and enabling
-//! statistics does not establish counter accumulation, visibility, or
-//! reporting semantics.
+//! Z-cull binding and from immutable GPU-profile capabilities. Region geometry
+//! describes the hardware's hierarchical depth/stencil cache, not the depth
+//! attachment. Neutral backends perform ordinary depth/stencil testing and do
+//! not consume this cache layout. Storage transfers and counter reports still
+//! require their own semantics; these register writes do not implement them.
+//!
+//! Register fields and enumerants:
+//! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h>
+//! deko3d programs this block when binding a depth attachment:
+//! <https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L282-L297>
 
 use crate::MaxwellMethodSource;
 
 use super::MaxwellThreeDRegister;
+
+/// Axis of a Z-cull region's size or pixel offset (unsigned 16-bit fields).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxwellThreeDZCullAxis {
+    Width,
+    Height,
+    Depth,
+}
+
+/// Allocation within the hardware Z-cull cache, in aliquots, not GPU addresses.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDZCullRegionLocation {
+    start_aliquot: u16,
+    aliquot_count: u16,
+}
+
+impl MaxwellThreeDZCullRegionLocation {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Self {
+        Self {
+            start_aliquot: raw as u16,
+            aliquot_count: (raw >> 16) as u16,
+        }
+    }
+
+    #[must_use]
+    pub const fn start_aliquot(self) -> u16 {
+        self.start_aliquot
+    }
+
+    #[must_use]
+    pub const fn aliquot_count(self) -> u16 {
+        self.aliquot_count
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.start_aliquot as u32 | (self.aliquot_count as u32) << 16
+    }
+}
+
+/// Cache format, independent of the depth attachment's pixel format.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDZCullRegionFormat {
+    Z4x4 = 0,
+    Zs4x4 = 1,
+    Z4x2 = 2,
+    Z2x4 = 3,
+    Z16x8Block4x4 = 4,
+    Z8x8Block4x2 = 5,
+    Z8x8Block2x4 = 6,
+    Z16x16Block4x8 = 7,
+    Z4x8Block2x2 = 8,
+    Zs16x8Block4x2 = 9,
+    Zs16x8Block2x4 = 10,
+    Zs8x8Block2x2 = 11,
+    Z4x8Block1x1 = 12,
+}
+
+impl MaxwellThreeDZCullRegionFormat {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        Some(match raw {
+            0 => Self::Z4x4,
+            1 => Self::Zs4x4,
+            2 => Self::Z4x2,
+            3 => Self::Z2x4,
+            4 => Self::Z16x8Block4x4,
+            5 => Self::Z8x8Block4x2,
+            6 => Self::Z8x8Block2x4,
+            7 => Self::Z16x16Block4x8,
+            8 => Self::Z4x8Block2x2,
+            9 => Self::Zs16x8Block4x2,
+            10 => Self::Zs16x8Block2x4,
+            11 => Self::Zs8x8Block2x2,
+            12 => Self::Z4x8Block1x1,
+            _ => return None,
+        })
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Subregion optimization policy, not an allocation or report operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDZCullSubregion {
+    enabled: bool,
+    normalized_aliquots: u32,
+}
+
+impl MaxwellThreeDZCullSubregion {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x0fff_fff1 != 0 {
+            return None;
+        }
+        Some(Self {
+            enabled: raw & 1 != 0,
+            normalized_aliquots: raw >> 4,
+        })
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub const fn normalized_aliquots(self) -> u32 {
+        self.normalized_aliquots
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.enabled as u32 | self.normalized_aliquots << 4
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u16)]
+pub enum MaxwellThreeDZCullDepthFormat {
+    MostSignificantBits = 0,
+    Float = 1,
+    ZTrick = 2,
+}
+
+/// Z-cull's depth ordering/representation, not SET_DEPTH_FUNC or SET_ZT_FORMAT.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDZCullDirectionFormat {
+    greater: bool,
+    format: MaxwellThreeDZCullDepthFormat,
+}
+
+impl MaxwellThreeDZCullDirectionFormat {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        if raw & 0xffff > 1 {
+            return None;
+        }
+        let format = match raw >> 16 {
+            0 => MaxwellThreeDZCullDepthFormat::MostSignificantBits,
+            1 => MaxwellThreeDZCullDepthFormat::Float,
+            2 => MaxwellThreeDZCullDepthFormat::ZTrick,
+            _ => return None,
+        };
+        Some(Self {
+            greater: raw & 1 != 0,
+            format,
+        })
+    }
+
+    #[must_use]
+    pub const fn greater(self) -> bool {
+        self.greater
+    }
+
+    #[must_use]
+    pub const fn format(self) -> MaxwellThreeDZCullDepthFormat {
+        self.format
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.greater as u32 | (self.format as u32) << 16
+    }
+}
 
 /// Stencil comparison used by Maxwell's internal Z-cull criterion.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -201,8 +377,8 @@ impl MaxwellThreeDZCullBounds {
 /// the pinned public class header:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2799-L2800>
 ///
-/// The selector remains pipeline-neutral until the selected region has
-/// modeled storage and geometry that a draw can actually consume.
+/// The selector is pipeline-neutral: neutral draws do not consume Maxwell's
+/// hierarchical cache, regardless of its programmed geometry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDZCullRegionId(u8);
 
@@ -262,6 +438,36 @@ impl MaxwellThreeDZCullStatsEnable {
 /// One validated Z-cull register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDZCullStateWrite {
+    RegionLocation {
+        value: MaxwellThreeDZCullRegionLocation,
+        source: MaxwellMethodSource,
+    },
+    RegionAliquots {
+        value: u16,
+        source: MaxwellMethodSource,
+    },
+    RegionFormat {
+        value: MaxwellThreeDZCullRegionFormat,
+        source: MaxwellMethodSource,
+    },
+    RegionSize {
+        axis: MaxwellThreeDZCullAxis,
+        value: u16,
+        source: MaxwellMethodSource,
+    },
+    RegionPixelOffset {
+        axis: MaxwellThreeDZCullAxis,
+        value: u16,
+        source: MaxwellMethodSource,
+    },
+    Subregion {
+        value: MaxwellThreeDZCullSubregion,
+        source: MaxwellMethodSource,
+    },
+    DirectionFormat {
+        value: MaxwellThreeDZCullDirectionFormat,
+        source: MaxwellMethodSource,
+    },
     Criterion {
         value: MaxwellThreeDZCullCriterion,
         source: MaxwellMethodSource,
@@ -287,6 +493,13 @@ pub enum MaxwellThreeDZCullStateWrite {
 /// Persistent Z-cull configuration on one `MAXWELL_B` engine.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDZCullState {
+    region_location: MaxwellThreeDRegister<MaxwellThreeDZCullRegionLocation>,
+    region_aliquots: MaxwellThreeDRegister<u16>,
+    region_format: MaxwellThreeDRegister<MaxwellThreeDZCullRegionFormat>,
+    region_size: [MaxwellThreeDRegister<u16>; 3],
+    region_pixel_offset: [MaxwellThreeDRegister<u16>; 3],
+    subregion: MaxwellThreeDRegister<MaxwellThreeDZCullSubregion>,
+    direction_format: MaxwellThreeDRegister<MaxwellThreeDZCullDirectionFormat>,
     criterion: MaxwellThreeDRegister<MaxwellThreeDZCullCriterion>,
     enable: MaxwellThreeDRegister<MaxwellThreeDZCullEnable>,
     bounds: MaxwellThreeDRegister<MaxwellThreeDZCullBounds>,
@@ -295,6 +508,48 @@ pub struct MaxwellThreeDZCullState {
 }
 
 impl MaxwellThreeDZCullState {
+    #[must_use]
+    pub const fn region_location(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDZCullRegionLocation> {
+        &self.region_location
+    }
+
+    #[must_use]
+    pub const fn region_aliquots(&self) -> &MaxwellThreeDRegister<u16> {
+        &self.region_aliquots
+    }
+
+    #[must_use]
+    pub const fn region_format(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCullRegionFormat> {
+        &self.region_format
+    }
+
+    #[must_use]
+    pub const fn region_size(&self, axis: MaxwellThreeDZCullAxis) -> &MaxwellThreeDRegister<u16> {
+        &self.region_size[axis as usize]
+    }
+
+    #[must_use]
+    pub const fn region_pixel_offset(
+        &self,
+        axis: MaxwellThreeDZCullAxis,
+    ) -> &MaxwellThreeDRegister<u16> {
+        &self.region_pixel_offset[axis as usize]
+    }
+
+    #[must_use]
+    pub const fn subregion(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCullSubregion> {
+        &self.subregion
+    }
+
+    #[must_use]
+    pub const fn direction_format(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDZCullDirectionFormat> {
+        &self.direction_format
+    }
+
     #[must_use]
     pub const fn criterion(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCullCriterion> {
         &self.criterion
@@ -322,6 +577,40 @@ impl MaxwellThreeDZCullState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDZCullStateWrite) {
         match write {
+            MaxwellThreeDZCullStateWrite::RegionLocation { value, source } => {
+                self.region_location =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDZCullStateWrite::RegionAliquots { value, source } => {
+                self.region_aliquots =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellThreeDZCullStateWrite::RegionFormat { value, source } => {
+                self.region_format = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDZCullStateWrite::RegionSize {
+                axis,
+                value,
+                source,
+            } => {
+                self.region_size[axis as usize] =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellThreeDZCullStateWrite::RegionPixelOffset {
+                axis,
+                value,
+                source,
+            } => {
+                self.region_pixel_offset[axis as usize] =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellThreeDZCullStateWrite::Subregion { value, source } => {
+                self.subregion = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDZCullStateWrite::DirectionFormat { value, source } => {
+                self.direction_format =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDZCullStateWrite::Criterion { value, source } => {
                 self.criterion = MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }

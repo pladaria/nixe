@@ -40,6 +40,7 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
                 | Instruction::ScalarFloatAdd(_)
                 | Instruction::ScalarFloatDivide(_)
                 | Instruction::VectorFloatDivide(_)
+                | Instruction::VectorFloatMultiply(_)
                 | Instruction::VectorFloatMultiplyElement(_)
                 | Instruction::VectorFloatFusedElement(_)
                 | Instruction::ScalarFloatMultiply(_)
@@ -363,24 +364,26 @@ pub(crate) fn complete_vector_divide(
     Ok(())
 }
 
-/// Atomic vector FMUL completion over canonical PRE-state. Read the selected
-/// element from the full Rm vector; an enabled exception commits no lane.
-/// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMUL--by-element---Floating-point-Multiply--by-element--
-pub(crate) fn complete_vector_multiply_element(
-    operation: crate::abi::VectorFpMultiplyElementOperation,
+/// Atomic FMUL completion, optionally selecting one element from the full Rm.
+/// An enabled exception commits no lane.
+/// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.82–83)
+pub(crate) fn complete_vector_multiply(
+    operation: crate::abi::VectorFpMultiplyOperation,
     state: &mut A64State,
 ) -> Result<(), CompletionError> {
     if operation.rn >= 32
         || operation.rm >= 32
         || operation.rd >= 32
         || (operation.lane_64 && !operation.vector_128)
-        || operation.lane >= if operation.lane_64 { 2 } else { 4 }
+        || operation
+            .lane
+            .is_some_and(|lane| lane >= if operation.lane_64 { 2 } else { 4 })
     {
         return Err(CompletionError::Invalid(Error::internal(
-            "invalid exact vector FP multiply-element operands",
+            "invalid exact vector FP multiply operands",
         )));
     }
-    let result = nixe_cpu::semantics::a64_fp_simd::exact_vector_float_multiply_element(
+    let result = nixe_cpu::semantics::a64_fp_simd::exact_vector_float_multiply(
         state.vector(operation.rn).unwrap(),
         state.vector(operation.rm).unwrap(),
         if operation.lane_64 { 64 } else { 32 },

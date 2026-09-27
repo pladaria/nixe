@@ -1081,7 +1081,13 @@ fn three_d_synchronization_operation(
         | MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi { maintenance, .. }
         | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { maintenance, .. }
         | MaxwellThreeDSynchronizationPlan::TiledCacheFlush { maintenance, .. } => maintenance,
-        MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. } => {
+        MaxwellThreeDSynchronizationPlan::PixelShaderBarrier { .. }
+        | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. } => {
+            // The neutral ordered-write boundary also covers fragment outputs.
+            // Conservatively expose writes for both SYSMEMBAR modes: backends
+            // own coherent device storage and materialize CPU reads on demand.
+            // This is GPU ordering, not a CPU wait or a syncpoint completion;
+            // in particular a fragment barrier does not drain unrelated stages.
             CacheMaintenanceOperation::FlushDirtyDeviceWrites
         }
         MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface { .. }
@@ -1899,6 +1905,8 @@ mod tests {
         .unwrap();
         let texture_invalidate = packet(0, 0x1288 / 4, &[0]);
         let shader_invalidate = packet(0, 0x0da4 / 4, &[0x1011]);
+        let fragment_barriers = packet(0, 0x0de0 / 4, &[0]);
+        let fragment_system_barrier = packet(0, 0x0de0 / 4, &[1]);
         let wait = packet(1, 0x0110 / 4, &[0]);
 
         let plan = lower_test_pushbuffers(
@@ -1909,6 +1917,8 @@ mod tests {
                 invalidate,
                 texture_invalidate,
                 shader_invalidate,
+                fragment_barriers,
+                fragment_system_barrier,
                 wait,
             ],
             &address_space,
@@ -1927,7 +1937,11 @@ mod tests {
                 MaxwellSubmissionExecutionStep::BackendOperation(invalidate),
                 MaxwellSubmissionExecutionStep::BackendOperation(texture),
                 MaxwellSubmissionExecutionStep::BackendOperation(shader),
+                MaxwellSubmissionExecutionStep::BackendOperation(fragment),
+                MaxwellSubmissionExecutionStep::BackendOperation(fragment_system),
             ] if *value == 0xfeed_beef_u32.to_le_bytes()
+                && matches!(fragment.command(), GpuCommand::CacheMaintenance(CacheMaintenanceOperation::FlushDirtyDeviceWrites))
+                && matches!(fragment_system.command(), GpuCommand::CacheMaintenance(CacheMaintenanceOperation::FlushDirtyDeviceWrites))
                 && target.offset().get() == address
                 && matches!(
                     flush.command(),

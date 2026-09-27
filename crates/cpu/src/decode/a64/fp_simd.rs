@@ -707,6 +707,17 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         161,
         &[],
     ),
+    // Arm FMUL (vector), single/double precision, section D6.83:
+    // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab
+    pattern(
+        "simd-floating-point-multiply",
+        0xbfa0_fc00,
+        0x2e20_dc00,
+        0x0000_00a3,
+        213,
+        &[],
+    )
+    .fixture32(0x6e3c_dfbd),
     // FMUL (vector, by element) multiplies every active lane by one selected
     // S/D element. This allocation is present in the application corpus.
     pattern(
@@ -1389,6 +1400,7 @@ instructions!(
     ScalarVectorSignedIntToFloat,
     ScalarVectorUnsignedIntToFloat,
     VectorFloatDivide,
+    VectorFloatMultiply,
     VectorFloatMultiplyElement,
     VectorFloatFusedElement,
     VectorFloatImmediate,
@@ -1571,6 +1583,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_008a => Instruction::ScalarVectorSignedIntToFloat(operands),
         0x0000_008b => Instruction::ScalarVectorUnsignedIntToFloat(operands),
         0x0000_006c => Instruction::VectorFloatDivide(operands),
+        0x0000_00a3 => Instruction::VectorFloatMultiply(operands),
         0x0000_00a1 => Instruction::VectorFloatMultiplyElement(operands),
         0x0000_00a2 => Instruction::VectorFloatFusedElement(operands),
         0x0000_0086 => Instruction::VectorFloatImmediate(operands),

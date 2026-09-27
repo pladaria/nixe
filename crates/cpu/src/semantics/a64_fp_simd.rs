@@ -250,8 +250,10 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             state.set_fpsr(state.fpsr() | fp_status_bits(status));
             Ok(())
         }
-        Instruction::VectorFloatMultiplyElement(_) => {
-            let (value, status) = vector_float_multiply_element(state, fields);
+        Instruction::VectorFloatMultiply(_) | Instruction::VectorFloatMultiplyElement(_) => {
+            let lane = matches!(instruction, Instruction::VectorFloatMultiplyElement(_))
+                .then_some(fields.fp_element_lane);
+            let (value, status) = vector_float_multiply(state, fields, lane);
             if fp_status_traps(status, state.fpcr()) {
                 return Err(A64FpSimdError::Trap);
             }
@@ -1588,9 +1590,10 @@ pub fn exact_vector_float_fused_element(
     }
 }
 
-fn vector_float_multiply_element(
+fn vector_float_multiply(
     state: &A64State,
     fields: crate::decode::a64::fp_simd::Operands,
+    lane: Option<u8>,
 ) -> (u128, FpStatus) {
     let format = if fields.opc == 0 {
         FpFormat::Binary32
@@ -1600,27 +1603,28 @@ fn vector_float_multiply_element(
     let vector_bits = if fields.vector_128 { 128_u32 } else { 64_u32 };
     let lhs = state
         .vector(fields.rn)
-        .expect("normalized SIMD by-element multiplicand");
-    let rhs = state
-        .vector(fields.rm)
-        .expect("normalized SIMD by-element multiplier");
-    let outcome = exact_vector_float_multiply_element(
+        .expect("normalized SIMD multiplicand");
+    let rhs = state.vector(fields.rm).expect("normalized SIMD multiplier");
+    let outcome = exact_vector_float_multiply(
         lhs,
         rhs,
         format.bits(),
         vector_bits as u8,
-        fields.fp_element_lane,
+        lane,
         state.fpcr(),
     );
     (outcome.bits, outcome.status)
 }
 
-pub fn exact_vector_float_multiply_element(
+/// FMUL vector and by-element forms share the same exact per-lane operation.
+/// Select from the full Rm before restricting execution to active lanes.
+/// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.82–83)
+pub fn exact_vector_float_multiply(
     lhs: u128,
     rhs: u128,
     lane_bits: u8,
     vector_bits: u8,
-    lane: u8,
+    lane: Option<u8>,
     fpcr: u32,
 ) -> ExactFpOutcome {
     let format = fp_format(lane_bits);
@@ -1631,11 +1635,17 @@ pub fn exact_vector_float_multiply_element(
     } else {
         u128::from(u32::MAX)
     };
-    let rhs = ((rhs >> (u32::from(lane) * lane_bits)) & lane_mask) as u64;
+    let rhs = if let Some(lane) = lane {
+        let element = (rhs >> (u32::from(lane) * lane_bits)) & lane_mask;
+        element * (u128::MAX / lane_mask)
+    } else {
+        rhs
+    };
     let mut result = 0_u128;
     let mut status = FpStatus::default();
     for shift in (0..vector_bits).step_by(lane_bits as usize) {
         let lhs = ((lhs >> shift) & lane_mask) as u64;
+        let rhs = ((rhs >> shift) & lane_mask) as u64;
         let outcome = multiply_ieee_lane(lhs, rhs, format, fpcr);
         result |= u128::from(outcome.bits) << shift;
         merge_fp_status(&mut status, outcome.status);

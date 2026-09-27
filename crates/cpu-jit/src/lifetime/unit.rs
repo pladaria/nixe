@@ -123,7 +123,7 @@ pub(crate) enum EdgeKind {
     FpAdd(crate::abi::FpAddOperation),
     FpDivide(crate::abi::FpDivideOperation),
     VectorFpDivide(crate::abi::VectorFpDivideOperation),
-    VectorFpMultiplyElement(crate::abi::VectorFpMultiplyElementOperation),
+    VectorFpMultiply(crate::abi::VectorFpMultiplyOperation),
     VectorFpFusedElement(crate::abi::VectorFpFusedElementOperation),
     FpMultiply(crate::abi::FpMultiplyOperation),
     FpFused(crate::abi::FpFusedOperation),

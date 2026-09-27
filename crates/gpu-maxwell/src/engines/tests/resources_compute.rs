@@ -1,6 +1,82 @@
 use super::*;
 
 #[test]
+fn resource_cache_does_not_alias_equal_revision_counters_from_different_channels() {
+    let mut address_space = resource_address_space();
+    let mut channels = Vec::new();
+    for allocation_id in [81, 82] {
+        let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+        let mapping = map_resource(
+            &mut address_space,
+            allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+            allocation_id,
+            0xfe,
+        );
+        let address = mapping.offset().get();
+        let mut channel = three_d_channel();
+        for (method, argument) in [
+            (0x0800, (address >> 32) as u32),
+            (0x0804, address as u32),
+            (0x0808, 64),
+            (0x080c, 32),
+            (0x0810, 0xd5),
+            (0x0814, 0),
+            (0x0818, 1),
+            (0x081c, 0),
+            (0x0820, 0),
+            (0x15d0, 0),
+        ] {
+            program_three_d(&mut channel, method, argument);
+        }
+        channels.push(channel);
+    }
+    let roles = [MaxwellThreeDResourceRole::ColorTarget(0)];
+    let first_state = channels[0].three_d();
+    let second_state = channels[1].three_d();
+    assert!(
+        !first_state
+            .resource_state_identity(&roles, false)
+            .matches(second_state)
+    );
+    assert!(!first_state.draw_state_identity().matches(second_state));
+    assert!(!first_state.shader_state_identity().matches(second_state));
+    let snapshot = first_state.clone();
+    assert!(
+        first_state
+            .resource_state_identity(&roles, false)
+            .matches(&snapshot)
+    );
+    assert!(first_state.draw_state_identity().matches(&snapshot));
+    assert!(first_state.shader_state_identity().matches(&snapshot));
+    let mut cache = MaxwellThreeDLoweringCache::default();
+    let first = cache
+        .resolved_resources_mut()
+        .resolve(first_state, &address_space, &roles, None, false, 4)
+        .unwrap();
+    let second = cache
+        .resolved_resources_mut()
+        .resolve(second_state, &address_space, &roles, None, false, 4)
+        .unwrap();
+    let MaxwellThreeDResolvedResource::Image(first_image) = &first.resources()[0] else {
+        panic!("expected color image");
+    };
+    let MaxwellThreeDResolvedResource::Image(second_image) = &second.resources()[0] else {
+        panic!("expected color image");
+    };
+    assert_ne!(
+        first_image.source().offset(),
+        second_image.source().offset()
+    );
+    let repeated = cache
+        .resolved_resources_mut()
+        .resolve(second_state, &address_space, &roles, None, false, 4)
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&second, &repeated));
+}
+
+#[test]
 fn three_d_embedded_inline_upload_covers_captured_block_linear_gob_row() {
     let mut channel = three_d_channel();
 
@@ -420,7 +496,7 @@ fn three_d_depth_layer_selects_one_array_subresource() {
         (0x0ff0, 0x1000),
         (0x1228, 64),
         (0x122c, 32),
-        (0x1230, 0x0001_0002),
+        (0x1230, 2),
         (0x1538, 1),
         (0x179c, 1),
         (0x15d0, 0),
@@ -442,6 +518,11 @@ fn three_d_depth_layer_selects_one_array_subresource() {
         })
         .expect("depth/stencil target must resolve as an image");
     assert_eq!(depth.description().array_layers(), 2);
+    assert_eq!(
+        depth.description().dimension(),
+        nixe_gpu::ImageDimension::Two
+    );
+    assert_eq!(depth.description().extent().depth, 1);
     assert_eq!(depth.view().bindings().len(), 1);
     assert_eq!(
         depth.view().bindings()[0].subresources(),
@@ -462,7 +543,7 @@ fn three_d_depth_layer_selects_one_array_subresource() {
         })
     ));
 
-    program_three_d(&mut channel, 0x1230, 2);
+    program_three_d(&mut channel, 0x1230, 0x0001_0002);
     program_three_d(&mut channel, 0x179c, 1);
     assert!(matches!(
         resolve_maxwell_three_d_resources(channel.three_d(), &address_space),
@@ -470,6 +551,76 @@ fn three_d_depth_layer_selects_one_array_subresource() {
             role: MaxwellThreeDResourceRole::DepthStencilTarget,
         })
     ));
+    program_three_d(&mut channel, 0x179c, 0);
+    for raw in [1, 0x10000, 0x10001, 0x10002, 0x1ffff] {
+        program_three_d(&mut channel, 0x1230, raw);
+        let resolved =
+            resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
+        let depth = resolved
+            .resources()
+            .iter()
+            .find_map(|resource| match resource {
+                MaxwellThreeDResolvedResource::Image(image)
+                    if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
+                {
+                    Some(image)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            depth.description().dimension(),
+            nixe_gpu::ImageDimension::Two
+        );
+        assert_eq!(depth.description().extent().depth, 1);
+        assert_eq!(depth.description().array_layers(), 1);
+        assert_eq!(depth.view().bindings()[0].subresources().base_layer, 0);
+    }
+    program_three_d(&mut channel, 0x1230, 0);
+    assert!(matches!(
+        resolve_maxwell_three_d_resources(channel.three_d(), &address_space),
+        Err(MaxwellThreeDResourceError::ContradictoryState {
+            role: MaxwellThreeDResourceRole::DepthStencilTarget
+        })
+    ));
+}
+
+#[test]
+fn depth_array_control_decodes_the_public_size_c_encoding() {
+    let mut channel = three_d_channel();
+    for (raw, expected) in [
+        (
+            1,
+            MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize,
+        ),
+        (
+            0xffff,
+            MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize,
+        ),
+        (0x10000, MaxwellThreeDDepthArrayControl::ArraySizeIsOne),
+        (0x1ffff, MaxwellThreeDDepthArrayControl::ArraySizeIsOne),
+    ] {
+        let dispatch = dispatch_method(&mut channel, 0x1230 / 4, raw).unwrap();
+        let target = channel.three_d().render_targets().depth_stencil();
+        assert_eq!(target.third_dimension().value(), Some(&(raw as u16)));
+        assert_eq!(target.array_control().value(), Some(&expected));
+        assert_eq!(target.array_control().raw(), Some(raw));
+        assert_eq!(
+            target.array_control().source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+    }
+    for raw in [0x20000, 0x80000000, u32::MAX] {
+        let before = channel.clone();
+        assert!(matches!(
+            dispatch_method(&mut channel, 0x1230 / 4, raw),
+            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                method_name: "SET_ZT_SIZE",
+                ..
+            })
+        ));
+        assert_eq!(channel, before);
+    }
 }
 
 #[test]
@@ -495,7 +646,7 @@ fn three_d_stencil8_z24_preserves_guest_packing_with_neutral_depth_stencil_seman
         (0x0ff0, 0x2000),
         (0x1228, 64),
         (0x122c, 32),
-        (0x1230, 0x0001_0001),
+        (0x1230, 1),
         (0x1538, 1),
         (0x179c, 0),
         (0x15d0, 0),
@@ -551,7 +702,245 @@ fn three_d_stencil8_z24_preserves_guest_packing_with_neutral_depth_stencil_seman
 }
 
 #[test]
+fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot() {
+    let allocation = CanonicalAllocation::zeroed(0x90_0000, 0x1000).unwrap();
+    let mut address_space = resource_address_space();
+    let mapping = map_resource(
+        &mut address_space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        16,
+        0x51,
+    );
+    let address = mapping.offset().get();
+    let mut channel = three_d_channel();
+    // Rotating cube's Z24S8 target and full scissor. The stencil-mask control
+    // is enabled, but its register is deliberately absent for the first check.
+    for (method, argument) in [
+        (0x0fe0, (address >> 32) as u32),
+        (0x0fe4, address as u32),
+        (0x0fe8, 0x14),
+        (0x0fec, 0x40),
+        (0x0ff0, 0x21c000),
+        (0x1228, 1920),
+        (0x122c, 1080),
+        (0x1230, 1),
+        (0x1538, 1),
+        (0x15d0, 0),
+        (0x0ff4, 1920 << 16),
+        (0x0ff8, 1080 << 16),
+        (0x0e00, 1),
+        (0x0e04, 1920 << 16),
+        (0x0e08, 1080 << 16),
+        (0x0d90, 1.0f32.to_bits()),
+        (0x0da0, 0x5a),
+        (0x10f8, 0x101),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let layer = channel.three_d().render_targets().depth_stencil().layer();
+    assert_eq!(layer.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+    assert_eq!(layer.value(), Some(&0));
+    assert_eq!(layer.source(), None);
+    let capabilities = BackendCapabilities::new(
+        BackendFeatures::CLEAR,
+        [ImageFormat::Depth24UnormStencil8Uint],
+        [SampleCount::One],
+        [ShaderStage::Vertex, ShaderStage::Fragment],
+        std::iter::empty::<QueryKind>(),
+        BackendLimits {
+            max_color_attachments: 8,
+            max_descriptor_bindings: 32,
+            max_compute_workgroups: [1, 1, 1],
+        },
+    );
+    let lower = |operation: &MaxwellThreeDTriggeredOperation,
+                 cache: &mut MaxwellThreeDLoweringCache| {
+        let resources =
+            resolve_maxwell_three_d_resources(operation.state(), &address_space).unwrap();
+        lower_maxwell_three_d_operation(
+            operation.state(),
+            &resources,
+            operation.trigger(),
+            None,
+            FrontendSubmissionId::new(11),
+            Vec::new(),
+            &capabilities,
+            cache,
+        )
+    };
+    let mut cache = MaxwellThreeDLoweringCache::default();
+    let missing = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
+    assert!(matches!(
+        lower(missing.operations()[0], &mut cache),
+        Err(MaxwellThreeDLoweringError::IncompleteClear(
+            "SET_STENCIL_MASK"
+        ))
+    ));
+
+    // Depth-only clears neither read nor initialize stencil, even when the
+    // respect-mask control is set and the stencil mask register is unset.
+    let depth_only = dispatch_method(&mut channel, 0x19d0 / 4, 1).unwrap();
+    let depth_plan = lower(
+        depth_only.operations()[0],
+        &mut MaxwellThreeDLoweringCache::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        depth_plan.submission().operations()[0].command(),
+        GpuCommand::Clear(nixe_gpu::ClearOperation::Image {
+            value: nixe_gpu::ClearValue::Depth(1.0),
+            ..
+        })
+    ));
+
+    for mask in [0, 0x7f] {
+        program_three_d(&mut channel, 0x139c, mask);
+        let partial = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
+        assert!(matches!(
+            lower(partial.operations()[0], &mut cache),
+            Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x51 })
+        ));
+    }
+
+    // Follow deko3d's temporary mask override and restore it before lowering.
+    program_three_d(&mut channel, 0x0124, 0);
+    program_three_d(&mut channel, 0x139c, 0);
+    program_three_d(&mut channel, 0x0124, 2);
+    program_three_d(&mut channel, 0x139c, 0xff);
+    let full = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
+    program_three_d(&mut channel, 0x0124, 3);
+    program_three_d(&mut channel, 0x139c, 0);
+    program_three_d(&mut channel, 0x0124, 1);
+    let plan = lower(full.operations()[0], &mut cache).unwrap();
+    assert!(plan.resource_creations().iter().any(|creation| matches!(
+        creation,
+        nixe_gpu::BackendResourceCreateInfo::Image { description, view: None, .. }
+            if description.dimension() == nixe_gpu::ImageDimension::Two
+                && description.extent().depth == 1
+                && description.array_layers() == 1
+    )));
+    assert!(matches!(
+        plan.submission().operations()[0].command(),
+        GpuCommand::Clear(nixe_gpu::ClearOperation::Image {
+            value: nixe_gpu::ClearValue::DepthStencil {
+                depth: 1.0,
+                stencil: 0x5a
+            },
+            ..
+        })
+    ));
+
+    // Once initialized, a partial spatial clear reuses the resident image.
+    program_three_d(&mut channel, 0x139c, 0xff);
+    program_three_d(&mut channel, 0x0e04, 960 << 16);
+    let partial = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
+    let partial_plan = lower(partial.operations()[0], &mut cache).unwrap();
+    assert!(partial_plan.resource_creations().is_empty());
+    assert!(matches!(
+        lower(
+            partial.operations()[0],
+            &mut MaxwellThreeDLoweringCache::default()
+        ),
+        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x51 })
+    ));
+
+    // Masked bit-preserving clears are still unsupported, even after the
+    // source contents have been materialized; never silently clear all bits.
+    for mask in [0, 0x7f] {
+        program_three_d(&mut channel, 0x139c, mask);
+        let masked = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
+        assert!(matches!(
+            lower(masked.operations()[0], &mut cache),
+            Err(MaxwellThreeDLoweringError::UnsupportedClearStencilMaskSemantics)
+        ));
+    }
+}
+
+#[test]
 fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes() {
+    for compression in [None, Some(0), Some(1)] {
+        check_depth_2cz_materialization(
+            0x16,
+            0x17,
+            MaxwellThreeDDepthStencilFormat::Stencil8Z24,
+            compression,
+        );
+    }
+}
+
+#[test]
+fn depth_2cz_kind_validation_rejects_other_packing_msaa_and_color_kinds() {
+    for (format, expected_kind) in [(0x16, 0x17), (0x14, 0x51)] {
+        for kind in [0x17, 0x51, 0x18, 0x52, 0xdb, 0xfe] {
+            let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+            let mut address_space = resource_address_space();
+            let mapping = map_resource(
+                &mut address_space,
+                allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                16,
+                kind,
+            );
+            let address = mapping.offset().get();
+            for compression in [None, Some(0), Some(1)] {
+                let mut channel = three_d_channel();
+                for (method, argument) in [
+                    (0x0fe0, (address >> 32) as u32),
+                    (0x0fe4, address as u32),
+                    (0x0fe8, format),
+                    (0x0fec, 0),
+                    (0x0ff0, 0x2000),
+                    (0x1228, 64),
+                    (0x122c, 32),
+                    (0x1230, 1),
+                    (0x1538, 1),
+                    (0x179c, 0),
+                    (0x15d0, 0),
+                ] {
+                    program_three_d(&mut channel, method, argument);
+                }
+                if let Some(compression) = compression {
+                    program_three_d(&mut channel, 0x19cc, compression);
+                }
+                let result = resolve_maxwell_three_d_resources(channel.three_d(), &address_space);
+                if kind == expected_kind || (kind == 0xfe && compression != Some(1)) {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    assert!(
+                        matches!(result,
+                            Err(MaxwellThreeDResourceError::UnsupportedKind {
+                                role: MaxwellThreeDResourceRole::DepthStencilTarget, expected, actual,
+                            }) if expected == expected_kind && actual == kind
+                        ),
+                        "format={format:x}, kind={kind:x}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn three_d_z24s8_2cz_full_clear_materializes_without_importing_compressed_bytes() {
+    for compression in [None, Some(0), Some(1)] {
+        check_depth_2cz_materialization(
+            0x14,
+            0x51,
+            MaxwellThreeDDepthStencilFormat::Z24Stencil8,
+            compression,
+        );
+    }
+}
+
+fn check_depth_2cz_materialization(
+    format: u32,
+    kind: u8,
+    guest_format: MaxwellThreeDDepthStencilFormat,
+    compression: Option<u32>,
+) {
     let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
     let mapping = map_resource(
@@ -560,7 +949,7 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap(),
         16,
-        0x17,
+        kind,
     );
     let address = mapping.offset().get();
     let mut channel = three_d_channel();
@@ -568,16 +957,15 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
     for (method, argument) in [
         (0x0fe0, (address >> 32) as u32),
         (0x0fe4, address as u32),
-        (0x0fe8, 0x16),
+        (0x0fe8, format),
         (0x0fec, 0),
         (0x0ff0, 0x2000),
         (0x1228, 64),
         (0x122c, 32),
-        (0x1230, 0x0001_0001),
+        (0x1230, 1),
         (0x1538, 1),
         (0x179c, 0),
         (0x15d0, 0),
-        (0x19cc, 1),
         (0x0d6c, 32 << 16),
         (0x0d70, 16 << 16),
         (0x0d90, 0x3f80_0000),
@@ -587,6 +975,13 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
         program_three_d(&mut channel, method, argument);
     }
 
+    if let Some(compression) = compression {
+        program_three_d(&mut channel, 0x19cc, compression);
+    }
+    // A discard is not initialization: the partial clear below must still
+    // reject an unmaterialized compressed attachment.
+    let discard = dispatch_method(&mut channel, 0x0f78 / 4, 1).unwrap();
+    assert!(discard.ordered_operations().is_empty());
     let partial_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
     let partial = &partial_dispatch.operations()[0];
     let partial_resources =
@@ -603,15 +998,16 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
             _ => None,
         })
         .expect("compressed depth/stencil target must resolve as an image");
-    assert_eq!(depth.guest_layout().pte_kind(), 0x17);
+    assert_eq!(depth.guest_layout().pte_kind(), kind);
     assert!(depth.guest_layout().requires_materialization());
+    assert!(!depth.guest_layout().has_direct_canonical_representation());
     assert_eq!(
         depth.description().format(),
         ImageFormat::Depth24UnormStencil8Uint
     );
     assert_eq!(
         depth.guest_format(),
-        MaxwellThreeDGuestImageFormat::DepthStencil(MaxwellThreeDDepthStencilFormat::Stencil8Z24)
+        MaxwellThreeDGuestImageFormat::DepthStencil(guest_format)
     );
 
     let capabilities = BackendCapabilities::new(
@@ -638,7 +1034,7 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x17 })
+        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
     ));
     // Disabling the clear rectangle selects the complete attachment. The
     // neutral image can therefore be initialized without decoding any 2CZ
@@ -671,6 +1067,16 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
     ));
     assert_eq!(plan.dirty_images(), &[0]);
 
+    // Discarding a resident image must not evict it or force compressed bytes
+    // to be imported on reuse. Capture a fresh partial clear after the discard.
+    let discard = dispatch_method(&mut channel, 0x0f78 / 4, 1).unwrap();
+    assert!(discard.ordered_operations().is_empty());
+    program_three_d(&mut channel, 0x10f8, 0x10);
+    let partial_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
+    let partial = &partial_dispatch.operations()[0];
+    let partial_resources =
+        resolve_maxwell_three_d_resources(partial.state(), &address_space).unwrap();
+
     // Once the complete clear has materialized the neutral image, later
     // partial operations reuse it instead of attempting to decode guest 2CZ.
     let partial_after_materialization = lower_maxwell_three_d_operation(
@@ -691,7 +1097,7 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
     );
 
     // Rebinding the same canonical depth pages through another GPU virtual
-    // mapping must retain the materialized backend texture. PTE kind 0x17 has
+    // mapping must retain the materialized backend texture. Neither 2CZ kind has
     // no directly importable canonical representation, so recreating the
     // texture here would lose its depth contents.
     let remapping = map_resource(
@@ -700,7 +1106,7 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap(),
         17,
-        0x17,
+        kind,
     );
     let remapped_address = remapping.offset().get();
     program_three_d(&mut channel, 0x0fe0, (remapped_address >> 32) as u32);
@@ -742,12 +1148,21 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x17 })
+        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
     ));
 }
 
 #[test]
 fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
+    check_draw_compressed_depth_aspects(0x16, 0x17);
+}
+
+#[test]
+fn z24s8_draw_consumes_only_the_materialized_depth_stencil_aspects() {
+    check_draw_compressed_depth_aspects(0x14, 0x51);
+}
+
+fn check_draw_compressed_depth_aspects(format: u32, kind: u8) {
     let vertex_allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
     let color_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let depth_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
@@ -778,7 +1193,7 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap(),
         63,
-        0x17,
+        kind,
     )
     .offset()
     .get();
@@ -790,12 +1205,12 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
         (0x121c, color_target_selection_raw(1, [0; 8])),
         (0x0fe0, (depth >> 32) as u32),
         (0x0fe4, depth as u32),
-        (0x0fe8, 0x16),
+        (0x0fe8, format),
         (0x0fec, 0),
         (0x0ff0, 0x2000),
         (0x1228, 64),
         (0x122c, 32),
-        (0x1230, 0x0001_0001),
+        (0x1230, 1),
         (0x1538, 1),
         (0x179c, 0),
         (0x19cc, 1),
@@ -877,7 +1292,7 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x17 })
+        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
     ));
 
     // textured_cube clears the complete depth aspect but deliberately leaves
@@ -939,7 +1354,7 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x17 })
+        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
     ));
 }
 
@@ -3295,6 +3710,88 @@ fn compute_wait_for_idle_is_an_ordered_neutral_operation() {
     assert_eq!(channel.compute(), &compute_before);
     assert_eq!(channel.three_d(), &three_d_before);
     assert_eq!(channel.two_d(), &two_d_before);
+}
+
+#[test]
+fn render_target_discard_is_a_validated_non_destructive_hint() {
+    let mut channel = three_d_channel();
+    use_mme_shadow_passthrough(&mut channel);
+    // Already-bound targets must not be unbound, cleared, or invalidated.
+    program_three_d(&mut channel, 0x0800, 5);
+    program_three_d(&mut channel, 0x0804, 0x0511_0000);
+    program_three_d(&mut channel, 0x0fe0, 5);
+    program_three_d(&mut channel, 0x0fe4, 0x0800_0000);
+    let before = channel.clone();
+    let draw = channel.three_d().draw_state_identity();
+    let shaders = channel.three_d().shader_state_identity();
+    let resources = channel
+        .three_d()
+        .resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false);
+    for color in 0..8 {
+        for depth_stencil in 0..2 {
+            let raw = (color << 4) | depth_stencil;
+            let dispatch = dispatch_method(&mut channel, 0x0f78 / 4, raw).unwrap();
+            assert!(dispatch.ordered_operations().is_empty());
+            let method = dispatch.methods()[0];
+            assert_eq!(method.metadata().method_name(), "DISCARD_RENDER_TARGET");
+            assert_eq!(method.method().source().argument(), raw);
+            assert_eq!(method.method().source().method(), GpuMethodId(0x0f78));
+            assert_eq!(channel, before);
+            assert!(draw.matches(channel.three_d()));
+            assert!(shaders.matches(channel.three_d()));
+            assert!(resources.matches(channel.three_d()));
+        }
+    }
+    for raw in [2, 4, 8, 0x80, 0x100, u32::MAX] {
+        assert!(matches!(
+            dispatch_method(&mut channel, 0x0f78 / 4, raw),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                defined_mask: 0x71,
+                ..
+            })
+        ));
+        assert_eq!(channel, before);
+    }
+}
+
+#[test]
+fn pixel_shader_barriers_preserve_source_and_do_not_mutate_draw_state() {
+    let mut channel = three_d_channel();
+    use_mme_shadow_passthrough(&mut channel);
+    let before = channel.clone();
+    let decoded = non_incrementing_packet_on_subchannel(0, 0x0de0 / 4, &[0, 1]);
+    let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
+    assert!(dispatch.operations().is_empty());
+    assert_eq!(dispatch.synchronization_operations().len(), 2);
+    for (index, operation) in dispatch.synchronization_operations().iter().enumerate() {
+        let expected = index != 0;
+        assert_eq!(
+            dispatch.methods()[index].metadata().method_name(),
+            "PIXEL_SHADER_BARRIER"
+        );
+        assert!(matches!(operation.trigger(),
+            MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier { system_memory_barrier, source }
+            if system_memory_barrier == expected && source.argument() == index as u32
+                && source.method() == GpuMethodId(0x0de0)));
+        assert_eq!(operation.state(), before.three_d());
+        for pending in [false, true] {
+            assert_eq!(
+                lower_maxwell_three_d_synchronization(operation, None, pending),
+                Ok(MaxwellThreeDSynchronizationPlan::PixelShaderBarrier {
+                    system_memory_barrier: expected
+                })
+            );
+        }
+    }
+    assert_eq!(channel, before);
+    for raw in [2, 3, 0x8000_0000, u32::MAX] {
+        assert!(
+            matches!(dispatch_first(&mut channel, &packet(0x0de0 / 4, raw)),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue { defined_mask: 1, source, .. })
+                if source.argument() == raw)
+        );
+        assert_eq!(channel, before);
+    }
 }
 
 #[test]

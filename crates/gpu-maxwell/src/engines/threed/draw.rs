@@ -621,7 +621,7 @@ struct ShaderTranslationSourceRecord {
     programs: Arc<[MaxwellTranslatedShaderProgram]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct ShaderStateRecord {
     state: super::MaxwellThreeDShaderStateIdentity,
     inputs: MaxwellShaderTranslationInputs,
@@ -1644,7 +1644,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             .vertex_input()
             .primitive()
             .active_begin()
-            .is_some_and(|begin| matches!(begin.topology(), 4..=6))
+            .is_some_and(|begin| matches!(begin.topology(), 4..=7))
         {
             if state.raster().polygon_smooth_enable().value() == Some(&true) {
                 return Err(MaxwellThreeDLoweringError::UnsupportedPolygonSmoothSemantics);
@@ -2293,7 +2293,7 @@ fn validate_line_rasterization_state(
         .active_begin()
         .map(|begin| begin.topology());
     let direct_line_primitive = topology.is_some_and(|topology| matches!(topology, 1 | 3));
-    let polygon_primitive = topology.is_some_and(|topology| matches!(topology, 4..=6));
+    let polygon_primitive = topology.is_some_and(|topology| matches!(topology, 4..=7));
     let polygon_line_mode = [
         MaxwellThreeDFixedFunctionRegister::FrontPolygonMode,
         MaxwellThreeDFixedFunctionRegister::BackPolygonMode,
@@ -2426,15 +2426,39 @@ fn depth_clear_fully_initializes(
     if !depth && !stencil {
         return Ok(false);
     }
-    let clear = state.render_targets().clear();
-    if clear
-        .surface_control()
-        .value()
-        .is_some_and(|control| stencil && control.respect_stencil_mask())
-    {
+    if stencil && !clear_stencil_mask_is_full(state)? {
         return Ok(false);
     }
     clear_fully_covers_image(state, image)
+}
+
+/// An enabled mask of 0xff still overwrites the entire eight-bit stencil
+/// aspect. Use the operation snapshot: deko3d restores SET_STENCIL_MASK via
+/// MME shadow replay immediately after issuing the clear.
+/// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+/// https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L470-L511
+fn clear_stencil_mask_is_full(
+    state: &MaxwellThreeDState,
+) -> Result<bool, MaxwellThreeDLoweringError> {
+    if !state
+        .render_targets()
+        .clear()
+        .surface_control()
+        .value()
+        .is_some_and(|control| control.respect_stencil_mask())
+    {
+        return Ok(true);
+    }
+    match state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::FrontStencilWriteMask)
+        .value()
+    {
+        Some(MaxwellThreeDFixedFunctionValue::Mask(mask)) => Ok(*mask == 0xff),
+        _ => Err(MaxwellThreeDLoweringError::IncompleteClear(
+            "SET_STENCIL_MASK",
+        )),
+    }
 }
 
 fn clear_fully_covers_image(
@@ -3393,8 +3417,7 @@ fn lower_clear(
     if surface.color_mask() == 0 && !surface.depth() && !surface.stencil() {
         return Err(MaxwellThreeDLoweringError::EmptyClearMask);
     }
-    let control = clear.surface_control().value().copied();
-    if surface.stencil() && control.is_some_and(|control| control.respect_stencil_mask()) {
+    if surface.stencil() && !clear_stencil_mask_is_full(state)? {
         return Err(MaxwellThreeDLoweringError::UnsupportedClearStencilMaskSemantics);
     }
     let regions = MaxwellThreeDClearRegions::from_state(state)?;
@@ -3996,6 +4019,9 @@ fn primitive_topology(
         4 => Ok(PrimitiveTopology::Triangles),
         5 => Ok(PrimitiveTopology::TriangleStrip),
         6 => Ok(PrimitiveTopology::TriangleFan),
+        // NVB197_BEGIN_OP_QUADS; keep primitive assembly backend-independent.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+        7 => Ok(PrimitiveTopology::Quads),
         14 => Ok(PrimitiveTopology::Patches),
         topology => Err(MaxwellThreeDLoweringError::UnsupportedTopology(topology)),
     }
@@ -4622,7 +4648,7 @@ impl Display for MaxwellThreeDLoweringError {
                 "MAXWELL_B enabled stencil testing has no neutral pipeline representation: two-sided={two_sided}"
             ),
             Self::UnsupportedClearStencilMaskSemantics => formatter.write_str(
-                "MAXWELL_B stencil-masked clear has no neutral backend representation",
+                "MAXWELL_B partial stencil write mask on clear has no neutral backend representation",
             ),
             Self::UnsupportedAliasedLineWidthSemantics => formatter.write_str(
                 "MAXWELL_B aliased line-width selection has no represented width register or host rasterization semantics",
@@ -5098,6 +5124,8 @@ mod tests {
         for instance in [0, 1, 2] {
             let begin = MaxwellThreeDBegin::parse(4 | (instance << 26)).unwrap();
             assert_eq!(primitive_topology(begin), Ok(PrimitiveTopology::Triangles));
+            let begin = MaxwellThreeDBegin::parse(7 | (instance << 26)).unwrap();
+            assert_eq!(primitive_topology(begin), Ok(PrimitiveTopology::Quads));
         }
     }
 

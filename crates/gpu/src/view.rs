@@ -283,17 +283,20 @@ fn validate_layout(
     let extent = description
         .mip_extent(subresources.mip_level)
         .ok_or(ImageViewError::SubresourcesOutOfBounds)?;
-    let bytes_per_texel = u64::from(
+    let bytes_per_block = u64::from(
         description
             .format()
-            .plane_bytes_per_texel(subresources.plane)
+            .plane_bytes_per_block(subresources.plane)
             .ok_or(ImageViewError::SubresourcesOutOfBounds)?,
     );
-    let minimum_row_pitch = u64::from(extent.width)
-        .checked_mul(bytes_per_texel)
+    let [block_width, block_height] = description.format().block_extent();
+    let block_columns = extent.width.div_ceil(block_width);
+    let block_rows = extent.height.div_ceil(block_height);
+    let minimum_row_pitch = u64::from(block_columns)
+        .checked_mul(bytes_per_block)
         .ok_or(ImageViewError::LayoutOverflow)?;
     let minimum_compact_layer_size = minimum_row_pitch
-        .checked_mul(u64::from(extent.height))
+        .checked_mul(u64::from(block_rows))
         .and_then(|size| size.checked_mul(u64::from(extent.depth)))
         .ok_or(ImageViewError::LayoutOverflow)?;
     let layer_count = u64::from(subresources.layer_count);
@@ -304,7 +307,7 @@ fn validate_layout(
             layer_stride,
         } => {
             let pitched_layer_size = row_pitch
-                .checked_mul(u64::from(extent.height))
+                .checked_mul(u64::from(block_rows))
                 .and_then(|size| size.checked_mul(u64::from(extent.depth)))
                 .ok_or(ImageViewError::LayoutOverflow)?;
             if row_pitch < minimum_row_pitch || layer_stride < pitched_layer_size {
@@ -587,6 +590,66 @@ mod tests {
             ),
             Err(ImageViewError::OverlappingCanonicalBytes)
         );
+    }
+
+    #[test]
+    fn compressed_layouts_count_blocks_including_small_mips() {
+        let description = ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent::new(8, 8, 1).unwrap(),
+            ImageFormat::Bc1RgbUnorm,
+            ImageKind::Color,
+            4,
+            1,
+            SampleCount::One,
+        )
+        .unwrap();
+        for (mip_level, row_pitch, layer_stride) in [(0, 16, 32), (1, 8, 8), (2, 8, 8), (3, 8, 8)] {
+            let range = ImageSubresourceRange {
+                plane: 0,
+                mip_level,
+                base_layer: 0,
+                layer_count: 1,
+            };
+            assert!(
+                super::validate_layout(
+                    description,
+                    range,
+                    ImageMemoryLayout::PitchLinear {
+                        row_pitch,
+                        layer_stride
+                    },
+                    layer_stride
+                )
+                .is_ok()
+            );
+            assert!(
+                super::validate_layout(
+                    description,
+                    range,
+                    ImageMemoryLayout::PitchLinear {
+                        row_pitch: row_pitch - 1,
+                        layer_stride
+                    },
+                    layer_stride
+                )
+                .is_err()
+            );
+            assert!(
+                super::validate_layout(
+                    description,
+                    range,
+                    ImageMemoryLayout::PitchLinear {
+                        row_pitch,
+                        layer_stride
+                    },
+                    layer_stride - 1
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(ImageFormat::Bc1RgbUnorm.plane_bytes_per_texel(0), None);
+        assert_eq!(ImageFormat::Bc1RgbUnorm.plane_bytes_per_block(1), None);
     }
 
     #[test]

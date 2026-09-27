@@ -38,6 +38,7 @@ use wgpu::{
     VertexFormat as WgpuVertexFormat, VertexState, VertexStepMode as WgpuVertexStepMode,
 };
 
+use crate::page_resources::{PageBinding, PageResources};
 use crate::{
     PIPELINE_CACHE_MAGIC, WgpuExecutionContext, WgpuQueueAccess, WgpuVisibilityCoordinator,
 };
@@ -196,7 +197,6 @@ struct ResourceRecord {
     host: Option<Resource>,
     content: Option<ResourceContent>,
     last_use: Option<ResourceUse>,
-    retired: bool,
     resident_bytes: u64,
 }
 
@@ -327,7 +327,7 @@ const UPLOAD_STAGING_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES_PER_SUBMISSION: u64 = MAX_RESIDENT_RESOURCE_BYTES;
 const MAX_DEVICE_WRITE_REGIONS: usize = 256;
 const MAX_RESIDENT_RESOURCE_COUNT: usize = 4_096;
-const MAX_RESIDENT_RESOURCE_BYTES: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_RESIDENT_RESOURCE_BYTES: u64 = 512 * 1024 * 1024;
 
 impl ResourceContent {
     fn new(info: &BackendResourceCreateInfo) -> Result<Option<Self>, BackendDriverError> {
@@ -507,6 +507,7 @@ struct RenderPipelineKey {
 
 struct CachedRenderPipeline {
     identity: PreparedPipelineIdentity,
+    opaque_textures: crate::texture_sampling::OpaqueTextureBindings,
     #[cfg(debug_assertions)]
     key: RenderPipelineKey,
     pipeline: RenderPipeline,
@@ -548,6 +549,7 @@ struct RenderPipelineLocation {
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
     fingerprint: u128,
+    opaque_textures: crate::texture_sampling::OpaqueTextureBindings,
 }
 
 #[derive(Clone)]
@@ -576,13 +578,13 @@ impl RenderPipelineCache {
         color_format: ImageFormat,
         depth_format: Option<ImageFormat>,
         draw: &DrawOperation,
-    ) -> Option<u128> {
+    ) -> Option<(u128, crate::texture_sampling::OpaqueTextureBindings)> {
         let current = self.current.as_ref()?;
         current
             .record
             .identity
             .matches(vertex, fragment, color_format, depth_format, draw)
-            .then_some(current.fingerprint)
+            .then_some((current.fingerprint, current.record.opaque_textures))
     }
 
     fn touch(&mut self, fingerprint: u128, last_used: u64) -> Option<(RenderPipeline, u64)> {
@@ -1017,6 +1019,10 @@ pub(crate) struct WgpuBackendDriver {
     queue_access: WgpuQueueAccess,
     visibility: Arc<WgpuVisibilityCoordinator>,
     resources: Vec<Option<WgpuResourceSlot>>,
+    // Logical slots may be reused as soon as the neutral resource is destroyed.
+    // Older generations still owning canonical bytes live outside that table.
+    retired_resources: HashMap<BackendResourceHandle, ResourceRecord>,
+    page_resources: PageResources,
     // One last writer per exact canonical range, not one entry per guest
     // resource incarnation. The prefix key keeps unrelated images out of the
     // bucket; exact range comparisons disambiguate shared-prefix mappings.
@@ -1038,6 +1044,7 @@ pub(crate) struct WgpuBackendDriver {
     vertex_pull_binding_key: Vec<(u32, BackendResourceHandle)>,
     draw_bind_groups: Vec<Vec<BindGroup>>,
     draw_pipelines: Vec<PreparedRenderPipeline>,
+    quad_indices: crate::quad_indices::QuadIndices,
     render_attachment_views: Vec<wgpu::TextureView>,
     uploaded_inputs: Vec<UploadMark>,
     upload_epoch: u64,
@@ -1093,6 +1100,8 @@ impl WgpuBackendDriver {
             queue_access,
             visibility,
             resources: Vec::new(),
+            retired_resources: HashMap::new(),
+            page_resources: PageResources::default(),
             presentation_images: HashMap::new(),
             presentation_imports: HashMap::new(),
             presentation_import_pipeline: None,
@@ -1111,6 +1120,7 @@ impl WgpuBackendDriver {
             vertex_pull_binding_key: Vec::new(),
             draw_bind_groups: Vec::new(),
             draw_pipelines: Vec::new(),
+            quad_indices: crate::quad_indices::QuadIndices::default(),
             render_attachment_views: Vec::new(),
             uploaded_inputs: Vec::new(),
             upload_epoch: 0,
@@ -1164,6 +1174,8 @@ impl WgpuBackendDriver {
 
     fn clear_owned_state(&mut self) {
         self.resources.clear();
+        self.retired_resources.clear();
+        self.page_resources.clear();
         self.presentation_images.clear();
         self.presentation_imports.clear();
         self.presentation_import_pipeline = None;
@@ -1178,6 +1190,7 @@ impl WgpuBackendDriver {
         self.vertex_pull_binding_key = Vec::new();
         self.draw_bind_groups = Vec::new();
         self.draw_pipelines = Vec::new();
+        self.quad_indices = crate::quad_indices::QuadIndices::default();
         self.render_attachment_views = Vec::new();
         self.readback_pool_bytes = 0;
         self.resident_resources = 0;
@@ -1536,15 +1549,17 @@ impl WgpuBackendDriver {
             let extent = description
                 .mip_extent(subresources.mip_level)
                 .ok_or_else(|| unsupported("invalid image upload mip"))?;
+            let [block_width, block_height] = description.format().block_extent();
+            let block_columns = extent.width.div_ceil(block_width);
+            let block_rows = extent.height.div_ceil(block_height);
             let bytes_per_texel = usize::from(
                 description
                     .format()
-                    .plane_bytes_per_texel(subresources.plane)
+                    .plane_bytes_per_block(subresources.plane)
                     .ok_or_else(|| unsupported("image plane format"))?,
             );
             let host_row_pitch = align_u32(
-                extent
-                    .width
+                block_columns
                     .checked_mul(u32::try_from(bytes_per_texel).unwrap())
                     .ok_or_else(|| unsupported("image upload row size"))?,
                 wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
@@ -1554,8 +1569,8 @@ impl WgpuBackendDriver {
                 &mut self.upload_linear,
                 binding.layout(),
                 ImageCopyShape {
-                    width: extent.width,
-                    height: extent.height,
+                    width: block_columns,
+                    height: block_rows,
                     layers: u32::from(subresources.layer_count),
                     bytes_per_texel,
                     host_row_pitch,
@@ -1578,11 +1593,11 @@ impl WgpuBackendDriver {
                 TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(host_row_pitch),
-                    rows_per_image: Some(extent.height),
+                    rows_per_image: Some(block_rows),
                 },
                 Extent3d {
-                    width: extent.width,
-                    height: extent.height,
+                    width: block_columns * block_width,
+                    height: block_rows * block_height,
                     depth_or_array_layers: u32::from(subresources.layer_count),
                 },
             )?;
@@ -2130,6 +2145,12 @@ impl WgpuBackendDriver {
         for (operation_index, operation) in operations[begin + 1..end].iter().enumerate() {
             let operation_index = begin + 1 + operation_index;
             if let GpuCommand::Draw(draw) = operation.command() {
+                if draw.prepared.topology == PrimitiveTopology::Quads {
+                    if draw.prepared.triangle_rasterization != TriangleRasterization::Fill {
+                        return Err(unsupported("non-fill quad rasterization"));
+                    }
+                    self.quad_indices.reserve(&self.device, draw.arguments)?;
+                }
                 let location = self.render_pipeline_location(
                     dependencies,
                     operation_index,
@@ -2251,6 +2272,20 @@ impl WgpuBackendDriver {
                         first_instance,
                         instance_count,
                     } => {
+                        if draw.prepared.topology == PrimitiveTopology::Quads {
+                            let (count, base) = crate::quad_indices::draw_indices(draw.arguments)?;
+                            pass.set_index_buffer(
+                                self.quad_indices.buffer().slice(..),
+                                IndexFormat::Uint32,
+                            );
+                            pass.draw_indexed(
+                                0..count,
+                                base,
+                                first_instance..first_instance + instance_count,
+                            );
+                            draw_index += 1;
+                            continue;
+                        }
                         let (first_vertex, vertex_count) =
                             match draw.prepared.triangle_rasterization {
                                 TriangleRasterization::Fill => (first_vertex, vertex_count),
@@ -2568,13 +2603,42 @@ impl WgpuBackendDriver {
             .iter()
             .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
             .map(|attachment| attachment.format);
-        let fingerprint = match self.resource(pipeline)? {
-            Resource::Pipeline { render, .. } => render
-                .current_fingerprint(vertex, fragment, color_format, depth_format, draw)
-                .unwrap_or_else(|| {
-                    render_pipeline_fingerprint(vertex, fragment, color_format, depth_format, draw)
-                }),
+        let cached = match self.resource(pipeline)? {
+            Resource::Pipeline { render, .. } => {
+                render.current_fingerprint(vertex, fragment, color_format, depth_format, draw)
+            }
             _ => return Err(kind_mismatch(pipeline)),
+        };
+        // Immutable prepared draws retain an O(1) pipeline fast path. Only a new
+        // descriptor table needs its image formats examined, not its contents.
+        let (fingerprint, opaque_textures) = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut opaque = crate::texture_sampling::OpaqueTextureBindings::default();
+            // Neutral shader resource bindings are all in group zero.
+            if let Some(table) = draw.prepared.descriptor_tables.first() {
+                let handle =
+                    dependency_handle(dependencies, ResourceDependency::DescriptorTable(*table))?;
+                let Resource::DescriptorTable { bindings, .. } = self.resource(handle)? else {
+                    return Err(kind_mismatch(handle));
+                };
+                for binding in bindings {
+                    if let ResourceDependency::Image(image) = binding.resource {
+                        let image_handle =
+                            dependency_handle(dependencies, ResourceDependency::Image(image))?;
+                        let Resource::Image { description, .. } = self.resource(image_handle)?
+                        else {
+                            return Err(kind_mismatch(image_handle));
+                        };
+                        if description.format().has_opaque_bc1_alpha() {
+                            opaque.insert(binding.binding);
+                        }
+                    }
+                }
+            }
+            let base =
+                render_pipeline_fingerprint(vertex, fragment, color_format, depth_format, draw);
+            (nixe_gpu::cache_fingerprint(&(base, opaque)), opaque)
         };
         Ok(RenderPipelineLocation {
             pipeline,
@@ -2583,6 +2647,7 @@ impl WgpuBackendDriver {
             color_format,
             depth_format,
             fingerprint,
+            opaque_textures,
         })
     }
 
@@ -2611,6 +2676,18 @@ impl WgpuBackendDriver {
                 return Err(kind_mismatch(pipeline_handle));
             };
             let cached = render.touch(fingerprint, cache_use);
+            if cached.is_some() {
+                let current = render
+                    .current
+                    .as_mut()
+                    .expect("touched pipeline is current");
+                debug_assert_eq!(current.record.opaque_textures, location.opaque_textures);
+                // Equivalent descriptor layouts can share a compiled pipeline.
+                // Remember the latest immutable draw for its next O(1) lookup.
+                if !Arc::ptr_eq(&current.record.identity.draw, &draw.prepared) {
+                    current.record.identity.draw = Arc::clone(&draw.prepared);
+                }
+            }
             #[cfg(debug_assertions)]
             if cached.is_some()
                 && let Some(cached) = render.current_record()
@@ -2640,7 +2717,7 @@ impl WgpuBackendDriver {
         );
         let (_, vertex, vertex_ir) =
             self.shader_for_stage(dependencies, operation, ShaderStage::Vertex)?;
-        let (_, fragment, _) =
+        let (_, fragment, fragment_ir) =
             self.shader_for_stage(dependencies, operation, ShaderStage::Fragment)?;
         let color_format = location.color_format;
         let depth_format = location.depth_format;
@@ -2737,12 +2814,22 @@ impl WgpuBackendDriver {
                 })
             })
             .collect::<Vec<_>>();
-        let alpha_constants = draw.prepared.alpha_test.map(|test| {
-            [(
-                "nixe_alpha_reference",
+        let vertex_constants = location.opaque_textures.constants(&vertex_ir);
+        let mut fragment_constants = location.opaque_textures.constants(&fragment_ir);
+        if let Some(test) = draw.prepared.alpha_test {
+            fragment_constants.push((
+                "nixe_alpha_reference".to_owned(),
                 f64::from(f32::from_bits(test.reference_bits)),
-            )]
-        });
+            ));
+        }
+        let vertex_constants = vertex_constants
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect::<Vec<_>>();
+        let fragment_constants = fragment_constants
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect::<Vec<_>>();
         let pipeline = self
             .device
             .create_render_pipeline(&RenderPipelineDescriptor {
@@ -2754,7 +2841,10 @@ impl WgpuBackendDriver {
                         uses_vertex_pulling,
                         draw.prepared.triangle_rasterization,
                     )),
-                    compilation_options: PipelineCompilationOptions::default(),
+                    compilation_options: PipelineCompilationOptions {
+                        constants: &vertex_constants,
+                        ..PipelineCompilationOptions::default()
+                    },
                     buffers: &vertex_buffers,
                 },
                 primitive: PrimitiveState {
@@ -2772,7 +2862,7 @@ impl WgpuBackendDriver {
                     module: &fragment,
                     entry_point: Some(alpha_test_entry_point(draw.prepared.alpha_test)),
                     compilation_options: PipelineCompilationOptions {
-                        constants: alpha_constants.as_ref().map_or(&[], |values| values),
+                        constants: &fragment_constants,
                         ..PipelineCompilationOptions::default()
                     },
                     targets: &targets,
@@ -2796,6 +2886,7 @@ impl WgpuBackendDriver {
         let evicted = render.insert(
             fingerprint,
             CachedRenderPipeline {
+                opaque_textures: location.opaque_textures,
                 identity: PreparedPipelineIdentity {
                     draw: Arc::clone(&draw.prepared),
                     vertex: vertex_handle,
@@ -2913,13 +3004,16 @@ impl WgpuBackendDriver {
         let extent = description
             .mip_extent(subresources.mip_level)
             .ok_or_else(|| unsupported("invalid image writeback mip"))?;
+        let [block_width, block_height] = description.format().block_extent();
+        let block_columns = extent.width.div_ceil(block_width);
+        let block_rows = extent.height.div_ceil(block_height);
         let bytes_per_texel = usize::from(
             description
                 .format()
-                .plane_bytes_per_texel(subresources.plane)
+                .plane_bytes_per_block(subresources.plane)
                 .ok_or_else(|| unsupported("image plane format"))?,
         );
-        let width_bytes = usize::try_from(extent.width)
+        let width_bytes = usize::try_from(block_columns)
             .ok()
             .and_then(|width| width.checked_mul(bytes_per_texel))
             .ok_or_else(|| unsupported("image row size overflow"))?;
@@ -2929,7 +3023,7 @@ impl WgpuBackendDriver {
         )?;
         let layers = u32::from(subresources.layer_count);
         let size = u64::from(host_row_pitch)
-            .checked_mul(u64::from(extent.height))
+            .checked_mul(u64::from(block_rows))
             .and_then(|value| value.checked_mul(u64::from(layers)))
             .ok_or_else(|| unsupported("image writeback size overflow"))?;
         let staging = self.take_readback_buffer(size, "Nixe image readback");
@@ -2949,12 +3043,12 @@ impl WgpuBackendDriver {
                 layout: TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(host_row_pitch),
-                    rows_per_image: Some(extent.height),
+                    rows_per_image: Some(block_rows),
                 },
             },
             Extent3d {
-                width: extent.width,
-                height: extent.height,
+                width: block_columns * block_width,
+                height: block_rows * block_height,
                 depth_or_array_layers: layers,
             },
         );
@@ -2964,8 +3058,8 @@ impl WgpuBackendDriver {
             host_row_pitch,
             canonical_layout: binding.layout(),
             bytes_per_texel,
-            width: extent.width,
-            height: extent.height,
+            width: block_columns,
+            height: block_rows,
             depth_or_layers: layers,
         });
         Ok(())
@@ -3147,6 +3241,7 @@ impl WgpuBackendDriver {
             .and_then(Option::as_ref)
             .filter(|slot| slot.handle == handle)
             .map(|slot| &slot.record)
+            .or_else(|| self.retired_resources.get(&handle))
             .ok_or_else(|| missing(handle))
     }
 
@@ -3160,6 +3255,7 @@ impl WgpuBackendDriver {
             .and_then(Option::as_mut)
             .filter(|slot| slot.handle == handle)
             .map(|slot| &mut slot.record)
+            .or_else(|| self.retired_resources.get_mut(&handle))
             .ok_or_else(|| missing(handle))
     }
 
@@ -3222,14 +3318,20 @@ impl WgpuBackendDriver {
 
     fn remove_resource_record(&mut self, handle: BackendResourceHandle) -> Option<ResourceRecord> {
         let index = usize::try_from(handle.slot()).ok()?;
-        let slot = self.resources.get_mut(index)?.as_ref()?;
-        if slot.handle != handle {
-            return None;
-        }
-        let record = self.resources[index]
-            .take()
-            .expect("validated WGPU resource slot")
-            .record;
+        let record = if self
+            .resources
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|slot| slot.handle == handle)
+        {
+            self.resources[index]
+                .take()
+                .expect("validated WGPU resource slot")
+                .record
+        } else {
+            self.retired_resources.remove(&handle)?
+        };
+        self.page_resources.remove(handle, &record.immutable);
         if let Some(shape) = presentation_image_key(&record.immutable)
             && let Some(handles) = self.presentation_images.get_mut(&shape)
         {
@@ -3716,8 +3818,9 @@ impl WgpuBackendDriver {
         retain_mirror: bool,
     ) -> Result<Box<[u8]>, BackendDriverError> {
         let mut demanded = Vec::new();
-        for slot in self.resources.iter().flatten() {
-            collect_demanded_writebacks(slot.handle, &slot.record, request.page, &mut demanded)?;
+        for candidate in self.page_resources.get(request.page) {
+            let record = self.resource_record(candidate.handle)?;
+            collect_demanded_writebacks(candidate.handle, record, candidate.binding, &mut demanded);
         }
         prepare_demanded_writebacks(&mut demanded);
         if !demanded.is_empty() {
@@ -3775,23 +3878,16 @@ impl WgpuBackendDriver {
                         .map_err(|error| BackendDriverError::failure(error.to_string()))?;
                 }
             }
-            let mut retired = Vec::new();
             for writeback in demanded {
                 let handle = writeback.handle();
-                if !retired.contains(&handle)
-                    && self.resource_record(handle).is_ok_and(|record| {
-                        record.retired
-                            && record
-                                .content
-                                .as_ref()
-                                .is_none_or(|content| !content.has_device_writes())
-                    })
-                {
-                    retired.push(handle);
+                if self.retired_resources.get(&handle).is_some_and(|record| {
+                    record
+                        .content
+                        .as_ref()
+                        .is_none_or(|content| !content.has_device_writes())
+                }) {
+                    self.remove_resource_record(handle);
                 }
-            }
-            for handle in retired {
-                self.remove_resource_record(handle);
             }
         }
         // The neutral visibility contract is currently page-conservative. If
@@ -3808,6 +3904,88 @@ impl WgpuBackendDriver {
         }
         .map_err(|error| BackendDriverError::failure(error.to_string()))
     }
+
+    fn reclaim_cleared_retired_images(
+        &mut self,
+        handle: BackendResourceHandle,
+        target: ImageRegion,
+    ) -> Result<(), BackendDriverError> {
+        if self.retired_resources.is_empty() {
+            return Ok(());
+        }
+        let record = self.resource_record(handle)?;
+        let BackendResourceCreateInfo::Image {
+            description,
+            view: Some(view),
+            ..
+        } = &record.immutable
+        else {
+            return Ok(());
+        };
+        if !image_region_is_full(*description, target)? {
+            return Ok(());
+        }
+        let mut superseded = Vec::new();
+        for binding in view.bindings() {
+            if binding.subresources() != target.subresources {
+                continue;
+            }
+            let Some(first) = binding.backing().range().segments().first() else {
+                continue;
+            };
+            for candidate in self.page_resources.get(first.page()) {
+                let PageBinding::Image {
+                    binding: old_binding,
+                } = candidate.binding
+                else {
+                    continue;
+                };
+                let Some(old) = self.retired_resources.get(&candidate.handle) else {
+                    continue;
+                };
+                let BackendResourceCreateInfo::Image {
+                    description: old_description,
+                    view: Some(old_view),
+                    ..
+                } = &old.immutable
+                else {
+                    continue;
+                };
+                let old_binding_view = &old_view.bindings()[old_binding];
+                // Only identical complete color storage domains are replaced.
+                // Partial clears, other aspects and differing layouts retain
+                // their old authority until an exact transfer is available.
+                if description == old_description
+                    && binding.subresources() == old_binding_view.subresources()
+                    && binding.layout() == old_binding_view.layout()
+                    && canonical_ranges_match(
+                        binding.backing().range(),
+                        old_binding_view.backing().range(),
+                    )
+                {
+                    superseded.push((candidate.handle, old_binding));
+                }
+            }
+        }
+        for (old, binding) in superseded {
+            let Some(record) = self.retired_resources.get_mut(&old) else {
+                continue;
+            };
+            if let Some(content) = record.content.as_mut() {
+                content
+                    .device_writes
+                    .retain(|write| write.region != DeviceWriteRegion::ImageBinding(binding));
+            }
+            if record
+                .content
+                .as_ref()
+                .is_none_or(|content| !content.has_device_writes())
+            {
+                self.remove_resource_record(old);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl BackendDriver for WgpuBackendDriver {
@@ -3817,6 +3995,16 @@ impl BackendDriver for WgpuBackendDriver {
         info: &BackendResourceCreateInfo,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
+        if let BackendResourceCreateInfo::Image { description, .. } = info {
+            let [bw, bh] = description.format().block_extent();
+            if !description.extent().width.is_multiple_of(bw)
+                || !description.extent().height.is_multiple_of(bh)
+            {
+                return Err(unsupported(
+                    "compressed base image extent is not block-aligned",
+                ));
+            }
+        }
         if let BackendResourceCreateInfo::Image {
             view: Some(view), ..
         } = info
@@ -3869,10 +4057,10 @@ impl BackendDriver for WgpuBackendDriver {
                 immutable: info.clone(),
                 host: Some(resource),
                 last_use: None,
-                retired: false,
                 resident_bytes,
             },
         });
+        self.page_resources.insert(handle, info);
         self.resident_resources += 1;
         self.resident_resource_bytes = self
             .resident_resource_bytes
@@ -3901,15 +4089,19 @@ impl BackendDriver for WgpuBackendDriver {
                 self.remove_presentation_import(key);
             }
         }
-        if let Ok(record) = self.resource_record_mut(handle) {
-            record.retired = true;
-            if record
-                .content
-                .as_ref()
-                .is_some_and(ResourceContent::has_device_writes)
-            {
-                return Ok(());
-            }
+        if let Some(slot) = self.resources.get_mut(handle.slot() as usize)
+            && slot.as_ref().is_some_and(|slot| {
+                slot.handle == handle
+                    && slot
+                        .record
+                        .content
+                        .as_ref()
+                        .is_some_and(ResourceContent::has_device_writes)
+            })
+        {
+            let record = slot.take().expect("validated WGPU resource slot").record;
+            self.retired_resources.insert(handle, record);
+            return Ok(());
         }
         self.remove_resource_record(handle);
         Ok(())
@@ -3967,6 +4159,16 @@ impl BackendDriver for WgpuBackendDriver {
                     record_device_write(record, access.target(), use_serial)?;
                 }
                 self.index_presentable_image(handle, access.target());
+            }
+            if let GpuCommand::Clear(ClearOperation::Image {
+                target,
+                value: ClearValue::Color(_),
+                ..
+            }) = operation.command()
+            {
+                let handle =
+                    dependency_handle(dependencies, ResourceDependency::Image(target.image))?;
+                self.reclaim_cleared_retired_images(handle, *target)?;
             }
         }
         Ok(())
@@ -4132,6 +4334,8 @@ fn webgpu_viewport(transform: ViewportTransform) -> Result<WebGpuViewport, Backe
 
 pub(crate) const fn texture_format(format: ImageFormat) -> Option<TextureFormat> {
     Some(match format {
+        ImageFormat::Bc1RgbUnorm | ImageFormat::Bc1RgbaUnorm => TextureFormat::Bc1RgbaUnorm,
+        ImageFormat::Bc1RgbSrgb | ImageFormat::Bc1RgbaSrgb => TextureFormat::Bc1RgbaUnormSrgb,
         ImageFormat::R8Unorm => TextureFormat::R8Unorm,
         ImageFormat::Rg8Unorm => TextureFormat::Rg8Unorm,
         ImageFormat::Rgba8Unorm => TextureFormat::Rgba8Unorm,
@@ -4198,7 +4402,9 @@ fn image_texture_plan(
 }
 
 pub(crate) fn required_texture_usages(format: ImageFormat) -> TextureUsages {
-    if format == ImageFormat::Depth24UnormStencil8Uint {
+    if format.block_extent() != [1, 1] {
+        TextureUsages::COPY_SRC | TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING
+    } else if format == ImageFormat::Depth24UnormStencil8Uint {
         TextureUsages::RENDER_ATTACHMENT
     } else {
         TextureUsages::COPY_SRC
@@ -4272,6 +4478,7 @@ fn primitive_topology(
         PrimitiveTopology::Lines => wgpu::PrimitiveTopology::LineList,
         PrimitiveTopology::LineStrip => wgpu::PrimitiveTopology::LineStrip,
         PrimitiveTopology::Triangles => wgpu::PrimitiveTopology::TriangleList,
+        PrimitiveTopology::Quads => wgpu::PrimitiveTopology::TriangleList,
         PrimitiveTopology::TriangleStrip => wgpu::PrimitiveTopology::TriangleStrip,
         PrimitiveTopology::TriangleFan => return Err(unsupported("triangle fan topology")),
         PrimitiveTopology::Patches => return Err(unsupported("patch topology")),
@@ -4583,57 +4790,41 @@ fn capture_cpu_writes(
 fn collect_demanded_writebacks(
     handle: BackendResourceHandle,
     record: &ResourceRecord,
-    page: CanonicalPageId,
+    binding: PageBinding,
     output: &mut Vec<DemandedWriteback>,
-) -> Result<(), BackendDriverError> {
+) {
     let Some(content) = record.content.as_ref() else {
-        return Ok(());
+        return;
     };
-    match &record.immutable {
-        BackendResourceCreateInfo::Buffer {
-            view: Some(view), ..
+    match binding {
+        PageBinding::Buffer {
+            offset,
+            page_offset,
+            size,
         } => {
             for write in &content.device_writes {
                 let DeviceWriteRegion::Buffer(dirty) = write.region else {
                     continue;
                 };
                 let dirty_end = dirty.offset + dirty.size;
-                let mut logical_offset = 0_u64;
-                for segment in view.backing().range().segments() {
-                    let segment_end = logical_offset + segment.size();
-                    if segment.page() == page {
-                        let start = dirty.offset.max(logical_offset);
-                        let end = dirty_end.min(segment_end);
-                        if start < end {
-                            output.push(DemandedWriteback::Buffer(DemandedBufferWriteback {
-                                handle,
-                                serial: write.serial,
-                                range: TransferRange {
-                                    offset: start,
-                                    size: end - start,
-                                },
-                                page_offset: segment.offset() + start - logical_offset,
-                            }));
-                        }
-                    }
-                    logical_offset = segment_end;
+                let start = dirty.offset.max(offset);
+                let end = dirty_end.min(offset + size);
+                if start < end {
+                    output.push(DemandedWriteback::Buffer(DemandedBufferWriteback {
+                        handle,
+                        serial: write.serial,
+                        range: TransferRange {
+                            offset: start,
+                            size: end - start,
+                        },
+                        page_offset: page_offset + start - offset,
+                    }));
                 }
             }
         }
-        BackendResourceCreateInfo::Image {
-            view: Some(view), ..
-        } => {
+        PageBinding::Image { binding } => {
             for write in &content.device_writes {
-                let DeviceWriteRegion::ImageBinding(binding) = write.region else {
-                    continue;
-                };
-                if view.bindings()[binding]
-                    .backing()
-                    .range()
-                    .segments()
-                    .iter()
-                    .any(|segment| segment.page() == page)
-                {
+                if write.region == DeviceWriteRegion::ImageBinding(binding) {
                     output.push(DemandedWriteback::Image {
                         handle,
                         binding,
@@ -4642,9 +4833,7 @@ fn collect_demanded_writebacks(
                 }
             }
         }
-        _ => {}
     }
-    Ok(())
 }
 
 fn coalesce_demanded_buffer_writebacks(writebacks: &mut Vec<DemandedWriteback>) {
@@ -4756,18 +4945,18 @@ fn estimated_resident_bytes(info: &BackendResourceCreateInfo) -> Result<u64, Bac
     match info {
         BackendResourceCreateInfo::Buffer { description, .. } => Ok(description.size()),
         BackendResourceCreateInfo::Image { description, .. } => {
-            let bytes_per_texel =
+            let bytes_per_block =
                 (0..description.format().plane_count()).try_fold(0_u64, |total, plane| {
                     total
                         .checked_add(u64::from(
                             description
                                 .format()
-                                .plane_bytes_per_texel(plane)
+                                .plane_bytes_per_block(plane)
                                 .ok_or_else(|| unsupported("image plane format"))?,
                         ))
                         .ok_or_else(|| unsupported("image residency size overflow"))
                 })?;
-            let mut texels = 0_u64;
+            let mut blocks = 0_u64;
             for mip in 0..description.mip_levels() {
                 let extent = description
                     .mip_extent(mip)
@@ -4776,17 +4965,18 @@ fn estimated_resident_bytes(info: &BackendResourceCreateInfo) -> Result<u64, Bac
                     ImageDimension::Three => 1,
                     _ => u64::from(description.array_layers()),
                 };
-                let mip_texels = u64::from(extent.width)
-                    .checked_mul(u64::from(extent.height))
+                let [bw, bh] = description.format().block_extent();
+                let mip_blocks = u64::from(extent.width.div_ceil(bw))
+                    .checked_mul(u64::from(extent.height.div_ceil(bh)))
                     .and_then(|value| value.checked_mul(u64::from(extent.depth)))
                     .and_then(|value| value.checked_mul(layers))
                     .ok_or_else(|| unsupported("image residency size overflow"))?;
-                texels = texels
-                    .checked_add(mip_texels)
+                blocks = blocks
+                    .checked_add(mip_blocks)
                     .ok_or_else(|| unsupported("image residency size overflow"))?;
             }
-            texels
-                .checked_mul(bytes_per_texel)
+            blocks
+                .checked_mul(bytes_per_block)
                 .and_then(|value| value.checked_mul(description.samples() as u64))
                 .ok_or_else(|| unsupported("image residency size overflow"))
         }
@@ -4799,6 +4989,8 @@ fn estimated_resident_bytes(info: &BackendResourceCreateInfo) -> Result<u64, Bac
 
 #[derive(Clone, Copy)]
 struct ImageCopyShape {
+    // Storage-element counts: texels for uncompressed formats, compression
+    // blocks for BC formats. Layout swizzling addresses bytes, not pixels.
     width: u32,
     height: u32,
     layers: u32,
@@ -5062,7 +5254,7 @@ fn address_mode(mode: nixe_gpu::AddressMode) -> wgpu::AddressMode {
     }
 }
 
-fn unsupported(semantic: &str) -> BackendDriverError {
+pub(super) fn unsupported(semantic: &str) -> BackendDriverError {
     BackendDriverError::failure(format!(
         "wgpu backend cannot represent neutral semantic: {semantic}"
     ))
@@ -5078,6 +5270,9 @@ fn kind_mismatch(handle: BackendResourceHandle) -> BackendDriverError {
 
 #[cfg(test)]
 mod clear_tests;
+
+#[cfg(test)]
+mod resource_lifetime_tests;
 
 #[cfg(test)]
 mod tests {

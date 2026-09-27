@@ -24,8 +24,8 @@ impl Translator<'_> {
             Instruction::ScalarFloatAdd(_) => self.fp_add(pc, instruction, flags),
             Instruction::ScalarFloatDivide(_) => self.fp_divide(pc, instruction, flags),
             Instruction::VectorFloatDivide(_) => self.vector_fp_divide(pc, instruction, flags),
-            Instruction::VectorFloatMultiplyElement(_) => {
-                self.vector_fp_multiply_element(pc, instruction, flags)
+            Instruction::VectorFloatMultiply(_) | Instruction::VectorFloatMultiplyElement(_) => {
+                self.vector_fp_multiply(pc, instruction, flags)
             }
             Instruction::ScalarFloatMultiply(_) => self.fp_multiply(pc, instruction, flags),
             Instruction::ScalarFloatFusedMultiplyAdd(_) => self.fp_fused(pc, instruction, flags),
@@ -216,34 +216,31 @@ impl Translator<'_> {
         Ok(false)
     }
 
-    fn vector_fp_multiply_element(
+    fn vector_fp_multiply(
         &mut self,
         pc: GuestVirtualAddress,
         instruction: Instruction,
         flags: &mut LazyFlags<ir::Value>,
     ) -> Result<bool, Error> {
         let f = instruction.operands();
+        let lane = matches!(instruction, Instruction::VectorFloatMultiplyElement(_))
+            .then_some(f.fp_element_lane);
         let lane_bits = scalar_width(f.opc)?;
         let vector_bits = if f.vector_128 { 128 } else { 64 };
         let first = self.read_vector(f.rn)?;
         let second = self.read_vector(f.rm)?;
-        let (first, second) = self.fp_vector_multiply_element_operands(
-            first,
-            second,
-            lane_bits,
-            vector_bits,
-            f.fp_element_lane,
-        );
+        let (first, second) =
+            self.fp_vector_multiply_operands(first, second, lane_bits, vector_bits, lane);
         let direct = self.fp_vector_multiply_domain(first, second, lane_bits, self.abi);
         self.native_fp_path(
             pc,
-            EdgeKind::VectorFpMultiplyElement(crate::abi::VectorFpMultiplyElementOperation {
+            EdgeKind::VectorFpMultiply(crate::abi::VectorFpMultiplyOperation {
                 rn: f.rn,
                 rm: f.rm,
                 rd: f.rd,
                 lane_64: lane_bits == 64,
                 vector_128: f.vector_128,
-                lane: f.fp_element_lane,
+                lane,
             }),
             direct,
             flags,
@@ -251,13 +248,8 @@ impl Translator<'_> {
         // Re-read operands after activation establishes fresh SSA inputs.
         let first = self.read_vector(f.rn)?;
         let second = self.read_vector(f.rm)?;
-        let (first, second) = self.fp_vector_multiply_element_operands(
-            first,
-            second,
-            lane_bits,
-            vector_bits,
-            f.fp_element_lane,
-        );
+        let (first, second) =
+            self.fp_vector_multiply_operands(first, second, lane_bits, vector_bits, lane);
         let result = self.fp_vector_multiply_value(first, second, lane_bits, vector_bits);
         self.write_vector(f.rd, result);
         Ok(false)
@@ -288,12 +280,12 @@ impl Translator<'_> {
         let first = self.read_vector(f.rn)?;
         let second = self.read_vector(f.rm)?;
         let third = self.read_vector(f.rd)?;
-        let (first, second) = self.fp_vector_multiply_element_operands(
+        let (first, second) = self.fp_vector_multiply_operands(
             first,
             second,
             lane_bits,
             vector_bits,
-            f.fp_element_lane,
+            Some(f.fp_element_lane),
         );
         let third = self.mask_vector(third, vector_bits);
         let ty = self.builder.func.dfg.value_type(first);
@@ -304,12 +296,12 @@ impl Translator<'_> {
         let first = self.read_vector(f.rn)?;
         let second = self.read_vector(f.rm)?;
         let third = self.read_vector(f.rd)?;
-        let (first, second) = self.fp_vector_multiply_element_operands(
+        let (first, second) = self.fp_vector_multiply_operands(
             first,
             second,
             lane_bits,
             vector_bits,
-            f.fp_element_lane,
+            Some(f.fp_element_lane),
         );
         let third = self.mask_vector(third, vector_bits);
         let ty = if lane_bits == 32 {
