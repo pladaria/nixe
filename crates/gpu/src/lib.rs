@@ -78,7 +78,8 @@ pub use shader::{
     ShaderPredicateSetOperation, ShaderRegister, ShaderResourceAccess, ShaderResourceKind,
     ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderSpecialFunction,
     ShaderTextureSampleOutput, ShaderVerificationError, VerifiedShaderIr, evaluate_shader_ir,
-    lower_shader_ir_to_wgsl, lower_shader_ir_to_wgsl_with_vertex_pulling,
+    lower_shader_ir_to_wgsl, lower_shader_ir_to_wgsl_with_quad_flat_attributes,
+    lower_shader_ir_to_wgsl_with_vertex_pulling,
 };
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,

@@ -376,6 +376,7 @@ fn requested_device_features(adapter_features: wgpu::Features) -> wgpu::Features
     adapter_features
         & (wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::PIPELINE_CACHE
+            | wgpu::Features::IMMEDIATES
             | wgpu::Features::TEXTURE_COMPRESSION_BC)
 }
 

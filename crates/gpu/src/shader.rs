@@ -6,7 +6,9 @@
 
 use std::{collections::BTreeSet, fmt::Display, sync::Arc};
 
-use crate::{ShaderStage, VertexBufferLayout, VertexComponentWidth, VertexStepMode};
+use crate::{ShaderStage, VertexBufferLayout, VertexStepMode};
+
+mod vertex_fetch;
 
 /// Stable location within the original guest shader byte stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1286,7 +1288,7 @@ struct InterfaceGroup {
 pub fn lower_shader_ir_to_wgsl(
     shader: &VerifiedShaderIr,
 ) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
-    lower_shader_ir_to_wgsl_impl(shader, None)
+    lower_shader_ir_to_wgsl_impl(shader, None, false)
 }
 
 /// Lowers a vertex shader with exact storage-buffer fetches for input formats
@@ -1296,12 +1298,25 @@ pub fn lower_shader_ir_to_wgsl_with_vertex_pulling(
     layouts: &[VertexBufferLayout],
     bind_group: u32,
 ) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
-    lower_shader_ir_to_wgsl_impl(shader, Some((layouts, bind_group)))
+    lower_shader_ir_to_wgsl_impl(shader, Some((layouts, bind_group)), false)
+}
+
+/// Lowers non-indexed quads with last-vertex constant attributes. All inputs
+/// are fetched from storage so the first corner can also evaluate the last
+/// corner's outputs. The host supplies the draw's first vertex as a u32
+/// immediate and uses triangles (0, 1, 2), (0, 2, 3).
+pub fn lower_shader_ir_to_wgsl_with_quad_flat_attributes(
+    shader: &VerifiedShaderIr,
+    layouts: &[VertexBufferLayout],
+    bind_group: u32,
+) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
+    lower_shader_ir_to_wgsl_impl(shader, Some((layouts, bind_group)), true)
 }
 
 fn lower_shader_ir_to_wgsl_impl(
     shader: &VerifiedShaderIr,
     vertex_pulling: Option<(&[VertexBufferLayout], u32)>,
+    quad_flat: bool,
 ) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
     let ir = shader.ir();
     if !matches!(ir.stage, ShaderStage::Vertex | ShaderStage::Fragment) {
@@ -1322,7 +1337,7 @@ fn lower_shader_ir_to_wgsl_impl(
                     && layout
                         .attributes
                         .iter()
-                        .any(|attribute| attribute.format.requires_vertex_pulling())
+                        .any(|attribute| quad_flat || attribute.format.requires_vertex_pulling())
             })
         }) {
             input_groups
@@ -1338,7 +1353,7 @@ fn lower_shader_ir_to_wgsl_impl(
     let mut source = String::new();
     emit_wgsl_resources(&mut source, ir)?;
     if let Some((layouts, bind_group)) = vertex_pulling {
-        emit_wgsl_vertex_pull_resources(&mut source, layouts, bind_group);
+        emit_wgsl_vertex_pull_resources(&mut source, layouts, bind_group, quad_flat);
     }
     source.push_str(
         "fn nixe_flush_denormal(bits: u32) -> u32 {\n\
@@ -1433,7 +1448,11 @@ fn lower_shader_ir_to_wgsl_impl(
             &input_groups,
             layouts,
             supports_fill_rectangle,
+            quad_flat,
         )?;
+        if quad_flat {
+            vertex_fetch::emit_quad_flat_entry_point(&mut source, &output_groups);
+        }
     }
     Ok(ShaderBackendModule(Arc::new(ShaderBackendModuleInner {
         source: source.into_boxed_str(),
@@ -1445,12 +1464,13 @@ fn emit_wgsl_vertex_pull_resources(
     source: &mut String,
     layouts: &[VertexBufferLayout],
     bind_group: u32,
+    pull_all: bool,
 ) {
     for (slot, layout) in layouts.iter().enumerate() {
         if !layout
             .attributes
             .iter()
-            .any(|attribute| attribute.format.requires_vertex_pulling())
+            .any(|attribute| pull_all || attribute.format.requires_vertex_pulling())
         {
             continue;
         }
@@ -1477,11 +1497,12 @@ fn emit_wgsl_vertex_pull_entry_points(
     inputs: &std::collections::BTreeMap<ShaderIoLocation, InterfaceGroup>,
     layouts: &[VertexBufferLayout],
     supports_fill_rectangle: bool,
+    pull_all: bool,
 ) -> Result<(), ShaderBackendLoweringError> {
     let mut pulled = std::collections::BTreeMap::new();
     for (slot, layout) in layouts.iter().enumerate() {
         for attribute in &layout.attributes {
-            if attribute.format.requires_vertex_pulling() {
+            if pull_all || attribute.format.requires_vertex_pulling() {
                 pulled.insert(attribute.shader_location, (slot, layout, attribute));
             }
         }
@@ -1513,88 +1534,7 @@ fn emit_wgsl_vertex_pull_entry_points(
             source.push_str(&format!("  input.{field} = host.{field};\n"));
             continue;
         };
-        let scaled = attribute.format.scaled_layout();
-        let integer = attribute.format.integer_layout();
-        let (signed, width, stored_components) = scaled
-            .or(integer)
-            .expect("pulled attributes have an explicit storage layout");
-        let expected_type = if scaled.is_some() {
-            ShaderScalarType::Float32
-        } else if signed {
-            ShaderScalarType::Signed32
-        } else {
-            ShaderScalarType::Unsigned32
-        };
-        if group.scalar_type != expected_type {
-            return Err(ShaderBackendLoweringError::VertexFetch(
-                "vertex storage format and shader input scalar type differ",
-            ));
-        }
-        let element = match layout.step_mode {
-            VertexStepMode::Vertex => "host.vertex_id",
-            VertexStepMode::Instance => "host.instance_id",
-        };
-        let base = layout
-            .buffer
-            .range
-            .offset()
-            .checked_add(attribute.offset)
-            .ok_or(ShaderBackendLoweringError::VertexFetch(
-                "vertex attribute base offset overflows",
-            ))?;
-        let base = u32::try_from(base).map_err(|_| {
-            ShaderBackendLoweringError::VertexFetch("vertex attribute base exceeds WGSL u32")
-        })?;
-        let stride = u32::try_from(layout.array_stride).map_err(|_| {
-            ShaderBackendLoweringError::VertexFetch("vertex stride exceeds WGSL u32")
-        })?;
-        let component_bytes = width.bytes() as u32;
-        // Generic vertex inputs use the neutral vec4 ABI even when the shader
-        // only consumes a prefix of their components. Populate that complete
-        // value so storage-backed and native vertex inputs expose the same
-        // interface to the guest shader body.
-        let values = (0..4)
-            .map(|component| {
-                if component >= stored_components.get() {
-                    return match (expected_type, component == 3) {
-                        (ShaderScalarType::Float32, true) => "1.0",
-                        (ShaderScalarType::Float32, false) => "0.0",
-                        (ShaderScalarType::Signed32, true) => "1i",
-                        (ShaderScalarType::Signed32, false) => "0i",
-                        (ShaderScalarType::Unsigned32, true) => "1u",
-                        (ShaderScalarType::Unsigned32, false) => "0u",
-                        _ => unreachable!("vertex storage formats are 32-bit shader scalars"),
-                    }
-                    .to_owned();
-                }
-                let offset = base + u32::from(component) * component_bytes;
-                let load = match width {
-                    VertexComponentWidth::Bits8 => "u8",
-                    VertexComponentWidth::Bits16 => "u16",
-                    VertexComponentWidth::Bits32 => "u32",
-                };
-                let raw =
-                    format!("nixe_vertex_buffer_{slot}_{load}({offset}u + {element} * {stride}u)");
-                if scaled.is_some() && signed {
-                    let shift = 32 - component_bytes * 8;
-                    format!("f32(i32({raw} << {shift}u) >> {shift}u)")
-                } else if scaled.is_some() {
-                    format!("f32({raw})")
-                } else if signed {
-                    let shift = 32 - component_bytes * 8;
-                    format!("i32({raw} << {shift}u) >> {shift}u")
-                } else {
-                    raw
-                }
-            })
-            .collect::<Vec<_>>();
-        let scalar = match expected_type {
-            ShaderScalarType::Float32 => "f32",
-            ShaderScalarType::Signed32 => "i32",
-            ShaderScalarType::Unsigned32 => "u32",
-            _ => unreachable!("vertex storage formats are 32-bit shader scalars"),
-        };
-        let value = format!("vec4<{scalar}>({})", values.join(", "));
+        let value = vertex_fetch::attribute_value(slot, layout, attribute, group.scalar_type)?;
         source.push_str(&format!("  input.{field} = {value};\n"));
     }
     source.push_str(
