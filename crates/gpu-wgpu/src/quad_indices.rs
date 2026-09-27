@@ -88,12 +88,12 @@ pub(crate) fn draw_indices(arguments: DrawArguments) -> Result<(u32, i32), Backe
 
 fn quad_indices(quad: u32) -> [u32; 6] {
     let base = quad * 4;
-    // Split along vertices 1--3, preserving perimeter winding. Both triangles
-    // put vertex 3 first, matching the quad's last-vertex constant interpolants
-    // to WebGPU's first-vertex flat interpolation convention.
-    // https://registry.khronos.org/OpenGL/extensions/EXT/EXT_provoking_vertex.txt
-    // https://www.w3.org/TR/WGSL/#interpolation
-    [base + 3, base, base + 1, base + 3, base + 1, base + 2]
+    // NVIDIA's 0--2 diagonal determines smooth interpolation as well as
+    // coverage. Do not change it to put the last vertex in both triangles:
+    // the quad vertex entry point handles constant attributes separately.
+    // NV_geometry_program4, issue 17 (also observed on Switch with deko3d):
+    // https://registry.khronos.org/OpenGL/extensions/NV/NV_geometry_program4.txt
+    [base, base + 1, base + 2, base, base + 2, base + 3]
 }
 
 #[cfg(test)]
@@ -134,18 +134,19 @@ mod tests {
     }
 
     #[test]
-    fn decomposition_preserves_winding_and_last_provoking_vertex() {
+    fn decomposition_preserves_winding_and_the_zero_two_diagonal() {
         let vertices = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
         for quad in 0..6 {
             let indices = quad_indices(quad);
             for triangle in indices.chunks_exact(3) {
-                assert_eq!(triangle[0], quad * 4 + 3);
+                assert_eq!(triangle[0], quad * 4);
+                assert!(triangle.contains(&(quad * 4 + 2)));
                 let [a, b, c] =
                     std::array::from_fn::<_, 3, _>(|i| vertices[(triangle[i] % 4) as usize]);
                 assert!((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) > 0);
             }
         }
-        assert_eq!(quad_indices(1), [7, 4, 5, 7, 5, 6]);
+        assert_eq!(quad_indices(1), [4, 5, 6, 4, 6, 7]);
     }
 
     #[test]

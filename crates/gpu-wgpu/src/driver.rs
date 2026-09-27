@@ -364,6 +364,7 @@ impl RenderPipelineKey {
         color_format: ImageFormat,
         depth_format: Option<ImageFormat>,
         draw: &DrawOperation,
+        quad_flat: bool,
     ) -> Self {
         Self {
             vertex,
@@ -378,7 +379,7 @@ impl RenderPipelineKey {
                 .prepared
                 .vertex_buffers
                 .iter()
-                .map(VertexPipelineLayoutKey::new)
+                .map(|layout| VertexPipelineLayoutKey::new(layout, quad_flat))
                 .collect(),
         }
     }
@@ -390,6 +391,7 @@ impl RenderPipelineKey {
         color_format: ImageFormat,
         depth_format: Option<ImageFormat>,
         draw: &DrawOperation,
+        quad_flat: bool,
     ) -> bool {
         self.vertex == vertex
             && self.fragment == fragment
@@ -404,11 +406,12 @@ impl RenderPipelineKey {
                 .vertex_buffers
                 .iter()
                 .zip(draw.prepared.vertex_buffers.iter())
-                .all(|(cached, current)| cached.matches(current))
+                .all(|(cached, current)| cached.matches(current, quad_flat))
     }
 }
 
 struct RenderPipelineFingerprintInput<'a> {
+    quad_flat: bool,
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
     topology: PrimitiveTopology,
@@ -432,10 +435,13 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.depth_state.hash(state);
         self.vertex_buffers.len().hash(state);
         for layout in self.vertex_buffers {
-            let pulled = layout
-                .attributes
-                .iter()
-                .any(|attribute| attribute.format.requires_vertex_pulling());
+            // Only flat quads pull native formats. Smooth quad pipelines must
+            // remain reusable across vertex-buffer suballocation offsets.
+            let pulled = self.quad_flat
+                || layout
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.format.requires_vertex_pulling());
             pulled.then_some(layout.buffer.range.offset()).hash(state);
             layout.array_stride.hash(state);
             layout.step_mode.hash(state);
@@ -450,8 +456,10 @@ fn render_pipeline_fingerprint(
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
     draw: &DrawOperation,
+    quad_flat: bool,
 ) -> u128 {
     nixe_gpu::cache_fingerprint(&RenderPipelineFingerprintInput {
+        quad_flat,
         vertex,
         fragment,
         topology: draw.prepared.topology,
@@ -466,11 +474,12 @@ fn render_pipeline_fingerprint(
 
 #[cfg(debug_assertions)]
 impl VertexPipelineLayoutKey {
-    fn new(layout: &VertexBufferLayout) -> Self {
-        let pulled = layout
-            .attributes
-            .iter()
-            .any(|attribute| attribute.format.requires_vertex_pulling());
+    fn new(layout: &VertexBufferLayout, quad_flat: bool) -> Self {
+        let pulled = quad_flat
+            || layout
+                .attributes
+                .iter()
+                .any(|attribute| attribute.format.requires_vertex_pulling());
         Self {
             pulled_buffer_offset: pulled.then_some(layout.buffer.range.offset()),
             array_stride: layout.array_stride,
@@ -479,11 +488,12 @@ impl VertexPipelineLayoutKey {
         }
     }
 
-    fn matches(&self, layout: &VertexBufferLayout) -> bool {
-        let pulled = layout
-            .attributes
-            .iter()
-            .any(|attribute| attribute.format.requires_vertex_pulling());
+    fn matches(&self, layout: &VertexBufferLayout, quad_flat: bool) -> bool {
+        let pulled = quad_flat
+            || layout
+                .attributes
+                .iter()
+                .any(|attribute| attribute.format.requires_vertex_pulling());
         self.pulled_buffer_offset == pulled.then_some(layout.buffer.range.offset())
             && self.array_stride == layout.array_stride
             && self.step_mode == layout.step_mode
@@ -506,6 +516,7 @@ struct RenderPipelineKey {
 }
 
 struct CachedRenderPipeline {
+    vertex_fetch: VertexFetchPlan,
     identity: PreparedPipelineIdentity,
     opaque_textures: crate::texture_sampling::OpaqueTextureBindings,
     #[cfg(debug_assertions)]
@@ -543,6 +554,7 @@ impl PreparedPipelineIdentity {
 
 #[derive(Clone, Copy)]
 struct RenderPipelineLocation {
+    quad_flat: bool,
     pipeline: BackendResourceHandle,
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
@@ -554,9 +566,47 @@ struct RenderPipelineLocation {
 
 #[derive(Clone)]
 struct PreparedRenderPipeline {
+    vertex_fetch: VertexFetchPlan,
     location: RenderPipelineLocation,
     pipeline: RenderPipeline,
     serial: u64,
+}
+
+/// Computed only when compiling a pipeline; command encoding uses this cached
+/// plan without re-inspecting the shader or rebuilding a vertex-fetch layout.
+#[derive(Clone, Copy)]
+struct VertexFetchPlan {
+    quad_flat: bool,
+    pulled_buffers: u32,
+}
+
+impl VertexFetchPlan {
+    fn new(
+        draw: &DrawOperation,
+        vertex: &nixe_gpu::ShaderBackendModule,
+        quad_flat: bool,
+    ) -> Result<Self, BackendDriverError> {
+        let ir = vertex.ir().ir();
+        let mut pulled_buffers = 0;
+        for (slot, layout) in draw.prepared.vertex_buffers.iter().enumerate() {
+            if layout.attributes.iter().any(|attribute| {
+                (quad_flat || attribute.format.requires_vertex_pulling())
+                    && ir.inputs().iter().any(|input| matches!(input.location(),
+                        nixe_gpu::ShaderIoLocation::Generic(location) if u32::from(location) == attribute.shader_location))
+            }) {
+                pulled_buffers |= 1_u32.checked_shl(slot as u32)
+                    .ok_or_else(|| unsupported("vertex-pull buffer slot exceeds host mask"))?;
+            }
+        }
+        Ok(Self {
+            quad_flat,
+            pulled_buffers,
+        })
+    }
+
+    fn pulls(self, slot: usize) -> bool {
+        slot < 32 && self.pulled_buffers & (1 << slot) != 0
+    }
 }
 
 struct CurrentRenderPipeline {
@@ -578,28 +628,40 @@ impl RenderPipelineCache {
         color_format: ImageFormat,
         depth_format: Option<ImageFormat>,
         draw: &DrawOperation,
-    ) -> Option<(u128, crate::texture_sampling::OpaqueTextureBindings)> {
+    ) -> Option<(u128, crate::texture_sampling::OpaqueTextureBindings, bool)> {
         let current = self.current.as_ref()?;
         current
             .record
             .identity
             .matches(vertex, fragment, color_format, depth_format, draw)
-            .then_some((current.fingerprint, current.record.opaque_textures))
+            .then_some((
+                current.fingerprint,
+                current.record.opaque_textures,
+                current.record.vertex_fetch.quad_flat,
+            ))
     }
 
-    fn touch(&mut self, fingerprint: u128, last_used: u64) -> Option<(RenderPipeline, u64)> {
+    fn touch(
+        &mut self,
+        fingerprint: u128,
+        last_used: u64,
+    ) -> Option<(RenderPipeline, u64, VertexFetchPlan)> {
         if let Some(current) = self.current.as_mut()
             && current.fingerprint == fingerprint
         {
             current.record.last_used = last_used;
-            return Some((current.record.pipeline.clone(), current.record.serial));
+            return Some((
+                current.record.pipeline.clone(),
+                current.record.serial,
+                current.record.vertex_fetch,
+            ));
         }
         if let Some(current) = self.current.take() {
             self.records.insert(current.fingerprint, current.record);
         }
         let mut record = self.records.remove(&fingerprint)?;
         record.last_used = last_used;
-        let result = (record.pipeline.clone(), record.serial);
+        let result = (record.pipeline.clone(), record.serial, record.vertex_fetch);
         let current = CurrentRenderPipeline {
             fingerprint,
             record,
@@ -2229,10 +2291,11 @@ impl WgpuBackendDriver {
                 };
                 pass.set_pipeline(&draw_pipelines[draw_index].pipeline);
                 for (slot, layout) in draw.prepared.vertex_buffers.iter().enumerate() {
-                    if !layout
-                        .attributes
-                        .iter()
-                        .any(|attribute| !attribute.format.requires_vertex_pulling())
+                    if draw_pipelines[draw_index].vertex_fetch.quad_flat
+                        || !layout
+                            .attributes
+                            .iter()
+                            .any(|attribute| !attribute.format.requires_vertex_pulling())
                     {
                         continue;
                     }
@@ -2273,6 +2336,9 @@ impl WgpuBackendDriver {
                         instance_count,
                     } => {
                         if draw.prepared.topology == PrimitiveTopology::Quads {
+                            if draw_pipelines[draw_index].vertex_fetch.quad_flat {
+                                pass.set_immediates(0, &first_vertex.to_le_bytes());
+                            }
                             let (count, base) = crate::quad_indices::draw_indices(draw.arguments)?;
                             pass.set_index_buffer(
                                 self.quad_indices.buffer().slice(..),
@@ -2470,27 +2536,17 @@ impl WgpuBackendDriver {
             );
             groups.push(bind_group);
         }
-        if draw.prepared.vertex_buffers.iter().any(|layout| {
-            layout
-                .attributes
-                .iter()
-                .any(|attribute| attribute.format.requires_vertex_pulling())
-        }) {
+        if prepared.vertex_fetch.pulled_buffers != 0 {
             let group = u32::try_from(draw.prepared.descriptor_tables.len())
                 .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
             let mut key = std::mem::take(&mut self.vertex_pull_binding_key);
             key.clear();
-            for (slot, layout) in
-                draw.prepared
-                    .vertex_buffers
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, layout)| {
-                        layout
-                            .attributes
-                            .iter()
-                            .any(|attribute| attribute.format.requires_vertex_pulling())
-                    })
+            for (slot, layout) in draw
+                .prepared
+                .vertex_buffers
+                .iter()
+                .enumerate()
+                .filter(|(slot, _)| prepared.vertex_fetch.pulls(*slot))
             {
                 key.push((
                     u32::try_from(slot).map_err(|_| unsupported("vertex-pull binding overflow"))?,
@@ -2611,7 +2667,7 @@ impl WgpuBackendDriver {
         };
         // Immutable prepared draws retain an O(1) pipeline fast path. Only a new
         // descriptor table needs its image formats examined, not its contents.
-        let (fingerprint, opaque_textures) = if let Some(cached) = cached {
+        let (fingerprint, opaque_textures, quad_flat) = if let Some(cached) = cached {
             cached
         } else {
             let mut opaque = crate::texture_sampling::OpaqueTextureBindings::default();
@@ -2636,11 +2692,32 @@ impl WgpuBackendDriver {
                     }
                 }
             }
-            let base =
-                render_pipeline_fingerprint(vertex, fragment, color_format, depth_format, draw);
-            (nixe_gpu::cache_fingerprint(&(base, opaque)), opaque)
+            let quad_flat = if draw.prepared.topology == PrimitiveTopology::Quads {
+                let Resource::Shader { neutral, .. } = self.resource(vertex)? else {
+                    return Err(kind_mismatch(vertex));
+                };
+                neutral.ir().ir().outputs().iter().any(|output| {
+                    output.interpolation() == Some(nixe_gpu::ShaderInterpolation::Constant)
+                })
+            } else {
+                false
+            };
+            let base = render_pipeline_fingerprint(
+                vertex,
+                fragment,
+                color_format,
+                depth_format,
+                draw,
+                quad_flat,
+            );
+            (
+                nixe_gpu::cache_fingerprint(&(base, opaque)),
+                opaque,
+                quad_flat,
+            )
         };
         Ok(RenderPipelineLocation {
+            quad_flat,
             pipeline,
             vertex,
             fragment,
@@ -2699,14 +2776,16 @@ impl WgpuBackendDriver {
                         location.color_format,
                         location.depth_format,
                         draw,
+                        location.quad_flat,
                     ),
                     "XXH3-128 collision or incomplete WGPU pipeline cache key"
                 );
             }
             cached
         };
-        if let Some((pipeline, serial)) = cached {
+        if let Some((pipeline, serial, vertex_fetch)) = cached {
             return Ok(PreparedRenderPipeline {
+                vertex_fetch,
                 location,
                 pipeline,
                 serial,
@@ -2719,6 +2798,15 @@ impl WgpuBackendDriver {
             self.shader_for_stage(dependencies, operation, ShaderStage::Vertex)?;
         let (_, fragment, fragment_ir) =
             self.shader_for_stage(dependencies, operation, ShaderStage::Fragment)?;
+        let vertex_fetch = VertexFetchPlan::new(draw, &vertex_ir, location.quad_flat)?;
+        if vertex_fetch.quad_flat
+            && (!self.device.features().contains(wgpu::Features::IMMEDIATES)
+                || self.device.limits().max_immediate_size < 4)
+        {
+            return Err(unsupported(
+                "flat quad assembly requires four bytes of host immediate data",
+            ));
+        }
         let color_format = location.color_format;
         let depth_format = location.depth_format;
         #[cfg(debug_assertions)]
@@ -2728,6 +2816,7 @@ impl WgpuBackendDriver {
             color_format,
             depth_format,
             draw,
+            location.quad_flat,
         );
         let target = ColorTargetState {
             format: texture_format(color_format)
@@ -2756,23 +2845,19 @@ impl WgpuBackendDriver {
             })
             .transpose()?;
         let scope = self.device.push_error_scope(ErrorFilter::Validation);
-        let uses_vertex_pulling = draw.prepared.vertex_buffers.iter().any(|layout| {
-            layout
-                .attributes
-                .iter()
-                .any(|attribute| attribute.format.requires_vertex_pulling())
-        });
+        let uses_vertex_pulling = vertex_fetch.quad_flat || vertex_fetch.pulled_buffers != 0;
         let vertex = if uses_vertex_pulling {
             let group = u32::try_from(draw.prepared.descriptor_tables.len())
                 .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
-            let module = nixe_gpu::lower_shader_ir_to_wgsl_with_vertex_pulling(
-                vertex_ir.ir(),
-                &draw.prepared.vertex_buffers,
-                group,
-            )
-            .map_err(|error| {
-                BackendDriverError::failure(format!("vertex-input pulling failed: {error}"))
-            })?;
+            let lower = if vertex_fetch.quad_flat {
+                nixe_gpu::lower_shader_ir_to_wgsl_with_quad_flat_attributes
+            } else {
+                nixe_gpu::lower_shader_ir_to_wgsl_with_vertex_pulling
+            };
+            let module =
+                lower(vertex_ir.ir(), &draw.prepared.vertex_buffers, group).map_err(|error| {
+                    BackendDriverError::failure(format!("vertex-input pulling failed: {error}"))
+                })?;
             self.device.create_shader_module(ShaderModuleDescriptor {
                 label: Some("Nixe vertex-pulling shader"),
                 source: ShaderSource::Wgsl(module.source().into()),
@@ -2788,7 +2873,9 @@ impl WgpuBackendDriver {
                 layout
                     .attributes
                     .iter()
-                    .filter(|attribute| !attribute.format.requires_vertex_pulling())
+                    .filter(|attribute| {
+                        !vertex_fetch.quad_flat && !attribute.format.requires_vertex_pulling()
+                    })
                     .map(|attribute| WgpuVertexAttribute {
                         format: vertex_format(attribute.format)
                             .expect("pulled formats were filtered before native vertex lowering"),
@@ -2837,10 +2924,14 @@ impl WgpuBackendDriver {
                 layout: None,
                 vertex: VertexState {
                     module: &vertex,
-                    entry_point: Some(vertex_entry_point(
-                        uses_vertex_pulling,
-                        draw.prepared.triangle_rasterization,
-                    )),
+                    entry_point: Some(if vertex_fetch.quad_flat {
+                        "nixe_quad_flat"
+                    } else {
+                        vertex_entry_point(
+                            uses_vertex_pulling,
+                            draw.prepared.triangle_rasterization,
+                        )
+                    }),
                     compilation_options: PipelineCompilationOptions {
                         constants: &vertex_constants,
                         ..PipelineCompilationOptions::default()
@@ -2886,6 +2977,7 @@ impl WgpuBackendDriver {
         let evicted = render.insert(
             fingerprint,
             CachedRenderPipeline {
+                vertex_fetch,
                 opaque_textures: location.opaque_textures,
                 identity: PreparedPipelineIdentity {
                     draw: Arc::clone(&draw.prepared),
@@ -2909,6 +3001,7 @@ impl WgpuBackendDriver {
             );
         }
         Ok(PreparedRenderPipeline {
+            vertex_fetch,
             location,
             pipeline: prepared_pipeline,
             serial,
@@ -5393,12 +5486,18 @@ mod tests {
             )
             .unwrap()
         };
-        let native = super::VertexPipelineLayoutKey::new(&layout(1, 0, VertexFormat::Float32x2));
-        assert!(native.matches(&layout(2, 16, VertexFormat::Float32x2)));
+        let native =
+            super::VertexPipelineLayoutKey::new(&layout(1, 0, VertexFormat::Float32x2), false);
+        assert!(native.matches(&layout(2, 16, VertexFormat::Float32x2), false));
 
-        let pulled = super::VertexPipelineLayoutKey::new(&layout(1, 4, VertexFormat::Uint8x2));
-        assert!(pulled.matches(&layout(2, 4, VertexFormat::Uint8x2)));
-        assert!(!pulled.matches(&layout(2, 8, VertexFormat::Uint8x2)));
+        let pulled =
+            super::VertexPipelineLayoutKey::new(&layout(1, 4, VertexFormat::Uint8x2), false);
+        assert!(pulled.matches(&layout(2, 4, VertexFormat::Uint8x2), false));
+        assert!(!pulled.matches(&layout(2, 8, VertexFormat::Uint8x2), false));
+        let quad =
+            super::VertexPipelineLayoutKey::new(&layout(1, 0, VertexFormat::Float32x2), true);
+        assert!(quad.matches(&layout(2, 0, VertexFormat::Float32x2), true));
+        assert!(!quad.matches(&layout(2, 16, VertexFormat::Float32x2), true));
 
         let shader = |slot| {
             BackendResourceHandle::new(
@@ -5408,11 +5507,12 @@ mod tests {
                 BackendResourceKind::Shader,
             )
         };
-        let fingerprint = |layout: &VertexBufferLayout| {
+        let fingerprint = |layout: &VertexBufferLayout, topology, quad_flat| {
             nixe_gpu::cache_fingerprint(&super::RenderPipelineFingerprintInput {
+                quad_flat,
                 vertex: shader(1),
                 fragment: shader(2),
-                topology: PrimitiveTopology::Triangles,
+                topology,
                 triangle_rasterization: TriangleRasterization::Fill,
                 alpha_test: None,
                 color_format: ImageFormat::Rgba8Unorm,
@@ -5421,17 +5521,31 @@ mod tests {
                 vertex_buffers: std::slice::from_ref(layout),
             })
         };
-        assert_eq!(
-            fingerprint(&layout(1, 0, VertexFormat::Float32x2)),
-            fingerprint(&layout(2, 16, VertexFormat::Float32x2))
-        );
-        assert_eq!(
-            fingerprint(&layout(1, 4, VertexFormat::Uint8x2)),
-            fingerprint(&layout(2, 4, VertexFormat::Uint8x2))
-        );
+        for topology in [PrimitiveTopology::Triangles, PrimitiveTopology::Quads] {
+            assert_eq!(
+                fingerprint(&layout(1, 0, VertexFormat::Float32x2), topology, false),
+                fingerprint(&layout(2, 16, VertexFormat::Float32x2), topology, false)
+            );
+            assert_eq!(
+                fingerprint(&layout(1, 4, VertexFormat::Uint8x2), topology, false),
+                fingerprint(&layout(2, 4, VertexFormat::Uint8x2), topology, false)
+            );
+            assert_ne!(
+                fingerprint(&layout(1, 4, VertexFormat::Uint8x2), topology, false),
+                fingerprint(&layout(2, 8, VertexFormat::Uint8x2), topology, false)
+            );
+        }
         assert_ne!(
-            fingerprint(&layout(1, 4, VertexFormat::Uint8x2)),
-            fingerprint(&layout(2, 8, VertexFormat::Uint8x2))
+            fingerprint(
+                &layout(1, 0, VertexFormat::Float32x2),
+                PrimitiveTopology::Quads,
+                true
+            ),
+            fingerprint(
+                &layout(2, 16, VertexFormat::Float32x2),
+                PrimitiveTopology::Quads,
+                true
+            )
         );
     }
 

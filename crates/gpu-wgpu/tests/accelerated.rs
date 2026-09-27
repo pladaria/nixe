@@ -1318,15 +1318,75 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     accelerated_polygon_draw(
         PrimitiveTopology::Triangles,
         ShaderInterpolation::Perspective,
+        false,
+        VertexFormat::Float32x3,
     );
 }
 
 #[test]
 fn accelerated_quads_cover_both_triangles_with_the_last_vertex_color() {
-    accelerated_polygon_draw(PrimitiveTopology::Quads, ShaderInterpolation::Constant);
+    accelerated_polygon_draw(
+        PrimitiveTopology::Quads,
+        ShaderInterpolation::Constant,
+        false,
+        VertexFormat::Float32x3,
+    );
 }
 
-fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderInterpolation) {
+#[test]
+fn accelerated_quads_interpolate_over_the_zero_two_diagonal() {
+    for interpolation in [
+        ShaderInterpolation::Perspective,
+        ShaderInterpolation::ScreenLinear,
+    ] {
+        accelerated_polygon_draw(
+            PrimitiveTopology::Quads,
+            interpolation,
+            false,
+            VertexFormat::Float32x3,
+        );
+    }
+}
+
+#[test]
+fn accelerated_quads_preserve_mixed_smooth_and_constant_attributes() {
+    accelerated_polygon_draw(
+        PrimitiveTopology::Quads,
+        ShaderInterpolation::Perspective,
+        true,
+        VertexFormat::Float32x3,
+    );
+}
+
+#[test]
+fn accelerated_flat_quads_fetch_native_and_scaled_color_formats() {
+    for format in [
+        VertexFormat::Unorm8x4,
+        VertexFormat::Snorm8x4,
+        VertexFormat::Unorm16x4,
+        VertexFormat::Snorm16x4,
+        VertexFormat::Float16x4,
+        VertexFormat::Unorm10_10_10_2,
+        VertexFormat::Sscaled {
+            width: nixe_gpu::VertexComponentWidth::Bits16,
+            components: nixe_gpu::VertexComponentCount::Four,
+        },
+    ] {
+        accelerated_polygon_draw(
+            PrimitiveTopology::Quads,
+            ShaderInterpolation::Perspective,
+            true,
+            format,
+        );
+    }
+}
+
+fn accelerated_polygon_draw(
+    topology: PrimitiveTopology,
+    interpolation: ShaderInterpolation,
+    mixed: bool,
+    color_format: VertexFormat,
+) {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x12);
     let Ok(initialized) = initialize_backend(
@@ -1399,13 +1459,68 @@ fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderIn
         // An incomplete trailing quad must not add any coverage.
         -1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
     ];
+    // Repeat the quad at a different first-vertex alignment. Both draws share
+    // one prepared pipeline; the second draw must update its immediate value.
+    let repeated_quads = [
+        &quad_vertices[..30],
+        &quad_vertices[..6],
+        &quad_vertices[6..],
+    ]
+    .concat();
     let vertices: &[f32] = if topology == PrimitiveTopology::Quads {
-        &quad_vertices
+        &repeated_quads
     } else {
         &triangle_vertices
     };
-    for component in vertices {
-        vertex_bytes.extend_from_slice(&component.to_le_bytes());
+    for (index, vertex) in vertices.chunks_exact(6).enumerate() {
+        // Different clip W values distinguish perspective from screen-linear
+        // interpolation while keeping the projected square at pixels 8..24.
+        let w = if topology == PrimitiveTopology::Quads && index % 5 != 0 && index < 10 {
+            [1.0_f32, 2.0, 4.0, 2.0][index % 5 - 1]
+        } else {
+            1.0
+        };
+        for component in [vertex[0] * w, vertex[1] * w, vertex[2] * w, w] {
+            vertex_bytes.extend_from_slice(&component.to_le_bytes());
+        }
+        let color = [vertex[3], vertex[4], vertex[5], 1.0];
+        match color_format {
+            VertexFormat::Float32x3 => {
+                for component in &color[..3] {
+                    vertex_bytes.extend_from_slice(&component.to_le_bytes());
+                }
+            }
+            VertexFormat::Unorm8x4 | VertexFormat::Snorm8x4 => {
+                let one = if color_format == VertexFormat::Unorm8x4 {
+                    255.0
+                } else {
+                    127.0
+                };
+                vertex_bytes.extend(color.map(|value| (value * one) as u8));
+            }
+            VertexFormat::Unorm16x4
+            | VertexFormat::Snorm16x4
+            | VertexFormat::Float16x4
+            | VertexFormat::Sscaled { .. } => {
+                let one = match color_format {
+                    VertexFormat::Unorm16x4 => 65535,
+                    VertexFormat::Snorm16x4 => 32767,
+                    VertexFormat::Float16x4 => 0x3c00,
+                    _ => 1,
+                };
+                for component in color {
+                    vertex_bytes.extend_from_slice(&((component as u16) * one).to_le_bytes());
+                }
+            }
+            VertexFormat::Unorm10_10_10_2 => {
+                let packed = (color[0] as u32 * 1023)
+                    | ((color[1] as u32 * 1023) << 10)
+                    | ((color[2] as u32 * 1023) << 20)
+                    | (3 << 30);
+                vertex_bytes.extend_from_slice(&packed.to_le_bytes());
+            }
+            _ => unreachable!("test color format"),
+        }
     }
     let vertex_size = vertex_bytes.len() as u64;
     let vertex_page = initialized_page(&vertex_bytes);
@@ -1442,14 +1557,14 @@ fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderIn
         description: ShaderDescription {
             stage: ShaderStage::Vertex,
         },
-        module: interpolated_vertex_module(interpolation),
+        module: interpolated_vertex_module(interpolation, mixed),
     });
     creations.push(BackendResourceCreateInfo::Shader {
         id: fragment,
         description: ShaderDescription {
             stage: ShaderStage::Fragment,
         },
-        module: interpolated_fragment_module(interpolation),
+        module: interpolated_fragment_module(interpolation, mixed),
     });
     let pipeline = PipelineId::new(1);
     creations.push(BackendResourceCreateInfo::Pipeline {
@@ -1492,17 +1607,17 @@ fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderIn
                     buffer: vertex_buffer,
                     range: BufferRange::new(0, vertex_size).unwrap(),
                 },
-                24,
+                16 + color_format.size(),
                 VertexStepMode::Vertex,
                 vec![
                     VertexAttribute {
-                        format: VertexFormat::Float32x3,
+                        format: VertexFormat::Float32x4,
                         offset: 0,
                         shader_location: 0,
                     },
                     VertexAttribute {
-                        format: VertexFormat::Float32x3,
-                        offset: 12,
+                        format: color_format,
+                        offset: 16,
                         shader_location: 1,
                     },
                 ],
@@ -1529,6 +1644,20 @@ fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderIn
         },
     )
     .unwrap();
+    let second_draw = if topology == PrimitiveTopology::Quads {
+        DrawOperation::new(
+            Arc::clone(&draw.prepared),
+            DrawArguments::NonIndexed {
+                first_vertex: 6,
+                vertex_count: 7,
+                first_instance: 2,
+                instance_count: 2,
+            },
+        )
+        .unwrap()
+    } else {
+        draw.clone()
+    };
     let submission = OperationSubmission::new(
         FrontendSubmissionId::new(2),
         vec![],
@@ -1541,6 +1670,16 @@ fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderIn
             ),
             GpuOperation::new(
                 GpuCommand::Draw(draw),
+                [],
+                [
+                    ResourceDependency::Buffer(vertex_buffer),
+                    ResourceDependency::Shader(vertex),
+                    ResourceDependency::Shader(fragment),
+                ],
+                CapabilityRequirements::none(),
+            ),
+            GpuOperation::new(
+                GpuCommand::Draw(second_draw),
                 [],
                 [
                     ResourceDependency::Buffer(vertex_buffer),
@@ -1596,11 +1735,50 @@ fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderIn
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
                 let expected = if (8..24).contains(&x) && (8..24).contains(&y) {
-                    [255, 255, 0, 255]
+                    if interpolation == ShaderInterpolation::Constant {
+                        [255, 255, 0, 255]
+                    } else {
+                        let u = (x as f32 + 0.5 - 8.0) / 16.0;
+                        let v = (24.0 - y as f32 - 0.5) / 16.0;
+                        let mut weights = if u >= v {
+                            [1.0 - u, u - v, v, 0.0]
+                        } else {
+                            [1.0 - v, 0.0, u, v - u]
+                        };
+                        if interpolation == ShaderInterpolation::Perspective {
+                            for (weight, w) in weights.iter_mut().zip([1.0, 2.0, 4.0, 2.0]) {
+                                *weight /= w;
+                            }
+                            let sum: f32 = weights.iter().sum();
+                            for weight in &mut weights {
+                                *weight /= sum;
+                            }
+                        }
+                        let rgb = [
+                            weights[0] + weights[3],
+                            // Second draw: last vertex 9, last instance 3.
+                            if mixed {
+                                (9.0 + 3.0) / 16.0
+                            } else {
+                                weights[1] + weights[3]
+                            },
+                            weights[2],
+                        ];
+                        [
+                            (rgb[0] * 255.0).round() as u8,
+                            (rgb[1] * 255.0).round() as u8,
+                            (rgb[2] * 255.0).round() as u8,
+                            255,
+                        ]
+                    }
                 } else {
                     clear
                 };
-                assert_eq!(pixel(x, y), expected, "pixel ({x}, {y})");
+                let actual = pixel(x, y);
+                assert!(
+                    actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 1),
+                    "pixel ({x}, {y}): actual={actual:?}, expected={expected:?}, interpolation={interpolation:?}, mixed={mixed}"
+                );
             }
         }
         return;
@@ -1625,9 +1803,14 @@ fn accelerated_polygon_draw(topology: PrimitiveTopology, interpolation: ShaderIn
     assert!((100..=160).contains(&drawn), "drawn pixels={drawn}");
 }
 
-fn interpolated_vertex_module(interpolation: ShaderInterpolation) -> nixe_gpu::ShaderBackendModule {
-    let inputs = (0..2)
-        .flat_map(|location| (0..3).map(move |component| (location, component)))
+fn interpolated_vertex_module(
+    interpolation: ShaderInterpolation,
+    mixed: bool,
+) -> nixe_gpu::ShaderBackendModule {
+    let mut inputs: Vec<_> = (0..2)
+        .flat_map(|location| {
+            (0..if location == 0 { 4 } else { 3 }).map(move |component| (location, component))
+        })
         .map(|(location, component)| {
             ShaderInterfaceElement::new(
                 ShaderIoLocation::Generic(location),
@@ -1641,29 +1824,105 @@ fn interpolated_vertex_module(interpolation: ShaderInterpolation) -> nixe_gpu::S
     let outputs = (0..4)
         .map(|component| (ShaderIoLocation::Position, component))
         .chain((0..3).map(|component| (ShaderIoLocation::Generic(0), component)))
+        .chain(
+            (0..if mixed { 3 } else { 0 })
+                .map(|component| (ShaderIoLocation::Generic(1), component)),
+        )
         .map(|(location, component)| {
             ShaderInterfaceElement::new(
                 location,
                 component,
                 ShaderScalarType::Float32,
-                matches!(location, ShaderIoLocation::Generic(_)).then_some(interpolation),
+                match location {
+                    ShaderIoLocation::Generic(0) => Some(interpolation),
+                    ShaderIoLocation::Generic(1) => Some(ShaderInterpolation::Constant),
+                    _ => None,
+                },
             )
             .unwrap()
         })
         .collect();
+    let mut instructions = vec![
+        load_input(8, 0, 0, ShaderIoLocation::Generic(0), 4),
+        store_output(24, 0, ShaderIoLocation::Position, 4),
+        load_input(32, 4, 0, ShaderIoLocation::Generic(1), 3),
+        store_output(40, 4, ShaderIoLocation::Generic(0), 3),
+    ];
+    if mixed {
+        // A flat output depends on computed results, not just vertex-buffer
+        // bytes. Preserve both guest builtins when evaluating the last corner.
+        for (index, location) in [ShaderIoLocation::VertexId, ShaderIoLocation::InstanceId]
+            .into_iter()
+            .enumerate()
+        {
+            inputs.push(
+                ShaderInterfaceElement::new(location, 0, ShaderScalarType::Unsigned32, None)
+                    .unwrap(),
+            );
+            instructions.push(ShaderInstruction::new(
+                ShaderSourceLocation::new(48 + index as u32 * 8),
+                ShaderPredicate::Always,
+                ShaderOperation::LoadInput {
+                    destinations: vec![ShaderRegister::new(8 + index as u16)].into(),
+                    location,
+                    first_component: 0,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                },
+            ));
+        }
+        instructions.push(ShaderInstruction::new(
+            ShaderSourceLocation::new(64),
+            ShaderPredicate::Always,
+            ShaderOperation::Add32 {
+                destination: ShaderRegister::new(8),
+                left: ShaderRegister::new(8),
+                right: ShaderRegister::new(9),
+                scalar_type: ShaderScalarType::Unsigned32,
+                float_control: nixe_gpu::ShaderFloatControl::PRECISE,
+            },
+        ));
+        instructions.push(ShaderInstruction::new(
+            ShaderSourceLocation::new(72),
+            ShaderPredicate::Always,
+            ShaderOperation::ConvertIntegerToFloat32 {
+                destination: ShaderRegister::new(8),
+                source: ShaderRegister::new(8),
+                source_type: ShaderScalarType::Unsigned32,
+            },
+        ));
+        instructions.push(move_f32(80, 9, 1.0 / 16.0));
+        for (offset, right) in [(88, 9), (96, 5)] {
+            instructions.push(ShaderInstruction::new(
+                ShaderSourceLocation::new(offset),
+                ShaderPredicate::Always,
+                ShaderOperation::Multiply32 {
+                    destination: ShaderRegister::new(8),
+                    left: ShaderRegister::new(8),
+                    right: ShaderRegister::new(right),
+                    scalar_type: ShaderScalarType::Float32,
+                    float_control: nixe_gpu::ShaderFloatControl::PRECISE,
+                },
+            ));
+        }
+        instructions.push(store_output(104, 4, ShaderIoLocation::Generic(1), 3));
+        instructions.push(ShaderInstruction::new(
+            ShaderSourceLocation::new(112),
+            ShaderPredicate::Always,
+            ShaderOperation::StoreOutput {
+                sources: vec![ShaderRegister::new(8)].into(),
+                location: ShaderIoLocation::Generic(1),
+                first_component: 1,
+                scalar_type: ShaderScalarType::Float32,
+            },
+        ));
+    }
+    instructions.push(exit(120));
     let verified = VerifiedShaderIr::verify(ShaderIr::new(
         ShaderStage::Vertex,
         inputs,
         outputs,
         vec![],
-        vec![
-            load_input(8, 0, 0, ShaderIoLocation::Generic(0), 3),
-            move_f32(16, 3, 1.0),
-            store_output(24, 0, ShaderIoLocation::Position, 4),
-            load_input(32, 4, 0, ShaderIoLocation::Generic(1), 3),
-            store_output(40, 4, ShaderIoLocation::Generic(0), 3),
-            exit(48),
-        ],
+        instructions,
     ))
     .unwrap();
     lower_shader_ir_to_wgsl(&verified).unwrap()
@@ -1671,14 +1930,21 @@ fn interpolated_vertex_module(interpolation: ShaderInterpolation) -> nixe_gpu::S
 
 fn interpolated_fragment_module(
     interpolation: ShaderInterpolation,
+    mixed: bool,
 ) -> nixe_gpu::ShaderBackendModule {
     let inputs = (0..3)
-        .map(|component| {
+        .map(|component| (0, component))
+        .chain((0..if mixed { 3 } else { 0 }).map(|component| (1, component)))
+        .map(|(location, component)| {
             ShaderInterfaceElement::new(
-                ShaderIoLocation::Generic(0),
+                ShaderIoLocation::Generic(location),
                 component,
                 ShaderScalarType::Float32,
-                Some(interpolation),
+                Some(if location == 0 {
+                    interpolation
+                } else {
+                    ShaderInterpolation::Constant
+                }),
             )
             .unwrap()
         })
@@ -1694,17 +1960,21 @@ fn interpolated_fragment_module(
             .unwrap()
         })
         .collect();
+    let mut instructions = vec![load_input(8, 0, 0, ShaderIoLocation::Generic(0), 3)];
+    if mixed {
+        instructions.push(load_input(12, 1, 1, ShaderIoLocation::Generic(1), 1));
+    }
+    instructions.extend([
+        move_f32(16, 3, 1.0),
+        store_output(24, 0, ShaderIoLocation::Color(0), 4),
+        exit(32),
+    ]);
     let verified = VerifiedShaderIr::verify(ShaderIr::new(
         ShaderStage::Fragment,
         inputs,
         outputs,
         vec![],
-        vec![
-            load_input(8, 0, 0, ShaderIoLocation::Generic(0), 3),
-            move_f32(16, 3, 1.0),
-            store_output(24, 0, ShaderIoLocation::Color(0), 4),
-            exit(32),
-        ],
+        instructions,
     ))
     .unwrap();
     lower_shader_ir_to_wgsl(&verified).unwrap()
