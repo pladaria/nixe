@@ -16,7 +16,7 @@ pub mod spirv;
 mod tessellation;
 mod vertex_fetch;
 
-pub use integer::ShaderIntegerComparison;
+pub use integer::{ShaderBitwiseOperation, ShaderIntegerComparison};
 
 /// Stable location within the original guest shader byte stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -490,6 +490,12 @@ pub enum ShaderOperation {
         amount: ShaderRegister,
         wrap: bool,
     },
+    Bitwise32 {
+        destination: ShaderRegister,
+        left: ShaderRegister,
+        right: ShaderRegister,
+        operation: ShaderBitwiseOperation,
+    },
     FloatMinMax32 {
         destination: ShaderRegister,
         left: ShaderRegister,
@@ -568,6 +574,13 @@ pub enum ShaderOperation {
         coordinates: [ShaderRegister; 2],
         image_binding: u8,
         sampler_binding: u8,
+    },
+    /// Unfiltered texel read at integer coordinates and a fixed mip level.
+    LoadTexture2D {
+        outputs: Box<[ShaderTextureSampleOutput]>,
+        coordinates: [ShaderRegister; 2],
+        image_binding: u8,
+        mip_level: u32,
     },
     SampleTexture2DArray {
         outputs: Box<[ShaderTextureSampleOutput]>,
@@ -1085,6 +1098,20 @@ pub fn evaluate_shader_ir(
                 };
                 registers[destination.index() as usize] = Some(value);
             }
+            ShaderOperation::Bitwise32 {
+                destination,
+                left,
+                right,
+                operation,
+            } => {
+                let left = register_bits(&registers, *left)?;
+                let right = register_bits(&registers, *right)?;
+                registers[destination.index() as usize] = Some(match operation {
+                    ShaderBitwiseOperation::And => left & right,
+                    ShaderBitwiseOperation::Or => left | right,
+                    ShaderBitwiseOperation::Xor => left ^ right,
+                });
+            }
             ShaderOperation::ShiftLeft32 {
                 destination,
                 value,
@@ -1298,6 +1325,7 @@ pub fn evaluate_shader_ir(
                 );
             }
             ShaderOperation::SampleTexture2D { .. }
+            | ShaderOperation::LoadTexture2D { .. }
             | ShaderOperation::SampleTexture2DArray { .. } => {
                 return Err(ShaderEvaluationError::TextureSampling(instruction.source));
             }
@@ -1468,6 +1496,7 @@ impl ShaderBackendModule {
                         std::mem::size_of_val(sources.as_ref())
                     }
                     ShaderOperation::SampleTexture2D { outputs, .. }
+                    | ShaderOperation::LoadTexture2D { outputs, .. }
                     | ShaderOperation::SampleTexture2DArray { outputs, .. } => {
                         std::mem::size_of_val(outputs.as_ref())
                     }
@@ -2620,6 +2649,24 @@ fn emit_wgsl_operation(
                 destination.index()
             ));
         }
+        ShaderOperation::Bitwise32 {
+            destination,
+            left,
+            right,
+            operation,
+        } => {
+            let operator = match operation {
+                ShaderBitwiseOperation::And => "&",
+                ShaderBitwiseOperation::Or => "|",
+                ShaderBitwiseOperation::Xor => "^",
+            };
+            source.push_str(&format!(
+                "  registers[{}] = registers[{}] {operator} registers[{}];\n",
+                destination.index(),
+                left.index(),
+                right.index(),
+            ));
+        }
         ShaderOperation::ShiftLeft32 {
             destination,
             value,
@@ -2836,6 +2883,29 @@ fn emit_wgsl_operation(
             dynamic_byte_offset.index(),
             *base_byte_offset as u32,
         )),
+        ShaderOperation::LoadTexture2D {
+            outputs,
+            coordinates,
+            image_binding,
+            mip_level,
+        } => {
+            let sample = format!("nixe_texel_{:x}", instruction.source.byte_offset());
+            source.push_str(&format!(
+                "  let {sample} = textureLoad(sampled_image_{image_binding}, vec2<i32>(bitcast<i32>(registers[{}]), bitcast<i32>(registers[{}])), i32({mip_level}u));\n",
+                coordinates[0].index(), coordinates[1].index(),
+            ));
+            for output in outputs {
+                if output.component() == 3 {
+                    source.push_str(&format!("  registers[{}] = bitcast<u32>(select({sample}.w, 1.0, nixe_texture_opaque_{image_binding}));\n", output.destination().index()));
+                } else {
+                    source.push_str(&format!(
+                        "  registers[{}] = bitcast<u32>({sample}{});\n",
+                        output.destination().index(),
+                        wgsl_component(output.component())
+                    ));
+                }
+            }
+        }
         ShaderOperation::SampleTexture2D {
             outputs,
             coordinates,
@@ -3368,6 +3438,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::FloatMultiplyZero32 { destination, .. }
             | ShaderOperation::Add32 { destination, .. }
             | ShaderOperation::ShiftLeft32 { destination, .. }
+            | ShaderOperation::Bitwise32 { destination, .. }
             | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
             | ShaderOperation::InterpolateInput { destination, .. } => {
                 for source in operation_sources(&instruction.operation) {
@@ -3517,7 +3588,13 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 outputs,
                 coordinates,
                 image_binding,
-                sampler_binding,
+                ..
+            }
+            | ShaderOperation::LoadTexture2D {
+                outputs,
+                coordinates,
+                image_binding,
+                ..
             } => {
                 for coordinate in coordinates {
                     require_definition(
@@ -3541,15 +3618,26 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                         .collect::<BTreeSet<_>>()
                         .len()
                         == outputs.len();
-                if ir.stage != ShaderStage::Fragment || !valid_outputs {
+                if (matches!(
+                    instruction.operation,
+                    ShaderOperation::SampleTexture2D { .. }
+                ) && ir.stage != ShaderStage::Fragment)
+                    || !valid_outputs
+                {
                     return Err(ShaderVerificationError::InvalidTextureSample {
                         source: instruction.source,
                     });
                 }
-                for (binding, kind) in [
-                    (*image_binding, ShaderResourceKind::SampledImage),
-                    (*sampler_binding, ShaderResourceKind::Sampler),
-                ] {
+                let sampler = match &instruction.operation {
+                    ShaderOperation::SampleTexture2D {
+                        sampler_binding, ..
+                    } => Some((*sampler_binding, ShaderResourceKind::Sampler)),
+                    _ => None,
+                };
+                for (binding, kind) in
+                    std::iter::once((*image_binding, ShaderResourceKind::SampledImage))
+                        .chain(sampler)
+                {
                     if !ir.resources.iter().any(|resource| {
                         resource.binding == binding
                             && resource.kind == kind
@@ -3736,6 +3824,7 @@ fn visit_operation_destinations(
         | ShaderOperation::FloatMultiplyZero32 { destination, .. }
         | ShaderOperation::Add32 { destination, .. }
         | ShaderOperation::ShiftLeft32 { destination, .. }
+        | ShaderOperation::Bitwise32 { destination, .. }
         | ShaderOperation::FloatMinMax32 { destination, .. }
         | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
         | ShaderOperation::Reciprocal32 { destination, .. }
@@ -3748,6 +3837,7 @@ fn visit_operation_destinations(
             destinations.iter().copied().for_each(visit)
         }
         ShaderOperation::SampleTexture2D { outputs, .. }
+        | ShaderOperation::LoadTexture2D { outputs, .. }
         | ShaderOperation::SampleTexture2DArray { outputs, .. } => outputs
             .iter()
             .map(|output| output.destination())
@@ -3817,6 +3907,7 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         | ShaderOperation::FloatMultiplyZero32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::Move32 { source, .. } => vec![*source],
         ShaderOperation::Add32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::Bitwise32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::ShiftLeft32 { value, amount, .. } => vec![*value, *amount],
         ShaderOperation::FloatMinMax32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::FloatAbsolute32 { source, .. }
@@ -3840,6 +3931,7 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
             ..
         } => vec![*dynamic_byte_offset],
         ShaderOperation::SampleTexture2D { coordinates, .. } => coordinates.to_vec(),
+        ShaderOperation::LoadTexture2D { coordinates, .. } => coordinates.to_vec(),
         ShaderOperation::SampleTexture2DArray {
             coordinates,
             array_index,
@@ -5415,6 +5507,43 @@ mod tests {
             evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 8),
             Err(ShaderEvaluationError::TextureSampling(source))
         );
+
+        let mut fetch = shader.ir().clone();
+        fetch.resources = vec![
+            ShaderResourceAccess::new(32, ShaderResourceKind::SampledImage, true, false).unwrap(),
+        ]
+        .into();
+        let ShaderOperation::SampleTexture2D {
+            outputs,
+            coordinates,
+            image_binding,
+            ..
+        } = fetch.instructions[2].operation.clone()
+        else {
+            unreachable!()
+        };
+        fetch.instructions[2].operation = ShaderOperation::LoadTexture2D {
+            outputs,
+            coordinates,
+            image_binding,
+            mip_level: 0,
+        };
+        let verified = VerifiedShaderIr::verify(fetch.clone()).unwrap();
+        let module = lower_shader_ir_to_wgsl(&verified).unwrap();
+        assert!(module.source().contains("textureLoad(sampled_image_32"));
+        assert!(!module.source().contains("var sampler_"));
+        validator
+            .validate(&naga::front::wgsl::parse_str(module.source()).unwrap())
+            .unwrap();
+        assert_eq!(
+            evaluate_shader_ir(&verified, &ShaderEvaluationInputs::default(), 8),
+            Err(ShaderEvaluationError::TextureSampling(source))
+        );
+        fetch.resources = Box::new([]);
+        assert!(matches!(
+            VerifiedShaderIr::verify(fetch),
+            Err(ShaderVerificationError::UndeclaredResourceAccess { binding: 32, .. })
+        ));
     }
 
     #[test]

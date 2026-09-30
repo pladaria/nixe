@@ -782,12 +782,9 @@ fn resolve_maxwell_three_d_resources_inner(
         }
     }
     for (texture_reference, dimension) in descriptors {
-        if !required_roles.contains(&MaxwellThreeDResourceRole::Sampler(texture_reference)) {
-            return Err(MaxwellThreeDResourceError::IncompleteState {
-                role: MaxwellThreeDResourceRole::Sampler(texture_reference),
-            });
-        }
-        builder.sampled_texture(bindings, texture_reference, dimension)?;
+        let needs_sampler =
+            required_roles.contains(&MaxwellThreeDResourceRole::Sampler(texture_reference));
+        builder.sampled_texture(bindings, texture_reference, dimension, needs_sampler)?;
     }
 
     for (index, target) in state.render_targets().color().iter().enumerate() {
@@ -1323,6 +1320,7 @@ impl<'a> ResourceBuilder<'a> {
         bindings: &super::MaxwellThreeDShaderBindingState,
         texture_reference: MaxwellThreeDTextureReference,
         dimension: MaxwellThreeDTextureDimension,
+        needs_sampler: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let raw_handle = self.texture_handle(texture_reference)?;
         // An unprogrammed selector retains the Maxwell class reset mode. Only
@@ -1340,19 +1338,29 @@ impl<'a> ResourceBuilder<'a> {
         // same raw index for both tables. Public corroborating definitions:
         // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/include/deko3d.h#L711-L724
         // https://source.hodakov.me/hdkv/yuzu/src/commit/55bf3dbf5ddaa3f7c1c3efade5553b07499fe289/src/video_core/textures/texture.h#L147-L165
-        let (image_index, sampler_index) = match bindings.sampler_binding().value() {
-            Some(mode) => texture_descriptor_pair(*mode, raw_handle),
-            None => {
-                return Err(MaxwellThreeDResourceError::IncompleteState {
-                    role: MaxwellThreeDResourceRole::Sampler(texture_reference),
-                });
+        let (image_index, sampler_index) = if !needs_sampler {
+            // Texel fetch consumes only the TIC portion, never TSC selection/state.
+            (raw_handle & 0x000f_ffff, None)
+        } else {
+            match bindings.sampler_binding().value() {
+                Some(mode) => {
+                    let (image, sampler) = texture_descriptor_pair(*mode, raw_handle);
+                    (image, Some(sampler))
+                }
+                None => {
+                    return Err(MaxwellThreeDResourceError::IncompleteState {
+                        role: MaxwellThreeDResourceRole::Sampler(texture_reference),
+                    });
+                }
             }
         };
         let tic = self.descriptor_bytes(MaxwellThreeDResourceRole::TextureHeaders, image_index)?;
-        let tsc = self.descriptor_bytes(MaxwellThreeDResourceRole::Samplers, sampler_index)?;
         self.sampled_image(texture_reference, dimension, image_index, tic)?;
-        self.samplers
-            .push(decode_sampler(texture_reference, sampler_index, tsc)?);
+        if let Some(sampler_index) = sampler_index {
+            let tsc = self.descriptor_bytes(MaxwellThreeDResourceRole::Samplers, sampler_index)?;
+            self.samplers
+                .push(decode_sampler(texture_reference, sampler_index, tsc)?);
+        }
         Ok(())
     }
 
@@ -1514,11 +1522,18 @@ impl<'a> ResourceBuilder<'a> {
             .ok_or(MaxwellThreeDResourceError::ResourceExhausted)?
             .mapping()
             .kind();
-        if source
-            .segments()
-            .iter()
-            .any(|segment| segment.mapping().kind() != MAXWELL_GENERIC_BLOCK_LINEAR_KIND)
-        {
+        // TIC and render-target descriptors use different format encodings,
+        // but refer to the same compressed allocation. Only texel formats
+        // (not BC blocks) may use these color-compression families. Lowering
+        // must supply an existing resident image; these bytes cannot be uploaded.
+        let compressed_kind = (block_width == 1 && block_height == 1)
+            .then(|| single_sample_compressed_color_kind(u64::from(bytes_per_block)))
+            .flatten();
+        if source.segments().iter().any(|segment| {
+            segment.mapping().kind() != actual_kind
+                || (actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND
+                    && Some(actual_kind) != compressed_kind)
+        }) {
             return Err(MaxwellThreeDResourceError::UnsupportedKind {
                 role,
                 expected: MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
@@ -1576,7 +1591,10 @@ impl<'a> ResourceBuilder<'a> {
                 guest_layout: MaxwellThreeDPreservedImageLayout {
                     layout,
                     pte_kind: actual_kind,
-                    compression_enabled: false,
+                    // A TIC cannot establish whether previous render-target
+                    // writes used compression. Require the resident representation
+                    // for compressed color kinds instead of importing opaque bytes.
+                    compression_enabled: actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
                 },
                 guest_format: MaxwellThreeDGuestImageFormat::Texture(format_word),
             },
@@ -1770,6 +1788,10 @@ impl<'a> ResourceBuilder<'a> {
         let description = if samples == SampleCount::Four {
             if !extent.width.is_multiple_of(2)
                 || !extent.height.is_multiple_of(2)
+                // Only the 32-bit color MS4 storage family is decoded below.
+                // Wider single-sample formats must not inherit its PTE kind.
+                || (matches!(guest_format, MaxwellThreeDGuestImageFormat::Color(_))
+                    && description.format().plane_bytes_per_texel(0) != Some(4))
                 || description.dimension() != ImageDimension::Two
                 || !matches!(
                     layout,
@@ -2106,8 +2128,9 @@ impl<'a> ResourceBuilder<'a> {
     }
 }
 
-// Preserve the transfer function as well as channel order for render targets
-// and 2D resolves. The L components denote sRGB; alpha remains linear UNORM.
+// Preserve precision, numeric representation, transfer function and channel
+// order for render targets and 2D resolves. The L components denote sRGB;
+// alpha remains linear UNORM in those formats.
 // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
 // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/image_formats.h
 fn color_image_format(
@@ -2115,6 +2138,7 @@ fn color_image_format(
     role: MaxwellThreeDResourceRole,
 ) -> Result<ImageFormat, MaxwellThreeDResourceError> {
     match format {
+        0xca => Ok(ImageFormat::Rgba16Float),
         0xcf => Ok(ImageFormat::Bgra8Unorm),
         0xd0 => Ok(ImageFormat::Bgra8Srgb),
         0xd5 => Ok(ImageFormat::Rgba8Unorm),
@@ -2985,6 +3009,24 @@ mod tests {
     }
 
     #[test]
+    fn rgba16_float_target_and_texture_encodings_have_the_same_interpretation() {
+        let target =
+            super::color_image_format(0xca, MaxwellThreeDResourceRole::ColorTarget(0)).unwrap();
+        assert_eq!(target, nixe_gpu::ImageFormat::Rgba16Float);
+        assert_eq!(
+            decode_sampled_texture_format(0x03, [7; 4], [2, 3, 4, 5], false, 0),
+            Some(target)
+        );
+        // Equal texel width does not make the signed/unsigned integer formats
+        // or the RGBX variant interchangeable with four floating components.
+        for raw in [0xc8, 0xc9, 0xce] {
+            assert!(
+                super::color_image_format(raw, MaxwellThreeDResourceRole::ColorTarget(0)).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn sampled_texture_formats_cover_captured_r32_float_and_direct_host_family() {
         assert_eq!(
             decode_sampled_texture_format(0x0f, [7; 4], [2, 0, 0, 7], false, 0),
@@ -3122,6 +3164,40 @@ mod tests {
                 ..
             })
         ));
+        // Fetch-only access must not read a sampler descriptor or require its
+        // selector. Even garbage TSC bits in the handle are irrelevant.
+        allocation.write(0, &descriptor_bytes(words)).unwrap();
+        allocation
+            .write(0x100, &0xfff0_0000_u32.to_le_bytes())
+            .unwrap();
+        let mut builder = super::ResourceBuilder::new(&address_space, None, None, None);
+        builder
+            .buffer(
+                MaxwellThreeDResourceRole::TextureHeaders,
+                super::MaxwellThreeDUnresolvedAddress::new((address >> 32) as u8, address as u32),
+                32,
+            )
+            .unwrap();
+        builder
+            .buffer(
+                MaxwellThreeDResourceRole::ConstantBuffer { group: 4, slot: 0 },
+                super::MaxwellThreeDUnresolvedAddress::new(
+                    (address >> 32) as u8,
+                    (address + 0x100) as u32,
+                ),
+                4,
+            )
+            .unwrap();
+        builder
+            .sampled_texture(
+                &super::super::MaxwellThreeDShaderBindingState::default(),
+                super::MaxwellThreeDTextureReference::new(4, 0, 0),
+                MaxwellThreeDTextureDimension::Two,
+                false,
+            )
+            .unwrap();
+        assert!(builder.samplers.is_empty());
+        assert_eq!(builder.descriptor_reads.len(), 2); // handle and TIC, no TSC
     }
 
     #[test]

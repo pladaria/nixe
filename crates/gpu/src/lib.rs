@@ -88,15 +88,15 @@ pub use shader::spirv::{
     lower_tessellation_shaders_to_spirv,
 };
 pub use shader::{
-    ShaderBackendLoweringError, ShaderBackendModule, ShaderEvaluationError, ShaderEvaluationInputs,
-    ShaderEvaluationResult, ShaderFloatComparison, ShaderFloatControl, ShaderInstruction,
-    ShaderIntegerComparison, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation,
-    ShaderIr, ShaderIrConstructionError, ShaderMathAccuracy, ShaderNanMode, ShaderOperation,
-    ShaderPredicate, ShaderPredicateSetOperation, ShaderRegister, ShaderResourceAccess,
-    ShaderResourceKind, ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation,
-    ShaderSpecialFunction, ShaderStageInterfaceError, ShaderTextureSampleOutput,
-    ShaderVerificationError, VerifiedShaderIr, WgslShaderModule, evaluate_shader_ir,
-    lower_shader_ir_to_wgsl, lower_shader_ir_to_wgsl_with_quad_flat_attributes,
+    ShaderBackendLoweringError, ShaderBackendModule, ShaderBitwiseOperation, ShaderEvaluationError,
+    ShaderEvaluationInputs, ShaderEvaluationResult, ShaderFloatComparison, ShaderFloatControl,
+    ShaderInstruction, ShaderIntegerComparison, ShaderInterfaceElement, ShaderInterpolation,
+    ShaderIoLocation, ShaderIr, ShaderIrConstructionError, ShaderMathAccuracy, ShaderNanMode,
+    ShaderOperation, ShaderPredicate, ShaderPredicateSetOperation, ShaderRegister,
+    ShaderResourceAccess, ShaderResourceKind, ShaderRoundingMode, ShaderScalarType,
+    ShaderSourceLocation, ShaderSpecialFunction, ShaderStageInterfaceError,
+    ShaderTextureSampleOutput, ShaderVerificationError, VerifiedShaderIr, WgslShaderModule,
+    evaluate_shader_ir, lower_shader_ir_to_wgsl, lower_shader_ir_to_wgsl_with_quad_flat_attributes,
     lower_shader_ir_to_wgsl_with_vertex_pulling, validate_shader_stage_link,
 };
 pub use submission::{

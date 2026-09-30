@@ -301,6 +301,7 @@ enum MethodAction {
     DecompressSurface,
     WaitForIdle,
     PixelShaderBarrier,
+    TiledCacheBarrier,
     DiscardRenderTarget,
     MmeShadowRamControl,
     MutableMethodControl,
@@ -843,6 +844,14 @@ methods!(
         0x03ff_fff1,
         MethodAction::InvalidateTextureCache(MaxwellThreeDTextureCacheTarget::Data)
     ),
+    // deko3d's waiting data-cache invalidation, used after tiled/fragment barriers.
+    // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/engine_3d.def#L242-L249
+    INVALIDATE_TEXTURE_DATA_CACHE_TILED => (
+        0x0f74,
+        "INVALIDATE_TEXTURE_DATA_CACHE_TILED",
+        0x03ff_fff1,
+        MethodAction::InvalidateTextureCache(MaxwellThreeDTextureCacheTarget::Data)
+    ),
     SET_L2_CACHE_CONTROL_FOR_ROP_NONINTERLOCKED_WRITE_REQUESTS => (
         0x12d8,
         "SET_L2_CACHE_CONTROL_FOR_ROP_NONINTERLOCKED_WRITE_REQUESTS",
@@ -902,6 +911,14 @@ methods!(
         "PIXEL_SHADER_BARRIER",
         0x0000_0001,
         MethodAction::PixelShaderBarrier
+    ),
+    // Only the zero payload is verified by deko3d's DkBarrier_Tiles emission.
+    // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_base.cpp#L49-L85
+    TILED_CACHE_BARRIER => (
+        0x0f7c,
+        "TILED_CACHE_BARRIER",
+        0,
+        MethodAction::TiledCacheBarrier
     ),
     // Bit 0 selects depth/stencil; bits 4..6 select a color target.
     // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/engine_3d.def#L250-L253
@@ -1477,6 +1494,11 @@ fn preflight_register(
             MethodAction::PixelShaderBarrier => {
                 synchronization_operation(MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier {
                     system_memory_barrier: source.argument() & 1 != 0,
+                    source,
+                })
+            }
+            MethodAction::TiledCacheBarrier => {
+                synchronization_operation(MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier {
                     source,
                 })
             }

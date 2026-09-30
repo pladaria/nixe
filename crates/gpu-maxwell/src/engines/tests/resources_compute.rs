@@ -291,6 +291,52 @@ fn operation_resource_scope_ignores_an_unreferenced_contradictory_vertex_stream(
 }
 
 #[test]
+fn rgba16_float_targets_preserve_texel_width_and_reject_incompatible_kinds() {
+    for kind in [0xfe, 0xe9, 0xdb, 0xe0] {
+        let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+        let mut address_space = resource_address_space();
+        let mapping = map_resource(
+            &mut address_space,
+            allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+            14,
+            kind,
+        );
+        let mut channel = three_d_channel();
+        program_color_target(&mut channel, 0, mapping.offset().get(), 0xca);
+        program_three_d(&mut channel, 0x15d0, 0);
+        let roles = [MaxwellThreeDResourceRole::ColorTarget(0)];
+        let result =
+            resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &address_space, &roles);
+        if matches!(kind, 0xdb | 0xe0) {
+            assert!(
+                matches!(result, Err(MaxwellThreeDResourceError::UnsupportedKind { expected: 0xe9, actual, .. }) if actual == kind)
+            );
+            continue;
+        }
+        let resources = result.unwrap();
+        let MaxwellThreeDResolvedResource::Image(image) = &resources.resources()[0] else {
+            panic!("image expected")
+        };
+        assert_eq!(image.description().format(), ImageFormat::Rgba16Float);
+        assert_eq!(
+            image.description().format().plane_bytes_per_texel(0),
+            Some(8)
+        );
+        assert_eq!(image.guest_layout().pte_kind(), kind);
+        assert_eq!(image.source().size(), 64 * 32 * 8);
+        // Adding the single-sample format must not accept a 64-bit MSAA image
+        // using the hard-coded C32_MS4 storage family.
+        program_three_d(&mut channel, 0x15d0, 2);
+        assert!(matches!(
+            resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &address_space, &roles),
+            Err(MaxwellThreeDResourceError::UnsupportedImageLayout { .. })
+        ));
+    }
+}
+
+#[test]
 fn captured_array_color_target_uses_the_verified_zero_layer_reset() {
     let allocation = CanonicalAllocation::zeroed(0x40_0000, 0x1000).unwrap();
     let backing = allocation
@@ -3889,6 +3935,42 @@ fn render_target_discard_is_a_validated_non_destructive_hint() {
 }
 
 #[test]
+fn tiled_cache_barrier_preserves_source_and_draw_state() {
+    let mut channel = three_d_channel();
+    use_mme_shadow_passthrough(&mut channel);
+    let before = channel.clone();
+    let dispatch = dispatch_method(&mut channel, 0x0f7c / 4, 0).unwrap();
+    assert!(dispatch.operations().is_empty());
+    assert_eq!(dispatch.synchronization_operations().len(), 1);
+    assert_eq!(
+        dispatch.methods()[0].metadata().method_name(),
+        "TILED_CACHE_BARRIER"
+    );
+    let operation = &dispatch.synchronization_operations()[0];
+    assert!(matches!(operation.trigger(),
+        MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier { source }
+            if source.method() == GpuMethodId(0x0f7c) && source.argument() == 0));
+    assert_eq!(operation.state(), before.three_d());
+    for pending in [false, true] {
+        assert_eq!(
+            lower_maxwell_three_d_synchronization(operation, None, pending),
+            Ok(MaxwellThreeDSynchronizationPlan::TiledCacheBarrier),
+        );
+    }
+    assert_eq!(channel, before);
+    for raw in [1, 2, 0x8000_0000, u32::MAX] {
+        assert!(matches!(
+            dispatch_method(&mut channel, 0x0f7c / 4, raw),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                defined_mask: 0,
+                ..
+            })
+        ));
+        assert_eq!(channel, before);
+    }
+}
+
+#[test]
 fn pixel_shader_barriers_preserve_source_and_do_not_mutate_draw_state() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
@@ -4337,6 +4419,12 @@ fn three_d_waiting_texture_cache_invalidation_family_drains_prior_work() {
         (
             0x1338,
             "INVALIDATE_TEXTURE_DATA_CACHE",
+            MaxwellThreeDTextureCacheTarget::Data,
+            nixe_gpu::CacheMaintenanceOperation::InvalidateTextureReadCaches,
+        ),
+        (
+            0x0f74,
+            "INVALIDATE_TEXTURE_DATA_CACHE_TILED",
             MaxwellThreeDTextureCacheTarget::Data,
             nixe_gpu::CacheMaintenanceOperation::InvalidateTextureReadCaches,
         ),
