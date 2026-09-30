@@ -275,7 +275,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     };
     let frontend = frontend
         .with_gpu_context(presentation_context)
-        .with_window_state(saved_window_state);
+        .with_window_state(saved_window_state)
+        .with_screenshots(title.name.clone(), PathBuf::from("docs/screenshots/nixe"));
 
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");

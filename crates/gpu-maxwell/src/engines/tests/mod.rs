@@ -23,7 +23,7 @@ fn channel() -> MaxwellGpuChannel {
     )
 }
 
-fn three_d_channel() -> MaxwellGpuChannel {
+pub(super) fn three_d_channel() -> MaxwellGpuChannel {
     let mut channel = channel();
     bind_three_d(&mut channel);
     channel
@@ -262,7 +262,7 @@ fn bind_three_d(channel: &mut MaxwellGpuChannel) {
         .unwrap();
 }
 
-fn program_three_d(channel: &mut MaxwellGpuChannel, method: u32, argument: u32) {
+pub(super) fn program_three_d(channel: &mut MaxwellGpuChannel, method: u32, argument: u32) {
     dispatch_method(channel, method / 4, argument).unwrap();
 }
 
@@ -346,6 +346,7 @@ fn program_color_target(channel: &mut MaxwellGpuChannel, target: u8, address: u6
 }
 
 fn program_basic_draw_state(channel: &mut MaxwellGpuChannel, vertex: u64) {
+    program_polygon_fill(channel);
     for (method, argument) in [
         (0x1c00, 0x1010),
         (0x1c04, (vertex >> 32) as u32),
@@ -366,6 +367,17 @@ fn program_basic_draw_state(channel: &mut MaxwellGpuChannel, vertex: u64) {
         (0x15d0, 0),
     ] {
         program_three_d(channel, method, argument);
+    }
+}
+
+fn program_polygon_fill(channel: &mut MaxwellGpuChannel) {
+    for (method, value) in [
+        (0x1918, 0),
+        (0x191c, 0x901),
+        (0x0dac, 0x1b02),
+        (0x0db0, 0x1b02),
+    ] {
+        program_three_d(channel, method, value);
     }
 }
 
@@ -395,8 +407,11 @@ fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellThre
     (shaders, cache)
 }
 
+mod color_output;
+mod coverage_dither;
 mod graphics_pipeline;
 mod raster_pipeline;
 mod resources_compute;
 mod state_validation;
+mod tessellation;
 mod zcull;

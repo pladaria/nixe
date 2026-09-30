@@ -15,6 +15,33 @@ use crate::MaxwellMethodSource;
 
 use super::MaxwellThreeDRegister;
 
+/// Dither footprint consumed by alpha-to-coverage, not polygon-line smoothing.
+/// Programming this selector does not enable alpha-to-coverage.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1879-L1883>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDAlphaToCoverageDither {
+    Pixels1x1 = 0,
+    Pixels2x2 = 1,
+    Pixels1x1VirtualSamples = 2,
+}
+
+impl MaxwellThreeDAlphaToCoverageDither {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Pixels1x1),
+            1 => Some(Self::Pixels2x2),
+            2 => Some(Self::Pixels1x1VirtualSamples),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Whether Maxwell enables the post-depth-test pixel-shader invocation mask.
 ///
 /// NVIDIA publishes the boolean field but does not document its detailed mask
@@ -475,6 +502,10 @@ impl MaxwellThreeDCsaaEnable {
 /// One validated coverage-sampling register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDCoverageStateWrite {
+    AlphaToCoverageDither {
+        value: MaxwellThreeDAlphaToCoverageDither,
+        source: MaxwellMethodSource,
+    },
     PostZPixelShaderImask {
         value: MaxwellThreeDPostZPixelShaderImask,
         source: MaxwellMethodSource,
@@ -525,6 +556,7 @@ pub enum MaxwellThreeDCoverageStateWrite {
 /// Persistent coverage-sampling configuration on one `MAXWELL_B` channel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDCoverageState {
+    alpha_to_coverage_dither: MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageDither>,
     post_z_pixel_shader_imask: MaxwellThreeDRegister<MaxwellThreeDPostZPixelShaderImask>,
     tir_mode: MaxwellThreeDRegister<MaxwellThreeDTirMode>,
     tir_control: MaxwellThreeDRegister<MaxwellThreeDTirControl>,
@@ -540,6 +572,13 @@ pub struct MaxwellThreeDCoverageState {
 }
 
 impl MaxwellThreeDCoverageState {
+    #[must_use]
+    pub const fn alpha_to_coverage_dither(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageDither> {
+        &self.alpha_to_coverage_dither
+    }
+
     #[must_use]
     pub const fn post_z_pixel_shader_imask(
         &self,
@@ -612,6 +651,10 @@ impl MaxwellThreeDCoverageState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDCoverageStateWrite) {
         match write {
+            MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source } => {
+                self.alpha_to_coverage_dither =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source } => {
                 self.post_z_pixel_shader_imask =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);

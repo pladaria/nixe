@@ -1,11 +1,15 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
+#[path = "../test-support/hardware.rs"]
+mod hardware;
+
 #[path = "accelerated/compressed_textures.rs"]
 mod compressed_textures;
 
 #[path = "accelerated/resource_lifetime.rs"]
 mod resource_lifetime;
 
+use hardware::initialize_backend;
 use nixe_gpu::{
     AttachmentLoad, AttachmentStore, BackendInstanceId, BackendResourceCreateInfo,
     BackendVisibilityRequester, BackingView, BlockLinearLayout, BufferDescription, BufferId,
@@ -20,9 +24,9 @@ use nixe_gpu::{
     ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
     ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType, ShaderSourceLocation,
     ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexStepMode, ViewportTransform, lower_shader_ir_to_wgsl,
+    VertexStepMode, ViewportTransform,
 };
-use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend, resident_texture};
+use nixe_gpu_wgpu::{WgpuBackendConfiguration, resident_texture};
 use nixe_memory::{
     CanonicalAllocation, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalBackingStore, ContentGeneration, CpuVisibilityRequest, DeviceVisibilityPoint,
@@ -150,12 +154,11 @@ fn color_clear_submission(
 #[test]
 fn partial_float32_clear_writes_unblended_values() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(701),
         NonCpuDeviceId::new(701),
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let page = initialized_page(&[0; 8 * 8 * 16]);
@@ -213,12 +216,11 @@ fn partial_float32_clear_writes_unblended_values() {
 #[test]
 fn partial_float16_clear_replaces_nan() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(703),
         NonCpuDeviceId::new(703),
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let page = initialized_page(&[0x00, 0x7e].repeat(8 * 8 * 4));
@@ -249,12 +251,11 @@ fn partial_float16_clear_replaces_nan() {
 #[test]
 fn partial_clear_after_cpu_write_and_full_clear() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(704),
         NonCpuDeviceId::new(704),
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let page = initialized_page(&[0, 255, 0, 255].repeat(64));
@@ -328,12 +329,11 @@ fn partial_clear_after_cpu_write_and_full_clear() {
 fn cpu_authored_rgb565_is_converted_by_a_reusable_gpu_import() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x15);
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(0x15),
         device_id,
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let mut bytes = vec![0_u8; 512];
@@ -445,12 +445,11 @@ fn cpu_authored_rgb565_is_converted_by_a_reusable_gpu_import() {
 #[test]
 fn partial_clear_initializes_a_new_image_from_a_device_authored_alias() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(705),
         NonCpuDeviceId::new(705),
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let page = initialized_page(&[0, 255, 0, 255].repeat(64));
@@ -630,7 +629,7 @@ fn read_presented_rgba(
 #[test]
 fn presentation_reconciles_mixed_cpu_and_device_pages() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(706),
         NonCpuDeviceId::new(706),
         WgpuBackendConfiguration::default(),
@@ -723,12 +722,11 @@ fn backing(
 fn accelerated_submissions_remain_in_flight_until_cpu_demand() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x11);
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(0x11),
         device_id,
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let runtime = RuntimeOwner::new(initialized.into_runtime());
@@ -826,12 +824,11 @@ fn accelerated_submissions_remain_in_flight_until_cpu_demand() {
 fn demanded_buffer_visibility_downloads_only_the_written_page_interval() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x14);
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(0x14),
         device_id,
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let runtime = RuntimeOwner::new(initialized.into_runtime());
@@ -895,12 +892,11 @@ fn demanded_buffer_visibility_downloads_only_the_written_page_interval() {
 #[test]
 fn neutral_runtime_reports_completion_separately_from_submission() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(0x12),
         NonCpuDeviceId::new(0x12),
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated runtime test");
         return;
     };
     let page = initialized_page(&[0x5a; 64]);
@@ -962,12 +958,11 @@ fn neutral_runtime_reports_completion_separately_from_submission() {
 fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x13);
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(0x13),
         device_id,
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let runtime = RuntimeOwner::new(initialized.into_runtime());
@@ -1033,12 +1028,11 @@ fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
 fn partial_image_clear_preserves_texels_and_reuses_device_authored_presentation() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x16);
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(0x16),
         device_id,
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     const WIDTH: u32 = 8;
@@ -1220,12 +1214,11 @@ fn partial_image_clear_preserves_texels_and_reuses_device_authored_presentation(
 #[test]
 fn partial_depth_stencil_clear_modes_are_accepted() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(0x17),
         NonCpuDeviceId::new(0x17),
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let image = ImageId::new(0x17);
@@ -1387,14 +1380,107 @@ fn accelerated_polygon_draw(
     mixed: bool,
     color_format: VertexFormat,
 ) {
+    accelerated_polygon_color_draw(topology, interpolation, mixed, color_format, None, None);
+}
+
+#[test]
+fn accelerated_blending_and_write_masks_preserve_destination_components() {
+    use nixe_gpu::{
+        BlendComponent, BlendFactor as F, BlendOperation as O, ColorBlendState, ColorOutputState,
+        ColorWriteMask,
+    };
+    let component = |operation, source, destination| BlendComponent {
+        operation,
+        source,
+        destination,
+    };
+    for (output, expected) in [
+        (
+            ColorOutputState {
+                blend: Some(ColorBlendState {
+                    color: component(O::Add, F::SourceAlpha, F::OneMinusSourceAlpha),
+                    alpha: component(O::Add, F::One, F::Zero),
+                }),
+                write_mask: ColorWriteMask::new(true, false, true, true),
+            },
+            [204, 77, 19, 128],
+        ),
+        (
+            ColorOutputState {
+                blend: None,
+                write_mask: ColorWriteMask::new(false, true, false, false),
+            },
+            [51, 255, 77, 255],
+        ),
+        (
+            ColorOutputState {
+                blend: Some(ColorBlendState {
+                    color: component(O::ReverseSubtract, F::One, F::One),
+                    alpha: component(O::Max, F::Zero, F::Zero),
+                }),
+                write_mask: ColorWriteMask::ALL,
+            },
+            [0, 0, 77, 255],
+        ),
+        (
+            ColorOutputState {
+                blend: Some(ColorBlendState {
+                    color: component(O::Min, F::Zero, F::Zero),
+                    alpha: component(O::Min, F::Zero, F::Zero),
+                }),
+                write_mask: ColorWriteMask::ALL,
+            },
+            [51, 77, 0, 128],
+        ),
+    ] {
+        accelerated_polygon_color_draw(
+            PrimitiveTopology::Quads,
+            ShaderInterpolation::Constant,
+            false,
+            VertexFormat::Float32x3,
+            Some((output, expected)),
+            None,
+        );
+    }
+}
+
+#[test]
+fn accelerated_polygon_facing_preserves_winding_for_triangles_and_quads() {
+    use nixe_gpu::{CullMode as C, FrontFace as F};
+    for topology in [PrimitiveTopology::Triangles, PrimitiveTopology::Quads] {
+        for (front, cull, visible) in [
+            (F::CounterClockwise, C::Back, true),
+            (F::CounterClockwise, C::Front, false),
+            (F::Clockwise, C::Back, false),
+            (F::Clockwise, C::Front, true),
+        ] {
+            accelerated_polygon_color_draw(
+                topology,
+                ShaderInterpolation::Perspective,
+                false,
+                VertexFormat::Float32x3,
+                None,
+                Some((front, cull, visible)),
+            );
+        }
+    }
+}
+
+fn accelerated_polygon_color_draw(
+    topology: PrimitiveTopology,
+    interpolation: ShaderInterpolation,
+    mixed: bool,
+    color_format: VertexFormat,
+    color_output: Option<(nixe_gpu::ColorOutputState, [u8; 4])>,
+    facing: Option<(nixe_gpu::FrontFace, nixe_gpu::CullMode, bool)>,
+) {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x12);
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(0x12),
         device_id,
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
     let runtime = RuntimeOwner::new(initialized.into_runtime());
@@ -1564,7 +1650,11 @@ fn accelerated_polygon_draw(
         description: ShaderDescription {
             stage: ShaderStage::Fragment,
         },
-        module: interpolated_fragment_module(interpolation, mixed),
+        module: interpolated_fragment_module(
+            interpolation,
+            mixed,
+            if color_output.is_some() { 0.5 } else { 1.0 },
+        ),
     });
     let pipeline = PipelineId::new(1);
     creations.push(BackendResourceCreateInfo::Pipeline {
@@ -1630,7 +1720,15 @@ fn accelerated_polygon_draw(
     .with_viewport_transform(
         ViewportTransform::new([16.0, -16.0, 0.5], [16.0, 16.0, 0.5], [0.0, 1.0]).unwrap(),
     );
-    let draw = DrawOperation::new(
+    let mut prepared = prepared;
+    if let Some((front, cull, _)) = facing {
+        prepared.front_face = front;
+        prepared.cull_mode = cull;
+    }
+    if let Some((output, _)) = color_output {
+        prepared.color_outputs[0] = output;
+    }
+    let mut draw = DrawOperation::new(
         Arc::new(prepared),
         DrawArguments::NonIndexed {
             first_vertex: u32::from(topology == PrimitiveTopology::Quads),
@@ -1658,6 +1756,22 @@ fn accelerated_polygon_draw(
     } else {
         draw.clone()
     };
+    if color_output.is_some() || facing.is_some() {
+        // Same neutral pipeline/shaders, one changed pipeline field. The first
+        // draw is invisible; a cache hit must restore the second draw's state.
+        let mut prepared = (*draw.prepared).clone();
+        if color_output.is_some() {
+            prepared.color_outputs[0].write_mask = nixe_gpu::ColorWriteMask::NONE;
+        }
+        if let Some((front, _, true)) = facing {
+            if front == nixe_gpu::FrontFace::CounterClockwise {
+                prepared.front_face = nixe_gpu::FrontFace::Clockwise;
+            } else {
+                prepared.cull_mode = nixe_gpu::CullMode::Back;
+            }
+        }
+        draw.prepared = Arc::new(prepared);
+    }
     let submission = OperationSubmission::new(
         FrontendSubmissionId::new(2),
         vec![],
@@ -1731,11 +1845,18 @@ fn accelerated_polygon_draw(
     assert_eq!(clear[3], 255);
     assert_eq!(pixel(WIDTH - 1, HEIGHT - 1), clear);
 
+    if let Some((_, _, false)) = facing {
+        assert!(pixels.chunks_exact(4).all(|p| p == clear));
+        return;
+    }
+
     if topology == PrimitiveTopology::Quads {
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
                 let expected = if (8..24).contains(&x) && (8..24).contains(&y) {
-                    if interpolation == ShaderInterpolation::Constant {
+                    if let Some((_, expected)) = color_output {
+                        expected
+                    } else if interpolation == ShaderInterpolation::Constant {
                         [255, 255, 0, 255]
                     } else {
                         let u = (x as f32 + 0.5 - 8.0) / 16.0;
@@ -1823,7 +1944,9 @@ fn interpolated_vertex_module(
         .collect();
     let outputs = (0..4)
         .map(|component| (ShaderIoLocation::Position, component))
-        .chain((0..3).map(|component| (ShaderIoLocation::Generic(0), component)))
+        // Match producers that export RGBA while the fragment stage consumes
+        // only RGB. The unconsumed alpha has no neutral interpolation contract.
+        .chain((0..4).map(|component| (ShaderIoLocation::Generic(0), component)))
         .chain(
             (0..if mixed { 3 } else { 0 })
                 .map(|component| (ShaderIoLocation::Generic(1), component)),
@@ -1834,7 +1957,7 @@ fn interpolated_vertex_module(
                 component,
                 ShaderScalarType::Float32,
                 match location {
-                    ShaderIoLocation::Generic(0) => Some(interpolation),
+                    ShaderIoLocation::Generic(0) if component < 3 => Some(interpolation),
                     ShaderIoLocation::Generic(1) => Some(ShaderInterpolation::Constant),
                     _ => None,
                 },
@@ -1846,7 +1969,8 @@ fn interpolated_vertex_module(
         load_input(8, 0, 0, ShaderIoLocation::Generic(0), 4),
         store_output(24, 0, ShaderIoLocation::Position, 4),
         load_input(32, 4, 0, ShaderIoLocation::Generic(1), 3),
-        store_output(40, 4, ShaderIoLocation::Generic(0), 3),
+        move_f32(36, 7, 0.25),
+        store_output(40, 4, ShaderIoLocation::Generic(0), 4),
     ];
     if mixed {
         // A flat output depends on computed results, not just vertex-buffer
@@ -1925,12 +2049,13 @@ fn interpolated_vertex_module(
         instructions,
     ))
     .unwrap();
-    lower_shader_ir_to_wgsl(&verified).unwrap()
+    nixe_gpu::ShaderBackendModule::new(verified)
 }
 
 fn interpolated_fragment_module(
     interpolation: ShaderInterpolation,
     mixed: bool,
+    alpha: f32,
 ) -> nixe_gpu::ShaderBackendModule {
     let inputs = (0..3)
         .map(|component| (0, component))
@@ -1965,7 +2090,7 @@ fn interpolated_fragment_module(
         instructions.push(load_input(12, 1, 1, ShaderIoLocation::Generic(1), 1));
     }
     instructions.extend([
-        move_f32(16, 3, 1.0),
+        move_f32(16, 3, alpha),
         store_output(24, 0, ShaderIoLocation::Color(0), 4),
         exit(32),
     ]);
@@ -1977,7 +2102,7 @@ fn interpolated_fragment_module(
         instructions,
     ))
     .unwrap();
-    lower_shader_ir_to_wgsl(&verified).unwrap()
+    nixe_gpu::ShaderBackendModule::new(verified)
 }
 
 fn load_input(

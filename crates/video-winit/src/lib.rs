@@ -1,5 +1,7 @@
 //! `winit` window and shared-device `wgpu` presenter for Nixe frames.
 
+mod screenshot;
+
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +118,7 @@ impl WindowFrontend {
                 failure: None,
                 initial_window_state: None,
                 last_window_state: None,
+                screenshots: None,
             },
             control: FrontendControl {
                 proxy,
@@ -145,6 +148,13 @@ impl WindowFrontend {
     #[must_use]
     pub fn with_window_state(mut self, state: Option<WindowState>) -> Self {
         self.application.initial_window_state = state;
+        self
+    }
+
+    /// Enables on-demand native-resolution PNG captures with the S hotkey.
+    #[must_use]
+    pub fn with_screenshots(mut self, title: String, directory: std::path::PathBuf) -> Self {
+        self.application.screenshots = Some(screenshot::Screenshots::new(title, directory));
         self
     }
 
@@ -186,6 +196,7 @@ struct Presenter {
     displayed_title: String,
     configured: bool,
     surface_reconfigure_pending: bool,
+    screenshots: Option<screenshot::Screenshots>,
 }
 
 impl Presenter {
@@ -326,6 +337,7 @@ impl Presenter {
             displayed_title: String::new(),
             configured: false,
             surface_reconfigure_pending: false,
+            screenshots: None,
         };
         presenter.resize(size.width, size.height);
         presenter.update_title();
@@ -525,12 +537,34 @@ impl Presenter {
                 pass.draw(0..3, 0..1);
             }
         }
+        // Encode only while the source frame lease is held. Requests made
+        // between frames wait for the next fresh frame, never sample a released
+        // swapchain image that the guest may already be rewriting.
+        let capture = if self.pending_frame.is_some() {
+            self.screenshots.as_mut().and_then(|screenshots| {
+                screenshots.encode(
+                    &self.device,
+                    &mut encoder,
+                    self.pending_frame.as_ref().expect("source frame lease"),
+                )
+            })
+        } else {
+            None
+        };
+        let submission;
         {
             let _queue_access = self.queue_access.lock();
-            self.queue.submit([encoder.finish()]);
+            submission = self.queue.submit([encoder.finish()]);
             self.queue.present(surface_texture);
         }
         self.pending_frame = None;
+        if let Some(capture) = capture {
+            self.screenshots.as_mut().expect("capture requested").save(
+                self.device.clone(),
+                submission,
+                capture,
+            );
+        }
         let now = Instant::now();
         self.refresh_title(now);
         if reconfigure_after_present {
@@ -639,6 +673,7 @@ struct PresenterApplication {
     failure: Option<WindowError>,
     initial_window_state: Option<WindowState>,
     last_window_state: Option<WindowState>,
+    screenshots: Option<screenshot::Screenshots>,
 }
 
 impl PresenterApplication {
@@ -709,7 +744,9 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             let context = self.context.take().ok_or_else(|| {
                 WindowError::device("accelerated presentation context was not configured")
             })?;
-            self.presenter = Some(Presenter::new(window, context)?);
+            let mut presenter = Presenter::new(window, context)?;
+            presenter.screenshots = self.screenshots.take();
+            self.presenter = Some(presenter);
             self.capture_window_state();
             if let Some(presenter) = &self.presenter {
                 presenter.window.request_redraw();
@@ -783,16 +820,29 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && !event.repeat
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyS) =>
+            {
+                if let Some(presenter) = &mut self.presenter
+                    && presenter.window.has_focus()
+                    && let Some(screenshots) = &mut presenter.screenshots
+                {
+                    screenshots.request();
+                    presenter.window.request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
                     && matches!(
                         event.physical_key,
                         PhysicalKey::Code(KeyCode::Digit1 | KeyCode::Numpad1)
                     ) =>
             {
-                if let Some(presenter) = &mut self.presenter {
-                    if presenter.window.has_focus() {
-                        presenter.resize_to_frame();
-                        self.capture_window_state();
-                    }
+                if let Some(presenter) = &mut self.presenter
+                    && presenter.window.has_focus()
+                {
+                    presenter.resize_to_frame();
+                    self.capture_window_state();
                 }
             }
             WindowEvent::RedrawRequested => {

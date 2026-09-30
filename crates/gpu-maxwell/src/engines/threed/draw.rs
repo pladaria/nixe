@@ -4,6 +4,11 @@
 //! operations. Shader translation is supplied as typed T10 evidence; this
 //! module never treats Maxwell code as a neutral or host shader.
 
+#[path = "draw/color.rs"]
+mod color;
+#[path = "draw/raster.rs"]
+mod raster;
+
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -65,6 +70,7 @@ use super::{
 #[derive(Clone, Debug)]
 struct DrawAttachmentSelection {
     colors: Vec<(u8, usize)>,
+    color_outputs: [nixe_gpu::ColorOutputState; 8],
     depth_stencil: Option<usize>,
 }
 
@@ -1177,8 +1183,7 @@ impl MaxwellThreeDLoweringCache {
                 )],
             ))
             .expect("synthetic unit-test shader is valid");
-            let module =
-                nixe_gpu::lower_shader_ir_to_wgsl(&ir).expect("synthetic unit-test shader lowers");
+            let module = nixe_gpu::ShaderBackendModule::new(ir);
             self.shader_translations.push(
                 shader.cache_fingerprint,
                 ShaderTranslationRecord {
@@ -1298,6 +1303,15 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             );
         }
     }
+    let mut raster_state = None;
+    let tessellation = if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) {
+        super::tessellation::draw_state(state)?
+    } else {
+        None
+    };
     if let Some(mode) = state.render_enable().execution_mode()
         && mode != MaxwellThreeDRenderEnableMode::Enabled
     {
@@ -1487,6 +1501,30 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedCsaaSemantics);
     }
+    // Dither footprint is only configuration while alpha-to-coverage is off.
+    // Neither coverage generation (including dithering) nor alpha-to-one is
+    // represented by the current neutral pipeline. Reject their activation,
+    // including after a cached draw, rather than ignoring a stored selector.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && let Some(MaxwellThreeDFixedFunctionValue::AlphaControl {
+        alpha_to_coverage,
+        alpha_to_one,
+    }) = state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::AlphaToCoverageEnable)
+        .value()
+        && (*alpha_to_coverage || *alpha_to_one)
+    {
+        return Err(
+            MaxwellThreeDLoweringError::UnsupportedAntiAliasAlphaControl {
+                alpha_to_coverage: *alpha_to_coverage,
+                alpha_to_one: *alpha_to_one,
+            },
+        );
+    }
     if matches!(
         trigger,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
@@ -1640,19 +1678,6 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         {
             return Err(MaxwellThreeDLoweringError::UnsupportedConservativeRasterSemantics);
         }
-        if state
-            .vertex_input()
-            .primitive()
-            .active_begin()
-            .is_some_and(|begin| matches!(begin.topology(), 4..=7))
-        {
-            if state.raster().polygon_smooth_enable().value() == Some(&true) {
-                return Err(MaxwellThreeDLoweringError::UnsupportedPolygonSmoothSemantics);
-            }
-            if state.raster().polygon_stipple_enable().value() == Some(&true) {
-                return Err(MaxwellThreeDLoweringError::UnsupportedPolygonStippleSemantics);
-            }
-        }
         if state.shader_bindings().has_enabled_pipeline()
             && state
                 .shader_bindings()
@@ -1663,32 +1688,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
                 "SET_PROGRAM_REGION_A/B",
             ));
         }
-        if state
-            .vertex_input()
-            .primitive()
-            .active_begin()
-            .is_some_and(|begin| begin.topology() == 14)
-        {
-            let patch_size = state
-                .vertex_input()
-                .primitive()
-                .patch_size()
-                .value()
-                .copied()
-                .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_PATCH"))?;
-            if patch_size.control_points() == 0 {
-                return Err(MaxwellThreeDLoweringError::InvalidPatchSize(patch_size));
-            }
-            return Err(MaxwellThreeDLoweringError::UnsupportedPatchSemantics(
-                patch_size,
-            ));
-        }
-        if state
-            .vertex_input()
-            .primitive()
-            .active_begin()
-            .is_some_and(|begin| begin.topology() == 0)
-        {
+        if state.generated_primitive() == Some(super::state::GeneratedPrimitive::Points) {
             if let Some(value) = state
                 .raster()
                 .attribute_point_size()
@@ -1725,19 +1725,15 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
                 ));
             }
         }
-        if state.edge_flag_affects_draw() {
-            return Err(MaxwellThreeDLoweringError::UnsupportedEdgeFlagSemantics(
-                MaxwellThreeDEdgeFlag::Disabled,
-            ));
-        }
-        validate_line_rasterization_state(state)?;
+        validate_direct_line_rasterization_state(state)?;
+        raster_state = Some(raster::draw_state(state)?);
     }
     if let MaxwellThreeDOperationTrigger::ClearSurface { source } = trigger
         && state.render_targets().clear().last_surface().source() != Some(source)
     {
         return Err(MaxwellThreeDLoweringError::TriggerStateMismatch);
     }
-    let draw_attachments = match trigger {
+    let mut draw_attachments = match trigger {
         MaxwellThreeDOperationTrigger::ClearSurface { .. } => None,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => {
             Some(select_draw_attachments(state, resources)?)
@@ -1748,7 +1744,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
     ) {
         let attachments = draw_attachments
-            .as_ref()
+            .as_mut()
             .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?;
         validate_draw_surface_clip(state, resources, attachments)?;
         if attachments.colors.len() > 1
@@ -1788,9 +1784,8 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             return Err(MaxwellThreeDLoweringError::UnsupportedRenderTargetLayerSemantics(value));
         }
         validate_draw_iterated_blend_state(state, attachments)?;
-        validate_draw_blending_state(state, attachments)?;
+        attachments.color_outputs = color::draw_color_outputs(state, resources, attachments)?;
         validate_draw_logic_op_state(state, attachments)?;
-        validate_draw_color_write_state(state, attachments)?;
         draw_alpha_test_state(state)?;
     }
     validate_compressed_depth_materialization(
@@ -1863,6 +1858,8 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
                 shaders.ok_or(MaxwellThreeDLoweringError::ShaderTranslationRequired)?,
                 attachments,
                 vertex_count,
+                tessellation,
+                raster_state.expect("draw consumes raster state"),
                 cache,
                 &mut creations,
             )?;
@@ -1961,71 +1958,6 @@ fn validate_visible_call_limit(
     Ok(())
 }
 
-fn validate_draw_blending_state(
-    state: &MaxwellThreeDState,
-    attachments: &DrawAttachmentSelection,
-) -> Result<(), MaxwellThreeDLoweringError> {
-    if attachments.colors.is_empty() {
-        return Ok(());
-    }
-
-    let per_target = match state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable)
-        .value()
-    {
-        Some(MaxwellThreeDFixedFunctionValue::Boolean(value)) => *value,
-        None => {
-            return Err(MaxwellThreeDLoweringError::IncompleteBlendState {
-                target: None,
-                field: "SET_BLEND_STATE_PER_TARGET",
-            });
-        }
-        Some(_) => {
-            return Err(MaxwellThreeDLoweringError::ContradictoryState {
-                reason: "blend-state selection register has the wrong typed value",
-            });
-        }
-    };
-
-    if !per_target {
-        return match state.fixed_function().blend_enable_common().value() {
-            None => Err(MaxwellThreeDLoweringError::IncompleteBlendState {
-                target: None,
-                field: "SET_BLEND_ENABLE_COMMON",
-            }),
-            Some(MaxwellThreeDBlendEnableCommon::Disabled) => Ok(()),
-            Some(MaxwellThreeDBlendEnableCommon::Enabled) => {
-                validate_common_blend_equation_state(state)?;
-                Err(MaxwellThreeDLoweringError::UnsupportedBlendSemantics { target: None })
-            }
-        };
-    }
-
-    let mut enabled_target = None;
-    for target in attachments.color_targets() {
-        match state.fixed_function().blend_enable()[target as usize].value() {
-            None => {
-                return Err(MaxwellThreeDLoweringError::IncompleteBlendState {
-                    target: Some(target),
-                    field: "SET_BLEND(i)",
-                });
-            }
-            Some(false) => {}
-            Some(true) => {
-                validate_per_target_blend_equation_state(state, target)?;
-                enabled_target.get_or_insert(target);
-            }
-        }
-    }
-    if let Some(target) = enabled_target {
-        return Err(MaxwellThreeDLoweringError::UnsupportedBlendSemantics {
-            target: Some(target),
-        });
-    }
-    Ok(())
-}
-
 fn validate_draw_iterated_blend_state(
     state: &MaxwellThreeDState,
     attachments: &DrawAttachmentSelection,
@@ -2082,40 +2014,6 @@ fn validate_draw_logic_op_state(
     Err(MaxwellThreeDLoweringError::UnsupportedLogicOpSemantics(
         function,
     ))
-}
-
-fn validate_draw_color_write_state(
-    state: &MaxwellThreeDState,
-    attachments: &DrawAttachmentSelection,
-) -> Result<(), MaxwellThreeDLoweringError> {
-    let fixed = state.fixed_function();
-    let Some(MaxwellThreeDFixedFunctionValue::Boolean(single)) = fixed
-        .register(MaxwellThreeDFixedFunctionRegister::SingleColorTargetWriteControl)
-        .value()
-    else {
-        // Preserve compatibility with snapshots predating this modeled
-        // register. Once explicitly programmed, its selected masks are fully
-        // validated below rather than guessed.
-        return Ok(());
-    };
-    for target in attachments.color_targets() {
-        let mask_register = if *single { 0 } else { target };
-        let mask = fixed.color_mask()[mask_register as usize]
-            .value()
-            .copied()
-            .ok_or(MaxwellThreeDLoweringError::IncompleteColorWriteState {
-                target,
-                mask_register,
-            })?;
-        if !mask.all_enabled() {
-            return Err(MaxwellThreeDLoweringError::UnsupportedColorWriteMask {
-                target,
-                mask_register,
-                mask,
-            });
-        }
-    }
-    Ok(())
 }
 
 fn draw_alpha_test_state(
@@ -2177,137 +2075,12 @@ fn draw_alpha_test_state(
     }))
 }
 
-fn validate_common_blend_equation_state(
+fn validate_direct_line_rasterization_state(
     state: &MaxwellThreeDState,
 ) -> Result<(), MaxwellThreeDLoweringError> {
-    let fixed = state.fixed_function();
-    let separate_alpha = require_common_blend_value(
-        fixed,
-        MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha,
-        "SET_BLEND_SEPARATE_FOR_ALPHA",
-    )?;
-    for (register, field) in [
-        (
-            MaxwellThreeDFixedFunctionRegister::BlendColorOp,
-            "SET_BLEND_OP_COLOR",
-        ),
-        (
-            MaxwellThreeDFixedFunctionRegister::BlendColorSource,
-            "SET_BLEND_COEFF_SOURCE_COLOR",
-        ),
-        (
-            MaxwellThreeDFixedFunctionRegister::BlendColorDestination,
-            "SET_BLEND_COEFF_DESTINATION_COLOR",
-        ),
-    ] {
-        require_common_blend_value(fixed, register, field)?;
-    }
-    if matches!(
-        separate_alpha,
-        MaxwellThreeDFixedFunctionValue::Boolean(true)
-    ) {
-        for (register, field) in [
-            (
-                MaxwellThreeDFixedFunctionRegister::BlendAlphaOp,
-                "SET_BLEND_OP_ALPHA",
-            ),
-            (
-                MaxwellThreeDFixedFunctionRegister::BlendAlphaSource,
-                "SET_BLEND_COEFF_SOURCE_ALPHA",
-            ),
-            (
-                MaxwellThreeDFixedFunctionRegister::BlendAlphaDestination,
-                "SET_BLEND_COEFF_DESTINATION_ALPHA",
-            ),
-        ] {
-            require_common_blend_value(fixed, register, field)?;
-        }
-    }
-    Ok(())
-}
-
-fn require_common_blend_value(
-    fixed: &super::MaxwellThreeDFixedFunctionState,
-    register: MaxwellThreeDFixedFunctionRegister,
-    field: &'static str,
-) -> Result<MaxwellThreeDFixedFunctionValue, MaxwellThreeDLoweringError> {
-    fixed.register(register).value().copied().ok_or(
-        MaxwellThreeDLoweringError::IncompleteBlendState {
-            target: None,
-            field,
-        },
-    )
-}
-
-fn validate_per_target_blend_equation_state(
-    state: &MaxwellThreeDState,
-    target: u8,
-) -> Result<(), MaxwellThreeDLoweringError> {
-    let values = &state.fixed_function().per_target_blend()[target as usize];
-    let separate_alpha =
-        values[0]
-            .value()
-            .copied()
-            .ok_or(MaxwellThreeDLoweringError::IncompleteBlendState {
-                target: Some(target),
-                field: "SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA",
-            })?;
-    for (index, field) in [
-        (1, "SET_BLEND_PER_TARGET_OP_COLOR"),
-        (2, "SET_BLEND_PER_TARGET_COEFF_SOURCE_COLOR"),
-        (3, "SET_BLEND_PER_TARGET_COEFF_DESTINATION_COLOR"),
-    ] {
-        values[index]
-            .value()
-            .ok_or(MaxwellThreeDLoweringError::IncompleteBlendState {
-                target: Some(target),
-                field,
-            })?;
-    }
-    if matches!(
-        separate_alpha,
-        MaxwellThreeDFixedFunctionValue::Boolean(true)
-    ) {
-        for (index, field) in [
-            (4, "SET_BLEND_PER_TARGET_OP_ALPHA"),
-            (5, "SET_BLEND_PER_TARGET_COEFF_SOURCE_ALPHA"),
-            (6, "SET_BLEND_PER_TARGET_COEFF_DESTINATION_ALPHA"),
-        ] {
-            values[index]
-                .value()
-                .ok_or(MaxwellThreeDLoweringError::IncompleteBlendState {
-                    target: Some(target),
-                    field,
-                })?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_line_rasterization_state(
-    state: &MaxwellThreeDState,
-) -> Result<(), MaxwellThreeDLoweringError> {
-    let topology = state
-        .vertex_input()
-        .primitive()
-        .active_begin()
-        .map(|begin| begin.topology());
-    let direct_line_primitive = topology.is_some_and(|topology| matches!(topology, 1 | 3));
-    let polygon_primitive = topology.is_some_and(|topology| matches!(topology, 4..=7));
-    let polygon_line_mode = [
-        MaxwellThreeDFixedFunctionRegister::FrontPolygonMode,
-        MaxwellThreeDFixedFunctionRegister::BackPolygonMode,
-    ]
-    .into_iter()
-    .any(|register| {
-        matches!(
-            state.fixed_function().register(register).value(),
-            Some(MaxwellThreeDFixedFunctionValue::PolygonMode(
-                MaxwellThreeDPolygonMode::Line
-            ))
-        )
-    });
-    if !direct_line_primitive && !(polygon_primitive && polygon_line_mode) {
+    let direct_line_primitive =
+        state.generated_primitive() == Some(super::state::GeneratedPrimitive::Lines);
+    if !direct_line_primitive {
         return Ok(());
     }
 
@@ -2327,14 +2100,6 @@ fn validate_line_rasterization_state(
             },
         );
     }
-    if polygon_primitive
-        && polygon_line_mode
-        && state.line().polygon_clip_generated_edge().value()
-            == Some(&MaxwellThreeDPolygonClipGeneratedEdge::DoNotDrawLine)
-    {
-        return Err(MaxwellThreeDLoweringError::UnsupportedPolygonClipGeneratedEdgeSemantics);
-    }
-
     match state.line().aliased_line_width_enable().value() {
         None => Err(MaxwellThreeDLoweringError::IncompleteDraw(
             "SET_ALIASED_LINE_WIDTH_ENABLE",
@@ -2761,6 +2526,7 @@ fn select_draw_attachments(
     }
     Ok(DrawAttachmentSelection {
         colors,
+        color_outputs: [nixe_gpu::ColorOutputState::REPLACE; 8],
         depth_stencil,
     })
 }
@@ -2788,6 +2554,15 @@ fn draw_depth_stencil_aspects(state: &MaxwellThreeDState) -> (bool, bool) {
 }
 
 fn draw_depth_stencil_enable_state(state: &MaxwellThreeDState) -> (Option<bool>, Option<bool>) {
+    // SET_ZT_SELECT.TARGET_COUNT=0 unbinds Z independently of the test enables.
+    // Only explicit absence suppresses consumption; an unknown selector must
+    // not hide a missing descriptor. ClearSurface has its own resource roles.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2748-L2749
+    if state.render_targets().depth_target_count().value()
+        == Some(&super::MaxwellThreeDDepthTargetCount::None)
+    {
+        return (Some(false), Some(false));
+    }
     let boolean = |register| {
         state
             .fixed_function()
@@ -2836,12 +2611,8 @@ fn draw_depth_state(state: &MaxwellThreeDState) -> Result<DepthState, MaxwellThr
 fn validate_draw_stencil_state(
     state: &MaxwellThreeDState,
 ) -> Result<(), MaxwellThreeDLoweringError> {
-    match state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::StencilTestEnable)
-        .value()
-    {
-        Some(MaxwellThreeDFixedFunctionValue::Boolean(true)) => {
+    match draw_depth_stencil_enable_state(state).1 {
+        Some(true) => {
             let two_sided = state
                 .fixed_function()
                 .register(MaxwellThreeDFixedFunctionRegister::TwoSidedStencilTestEnable)
@@ -3536,6 +3307,8 @@ fn lower_draw(
     shaders: &MaxwellThreeDTranslatedShaders,
     attachment_selection: &DrawAttachmentSelection,
     vertex_count: u32,
+    tessellation: Option<nixe_gpu::TessellationState>,
+    raster: raster::DrawRasterState,
     cache: &mut MaxwellThreeDLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
 ) -> Result<(Vec<GpuOperation>, Arc<[usize]>), MaxwellThreeDLoweringError> {
@@ -3556,6 +3329,12 @@ fn lower_draw(
         );
         if record.module.stage() != translated.stage {
             return Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders);
+        }
+        if let Some(tessellation) = tessellation {
+            super::tessellation::validate_default_level_inputs(
+                tessellation.control,
+                record.module.ir().ir(),
+            )?;
         }
         if !record.published {
             creations.push(BackendResourceCreateInfo::Shader {
@@ -3653,7 +3432,7 @@ fn lower_draw(
         .copied()
         .unwrap_or(MaxwellThreeDFillViaTriangleMode::Disabled)
     {
-        MaxwellThreeDFillViaTriangleMode::Disabled => TriangleRasterization::Fill,
+        MaxwellThreeDFillViaTriangleMode::Disabled => raster.triangles,
         MaxwellThreeDFillViaTriangleMode::FillBoundingBox => {
             if topology != PrimitiveTopology::Triangles {
                 return Err(MaxwellThreeDLoweringError::UnsupportedFillRectangleDraw(
@@ -3844,6 +3623,10 @@ fn lower_draw(
     )
     .map_err(MaxwellThreeDLoweringError::Command)?;
     draw = draw.with_triangle_rasterization(triangle_rasterization);
+    draw.front_face = raster.front_face;
+    draw.cull_mode = raster.cull_mode;
+    draw.tessellation = tessellation;
+    draw.color_outputs = attachment_selection.color_outputs;
     if let Some(alpha_test) = draw_alpha_test_state(state)? {
         draw = draw.with_alpha_test(alpha_test);
     }
@@ -4348,6 +4131,8 @@ fn take_identity(
 /// Typed failure before any cache or backend effect is published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDLoweringError {
+    UnsupportedPolygonRasterization(&'static str),
+    UnsupportedWindowOrigin(u32),
     ContradictoryState {
         reason: &'static str,
     },
@@ -4366,6 +4151,10 @@ pub enum MaxwellThreeDLoweringError {
     UnsupportedPixelShaderInterlockSemantics(MaxwellThreeDPixelShaderInterlockControl),
     UnsupportedGlobalBaseVertexIndex(u32),
     UnsupportedCsaaSemantics,
+    UnsupportedAntiAliasAlphaControl {
+        alpha_to_coverage: bool,
+        alpha_to_one: bool,
+    },
     UnsupportedCoverageToColorSemantics(MaxwellThreeDCoverageToColor),
     UnsupportedAlphaToCoverageOverrideSemantics(MaxwellThreeDAlphaToCoverageOverride),
     UnsupportedTirSemantics {
@@ -4413,7 +4202,12 @@ pub enum MaxwellThreeDLoweringError {
         divisor: u32,
     },
     InvalidPatchSize(MaxwellThreeDPatchSize),
-    UnsupportedPatchSemantics(MaxwellThreeDPatchSize),
+    TessellationStageTopology,
+    TessellationMode {
+        value: super::MaxwellThreeDTessellationMode,
+        source: Option<MaxwellMethodSource>,
+        reason: super::MaxwellTessellationModeError,
+    },
     UnsupportedPointSpriteCoordinatesSemantics(MaxwellThreeDPointSpriteSelect),
     UnsupportedAttributePointSizeSemantics {
         slot: u8,
@@ -4435,8 +4229,13 @@ pub enum MaxwellThreeDLoweringError {
         output: u8,
         range: MaxwellThreeDPixelShaderClampRange,
     },
-    UnsupportedBlendSemantics {
+    UnsupportedBlendFactor {
         target: Option<u8>,
+        value: u32,
+    },
+    UnsupportedBlendFormat {
+        target: u8,
+        format: nixe_gpu::ImageFormat,
     },
     UnsupportedIteratedBlendSemantics {
         value: MaxwellThreeDIteratedBlend,
@@ -4447,11 +4246,6 @@ pub enum MaxwellThreeDLoweringError {
     IncompleteColorWriteState {
         target: u8,
         mask_register: u8,
-    },
-    UnsupportedColorWriteMask {
-        target: u8,
-        mask_register: u8,
-        mask: super::MaxwellThreeDColorMask,
     },
     IncompleteAlphaTestState(&'static str),
     CompressedDepthImportRequired {
@@ -4531,6 +4325,9 @@ pub enum MaxwellThreeDLoweringError {
 impl Display for MaxwellThreeDLoweringError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedPolygonRasterization(reason) => write!(formatter, "MAXWELL_B polygon rasterization is unsupported: {reason}"),
+            Self::UnsupportedWindowOrigin(value) => write!(formatter,
+                "MAXWELL_B window origin/flip has no neutral coordinate lowering: value=0x{value:x}"),
             Self::ContradictoryState { reason } => {
                 write!(formatter, "contradictory Maxwell 3D state: {reason}")
             }
@@ -4574,6 +4371,10 @@ impl Display for MaxwellThreeDLoweringError {
             ),
             Self::UnsupportedCsaaSemantics => formatter.write_str(
                 "MAXWELL_B enabled CSAA has no verified coverage sampling, resolve, capability, or coherency semantics",
+            ),
+            Self::UnsupportedAntiAliasAlphaControl { alpha_to_coverage, alpha_to_one } => write!(
+                formatter,
+                "MAXWELL_B alpha-to-coverage/dithering or alpha-to-one is not represented by the neutral pipeline: alpha-to-coverage={alpha_to_coverage} alpha-to-one={alpha_to_one}"
             ),
             Self::UnsupportedCoverageToColorSemantics(value) => write!(
                 formatter,
@@ -4682,11 +4483,8 @@ impl Display for MaxwellThreeDLoweringError {
                 "MAXWELL_B patch draw has an invalid control-point count: {}",
                 size.control_points()
             ),
-            Self::UnsupportedPatchSemantics(size) => write!(
-                formatter,
-                "MAXWELL_B patch control-point count is not represented by the neutral pipeline contract: {}",
-                size.control_points()
-            ),
+            Self::TessellationStageTopology => formatter.write_str("MAXWELL_B tessellation shaders require patch topology"),
+            Self::TessellationMode { value, source, reason } => write!(formatter, "MAXWELL_B tessellation mode cannot be consumed: value={:#x} reason={reason:?} source={source:?}", value.raw()),
             Self::UnsupportedPointSpriteCoordinatesSemantics(select) => write!(
                 formatter,
                 "MAXWELL_B generated point-sprite coordinates are not represented by shader translation or the neutral pipeline contract: texture-mask=0x{:03x} r-mode={:?} origin={:?}",
@@ -4747,15 +4545,10 @@ impl Display for MaxwellThreeDLoweringError {
                 formatter,
                 "MAXWELL_B pixel-shader output saturation is not represented by shader or neutral backend lowering: output={output} range={range:?}"
             ),
-            Self::UnsupportedBlendSemantics { target } => match target {
-                Some(target) => write!(
-                    formatter,
-                    "MAXWELL_B enabled blend state is not representable in the neutral pipeline contract: target={target}"
-                ),
-                None => formatter.write_str(
-                    "MAXWELL_B enabled common blend state is not representable in the neutral pipeline contract",
-                ),
-            },
+            Self::UnsupportedBlendFactor { target, value } => write!(formatter,
+                "MAXWELL_B blend factor requires unsupported coupled/constant/dual-source semantics: target={target:?} value=0x{value:04x}"),
+            Self::UnsupportedBlendFormat { target, format } => write!(formatter,
+                "MAXWELL_B blending currently requires RGBA8/BGRA8 UNORM or sRGB: target={target} format={format:?}"),
             Self::UnsupportedIteratedBlendSemantics { value, pass_count } => write!(
                 formatter,
                 "MAXWELL_B iterated blending has no neutral backend representation: color={} alpha={} pass-count={pass_count:?}",
@@ -4776,15 +4569,6 @@ impl Display for MaxwellThreeDLoweringError {
             } => write!(
                 formatter,
                 "MAXWELL_B color target {target} selects unprogrammed SET_CT_WRITE({mask_register})",
-            ),
-            Self::UnsupportedColorWriteMask {
-                target,
-                mask_register,
-                mask,
-            } => write!(
-                formatter,
-                "MAXWELL_B partial color writes are not represented by the neutral render pipeline: target={target} mask-register={mask_register} mask=0x{:04x}",
-                mask.raw()
             ),
             Self::IncompleteAlphaTestState(field) => write!(
                 formatter,
@@ -4965,7 +4749,7 @@ mod tests {
             )],
         ))
         .unwrap();
-        let module = nixe_gpu::lower_shader_ir_to_wgsl(&verified).unwrap();
+        let module = nixe_gpu::ShaderBackendModule::new(verified);
         let configuration = GpuCacheConfiguration::new(6, 1, 1, 1, 1).unwrap();
         let mut cache = MaxwellThreeDLoweringCache::new(configuration);
         for raw in 1..=7 {

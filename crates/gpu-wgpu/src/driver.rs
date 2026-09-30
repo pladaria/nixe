@@ -43,6 +43,11 @@ use crate::{
     PIPELINE_CACHE_MAGIC, WgpuExecutionContext, WgpuQueueAccess, WgpuVisibilityCoordinator,
 };
 
+mod color;
+#[cfg(not(target_os = "macos"))]
+#[path = "native/vulkan/draw.rs"]
+mod native_draw;
+
 // WebGPU and Maxwell expose at most eight simultaneous color attachments.
 const MAX_COLOR_ATTACHMENTS: usize = 8;
 
@@ -172,12 +177,14 @@ enum Resource {
         description: ImageDescription,
         view: Option<nixe_gpu::ImageView>,
         attachment_views: HashMap<ImageSubresourceRange, wgpu::TextureView>,
+        #[cfg(not(target_os = "macos"))]
+        native_initialized: bool,
     },
     Sampler {
         sampler: wgpu::Sampler,
     },
     Shader {
-        module: ShaderModule,
+        module: Option<ShaderModule>,
         neutral: nixe_gpu::ShaderBackendModule,
     },
     Pipeline {
@@ -186,6 +193,8 @@ enum Resource {
     },
     DescriptorTable {
         bindings: Box<[nixe_gpu::DescriptorTableBinding]>,
+        #[cfg(not(target_os = "macos"))]
+        native_indices: Option<Box<[u16; 256]>>,
         bind_groups: HashMap<(u64, u32), CachedBindGroup>,
     },
     RenderPass,
@@ -293,6 +302,15 @@ struct ResourceContent {
 struct HostSubmission {
     index: wgpu::SubmissionIndex,
     completed: bool,
+    #[cfg(not(target_os = "macos"))]
+    native: Vec<native_draw::RetainedDraw>,
+}
+
+struct EncodedSubmission {
+    last: CommandEncoder,
+    segments: Vec<wgpu::CommandBuffer>,
+    #[cfg(not(target_os = "macos"))]
+    native: Vec<native_draw::RetainedDraw>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -371,7 +389,10 @@ impl RenderPipelineKey {
             fragment,
             topology: draw.prepared.topology,
             triangle_rasterization: draw.prepared.triangle_rasterization,
+            front_face: draw.prepared.front_face,
+            cull_mode: draw.prepared.cull_mode,
             alpha_test: draw.prepared.alpha_test,
+            color_output: draw.prepared.color_outputs[0],
             color_format,
             depth_format,
             depth_state: draw.prepared.depth_state,
@@ -397,7 +418,10 @@ impl RenderPipelineKey {
             && self.fragment == fragment
             && self.topology == draw.prepared.topology
             && self.triangle_rasterization == draw.prepared.triangle_rasterization
+            && self.front_face == draw.prepared.front_face
+            && self.cull_mode == draw.prepared.cull_mode
             && self.alpha_test == draw.prepared.alpha_test
+            && self.color_output == draw.prepared.color_outputs[0]
             && self.color_format == color_format
             && self.depth_format == depth_format
             && self.depth_state == draw.prepared.depth_state
@@ -411,6 +435,9 @@ impl RenderPipelineKey {
 }
 
 struct RenderPipelineFingerprintInput<'a> {
+    front_face: nixe_gpu::FrontFace,
+    cull_mode: nixe_gpu::CullMode,
+    color_output: nixe_gpu::ColorOutputState,
     quad_flat: bool,
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
@@ -429,7 +456,10 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.fragment.hash(state);
         self.topology.hash(state);
         self.triangle_rasterization.hash(state);
+        self.front_face.hash(state);
+        self.cull_mode.hash(state);
         self.alpha_test.hash(state);
+        self.color_output.hash(state);
         self.color_format.hash(state);
         self.depth_format.hash(state);
         self.depth_state.hash(state);
@@ -459,12 +489,15 @@ fn render_pipeline_fingerprint(
     quad_flat: bool,
 ) -> u128 {
     nixe_gpu::cache_fingerprint(&RenderPipelineFingerprintInput {
+        front_face: draw.prepared.front_face,
+        cull_mode: draw.prepared.cull_mode,
         quad_flat,
         vertex,
         fragment,
         topology: draw.prepared.topology,
         triangle_rasterization: draw.prepared.triangle_rasterization,
         alpha_test: draw.prepared.alpha_test,
+        color_output: draw.prepared.color_outputs[0],
         color_format,
         depth_format,
         depth_state: draw.prepared.depth_state,
@@ -504,6 +537,9 @@ impl VertexPipelineLayoutKey {
 #[cfg(debug_assertions)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RenderPipelineKey {
+    front_face: nixe_gpu::FrontFace,
+    cull_mode: nixe_gpu::CullMode,
+    color_output: nixe_gpu::ColorOutputState,
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
     topology: PrimitiveTopology,
@@ -1066,9 +1102,11 @@ fn vertex_entry_point(
     triangle_rasterization: TriangleRasterization,
 ) -> &'static str {
     match (uses_vertex_pulling, triangle_rasterization) {
-        (false, TriangleRasterization::Fill) => "main",
+        (false, TriangleRasterization::Fill | TriangleRasterization::Wireframe { .. }) => "main",
         (false, TriangleRasterization::FillRectangle) => "nixe_fill_rectangle",
-        (true, TriangleRasterization::Fill) => "nixe_vertex_pull",
+        (true, TriangleRasterization::Fill | TriangleRasterization::Wireframe { .. }) => {
+            "nixe_vertex_pull"
+        }
         (true, TriangleRasterization::FillRectangle) => "nixe_vertex_pull_fill_rectangle",
     }
 }
@@ -1120,6 +1158,8 @@ pub(crate) struct WgpuBackendDriver {
     pipeline_cache_path: Option<PathBuf>,
     cache_configuration: GpuCacheConfiguration,
     torn_down: bool,
+    #[cfg(not(target_os = "macos"))]
+    native: native_draw::NativeCache,
 }
 
 impl WgpuBackendDriver {
@@ -1135,7 +1175,10 @@ impl WgpuBackendDriver {
             device,
             queue,
             queue_access,
+            native_vulkan,
         } = execution;
+        #[cfg(target_os = "macos")]
+        let _ = native_vulkan;
         let device_loss = Arc::new(Mutex::new(None));
         let callback_state = Arc::clone(&device_loss);
         device.set_device_lost_callback(move |reason, message| {
@@ -1156,6 +1199,8 @@ impl WgpuBackendDriver {
         let upload_staging = StagingBelt::new(device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         let partial_clear_parameters = PartialClearParameters::new(&device);
         Self {
+            #[cfg(not(target_os = "macos"))]
+            native: native_draw::NativeCache::new(native_vulkan),
             backend,
             device,
             queue,
@@ -1230,11 +1275,15 @@ impl WgpuBackendDriver {
         while let Ok(token) = self.completion_receiver.try_recv() {
             if let Some(submission) = self.submissions.get_mut(&token) {
                 submission.completed = true;
+                #[cfg(not(target_os = "macos"))]
+                submission.native.clear();
             }
         }
     }
 
     fn clear_owned_state(&mut self) {
+        #[cfg(not(target_os = "macos"))]
+        self.native.clear();
         self.resources.clear();
         self.retired_resources.clear();
         self.page_resources.clear();
@@ -1685,7 +1734,13 @@ impl WgpuBackendDriver {
         accepted: &AcceptedBackendSubmission<'_>,
         dependencies: &ResolvedBackendResources,
         mut encoder: CommandEncoder,
-    ) -> Result<CommandEncoder, BackendDriverError> {
+    ) -> Result<EncodedSubmission, BackendDriverError> {
+        #[cfg(target_os = "macos")]
+        let segments = Vec::new();
+        #[cfg(not(target_os = "macos"))]
+        let mut segments = Vec::new();
+        #[cfg(not(target_os = "macos"))]
+        let mut native = Vec::new();
         let operations = accepted.submission().operations();
         let mut index = 0;
         while index < operations.len() {
@@ -1703,7 +1758,42 @@ impl WgpuBackendDriver {
                         })
                         .map(|offset| index + 1 + offset)
                         .ok_or_else(|| unsupported("unterminated render pass"))?;
-                    self.encode_render_pass(&mut encoder, dependencies, operations, index, end)?;
+                    let patches = operations[index + 1..end].iter().any(|operation| {
+                        matches!(operation.command(), GpuCommand::Draw(draw)
+                            if draw.prepared.topology == PrimitiveTopology::Patches)
+                    });
+                    if patches {
+                        #[cfg(target_os = "macos")]
+                        return Err(unsupported(
+                            "native tessellation requires the Vulkan host backend",
+                        ));
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let (raw, retained) = self.encode_native_pass(
+                                &mut encoder,
+                                dependencies,
+                                operations,
+                                index,
+                                end,
+                            )?;
+                            segments.push(encoder.finish());
+                            segments.push(raw);
+                            native.extend(retained);
+                            encoder =
+                                self.device
+                                    .create_command_encoder(&CommandEncoderDescriptor {
+                                        label: Some("Nixe resumed normal segment"),
+                                    });
+                        }
+                    } else {
+                        self.encode_render_pass(
+                            &mut encoder,
+                            dependencies,
+                            operations,
+                            index,
+                            end,
+                        )?;
+                    }
                     index = end;
                 }
                 GpuCommand::RenderPass(RenderPassOperation::End { .. }) => {
@@ -1721,7 +1811,12 @@ impl WgpuBackendDriver {
             }
             index += 1;
         }
-        Ok(encoder)
+        Ok(EncodedSubmission {
+            last: encoder,
+            segments,
+            #[cfg(not(target_os = "macos"))]
+            native,
+        })
     }
 
     fn stage_buffer_upload(
@@ -2207,6 +2302,29 @@ impl WgpuBackendDriver {
         for (operation_index, operation) in operations[begin + 1..end].iter().enumerate() {
             let operation_index = begin + 1 + operation_index;
             if let GpuCommand::Draw(draw) = operation.command() {
+                if draw.prepared.cull_mode == nixe_gpu::CullMode::FrontAndBack
+                    && !matches!(
+                        draw.prepared.topology,
+                        PrimitiveTopology::Points
+                            | PrimitiveTopology::Lines
+                            | PrimitiveTopology::LineStrip
+                    )
+                {
+                    return Err(unsupported("ordinary wgpu front-and-back face culling"));
+                }
+                if draw.prepared.triangle_rasterization == TriangleRasterization::FillRectangle
+                    && draw.prepared.cull_mode != nixe_gpu::CullMode::None
+                {
+                    return Err(unsupported("face culling before fill-rectangle expansion"));
+                }
+                if matches!(
+                    draw.prepared.triangle_rasterization,
+                    TriangleRasterization::Wireframe { .. }
+                ) {
+                    return Err(unsupported(
+                        "ordinary wgpu rectangular/smooth wireframe rasterization; native tessellation required",
+                    ));
+                }
                 if draw.prepared.topology == PrimitiveTopology::Quads {
                     if draw.prepared.triangle_rasterization != TriangleRasterization::Fill {
                         return Err(unsupported("non-fill quad rasterization"));
@@ -2354,7 +2472,10 @@ impl WgpuBackendDriver {
                         }
                         let (first_vertex, vertex_count) =
                             match draw.prepared.triangle_rasterization {
-                                TriangleRasterization::Fill => (first_vertex, vertex_count),
+                                TriangleRasterization::Fill
+                                | TriangleRasterization::Wireframe { .. } => {
+                                    (first_vertex, vertex_count)
+                                }
                                 TriangleRasterization::FillRectangle => (
                                     first_vertex.checked_mul(2).ok_or_else(|| {
                                         unsupported("fill-rectangle first vertex overflow")
@@ -2410,6 +2531,22 @@ impl WgpuBackendDriver {
         }
         self.draw_bind_groups = draw_bind_groups;
         self.draw_pipelines = draw_pipelines;
+        #[cfg(not(target_os = "macos"))]
+        for attachment in attachments
+            .iter()
+            .filter(|a| a.store == AttachmentStore::Discard)
+        {
+            let handle =
+                dependency_handle(dependencies, ResourceDependency::Image(attachment.image))?;
+            if let Some(Resource::Image {
+                native_initialized, ..
+            }) = self.resource_record_mut(handle)?.host.as_mut()
+            {
+                // wgpu will initialize a discarded subresource on its next use.
+                // Raw writes must not be erased by that deferred initialization.
+                *native_initialized = false;
+            }
+        }
         Ok(())
     }
 
@@ -2650,11 +2787,18 @@ impl WgpuBackendDriver {
         )?;
         let vertex = shader_handle_for_stage(dependencies, operation, ShaderStage::Vertex)?;
         let fragment = shader_handle_for_stage(dependencies, operation, ShaderStage::Fragment)?;
-        let color_format = attachments
+        let mut colors = attachments
             .iter()
-            .find(|attachment| attachment.kind == nixe_gpu::ImageKind::Color)
+            .filter(|a| a.kind == nixe_gpu::ImageKind::Color);
+        let color_format = colors
+            .next()
             .ok_or_else(|| unsupported("graphics draw without color attachment"))?
             .format;
+        if colors.next().is_some() {
+            return Err(unsupported(
+                "ordinary graphics currently requires exactly one color attachment",
+            ));
+        }
         let depth_format = attachments
             .iter()
             .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
@@ -2821,8 +2965,10 @@ impl WgpuBackendDriver {
         let target = ColorTargetState {
             format: texture_format(color_format)
                 .ok_or_else(|| unsupported("color attachment format"))?,
-            blend: None,
-            write_mask: ColorWrites::ALL,
+            blend: draw.prepared.color_outputs[0].blend.map(color::blend),
+            write_mask: ColorWrites::from_bits_retain(u32::from(
+                draw.prepared.color_outputs[0].write_mask.bits(),
+            )),
         };
         let targets = [Some(target)];
         let depth_stencil = depth_format
@@ -2941,8 +3087,18 @@ impl WgpuBackendDriver {
                 primitive: PrimitiveState {
                     topology: primitive_topology(draw.prepared.topology)?,
                     strip_index_format: None,
-                    front_face: FrontFace::Ccw,
-                    cull_mode: None,
+                    front_face: match draw.prepared.front_face {
+                        nixe_gpu::FrontFace::CounterClockwise => FrontFace::Ccw,
+                        nixe_gpu::FrontFace::Clockwise => FrontFace::Cw,
+                    },
+                    cull_mode: match draw.prepared.cull_mode {
+                        nixe_gpu::CullMode::None => None,
+                        nixe_gpu::CullMode::Front => Some(wgpu::Face::Front),
+                        nixe_gpu::CullMode::Back => Some(wgpu::Face::Back),
+                        // Polygon draws were rejected at consumption. Direct
+                        // points/lines are unaffected by polygon culling.
+                        nixe_gpu::CullMode::FrontAndBack => None,
+                    },
                     unclipped_depth: false,
                     polygon_mode: PolygonMode::Fill,
                     conservative: false,
@@ -3009,7 +3165,7 @@ impl WgpuBackendDriver {
     }
 
     fn shader_for_stage(
-        &self,
+        &mut self,
         dependencies: &ResolvedBackendResources,
         operation: usize,
         stage: ShaderStage,
@@ -3025,7 +3181,25 @@ impl WgpuBackendDriver {
         let Resource::Shader { module, neutral } = self.resource(handle)? else {
             return Err(kind_mismatch(handle));
         };
-        Ok((handle, module.clone(), neutral.clone()))
+        let neutral = neutral.clone();
+        if let Some(module) = module {
+            return Ok((handle, module.clone(), neutral));
+        }
+        let wgsl = nixe_gpu::lower_shader_ir_to_wgsl(neutral.ir()).map_err(|error| {
+            BackendDriverError::failure(format!("WGSL shader lowering failed: {error}"))
+        })?;
+        let scope = self.device.push_error_scope(ErrorFilter::Validation);
+        let compiled = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Nixe translated shader"),
+            source: ShaderSource::Wgsl(wgsl.source().into()),
+        });
+        self.capture_error_scope(scope)?;
+        if let Some(Resource::Shader { module, .. }) =
+            self.resource_record_mut(handle)?.host.as_mut()
+        {
+            *module = Some(compiled.clone());
+        }
+        Ok((handle, compiled, neutral))
     }
 
     fn encode_buffer_writeback(
@@ -3410,6 +3584,8 @@ impl WgpuBackendDriver {
     }
 
     fn remove_resource_record(&mut self, handle: BackendResourceHandle) -> Option<ResourceRecord> {
+        #[cfg(not(target_os = "macos"))]
+        self.native.invalidate_resource(handle);
         let index = usize::try_from(handle.slot()).ok()?;
         let record = if self
             .resources
@@ -3760,6 +3936,8 @@ impl WgpuBackendDriver {
                     description: *description,
                     view: view.clone(),
                     attachment_views: HashMap::new(),
+                    #[cfg(not(target_os = "macos"))]
+                    native_initialized: false,
                 }
             }
             BackendResourceCreateInfo::Sampler { description, .. } => Resource::Sampler {
@@ -3778,10 +3956,7 @@ impl WgpuBackendDriver {
                 }),
             },
             BackendResourceCreateInfo::Shader { module, .. } => Resource::Shader {
-                module: self.device.create_shader_module(ShaderModuleDescriptor {
-                    label: Some("Nixe translated shader"),
-                    source: ShaderSource::Wgsl(module.source().into()),
-                }),
+                module: None,
                 neutral: module.clone(),
             },
             BackendResourceCreateInfo::Pipeline { description, .. } => Resource::Pipeline {
@@ -3791,6 +3966,8 @@ impl WgpuBackendDriver {
             BackendResourceCreateInfo::DescriptorTable { bindings, .. } => {
                 Resource::DescriptorTable {
                     bindings: bindings.clone(),
+                    #[cfg(not(target_os = "macos"))]
+                    native_indices: None,
                     bind_groups: HashMap::new(),
                 }
             }
@@ -3862,6 +4039,8 @@ impl WgpuBackendDriver {
             };
             match candidate {
                 ResidencyCandidate::Resource(handle) => {
+                    #[cfg(not(target_os = "macos"))]
+                    self.native.invalidate_resource(handle);
                     let resident_bytes = {
                         let record = self
                             .resource_record_mut(handle)
@@ -4216,11 +4395,20 @@ impl BackendDriver for WgpuBackendDriver {
                 label: Some("Nixe neutral submission"),
             });
         self.upload_inputs(accepted, dependencies, &mut encoder)?;
-        let encoder = self.encode_submission(accepted, dependencies, encoder)?;
+        let EncodedSubmission {
+            last: encoder,
+            segments,
+            #[cfg(not(target_os = "macos"))]
+            native,
+        } = self.encode_submission(accepted, dependencies, encoder)?;
         self.upload_staging.finish_and_recall_on_submit(&encoder);
         let submission_index = {
             let _queue_access = self.queue_access.lock();
-            self.queue.submit([encoder.finish()])
+            self.queue.submit(
+                segments
+                    .into_iter()
+                    .chain(std::iter::once(encoder.finish())),
+            )
         };
         let token = accepted.token();
         self.submissions.insert(
@@ -4228,6 +4416,8 @@ impl BackendDriver for WgpuBackendDriver {
             HostSubmission {
                 index: submission_index,
                 completed: false,
+                #[cfg(not(target_os = "macos"))]
+                native,
             },
         );
         let completed = self.completion_sender.clone();
@@ -4357,10 +4547,36 @@ impl BackendDriver for WgpuBackendDriver {
         if self.torn_down {
             return Ok(());
         }
+        #[cfg(not(target_os = "macos"))]
+        self.wait_native_uses()?;
         let cache_result = self.persist_pipeline_cache();
+        #[cfg(not(target_os = "macos"))]
+        let cache_result = cache_result.and(self.native.persist());
         self.clear_owned_state();
         self.torn_down = true;
         cache_result
+    }
+}
+
+impl WgpuBackendDriver {
+    #[cfg(not(target_os = "macos"))]
+    fn wait_native_uses(&mut self) -> Result<(), BackendDriverError> {
+        if self.submissions.values().any(|s| !s.native.is_empty()) {
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| BackendDriverError::device_lost(e.to_string()))?;
+            self.drain_completions();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WgpuBackendDriver {
+    fn drop(&mut self) {
+        // Raw objects are invisible to wgpu's deferred destruction. Only final
+        // backend destruction can wait; cache eviction and submissions never do.
+        #[cfg(not(target_os = "macos"))]
+        let _ = self.wait_native_uses();
     }
 }
 
@@ -5074,7 +5290,7 @@ fn estimated_resident_bytes(info: &BackendResourceCreateInfo) -> Result<u64, Bac
                 .ok_or_else(|| unsupported("image residency size overflow"))
         }
         BackendResourceCreateInfo::Shader { module, .. } => {
-            Ok(module.source().len().try_into().unwrap_or(u64::MAX))
+            Ok(module.retained_bytes().try_into().unwrap_or(u64::MAX))
         }
         _ => Ok(0),
     }
@@ -5509,12 +5725,15 @@ mod tests {
         };
         let fingerprint = |layout: &VertexBufferLayout, topology, quad_flat| {
             nixe_gpu::cache_fingerprint(&super::RenderPipelineFingerprintInput {
+                front_face: nixe_gpu::FrontFace::CounterClockwise,
+                cull_mode: nixe_gpu::CullMode::None,
                 quad_flat,
                 vertex: shader(1),
                 fragment: shader(2),
                 topology,
                 triangle_rasterization: TriangleRasterization::Fill,
                 alpha_test: None,
+                color_output: nixe_gpu::ColorOutputState::REPLACE,
                 color_format: ImageFormat::Rgba8Unorm,
                 depth_format: None,
                 depth_state: DepthState::DISABLED,

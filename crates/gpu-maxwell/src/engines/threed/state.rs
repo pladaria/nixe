@@ -10,6 +10,8 @@ use nixe_gpu::GpuMethodId;
 
 use crate::MaxwellMethodSource;
 
+use super::output::{BLEND_SEPARATE_ALPHA_BASE, BLEND_SEPARATE_ALPHA_RESET, BLEND_TARGET_STRIDE};
+
 use super::{
     MAXWELL_COLOR_TARGET_COUNT, MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
     MaxwellThreeDColorReductionStateWrite, MaxwellThreeDConstantColorRenderingState,
@@ -22,7 +24,7 @@ use super::{
     MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
     MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState,
     MaxwellThreeDLineStateWrite, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
-    MaxwellThreeDMmeStateWrite, MaxwellThreeDPolygonMode, MaxwellThreeDRenderEnableState,
+    MaxwellThreeDMmeStateWrite, MaxwellThreeDRenderEnableState,
     MaxwellThreeDRenderEnableStateWrite, MaxwellThreeDRenderTargetState,
     MaxwellThreeDRenderTargetWrite, MaxwellThreeDReportSemaphoreState,
     MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDResourceRole,
@@ -92,6 +94,16 @@ pub(super) const MAXWELL_THREE_D_WINDOW_ORIGIN_RESET: u32 = 0;
 /// unknown rather than being silently fabricated as zero.
 pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u32> {
     match method.0 {
+        raw if raw >= BLEND_SEPARATE_ALPHA_BASE
+            && raw
+                < BLEND_SEPARATE_ALPHA_BASE
+                    + MAXWELL_COLOR_TARGET_COUNT as u32 * BLEND_TARGET_STRIDE
+            && (raw - BLEND_SEPARATE_ALPHA_BASE).is_multiple_of(BLEND_TARGET_STRIDE) =>
+        {
+            Some(BLEND_SEPARATE_ALPHA_RESET)
+        }
+        // Typed line-state defaults and sources live in line.rs.
+        0x0f8c | 0x166c => Some(0),
         MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD | MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD => {
             Some(MAXWELL_THREE_D_POLYGON_MODE_RESET)
         }
@@ -902,6 +914,14 @@ impl MaxwellThreeDDrawStateIdentity {
     }
 }
 
+/// Primitive class consumed by raster state, independent of assembly/winding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GeneratedPrimitive {
+    Points,
+    Lines,
+    Triangles,
+}
+
 impl MaxwellThreeDShaderStateIdentity {
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
         Arc::ptr_eq(&self.scope, &state.cache_scope) && self.revision == state.shader_revision
@@ -964,6 +984,8 @@ impl Default for MaxwellThreeDFrontendState {
     fn default() -> Self {
         let mut raw_registers = BTreeMap::new();
         for method in [
+            0x0f8c,
+            0x166c,
             MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD,
@@ -989,6 +1011,14 @@ impl Default for MaxwellThreeDFrontendState {
             }
         }
         for target in 0..MAXWELL_COLOR_TARGET_COUNT {
+            let blend_method = BLEND_SEPARATE_ALPHA_BASE + target as u32 * BLEND_TARGET_STRIDE;
+            raw_registers.insert(
+                blend_method,
+                MaxwellThreeDRegister::verified_reset(
+                    BLEND_SEPARATE_ALPHA_RESET,
+                    Some(BLEND_SEPARATE_ALPHA_RESET),
+                ),
+            );
             let method = MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD
                 + target as u32 * MAXWELL_THREE_D_COLOR_TARGET_STRIDE
                 + MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET;
@@ -1234,28 +1264,26 @@ impl MaxwellThreeDState {
         usage.effective(anti_alias_enable)
     }
 
-    pub(crate) fn edge_flag_affects_draw(&self) -> bool {
-        let polygon_topology = self
-            .vertex_input
-            .primitive()
-            .active_begin()
-            .is_some_and(|begin| matches!(begin.topology(), 4..=7));
-        let non_fill_polygon_mode = [
-            MaxwellThreeDFixedFunctionRegister::FrontPolygonMode,
-            MaxwellThreeDFixedFunctionRegister::BackPolygonMode,
-        ]
-        .into_iter()
-        .any(|register| {
-            matches!(
-                self.fixed_function.register(register).value(),
-                Some(MaxwellThreeDFixedFunctionValue::PolygonMode(
-                    MaxwellThreeDPolygonMode::Point | MaxwellThreeDPolygonMode::Line
-                ))
-            )
-        });
-        polygon_topology
-            && non_fill_polygon_mode
-            && self.raster.edge_flag.value() == Some(&MaxwellThreeDEdgeFlag::Disabled)
+    /// Patches consume the tessellator's output primitive, not their input topology.
+    pub(super) fn generated_primitive(&self) -> Option<GeneratedPrimitive> {
+        use GeneratedPrimitive as Output;
+        match self.vertex_input.primitive().active_begin()?.topology() {
+            0 => Some(Output::Points),
+            1 | 3 => Some(Output::Lines),
+            4..=7 => Some(Output::Triangles),
+            14 => self
+                .shader_bindings
+                .tessellation_mode()
+                .value()?
+                .lower()
+                .ok()
+                .map(|mode| match mode.output {
+                    nixe_gpu::TessellationOutput::Points => Output::Points,
+                    nixe_gpu::TessellationOutput::Lines => Output::Lines,
+                    nixe_gpu::TessellationOutput::Triangles(_) => Output::Triangles,
+                }),
+            _ => None,
+        }
     }
 }
 
@@ -1748,6 +1776,8 @@ impl MaxwellThreeDStateWrite {
                 MaxwellThreeDVertexInputWrite::VertexArrayStart { .. }
                     | MaxwellThreeDVertexInputWrite::GlobalBaseInstanceIndex { .. }
             ),
+            Self::ShaderBinding(MaxwellThreeDShaderBindingWrite::TessellationMode { .. }
+                | MaxwellThreeDShaderBindingWrite::TessellationLod { .. }) => true,
             Self::InlineToMemory(_)
             // Z-cull only describes the guest's hierarchical cache. The
             // neutral draw always uses its ordinary depth/stencil tests.

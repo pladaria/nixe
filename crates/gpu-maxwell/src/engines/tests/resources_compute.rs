@@ -1153,6 +1153,128 @@ fn check_depth_2cz_materialization(
 }
 
 #[test]
+fn unselected_depth_target_suppresses_draw_tests_but_not_explicit_clear_resources() {
+    let mut address_space = resource_address_space();
+    let vertex = map_resource(
+        &mut address_space,
+        CanonicalAllocation::zeroed(0x4000, 0x1000)
+            .unwrap()
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        61,
+        0,
+    )
+    .offset()
+    .get();
+    let color = map_resource(
+        &mut address_space,
+        CanonicalAllocation::zeroed(0x10000, 0x1000)
+            .unwrap()
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        62,
+        0xfe,
+    )
+    .offset()
+    .get();
+    let mut channel = three_d_channel();
+    program_basic_draw_state(&mut channel, vertex);
+    program_color_target(&mut channel, 0, color, 0xd5);
+    program_three_d(&mut channel, 0x121c, color_target_selection_raw(1, [0; 8]));
+    let (shaders, mut cache) = translated_graphics_shaders();
+    let capabilities =
+        lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
+
+    // A missing selector is not proof that no depth buffer is selected.
+    program_three_d(&mut channel, 0x12cc, 1);
+    let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+    let operation = &dispatch.operations()[0];
+    let mut roles = Vec::new();
+    operation
+        .trigger()
+        .append_resource_roles(operation.state(), &mut roles);
+    assert!(roles.contains(&MaxwellThreeDResourceRole::DepthStencilTarget));
+
+    // The default deko3d depth state enables depth testing/writes even when
+    // bindRenderTargets supplies no depth image. Stencil must obey the same
+    // selection, including transitions after a cached successful draw.
+    for (serial, (selected, stencil)) in [(0, 0), (1, 0), (0, 0), (0, 1), (1, 1), (0, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        program_three_d(&mut channel, 0x1538, selected);
+        program_three_d(&mut channel, 0x1380, stencil);
+        program_three_d(&mut channel, 0x12e8, 1);
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let operation = &dispatch.operations()[0];
+        roles.clear();
+        operation
+            .trigger()
+            .append_resource_roles(operation.state(), &mut roles);
+        assert_eq!(
+            roles.contains(&MaxwellThreeDResourceRole::DepthStencilTarget),
+            selected != 0
+        );
+        let resources = cache.resolved_resources_mut().resolve(
+            operation.state(),
+            &address_space,
+            &roles,
+            None,
+            false,
+            4,
+        );
+        if selected != 0 {
+            assert!(matches!(
+                resources,
+                Err(MaxwellThreeDResourceError::IncompleteState {
+                    role: MaxwellThreeDResourceRole::DepthStencilTarget,
+                })
+            ));
+            continue;
+        }
+        let resources = resources.unwrap();
+        assert!(
+            resources
+                .resources()
+                .iter()
+                .all(|r| r.role() != MaxwellThreeDResourceRole::DepthStencilTarget)
+        );
+        let plan = lower_maxwell_three_d_operation(
+            operation.state(),
+            &resources,
+            operation.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(serial as u64 + 1),
+            Vec::new(),
+            &capabilities,
+            &mut cache,
+        )
+        .unwrap();
+        for operation in plan.submission().operations() {
+            match operation.command() {
+                GpuCommand::Draw(draw) => {
+                    assert_eq!(draw.prepared.depth_state, nixe_gpu::DepthState::DISABLED);
+                }
+                GpuCommand::RenderPass(RenderPassOperation::Begin { attachments, .. }) => {
+                    assert_eq!(attachments.len(), 1);
+                    assert_eq!(attachments[0].kind, nixe_gpu::ImageKind::Color);
+                }
+                _ => {}
+            }
+        }
+        // A stale, partially programmed descriptor must also remain unused.
+        program_three_d(&mut channel, 0x0fe4, 0xdead_0000);
+    }
+
+    let clear = dispatch_method(&mut channel, 0x19d0 / 4, 1).unwrap();
+    roles.clear();
+    clear.operations()[0]
+        .trigger()
+        .append_resource_roles(channel.three_d(), &mut roles);
+    assert_eq!(roles, [MaxwellThreeDResourceRole::DepthStencilTarget]);
+}
+
+#[test]
 fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
     check_draw_compressed_depth_aspects(0x16, 0x17);
 }
@@ -2033,7 +2155,11 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
     let vertex = vertex_mapping.offset().get();
     let target = target_mapping.offset().get();
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     for (method, argument) in [
+        (0x1918, 1),
+        (0x191c, 0x901),
+        (0x1920, 0x405),
         (0x1c00, 0x1018),
         (0x1c04, (vertex >> 32) as u32),
         (0x1c08, vertex as u32),
@@ -2296,6 +2422,11 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
     let GpuCommand::Draw(draw) = commands[1] else {
         panic!("middle neutral command must be the draw");
     };
+    assert_eq!(
+        draw.prepared.front_face,
+        nixe_gpu::FrontFace::CounterClockwise
+    );
+    assert_eq!(draw.prepared.cull_mode, nixe_gpu::CullMode::Back);
     assert_eq!(draw.prepared.vertex_buffers.len(), 1);
     assert_eq!(draw.prepared.vertex_buffers[0].array_stride, 24);
     assert_eq!(draw.prepared.vertex_buffers[0].attributes.len(), 2);
@@ -2426,7 +2557,10 @@ fn procedural_draw_lowers_without_fabricating_a_vertex_stream() {
     .offset()
     .get();
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     for (method, argument) in [
+        (0x1918, 0),
+        (0x191c, 0x901),
         (0x0d74, 0),
         (0x0308, 3),
         (0x1618, 4),

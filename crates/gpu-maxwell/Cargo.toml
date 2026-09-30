@@ -11,3 +11,11 @@ nixe-memory.workspace = true
 
 [dev-dependencies]
 naga = { version = "30.0.0", features = ["wgsl-in"] }
+
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
+# Opt-in execution of the existing captured shader fixtures; no backend coupling
+# in the Maxwell production frontend.
+nixe-gpu-wgpu.workspace = true
+wgpu.workspace = true
+ash = "=0.38.0"
+pollster.workspace = true

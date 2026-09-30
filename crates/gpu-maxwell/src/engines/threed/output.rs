@@ -11,6 +11,22 @@ pub const MAXWELL_VIEWPORT_COUNT: usize = 16;
 pub const MAXWELL_SCISSOR_COUNT: usize = 16;
 pub const MAXWELL_WINDOW_CLIP_COUNT: usize = 8;
 
+pub(super) const BLEND_SEPARATE_ALPHA_BASE: u32 = 0x1e00;
+pub(super) const BLEND_TARGET_STRIDE: u32 = 0x20;
+/// Initial channel context, not a draw-time fallback. NVIDIA's GM20B method
+/// initialization (shared with GM200) sets all eight B197 selectors to one.
+/// The installed table's SHA-256 is
+/// 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24.
+/// No firmware bytes are embedded here. Nouveau's public Maxwell context table
+/// independently documents the same eight writes:
+/// https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgm107.c#L360-L366
+/// GM20B table provenance and address/class decoding:
+/// https://gitlab.com/kernel-firmware/linux-firmware/-/blob/main/WHENCE
+/// https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
+/// Encoding:
+/// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3309-L3312
+pub(super) const BLEND_SEPARATE_ALPHA_RESET: u32 = 1;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellThreeDCompareOp {
     Never,
@@ -1074,7 +1090,14 @@ impl Default for MaxwellThreeDFixedFunctionState {
             blend_enable_common: Default::default(),
             blend_enable: Default::default(),
             color_mask: Default::default(),
-            per_target_blend: std::array::from_fn(|_| std::array::from_fn(|_| Default::default())),
+            per_target_blend: std::array::from_fn(|_| {
+                let mut blend = std::array::from_fn(|_| Default::default());
+                blend[0] = MaxwellThreeDRegister::verified_reset(
+                    BLEND_SEPARATE_ALPHA_RESET,
+                    Some(MaxwellThreeDFixedFunctionValue::Boolean(true)),
+                );
+                blend
+            }),
             blend_controls: Default::default(),
         }
     }

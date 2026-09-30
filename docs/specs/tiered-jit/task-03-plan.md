@@ -1315,9 +1315,6 @@ executable; do not route homebrews to an incomplete implementation.
   LD_LIBRARY_PATH=target/release timeout --signal=INT --kill-after=30s 45s
   target/release/nixe-cli --log-level debug --headless run es2gears`.
   The successful stop reports released resources and a saved pipeline cache.
-  A preceding run with a five-second shutdown allowance was forcibly killed;
-  that allowance is not evidence of a lifecycle failure. A sandbox run selected
-  llvmpipe and could not persist its cache; it is not GPU performance evidence.
   The maintainer also confirms windowed execution, but reports about 10 FPS
   versus 60 before cutover. The subsequent maintainer-run capture in
   `dump/perf-20260911-110035-1KN0ac/` identifies full unit-registry scans in
