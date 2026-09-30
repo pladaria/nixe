@@ -930,8 +930,8 @@ impl MaxwellThreeDResolvedResourceCache {
         let entry = &self.entries[index];
         if entry.address_space != address_space.id()
             || entry.inspect_complete_state != inspect_complete_state
-            || entry.roles.as_ref() != required_roles
             || !entry.state.matches(state)
+            || entry.roles.as_ref() != required_roles
             || !entry.resources.image_content_dependencies_current()
         {
             return Ok(false);

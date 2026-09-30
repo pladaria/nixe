@@ -12,15 +12,23 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use nixe_gpu::lower_shader_ir_to_wgsl;
 use nixe_gpu::{
-    ShaderBackendLoweringError, ShaderBackendModule, ShaderFloatComparison, ShaderFloatControl,
-    ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
-    ShaderMathAccuracy, ShaderNanMode, ShaderOperation, ShaderPredicate,
-    ShaderPredicateSetOperation, ShaderRegister, ShaderResourceAccess, ShaderResourceKind,
-    ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderSpecialFunction, ShaderStage,
-    ShaderTextureSampleOutput, ShaderVerificationError, VerifiedShaderIr, lower_shader_ir_to_wgsl,
+    ShaderBackendModule, ShaderFloatComparison, ShaderFloatControl, ShaderInstruction,
+    ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr, ShaderMathAccuracy,
+    ShaderNanMode, ShaderOperation, ShaderPredicate, ShaderPredicateSetOperation, ShaderRegister,
+    ShaderResourceAccess, ShaderResourceKind, ShaderRoundingMode, ShaderScalarType,
+    ShaderSourceLocation, ShaderSpecialFunction, ShaderStage, ShaderTextureSampleOutput,
+    ShaderVerificationError, VerifiedShaderIr,
 };
 use nixe_memory::{CanonicalBackingRange, CanonicalCpuWriteDependency, MemoryPermissions};
+
+#[cfg(test)]
+mod float_control_tests;
+mod integer;
+mod patch_address;
+mod tessellation;
 
 use crate::{
     MAXWELL_PIPELINE_SHADER_COUNT, MAXWELL_VERTEX_ATTRIBUTE_COUNT, MaxwellGpuAccessError,
@@ -362,7 +370,7 @@ impl Hash for MaxwellShaderProgramTranslationInput {
 pub(crate) struct MaxwellShaderTranslationKey {
     input: Arc<MaxwellShaderProgramTranslationInput>,
     resource_binding_remap: Box<[(u8, u8)]>,
-    linked_output_interpolation: Box<[(ShaderIoLocation, ShaderInterpolation)]>,
+    linked_output_interpolation: Box<[((ShaderIoLocation, u8), ShaderInterpolation)]>,
 }
 
 /// One verified neutral program and its portable backend module.
@@ -596,12 +604,13 @@ pub enum MaxwellShaderTranslationError {
         detail: &'static str,
     },
     StageInterfaceMismatch {
+        producer: ShaderStage,
+        consumer: ShaderStage,
         location: ShaderIoLocation,
         component: u8,
         reason: &'static str,
     },
     Verification(ShaderVerificationError),
-    BackendLowering(ShaderBackendLoweringError),
     ProgramDoesNotExit {
         stage: MaxwellThreeDShaderStage,
         limit: usize,
@@ -694,12 +703,14 @@ impl Display for MaxwellShaderTranslationError {
                 "malformed Maxwell {stage:?} instruction at offset 0x{instruction_offset:x}: encoding=0x{encoding:016x} reason={reason}"
             ),
             Self::StageInterfaceMismatch {
+                producer,
+                consumer,
                 location,
                 component,
                 reason,
             } => write!(
                 formatter,
-                "Maxwell graphics shader interface does not link at {location:?}.{component}: {reason}"
+                "Maxwell graphics shader interface {producer:?} -> {consumer:?} does not link at {location:?}.{component}: {reason}"
             ),
             Self::UnsupportedHeaderFeature { stage, feature } => write!(
                 formatter,
@@ -718,12 +729,6 @@ impl Display for MaxwellShaderTranslationError {
                 formatter,
                 "translated Maxwell shader failed neutral verification: {error}"
             ),
-            Self::BackendLowering(error) => {
-                write!(
-                    formatter,
-                    "verified Maxwell shader cannot be lowered to a backend module: {error}"
-                )
-            }
             Self::ProgramDoesNotExit { stage, limit } => write!(
                 formatter,
                 "Maxwell {stage:?} shader has no EXIT within the {limit}-byte decoding bound"
@@ -748,12 +753,6 @@ impl std::error::Error for MaxwellShaderTranslationError {}
 impl From<ShaderVerificationError> for MaxwellShaderTranslationError {
     fn from(value: ShaderVerificationError) -> Self {
         Self::Verification(value)
-    }
-}
-
-impl From<ShaderBackendLoweringError> for MaxwellShaderTranslationError {
-    fn from(value: ShaderBackendLoweringError) -> Self {
-        Self::BackendLowering(value)
     }
 }
 
@@ -954,6 +953,7 @@ fn translate_shader_binary(
     let mut active_reconvergence_targets = Vec::new();
     let mut pending_range_reduction = None;
     let mut exited = false;
+    let mut patch_addresses = patch_address::PatchAddresses::default();
     let code_size = u32::try_from(binary.bundles().len() * MAXWELL_SCHEDULE_BUNDLE_SIZE)
         .expect("bounded Maxwell shader code size fits u32");
 
@@ -964,6 +964,7 @@ fn translate_shader_binary(
                 + (slot * MAXWELL_INSTRUCTION_SIZE) as u32;
             let source = ShaderSourceLocation::new(offset);
             let predicate = decode_predicate(encoding);
+            let translated_start = instructions.len();
 
             if let Some(range_reduction) = pending_range_reduction.as_ref()
                 && !is_compatible_mufu(range_reduction, encoding, predicate)
@@ -985,6 +986,19 @@ fn translate_shader_binary(
                 .retain(|target: &ShaderSourceLocation| target.byte_offset() > offset);
 
             if is_exit(encoding) {
+                if matches!(
+                    stage,
+                    MaxwellThreeDShaderStage::TessellationInit
+                        | MaxwellThreeDShaderStage::Tessellation
+                ) && predicate != ShaderPredicate::Always
+                {
+                    return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                        stage,
+                        instruction_offset: offset,
+                        encoding,
+                        detail: "conditional tessellation EXIT requires complete shader control-flow discovery",
+                    });
+                }
                 append_implicit_outputs(
                     neutral_stage,
                     source,
@@ -997,6 +1011,7 @@ fn translate_shader_binary(
                     predicate,
                     ShaderOperation::Exit,
                 ));
+                patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
                 exited = true;
                 break 'bundles;
             }
@@ -1030,6 +1045,7 @@ fn translate_shader_binary(
                         ShaderOperation::Branch { target },
                     ));
                 }
+                patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
                 continue;
             }
 
@@ -1055,270 +1071,345 @@ fn translate_shader_binary(
                 continue;
             }
 
-            let operation = if is_branch(encoding) {
-                ShaderOperation::Branch {
-                    target: decode_shader_control_target(stage, offset, encoding, code_size)?,
-                }
-            } else if is_attribute_load(encoding) {
-                let operations = decode_attribute_load(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    vertex_input_types,
-                )?;
-                for operation in &operations {
-                    if let ShaderOperation::LoadInput {
-                        location:
-                            location @ (ShaderIoLocation::VertexId | ShaderIoLocation::InstanceId),
-                        scalar_type,
-                        ..
-                    } = operation
-                        && !inputs.iter().any(|input| input.location() == *location)
-                    {
-                        inputs.push(
-                            ShaderInterfaceElement::new(*location, 0, *scalar_type, None)
-                                .expect("Maxwell vertex system values are scalar inputs"),
-                        );
-                    }
-                }
+            if let Some(operations) = patch_addresses.lower(
+                stage,
+                offset,
+                encoding,
+                register_count,
+                &mut next_temporary,
+                &mut inputs,
+            )? {
                 instructions.extend(
                     operations
                         .into_iter()
                         .map(|operation| ShaderInstruction::new(source, predicate, operation)),
                 );
                 continue;
-            } else if is_attribute_store(encoding) {
-                let operation = decode_attribute_store(stage, offset, encoding, register_count)?;
-                if let ShaderOperation::StoreOutput {
-                    location,
-                    first_component,
-                    sources,
-                    ..
-                } = &operation
-                {
-                    for component in 0..sources.len() {
-                        explicitly_stored
-                            .insert((*location, first_component.saturating_add(component as u8)));
+            }
+            'instruction: {
+                let operation = if is_branch(encoding) {
+                    ShaderOperation::Branch {
+                        target: decode_shader_control_target(stage, offset, encoding, code_size)?,
                     }
-                }
-                operation
-            } else if is_move_immediate(encoding) {
-                decode_move_immediate(stage, offset, encoding, register_count)?
-            } else if is_move(encoding) {
-                let decoded =
-                    decode_move(stage, offset, encoding, register_count, &mut next_temporary)?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_shift_left(encoding) {
-                let decoded = decode_shift_left(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut next_temporary,
-                )?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_integer_to_float(encoding) {
-                let decoded = decode_integer_to_float(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut next_temporary,
-                )?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_float_to_float(encoding) {
-                let decoded = decode_float_to_float(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut next_temporary,
-                )?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_float_to_integer(encoding) {
-                let decoded = decode_float_to_integer(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut next_temporary,
-                )?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_constant_buffer_load(encoding) {
-                let decoded = decode_constant_buffer_load(stage, offset, encoding, register_count)?;
-                constant_buffer_bindings.insert(decoded.constant_buffer_binding);
-                instructions.push(ShaderInstruction::new(source, predicate, decoded.operation));
-                continue;
-            } else if is_texture_sample_simplified(encoding) {
-                decode_texture_sample_simplified(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut texture_bindings,
-                )?
-            } else if is_interpolate(encoding) {
-                decode_interpolate(stage, offset, encoding, register_count, &inputs)?
-            } else if is_mufu(encoding) {
-                if let Some(range_reduction) = pending_range_reduction.take() {
-                    if let Some(binding) = range_reduction.constant_buffer_binding {
-                        constant_buffer_bindings.insert(binding);
-                    }
-                    let operation = decode_range_reduced_mufu(
+                } else if tessellation::is_system_register_read(encoding) {
+                    tessellation::decode_system_register(
                         stage,
                         offset,
                         encoding,
                         register_count,
-                        &range_reduction,
+                        &mut inputs,
+                    )?
+                } else if is_attribute_load(encoding) {
+                    let operations = decode_attribute_load(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        vertex_input_types,
                     )?;
+                    for operation in &operations {
+                        if let ShaderOperation::LoadInput {
+                            location:
+                                location @ (ShaderIoLocation::VertexId | ShaderIoLocation::InstanceId),
+                            scalar_type,
+                            ..
+                        } = operation
+                            && !inputs.iter().any(|input| input.location() == *location)
+                        {
+                            inputs.push(
+                                ShaderInterfaceElement::new(*location, 0, *scalar_type, None)
+                                    .expect("Maxwell vertex system values are scalar inputs"),
+                            );
+                        }
+                    }
+                    instructions.extend(
+                        operations
+                            .into_iter()
+                            .map(|operation| ShaderInstruction::new(source, predicate, operation)),
+                    );
+                    break 'instruction;
+                } else if is_attribute_store(encoding) {
+                    if stage == MaxwellThreeDShaderStage::TessellationInit {
+                        let operations = tessellation::decode_control_store(
+                            stage,
+                            offset,
+                            encoding,
+                            register_count,
+                            &mut next_temporary,
+                            &mut inputs,
+                        )?;
+                        instructions.extend(operations.into_iter().map(|operation| {
+                            let predicate =
+                                if matches!(operation, ShaderOperation::LoadInput { .. }) {
+                                    ShaderPredicate::Always
+                                } else {
+                                    predicate
+                                };
+                            ShaderInstruction::new(source, predicate, operation)
+                        }));
+                        break 'instruction;
+                    }
+                    let operation =
+                        decode_attribute_store(stage, offset, encoding, register_count)?;
+                    if let ShaderOperation::StoreOutput {
+                        location,
+                        first_component,
+                        sources,
+                        ..
+                    } = &operation
+                    {
+                        for component in 0..sources.len() {
+                            explicitly_stored.insert((
+                                *location,
+                                first_component.saturating_add(component as u8),
+                            ));
+                        }
+                    }
+                    operation
+                } else if is_move_immediate(encoding) {
+                    decode_move_immediate(stage, offset, encoding, register_count)?
+                } else if is_move(encoding) {
+                    let decoded =
+                        decode_move(stage, offset, encoding, register_count, &mut next_temporary)?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
                     append_expanded_operations(
                         &mut instructions,
-                        range_reduction.source,
-                        range_reduction.predicate,
-                        range_reduction.preparation,
+                        source,
+                        predicate,
+                        decoded.operations,
                     );
-                    instructions.push(ShaderInstruction::new(source, predicate, operation));
-                    continue;
-                }
-                let operations =
-                    decode_mufu(stage, offset, encoding, register_count, &mut next_temporary)?;
-                append_expanded_operations(&mut instructions, source, predicate, operations);
-                continue;
-            } else if is_float_min_max(encoding) {
-                let decoded = decode_float_min_max(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut next_temporary,
-                )?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_float_multiply(encoding) {
-                let decoded = decode_float_multiply(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut next_temporary,
-                )?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_float_fused_multiply_add(encoding) {
-                let decoded = decode_float_fused_multiply_add(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut next_temporary,
-                )?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_float_add(encoding) {
-                let decoded =
-                    decode_float_add(stage, offset, encoding, register_count, &mut next_temporary)?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else if is_float_set_predicate(encoding) {
-                let decoded = decode_float_set_predicate(
-                    stage,
-                    offset,
-                    encoding,
-                    register_count,
-                    &mut next_temporary,
-                )?;
-                if let Some(binding) = decoded.constant_buffer_binding {
-                    constant_buffer_bindings.insert(binding);
-                }
-                append_expanded_operations(
-                    &mut instructions,
-                    source,
-                    predicate,
-                    decoded.operations,
-                );
-                continue;
-            } else {
-                return Err(unsupported_instruction(binary, offset, encoding));
-            };
-            instructions.push(ShaderInstruction::new(source, predicate, operation));
+                    break 'instruction;
+                } else if is_shift_left(encoding) {
+                    let decoded = decode_shift_left(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if is_integer_to_float(encoding) {
+                    let decoded = decode_integer_to_float(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if is_float_to_float(encoding) {
+                    let decoded = decode_float_to_float(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if is_float_to_integer(encoding) {
+                    let decoded = decode_float_to_integer(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if is_constant_buffer_load(encoding) {
+                    let decoded =
+                        decode_constant_buffer_load(stage, offset, encoding, register_count)?;
+                    constant_buffer_bindings.insert(decoded.constant_buffer_binding);
+                    instructions.push(ShaderInstruction::new(source, predicate, decoded.operation));
+                    break 'instruction;
+                } else if is_texture_sample_simplified(encoding) {
+                    decode_texture_sample_simplified(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut texture_bindings,
+                    )?
+                } else if is_interpolate(encoding) {
+                    decode_interpolate(stage, offset, encoding, register_count, &inputs)?
+                } else if is_mufu(encoding) {
+                    if let Some(range_reduction) = pending_range_reduction.take() {
+                        if let Some(binding) = range_reduction.constant_buffer_binding {
+                            constant_buffer_bindings.insert(binding);
+                        }
+                        let operation = decode_range_reduced_mufu(
+                            stage,
+                            offset,
+                            encoding,
+                            register_count,
+                            &range_reduction,
+                        )?;
+                        append_expanded_operations(
+                            &mut instructions,
+                            range_reduction.source,
+                            range_reduction.predicate,
+                            range_reduction.preparation,
+                        );
+                        instructions.push(ShaderInstruction::new(source, predicate, operation));
+                        break 'instruction;
+                    }
+                    let operations =
+                        decode_mufu(stage, offset, encoding, register_count, &mut next_temporary)?;
+                    append_expanded_operations(&mut instructions, source, predicate, operations);
+                    break 'instruction;
+                } else if is_float_min_max(encoding) {
+                    let decoded = decode_float_min_max(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if is_float_multiply(encoding) {
+                    let decoded = decode_float_multiply(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if is_float_fused_multiply_add(encoding) {
+                    let decoded = decode_float_fused_multiply_add(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if is_float_add(encoding) {
+                    let decoded = decode_float_add(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if integer::is_set_predicate(encoding) {
+                    let decoded = integer::decode_set_predicate(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    // Every source preparation inherits the predicate as well: a
+                    // source may itself only be defined under that condition.
+                    instructions.extend(
+                        decoded
+                            .operations
+                            .into_iter()
+                            .map(|operation| ShaderInstruction::new(source, predicate, operation)),
+                    );
+                    break 'instruction;
+                } else if is_float_set_predicate(encoding) {
+                    let decoded = decode_float_set_predicate(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else {
+                    return Err(unsupported_instruction(binary, offset, encoding));
+                };
+                instructions.push(ShaderInstruction::new(source, predicate, operation));
+            }
+            patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
         }
     }
     debug_assert!(
@@ -1348,7 +1439,14 @@ fn translate_shader_binary(
             .expect("read-only sampler access is valid"),
         );
     }
-    let ir = ShaderIr::new(neutral_stage, inputs, outputs, resources, instructions);
+    if stage == MaxwellThreeDShaderStage::TessellationInit {
+        tessellation::order_patch_outputs(&mut instructions);
+    }
+    let ir = ShaderIr::new(neutral_stage, inputs, outputs, resources, instructions)
+        .with_tessellation_control_points(
+            (stage == MaxwellThreeDShaderStage::TessellationInit)
+                .then(|| binary.header.bits(88, 8) as u32),
+        );
     Ok(TranslatedShaderIr {
         ir,
         texture_bindings: texture_bindings.values().copied().collect(),
@@ -1425,6 +1523,7 @@ fn decode_header_inputs(
             }
         }
     } else {
+        tessellation::header_inputs(header, &mut inputs);
         for component in 0..4_u8 {
             if header.bit(188 + component as usize) {
                 inputs.push(interface_element(
@@ -1480,6 +1579,7 @@ fn decode_header_outputs(
             outputs.push(interface_element(ShaderIoLocation::FragmentDepth, 0, None));
         }
     } else {
+        tessellation::header_outputs(header, &mut outputs);
         for component in 0..4_u8 {
             if header.bit(428 + component as usize) {
                 outputs.push(interface_element(
@@ -1561,6 +1661,11 @@ fn append_implicit_outputs(
     instructions: &mut Vec<ShaderInstruction>,
 ) -> Result<(), MaxwellShaderTranslationError> {
     let mut next_undefined_register = 255_u16;
+    // TCS outputs are shared; synthetic undefined stores could erase writes
+    // from other invocations, including their per-patch tessellation levels.
+    if stage == ShaderStage::TessellationControl {
+        return Ok(());
+    }
     for output in outputs {
         if explicitly_stored.contains(&(output.location(), output.component())) {
             continue;
@@ -1610,11 +1715,9 @@ fn append_implicit_outputs(
                     detail: "implicit depth or sample-mask output register mapping",
                 });
             }
-            ShaderIoLocation::PointSize
-            | ShaderIoLocation::VertexId
-            | ShaderIoLocation::InstanceId => {
+            _ => {
                 return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-                    stage: MaxwellThreeDShaderStage::Vertex,
+                    stage: MaxwellThreeDShaderStage::Pixel,
                     instruction_offset: source.byte_offset(),
                     encoding: 0,
                     detail: "implicit system-value output register mapping",
@@ -1757,6 +1860,7 @@ const fn is_texture_sample_simplified(encoding: u64) -> bool {
 
 const fn is_supported_family(encoding: u64) -> bool {
     is_exit(encoding)
+        || tessellation::is_system_register_read(encoding)
         || is_branch(encoding)
         || is_set_sync_point(encoding)
         || is_synchronize(encoding)
@@ -1778,6 +1882,8 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_float_fused_multiply_add(encoding)
         || is_float_add(encoding)
         || is_float_set_predicate(encoding)
+        || integer::is_set_predicate(encoding)
+        || patch_address::is_supported_family(encoding)
 }
 
 fn decode_texture_sample_simplified(
@@ -2595,6 +2701,21 @@ fn decode_float_multiply(
     register_count: u8,
     next_temporary: &mut u16,
 ) -> Result<DecodedFloatMultiply, MaxwellShaderTranslationError> {
+    // SM50 FTZ and DNZ are distinct modes, not independent output/input flags.
+    // FTZ flushes BOTH operands and results; DNZ has separate zero-multiply
+    // semantics and cannot be represented by merely enabling DAZ in the IR.
+    // NAK selects DNZ for fmulz/ffmaz, not ordinary multiplication:
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/a3fcccb47bfbaf49a5d1ffa56547973462e70ab0/src/nouveau/compiler/nak/from_nir.rs
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul
+    if encoding & (1 << 45) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "FMUL DNZ zero-multiply semantics",
+        });
+    }
     let destination = (encoding & 0xff) as u8;
     let left = ((encoding >> 8) & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
@@ -2634,7 +2755,7 @@ fn decode_float_multiply(
         rounding,
         ShaderNanMode::Propagate,
         encoding & (1 << 44) != 0,
-        encoding & (1 << 45) != 0,
+        encoding & (1 << 44) != 0,
         false,
     );
     let opcode = (encoding >> 48) as u16;
@@ -2841,7 +2962,9 @@ fn decode_float_add(
         rounding,
         ShaderNanMode::Propagate,
         encoding & (1 << 44) != 0,
-        false,
+        // FADD.FTZ also flushes subnormal inputs, not only the rounded sum.
+        // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add
+        encoding & (1 << 44) != 0,
         false,
     );
     let opcode = (encoding >> 48) as u16;
@@ -3169,6 +3292,18 @@ fn decode_float_fused_multiply_add(
     register_count: u8,
     next_temporary: &mut u16,
 ) -> Result<DecodedFloatFusedMultiplyAdd, MaxwellShaderTranslationError> {
+    // FTZ flushes all three inputs and the fused result. DNZ is a different
+    // multiplication mode, not the IR's independent denormals-are-zero flag.
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-fma
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L532-L602
+    if encoding & (1 << 54) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "FFMA DNZ zero-multiply semantics",
+        });
+    }
     let destination = (encoding & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
     if encoding & (1 << 50) != 0 {
@@ -3190,7 +3325,7 @@ fn decode_float_fused_multiply_add(
         rounding,
         ShaderNanMode::Propagate,
         encoding & (1 << 53) != 0,
-        encoding & (1 << 54) != 0,
+        encoding & (1 << 53) != 0,
         false,
     );
     let opcode_class = ((encoding >> 48) as u16) & 0xff80;
@@ -3363,6 +3498,17 @@ fn decode_attribute_load(
     register_count: u8,
     vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+    if matches!(
+        stage,
+        MaxwellThreeDShaderStage::TessellationInit | MaxwellThreeDShaderStage::Tessellation
+    ) {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "tessellation ALD requires ISBE handle/output/patch address lowering",
+        });
+    }
     let destination = (encoding & 0xff) as u8;
     let components = (((encoding >> 47) & 0x3) + 1) as u8;
     validate_register_range(
@@ -3466,6 +3612,14 @@ fn decode_attribute_store(
     encoding: u64,
     register_count: u8,
 ) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+    if encoding & (1 << 31) != 0 {
+        return Err(malformed(
+            stage,
+            offset,
+            encoding,
+            "per-patch AST requires a tessellation control shader",
+        ));
+    }
     let source = (encoding & 0xff) as u8;
     let components = (((encoding >> 47) & 0x3) + 1) as u8;
     validate_register_range(stage, offset, encoding, source, components, register_count)?;
@@ -4148,6 +4302,20 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
     validate_graphics_stage_interfaces(&translated)?;
     let global_bindings = graphics_resource_bindings(inputs, &translated)?;
     let linked_interpolation = graphics_output_interpolation(&translated);
+    let final_producer = translated
+        .iter()
+        .map(|program| program.ir.stage())
+        .filter(|stage| {
+            matches!(
+                stage,
+                ShaderStage::Vertex | ShaderStage::TessellationEvaluation | ShaderStage::Geometry
+            )
+        })
+        .max_by_key(|stage| match stage {
+            ShaderStage::Geometry => 2,
+            ShaderStage::TessellationEvaluation => 1,
+            _ => 0,
+        });
     let mut programs = Vec::with_capacity(translated.len());
     for (input, mut translated) in inputs.programs.iter().zip(translated) {
         let stage = input.binary.header.stage;
@@ -4158,7 +4326,7 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             texture.sampler_binding =
                 remapped_binding(&local_bindings, stage, texture.sampler_binding)?;
         }
-        let output_interpolation = if neutral_stage(stage) == ShaderStage::Vertex {
+        let output_interpolation = if Some(neutral_stage(stage)) == final_producer {
             linked_interpolation.as_slice()
         } else {
             &[]
@@ -4170,7 +4338,7 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
                 field: "SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT",
             });
         }
-        let module = lower_shader_ir_to_wgsl(&ir)?;
+        let module = ShaderBackendModule::new(ir);
         let key = MaxwellShaderTranslationKey {
             input: Arc::clone(input),
             resource_binding_remap: local_bindings.into_iter().collect(),
@@ -4227,11 +4395,11 @@ fn maxwell_vertex_input_types_iter(
 }
 
 /// Maxwell records interpolation on fragment `IPA` inputs. Copy that linked
-/// contract onto matching vertex outputs before backend lowering so derived
+/// contract onto matching final pre-rasterization outputs before backend lowering so derived
 /// rasterization paths can preserve the same interpolation planes.
 fn graphics_output_interpolation(
     programs: &[TranslatedShaderIr],
-) -> Vec<(ShaderIoLocation, ShaderInterpolation)> {
+) -> Vec<((ShaderIoLocation, u8), ShaderInterpolation)> {
     programs
         .iter()
         .find(|program| program.ir.stage() == ShaderStage::Fragment)
@@ -4243,7 +4411,7 @@ fn graphics_output_interpolation(
                 .filter_map(|input| {
                     input
                         .interpolation()
-                        .map(|interpolation| (input.location(), interpolation))
+                        .map(|interpolation| ((input.location(), input.component()), interpolation))
                 })
                 .collect::<BTreeMap<_, _>>()
                 .into_iter()
@@ -4313,7 +4481,7 @@ fn finalize_shader_ir(
     ir: ShaderIr,
     stage: MaxwellThreeDShaderStage,
     bindings: &BTreeMap<u8, u8>,
-    output_interpolation: &[(ShaderIoLocation, ShaderInterpolation)],
+    output_interpolation: &[((ShaderIoLocation, u8), ShaderInterpolation)],
 ) -> Result<VerifiedShaderIr, MaxwellShaderTranslationError> {
     let resources = ir
         .resources()
@@ -4403,18 +4571,23 @@ fn finalize_shader_ir(
                 output.location(),
                 output.component(),
                 output.scalar_type(),
-                interpolation.get(&output.location()).copied(),
+                interpolation
+                    .get(&(output.location(), output.component()))
+                    .copied(),
             )
             .expect("linking preserves the decoded interface shape")
         })
         .collect();
-    VerifiedShaderIr::verify(ShaderIr::new(
-        ir.stage(),
-        ir.inputs().to_vec(),
-        outputs,
-        resources,
-        instructions,
-    ))
+    VerifiedShaderIr::verify(
+        ShaderIr::new(
+            ir.stage(),
+            ir.inputs().to_vec(),
+            outputs,
+            resources,
+            instructions,
+        )
+        .with_tessellation_control_points(ir.tessellation_control_points()),
+    )
     .map_err(MaxwellShaderTranslationError::from)
 }
 
@@ -4432,38 +4605,33 @@ fn remapped_binding(
 fn validate_graphics_stage_interfaces(
     programs: &[TranslatedShaderIr],
 ) -> Result<(), MaxwellShaderTranslationError> {
-    let vertex = programs
-        .iter()
-        .find(|program| program.ir.stage() == ShaderStage::Vertex);
-    let fragment = programs
-        .iter()
-        .find(|program| program.ir.stage() == ShaderStage::Fragment);
-    let (Some(vertex), Some(fragment)) = (vertex, fragment) else {
-        return Ok(());
-    };
-    for input in fragment.ir.inputs() {
-        if !matches!(
-            input.location(),
-            ShaderIoLocation::Generic(_) | ShaderIoLocation::Color(_)
-        ) {
+    let mut producer: Option<&ShaderIr> = None;
+    for stage in [
+        ShaderStage::Vertex,
+        ShaderStage::TessellationControl,
+        ShaderStage::TessellationEvaluation,
+        ShaderStage::Geometry,
+        ShaderStage::Fragment,
+    ] {
+        let Some(consumer) = programs
+            .iter()
+            .find(|program| program.ir.stage() == stage)
+            .map(|program| &program.ir)
+        else {
             continue;
-        }
-        let Some(output) = vertex.ir.outputs().iter().find(|output| {
-            output.location() == input.location() && output.component() == input.component()
-        }) else {
-            return Err(MaxwellShaderTranslationError::StageInterfaceMismatch {
-                location: input.location(),
-                component: input.component(),
-                reason: "fragment input has no vertex output",
-            });
         };
-        if output.scalar_type() != input.scalar_type() {
-            return Err(MaxwellShaderTranslationError::StageInterfaceMismatch {
-                location: input.location(),
-                component: input.component(),
-                reason: "vertex output and fragment input scalar types differ",
-            });
-        }
+        let Some(previous) = producer.replace(consumer) else {
+            continue;
+        };
+        nixe_gpu::validate_shader_stage_link(previous, consumer).map_err(|error| {
+            MaxwellShaderTranslationError::StageInterfaceMismatch {
+                producer: error.producer,
+                consumer: error.consumer,
+                location: error.location,
+                component: error.component,
+                reason: error.reason,
+            }
+        })?;
     }
     Ok(())
 }
@@ -4782,7 +4950,7 @@ mod tests {
         .unwrap()
     }
 
-    fn validate_wgsl(module: &ShaderBackendModule) {
+    fn validate_wgsl(module: &nixe_gpu::WgslShaderModule) {
         let parsed = naga::front::wgsl::parse_str(module.source()).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -5723,7 +5891,7 @@ mod tests {
                 && left.index() == 0
                 && right.index() == 4
                 && float_control.flush_denormals_to_zero()
-                && !float_control.denormals_are_zero()
+                && float_control.denormals_are_zero()
         )));
         let module = nixe_gpu::lower_shader_ir_to_wgsl(&translated).unwrap();
         assert!(
@@ -7245,8 +7413,18 @@ mod tests {
         assert_eq!(translated[1].bind_group(), Some(4));
         assert_eq!(translated[0].resources()[0].binding(), 0);
         assert_eq!(translated[1].resources()[0].binding(), 1);
-        assert!(translated[0].module().source().contains("@binding(0)"));
-        assert!(translated[1].module().source().contains("@binding(1)"));
+        assert!(
+            lower_shader_ir_to_wgsl(translated[0].module().ir())
+                .unwrap()
+                .source()
+                .contains("@binding(0)")
+        );
+        assert!(
+            lower_shader_ir_to_wgsl(translated[1].module().ir())
+                .unwrap()
+                .source()
+                .contains("@binding(1)")
+        );
 
         let lowered = MaxwellThreeDLoweringCache::default()
             .stage_shader_translations(&translated)

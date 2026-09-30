@@ -9,12 +9,21 @@ mod allocation;
 mod backend;
 mod cache;
 mod capability;
+mod color;
 mod command;
+pub use color::{
+    BlendComponent, BlendFactor, BlendOperation, ColorBlendState, ColorOutputState, ColorWriteMask,
+};
 mod diagnostics;
 mod presentation;
 mod resource;
 mod runtime;
 mod shader;
+mod tessellation;
+pub use tessellation::{
+    TessellationControl, TessellationDomain, TessellationMode, TessellationOutput,
+    TessellationSpacing, TessellationState, TessellationWinding,
+};
 mod submission;
 mod synchronization;
 mod view;
@@ -46,8 +55,8 @@ pub use capability::{
 pub use command::{
     AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BarrierOperation,
     BufferRegion, CacheMaintenanceOperation, ClearOperation, ClearValue, CommandDescriptionError,
-    CopyOperation, DepthCompareOperation, DepthState, DispatchOperation, DrawArguments,
-    DrawOperation, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
+    CopyOperation, CullMode, DepthCompareOperation, DepthState, DispatchOperation, DrawArguments,
+    DrawOperation, FrontFace, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
     OperationSubmission, PreparedDraw, PrimitiveTopology, QueryOperation, RenderAttachment,
     RenderPassOperation, TriangleRasterization, VertexAttribute, VertexBufferLayout,
     VertexComponentCount, VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
@@ -70,16 +79,24 @@ pub use runtime::{
     BackendExecutionCompletion, BackendRuntime, BackendRuntimeError, BackendVisibilityRequester,
     NeutralBackendRuntime,
 };
+pub use shader::spirv::{
+    SpirvDefaultControlOptions, SpirvDefaultControlShader, SpirvFloat32Capabilities,
+    SpirvFloat64Capabilities, SpirvPipelineBinding, SpirvShaderError, SpirvShaderModule,
+    SpirvShaderOptions, SpirvTessellationOptions, SpirvTessellationShaders,
+    lower_default_tessellation_control_to_spirv, lower_shader_ir_to_spirv,
+    lower_tessellation_shaders_to_spirv,
+};
 pub use shader::{
     ShaderBackendLoweringError, ShaderBackendModule, ShaderEvaluationError, ShaderEvaluationInputs,
     ShaderEvaluationResult, ShaderFloatComparison, ShaderFloatControl, ShaderInstruction,
-    ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
-    ShaderIrConstructionError, ShaderMathAccuracy, ShaderNanMode, ShaderOperation, ShaderPredicate,
-    ShaderPredicateSetOperation, ShaderRegister, ShaderResourceAccess, ShaderResourceKind,
-    ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderSpecialFunction,
-    ShaderTextureSampleOutput, ShaderVerificationError, VerifiedShaderIr, evaluate_shader_ir,
+    ShaderIntegerComparison, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation,
+    ShaderIr, ShaderIrConstructionError, ShaderMathAccuracy, ShaderNanMode, ShaderOperation,
+    ShaderPredicate, ShaderPredicateSetOperation, ShaderRegister, ShaderResourceAccess,
+    ShaderResourceKind, ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation,
+    ShaderSpecialFunction, ShaderStageInterfaceError, ShaderTextureSampleOutput,
+    ShaderVerificationError, VerifiedShaderIr, WgslShaderModule, evaluate_shader_ir,
     lower_shader_ir_to_wgsl, lower_shader_ir_to_wgsl_with_quad_flat_attributes,
-    lower_shader_ir_to_wgsl_with_vertex_pulling,
+    lower_shader_ir_to_wgsl_with_vertex_pulling, validate_shader_stage_link,
 };
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,

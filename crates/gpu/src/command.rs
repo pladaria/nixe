@@ -195,6 +195,35 @@ pub enum TriangleRasterization {
     /// Cover the triangle's axis-aligned post-projection bounding box while
     /// retaining the original triangle's interpolation planes.
     FillRectangle,
+    /// Rasterize triangle boundaries as rectangular lines. When `smooth` is
+    /// set, coverage modulates fragment output zero's alpha after shading.
+    /// Width is a positive finite float in framebuffer pixels, stored as bits
+    /// for exact state identity. Backends validate host limits when consumed.
+    Wireframe { width_bits: u32, smooth: bool },
+}
+
+/// Front-facing winding in framebuffer coordinates (X right, Y down), after
+/// viewport transformation. Counterclockwise means negative shoelace area.
+/// Changing the viewport determinant changes facing; it does not change this
+/// state. Both WebGPU and Vulkan use this convention:
+/// https://gpuweb.github.io/gpuweb/#polygon-rasterization
+/// https://docs.vulkan.org/spec/latest/chapters/primsrast.html#primsrast-polygons-basic
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum FrontFace {
+    #[default]
+    CounterClockwise,
+    Clockwise,
+}
+
+/// Faces discarded after polygon assembly, without suppressing shader execution
+/// before rasterization. Points and direct lines are not affected.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CullMode {
+    #[default]
+    None,
+    Front,
+    Back,
+    FrontAndBack,
 }
 
 /// Comparison applied by the legacy fixed-function alpha test.
@@ -589,8 +618,13 @@ pub struct PreparedDraw {
     pub pipeline: PipelineId,
     pub render_pass: RenderPassId,
     pub topology: PrimitiveTopology,
+    pub tessellation: Option<crate::TessellationState>,
     pub triangle_rasterization: TriangleRasterization,
+    pub front_face: FrontFace,
+    pub cull_mode: CullMode,
     pub alpha_test: Option<AlphaTest>,
+    /// Indexed by fragment output location, not by guest physical target index.
+    pub color_outputs: [crate::ColorOutputState; 8],
     pub descriptor_tables: Box<[DescriptorTableId]>,
     pub vertex_buffers: Box<[VertexBufferLayout]>,
     pub index_buffer: Option<(BufferRegion, IndexType)>,
@@ -665,8 +699,12 @@ impl PreparedDraw {
             pipeline,
             render_pass,
             topology,
+            tessellation: None,
             triangle_rasterization: TriangleRasterization::Fill,
+            front_face: FrontFace::CounterClockwise,
+            cull_mode: CullMode::None,
             alpha_test: None,
+            color_outputs: [crate::ColorOutputState::REPLACE; 8],
             descriptor_tables: descriptor_tables.into_boxed_slice(),
             vertex_buffers: vertex_buffers.into_boxed_slice(),
             index_buffer,
@@ -710,6 +748,13 @@ impl DrawOperation {
         prepared: Arc<PreparedDraw>,
         arguments: DrawArguments,
     ) -> Result<Self, CommandDescriptionError> {
+        if (prepared.topology == PrimitiveTopology::Patches) != prepared.tessellation.is_some()
+            || prepared
+                .tessellation
+                .is_some_and(|state| state.input_control_points == 0)
+        {
+            return Err(CommandDescriptionError::TessellationTopologyMismatch);
+        }
         if arguments.is_empty() {
             return Err(CommandDescriptionError::EmptyDraw);
         }
@@ -1221,6 +1266,7 @@ impl OperationSubmission {
 /// Failure to construct an immutable neutral operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandDescriptionError {
+    TessellationTopologyMismatch,
     CopySizeMismatch,
     ClearValueMismatch,
     NonFiniteClearValue,
@@ -1248,6 +1294,7 @@ pub enum CommandDescriptionError {
 impl Display for CommandDescriptionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TessellationTopologyMismatch => formatter.write_str("patch draw requires tessellation state and nonzero input control points; other topologies forbid it"),
             Self::CopySizeMismatch => {
                 formatter.write_str("buffer copy source and destination sizes differ")
             }
@@ -1574,6 +1621,57 @@ mod tests {
         assert_eq!(
             ViewportTransform::new([1.0; 3], [0.0; 3], [0.0, f32::INFINITY]),
             Err(CommandDescriptionError::NonFiniteViewportTransform)
+        );
+    }
+
+    #[test]
+    fn patch_draw_requires_tessellation_state_without_changing_draw_arguments() {
+        let mut prepared = PreparedDraw::new(
+            PipelineId::new(1),
+            RenderPassId::new(1),
+            PrimitiveTopology::Patches,
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        let arguments = DrawArguments::NonIndexed {
+            first_vertex: 4,
+            vertex_count: 12,
+            first_instance: 2,
+            instance_count: 3,
+        };
+        assert_eq!(
+            DrawOperation::new(Arc::new(prepared.clone()), arguments),
+            Err(CommandDescriptionError::TessellationTopologyMismatch)
+        );
+        prepared.tessellation = Some(crate::TessellationState {
+            mode: crate::TessellationMode {
+                domain: crate::TessellationDomain::Triangles,
+                spacing: crate::TessellationSpacing::Equal,
+                output: crate::TessellationOutput::Triangles(
+                    crate::TessellationWinding::CounterClockwise,
+                ),
+            },
+            input_control_points: 4,
+            control: crate::TessellationControl::Shader,
+        });
+        assert_eq!(
+            DrawOperation::new(Arc::new(prepared.clone()), arguments)
+                .unwrap()
+                .arguments,
+            arguments
+        );
+        prepared.topology = PrimitiveTopology::Triangles;
+        assert_eq!(
+            DrawOperation::new(Arc::new(prepared.clone()), arguments),
+            Err(CommandDescriptionError::TessellationTopologyMismatch)
+        );
+        prepared.topology = PrimitiveTopology::Patches;
+        prepared.tessellation.as_mut().unwrap().input_control_points = 0;
+        assert_eq!(
+            DrawOperation::new(Arc::new(prepared), arguments),
+            Err(CommandDescriptionError::TessellationTopologyMismatch)
         );
     }
 

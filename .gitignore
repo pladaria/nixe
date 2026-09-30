@@ -39,3 +39,6 @@ Thumbs.db
 /perf-*
 /dump/
 /docker/reference-*
+
+# Local validation/debug tools (downloaded sources and binaries)
+/dev-tools/

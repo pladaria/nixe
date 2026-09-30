@@ -8,7 +8,14 @@ use std::{collections::BTreeSet, fmt::Display, sync::Arc};
 
 use crate::{ShaderStage, VertexBufferLayout, VertexStepMode};
 
+mod integer;
+mod linkage;
+pub use linkage::{ShaderStageInterfaceError, validate_shader_stage_link};
+pub mod spirv;
+mod tessellation;
 mod vertex_fetch;
+
+pub use integer::ShaderIntegerComparison;
 
 /// Stable location within the original guest shader byte stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -101,6 +108,14 @@ pub enum ShaderIoLocation {
     Color(u8),
     FragmentDepth,
     SampleMask,
+    InvocationId,
+    PatchVertices,
+    PrimitiveId,
+    TessCoord,
+    TessLevelOuter,
+    TessLevelInner,
+    /// Per-patch user data, distinct from arrayed per-vertex `Generic` data.
+    Patch(u8),
 }
 
 /// Guest interpolation behavior for one fragment input.
@@ -319,11 +334,17 @@ impl ShaderInterfaceElement {
         scalar_type: ShaderScalarType,
         interpolation: Option<ShaderInterpolation>,
     ) -> Result<Self, ShaderIrConstructionError> {
-        let vector_location = matches!(
-            location,
-            ShaderIoLocation::Position | ShaderIoLocation::Generic(_) | ShaderIoLocation::Color(_)
-        );
-        if component > 3 || (!vector_location && component != 0) {
+        let components = match location {
+            ShaderIoLocation::Position
+            | ShaderIoLocation::Generic(_)
+            | ShaderIoLocation::Color(_)
+            | ShaderIoLocation::Patch(_)
+            | ShaderIoLocation::TessLevelOuter => 4,
+            ShaderIoLocation::TessCoord => 3,
+            ShaderIoLocation::TessLevelInner => 2,
+            _ => 1,
+        };
+        if component >= components {
             return Err(ShaderIrConstructionError::InvalidInterfaceComponent {
                 location,
                 component,
@@ -413,6 +434,31 @@ pub enum ShaderOperation {
         first_component: u8,
         scalar_type: ShaderScalarType,
     },
+    /// Arrayed per-vertex I/O. `output` selects a TCS output read; otherwise
+    /// this reads a TCS/TES input. Vertex indices are unsigned register values.
+    LoadControlPoint {
+        destination: ShaderRegister,
+        vertex: ShaderRegister,
+        output: bool,
+        location: ShaderIoLocation,
+        component: u8,
+    },
+    StoreControlPoint {
+        source: ShaderRegister,
+        vertex: ShaderRegister,
+        location: ShaderIoLocation,
+        component: u8,
+    },
+    /// TCS per-patch output read, including tessellation levels.
+    LoadPatchOutput {
+        destination: ShaderRegister,
+        location: ShaderIoLocation,
+        component: u8,
+    },
+    /// Rendezvous of all control-stage invocations in one patch. Orders output
+    /// memory writes before subsequent output reads in those invocations.
+    /// https://docs.vulkan.org/spec/latest/chapters/tessellation.html
+    PatchBarrier,
     Multiply32 {
         destination: ShaderRegister,
         left: ShaderRegister,
@@ -475,6 +521,18 @@ pub enum ShaderOperation {
         set_operation: ShaderPredicateSetOperation,
         flush_denormals_to_zero: bool,
     },
+    /// Both results use the old accumulator value. The second comparison is
+    /// complemented before combining with the accumulator, not afterward.
+    /// https://docs.nvidia.com/cuda/parallel-thread-execution/#comparison-and-selection-instructions-setp
+    SetPredicateInteger32 {
+        destinations: [Option<u8>; 2],
+        left: ShaderRegister,
+        right: ShaderRegister,
+        signed: bool,
+        comparison: ShaderIntegerComparison,
+        accumulator: ShaderPredicate,
+        set_operation: ShaderPredicateSetOperation,
+    },
     InterpolateInput {
         destination: ShaderRegister,
         location: ShaderIoLocation,
@@ -512,6 +570,20 @@ pub enum ShaderOperation {
         target: ShaderSourceLocation,
     },
     Exit,
+}
+
+impl ShaderOperation {
+    /// Scalar register dependencies, excluding predicate operands. Frontend
+    /// legalization uses these before replacing architecture-private addresses.
+    #[must_use]
+    pub fn source_registers(&self) -> Vec<ShaderRegister> {
+        operation_sources(self)
+    }
+
+    /// Visit scalar definitions without allocating a destination list.
+    pub fn visit_destination_registers(&self, visit: impl FnMut(ShaderRegister)) {
+        visit_operation_destinations(self, visit);
+    }
 }
 
 /// One operation with stable guest diagnostic provenance.
@@ -556,6 +628,7 @@ impl ShaderInstruction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShaderIr {
     stage: ShaderStage,
+    tessellation_control_points: Option<u32>,
     inputs: Box<[ShaderInterfaceElement]>,
     outputs: Box<[ShaderInterfaceElement]>,
     resources: Box<[ShaderResourceAccess]>,
@@ -573,6 +646,7 @@ impl ShaderIr {
     ) -> Self {
         Self {
             stage,
+            tessellation_control_points: None,
             inputs: inputs.into_boxed_slice(),
             outputs: outputs.into_boxed_slice(),
             resources: resources.into_boxed_slice(),
@@ -583,6 +657,18 @@ impl ShaderIr {
     #[must_use]
     pub const fn stage(&self) -> ShaderStage {
         self.stage
+    }
+
+    /// Control-stage output cardinality; never the draw's input patch size.
+    #[must_use]
+    pub fn with_tessellation_control_points(mut self, points: Option<u32>) -> Self {
+        self.tessellation_control_points = points;
+        self
+    }
+
+    #[must_use]
+    pub const fn tessellation_control_points(&self) -> Option<u32> {
+        self.tessellation_control_points
     }
 
     #[must_use]
@@ -628,6 +714,7 @@ pub struct VerifiedShaderIr(ShaderIr);
 
 impl VerifiedShaderIr {
     pub fn verify(ir: ShaderIr) -> Result<Self, ShaderVerificationError> {
+        tessellation::verify_metadata(&ir)?;
         verify_interface_set(ir.stage, &ir.inputs, true)?;
         verify_interface_set(ir.stage, &ir.outputs, false)?;
         verify_resource_set(&ir.resources)?;
@@ -646,9 +733,22 @@ impl VerifiedShaderIr {
 pub struct ShaderEvaluationInputs {
     interface: std::collections::BTreeMap<(ShaderIoLocation, u8), u32>,
     constant_buffers: std::collections::BTreeMap<(u8, u32), u32>,
+    control_points: std::collections::BTreeMap<(u32, ShaderIoLocation, u8), u32>,
 }
 
 impl ShaderEvaluationInputs {
+    #[must_use]
+    pub fn with_control_point_bits(
+        mut self,
+        vertex: u32,
+        location: ShaderIoLocation,
+        component: u8,
+        bits: u32,
+    ) -> Self {
+        self.control_points
+            .insert((vertex, location, component), bits);
+        self
+    }
     #[must_use]
     pub fn with_interface_bits(
         mut self,
@@ -671,9 +771,21 @@ impl ShaderEvaluationInputs {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ShaderEvaluationResult {
     outputs: std::collections::BTreeMap<(ShaderIoLocation, u8), u32>,
+    control_points: std::collections::BTreeMap<(u32, ShaderIoLocation, u8), u32>,
 }
 
 impl ShaderEvaluationResult {
+    #[must_use]
+    pub fn control_point_bits(
+        &self,
+        vertex: u32,
+        location: ShaderIoLocation,
+        component: u8,
+    ) -> Option<u32> {
+        self.control_points
+            .get(&(vertex, location, component))
+            .copied()
+    }
     #[must_use]
     pub fn output_bits(&self, location: ShaderIoLocation, component: u8) -> Option<u32> {
         self.outputs.get(&(location, component)).copied()
@@ -684,6 +796,12 @@ impl ShaderEvaluationResult {
 /// values and evaluator limits remain invocation-specific.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShaderEvaluationError {
+    MissingControlPoint {
+        vertex: u32,
+        location: ShaderIoLocation,
+        component: u8,
+    },
+    PatchExecutionRequired(ShaderSourceLocation),
     MissingInterfaceInput {
         location: ShaderIoLocation,
         component: u8,
@@ -732,6 +850,44 @@ pub fn evaluate_shader_ir(
             continue;
         }
         match instruction.operation() {
+            ShaderOperation::LoadControlPoint {
+                destination,
+                vertex,
+                output: false,
+                location,
+                component,
+            } => {
+                let vertex = register_bits(&registers, *vertex)?;
+                let bits = inputs
+                    .control_points
+                    .get(&(vertex, *location, *component))
+                    .copied()
+                    .ok_or(ShaderEvaluationError::MissingControlPoint {
+                        vertex,
+                        location: *location,
+                        component: *component,
+                    })?;
+                registers[destination.index() as usize] = Some(bits);
+            }
+            ShaderOperation::StoreControlPoint {
+                source,
+                vertex,
+                location,
+                component,
+            } => {
+                let vertex = register_bits(&registers, *vertex)?;
+                result.control_points.insert(
+                    (vertex, *location, *component),
+                    register_bits(&registers, *source)?,
+                );
+            }
+            ShaderOperation::LoadControlPoint { output: true, .. }
+            | ShaderOperation::LoadPatchOutput { .. }
+            | ShaderOperation::PatchBarrier => {
+                return Err(ShaderEvaluationError::PatchExecutionRequired(
+                    instruction.source,
+                ));
+            }
             ShaderOperation::Undefined32 { destination } => {
                 registers[destination.index() as usize] = Some(0);
             }
@@ -1010,6 +1166,32 @@ pub fn evaluate_shader_ir(
                 })?;
                 registers[destination.index() as usize] = Some(value);
             }
+            ShaderOperation::SetPredicateInteger32 {
+                destinations,
+                left,
+                right,
+                signed,
+                comparison,
+                accumulator,
+                set_operation,
+            } => {
+                let compared = integer::compare(
+                    register_bits(&registers, *left)?,
+                    register_bits(&registers, *right)?,
+                    *signed,
+                    *comparison,
+                );
+                let accumulated = evaluate_shader_predicate(*accumulator, &predicates)?;
+                for (index, destination) in destinations.iter().enumerate() {
+                    if let Some(destination) = destination {
+                        predicates[usize::from(*destination)] = Some(integer::combine(
+                            if index == 0 { compared } else { !compared },
+                            accumulated,
+                            *set_operation,
+                        ));
+                    }
+                }
+            }
             ShaderOperation::SetPredicateFloat32 {
                 destination,
                 left,
@@ -1236,24 +1418,64 @@ pub struct ShaderBackendModule(Arc<ShaderBackendModuleInner>);
 
 #[derive(Debug, Eq, PartialEq)]
 struct ShaderBackendModuleInner {
-    source: Box<str>,
     ir: VerifiedShaderIr,
+    retained_bytes: usize,
 }
 
 impl ShaderBackendModule {
+    /// Share verified semantic IR without selecting a host shader language.
+    #[must_use]
+    pub fn new(ir: VerifiedShaderIr) -> Self {
+        let program = ir.ir();
+        let retained_bytes = std::mem::size_of::<ShaderBackendModuleInner>()
+            + std::mem::size_of_val(program.inputs())
+            + std::mem::size_of_val(program.outputs())
+            + std::mem::size_of_val(program.resources())
+            + std::mem::size_of_val(program.instructions())
+            + program
+                .instructions()
+                .iter()
+                .map(|instruction| match instruction.operation() {
+                    ShaderOperation::LoadInput { destinations, .. } => {
+                        std::mem::size_of_val(destinations.as_ref())
+                    }
+                    ShaderOperation::StoreOutput { sources, .. } => {
+                        std::mem::size_of_val(sources.as_ref())
+                    }
+                    ShaderOperation::SampleTexture2D { outputs, .. }
+                    | ShaderOperation::SampleTexture2DArray { outputs, .. } => {
+                        std::mem::size_of_val(outputs.as_ref())
+                    }
+                    _ => 0,
+                })
+                .sum::<usize>();
+        Self(Arc::new(ShaderBackendModuleInner { ir, retained_bytes }))
+    }
+
     #[must_use]
     pub fn stage(&self) -> ShaderStage {
         self.0.ir.ir().stage()
     }
 
     #[must_use]
-    pub fn source(&self) -> &str {
-        &self.0.source
+    pub fn retained_bytes(&self) -> usize {
+        self.0.retained_bytes
     }
 
     #[must_use]
     pub fn ir(&self) -> &VerifiedShaderIr {
         &self.0.ir
+    }
+}
+
+/// Host-language artifact produced only by the WGSL execution path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WgslShaderModule(Box<str>);
+
+impl WgslShaderModule {
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.0
     }
 }
 
@@ -1287,7 +1509,7 @@ struct InterfaceGroup {
 /// Lowers verified neutral IR to a standalone WGSL module.
 pub fn lower_shader_ir_to_wgsl(
     shader: &VerifiedShaderIr,
-) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
+) -> Result<WgslShaderModule, ShaderBackendLoweringError> {
     lower_shader_ir_to_wgsl_impl(shader, None, false)
 }
 
@@ -1297,7 +1519,7 @@ pub fn lower_shader_ir_to_wgsl_with_vertex_pulling(
     shader: &VerifiedShaderIr,
     layouts: &[VertexBufferLayout],
     bind_group: u32,
-) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
+) -> Result<WgslShaderModule, ShaderBackendLoweringError> {
     lower_shader_ir_to_wgsl_impl(shader, Some((layouts, bind_group)), false)
 }
 
@@ -1309,7 +1531,7 @@ pub fn lower_shader_ir_to_wgsl_with_quad_flat_attributes(
     shader: &VerifiedShaderIr,
     layouts: &[VertexBufferLayout],
     bind_group: u32,
-) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
+) -> Result<WgslShaderModule, ShaderBackendLoweringError> {
     lower_shader_ir_to_wgsl_impl(shader, Some((layouts, bind_group)), true)
 }
 
@@ -1317,7 +1539,7 @@ fn lower_shader_ir_to_wgsl_impl(
     shader: &VerifiedShaderIr,
     vertex_pulling: Option<(&[VertexBufferLayout], u32)>,
     quad_flat: bool,
-) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
+) -> Result<WgslShaderModule, ShaderBackendLoweringError> {
     let ir = shader.ir();
     if !matches!(ir.stage, ShaderStage::Vertex | ShaderStage::Fragment) {
         return Err(ShaderBackendLoweringError::UnsupportedStage(ir.stage));
@@ -1454,10 +1676,7 @@ fn lower_shader_ir_to_wgsl_impl(
             vertex_fetch::emit_quad_flat_entry_point(&mut source, &output_groups);
         }
     }
-    Ok(ShaderBackendModule(Arc::new(ShaderBackendModuleInner {
-        source: source.into_boxed_str(),
-        ir: shader.clone(),
-    })))
+    Ok(WgslShaderModule(source.into_boxed_str()))
 }
 
 fn emit_wgsl_vertex_pull_resources(
@@ -1922,12 +2141,20 @@ fn interface_groups(
             scalar_type: element.scalar_type,
             interpolation: element.interpolation,
         });
-        if group.scalar_type != element.scalar_type || group.interpolation != element.interpolation
+        if group.scalar_type != element.scalar_type
+            || matches!((group.interpolation, element.interpolation), (Some(left), Some(right)) if left != right)
         {
             return Err(ShaderBackendLoweringError::InconsistentInterfaceType(
                 element.location,
             ));
         }
+        // The neutral linker leaves unconsumed producer components unqualified.
+        // WGSL assigns interpolation to the whole location, so pack those lanes
+        // with the consumed lanes' qualifier without modifying the semantic IR.
+        // None is not a competing interpolation mode. Distinct explicit modes
+        // still require an interface-splitting lowering and must not be merged.
+        // https://www.w3.org/TR/WGSL/#interpolation
+        group.interpolation = group.interpolation.or(element.interpolation);
         group.components = group.components.max(element.component + 1);
     }
     Ok(groups)
@@ -1995,6 +2222,13 @@ fn wgsl_field_name(location: ShaderIoLocation) -> String {
         ShaderIoLocation::Color(index) => format!("color_{index}"),
         ShaderIoLocation::FragmentDepth => "fragment_depth".to_owned(),
         ShaderIoLocation::SampleMask => "sample_mask".to_owned(),
+        ShaderIoLocation::InvocationId => "invocation_id".to_owned(),
+        ShaderIoLocation::PatchVertices => "patch_vertices".to_owned(),
+        ShaderIoLocation::PrimitiveId => "primitive_id".to_owned(),
+        ShaderIoLocation::TessCoord => "tess_coord".to_owned(),
+        ShaderIoLocation::TessLevelOuter => "tess_level_outer".to_owned(),
+        ShaderIoLocation::TessLevelInner => "tess_level_inner".to_owned(),
+        ShaderIoLocation::Patch(index) => format!("patch_{index}"),
     }
 }
 
@@ -2024,6 +2258,14 @@ fn emit_wgsl_operation(
     instruction: &ShaderInstruction,
 ) -> Result<(), ShaderBackendLoweringError> {
     match instruction.operation() {
+        ShaderOperation::LoadControlPoint { .. }
+        | ShaderOperation::StoreControlPoint { .. }
+        | ShaderOperation::LoadPatchOutput { .. }
+        | ShaderOperation::PatchBarrier => {
+            return Err(ShaderBackendLoweringError::ResourceAccess(
+                instruction.source,
+            ));
+        }
         ShaderOperation::Undefined32 { destination } => source.push_str(&format!(
             "  registers[{}] = 0u; // deterministic choice for undefined guest bits\n",
             destination.index()
@@ -2400,6 +2642,9 @@ fn emit_wgsl_operation(
                 operand.index()
             ));
         }
+        operation @ ShaderOperation::SetPredicateInteger32 { .. } => {
+            integer::emit_wgsl(source, operation)
+        }
         ShaderOperation::SetPredicateFloat32 {
             destination,
             left,
@@ -2759,6 +3004,19 @@ fn wgsl_unpack_expression(scalar_type: ShaderScalarType, register: u16) -> Strin
 /// Typed reason why translated IR cannot be consumed by any backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShaderVerificationError {
+    AliasedPredicateDestinations {
+        source: ShaderSourceLocation,
+    },
+    InvalidTessellationMetadata,
+    InvalidTessellationInterface {
+        stage: ShaderStage,
+        input: bool,
+        location: ShaderIoLocation,
+    },
+    InvalidPatchOperation {
+        source: ShaderSourceLocation,
+        reason: &'static str,
+    },
     EmptyProgram,
     MissingExit,
     DuplicateInterfaceElement {
@@ -2807,6 +3065,9 @@ pub enum ShaderVerificationError {
 impl Display for ShaderVerificationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidTessellationMetadata => formatter.write_str("shader IR requires nonzero output control-point count exactly for the control stage"),
+            Self::InvalidTessellationInterface { stage, input, location } => write!(formatter, "invalid tessellation interface: stage={stage:?} input={input} location={location:?}"),
+            Self::InvalidPatchOperation { source, reason } => write!(formatter, "invalid patch operation at {source:?}: {reason}"),
             Self::EmptyProgram => formatter.write_str("shader IR contains no instructions"),
             Self::MissingExit => formatter.write_str("shader IR has no reachable structured exit"),
             Self::DuplicateInterfaceElement {
@@ -2835,6 +3096,7 @@ impl Display for ShaderVerificationError {
                 register.index(),
                 source.byte_offset()
             ),
+            Self::AliasedPredicateDestinations { source } => write!(formatter, "shader IR writes the same predicate twice at byte offset 0x{:x}", source.byte_offset()),
             Self::UndefinedPredicate { source, register } => write!(
                 formatter,
                 "shader IR reads undefined predicate p{register} at byte offset 0x{:x}",
@@ -2885,6 +3147,7 @@ fn verify_interface_set(
 ) -> Result<(), ShaderVerificationError> {
     let mut seen = BTreeSet::new();
     for element in elements {
+        tessellation::verify_interface(stage, input, element)?;
         if !seen.insert((element.location, element.component)) {
             return Err(ShaderVerificationError::DuplicateInterfaceElement {
                 input,
@@ -2899,7 +3162,12 @@ fn verify_interface_set(
                 }
                 _ => element.interpolation.is_none(),
             }
-        } else if !input && stage == ShaderStage::Vertex {
+        } else if !input
+            && matches!(
+                stage,
+                ShaderStage::Vertex | ShaderStage::TessellationEvaluation | ShaderStage::Geometry
+            )
+        {
             match element.location {
                 // Frontends may leave an unconsumed output unlinked (`None`)
                 // or attach the interpolation contract selected by the next
@@ -2964,6 +3232,32 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             ShaderPredicate::Always => {}
         }
         match &instruction.operation {
+            ShaderOperation::LoadControlPoint { destination, .. }
+            | ShaderOperation::LoadPatchOutput { destination, .. } => {
+                tessellation::verify_operation(ir, instruction, index)?;
+                for source in operation_sources(&instruction.operation) {
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
+                }
+                if !conditional {
+                    definitions.registers.insert(*destination);
+                }
+            }
+            ShaderOperation::StoreControlPoint { .. } | ShaderOperation::PatchBarrier => {
+                tessellation::verify_operation(ir, instruction, index)?;
+                for source in operation_sources(&instruction.operation) {
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
+                }
+            }
             ShaderOperation::Undefined32 { destination }
             | ShaderOperation::MoveImmediate32 { destination, .. }
             | ShaderOperation::Move32 { destination, .. }
@@ -2983,7 +3277,12 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
             | ShaderOperation::InterpolateInput { destination, .. } => {
                 for source in operation_sources(&instruction.operation) {
-                    require_definition(instruction.source, source, &definitions.registers)?;
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
                 }
                 if !conditional {
                     definitions.registers.insert(*destination);
@@ -2995,6 +3294,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 first_component,
                 ..
             } => {
+                tessellation::verify_scalar_access(ir, instruction.source, true, *location)?;
                 verify_interface_range(
                     ir,
                     instruction.source,
@@ -3013,6 +3313,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 first_component,
                 ..
             } => {
+                tessellation::verify_scalar_access(ir, instruction.source, false, *location)?;
                 verify_interface_range(
                     ir,
                     instruction.source,
@@ -3022,7 +3323,12 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     sources.len(),
                 )?;
                 for source in sources.iter().copied() {
-                    require_definition(instruction.source, source, &definitions.registers)?;
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
                 }
             }
             ShaderOperation::FloatMinMax32 {
@@ -3031,7 +3337,12 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 ..
             } => {
                 for source in operation_sources(&instruction.operation) {
-                    require_definition(instruction.source, source, &definitions.registers)?;
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
                 }
                 if let ShaderPredicate::Register { register, .. } = minimum {
                     validate_predicate_register(instruction.source, *register)?;
@@ -3045,14 +3356,26 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     definitions.registers.insert(*destination);
                 }
             }
-            ShaderOperation::SetPredicateFloat32 {
-                destination,
+            ShaderOperation::SetPredicateInteger32 {
+                destinations,
                 accumulator,
                 ..
             } => {
-                validate_predicate_register(instruction.source, *destination)?;
+                for destination in destinations.iter().flatten() {
+                    validate_predicate_register(instruction.source, *destination)?;
+                }
+                if destinations[0].is_some() && destinations[0] == destinations[1] {
+                    return Err(ShaderVerificationError::AliasedPredicateDestinations {
+                        source: instruction.source,
+                    });
+                }
                 for source in operation_sources(&instruction.operation) {
-                    require_definition(instruction.source, source, &definitions.registers)?;
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
                 }
                 if let ShaderPredicate::Register { register, .. } = accumulator {
                     validate_predicate_register(instruction.source, *register)?;
@@ -3062,6 +3385,36 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                         &definitions.predicates,
                     )?;
                 }
+                for destination in destinations.iter().flatten() {
+                    definitions.invalidate_guard(*destination);
+                    if !conditional {
+                        definitions.predicates.insert(*destination);
+                    }
+                }
+            }
+            ShaderOperation::SetPredicateFloat32 {
+                destination,
+                accumulator,
+                ..
+            } => {
+                validate_predicate_register(instruction.source, *destination)?;
+                for source in operation_sources(&instruction.operation) {
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
+                }
+                if let ShaderPredicate::Register { register, .. } = accumulator {
+                    validate_predicate_register(instruction.source, *register)?;
+                    require_predicate_definition(
+                        instruction.source,
+                        *register,
+                        &definitions.predicates,
+                    )?;
+                }
+                definitions.invalidate_guard(*destination);
                 if !conditional {
                     definitions.predicates.insert(*destination);
                 }
@@ -3073,7 +3426,12 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 sampler_binding,
             } => {
                 for coordinate in coordinates {
-                    require_definition(instruction.source, *coordinate, &definitions.registers)?;
+                    require_definition(
+                        instruction.source,
+                        *coordinate,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
                 }
                 let valid_outputs = !outputs.is_empty()
                     && outputs.len() <= 4
@@ -3124,7 +3482,12 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 sampler_binding,
             } => {
                 for source in [coordinates[0], coordinates[1], *array_index] {
-                    require_definition(instruction.source, source, &definitions.registers)?;
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
                 }
                 let valid_outputs = !outputs.is_empty()
                     && outputs.len() <= 4
@@ -3191,6 +3554,13 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 }
             }
         }
+        if let Some(guard) = predicate_guard(instruction.predicate) {
+            visit_operation_destinations(&instruction.operation, |destination| {
+                if !definitions.registers.contains(&destination) {
+                    *definitions.guarded.entry(destination).or_default() |= 1 << guard;
+                }
+            });
+        }
         if let ShaderOperation::LoadConstantBuffer32 { binding, .. }
         | ShaderOperation::LoadConstantBufferIndexed32 { binding, .. } = instruction.operation
             && !ir.resources.iter().any(|resource| {
@@ -3229,6 +3599,66 @@ fn shader_instruction_entry_points(
 struct ShaderDefinitions {
     registers: BTreeSet<ShaderRegister>,
     predicates: BTreeSet<u8>,
+    // Sparse proof facts, allocated only for conditionally defined registers.
+    // Each predicate contributes one positive and one negative guard bit.
+    guarded: std::collections::BTreeMap<ShaderRegister, u16>,
+}
+
+impl ShaderDefinitions {
+    fn invalidate_guard(&mut self, predicate: u8) {
+        let keep = !(3 << (u16::from(predicate) * 2));
+        self.guarded.retain(|_, guards| {
+            *guards &= keep;
+            *guards != 0
+        });
+    }
+}
+
+fn predicate_guard(predicate: ShaderPredicate) -> Option<usize> {
+    match predicate {
+        ShaderPredicate::Register { register, inverted } => {
+            Some(usize::from(register) * 2 + usize::from(inverted))
+        }
+        _ => None,
+    }
+}
+
+fn visit_operation_destinations(
+    operation: &ShaderOperation,
+    mut visit: impl FnMut(ShaderRegister),
+) {
+    match operation {
+        ShaderOperation::Undefined32 { destination }
+        | ShaderOperation::MoveImmediate32 { destination, .. }
+        | ShaderOperation::Move32 { destination, .. }
+        | ShaderOperation::FloatAbsolute32 { destination, .. }
+        | ShaderOperation::FloatNegate32 { destination, .. }
+        | ShaderOperation::ConvertIntegerToFloat32 { destination, .. }
+        | ShaderOperation::RoundFloat32ToIntegral { destination, .. }
+        | ShaderOperation::ConvertFloat32ToInteger { destination, .. }
+        | ShaderOperation::LoadControlPoint { destination, .. }
+        | ShaderOperation::LoadPatchOutput { destination, .. }
+        | ShaderOperation::Multiply32 { destination, .. }
+        | ShaderOperation::Add32 { destination, .. }
+        | ShaderOperation::ShiftLeft32 { destination, .. }
+        | ShaderOperation::FloatMinMax32 { destination, .. }
+        | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
+        | ShaderOperation::Reciprocal32 { destination, .. }
+        | ShaderOperation::ReciprocalSqrt32 { destination, .. }
+        | ShaderOperation::SpecialFunction32 { destination, .. }
+        | ShaderOperation::InterpolateInput { destination, .. }
+        | ShaderOperation::LoadConstantBuffer32 { destination, .. }
+        | ShaderOperation::LoadConstantBufferIndexed32 { destination, .. } => visit(*destination),
+        ShaderOperation::LoadInput { destinations, .. } => {
+            destinations.iter().copied().for_each(visit)
+        }
+        ShaderOperation::SampleTexture2D { outputs, .. }
+        | ShaderOperation::SampleTexture2DArray { outputs, .. } => outputs
+            .iter()
+            .map(|output| output.destination())
+            .for_each(visit),
+        _ => {}
+    }
 }
 
 fn enqueue_shader_successor(
@@ -3247,6 +3677,22 @@ fn enqueue_shader_successor(
         }
         Some(existing) => {
             let merged = ShaderDefinitions {
+                guarded: existing
+                    .guarded
+                    .keys()
+                    .chain(definitions.guarded.keys())
+                    .filter_map(|&register| {
+                        let guards = |state: &ShaderDefinitions| {
+                            if state.registers.contains(&register) {
+                                0x3fff
+                            } else {
+                                state.guarded.get(&register).copied().unwrap_or(0)
+                            }
+                        };
+                        let intersection = guards(existing) & guards(definitions);
+                        (intersection != 0).then_some((register, intersection))
+                    })
+                    .collect(),
                 registers: existing
                     .registers
                     .intersection(&definitions.registers)
@@ -3269,6 +3715,9 @@ fn enqueue_shader_successor(
 
 fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
     match operation {
+        ShaderOperation::StoreOutput { sources, .. } => sources.to_vec(),
+        ShaderOperation::LoadControlPoint { vertex, .. } => vec![*vertex],
+        ShaderOperation::StoreControlPoint { source, vertex, .. } => vec![*source, *vertex],
         ShaderOperation::Multiply32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::Move32 { source, .. } => vec![*source],
         ShaderOperation::Add32 { left, right, .. } => vec![*left, *right],
@@ -3288,7 +3737,8 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         ShaderOperation::Reciprocal32 { source, .. } => vec![*source],
         ShaderOperation::ReciprocalSqrt32 { source, .. } => vec![*source],
         ShaderOperation::SpecialFunction32 { source, .. } => vec![*source],
-        ShaderOperation::SetPredicateFloat32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::SetPredicateFloat32 { left, right, .. }
+        | ShaderOperation::SetPredicateInteger32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::LoadConstantBufferIndexed32 {
             dynamic_byte_offset,
             ..
@@ -3335,9 +3785,19 @@ fn require_predicate_definition(
 fn require_definition(
     source: ShaderSourceLocation,
     register: ShaderRegister,
-    definitions: &BTreeSet<ShaderRegister>,
+    definitions: &ShaderDefinitions,
+    predicate: ShaderPredicate,
 ) -> Result<(), ShaderVerificationError> {
-    if definitions.contains(&register) {
+    // A definition under P is usable under the same unchanged P. Test the
+    // sparse guard mask directly; do not build a register set per instruction.
+    if definitions.registers.contains(&register)
+        || predicate_guard(predicate).is_some_and(|guard| {
+            definitions
+                .guarded
+                .get(&register)
+                .is_some_and(|mask| mask & (1 << guard) != 0)
+        })
+    {
         Ok(())
     } else {
         Err(ShaderVerificationError::UndefinedRegister { source, register })
@@ -3375,6 +3835,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wgsl_grouping_inherits_only_the_consumed_components_interpolation() {
+        for interpolation in [
+            ShaderInterpolation::Perspective,
+            ShaderInterpolation::ScreenLinear,
+            ShaderInterpolation::Constant,
+        ] {
+            for linked_component in 0..4 {
+                let elements = (0..4)
+                    .map(|component| {
+                        ShaderInterfaceElement::new(
+                            ShaderIoLocation::Generic(0),
+                            component,
+                            ShaderScalarType::Float32,
+                            (component == linked_component).then_some(interpolation),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                for elements in [elements.clone(), elements.into_iter().rev().collect()] {
+                    let groups = interface_groups(&elements).unwrap();
+                    assert_eq!(
+                        groups[&ShaderIoLocation::Generic(0)].interpolation,
+                        Some(interpolation)
+                    );
+                    assert_eq!(groups[&ShaderIoLocation::Generic(0)].components, 4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wgsl_grouping_still_rejects_incompatible_consumed_components() {
+        for (scalar, interpolation) in [
+            (
+                ShaderScalarType::Unsigned32,
+                Some(ShaderInterpolation::Perspective),
+            ),
+            (
+                ShaderScalarType::Float32,
+                Some(ShaderInterpolation::Constant),
+            ),
+        ] {
+            let elements = [
+                ShaderInterfaceElement::new(
+                    ShaderIoLocation::Generic(0),
+                    0,
+                    ShaderScalarType::Float32,
+                    Some(ShaderInterpolation::Perspective),
+                )
+                .unwrap(),
+                ShaderInterfaceElement::new(ShaderIoLocation::Generic(0), 1, scalar, interpolation)
+                    .unwrap(),
+            ];
+            assert!(matches!(
+                interface_groups(&elements),
+                Err(ShaderBackendLoweringError::InconsistentInterfaceType(
+                    ShaderIoLocation::Generic(0)
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn cloning_a_backend_module_shares_verified_immutable_storage() {
         let shader = VerifiedShaderIr::verify(ShaderIr::new(
             ShaderStage::Fragment,
@@ -3388,7 +3911,7 @@ mod tests {
             )],
         ))
         .unwrap();
-        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        let module = ShaderBackendModule::new(shader);
 
         let cloned = module.clone();
 

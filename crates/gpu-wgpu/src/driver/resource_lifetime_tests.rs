@@ -9,13 +9,16 @@ use nixe_memory::{CanonicalAllocation, MemoryPermissions, NonCpuDeviceId};
 fn full_clear_reclaims_superseded_generations_and_their_page_index_entries() {
     let instance = BackendInstanceId::new(810);
     let device_id = NonCpuDeviceId::new(810);
-    let Ok(initialized) = crate::initialize_backend(instance, device_id, Default::default()) else {
+    let Some(initialized) =
+        crate::test_hardware::initialize_backend(instance, device_id, Default::default())
+    else {
         return;
     };
     let context = initialized.presentation_context();
     let mut driver = WgpuBackendDriver::new(
         instance,
         WgpuExecutionContext {
+            native_vulkan: None,
             device: context.device().clone(),
             queue: context.queue().clone(),
             queue_access: context.queue_access().clone(),

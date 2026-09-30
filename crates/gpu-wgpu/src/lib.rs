@@ -4,10 +4,17 @@
 //! Switch profiles and Maxwell packets deliberately remain outside this layer.
 
 mod driver;
+mod native;
 mod page_resources;
 mod quad_indices;
 mod texture_sampling;
 mod visibility;
+
+#[cfg(test)]
+extern crate self as nixe_gpu_wgpu;
+#[cfg(test)]
+#[path = "../test-support/hardware.rs"]
+mod test_hardware;
 
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -15,6 +22,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use driver::WgpuBackendDriver;
 use visibility::WgpuVisibilityCoordinator;
+
+pub use native::{
+    VulkanGraphicsLimits, VulkanNativeCapabilities, VulkanRasterCapabilities,
+    VulkanTessellationLimits,
+};
 
 use nixe_gpu::{
     Backend, BackendCapabilities, BackendFeatures, BackendInstanceId, BackendLimits,
@@ -133,6 +145,9 @@ pub struct WgpuAdapterInformation {
     pub name: Box<str>,
     pub driver: Box<str>,
     pub backend: HostBackend,
+    /// Enabled native capabilities for diagnostics and native pipeline selection.
+    /// This does not advertise completed guest tessellation support.
+    pub native_vulkan: Option<VulkanNativeCapabilities>,
 }
 
 /// Serializes host queue mutation with surface reconfiguration.
@@ -157,6 +172,7 @@ pub(crate) struct WgpuExecutionContext {
     device: Device,
     queue: Queue,
     queue_access: WgpuQueueAccess,
+    native_vulkan: Option<VulkanNativeCapabilities>,
 }
 
 /// Result of accelerated backend initialization.
@@ -290,18 +306,41 @@ async fn initialize_backend_async(
     let info = adapter.get_info();
     let required_limits = adapter.limits();
     let required_features = requested_device_features(adapter.features());
-    let (device, queue) = adapter
-        .request_device(&DeviceDescriptor {
-            label: Some("Nixe accelerated GPU backend"),
-            required_features,
-            required_limits: required_limits.clone(),
-            experimental_features: ExperimentalFeatures::disabled(),
-            memory_hints: MemoryHints::Performance,
-            trace: Trace::Off,
-        })
-        .await
-        .map_err(|error| WgpuBackendInitializationError::Device(error.to_string().into()))?;
-    let capabilities = capabilities(&adapter, &required_limits, required_features);
+    let device_descriptor = DeviceDescriptor {
+        label: Some("Nixe accelerated GPU backend"),
+        required_features,
+        required_limits: required_limits.clone(),
+        experimental_features: ExperimentalFeatures::disabled(),
+        memory_hints: MemoryHints::Performance,
+        trace: Trace::Off,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let native = native::vulkan::create_device(&instance, &adapter, &device_descriptor)?;
+    #[cfg(not(target_os = "macos"))]
+    let (device, queue, native_vulkan) = if let Some(native) = native {
+        (native.device, native.queue, Some(native.capabilities))
+    } else {
+        let (device, queue) = adapter
+            .request_device(&device_descriptor)
+            .await
+            .map_err(|error| WgpuBackendInitializationError::Device(error.to_string().into()))?;
+        (device, queue, None)
+    };
+    #[cfg(target_os = "macos")]
+    let (device, queue, native_vulkan) = {
+        let (device, queue) = adapter
+            .request_device(&device_descriptor)
+            .await
+            .map_err(|error| WgpuBackendInitializationError::Device(error.to_string().into()))?;
+        (device, queue, None)
+    };
+    log::debug!("native Vulkan capabilities: {native_vulkan:?}");
+    let capabilities = capabilities(
+        &adapter,
+        &required_limits,
+        required_features,
+        native_vulkan.is_some_and(|c| c.tessellation_shader),
+    );
     let visibility = Arc::new(WgpuVisibilityCoordinator::new(device_id));
     let pipeline_cache_path = configuration
         .pipeline_cache_directory
@@ -353,6 +392,7 @@ async fn initialize_backend_async(
             device,
             queue,
             queue_access,
+            native_vulkan,
         },
         Arc::clone(&visibility),
         pipeline_cache,
@@ -368,6 +408,7 @@ async fn initialize_backend_async(
             name: info.name.into(),
             driver: info.driver.into(),
             backend: configuration.host_backend,
+            native_vulkan,
         },
     })
 }
@@ -490,6 +531,7 @@ fn capabilities(
     adapter: &wgpu::Adapter,
     limits: &wgpu::Limits,
     enabled_features: wgpu::Features,
+    native_tessellation: bool,
 ) -> BackendCapabilities {
     let formats = ALL_IMAGE_FORMATS.into_iter().filter(|format| {
         if !enabled_features.contains(required_features_for_image_format(*format)) {
@@ -510,7 +552,14 @@ fn capabilities(
             .union(BackendFeatures::RENDER_PASS),
         formats,
         [SampleCount::One],
-        [ShaderStage::Vertex, ShaderStage::Fragment],
+        [
+            Some(ShaderStage::Vertex),
+            Some(ShaderStage::Fragment),
+            native_tessellation.then_some(ShaderStage::TessellationControl),
+            native_tessellation.then_some(ShaderStage::TessellationEvaluation),
+        ]
+        .into_iter()
+        .flatten(),
         std::iter::empty::<QueryKind>(),
         BackendLimits {
             max_color_attachments: limits.max_color_attachments.min(u32::from(u8::MAX)) as u8,

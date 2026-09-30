@@ -43,6 +43,15 @@ fn address_space() -> MaxwellGpuAddressSpace {
 
 #[test]
 fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
+    captured_color_shader_pipeline(false);
+}
+
+#[test]
+fn vertex_rgba_output_links_to_fragment_rgb_without_qualifying_unused_alpha() {
+    captured_color_shader_pipeline(true);
+}
+
+fn captured_color_shader_pipeline(unused_alpha: bool) {
     let vertex_allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
     let target_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let shader_allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
@@ -83,7 +92,11 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
     vertex_header[0] = 0x0002_0461;
     vertex_header[4] = 0x000f_f000;
     vertex_header[6] = 0x0000_0077;
-    vertex_header[13] = 0x0007_f000;
+    vertex_header[13] = if unused_alpha {
+        0x000f_f000
+    } else {
+        0x0007_f000
+    };
     write_program(
         0,
         vertex_header,
@@ -98,7 +111,11 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
             0xefd8_7f80_0987_ff02,
             0x07ff_bc02_3c40_08e1,
             0xeff0_ff80_087f_ff00,
-            0xeff0_7f80_0887_ff02,
+            if unused_alpha {
+                0xeff0_ff80_0887_ff02
+            } else {
+                0xeff0_7f80_0887_ff02
+            },
             0xe300_0000_0007_000f,
         ],
     );
@@ -168,6 +185,10 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
         (0x0d74, 3),
         (0x0308, 3),
         (0x1618, 4),
+        (0x1918, 0),
+        (0x0dac, 0x1b02),
+        (0x0db0, 0x1b02),
+        (0x191c, 0x901),
         (0x1970, 4),
         (0x1608, (shader >> 32) as u32),
         (0x160c, shader as u32),
@@ -210,8 +231,30 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
             .iter()
             .any(|(stage, _)| *stage == ShaderStage::Fragment)
     );
-    for (_, module) in shader_modules {
-        let parsed = naga::front::wgsl::parse_str(module.source()).unwrap();
+    for (stage, module) in shader_modules {
+        if unused_alpha && stage == ShaderStage::Vertex {
+            let color = module
+                .ir()
+                .ir()
+                .outputs()
+                .iter()
+                .filter(|output| output.location() == nixe_gpu::ShaderIoLocation::Generic(0))
+                .collect::<Vec<_>>();
+            assert_eq!(color.len(), 4);
+            for component in &color[..3] {
+                assert_eq!(
+                    component.interpolation(),
+                    Some(nixe_gpu::ShaderInterpolation::Perspective)
+                );
+            }
+            assert_eq!(
+                color[3].interpolation(),
+                None,
+                "unconsumed alpha stays unlinked in neutral IR"
+            );
+        }
+        let wgsl = nixe_gpu::lower_shader_ir_to_wgsl(module.ir()).unwrap();
+        let parsed = naga::front::wgsl::parse_str(wgsl.source()).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -239,5 +282,68 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
             .resource_creations()
             .iter()
             .any(|creation| matches!(creation, BackendResourceCreateInfo::Pipeline { .. }))
+    );
+
+    let prepared = |work: &MaxwellThreeDLoweredWork| {
+        work.submission()
+            .operations()
+            .iter()
+            .find_map(|op| match op.command() {
+                nixe_gpu::GpuCommand::Draw(draw) => Some(draw.prepared.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let filled = prepared(replacement_work);
+    for (method, argument) in [
+        (0x0dac, 0x1b01),
+        (0x0db0, 0x1b01),
+        (0x1570, 1),
+        (0x0db4, 1),
+        (0x1658, 1),
+        (0x15e4, 1),
+        (0x020c, 1),
+        (0x13b4, 99_f32.to_bits()),
+        (0x0dc4, 0),
+    ] {
+        let _ = dispatch(method, argument);
+    }
+    let mut previous = filled.clone();
+    for width in [1_f32, 4.0, 4.0] {
+        let _ = dispatch(0x13b0, width.to_bits());
+        let result = dispatch(0x0d78, 3);
+        let [MaxwellSubmissionExecutionStep::ThreeD(work)] = result.steps() else {
+            panic!("wireframe draw");
+        };
+        let current = prepared(work);
+        assert_eq!(
+            current.triangle_rasterization,
+            nixe_gpu::TriangleRasterization::Wireframe {
+                width_bits: width.to_bits(),
+                smooth: true,
+            }
+        );
+        assert_eq!(current.pipeline, filled.pipeline);
+        assert!(!work.resource_creations().iter().any(|c| matches!(
+            c,
+            BackendResourceCreateInfo::Shader { .. } | BackendResourceCreateInfo::Pipeline { .. }
+        )));
+        if previous.triangle_rasterization == current.triangle_rasterization {
+            assert!(std::sync::Arc::ptr_eq(&previous, &current));
+        } else {
+            assert!(!std::sync::Arc::ptr_eq(&previous, &current));
+        }
+        previous = current;
+    }
+    for (method, argument) in [(0x0dac, 0x1b02), (0x0db0, 0x1b02), (0x0db4, 0)] {
+        let _ = dispatch(method, argument);
+    }
+    let result = dispatch(0x0d78, 3);
+    let [MaxwellSubmissionExecutionStep::ThreeD(work)] = result.steps() else {
+        panic!("filled draw");
+    };
+    assert_eq!(
+        prepared(work).triangle_rasterization,
+        nixe_gpu::TriangleRasterization::Fill
     );
 }

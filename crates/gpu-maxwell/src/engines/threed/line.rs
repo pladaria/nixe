@@ -155,7 +155,7 @@ pub enum MaxwellThreeDLineStateWrite {
 }
 
 /// Persistent line-rasterization configuration on one `MAXWELL_B` channel.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDLineState {
     polygon_clip_generated_edge: MaxwellThreeDRegister<MaxwellThreeDPolygonClipGeneratedEdge>,
     aliased_line_width_enable: MaxwellThreeDRegister<MaxwellThreeDAliasedLineWidthEnable>,
@@ -163,6 +163,28 @@ pub struct MaxwellThreeDLineState {
     aliased_line_width: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
     stipple_enable: MaxwellThreeDRegister<bool>,
     stipple_parameters: MaxwellThreeDRegister<MaxwellThreeDLineStippleParameters>,
+}
+
+impl Default for MaxwellThreeDLineState {
+    fn default() -> Self {
+        // Reset disables stippling and draws clip-generated polygon edges.
+        // The public Maxwell class encodes both as zero; the independently
+        // implemented register initialization retains zero for these fields
+        // and copies them into shadow RAM (not a blanket zero fallback):
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1261-L1264
+        // https://github.com/eden-emulator/mirror/blob/815325cceca948030cf476dce7c46d901e4e4df5/src/video_core/engines/maxwell_3d.cpp#L52-L135
+        Self {
+            polygon_clip_generated_edge: MaxwellThreeDRegister::verified_reset(
+                0,
+                Some(MaxwellThreeDPolygonClipGeneratedEdge::DrawLine),
+            ),
+            stipple_enable: MaxwellThreeDRegister::verified_reset(0, Some(false)),
+            aliased_line_width_enable: Default::default(),
+            anti_aliased_line_enable: Default::default(),
+            aliased_line_width: Default::default(),
+            stipple_parameters: Default::default(),
+        }
+    }
 }
 
 impl MaxwellThreeDLineState {

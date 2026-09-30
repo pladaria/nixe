@@ -11,7 +11,7 @@ use super::state::{
     MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
     MaxwellThreeDRegisterOrigin,
 };
-use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
+use super::{MaxwellThreeDRegister, MaxwellThreeDTessellationMode, MaxwellThreeDUnresolvedAddress};
 
 pub const MAXWELL_PIPELINE_SHADER_COUNT: usize = 6;
 pub const MAXWELL_BIND_GROUP_COUNT: usize = 8;
@@ -404,6 +404,7 @@ pub struct MaxwellThreeDShaderBindingState {
     maxwell_texture_headers: MaxwellThreeDRegister<bool>,
     bindless_texture_constant_buffer_slot: MaxwellThreeDRegister<u8>,
     tessellation_lod: [MaxwellThreeDRegister<u32>; MAXWELL_TESSELLATION_LOD_COUNT],
+    tessellation_mode: MaxwellThreeDRegister<MaxwellThreeDTessellationMode>,
 }
 
 impl Default for MaxwellThreeDShaderBindingState {
@@ -422,11 +423,15 @@ impl Default for MaxwellThreeDShaderBindingState {
             maxwell_texture_headers: MaxwellThreeDRegister::default(),
             bindless_texture_constant_buffer_slot: MaxwellThreeDRegister::default(),
             tessellation_lod: std::array::from_fn(|_| MaxwellThreeDRegister::default()),
+            tessellation_mode: MaxwellThreeDRegister::default(),
         }
     }
 }
 
 impl MaxwellThreeDShaderBindingState {
+    pub const fn tessellation_mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDTessellationMode> {
+        &self.tessellation_mode
+    }
     #[must_use]
     pub const fn program_region(&self) -> &MaxwellThreeDProgramRegionState {
         &self.program_region
@@ -625,12 +630,19 @@ impl MaxwellThreeDShaderBindingState {
                 self.tessellation_lod[level.index()] =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDShaderBindingWrite::TessellationMode { value, .. } => {
+                self.tessellation_mode = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderBindingWrite {
+    TessellationMode {
+        value: MaxwellThreeDTessellationMode,
+        source: MaxwellMethodSource,
+    },
     ProgramRegionAddressUpper {
         value: u8,
         source: MaxwellMethodSource,
@@ -739,7 +751,8 @@ pub enum MaxwellThreeDShaderBindingWrite {
 impl MaxwellThreeDShaderBindingWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::ProgramRegionAddressUpper { source, .. }
+            Self::TessellationMode { source, .. }
+            | Self::ProgramRegionAddressUpper { source, .. }
             | Self::ProgramRegionAddressLower { source, .. }
             | Self::SpaVersion { source, .. }
             | Self::PipelineShader { source, .. }

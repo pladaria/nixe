@@ -19,8 +19,10 @@ mod render_targets;
 mod resource;
 mod shader_execution;
 mod state;
+pub(super) mod tessellation;
 mod tiled_cache;
 mod vertex;
+pub use tessellation::{MaxwellTessellationModeError, MaxwellThreeDTessellationMode};
 mod zcull;
 
 pub use bindings::{
@@ -50,13 +52,13 @@ pub use counters::{
 };
 pub use coverage::{
     MAXWELL_SAMPLE_LOCATION_GROUP_COUNT, MAXWELL_SAMPLE_LOCATIONS_PER_GROUP,
-    MaxwellThreeDAlphaToCoverageOverride, MaxwellThreeDCoverageState,
-    MaxwellThreeDCoverageStateWrite, MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable,
-    MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
-    MaxwellThreeDPostZPixelShaderImask, MaxwellThreeDPsOutputSampleMaskUsage,
-    MaxwellThreeDSampleLocation, MaxwellThreeDSampleLocationGroup, MaxwellThreeDTirControl,
-    MaxwellThreeDTirMode, MaxwellThreeDTirModulationComponentSelect,
-    MaxwellThreeDTirModulationFunction,
+    MaxwellThreeDAlphaToCoverageDither, MaxwellThreeDAlphaToCoverageOverride,
+    MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite, MaxwellThreeDCoverageToColor,
+    MaxwellThreeDCsaaEnable, MaxwellThreeDHybridAntiAliasCentroid,
+    MaxwellThreeDHybridAntiAliasControl, MaxwellThreeDPostZPixelShaderImask,
+    MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDSampleLocation,
+    MaxwellThreeDSampleLocationGroup, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
+    MaxwellThreeDTirModulationComponentSelect, MaxwellThreeDTirModulationFunction,
 };
 pub(crate) use draw::lower_maxwell_three_d_operation_into_cache;
 pub use draw::{
@@ -333,6 +335,7 @@ enum MethodAction {
     TirModulationFunction,
     CoverageToColor,
     AlphaToCoverageOverride,
+    AlphaToCoverageDither,
     HybridAntiAliasControl,
     SampleLocations(u8),
     RasterBoundingBox,
@@ -688,6 +691,12 @@ methods!(
         "SET_ALPHA_TO_COVERAGE_OVERRIDE",
         0x0000_0003,
         MethodAction::AlphaToCoverageOverride
+    ),
+    SET_ALPHA_TO_COVERAGE_DITHER_CONTROL => (
+        0x12e0,
+        "SET_ALPHA_TO_COVERAGE_DITHER_CONTROL",
+        0x0000_000f,
+        MethodAction::AlphaToCoverageDither
     ),
     SET_TIR_CONTROL => (
         0x1130,
@@ -2152,6 +2161,19 @@ fn preflight_register(
                 candidate.apply(write);
                 state_write()
             }
+            MethodAction::AlphaToCoverageDither => {
+                let value = MaxwellThreeDAlphaToCoverageDither::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                candidate.apply(MaxwellThreeDStateWrite::Coverage(
+                    MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source },
+                ));
+                state_write()
+            }
             MethodAction::SampleLocations(group) => {
                 let value = MaxwellThreeDSampleLocationGroup::parse(source.argument());
                 let write = MaxwellThreeDStateWrite::Coverage(
@@ -3134,6 +3156,14 @@ fn preflight_vertex_and_binding_state(
             }
             _ => None,
         }
+    } else if method == 0x0320 {
+        Some((
+            B::TessellationMode {
+                value: MaxwellThreeDTessellationMode::new(raw),
+                source,
+            },
+            "SET_TESSELLATION_PARAMETERS",
+        ))
     } else if (0x0324..=0x0338).contains(&method) && method.is_multiple_of(4) {
         Some((
             B::TessellationLod {

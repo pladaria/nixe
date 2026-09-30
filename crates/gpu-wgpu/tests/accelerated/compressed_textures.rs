@@ -8,12 +8,11 @@ use nixe_gpu::{
 #[test]
 fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(720),
         NonCpuDeviceId::new(720),
         WgpuBackendConfiguration::default(),
     ) else {
-        eprintln!("Vulkan adapter unavailable; skipping BC1 acceptance test");
         return;
     };
     let presentation = initialized.presentation_context();
@@ -22,7 +21,7 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
         .features()
         .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
     {
-        eprintln!("Native BC compression unavailable; skipping BC1 acceptance test");
+        eprintln!("SKIP: physical GPU lacks native BC texture compression");
         return;
     }
     let runtime = RuntimeOwner::new(initialized.into_runtime());
@@ -58,8 +57,8 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
         ),
     });
     let vertex = ShaderId::new(720);
-    let vertex_module = lower_shader_ir_to_wgsl(
-        &VerifiedShaderIr::verify(ShaderIr::new(
+    let vertex_module = nixe_gpu::ShaderBackendModule::new(
+        VerifiedShaderIr::verify(ShaderIr::new(
             ShaderStage::Vertex,
             (0..3)
                 .map(|component| interface(ShaderIoLocation::Generic(0), component))
@@ -76,8 +75,7 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
             ],
         ))
         .unwrap(),
-    )
-    .unwrap();
+    );
     creations.push(BackendResourceCreateInfo::Shader {
         id: vertex,
         description: ShaderDescription {
@@ -389,8 +387,8 @@ fn sampled_fragment(array: bool) -> nixe_gpu::ShaderBackendModule {
             sampler_binding: 1,
         }
     };
-    lower_shader_ir_to_wgsl(
-        &VerifiedShaderIr::verify(ShaderIr::new(
+    nixe_gpu::ShaderBackendModule::new(
+        VerifiedShaderIr::verify(ShaderIr::new(
             ShaderStage::Fragment,
             vec![],
             (0..4)
@@ -433,5 +431,4 @@ fn sampled_fragment(array: bool) -> nixe_gpu::ShaderBackendModule {
         ))
         .unwrap(),
     )
-    .unwrap()
 }

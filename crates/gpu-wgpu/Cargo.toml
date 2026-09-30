@@ -13,3 +13,15 @@ wgpu.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Keep the Vulkan ABI identical to wgpu-hal's device and resource handles.
+ash = "=0.38.0"
+sha2.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
+wgpu-types = "=30.0.0"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libloading = "=0.8.9"

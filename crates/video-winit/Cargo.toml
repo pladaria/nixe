@@ -6,10 +6,16 @@ license.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+chrono.workspace = true
 log.workspace = true
 nixe-config.workspace = true
 nixe-gpu.workspace = true
 nixe-gpu-wgpu.workspace = true
 nixe-video.workspace = true
+png.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
+tempfile.workspace = true

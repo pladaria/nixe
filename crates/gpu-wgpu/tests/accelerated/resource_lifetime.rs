@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn retired_images_preserve_contents_without_occupying_reused_logical_slots() {
     let _guard = accelerated_test_guard();
-    let Ok(initialized) = initialize_backend(
+    let Some(initialized) = initialize_backend(
         BackendInstanceId::new(740),
         NonCpuDeviceId::new(740),
         WgpuBackendConfiguration::default(),

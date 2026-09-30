@@ -102,12 +102,11 @@ mod tests {
 
     #[test]
     fn index_storage_is_reused_until_a_larger_draw_requires_growth() {
-        let Ok(initialized) = crate::initialize_backend(
+        let Some(initialized) = crate::test_hardware::initialize_backend(
             nixe_gpu::BackendInstanceId::new(801),
             nixe_memory::NonCpuDeviceId::new(801),
             Default::default(),
         ) else {
-            eprintln!("Vulkan adapter is unavailable; skipping quad index cache test");
             return;
         };
         let context = initialized.presentation_context();

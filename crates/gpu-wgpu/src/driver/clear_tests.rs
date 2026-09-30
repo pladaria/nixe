@@ -6,8 +6,9 @@ use super::*;
 fn partial_depth_stencil_clears_preserve_other_aspects_and_outside_texels() {
     let backend = nixe_gpu::BackendInstanceId::new(800);
     let device_id = nixe_memory::NonCpuDeviceId::new(800);
-    let Ok(initialized) = crate::initialize_backend(backend, device_id, Default::default()) else {
-        eprintln!("Vulkan adapter is unavailable; skipping accelerated clear test");
+    let Some(initialized) =
+        crate::test_hardware::initialize_backend(backend, device_id, Default::default())
+    else {
         return;
     };
     let context = initialized.presentation_context();
@@ -15,6 +16,7 @@ fn partial_depth_stencil_clears_preserve_other_aspects_and_outside_texels() {
     let mut driver = WgpuBackendDriver::new(
         backend,
         WgpuExecutionContext {
+            native_vulkan: None,
             device: device.clone(),
             queue: context.queue().clone(),
             queue_access: context.queue_access().clone(),

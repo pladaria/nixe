@@ -1585,6 +1585,7 @@ fn viewport_coordinate_swizzles_are_indexed_typed_and_atomic() {
 #[test]
 fn effective_viewport_coordinate_swizzles_stop_draws_before_publication() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     for (method, argument) in [(0x121c, 0), (0x1618, 4), (0x0a18, 0x6420)] {
         program_three_d(&mut channel, method, argument);
     }
@@ -1635,6 +1636,7 @@ fn effective_viewport_coordinate_swizzles_stop_draws_before_publication() {
 #[test]
 fn integer_viewport_pixel_centers_stop_draws_before_publication() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     for (method, argument) in [(0x121c, 0), (0x1618, 4), (0x1924, 0)] {
         program_three_d(&mut channel, method, argument);
     }
@@ -1684,6 +1686,7 @@ fn integer_viewport_pixel_centers_stop_draws_before_publication() {
 #[test]
 fn effective_polygon_smoothing_and_stipple_are_topology_aware() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     for (method, argument) in [(0x121c, 0), (0x1618, 4), (0x0db4, 0), (0x168c, 0)] {
         program_three_d(&mut channel, method, argument);
     }
@@ -1745,6 +1748,7 @@ fn effective_polygon_smoothing_and_stipple_are_topology_aware() {
 #[test]
 fn effective_triangle_fill_modes_preserve_supported_bounding_box_semantics() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     for (method, argument) in [(0x121c, 0), (0x1618, 4), (0x113c, 0), (0x1148, 0)] {
         program_three_d(&mut channel, method, argument);
     }
@@ -1808,6 +1812,7 @@ fn effective_triangle_fill_modes_preserve_supported_bounding_box_semantics() {
 #[test]
 fn point_controls_are_topology_aware_and_effective_modes_stop_before_publication() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     for (method, argument) in [
         (0x121c, 0),
         (0x1518, 0x3f80_0000),
@@ -2110,10 +2115,12 @@ fn invalid_shade_modes_and_failed_packet_keeps_valid_prefix() {
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x12d4 / 4, &[0x1d01, 0, 0, 0]);
+    // 0x12e0 is now decoded; use its reserved footprint encoding to retain
+    // the valid-prefix failure test rather than relying on an unknown method.
+    let decoded = incrementing_packet(0x12d4 / 4, &[0x1d01, 0, 0, 3]);
     assert!(matches!(
         dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+        Err(MaxwellEngineDispatchError::InvalidMethodValue { source, defined_mask: 0xf, .. })
             if source.method() == GpuMethodId(0x12e0)
     ));
     assert_eq!(channel.frontend(), frontend_before);
@@ -2605,7 +2612,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     }
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedBlendSemantics { target: None })
+        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x12e4, 1);
@@ -2626,10 +2633,10 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
         preflight(&channel),
         Err(MaxwellThreeDLoweringError::IncompleteBlendState {
             target: Some(0),
-            field: "SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA"
+            field: "SET_BLEND_PER_TARGET_OP_COLOR"
         })
     ));
-    for (method, argument) in [(0x1e00, 1), (0x1e04, 1), (0x1e08, 1), (0x1e0c, 1)] {
+    for (method, argument) in [(0x1e04, 1), (0x1e08, 1), (0x1e0c, 1)] {
         program_three_d(&mut channel, method, argument);
     }
     assert!(matches!(
@@ -2644,7 +2651,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     }
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedBlendSemantics { target: Some(0) })
+        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -3461,11 +3468,7 @@ fn effective_color_write_mask_is_selected_and_validated_before_draw_publication(
     program_three_d(&mut channel, 0x0f90, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedColorWriteMask {
-            target: 1,
-            mask_register: 1,
-            mask,
-        }) if mask.raw() == 0x0111
+        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1a04, 0x1111);
@@ -3478,6 +3481,7 @@ fn effective_color_write_mask_is_selected_and_validated_before_draw_publication(
 #[test]
 fn enabled_vertex_array_restart_uses_each_neutral_draw_boundary() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
     let mut cache = MaxwellThreeDLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
@@ -3629,7 +3633,7 @@ fn polygon_clip_generated_edge_is_typed_source_preserving_line_state() {
             .line()
             .polygon_clip_generated_edge()
             .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
+        MaxwellThreeDRegisterOrigin::VerifiedReset
     );
 
     for (argument, expected) in [
@@ -3692,11 +3696,12 @@ fn invalid_polygon_clip_generated_edge_values_and_failed_packet_keeps_valid_pref
 #[test]
 fn polygon_clip_edge_suppression_is_rejected_only_for_polygon_line_draws() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x1618, 4);
     program_three_d(&mut channel, 0x0dac, 0x1b01);
     program_three_d(&mut channel, 0x0db0, 0x1b01);
-    program_three_d(&mut channel, 0x1570, 0);
+    program_three_d(&mut channel, 0x1570, 1);
     program_three_d(&mut channel, 0x166c, 0);
     program_three_d(&mut channel, 0x0f8c, 1);
     let resources =
@@ -3857,6 +3862,7 @@ fn line_smoothing_width_and_stipple_family_is_typed_source_preserving_and_atomic
 #[test]
 fn aliased_line_width_is_consumed_only_by_line_rasterization() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x1618, 1);
     let resources =
@@ -4051,6 +4057,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
 
     program_three_d(&mut channel, 0x1618, 4);
     program_three_d(&mut channel, 0x0dac, 0x1b01);
+    program_three_d(&mut channel, 0x0db0, 0x1b01);
     assert!(matches!(
         lower_maxwell_three_d_operation(
             channel.three_d(),
@@ -4065,7 +4072,9 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedAliasedLineWidthSemantics)
+        Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+            _
+        ))
     ));
 
     // Polygon mode does not turn point primitives into line primitives.
@@ -4700,6 +4709,7 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
     let missing = missing_channel.three_d().clone();
 
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x2080, 0x20);
     program_three_d(&mut channel, 0x20c0, 0x30);
@@ -4754,9 +4764,11 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPatchSemantics(size))
-            if size.control_points() == 4
+            &mut cache,
+        ),
+        Err(MaxwellThreeDLoweringError::IncompleteDraw(
+            "SET_TESSELLATION_PARAMETERS"
+        ))
     ));
 
     program_three_d(&mut channel, 0x0dcc, 0);
@@ -4820,6 +4832,7 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
 fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears() {
     let mut passthrough = channel();
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x1618, 4);
     program_three_d(&mut channel, 0x1604, 0x000d);
@@ -4956,6 +4969,7 @@ fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears
 #[test]
 fn edge_flag_is_consumed_only_by_non_fill_polygon_draws_and_never_by_clears() {
     let mut channel = three_d_channel();
+    program_polygon_fill(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x1618, 4);
     program_three_d(&mut channel, 0x0dac, 0x1b02);
@@ -4991,6 +5005,8 @@ fn edge_flag_is_consumed_only_by_non_fill_polygon_draws_and_never_by_clears() {
     ));
 
     program_three_d(&mut channel, 0x0dac, 0x1b01);
+    program_three_d(&mut channel, 0x0db0, 0x1b01);
+    program_three_d(&mut channel, 0x1570, 1);
     assert!(matches!(
         lower_maxwell_three_d_operation(
             channel.three_d(),

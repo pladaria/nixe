@@ -78,8 +78,14 @@ Run a title by its ID or name:
 cargo cli run <id | name>
 ```
 
-Press `1` while the window is focused to resize its image area to the current
-frame resolution.
+With the game window focused, press **S** to save a PNG to
+`docs/screenshots/nixe/<title>-<UTC timestamp>.png` (relative to the working
+directory). Captures copy the next presented framebuffer at its native cropped
+resolution, applying its display orientation without filtering or window scaling.
+RGB bytes are preserved; internal framebuffer alpha is omitted, as in window
+presentation. GPU readback and background PNG writing happen only on request;
+holding S does not produce repeated captures. The log reports the saved path or
+an error. Press **1** to resize the window to the frame's native resolution.
 
 ## Testing
 
@@ -88,6 +94,15 @@ Run
 ```
 cargo test-all
 ```
+
+### GPU tests
+
+GPU execution tests require a physical GPU; software rasterizers are excluded.
+When no physical GPU is available they print `SKIP:` (visible with `--nocapture`)
+and return. The standard Rust harness labels these returns `ok`, so they must
+not be counted as hardware validation. Errors after GPU initialization remain
+test failures. Opt-in native tests and their additional requirements are described
+in [the native interop test guide](crates/gpu-wgpu/tests/native_interop/README.md).
 
 ### Integration tests against real titles
 

@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 
-use twox_hash::XxHash3_128;
+use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher, SecretBuffer};
 
 /// Default number of entries retained by each frontend shader index.
 pub const DEFAULT_SHADER_CACHE_ENTRIES: usize = 4_096;
@@ -144,12 +144,16 @@ impl Error for GpuCacheConfigurationError {}
 #[must_use]
 #[inline]
 pub fn cache_fingerprint<T: Hash + ?Sized>(value: &T) -> u128 {
-    let mut hasher = CacheFingerprintHasher(XxHash3_128::new());
+    // The streaming convenience hasher allocates its default secret per call.
+    // Borrow the same immutable secret with inline streaming state instead;
+    // keep the algorithm/seed and therefore every existing cache identity.
+    // https://docs.rs/twox-hash/2.1.3/twox_hash/xxhash3_128/struct.SecretBuffer.html#method.default
+    let mut hasher = CacheFingerprintHasher(RawHasher::new(SecretBuffer::default()));
     value.hash(&mut hasher);
     hasher.0.finish_128()
 }
 
-struct CacheFingerprintHasher(XxHash3_128);
+struct CacheFingerprintHasher(RawHasher<&'static [u8; DEFAULT_SECRET_LENGTH]>);
 
 impl Hasher for CacheFingerprintHasher {
     fn finish(&self) -> u64 {
@@ -164,6 +168,26 @@ impl Hasher for CacheFingerprintHasher {
 #[cfg(test)]
 mod tests {
     use super::{GpuCacheConfiguration, cache_fingerprint};
+
+    #[test]
+    fn fingerprint_matches_xxh3_for_streaming_boundaries() {
+        use std::hash::{Hash, Hasher};
+        struct Writes<'a>(&'a [u8], usize);
+        impl Hash for Writes<'_> {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                for chunk in self.0.chunks(self.1) {
+                    state.write(chunk);
+                }
+            }
+        }
+        let data: Vec<_> = (0..4097).map(|i| (i * 37) as u8).collect();
+        for len in [0, 1, 16, 17, 128, 129, 240, 241, 255, 256, 257, 1024, 4097] {
+            let expected = twox_hash::XxHash3_128::oneshot(&data[..len]);
+            for chunk in [1, 7, 64, 255, 256, 1024] {
+                assert_eq!(cache_fingerprint(&Writes(&data[..len], chunk)), expected);
+            }
+        }
+    }
 
     #[test]
     fn fingerprint_is_stable_for_equal_semantic_inputs() {
