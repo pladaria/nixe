@@ -44,7 +44,9 @@ pub(crate) fn fp_lowering_disposition(instruction: Instruction) -> FpLoweringDis
     #[cfg(target_arch = "x86_64")]
     if matches!(
         instruction,
-        Instruction::ScalarFloatFusedMultiplyAdd(_) | Instruction::VectorFloatFusedElement(_)
+        Instruction::ScalarFloatFusedMultiplyAdd(_)
+            | Instruction::VectorFloatFusedElement(_)
+            | Instruction::VectorFloatFused(_)
     ) && !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma"))
     {
         return FpLoweringDisposition::Exact;
@@ -84,9 +86,11 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::ScalarVectorSignedIntToFloat(_)
         | Instruction::ScalarVectorUnsignedIntToFloat(_)
         | Instruction::VectorFloatDivide(_)
+        | Instruction::VectorFloatAdd(_)
         | Instruction::VectorFloatMultiply(_)
         | Instruction::VectorFloatMultiplyElement(_)
         | Instruction::VectorFloatFusedElement(_)
+        | Instruction::VectorFloatFused(_)
         | Instruction::ScalarFloatConvert(_)
         | Instruction::ScalarFloatDivide(_)
         | Instruction::ScalarFloatAdd(_)

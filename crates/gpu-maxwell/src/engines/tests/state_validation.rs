@@ -405,6 +405,30 @@ fn pixel_shader_interlock_control_rejects_reserved_encodings_atomically() {
 }
 
 #[test]
+fn vertex_id_base_preserves_full_width_values_and_is_independent_of_global_base() {
+    let mut channel = three_d_channel();
+    program_three_d(&mut channel, 0x1434, 7);
+    for raw in [0, 1, i32::MAX as u32, 0x8000_0000, u32::MAX, 0] {
+        let before = channel.three_d().clone();
+        let dispatch = dispatch_method(&mut channel, 0x1118 / 4, raw).unwrap();
+        assert!(dispatch.operations().is_empty());
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_VERTEX_ID_BASE"
+        );
+        let assembly = channel.three_d().vertex_input().assembly();
+        assert_eq!(assembly.vertex_id_base().raw(), Some(raw));
+        assert_eq!(assembly.vertex_id_base().value(), Some(&raw));
+        assert_eq!(
+            assembly.vertex_id_base().source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+        assert_eq!(assembly.global_base_vertex_index().value(), Some(&7));
+        assert_ne!(channel.three_d(), &before);
+    }
+}
+
+#[test]
 fn global_draw_indices_preserve_full_width_values_without_changing_pipeline_identity() {
     let mut channel = three_d_channel();
 
@@ -1454,8 +1478,14 @@ fn two_d_render_enable_modes_are_typed_state_without_condition_evaluation() {
     let three_d_before = channel.three_d().clone();
     assert_eq!(
         channel.two_d().render_enable().mode().origin(),
-        MaxwellTwoDRegisterOrigin::Unset
+        MaxwellTwoDRegisterOrigin::ContextDefault
     );
+    assert_eq!(
+        channel.two_d().render_enable().mode().value(),
+        Some(&MaxwellTwoDRenderEnableMode::Enabled)
+    );
+    assert_eq!(channel.two_d().render_enable().mode().raw(), Some(1));
+    assert_eq!(channel.two_d().render_enable().mode().source(), None);
 
     for (argument, expected) in [
         (0, MaxwellTwoDRenderEnableMode::Disabled),
@@ -1713,8 +1743,14 @@ fn two_d_color_key_enable_values_are_typed_state_without_execution() {
     let three_d_before = channel.three_d().clone();
     assert_eq!(
         channel.two_d().color_key_enable().origin(),
-        MaxwellTwoDRegisterOrigin::Unset
+        MaxwellTwoDRegisterOrigin::ContextDefault
     );
+    assert_eq!(
+        channel.two_d().color_key_enable().value(),
+        Some(&MaxwellTwoDColorKeyEnable::Disabled)
+    );
+    assert_eq!(channel.two_d().color_key_enable().raw(), Some(0));
+    assert_eq!(channel.two_d().color_key_enable().source(), None);
     assert_eq!(
         channel.two_d().clip_enable().origin(),
         MaxwellTwoDRegisterOrigin::Unset

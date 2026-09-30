@@ -410,7 +410,12 @@ impl Presenter {
         let texture = resident_texture(image).ok_or_else(|| {
             WindowError::resident("resident frame payload is not owned by the WGPU backend")
         })?;
-        let view = texture.create_view(&TextureViewDescriptor::default());
+        // Scanout consumes encoded framebuffer bytes. Sampling an sRGB view
+        // would decode them a second time before writing our UNORM surface.
+        let view = texture.create_view(&TextureViewDescriptor {
+            format: Some(texture.format().remove_srgb_suffix()),
+            ..Default::default()
+        });
         self.frame_bind_group = Some(self.create_frame_bind_group(&view));
         self.frame_dimensions = Some((frame.width(), frame.height()));
         let extent = image.description().extent();

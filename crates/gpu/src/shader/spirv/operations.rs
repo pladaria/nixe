@@ -225,24 +225,38 @@ impl Emitter {
                         }
                     }
                     ShaderScalarType::Float32 => {
-                        self.require_float(*float_control)?;
-                        let left = self.float_operand(left, *float_control)?;
-                        let right = self.float_operand(right, *float_control)?;
-                        let value = if multiply {
-                            self.b.f_mul(self.float, None, left, right)?
-                        } else {
-                            self.b.f_add(self.float, None, left, right)?
-                        };
-                        self.b.decorate(value, spv::Decoration::NoContraction, []);
-                        let value = if self.options.float32.denorm_preserve {
-                            value
-                        } else {
-                            self.repair_binary_underflow(value, left, right, multiply)?
-                        };
-                        self.float_result(value, *float_control)?
+                        self.float_binary(left, right, *float_control, multiply)?
                     }
                     _ => return Err(self.unsupported("64-bit arithmetic is not implemented")),
                 };
+                self.write(*destination, value);
+            }
+            FloatMultiplyZero32 {
+                destination,
+                left,
+                right,
+                float_control,
+            } => {
+                let mut left = self.read(*left)?;
+                let mut right = self.read(*right)?;
+                // Test integer magnitudes, including subnormals when DAZ is
+                // enabled. Substitute +0 for BOTH operands before floating
+                // arithmetic so 0*Inf/NaN never reaches the host multiply.
+                let mask = self.constant(0x7fff_ffff);
+                let threshold = self.constant(if float_control.denormals_are_zero() {
+                    0x007f_ffff
+                } else {
+                    0
+                });
+                let a = self.b.bitwise_and(self.uint, None, left, mask)?;
+                let b = self.b.bitwise_and(self.uint, None, right, mask)?;
+                let a_zero = self.b.u_less_than_equal(self.boolean, None, a, threshold)?;
+                let b_zero = self.b.u_less_than_equal(self.boolean, None, b, threshold)?;
+                let absorbing = self.b.logical_or(self.boolean, None, a_zero, b_zero)?;
+                let zero = self.constant(0);
+                left = self.b.select(self.uint, None, absorbing, zero, left)?;
+                right = self.b.select(self.uint, None, absorbing, zero, right)?;
+                let value = self.float_binary(left, right, *float_control, true)?;
                 self.write(*destination, value);
             }
             FusedMultiplyAdd32 {
@@ -402,6 +416,30 @@ impl Emitter {
         } else {
             Err(self.unsupported("64-bit scalar moves are not implemented"))
         }
+    }
+
+    fn float_binary(
+        &mut self,
+        left: u32,
+        right: u32,
+        control: ShaderFloatControl,
+        multiply: bool,
+    ) -> Result<u32> {
+        self.require_float(control)?;
+        let left = self.float_operand(left, control)?;
+        let right = self.float_operand(right, control)?;
+        let value = if multiply {
+            self.b.f_mul(self.float, None, left, right)?
+        } else {
+            self.b.f_add(self.float, None, left, right)?
+        };
+        self.b.decorate(value, spv::Decoration::NoContraction, []);
+        let value = if self.options.float32.denorm_preserve {
+            value
+        } else {
+            self.repair_binary_underflow(value, left, right, multiply)?
+        };
+        self.float_result(value, control)
     }
 
     fn flush_denormal(&mut self, bits: u32) -> Result<u32> {

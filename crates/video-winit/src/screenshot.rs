@@ -126,8 +126,8 @@ impl Capture {
         // No rendering, filtering or color-space conversion: copy the actual
         // resident presentation bytes. A future format must be handled explicitly.
         let bgra = match texture.format() {
-            wgpu::TextureFormat::Rgba8Unorm => false,
-            wgpu::TextureFormat::Bgra8Unorm => true,
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => false,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => true,
             format => {
                 return Err(io::Error::other(format!(
                     "unsupported screenshot format {format:?}"
@@ -472,6 +472,8 @@ mod tests {
         for (bgra, format) in [
             (false, wgpu::TextureFormat::Rgba8Unorm),
             (true, wgpu::TextureFormat::Bgra8Unorm),
+            (false, wgpu::TextureFormat::Rgba8UnormSrgb),
+            (true, wgpu::TextureFormat::Bgra8UnormSrgb),
         ] {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("screenshot source with crop padding"),
@@ -511,7 +513,7 @@ mod tests {
                 texture.size(),
             );
             for (bits, expected) in TRANSFORMED.iter().enumerate() {
-                let path = directory.path().join(format!("{bgra}-{bits}.png"));
+                let path = directory.path().join(format!("{format:?}-{bits}.png"));
                 let mut encoder = device.create_command_encoder(&Default::default());
                 let capture = Capture::encode(
                     &device,

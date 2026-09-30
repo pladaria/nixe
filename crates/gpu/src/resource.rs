@@ -530,6 +530,12 @@ impl RenderPassDescription {
         let mut depth_stencil = false;
         let mut seen_depth_stencil = false;
         for attachment in &attachments {
+            if attachments
+                .first()
+                .is_some_and(|first| first.samples != attachment.samples)
+            {
+                return Err(ResourceDescriptionError::InvalidRenderPassAttachments);
+            }
             match attachment.kind {
                 ImageKind::Color if !seen_depth_stencil => {}
                 ImageKind::Color => {
@@ -652,6 +658,26 @@ impl std::error::Error for ResourceDescriptionError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_pass_attachments_require_matching_sample_counts() {
+        let color = RenderPassAttachmentDescription {
+            kind: ImageKind::Color,
+            format: ImageFormat::Rgba8Unorm,
+            samples: SampleCount::Four,
+        };
+        let mut depth = RenderPassAttachmentDescription {
+            kind: ImageKind::DepthStencil,
+            format: ImageFormat::Depth32Float,
+            samples: SampleCount::One,
+        };
+        assert_eq!(
+            RenderPassDescription::new(vec![color, depth]),
+            Err(ResourceDescriptionError::InvalidRenderPassAttachments)
+        );
+        depth.samples = SampleCount::Four;
+        assert!(RenderPassDescription::new(vec![color, depth]).is_ok());
+    }
 
     #[test]
     fn image_description_checks_dimension_mips_samples_and_kind() {

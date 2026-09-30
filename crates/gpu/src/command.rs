@@ -95,6 +95,41 @@ impl CopyOperation {
     }
 }
 
+/// Resolve color samples into a single-sample image without changing pixel size.
+/// Source contents are preserved; this is not a scaled blit or a sample copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolveOperation {
+    pub source: ImageRegion,
+    pub destination: ImageRegion,
+    pub format: ImageFormat,
+    pub samples: SampleCount,
+}
+
+impl ResolveOperation {
+    pub fn new(
+        source: ImageRegion,
+        destination: ImageRegion,
+        format: ImageFormat,
+        samples: SampleCount,
+    ) -> Result<Self, CommandDescriptionError> {
+        if samples == SampleCount::One
+            || format.is_depth_stencil()
+            || format.block_extent() != [1, 1]
+            || source.image == destination.image
+            || source.extent != destination.extent
+            || source.subresources.layer_count != destination.subresources.layer_count
+        {
+            return Err(CommandDescriptionError::InvalidImageResolve);
+        }
+        Ok(Self {
+            source,
+            destination,
+            format,
+            samples,
+        })
+    }
+}
+
 /// Neutral clear payload retaining the exact requested value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClearValue {
@@ -985,6 +1020,7 @@ impl RenderPassOperation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum GpuCommand {
     Copy(CopyOperation),
+    Resolve(ResolveOperation),
     Clear(ClearOperation),
     Draw(DrawOperation),
     Dispatch(DispatchOperation),
@@ -1072,6 +1108,24 @@ impl GpuCommand {
     fn accesses(&self) -> Vec<ResourceAccess> {
         match self {
             Self::Copy(copy) => copy_accesses(copy),
+            Self::Resolve(resolve) => vec![
+                ResourceAccess::new(
+                    resolve.source.target(),
+                    scope(
+                        PipelineStages::COLOR_OUTPUT,
+                        AccessMode::Read,
+                        ResourceUsage::ColorAttachment,
+                    ),
+                ),
+                ResourceAccess::new(
+                    resolve.destination.target(),
+                    scope(
+                        PipelineStages::COLOR_OUTPUT,
+                        AccessMode::Write,
+                        ResourceUsage::ColorAttachment,
+                    ),
+                ),
+            ],
             Self::Clear(clear) => clear_accesses(clear),
             Self::Draw(draw) => draw_accesses(draw),
             Self::Dispatch(_) => Vec::new(),
@@ -1085,7 +1139,7 @@ impl GpuCommand {
     fn dependencies(&self) -> Vec<ResourceDependency> {
         let mut dependencies = Vec::new();
         match self {
-            Self::Copy(_) | Self::Clear(_) => {
+            Self::Copy(_) | Self::Resolve(_) | Self::Clear(_) => {
                 for access in self.accesses() {
                     push_target_dependency(&mut dependencies, access.target());
                 }
@@ -1132,6 +1186,7 @@ impl GpuCommand {
     fn capability_requirements(&self) -> CapabilityRequirements {
         let mut requirements = vec![CapabilityRequirement::Features(match self {
             Self::Copy(_) => BackendFeatures::COPY,
+            Self::Resolve(_) => BackendFeatures::RESOLVE,
             Self::Clear(_) => BackendFeatures::CLEAR,
             Self::Draw(draw) if draw.arguments.is_indexed() => {
                 BackendFeatures::DRAW.union(BackendFeatures::INDEXED_DRAW)
@@ -1144,6 +1199,11 @@ impl GpuCommand {
             Self::RenderPass(_) => BackendFeatures::RENDER_PASS,
         })];
         match self {
+            Self::Resolve(resolve) => {
+                requirements.push(CapabilityRequirement::ImageFormat(resolve.format));
+                requirements.push(CapabilityRequirement::SampleCount(resolve.samples));
+                requirements.push(CapabilityRequirement::SampleCount(SampleCount::One));
+            }
             Self::Clear(ClearOperation::Image {
                 format, samples, ..
             }) => {
@@ -1266,6 +1326,7 @@ impl OperationSubmission {
 /// Failure to construct an immutable neutral operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandDescriptionError {
+    InvalidImageResolve,
     TessellationTopologyMismatch,
     CopySizeMismatch,
     ClearValueMismatch,
@@ -1294,6 +1355,7 @@ pub enum CommandDescriptionError {
 impl Display for CommandDescriptionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidImageResolve => formatter.write_str("color resolve requires distinct images, matching regions and a multisampled source"),
             Self::TessellationTopologyMismatch => formatter.write_str("patch draw requires tessellation state and nonzero input control points; other topologies forbid it"),
             Self::CopySizeMismatch => {
                 formatter.write_str("buffer copy source and destination sizes differ")
@@ -1548,6 +1610,77 @@ mod tests {
             },
             origin: ImageOrigin { x: 0, y: 0, z: 0 },
             extent: ImageExtent::new(16, 16, 1).unwrap(),
+        }
+    }
+
+    #[test]
+    fn color_resolve_preserves_source_and_derives_attachment_accesses() {
+        let resolve = ResolveOperation::new(
+            image(1),
+            image(2),
+            ImageFormat::Rgba8Unorm,
+            SampleCount::Four,
+        )
+        .unwrap();
+        let operation = GpuOperation::new(
+            GpuCommand::Resolve(resolve),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        );
+        assert_eq!(operation.accesses().len(), 2);
+        assert_eq!(operation.accesses()[0].scope().mode(), AccessMode::Read);
+        assert_eq!(operation.accesses()[1].scope().mode(), AccessMode::Write);
+        assert_eq!(
+            operation.dependencies(),
+            &[
+                ResourceDependency::Image(ImageId::new(1)),
+                ResourceDependency::Image(ImageId::new(2))
+            ]
+        );
+        assert!(
+            operation
+                .capability_requirements()
+                .requirements()
+                .contains(&CapabilityRequirement::Features(BackendFeatures::RESOLVE))
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_single_samples_depth_aliases_and_resizing() {
+        for (source, destination, format, samples) in [
+            (
+                image(1),
+                image(2),
+                ImageFormat::Rgba8Unorm,
+                SampleCount::One,
+            ),
+            (
+                image(1),
+                image(2),
+                ImageFormat::Depth32Float,
+                SampleCount::Four,
+            ),
+            (
+                image(1),
+                image(1),
+                ImageFormat::Rgba8Unorm,
+                SampleCount::Four,
+            ),
+            (
+                image(1),
+                ImageRegion {
+                    extent: ImageExtent::new(8, 8, 1).unwrap(),
+                    ..image(2)
+                },
+                ImageFormat::Rgba8Unorm,
+                SampleCount::Four,
+            ),
+        ] {
+            assert_eq!(
+                ResolveOperation::new(source, destination, format, samples),
+                Err(CommandDescriptionError::InvalidImageResolve)
+            );
         }
     }
 

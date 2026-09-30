@@ -348,6 +348,8 @@ impl Translator<'_> {
     /// Normal/zero inputs with effective opposite signs can have a subnormal
     /// difference only below exponent-field precision+1 (including the binade
     /// boundary's half-ULP spacing). All other guarded adds remain native.
+    /// Scalar and packed integer inputs share the same lane predicate; packed
+    /// cancellation is reduced once before combining with scalar FPCR.FZ.
     /// https://developer.arm.com/documentation/ddi0602/2025-12/Shared-Pseudocode/shared.functions.float.fpadd.FPAdd
     pub(crate) fn fp_add_status_compatible(
         &mut self,
@@ -367,9 +369,18 @@ impl Translator<'_> {
         } else {
             54u64 << 52
         };
+        let ty = self.builder.func.dfg.value_type(first);
+        let constants = [sign_mask, sign_mask - 1, threshold, 0];
+        let [sign_mask, magnitude_mask, threshold, zero] = constants.map(|bits| {
+            if ty.is_vector() {
+                self.fp_vector_lane_constant(ty, width, bits)
+            } else {
+                self.builder.ins().iconst(ty, bits as i64)
+            }
+        });
         let signs = self.builder.ins().bxor(first, second);
-        let signs = self.builder.ins().band_imm_u(signs, sign_mask as i64);
-        let opposite = self.builder.ins().icmp_imm_s(
+        let signs = self.builder.ins().band(signs, sign_mask);
+        let opposite = self.builder.ins().icmp(
             if matches!(
                 operation,
                 nixe_cpu::decode::a64::fp_simd::FloatAddOperation::Add
@@ -379,23 +390,31 @@ impl Translator<'_> {
                 IntCC::Equal
             },
             signs,
-            0,
+            zero,
         );
-        let first = self.builder.ins().band_imm_u(first, (sign_mask - 1) as i64);
-        let second = self
+        let first = self.builder.ins().band(first, magnitude_mask);
+        let second = self.builder.ins().band(second, magnitude_mask);
+        // Magnitudes have no sign bit: signed SIMD comparisons are sufficient.
+        let small_first = self
             .builder
             .ins()
-            .band_imm_u(second, (sign_mask - 1) as i64);
-        let small_first =
-            self.builder
-                .ins()
-                .icmp_imm_u(IntCC::UnsignedLessThan, first, threshold as i64);
-        let small_second =
-            self.builder
-                .ins()
-                .icmp_imm_u(IntCC::UnsignedLessThan, second, threshold as i64);
+            .icmp(IntCC::SignedLessThan, first, threshold);
+        let small_second = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, second, threshold);
         let small = self.builder.ins().band(small_first, small_second);
         let cancellation = self.builder.ins().band(small, opposite);
+        // Equal magnitudes cancel exactly to zero, including masked inactive
+        // lanes. They cannot trigger Arm/x86 tiny-result status differences.
+        let unequal = self.builder.ins().icmp(IntCC::NotEqual, first, second);
+        let cancellation = self.builder.ins().band(cancellation, unequal);
+        let cancellation = if ty.is_vector() {
+            let bits = self.vector_as(cancellation, types::I128);
+            self.builder.ins().icmp_imm_s(IntCC::NotEqual, bits, 0)
+        } else {
+            cancellation
+        };
         let fz = self.builder.ins().band_imm_u(fpcr, 1 << 24);
         let fz = self.builder.ins().icmp_imm_s(IntCC::NotEqual, fz, 0);
         let exact = self.builder.ins().band(cancellation, fz);
@@ -591,11 +610,11 @@ impl Translator<'_> {
         self.mask_vector(result, vector_bits)
     }
 
-    /// FMUL selects Rm's element (if indexed) before masking the vector shape.
+    /// Binary FP operands select Rm's element (if indexed) before masking.
     /// Otherwise mask both sources: inactive NaNs must not affect eligibility
-    /// or status. The inactive products are exact zeros in either form.
+    /// or status. Inactive lanes are zero for corresponding-lane arithmetic.
     /// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.82–83)
-    pub(crate) fn fp_vector_multiply_operands(
+    pub(crate) fn fp_vector_binary_operands(
         &mut self,
         first: Value,
         second: Value,

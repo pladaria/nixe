@@ -371,6 +371,7 @@ pub(crate) struct MaxwellShaderTranslationKey {
     input: Arc<MaxwellShaderProgramTranslationInput>,
     resource_binding_remap: Box<[(u8, u8)]>,
     linked_output_interpolation: Box<[((ShaderIoLocation, u8), ShaderInterpolation)]>,
+    prune_raster_outputs: bool,
 }
 
 /// One verified neutral program and its portable backend module.
@@ -2702,18 +2703,19 @@ fn decode_float_multiply(
     next_temporary: &mut u16,
 ) -> Result<DecodedFloatMultiply, MaxwellShaderTranslationError> {
     // SM50 FTZ and DNZ are distinct modes, not independent output/input flags.
-    // FTZ flushes BOTH operands and results; DNZ has separate zero-multiply
-    // semantics and cannot be represented by merely enabling DAZ in the IR.
-    // NAK selects DNZ for fmulz/ffmaz, not ordinary multiplication:
+    // DNZ implies FTZ and additionally makes +/-0 absorb even Inf/NaN to +0.
+    // NAK selects DNZ for fmulz, not ordinary multiplication; FTZ+DNZ is invalid:
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/a3fcccb47bfbaf49a5d1ffa56547973462e70ab0/src/nouveau/compiler/nak/from_nir.rs
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul
-    if encoding & (1 << 45) != 0 {
+    let dnz = encoding & (1 << 45) != 0;
+    let ftz = encoding & (1 << 44) != 0;
+    if dnz && ftz {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "FMUL DNZ zero-multiply semantics",
+            detail: "FMUL combined FTZ and DNZ modes",
         });
     }
     let destination = (encoding & 0xff) as u8;
@@ -2754,8 +2756,8 @@ fn decode_float_multiply(
     let float_control = ShaderFloatControl::new(
         rounding,
         ShaderNanMode::Propagate,
-        encoding & (1 << 44) != 0,
-        encoding & (1 << 44) != 0,
+        ftz || dnz,
+        ftz || dnz,
         false,
     );
     let opcode = (encoding >> 48) as u16;
@@ -2809,12 +2811,21 @@ fn decode_float_multiply(
     if let Some(preparation) = preparation {
         operations.push(preparation);
     }
-    operations.push(ShaderOperation::Multiply32 {
-        destination: ShaderRegister::new(u16::from(destination)),
-        left: ShaderRegister::new(u16::from(left)),
-        right,
-        scalar_type: ShaderScalarType::Float32,
-        float_control,
+    operations.push(if dnz {
+        ShaderOperation::FloatMultiplyZero32 {
+            destination: ShaderRegister::new(u16::from(destination)),
+            left: ShaderRegister::new(u16::from(left)),
+            right,
+            float_control,
+        }
+    } else {
+        ShaderOperation::Multiply32 {
+            destination: ShaderRegister::new(u16::from(destination)),
+            left: ShaderRegister::new(u16::from(left)),
+            right,
+            scalar_type: ShaderScalarType::Float32,
+            float_control,
+        }
     });
     Ok(DecodedFloatMultiply {
         operations,
@@ -4302,6 +4313,9 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
     validate_graphics_stage_interfaces(&translated)?;
     let global_bindings = graphics_resource_bindings(inputs, &translated)?;
     let linked_interpolation = graphics_output_interpolation(&translated);
+    let has_fragment = translated
+        .iter()
+        .any(|program| program.ir.stage() == ShaderStage::Fragment);
     let final_producer = translated
         .iter()
         .map(|program| program.ir.stage())
@@ -4331,7 +4345,15 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
         } else {
             &[]
         };
-        let ir = finalize_shader_ir(translated.ir, stage, &local_bindings, output_interpolation)?;
+        let mut ir =
+            finalize_shader_ir(translated.ir, stage, &local_bindings, output_interpolation)?;
+        // Fixed-function validation rejects transform feedback; only fragment
+        // consumers and raster builtins can observe this final stage's outputs.
+        let prune_raster_outputs = has_fragment && Some(neutral_stage(stage)) == final_producer;
+        if prune_raster_outputs {
+            ir = ir
+                .prune_raster_outputs(output_interpolation.iter().map(|(component, _)| *component));
+        }
         if !translated.texture_bindings.is_empty() && input.texture_constant_buffer_slot.is_none() {
             return Err(MaxwellShaderTranslationError::IncompletePipelineBinding {
                 pipeline: input.pipeline,
@@ -4343,6 +4365,7 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             input: Arc::clone(input),
             resource_binding_remap: local_bindings.into_iter().collect(),
             linked_output_interpolation: output_interpolation.into(),
+            prune_raster_outputs,
         };
         programs.push(MaxwellTranslatedShaderProgram {
             fingerprint: nixe_gpu::cache_fingerprint(&key),
@@ -7082,7 +7105,8 @@ mod tests {
         let (allocation, address_space, address) = mapped_memory();
         let mut vertex_header = [0_u32; 20];
         vertex_header[0] = 0x0002_0461;
-        vertex_header[13] = 1 << 16;
+        vertex_header[6] = 0xf | (0xf << 8); // Position from attribute 0, passthrough from 2.
+        vertex_header[13] = (0xf << 12) | (1 << 16) | (0xf << 24);
         let mut fragment_header = [0_u32; 20];
         fragment_header[0] = 0x0002_5462;
         fragment_header[6] = 2;
@@ -7095,7 +7119,22 @@ mod tests {
                 .chain(code.into_iter().flat_map(u64::to_le_bytes))
                 .collect::<Vec<_>>()
         };
-        allocation.write(0, &program_bytes(vertex_header)).unwrap();
+        let vertex_code = [
+            0_u64,
+            0xeff1_ff80_0707_ff00, // AST Position, preloaded attribute 0
+            0xefd9_ff80_0a07_ff00, // ALD R0-R3, Generic(2)
+            0xeff1_ff80_0a07_ff00, // AST Generic(2), R0-R3
+            0,
+            0x0103_f800_0007_f000, // MOV R0, 1.0 for Generic(0)
+            0xe300_0000_0007_000f,
+            0,
+        ];
+        let vertex_bytes = vertex_header
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .chain(vertex_code.into_iter().flat_map(u64::to_le_bytes))
+            .collect::<Vec<_>>();
+        allocation.write(0, &vertex_bytes).unwrap();
         allocation
             .write(0x100, &program_bytes(fragment_header))
             .unwrap();
@@ -7125,6 +7164,25 @@ mod tests {
         let linked =
             translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
         assert_eq!(linked.len(), 2);
+        let vertex = linked[0].module.ir();
+        assert!(
+            vertex
+                .ir()
+                .inputs()
+                .iter()
+                .all(|i| i.location() == ShaderIoLocation::Generic(0)),
+            "dead passthrough must not require vertex attribute 2"
+        );
+        assert!(!vertex.ir().instructions().iter().any(|i| matches!(
+            i.operation(),
+            ShaderOperation::LoadInput {
+                location: ShaderIoLocation::Generic(2),
+                ..
+            }
+        )));
+        let wgsl = lower_shader_ir_to_wgsl(vertex).unwrap();
+        validate_wgsl(&wgsl);
+        assert!(!wgsl.source().contains("generic_2"));
 
         fragment_header[6] = 2 << 8;
         allocation
@@ -7138,6 +7196,24 @@ mod tests {
                 ..
             })
         ));
+        // The same vertex program must keep the attribute when a new fragment
+        // program consumes it. Linked inputs belong to shader cache identity.
+        fragment_header[6] = 2 << 16;
+        allocation
+            .write(0x100, &program_bytes(fragment_header))
+            .unwrap();
+        let consumed =
+            translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+        assert_ne!(linked[0].fingerprint, consumed[0].fingerprint);
+        assert!(
+            consumed[0]
+                .module
+                .ir()
+                .ir()
+                .inputs()
+                .iter()
+                .any(|i| i.location() == ShaderIoLocation::Generic(2))
+        );
     }
 
     #[test]

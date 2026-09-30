@@ -1,7 +1,7 @@
 //! Typed, source-preserving `FERMI_TWOD_A` register state.
 //!
-//! Unprogrammed registers remain explicitly unset. The frontend must not infer
-//! a hardware reset value unless a pinned public source establishes it.
+//! Context initialization is distinct from guest writes. Registers without
+//! an established initial context value remain explicitly unset.
 
 use crate::MaxwellMethodSource;
 
@@ -17,6 +17,8 @@ use super::{
 pub enum MaxwellTwoDRegisterOrigin {
     /// No verified reset or method write establishes a value.
     Unset,
+    /// The initial graphics context supplies this value, without a guest write.
+    ContextDefault,
     /// A validated guest method programmed the register.
     Programmed,
 }
@@ -31,6 +33,14 @@ pub struct MaxwellTwoDRegister<T> {
 }
 
 impl<T> MaxwellTwoDRegister<T> {
+    pub(super) const fn context_default(raw: u32, value: T) -> Self {
+        Self {
+            origin: MaxwellTwoDRegisterOrigin::ContextDefault,
+            raw: Some(raw),
+            value: Some(value),
+            source: None,
+        }
+    }
     #[must_use]
     pub const fn origin(&self) -> MaxwellTwoDRegisterOrigin {
         self.origin
@@ -203,8 +213,9 @@ pub enum MaxwellTwoDStateWrite {
 }
 
 /// Persistent semantic state of the `FERMI_TWOD_A` engine on one channel.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellTwoDState {
+    pub(super) blit: super::blit::MaxwellTwoDBlitState,
     processing_clusters: MaxwellTwoDRegister<MaxwellTwoDProcessingClusters>,
     operation: MaxwellTwoDRegister<MaxwellTwoDOperation>,
     clip_enable: MaxwellTwoDRegister<MaxwellTwoDClipEnable>,
@@ -213,6 +224,31 @@ pub struct MaxwellTwoDState {
     pixels_from_memory: MaxwellTwoDPixelsFromMemoryState,
     render_enable: MaxwellTwoDRenderEnableState,
     notify: MaxwellTwoDNotifyState,
+}
+
+impl Default for MaxwellTwoDState {
+    fn default() -> Self {
+        // deko3d's setupTransfer programs clipping but leaves color key and
+        // render-enable untouched. Its unconditional Blit2DEngine path relies
+        // on a context with keying disabled and rendering enabled. These are
+        // initial-context values, not fabricated guest method writes or a
+        // blanket assumption that every hardware register resets to zero.
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_transfer.cpp
+        Self {
+            blit: Default::default(),
+            processing_clusters: Default::default(),
+            operation: Default::default(),
+            clip_enable: Default::default(),
+            color_key_enable: MaxwellTwoDRegister::context_default(
+                0,
+                MaxwellTwoDColorKeyEnable::Disabled,
+            ),
+            beta: Default::default(),
+            pixels_from_memory: Default::default(),
+            render_enable: Default::default(),
+            notify: Default::default(),
+        }
+    }
 }
 
 impl MaxwellTwoDState {

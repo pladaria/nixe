@@ -1,6 +1,8 @@
 //! GM20B `FERMI_TWOD_A` engine boundary.
 
 mod beta;
+pub(crate) mod blit;
+pub use blit::MaxwellTwoDResolveOperation;
 mod methods;
 mod notify;
 mod pixels_from_memory;

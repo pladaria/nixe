@@ -410,6 +410,8 @@ fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellThre
 mod color_output;
 mod coverage_dither;
 mod graphics_pipeline;
+mod indexed;
+mod multisample;
 mod raster_pipeline;
 mod resources_compute;
 mod state_validation;

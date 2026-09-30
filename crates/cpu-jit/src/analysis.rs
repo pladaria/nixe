@@ -678,6 +678,7 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::VectorSignedShiftRegister(_)
         | fp_simd::Instruction::VectorUnsignedShiftRegister(_)
         | fp_simd::Instruction::VectorFloatDivide(_)
+        | fp_simd::Instruction::VectorFloatAdd(_)
         | fp_simd::Instruction::VectorFloatMultiply(_)
         | fp_simd::Instruction::VectorFloatMultiplyElement(_)
         | fp_simd::Instruction::ScalarFloatDivide(_)
@@ -694,7 +695,8 @@ fn register_access_fp_simd_vector(
             read(accessed, fields.ra);
             write(accessed, dirty, fields.rd);
         }
-        fp_simd::Instruction::VectorFloatFusedElement(_) => {
+        fp_simd::Instruction::VectorFloatFusedElement(_)
+        | fp_simd::Instruction::VectorFloatFused(_) => {
             read(accessed, fields.rn);
             read(accessed, fields.rm);
             read(accessed, fields.rd);

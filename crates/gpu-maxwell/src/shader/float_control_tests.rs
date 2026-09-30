@@ -37,6 +37,10 @@ fn decoded(
 }
 
 fn evaluate(kind: u8, ftz: bool, values: [u32; 3]) -> u32 {
+    evaluate_operations(decoded(kind, ftz, false).unwrap(), values)
+}
+
+fn evaluate_operations(operations: Vec<ShaderOperation>, values: [u32; 3]) -> u32 {
     let mut code: Vec<_> = values
         .into_iter()
         .enumerate()
@@ -46,7 +50,7 @@ fn evaluate(kind: u8, ftz: bool, values: [u32; 3]) -> u32 {
             scalar_type: ShaderScalarType::Float32,
         })
         .collect();
-    code.extend(decoded(kind, ftz, false).unwrap());
+    code.extend(operations);
     code.push(ShaderOperation::StoreOutput {
         sources: vec![ShaderRegister::new(3)].into(),
         location: ShaderIoLocation::Generic(0),
@@ -126,13 +130,92 @@ fn ftz_is_not_an_independent_output_only_modifier() {
 }
 
 #[test]
-fn dnz_is_rejected_instead_of_misrepresented_as_daz() {
-    for kind in [1, 2] {
-        for ftz in [false, true] {
-            assert!(matches!(decoded(kind,ftz,true),
+fn unsupported_dnz_combinations_remain_explicit() {
+    assert!(matches!(
+        decoded(1, true, true),
+        Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            detail: "FMUL combined FTZ and DNZ modes",
+            ..
+        })
+    ));
+    for ftz in [false, true] {
+        assert!(matches!(decoded(2,ftz,true),
                 Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
                     stage: MaxwellThreeDShaderStage::Vertex, instruction_offset: 8, detail, ..
                 }) if detail.contains("DNZ zero-multiply")));
+    }
+}
+
+#[test]
+fn fmul_dnz_absorbs_signed_zero_and_subnormals_before_multiplication() {
+    let operations = decoded(1, false, true).unwrap();
+    assert!(
+        matches!(operations.as_slice(), [ShaderOperation::FloatMultiplyZero32 { float_control, .. }]
+        if float_control.denormals_are_zero() && float_control.flush_denormals_to_zero())
+    );
+    for zero in [0, 0x8000_0000, 1, 0x807f_ffff] {
+        for other in [
+            0,
+            0x8000_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_1234,
+            0x7f80_0001,
+        ] {
+            for values in [[zero, other, 0], [other, zero, 0]] {
+                assert_eq!(
+                    evaluate_operations(operations.clone(), values),
+                    0,
+                    "{values:08x?}"
+                );
+            }
         }
     }
+    for (a, b, expected) in [
+        (0x4000_0000, 0xc040_0000, 0xc0c0_0000), // 2 * -3 = -6
+        (0x8080_0000, 0x3f00_0000, 0x8000_0000), // negative underflow retains its sign
+        (0x7f80_0000, 0xbf80_0000, 0xff80_0000),
+    ] {
+        assert_eq!(evaluate_operations(operations.clone(), [a, b, 0]), expected);
+    }
+    assert!(
+        f32::from_bits(evaluate_operations(
+            operations,
+            [0x7fc0_1234, 0x3f80_0000, 0]
+        ))
+        .is_nan()
+    );
+    assert!(f32::from_bits(evaluate(1, false, [0, 0x7f80_0000, 0])).is_nan());
+}
+
+#[test]
+fn fmul_dnz_constant_buffer_encoding_and_immediate_form() {
+    let mut temporary = 4;
+    let decoded = decode_float_multiply(
+        MaxwellThreeDShaderStage::Pixel,
+        0x250,
+        0x4c68_2008_00f7_0000,
+        4,
+        &mut temporary,
+    )
+    .unwrap();
+    assert_eq!(decoded.constant_buffer_binding, Some(2));
+    assert!(matches!(decoded.operations.as_slice(), [
+        ShaderOperation::LoadConstantBuffer32 { binding: 2, byte_offset: 60, destination: load, .. },
+        ShaderOperation::FloatMultiplyZero32 { destination, left, right, .. },
+    ] if destination.index() == 0 && left.index() == 0 && *right == *load));
+    let decoded = decode_float_multiply(
+        MaxwellThreeDShaderStage::Pixel,
+        8,
+        0x3868_2000_0007_0003,
+        4,
+        &mut temporary,
+    )
+    .unwrap();
+    assert_eq!(
+        evaluate_operations(decoded.operations, [0x7f80_0000, 0, 0]),
+        0
+    );
 }

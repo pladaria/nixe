@@ -8,6 +8,8 @@ pub(crate) mod vulkan;
 /// for ordinary wgpu rendering and are checked when native shaders consume them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VulkanNativeCapabilities {
+    /// Whether the standard Vulkan sample positions are guaranteed by hardware.
+    pub standard_sample_locations: bool,
     pub tessellation_shader: bool,
     pub raster: VulkanRasterCapabilities,
     pub float32: nixe_gpu::SpirvFloat32Capabilities,

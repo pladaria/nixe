@@ -10,6 +10,7 @@ use crate::{ShaderStage, VertexBufferLayout, VertexStepMode};
 
 mod integer;
 mod linkage;
+mod liveness;
 pub use linkage::{ShaderStageInterfaceError, validate_shader_stage_link};
 pub mod spirv;
 mod tessellation;
@@ -464,6 +465,16 @@ pub enum ShaderOperation {
         left: ShaderRegister,
         right: ShaderRegister,
         scalar_type: ShaderScalarType,
+        float_control: ShaderFloatControl,
+    },
+    /// Floating multiplication where either signed zero absorbs every operand
+    /// (including NaN/infinity), producing positive zero. Input denormal
+    /// handling precedes this test; output controls follow multiplication.
+    /// https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/compiler/nir/nir_opcodes.py
+    FloatMultiplyZero32 {
+        destination: ShaderRegister,
+        left: ShaderRegister,
+        right: ShaderRegister,
         float_control: ShaderFloatControl,
     },
     Add32 {
@@ -1040,6 +1051,20 @@ pub fn evaluate_shader_ir(
                 };
                 registers[destination.index() as usize] = Some(value);
             }
+            ShaderOperation::FloatMultiplyZero32 {
+                destination,
+                left,
+                right,
+                float_control,
+            } => {
+                let value = evaluate_float_binary(
+                    register_bits(&registers, *left)?,
+                    register_bits(&registers, *right)?,
+                    *float_control,
+                    |a, b| if a == 0.0 || b == 0.0 { 0.0 } else { a * b },
+                )?;
+                registers[destination.index() as usize] = Some(value);
+            }
             ShaderOperation::Add32 {
                 destination,
                 left,
@@ -1574,6 +1599,46 @@ fn lower_shader_ir_to_wgsl_impl(
     let output_groups = interface_groups(&ir.outputs)?;
     let mut source = String::new();
     emit_wgsl_resources(&mut source, ir)?;
+    if ir.instructions.iter().any(|i| {
+        matches!(i.operation,
+        ShaderOperation::Multiply32 { scalar_type: ShaderScalarType::Float32, float_control, .. }
+        | ShaderOperation::FloatMultiplyZero32 { float_control, .. }
+        if float_control.flush_denormals_to_zero())
+    }) {
+        // Some hosts flush a tiny product before rounding. At the normal /
+        // subnormal boundary RTE can still produce MIN_NORMAL. Classify that
+        // midpoint using the exact 24x24-bit significand product (12-bit limbs),
+        // only when the host returned zero and the exponent sum can straddle it.
+        // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul
+        source.push_str("fn nixe_flush_product(bits: u32, a: u32, b: u32) -> u32 {\n\
+            let result = nixe_flush_denormal(bits);\n\
+            let ea = (a >> 23u) & 255u;\n\
+            let eb = (b >> 23u) & 255u;\n\
+            if ((result & 0x7fffffffu) == 0u && ea > 0u && eb > 0u && ea + eb == 127u) {\n\
+                let ma = (a & 0x007fffffu) | 0x00800000u;\n\
+                let mb = (b & 0x007fffffu) | 0x00800000u;\n\
+                let cross = (ma >> 12u) * (mb & 4095u) + (mb >> 12u) * (ma & 4095u);\n\
+                let low = (ma & 4095u) * (mb & 4095u) + ((cross & 4095u) << 12u);\n\
+                let high = (ma >> 12u) * (mb >> 12u) + (cross >> 12u) + (low >> 24u);\n\
+                if (high > 0x007fffffu || (high == 0x007fffffu && (low & 0x00ffffffu) >= 0x00800000u)) {\n\
+                    return ((a ^ b) & 0x80000000u) | 0x00800000u;\n\
+                }\n\
+            }\n\
+            return result;\n\
+        }\n");
+    }
+    if ir
+        .instructions
+        .iter()
+        .any(|i| matches!(i.operation, ShaderOperation::FloatMultiplyZero32 { .. }))
+    {
+        // Classify and replace operands as integers before multiplying. Selecting
+        // the result of 0*NaN afterwards permits unsafe host FP optimizations.
+        source.push_str("fn nixe_multiply_zero(a: u32, b: u32) -> u32 {\n\
+            let zero = (a & 0x7fffffffu) == 0u || (b & 0x7fffffffu) == 0u;\n\
+            return bitcast<u32>(bitcast<f32>(select(a, 0u, zero)) * bitcast<f32>(select(b, 0u, zero)));\n\
+        }\n");
+    }
     if let Some((layouts, bind_group)) = vertex_pulling {
         emit_wgsl_vertex_pull_resources(&mut source, layouts, bind_group, quad_flat);
     }
@@ -2493,6 +2558,7 @@ fn emit_wgsl_operation(
                     left.index(),
                     right.index(),
                     *float_control,
+                    false,
                 )?,
                 ShaderScalarType::Unsigned32 | ShaderScalarType::Signed32 => {
                     format!("registers[{}] * registers[{}]", left.index(), right.index())
@@ -2503,6 +2569,24 @@ fn emit_wgsl_operation(
                     ));
                 }
             };
+            source.push_str(&format!(
+                "  registers[{}] = {expression};\n",
+                destination.index()
+            ));
+        }
+        ShaderOperation::FloatMultiplyZero32 {
+            destination,
+            left,
+            right,
+            float_control,
+        } => {
+            let expression = wgsl_float_multiply_expression(
+                instruction.source,
+                left.index(),
+                right.index(),
+                *float_control,
+                true,
+            )?;
             source.push_str(&format!(
                 "  registers[{}] = {expression};\n",
                 destination.index()
@@ -2825,6 +2909,7 @@ fn wgsl_float_multiply_expression(
     left: u16,
     right: u16,
     control: ShaderFloatControl,
+    zero_is_absorbing: bool,
 ) -> Result<String, ShaderBackendLoweringError> {
     if control.rounding() != ShaderRoundingMode::NearestEven
         || control.nan_mode() != ShaderNanMode::Propagate
@@ -2839,13 +2924,21 @@ fn wgsl_float_multiply_expression(
             format!("registers[{register}]")
         }
     };
-    let result = format!(
-        "bitcast<u32>(bitcast<f32>({}) * bitcast<f32>({}))",
-        operand(left),
-        operand(right)
-    );
+    let result = if zero_is_absorbing {
+        format!("nixe_multiply_zero({}, {})", operand(left), operand(right))
+    } else {
+        format!(
+            "bitcast<u32>(bitcast<f32>({}) * bitcast<f32>({}))",
+            operand(left),
+            operand(right)
+        )
+    };
     Ok(if control.flush_denormals_to_zero() {
-        format!("nixe_flush_denormal({result})")
+        format!(
+            "nixe_flush_product({result}, {}, {})",
+            operand(left),
+            operand(right)
+        )
     } else {
         result
     })
@@ -3272,6 +3365,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::ReciprocalSqrt32 { destination, .. }
             | ShaderOperation::SpecialFunction32 { destination, .. }
             | ShaderOperation::Multiply32 { destination, .. }
+            | ShaderOperation::FloatMultiplyZero32 { destination, .. }
             | ShaderOperation::Add32 { destination, .. }
             | ShaderOperation::ShiftLeft32 { destination, .. }
             | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
@@ -3639,6 +3733,7 @@ fn visit_operation_destinations(
         | ShaderOperation::LoadControlPoint { destination, .. }
         | ShaderOperation::LoadPatchOutput { destination, .. }
         | ShaderOperation::Multiply32 { destination, .. }
+        | ShaderOperation::FloatMultiplyZero32 { destination, .. }
         | ShaderOperation::Add32 { destination, .. }
         | ShaderOperation::ShiftLeft32 { destination, .. }
         | ShaderOperation::FloatMinMax32 { destination, .. }
@@ -3718,7 +3813,8 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         ShaderOperation::StoreOutput { sources, .. } => sources.to_vec(),
         ShaderOperation::LoadControlPoint { vertex, .. } => vec![*vertex],
         ShaderOperation::StoreControlPoint { source, vertex, .. } => vec![*source, *vertex],
-        ShaderOperation::Multiply32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::Multiply32 { left, right, .. }
+        | ShaderOperation::FloatMultiplyZero32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::Move32 { source, .. } => vec![*source],
         ShaderOperation::Add32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::ShiftLeft32 { value, amount, .. } => vec![*value, *amount],
@@ -4508,6 +4604,103 @@ mod tests {
         );
         assert!(!module.source().contains("input.generic_0.x *"));
         naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
+    fn absorbing_zero_multiply_preserves_aliases_and_validates_wgsl() {
+        for daz in [false, true] {
+            let control = ShaderFloatControl::new(
+                ShaderRoundingMode::NearestEven,
+                ShaderNanMode::Propagate,
+                daz,
+                daz,
+                false,
+            );
+            let ir = VerifiedShaderIr::verify(ShaderIr::new(
+                ShaderStage::Fragment,
+                vec![
+                    ShaderInterfaceElement::new(
+                        ShaderIoLocation::Generic(0),
+                        0,
+                        ShaderScalarType::Float32,
+                        Some(ShaderInterpolation::Constant),
+                    )
+                    .unwrap(),
+                ],
+                vec![
+                    ShaderInterfaceElement::new(
+                        ShaderIoLocation::Color(0),
+                        0,
+                        ShaderScalarType::Float32,
+                        None,
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+                vec![
+                    ShaderOperation::LoadInput {
+                        destinations: vec![ShaderRegister::new(0)].into(),
+                        location: ShaderIoLocation::Generic(0),
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(1),
+                        bits: 0xff80_0000,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                    ShaderOperation::FloatMultiplyZero32 {
+                        destination: ShaderRegister::new(0),
+                        left: ShaderRegister::new(0),
+                        right: ShaderRegister::new(1),
+                        float_control: control,
+                    },
+                    ShaderOperation::StoreOutput {
+                        sources: vec![ShaderRegister::new(0)].into(),
+                        location: ShaderIoLocation::Color(0),
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                    ShaderOperation::Exit,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(i, op)| {
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(i as u32 * 8),
+                        ShaderPredicate::Always,
+                        op,
+                    )
+                })
+                .collect(),
+            ))
+            .unwrap();
+            for (input, expected) in [(0x8000_0000, 0), (1, if daz { 0 } else { 0xff80_0000 })] {
+                let result = evaluate_shader_ir(
+                    &ir,
+                    &ShaderEvaluationInputs::default().with_interface_bits(
+                        ShaderIoLocation::Generic(0),
+                        0,
+                        input,
+                    ),
+                    8,
+                )
+                .unwrap();
+                assert_eq!(
+                    result.output_bits(ShaderIoLocation::Color(0), 0),
+                    Some(expected)
+                );
+            }
+            let wgsl = lower_shader_ir_to_wgsl(&ir).unwrap();
+            let parsed = naga::front::wgsl::parse_str(wgsl.source()).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&parsed)
+            .unwrap();
+            assert_eq!(wgsl.source().contains("fn nixe_flush_product"), daz);
+        }
     }
 
     #[test]

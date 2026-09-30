@@ -205,7 +205,7 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
         0x0000_0088 => validate_a64_simd_extract_narrow(bits),
         0x0000_0066..=0x0000_0069 => validate_a64_simd_min_max_pairwise(bits),
         0x0000_006a | 0x0000_006b => validate_a64_simd_integer_to_float(bits),
-        0x0000_006c | 0x0000_00a3 => validate_a64_simd_float_vector(bits),
+        0x0000_006c | 0x0000_00a3..=0x0000_00a5 => validate_a64_simd_float_vector(bits),
         0x0000_006d..=0x0000_0084 | 0x0000_0087 | 0x0000_0089..=0x0000_0090 => {
             AllocationStatus::Allocated
         }

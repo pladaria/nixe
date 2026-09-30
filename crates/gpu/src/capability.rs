@@ -21,6 +21,7 @@ impl BackendFeatures {
     pub const BARRIER: Self = Self(1 << 5);
     pub const QUERY: Self = Self(1 << 6);
     pub const RENDER_PASS: Self = Self(1 << 7);
+    pub const RESOLVE: Self = Self(1 << 8);
 
     #[must_use]
     pub const fn empty() -> Self {
