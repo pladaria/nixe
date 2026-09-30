@@ -389,7 +389,7 @@ pub(crate) struct MaxwellTranslatedShaderProgram {
 pub(crate) struct MaxwellTextureResourceBinding {
     constant_buffer_byte_offset: u32,
     image_binding: u8,
-    sampler_binding: u8,
+    sampler_binding: Option<u8>,
     image_kind: ShaderResourceKind,
 }
 
@@ -455,7 +455,7 @@ impl MaxwellTextureResourceBinding {
     pub(crate) const fn image_binding(self) -> u8 {
         self.image_binding
     }
-    pub(crate) const fn sampler_binding(self) -> u8 {
+    pub(crate) const fn sampler_binding(self) -> Option<u8> {
         self.sampler_binding
     }
     pub(crate) const fn image_kind(self) -> ShaderResourceKind {
@@ -1260,8 +1260,8 @@ fn translate_shader_binary(
                     constant_buffer_bindings.insert(decoded.constant_buffer_binding);
                     instructions.push(ShaderInstruction::new(source, predicate, decoded.operation));
                     break 'instruction;
-                } else if is_texture_sample_simplified(encoding) {
-                    decode_texture_sample_simplified(
+                } else if is_texture_access_simplified(encoding) {
+                    decode_texture_access_simplified(
                         stage,
                         offset,
                         encoding,
@@ -1367,14 +1367,19 @@ fn translate_shader_binary(
                         decoded.operations,
                     );
                     break 'instruction;
-                } else if integer::is_set_predicate(encoding) {
-                    let decoded = integer::decode_set_predicate(
-                        stage,
-                        offset,
-                        encoding,
-                        register_count,
-                        &mut next_temporary,
-                    )?;
+                } else if integer::is_bitwise(encoding)
+                    || integer::is_add(encoding)
+                    || integer::is_set_predicate(encoding)
+                {
+                    let decode = if integer::is_bitwise(encoding) {
+                        integer::decode_bitwise
+                    } else if integer::is_add(encoding) {
+                        integer::decode_add
+                    } else {
+                        integer::decode_set_predicate
+                    };
+                    let decoded =
+                        decode(stage, offset, encoding, register_count, &mut next_temporary)?;
                     if let Some(binding) = decoded.constant_buffer_binding {
                         constant_buffer_bindings.insert(binding);
                     }
@@ -1430,15 +1435,17 @@ fn translate_shader_binary(
             ShaderResourceAccess::new(binding.image_binding, binding.image_kind, true, false)
                 .expect("read-only sampled-image access is valid"),
         );
-        resources.push(
-            ShaderResourceAccess::new(
-                binding.sampler_binding,
-                ShaderResourceKind::Sampler,
-                true,
-                false,
-            )
-            .expect("read-only sampler access is valid"),
-        );
+        if let Some(sampler_binding) = binding.sampler_binding {
+            resources.push(
+                ShaderResourceAccess::new(
+                    sampler_binding,
+                    ShaderResourceKind::Sampler,
+                    true,
+                    false,
+                )
+                .expect("read-only sampler access is valid"),
+            );
+        }
     }
     if stage == MaxwellThreeDShaderStage::TessellationInit {
         tessellation::order_patch_outputs(&mut instructions);
@@ -1855,8 +1862,11 @@ const fn is_float_set_predicate(encoding: u64) -> bool {
     opcode & 0xfff0 == 0x5bb0 || opcode & 0xfff0 == 0x4bb0 || opcode & 0xfef0 == 0x36b0
 }
 
-const fn is_texture_sample_simplified(encoding: u64) -> bool {
-    encoding & 0xf600_0000_0000_0000 == 0xd000_0000_0000_0000
+const fn is_texture_access_simplified(encoding: u64) -> bool {
+    matches!(
+        encoding & 0xf600_0000_0000_0000,
+        0xd000_0000_0000_0000 | 0xd200_0000_0000_0000
+    )
 }
 
 const fn is_supported_family(encoding: u64) -> bool {
@@ -1874,7 +1884,7 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_float_to_float(encoding)
         || is_float_to_integer(encoding)
         || is_constant_buffer_load(encoding)
-        || is_texture_sample_simplified(encoding)
+        || is_texture_access_simplified(encoding)
         || is_interpolate(encoding)
         || is_range_reduction(encoding)
         || is_mufu(encoding)
@@ -1884,21 +1894,36 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_float_add(encoding)
         || is_float_set_predicate(encoding)
         || integer::is_set_predicate(encoding)
+        || integer::is_bitwise(encoding)
+        || integer::is_add(encoding)
         || patch_address::is_supported_family(encoding)
 }
 
-fn decode_texture_sample_simplified(
+fn decode_texture_access_simplified(
     stage: MaxwellThreeDShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
     bindings: &mut BTreeMap<u16, MaxwellTextureResourceBinding>,
 ) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
-    // TEXS operand fields, dimensionality/LOD selectors, and split destination
+    // TEXS/TLDS operand fields, dimensionality/LOD selectors, and split destination
     // channel masks follow envytools' pinned public GM107 ISA table:
     // https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/envydis/gm107.c
     let selector = ((encoding >> 53) & 0xf) as u8;
-    if stage != MaxwellThreeDShaderStage::Pixel || !matches!(selector, 1 | 7) {
+    let fetch = encoding & 0xf600_0000_0000_0000 == 0xd200_0000_0000_0000;
+    // TLDS.LZ.2D has separate integer X/Y source registers and the same
+    // split RGBA destinations as TEXS. F16, offsets and other modes need
+    // distinct semantics; never reinterpret them as a filtered sample.
+    // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L2658-L2764
+    if fetch && (selector != 2 || encoding & (1 << 59) == 0) {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "TLDS mode other than F32 2D level-zero without offsets",
+        });
+    }
+    if !fetch && (stage != MaxwellThreeDShaderStage::Pixel || !matches!(selector, 1 | 7)) {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
@@ -1910,13 +1935,13 @@ fn decode_texture_sample_simplified(
     let x_coordinate = ((encoding >> 8) & 0xff) as u8;
     let y_coordinate = ((encoding >> 20) & 0xff) as u8;
     let secondary_destination = ((encoding >> 28) & 0xff) as u8;
-    // TEXS stores a dword offset into SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT,
+    // TEXS/TLDS store a dword offset into SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT,
     // not a TIC index. The u32 fetched there is the raw TIC/TSC handle. This
     // distinction is visible in yuzu's pinned Maxwell translator:
     // https://github.com/yuzu-emu/yuzu/blob/55bf3dbf5ddaa3f7c1c3efade5553b07499fe289/src/shader_recompiler/frontend/maxwell/translate/impl/texture_fetch_swizzled.cpp#L28-L72
     let constant_buffer_dword_offset = ((encoding >> 36) & 0x1fff) as u16;
     let constant_buffer_byte_offset = u32::from(constant_buffer_dword_offset) * 4;
-    if selector == 1 {
+    if fetch || selector == 1 {
         validate_register_range(stage, offset, encoding, x_coordinate, 1, register_count)?;
         validate_register_range(stage, offset, encoding, y_coordinate, 1, register_count)?;
     } else {
@@ -1957,7 +1982,7 @@ fn decode_texture_sample_simplified(
                     stage,
                     offset,
                     encoding,
-                    "TEXS split-destination channel selector is reserved",
+                    "TEXS/TLDS split-destination channel selector is reserved",
                 ));
             }
         }
@@ -1982,41 +2007,44 @@ fn decode_texture_sample_simplified(
         )?;
     }
 
-    let image_kind = if selector == 1 {
+    let image_kind = if fetch || selector == 1 {
         ShaderResourceKind::SampledImage
     } else {
         ShaderResourceKind::SampledImage2DArray
     };
-    let binding = if let Some(binding) = bindings.get(&constant_buffer_dword_offset).copied() {
+    let binding = if let Some(binding) = bindings.get_mut(&constant_buffer_dword_offset) {
         if binding.image_kind != image_kind {
             return Err(malformed(
                 stage,
                 offset,
                 encoding,
-                "TEXS reuses one descriptor with contradictory image dimensions",
+                "TEXS/TLDS reuse one descriptor with contradictory image dimensions",
             ));
         }
-        binding
+        if !fetch && binding.sampler_binding.is_none() {
+            binding.sampler_binding = Some(binding.image_binding + 1);
+        }
+        *binding
     } else {
         let next_pair = u8::try_from(32 + bindings.len() * 2).map_err(|_| {
             malformed(
                 stage,
                 offset,
                 encoding,
-                "TEXS neutral resource binding space is exhausted",
+                "TEXS/TLDS neutral resource binding space is exhausted",
             )
         })?;
         let binding = MaxwellTextureResourceBinding {
             constant_buffer_byte_offset,
             image_binding: next_pair,
-            sampler_binding: next_pair.checked_add(1).ok_or_else(|| {
+            sampler_binding: (!fetch).then_some(next_pair.checked_add(1).ok_or_else(|| {
                 malformed(
                     stage,
                     offset,
                     encoding,
-                    "TEXS neutral resource binding space is exhausted",
+                    "TEXS/TLDS neutral resource binding space is exhausted",
                 )
-            })?,
+            })?),
             image_kind,
         };
         bindings.insert(constant_buffer_dword_offset, binding);
@@ -2032,11 +2060,21 @@ fn decode_texture_sample_simplified(
                 secondary_destination + (index - primary_count) as u8
             };
             ShaderTextureSampleOutput::new(ShaderRegister::new(u16::from(register)), *component)
-                .expect("decoded TEXS component is in RGBA range")
+                .expect("decoded texture component is in RGBA range")
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    if selector == 1 {
+    if fetch {
+        Ok(ShaderOperation::LoadTexture2D {
+            outputs,
+            coordinates: [
+                ShaderRegister::new(u16::from(x_coordinate)),
+                ShaderRegister::new(u16::from(y_coordinate)),
+            ],
+            image_binding: binding.image_binding,
+            mip_level: 0,
+        })
+    } else if selector == 1 {
         Ok(ShaderOperation::SampleTexture2D {
             outputs,
             coordinates: [
@@ -2044,7 +2082,7 @@ fn decode_texture_sample_simplified(
                 ShaderRegister::new(u16::from(y_coordinate)),
             ],
             image_binding: binding.image_binding,
-            sampler_binding: binding.sampler_binding,
+            sampler_binding: binding.sampler_binding.expect("TEXS reserves a sampler"),
         })
     } else {
         Ok(ShaderOperation::SampleTexture2DArray {
@@ -2055,7 +2093,7 @@ fn decode_texture_sample_simplified(
             ],
             array_index: ShaderRegister::new(u16::from(x_coordinate)),
             image_binding: binding.image_binding,
-            sampler_binding: binding.sampler_binding,
+            sampler_binding: binding.sampler_binding.expect("TEXS reserves a sampler"),
         })
     }
 }
@@ -4337,8 +4375,10 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
         for texture in &mut translated.texture_bindings {
             texture.image_binding =
                 remapped_binding(&local_bindings, stage, texture.image_binding)?;
-            texture.sampler_binding =
-                remapped_binding(&local_bindings, stage, texture.sampler_binding)?;
+            texture.sampler_binding = texture
+                .sampler_binding
+                .map(|binding| remapped_binding(&local_bindings, stage, binding))
+                .transpose()?;
         }
         let output_interpolation = if Some(neutral_stage(stage)) == final_producer {
             linked_interpolation.as_slice()
@@ -4547,6 +4587,17 @@ fn finalize_shader_ir(
                     base_byte_offset: *base_byte_offset,
                     dynamic_byte_offset: *dynamic_byte_offset,
                     scalar_type: *scalar_type,
+                },
+                ShaderOperation::LoadTexture2D {
+                    outputs,
+                    coordinates,
+                    image_binding,
+                    mip_level,
+                } => ShaderOperation::LoadTexture2D {
+                    outputs: outputs.clone(),
+                    coordinates: *coordinates,
+                    image_binding: remapped_binding(bindings, stage, *image_binding)?,
+                    mip_level: *mip_level,
                 },
                 ShaderOperation::SampleTexture2D {
                     outputs,
@@ -5410,6 +5461,98 @@ mod tests {
                 }) if actual == detail
             ));
         }
+    }
+
+    #[test]
+    fn captured_iadd_reaches_verified_unsigned_add_and_wgsl() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0006_0461;
+        header[13] = 0x0000_8000;
+        let translated = translated_fixture_with_register_count(
+            MaxwellThreeDShaderStage::Vertex,
+            header,
+            &[
+                0,
+                0xefd8_7f80_2fc7_ff01,
+                0x3810_0000_0017_0101,
+                0xe300_0000_0007_000f,
+            ],
+            4,
+        );
+        assert!(matches!(
+            translated.ir().instructions()[1].operation(),
+            ShaderOperation::MoveImmediate32 { bits: 1, .. }
+        ));
+        assert!(
+            matches!(translated.ir().instructions()[2].operation(), ShaderOperation::Add32 { destination, left, scalar_type: ShaderScalarType::Unsigned32, .. } if destination.index() == 1 && left.index() == 1)
+        );
+        let module = lower_shader_ir_to_wgsl(&translated).unwrap();
+        assert!(
+            module
+                .source()
+                .contains("registers[1] = registers[1] + registers[4]")
+        );
+        validate_wgsl(&module);
+    }
+
+    #[test]
+    fn captured_lop_and_vertex_id_reaches_verified_ir_and_wgsl() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0006_0461;
+        header[13] = 0x0000_8000;
+        let translated = translated_fixture_with_register_count(
+            MaxwellThreeDShaderStage::Vertex,
+            header,
+            &[
+                0,
+                0xefd8_7f80_2fc7_ff00,
+                0x3847_0000_0027_0000,
+                0xe300_0000_0007_000f,
+            ],
+            4,
+        );
+        assert!(matches!(
+            translated.ir().instructions()[1].operation(),
+            ShaderOperation::MoveImmediate32 { bits: 2, .. }
+        ));
+        assert!(matches!(translated.ir().instructions()[2].operation(),
+            ShaderOperation::Bitwise32 { destination, left, operation: nixe_gpu::ShaderBitwiseOperation::And, .. }
+                if destination.index() == 0 && left.index() == 0));
+        validate_wgsl(&lower_shader_ir_to_wgsl(&translated).unwrap());
+    }
+
+    #[test]
+    fn predicated_lop_complement_keeps_conditionally_defined_sources_guarded() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0006_0461;
+        header[13] = 0x0000_8000;
+        let translated = translated_fixture_with_register_count(
+            MaxwellThreeDShaderStage::Vertex,
+            header,
+            &[
+                0,
+                0xefd8_7f80_2fc7_ff00, // R0 = vertex ID
+                0x5b64_0380_0ff7_0007, // P0 = R0 == 0
+                0x5c98_0780_0000_0001, // @P0 R1 = R0
+                0,
+                0x3847_0080_0020_0101, // @P0 R1 = ~R1 & 2
+                0xe300_0000_0007_000f,
+            ],
+            4,
+        );
+        let expanded = translated
+            .ir()
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.source().byte_offset() == 40)
+            .collect::<Vec<_>>();
+        assert_eq!(expanded.len(), 4);
+        assert!(expanded.iter().all(|instruction| instruction.predicate()
+            == ShaderPredicate::Register {
+                register: 0,
+                inverted: false
+            }));
+        validate_wgsl(&lower_shader_ir_to_wgsl(&translated).unwrap());
     }
 
     #[test]
@@ -7516,10 +7659,129 @@ mod tests {
     }
 
     #[test]
+    fn tlds_level_zero_preserves_coordinates_channels_and_samplerless_binding() {
+        let mut bindings = BTreeMap::new();
+        let captured = 0xda50_1a40_2077_0600;
+        let operation = decode_texture_access_simplified(
+            MaxwellThreeDShaderStage::Pixel,
+            0x30,
+            captured,
+            8,
+            &mut bindings,
+        )
+        .unwrap();
+        assert_eq!(
+            operation,
+            ShaderOperation::LoadTexture2D {
+                outputs: (0..4)
+                    .map(|component| ShaderTextureSampleOutput::new(
+                        ShaderRegister::new(u16::from(component)),
+                        component
+                    )
+                    .unwrap())
+                    .collect(),
+                coordinates: [ShaderRegister::new(6), ShaderRegister::new(7)],
+                image_binding: 32,
+                mip_level: 0,
+            }
+        );
+        assert_eq!(bindings[&420].constant_buffer_byte_offset, 1680);
+        assert_eq!(bindings[&420].sampler_binding, None);
+        // The same descriptor can later be filtered: reserve its sampler once.
+        let sample = (captured & !(0x1f << 53)) | (1 << 53);
+        decode_texture_access_simplified(
+            MaxwellThreeDShaderStage::Pixel,
+            0x38,
+            sample,
+            8,
+            &mut bindings,
+        )
+        .unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[&420].sampler_binding, Some(33));
+        decode_texture_access_simplified(
+            MaxwellThreeDShaderStage::Pixel,
+            0x40,
+            captured,
+            8,
+            &mut bindings,
+        )
+        .unwrap();
+        assert_eq!(bindings[&420].sampler_binding, Some(33));
+        for word in [
+            captured & !(1 << 59),
+            captured ^ (1 << 53),
+            captured | (1 << 55),
+        ] {
+            assert!(matches!(
+                decode_texture_access_simplified(
+                    MaxwellThreeDShaderStage::Pixel,
+                    0x30,
+                    word,
+                    8,
+                    &mut BTreeMap::new()
+                ),
+                Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn tlds_reaches_wgsl_without_declaring_a_sampler() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0002_5462;
+        header[18] = 0xf;
+        let translated = translated_fixture_with_register_count(
+            MaxwellThreeDShaderStage::Pixel,
+            header,
+            &[
+                0,
+                0x0100_0000_0037_f006,
+                0x0100_0000_0057_f007,
+                0xda50_1a40_2077_0600,
+                0,
+                0xe300_0000_0007_000f,
+            ],
+            8,
+        );
+        assert_eq!(translated.ir().resources().len(), 1);
+        assert_eq!(
+            translated.ir().resources()[0].kind(),
+            ShaderResourceKind::SampledImage
+        );
+        let module = lower_shader_ir_to_wgsl(&translated).unwrap();
+        assert!(module.source().contains("textureLoad(sampled_image_32"));
+        assert!(!module.source().contains("textureSample("));
+        assert!(!module.source().contains("var sampler_"));
+        validate_wgsl(&module);
+        let mapping = BTreeMap::from([(32, 4)]);
+        let remapped = finalize_shader_ir(
+            translated.ir().clone(),
+            MaxwellThreeDShaderStage::Pixel,
+            &mapping,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            remapped
+                .ir()
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(
+                    instruction.operation(),
+                    ShaderOperation::LoadTexture2D {
+                        image_binding: 4,
+                        ..
+                    }
+                ))
+        );
+    }
+
+    #[test]
     fn texs_2d_implicit_lod_decodes_captured_split_rgba_operands() {
         let encoding = 0xd830_0080_2007_0100;
         let mut bindings = BTreeMap::new();
-        let operation = decode_texture_sample_simplified(
+        let operation = decode_texture_access_simplified(
             MaxwellThreeDShaderStage::Pixel,
             0x2a8,
             encoding,
@@ -7551,7 +7813,7 @@ mod tests {
             Some(&MaxwellTextureResourceBinding {
                 constant_buffer_byte_offset: 32,
                 image_binding: 32,
-                sampler_binding: 33,
+                sampler_binding: Some(33),
                 image_kind: ShaderResourceKind::SampledImage,
             })
         );
@@ -7561,7 +7823,7 @@ mod tests {
     fn texs_2d_array_implicit_lod_decodes_packed_layer_and_coordinates() {
         let encoding = 0xd8e0_1a4f_f027_0003;
         let mut bindings = BTreeMap::new();
-        let operation = decode_texture_sample_simplified(
+        let operation = decode_texture_access_simplified(
             MaxwellThreeDShaderStage::Pixel,
             0x30,
             encoding,
@@ -7586,7 +7848,7 @@ mod tests {
             Some(&MaxwellTextureResourceBinding {
                 constant_buffer_byte_offset: 1680,
                 image_binding: 32,
-                sampler_binding: 33,
+                sampler_binding: Some(33),
                 image_kind: ShaderResourceKind::SampledImage2DArray,
             })
         );

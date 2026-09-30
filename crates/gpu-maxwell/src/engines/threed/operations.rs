@@ -514,6 +514,9 @@ pub enum MaxwellThreeDSynchronizationTrigger {
         system_memory_barrier: bool,
         source: MaxwellMethodSource,
     },
+    /// Order fragment work within each tile, without completing unrelated work.
+    /// https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_base.cpp#L61-L64
+    TiledCacheBarrier { source: MaxwellMethodSource },
     InvalidateShaderCaches {
         request: MaxwellThreeDShaderCacheInvalidation,
         source: MaxwellMethodSource,
@@ -555,6 +558,7 @@ impl MaxwellThreeDSynchronizationTrigger {
             Self::DecompressSurface { source, .. }
             | Self::WaitForIdle { source, .. }
             | Self::PixelShaderBarrier { source, .. }
+            | Self::TiledCacheBarrier { source }
             | Self::InvalidateShaderCaches { source, .. }
             | Self::InvalidateShaderCachesNoWfi { source, .. }
             | Self::InvalidateTextureCacheNoWfi { source, .. }
@@ -583,6 +587,7 @@ pub enum MaxwellThreeDSynchronizationPlan {
     PixelShaderBarrier {
         system_memory_barrier: bool,
     },
+    TiledCacheBarrier,
     InvalidateShaderCaches {
         request: MaxwellThreeDShaderCacheInvalidation,
         maintenance: CacheMaintenanceOperation,
@@ -756,6 +761,9 @@ pub fn lower_maxwell_three_d_synchronization(
         } => Ok(MaxwellThreeDSynchronizationPlan::PixelShaderBarrier {
             system_memory_barrier,
         }),
+        MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier { .. } => {
+            Ok(MaxwellThreeDSynchronizationPlan::TiledCacheBarrier)
+        }
         MaxwellThreeDSynchronizationTrigger::InvalidateShaderCaches { request, source } => {
             if request.locks() {
                 return Err(

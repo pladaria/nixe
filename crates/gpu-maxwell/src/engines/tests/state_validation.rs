@@ -144,8 +144,8 @@ fn tiled_cache_enable_rejects_reserved_bits_and_failed_packet_keeps_valid_prefix
     let decoded = incrementing_packet(0x0f60 / 4, &[0, 0x0040_0020, 3, 4, 5, 6]);
     assert!(matches!(
         dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x0f74)
+        Err(MaxwellEngineDispatchError::InvalidMethodValue { source, defined_mask: 0x03ff_fff1, .. })
+            if source.method() == GpuMethodId(0x0f74) && source.argument() == 6
     ));
     assert_ne!(channel, before);
 

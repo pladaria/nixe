@@ -1094,12 +1094,15 @@ fn three_d_synchronization_operation(
         | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { maintenance, .. }
         | MaxwellThreeDSynchronizationPlan::TiledCacheFlush { maintenance, .. } => maintenance,
         MaxwellThreeDSynchronizationPlan::PixelShaderBarrier { .. }
+        | MaxwellThreeDSynchronizationPlan::TiledCacheBarrier
         | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. } => {
             // The neutral ordered-write boundary also covers fragment outputs.
             // Conservatively expose writes for both SYSMEMBAR modes: backends
             // own coherent device storage and materialize CPU reads on demand.
             // This is GPU ordering, not a CPU wait or a syncpoint completion;
             // in particular a fragment barrier does not drain unrelated stages.
+            // Tile-local ordering is satisfied by this stronger whole-pass
+            // boundary: host backends do not replay draws per Maxwell tile.
             CacheMaintenanceOperation::FlushDirtyDeviceWrites
         }
         MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface { .. }
@@ -1919,6 +1922,7 @@ mod tests {
         let shader_invalidate = packet(0, 0x0da4 / 4, &[0x1011]);
         let fragment_barriers = packet(0, 0x0de0 / 4, &[0]);
         let fragment_system_barrier = packet(0, 0x0de0 / 4, &[1]);
+        let tiled_barrier = packet(0, 0x0f7c / 4, &[0]);
         let wait = packet(1, 0x0110 / 4, &[0]);
 
         let plan = lower_test_pushbuffers(
@@ -1931,6 +1935,7 @@ mod tests {
                 shader_invalidate,
                 fragment_barriers,
                 fragment_system_barrier,
+                tiled_barrier,
                 wait,
             ],
             &address_space,
@@ -1951,9 +1956,11 @@ mod tests {
                 MaxwellSubmissionExecutionStep::BackendOperation(shader),
                 MaxwellSubmissionExecutionStep::BackendOperation(fragment),
                 MaxwellSubmissionExecutionStep::BackendOperation(fragment_system),
+                MaxwellSubmissionExecutionStep::BackendOperation(tiled),
             ] if *value == 0xfeed_beef_u32.to_le_bytes()
                 && matches!(fragment.command(), GpuCommand::CacheMaintenance(CacheMaintenanceOperation::FlushDirtyDeviceWrites))
                 && matches!(fragment_system.command(), GpuCommand::CacheMaintenance(CacheMaintenanceOperation::FlushDirtyDeviceWrites))
+                && matches!(tiled.command(), GpuCommand::CacheMaintenance(CacheMaintenanceOperation::FlushDirtyDeviceWrites))
                 && target.offset().get() == address
                 && matches!(
                     flush.command(),
@@ -1987,6 +1994,44 @@ mod tests {
         assert_eq!(completion, None);
         allocation.read(0, &mut bytes).unwrap();
         assert_eq!(bytes, 0xfeed_beef_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn tiled_barrier_and_texture_invalidation_stay_in_one_gpu_submission() {
+        let frontend = FrontendSubmissionId::new(2);
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let plan = lower_test_pushbuffers(
+            &mut channel,
+            &[
+                packet(0, 0, &[SWITCH_1_GM20B_PROFILE.classes().three_d().0]),
+                packet(0, 0x0f7c / 4, &[0]),
+                packet(0, 0x0f74 / 4, &[0]),
+                packet(0, 0x0f78 / 4, &[1]),
+            ],
+            &address_space(),
+            frontend,
+            Vec::new(),
+            None,
+            &mut MaxwellThreeDLoweringCache::default(),
+        )
+        .unwrap();
+        assert!(!plan.has_deferred_canonical_writes());
+        let mut execution = MaxwellBackendExecution::new(plan).unwrap();
+        let segment = execution.next_segment().unwrap().unwrap();
+        assert!(segment.creations().is_empty());
+        assert!(segment.invalidations().is_empty());
+        assert_eq!(segment.submission().id(), frontend);
+        assert!(
+            matches!(segment.submission().operations(), [barrier, invalidate]
+            if matches!(barrier.command(), GpuCommand::CacheMaintenance(CacheMaintenanceOperation::FlushDirtyDeviceWrites))
+                && matches!(invalidate.command(), GpuCommand::CacheMaintenance(CacheMaintenanceOperation::InvalidateTextureReadCaches)))
+        );
+        execution.complete_segment();
+        assert!(execution.next_segment().unwrap().is_none());
     }
 
     #[test]

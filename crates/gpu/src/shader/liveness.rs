@@ -75,6 +75,7 @@ pub(super) fn live_instructions(
             | ShaderOperation::FloatMultiplyZero32 { .. }
             | ShaderOperation::Add32 { .. }
             | ShaderOperation::ShiftLeft32 { .. }
+            | ShaderOperation::Bitwise32 { .. }
             | ShaderOperation::FloatMinMax32 { .. }
             | ShaderOperation::FusedMultiplyAdd32 { .. }
             | ShaderOperation::Reciprocal32 { .. }
@@ -86,6 +87,7 @@ pub(super) fn live_instructions(
             | ShaderOperation::LoadConstantBuffer32 { .. }
             | ShaderOperation::LoadConstantBufferIndexed32 { .. }
             | ShaderOperation::SampleTexture2D { .. }
+            | ShaderOperation::LoadTexture2D { .. }
             | ShaderOperation::SampleTexture2DArray { .. } => false,
             ShaderOperation::Branch { .. } => unreachable!("branches rejected before liveness"),
         };

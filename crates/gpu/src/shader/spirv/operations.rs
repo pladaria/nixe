@@ -199,6 +199,27 @@ impl Emitter {
                 let semantics = self.constant(spv::MemorySemantics::empty().bits());
                 self.b.control_barrier(execution, memory, semantics)?;
             }
+            Bitwise32 {
+                destination,
+                left,
+                right,
+                operation,
+            } => {
+                let left = self.read(*left)?;
+                let right = self.read(*right)?;
+                let value = match operation {
+                    ShaderBitwiseOperation::And => {
+                        self.b.bitwise_and(self.uint, None, left, right)?
+                    }
+                    ShaderBitwiseOperation::Or => {
+                        self.b.bitwise_or(self.uint, None, left, right)?
+                    }
+                    ShaderBitwiseOperation::Xor => {
+                        self.b.bitwise_xor(self.uint, None, left, right)?
+                    }
+                };
+                self.write(*destination, value);
+            }
             Add32 {
                 destination,
                 left,

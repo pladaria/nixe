@@ -12,6 +12,12 @@ mod resource_lifetime;
 #[path = "accelerated/multisample.rs"]
 mod multisample;
 
+#[path = "accelerated/texel_fetch.rs"]
+mod texel_fetch;
+
+#[path = "accelerated/multiple_targets.rs"]
+mod multiple_targets;
+
 use hardware::initialize_backend;
 use nixe_gpu::{
     AttachmentLoad, AttachmentStore, BackendInstanceId, BackendResourceCreateInfo,

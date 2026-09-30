@@ -7,6 +7,128 @@ use nixe_memory::{
 
 use super::*;
 
+#[test]
+fn draws_stop_consuming_vertex_streams_when_their_attributes_are_disabled() {
+    let vertices = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let color = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let mut space = resource_address_space();
+    let vertex_address = map_resource(
+        &mut space,
+        vertices
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        1,
+        0,
+    )
+    .offset()
+    .get();
+    let color_address = map_resource(
+        &mut space,
+        color.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+        2,
+        0xfe,
+    )
+    .offset()
+    .get();
+    let mut channel = three_d_channel();
+    program_basic_draw_state(&mut channel, vertex_address);
+    program_color_target(&mut channel, 0, color_address, 0xd5);
+    program_three_d(&mut channel, 0x121c, 1);
+    let (shaders, mut cache) = translated_graphics_shaders();
+    for enabled in [true, false, true, false] {
+        program_three_d(
+            &mut channel,
+            0x1160,
+            0x3820_0000 | if enabled { 0 } else { 1 << 6 },
+        );
+        // The stale stream remains enabled, with an invalid range. A draw
+        // without array attributes must neither resolve nor bind its storage.
+        program_three_d(
+            &mut channel,
+            0x1c04,
+            if enabled {
+                (vertex_address >> 32) as u32
+            } else {
+                0
+            },
+        );
+        program_three_d(
+            &mut channel,
+            0x1c08,
+            if enabled { vertex_address as u32 } else { 0 },
+        );
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let mut roles = Vec::new();
+        draw.trigger()
+            .append_resource_roles(draw.state(), &mut roles);
+        assert_eq!(
+            roles.contains(&MaxwellThreeDResourceRole::VertexStream(0)),
+            enabled
+        );
+        let resources = cache
+            .resolved_resources_mut()
+            .resolve(draw.state(), &space, &roles, None, false, 16)
+            .unwrap();
+        assert_eq!(
+            resources
+                .resources()
+                .iter()
+                .any(|resource| resource.role() == MaxwellThreeDResourceRole::VertexStream(0)),
+            enabled
+        );
+        for repetition in 0..2 {
+            let work = lower_maxwell_three_d_operation_into_cache(
+                draw.state(),
+                &resources,
+                draw.trigger(),
+                Some(&shaders),
+                FrontendSubmissionId::new(1),
+                vec![],
+                &mut cache,
+            )
+            .unwrap();
+            let prepared = work
+                .submission()
+                .operations()
+                .iter()
+                .find_map(|op| match op.command() {
+                    GpuCommand::Draw(draw) => Some(&draw.prepared),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(prepared.vertex_buffers.len(), usize::from(enabled));
+            if repetition == 1 {
+                assert!(work.resource_creations().is_empty());
+            }
+        }
+    }
+    // A genuinely consumed attribute still requires a resolved, enabled stream.
+    program_three_d(&mut channel, 0x1160, 0x3820_0000);
+    program_three_d(&mut channel, 0x1c00, 0x10);
+    let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+    let draw = &dispatch.operations()[0];
+    let mut roles = Vec::new();
+    draw.trigger()
+        .append_resource_roles(draw.state(), &mut roles);
+    let resources =
+        resolve_maxwell_three_d_resources_for_roles(draw.state(), &space, &roles).unwrap();
+    assert!(matches!(
+        lower_maxwell_three_d_operation_into_cache(
+            draw.state(),
+            &resources,
+            draw.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(1),
+            vec![],
+            &mut cache,
+        ),
+        Err(MaxwellThreeDLoweringError::MissingResolvedResource {
+            role: MaxwellThreeDResourceRole::VertexStream(0)
+        })
+    ));
+}
+
 struct MaterializationWriteback;
 
 impl VisibilityCoordinator for MaterializationWriteback {
@@ -303,7 +425,13 @@ fn compression_threshold_reserved_values_and_failed_packet_keeps_valid_prefix() 
 }
 
 #[test]
-fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes() {
+fn compressed_color_clears_materialize_resident_images_and_generic_writeback() {
+    for (format, kind) in [(0xd5, 0xfe), (0xca, 0xfe), (0xca, 0xe9)] {
+        check_compressed_color_materialization(format, kind);
+    }
+}
+
+fn check_compressed_color_materialization(format: u32, kind: u8) {
     let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
     let mapping = map_resource(
@@ -312,7 +440,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap(),
         41,
-        0xfe,
+        kind,
     );
     let address = mapping.offset().get();
     let mut channel = three_d_channel();
@@ -321,7 +449,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         (0x0804, address as u32),
         (0x0808, 64),
         (0x080c, 32),
-        (0x0810, 0xd5),
+        (0x0810, format),
         (0x0814, 0),
         (0x0818, 1),
         (0x081c, 0),
@@ -402,10 +530,29 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         &mut cache,
     )
     .unwrap();
-    assert!(plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Image { view: Some(_), .. }
-    )));
+    let (description, view) = plan
+        .resource_creations()
+        .iter()
+        .find_map(|creation| match creation {
+            nixe_gpu::BackendResourceCreateInfo::Image {
+                description, view, ..
+            } => Some((description, view)),
+            _ => None,
+        })
+        .expect("clear must create a resident color image");
+    assert_eq!(
+        description.format(),
+        if format == 0xca {
+            ImageFormat::Rgba16Float
+        } else {
+            ImageFormat::Rgba8Unorm
+        }
+    );
+    assert_eq!(
+        view.is_some(),
+        kind == 0xfe,
+        "opaque compressed kinds must not expose a generic byte representation"
+    );
     assert!(matches!(
         plan.submission().operations()[0].command(),
         GpuCommand::Clear(nixe_gpu::ClearOperation::Image {
@@ -430,6 +577,12 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             .resource_creations()
             .is_empty()
     );
+
+    // C64 compressed storage stays device-resident; only the generic storage
+    // representation below can be exported as canonical uncompressed bytes.
+    if kind != 0xfe {
+        return;
+    }
 
     // Rebinding the same canonical bytes through a different GPU allocation
     // changes view identity, not the neutral representation of the image.

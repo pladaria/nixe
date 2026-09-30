@@ -76,6 +76,33 @@ fn immediate(reg: u16, bits: u32) -> ShaderOperation {
     }
 }
 
+fn bitwise() -> VerifiedShaderIr {
+    let mut operations = vec![immediate(0, 0x8000_0001), immediate(1, 0xaaaa_5555)];
+    for operation in [
+        ShaderBitwiseOperation::And,
+        ShaderBitwiseOperation::Or,
+        ShaderBitwiseOperation::Xor,
+    ] {
+        operations.push(ShaderOperation::Bitwise32 {
+            destination: ShaderRegister(0),
+            left: ShaderRegister(0),
+            right: ShaderRegister(1),
+            operation,
+        });
+    }
+    operations.extend([store(0), ShaderOperation::Exit]);
+    control(operations)
+}
+
+#[test]
+fn bitwise_operations_lower_to_native_integer_instructions() {
+    let m = module(&bitwise(), options());
+    for opcode in [spv::Op::BitwiseAnd, spv::Op::BitwiseOr, spv::Op::BitwiseXor] {
+        assert_eq!(ops(&m, opcode).len(), 1);
+    }
+    assert!(ops(&m, spv::Op::ConvertUToF).is_empty());
+}
+
 #[test]
 fn integer_to_float_uses_signedness_and_rte_without_denormal_repair() {
     for (source_type, opcode) in [
@@ -662,6 +689,7 @@ fn validate_native_graphics_modules_with_spirv_tools() {
         ("io", patch_io()),
         ("add", arithmetic(false)),
         ("fma", arithmetic(true)),
+        ("bitwise", bitwise()),
     ] {
         modules.push((
             name.to_owned(),

@@ -307,7 +307,11 @@ fn map_resource(
 fn lowering_capabilities(features: BackendFeatures) -> BackendCapabilities {
     BackendCapabilities::new(
         features,
-        [ImageFormat::Rgba8Unorm, ImageFormat::Bgra8Unorm],
+        [
+            ImageFormat::Rgba8Unorm,
+            ImageFormat::Bgra8Unorm,
+            ImageFormat::Rgba16Float,
+        ],
         [SampleCount::One],
         [ShaderStage::Vertex, ShaderStage::Fragment],
         std::iter::empty::<QueryKind>(),

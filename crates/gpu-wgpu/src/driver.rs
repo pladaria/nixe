@@ -380,7 +380,7 @@ impl RenderPipelineKey {
     fn new(
         vertex: BackendResourceHandle,
         fragment: BackendResourceHandle,
-        color_format: ImageFormat,
+        color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
         depth_format: Option<ImageFormat>,
         samples: SampleCount,
         draw: &DrawOperation,
@@ -394,8 +394,8 @@ impl RenderPipelineKey {
             front_face: draw.prepared.front_face,
             cull_mode: draw.prepared.cull_mode,
             alpha_test: draw.prepared.alpha_test,
-            color_output: draw.prepared.color_outputs[0],
-            color_format,
+            color_outputs: draw.prepared.color_outputs,
+            color_formats,
             depth_format,
             samples,
             depth_state: draw.prepared.depth_state,
@@ -416,8 +416,10 @@ impl RenderPipelineKey {
             && self.front_face == draw.prepared.front_face
             && self.cull_mode == draw.prepared.cull_mode
             && self.alpha_test == draw.prepared.alpha_test
-            && self.color_output == draw.prepared.color_outputs[0]
-            && self.color_format == location.color_format
+            && self.color_formats.iter().enumerate().all(|(slot, format)| {
+                format.is_none() || self.color_outputs[slot] == draw.prepared.color_outputs[slot]
+            })
+            && self.color_formats == location.color_formats
             && self.depth_format == location.depth_format
             && self.samples == location.samples
             && self.depth_state == draw.prepared.depth_state
@@ -433,14 +435,14 @@ impl RenderPipelineKey {
 struct RenderPipelineFingerprintInput<'a> {
     front_face: nixe_gpu::FrontFace,
     cull_mode: nixe_gpu::CullMode,
-    color_output: nixe_gpu::ColorOutputState,
+    color_outputs: [nixe_gpu::ColorOutputState; MAX_COLOR_ATTACHMENTS],
     quad_flat: bool,
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
     topology: PrimitiveTopology,
     triangle_rasterization: TriangleRasterization,
     alpha_test: Option<AlphaTest>,
-    color_format: ImageFormat,
+    color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
     depth_state: DepthState,
@@ -456,8 +458,13 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.front_face.hash(state);
         self.cull_mode.hash(state);
         self.alpha_test.hash(state);
-        self.color_output.hash(state);
-        self.color_format.hash(state);
+        // Inactive slots must not create redundant pipeline variants.
+        for (format, output) in self.color_formats.iter().zip(self.color_outputs) {
+            if format.is_some() {
+                output.hash(state);
+            }
+        }
+        self.color_formats.hash(state);
         self.depth_format.hash(state);
         self.samples.hash(state);
         self.depth_state.hash(state);
@@ -481,7 +488,7 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
 fn render_pipeline_fingerprint(
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
-    color_format: ImageFormat,
+    color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
     draw: &DrawOperation,
@@ -496,8 +503,8 @@ fn render_pipeline_fingerprint(
         topology: draw.prepared.topology,
         triangle_rasterization: draw.prepared.triangle_rasterization,
         alpha_test: draw.prepared.alpha_test,
-        color_output: draw.prepared.color_outputs[0],
-        color_format,
+        color_outputs: draw.prepared.color_outputs,
+        color_formats,
         depth_format,
         samples,
         depth_state: draw.prepared.depth_state,
@@ -539,13 +546,13 @@ impl VertexPipelineLayoutKey {
 struct RenderPipelineKey {
     front_face: nixe_gpu::FrontFace,
     cull_mode: nixe_gpu::CullMode,
-    color_output: nixe_gpu::ColorOutputState,
+    color_outputs: [nixe_gpu::ColorOutputState; MAX_COLOR_ATTACHMENTS],
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
     topology: PrimitiveTopology,
     triangle_rasterization: TriangleRasterization,
     alpha_test: Option<AlphaTest>,
-    color_format: ImageFormat,
+    color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
     depth_state: DepthState,
@@ -556,8 +563,9 @@ struct CachedRenderPipeline {
     vertex_fetch: VertexFetchPlan,
     identity: PreparedPipelineIdentity,
     opaque_textures: crate::texture_sampling::OpaqueTextureBindings,
+    // Collision evidence is debug-only; do not enlarge every resource slot.
     #[cfg(debug_assertions)]
-    key: RenderPipelineKey,
+    key: Box<RenderPipelineKey>,
     pipeline: RenderPipeline,
     serial: u64,
     last_used: u64,
@@ -568,7 +576,7 @@ struct PreparedPipelineIdentity {
     draw: Arc<nixe_gpu::PreparedDraw>,
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
-    color_format: ImageFormat,
+    color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
 }
@@ -578,7 +586,7 @@ impl PreparedPipelineIdentity {
         &self,
         vertex: BackendResourceHandle,
         fragment: BackendResourceHandle,
-        color_format: ImageFormat,
+        color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
         depth_format: Option<ImageFormat>,
         samples: SampleCount,
         draw: &DrawOperation,
@@ -586,7 +594,7 @@ impl PreparedPipelineIdentity {
         Arc::ptr_eq(&self.draw, &draw.prepared)
             && self.vertex == vertex
             && self.fragment == fragment
-            && self.color_format == color_format
+            && self.color_formats == color_formats
             && self.depth_format == depth_format
             && self.samples == samples
     }
@@ -598,7 +606,7 @@ struct RenderPipelineLocation {
     pipeline: BackendResourceHandle,
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
-    color_format: ImageFormat,
+    color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
     fingerprint: u128,
@@ -666,7 +674,7 @@ impl RenderPipelineCache {
         &self,
         vertex: BackendResourceHandle,
         fragment: BackendResourceHandle,
-        color_format: ImageFormat,
+        color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
         depth_format: Option<ImageFormat>,
         samples: SampleCount,
         draw: &DrawOperation,
@@ -675,7 +683,7 @@ impl RenderPipelineCache {
         current
             .record
             .identity
-            .matches(vertex, fragment, color_format, depth_format, samples, draw)
+            .matches(vertex, fragment, color_formats, depth_format, samples, draw)
             .then_some((
                 current.fingerprint,
                 current.record.opaque_textures,
@@ -2813,17 +2821,18 @@ impl WgpuBackendDriver {
         )?;
         let vertex = shader_handle_for_stage(dependencies, operation, ShaderStage::Vertex)?;
         let fragment = shader_handle_for_stage(dependencies, operation, ShaderStage::Fragment)?;
-        let mut colors = attachments
+        let colors = attachments
             .iter()
             .filter(|a| a.kind == nixe_gpu::ImageKind::Color);
-        let color_format = colors
-            .next()
-            .ok_or_else(|| unsupported("graphics draw without color attachment"))?
-            .format;
-        if colors.next().is_some() {
-            return Err(unsupported(
-                "ordinary graphics currently requires exactly one color attachment",
-            ));
+        let mut color_formats = [None; MAX_COLOR_ATTACHMENTS];
+        for (index, attachment) in colors.enumerate() {
+            *color_formats
+                .get_mut(index)
+                .ok_or_else(|| unsupported("too many color attachments"))? =
+                Some(attachment.format);
+        }
+        if color_formats[0].is_none() {
+            return Err(unsupported("graphics draw without color attachment"));
         }
         let samples = attachments[0].samples;
         let depth_format = attachments
@@ -2834,7 +2843,7 @@ impl WgpuBackendDriver {
             Resource::Pipeline { render, .. } => render.current_fingerprint(
                 vertex,
                 fragment,
-                color_format,
+                color_formats,
                 depth_format,
                 samples,
                 draw,
@@ -2881,7 +2890,7 @@ impl WgpuBackendDriver {
             let base = render_pipeline_fingerprint(
                 vertex,
                 fragment,
-                color_format,
+                color_formats,
                 depth_format,
                 samples,
                 draw,
@@ -2898,7 +2907,7 @@ impl WgpuBackendDriver {
             pipeline,
             vertex,
             fragment,
-            color_format,
+            color_formats,
             depth_format,
             samples,
             fingerprint,
@@ -2978,28 +2987,33 @@ impl WgpuBackendDriver {
                 "flat quad assembly requires four bytes of host immediate data",
             ));
         }
-        let color_format = location.color_format;
+        let color_formats = location.color_formats;
         let depth_format = location.depth_format;
         let samples = location.samples;
         #[cfg(debug_assertions)]
         let key = RenderPipelineKey::new(
             vertex_handle,
             fragment_handle,
-            color_format,
+            color_formats,
             depth_format,
             samples,
             draw,
             location.quad_flat,
         );
-        let target = ColorTargetState {
-            format: texture_format(color_format)
-                .ok_or_else(|| unsupported("color attachment format"))?,
-            blend: draw.prepared.color_outputs[0].blend.map(color::blend),
-            write_mask: ColorWrites::from_bits_retain(u32::from(
-                draw.prepared.color_outputs[0].write_mask.bits(),
-            )),
-        };
-        let targets = [Some(target)];
+        let mut targets: [Option<ColorTargetState>; MAX_COLOR_ATTACHMENTS] =
+            std::array::from_fn(|_| None);
+        let mut target_count = 0;
+        for (slot, format) in color_formats.iter().enumerate() {
+            let Some(format) = format else { break };
+            let output = draw.prepared.color_outputs[slot];
+            targets[slot] = Some(ColorTargetState {
+                format: texture_format(*format)
+                    .ok_or_else(|| unsupported("color attachment format"))?,
+                blend: output.blend.map(color::blend),
+                write_mask: ColorWrites::from_bits_retain(u32::from(output.write_mask.bits())),
+            });
+            target_count += 1;
+        }
         let depth_stencil = depth_format
             .map(|format| {
                 Ok(DepthStencilState {
@@ -3144,7 +3158,7 @@ impl WgpuBackendDriver {
                         constants: &fragment_constants,
                         ..PipelineCompilationOptions::default()
                     },
-                    targets: &targets,
+                    targets: &targets[..target_count],
                 }),
                 multiview_mask: None,
                 cache: self.pipeline_cache.as_ref(),
@@ -3171,12 +3185,12 @@ impl WgpuBackendDriver {
                     draw: Arc::clone(&draw.prepared),
                     vertex: vertex_handle,
                     fragment: fragment_handle,
-                    color_format,
+                    color_formats,
                     depth_format,
                     samples,
                 },
                 #[cfg(debug_assertions)]
-                key,
+                key: Box::new(key),
                 pipeline,
                 serial,
                 last_used: cache_use,
@@ -5744,6 +5758,49 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_fingerprint_tracks_all_active_color_slots_only() {
+        let shader = |slot| {
+            BackendResourceHandle::new(
+                BackendInstanceId::new(1),
+                slot,
+                1,
+                BackendResourceKind::Shader,
+            )
+        };
+        let mut input = super::RenderPipelineFingerprintInput {
+            front_face: nixe_gpu::FrontFace::CounterClockwise,
+            cull_mode: nixe_gpu::CullMode::None,
+            color_outputs: [nixe_gpu::ColorOutputState::REPLACE; super::MAX_COLOR_ATTACHMENTS],
+            quad_flat: false,
+            vertex: shader(1),
+            fragment: shader(2),
+            topology: PrimitiveTopology::Triangles,
+            triangle_rasterization: TriangleRasterization::Fill,
+            alpha_test: None,
+            color_formats: [None; super::MAX_COLOR_ATTACHMENTS],
+            depth_format: None,
+            samples: SampleCount::One,
+            depth_state: DepthState::DISABLED,
+            vertex_buffers: &[],
+        };
+        input.color_formats[0] = Some(ImageFormat::Rgba16Float);
+        let single = nixe_gpu::cache_fingerprint(&input);
+        input.color_formats[1] = Some(ImageFormat::Rgba8Unorm);
+        let multiple = nixe_gpu::cache_fingerprint(&input);
+        assert_ne!(single, multiple);
+        input.color_formats.swap(0, 1);
+        assert_ne!(multiple, nixe_gpu::cache_fingerprint(&input));
+        input.color_formats.swap(0, 1);
+        input.color_outputs[1].write_mask =
+            nixe_gpu::ColorWriteMask::new(false, true, false, false);
+        assert_ne!(multiple, nixe_gpu::cache_fingerprint(&input));
+        input.color_outputs[1] = nixe_gpu::ColorOutputState::REPLACE;
+        input.color_outputs[7].write_mask =
+            nixe_gpu::ColorWriteMask::new(false, false, false, false);
+        assert_eq!(multiple, nixe_gpu::cache_fingerprint(&input));
+    }
+
+    #[test]
     fn pipeline_vertex_layout_ignores_buffer_identity_but_keeps_shader_specialization() {
         let layout = |buffer, offset, format| {
             VertexBufferLayout::new(
@@ -5792,8 +5849,10 @@ mod tests {
                 topology,
                 triangle_rasterization: TriangleRasterization::Fill,
                 alpha_test: None,
-                color_output: nixe_gpu::ColorOutputState::REPLACE,
-                color_format: ImageFormat::Rgba8Unorm,
+                color_outputs: [nixe_gpu::ColorOutputState::REPLACE; super::MAX_COLOR_ATTACHMENTS],
+                color_formats: std::array::from_fn(|slot| {
+                    (slot == 0).then_some(ImageFormat::Rgba8Unorm)
+                }),
                 depth_format: None,
                 samples: SampleCount::One,
                 depth_state: DepthState::DISABLED,

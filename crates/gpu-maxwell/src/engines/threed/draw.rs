@@ -6,6 +6,9 @@
 
 #[path = "draw/color.rs"]
 mod color;
+#[cfg(test)]
+#[path = "draw/compressed_sampling_tests.rs"]
+mod compressed_sampling_tests;
 #[path = "draw/indexed.rs"]
 mod indexed;
 #[path = "draw/multisample.rs"]
@@ -161,14 +164,9 @@ impl MaxwellThreeDOperationTrigger {
                 if self.is_indexed() {
                     roles.push(MaxwellThreeDResourceRole::IndexBuffer);
                 }
-                for attribute in state.vertex_input().attributes() {
-                    if let Some(attribute) = attribute.value().filter(|value| value.enabled()) {
-                        let role = MaxwellThreeDResourceRole::VertexStream(attribute.stream());
-                        if !roles.contains(&role) {
-                            roles.push(role);
-                        }
-                    }
-                }
+                roles.extend(
+                    consumed_vertex_streams(state).map(MaxwellThreeDResourceRole::VertexStream),
+                );
                 if let Some(selection) = state.render_targets().color_target_selection().value() {
                     roles.extend(
                         selection
@@ -184,6 +182,30 @@ impl MaxwellThreeDOperationTrigger {
             }
         }
     }
+}
+
+/// A stream's enable bit alone does not cause vertex fetches. Draws can leave
+/// old streams configured while disabling all their attributes (for example,
+/// when a subsequent shader generates geometry from the vertex ID).
+fn consumed_vertex_streams(state: &MaxwellThreeDState) -> impl Iterator<Item = u8> {
+    let mut mask = state
+        .vertex_input()
+        .attributes()
+        .iter()
+        .fold(0_u32, |mask, attribute| {
+            match attribute.value().filter(|attribute| attribute.enabled()) {
+                Some(attribute) => mask | (1 << attribute.stream()),
+                None => mask,
+            }
+        });
+    std::iter::from_fn(move || {
+        if mask == 0 {
+            return None;
+        }
+        let stream = mask.trailing_zeros() as u8;
+        mask &= mask - 1;
+        Some(stream)
+    })
 }
 
 /// Stable evidence that T10 translated one enabled Maxwell shader stage.
@@ -455,9 +477,13 @@ impl ViewKey {
         };
         *description == image.description()
             && *swizzle == image.view().swizzle()
-            && *guest_format == image.guest_format()
+            && same_guest_image_interpretation(
+                *guest_format,
+                *guest_compression_enabled,
+                image.guest_format(),
+                image.guest_layout().requires_materialization(),
+            )
             && *guest_pte_kind == image.guest_layout().pte_kind()
-            && *guest_compression_enabled == image.guest_layout().requires_materialization()
             && bindings.len() == image.view().bindings().len()
             && bindings.iter().zip(image.view().bindings()).all(
                 |((recorded_subresources, recorded_layout, recorded_backing), current)| {
@@ -482,6 +508,25 @@ fn same_canonical_backing(left: &nixe_gpu::BackingView, right: &nixe_gpu::Backin
                         && left.offset() == right.offset()
                         && left.size() == right.size()
                 }))
+}
+
+/// Exact neutral descriptions and layouts are checked by the caller. Color
+/// targets and TICs encode the same texel format in different register domains;
+/// their raw encodings must not prevent reuse of the rendered image.
+/// A TIC has no write-compression selector: reading an existing representation
+/// does not depend on whether the producer enabled compression of its writes.
+fn same_guest_image_interpretation(
+    left: super::MaxwellThreeDGuestImageFormat,
+    left_compression: bool,
+    right: super::MaxwellThreeDGuestImageFormat,
+    right_compression: bool,
+) -> bool {
+    use super::MaxwellThreeDGuestImageFormat::{Color, Texture};
+    (left == right && left_compression == right_compression)
+        || matches!(
+            (left, right),
+            (Color(_), Texture(_)) | (Texture(_), Color(_))
+        )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -509,9 +554,13 @@ impl ColorRepresentationRecord {
     fn same_domain_as_image(&self, image: &super::MaxwellThreeDResolvedImage) -> bool {
         self.description == image.description()
             && self.swizzle == image.view().swizzle()
-            && self.guest_format == image.guest_format()
+            && same_guest_image_interpretation(
+                self.guest_format,
+                self.guest_compression_enabled,
+                image.guest_format(),
+                image.guest_layout().requires_materialization(),
+            )
             && self.guest_pte_kind == image.guest_layout().pte_kind()
-            && self.guest_compression_enabled == image.guest_layout().requires_materialization()
             && self.bindings.len() == image.view().bindings().len()
             && self.bindings.iter().zip(image.view().bindings()).all(
                 |(recorded_binding, current_binding)| {
@@ -1127,7 +1176,7 @@ impl MaxwellThreeDLoweringCache {
                             .texture_bindings()
                             .iter()
                             .copied()
-                            .find(|binding| binding.sampler_binding() == resource.binding())
+                            .find(|binding| binding.sampler_binding() == Some(resource.binding()))
                             .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
                         (
                             MaxwellThreeDResourceRole::Sampler(
@@ -2418,17 +2467,11 @@ fn draw_resource_indices(
     shaders: &MaxwellThreeDTranslatedShaders,
 ) -> Result<Vec<usize>, MaxwellThreeDLoweringError> {
     let mut indices = attachments.attachment_indices();
-    for (stream, state) in state.vertex_input().streams().iter().enumerate() {
-        if state
-            .format()
-            .value()
-            .is_some_and(|format| format.enabled())
-        {
-            indices.push(resource_index(
-                resources,
-                MaxwellThreeDResourceRole::VertexStream(stream as u8),
-            )?);
-        }
+    for stream in consumed_vertex_streams(state) {
+        indices.push(resource_index(
+            resources,
+            MaxwellThreeDResourceRole::VertexStream(stream),
+        )?);
     }
     for resource in shaders.resources() {
         if !matches!(resource.role(), MaxwellThreeDResourceRole::Sampler(_)) {
@@ -2732,6 +2775,37 @@ fn prepare_resources(
             .resources()
             .get(*index)
             .ok_or(MaxwellThreeDLoweringError::ResourceExhausted)?;
+        if let MaxwellThreeDResolvedResource::Image(image) = resource
+            && matches!(image.role(), MaxwellThreeDResourceRole::SampledImage { .. })
+            && image.guest_layout().requires_materialization()
+        {
+            // Compressed guest bytes are opaque. Sampling is legal only while
+            // the initialized representation is still resident and no CPU write
+            // has invalidated it. Never create a blank texture or import bytes.
+            let resident = cache
+                .views
+                .iter()
+                .find(|record| record.remains_current_for_image(image));
+            if let Some(record) = resident
+                && (record.materialization == ViewMaterialization::Direct
+                    || (record.materialization == ViewMaterialization::CompressedColor
+                        && cache
+                            .color_materializations
+                            .iter()
+                            .any(|previous| previous.remains_materialized_for(image))))
+            {
+                // Direct residents have canonical initialization from their
+                // producer; opaque residents require the recorded clear.
+                result[*index] = Some(record.dependency);
+                continue;
+            }
+            return Err(
+                MaxwellThreeDLoweringError::CompressedSampledImageImportRequired {
+                    role: image.role(),
+                    kind: image.guest_layout().pte_kind(),
+                },
+            );
+        }
         let (allocation, allocation_description) = match resource {
             MaxwellThreeDResolvedResource::Buffer(value) => (
                 value.view().backing().allocation(),
@@ -3330,7 +3404,8 @@ fn lower_draw(
             .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("BEGIN"))?,
     )?;
     let mut vertex_buffers = Vec::new();
-    for (index, stream) in state.vertex_input().streams().iter().enumerate() {
+    for index in consumed_vertex_streams(state).map(usize::from) {
+        let stream = &state.vertex_input().streams()[index];
         let Some(stream_format) = stream.format().value().filter(|value| value.enabled()) else {
             continue;
         };
@@ -4265,6 +4340,10 @@ pub enum MaxwellThreeDLoweringError {
     CompressedColorImportRequired {
         target: u8,
     },
+    CompressedSampledImageImportRequired {
+        role: MaxwellThreeDResourceRole,
+        kind: u8,
+    },
     ShaderTranslationRequired,
     InvalidTranslatedShaders,
     TranslatedShaderStageMismatch,
@@ -4597,6 +4676,10 @@ impl Display for MaxwellThreeDLoweringError {
                 formatter,
                 "Maxwell compressed depth contents require materialization before use: kind=0x{kind:02x}"
             ),
+            Self::CompressedSampledImageImportRequired { role, kind } => write!(
+                formatter,
+                "Maxwell compressed sampled image has no current materialized resident image: role={role:?} kind={kind:#04x}"
+            ),
             Self::CompressedColorImportRequired { target } => write!(
                 formatter,
                 "Maxwell compressed color contents require materialization before use: target={target}"
@@ -4741,6 +4824,24 @@ mod tests {
         ShaderTranslationRecord, depth_stencil_attachment_required, neutral_depth_compare,
         neutral_first_instance, neutral_vertex_format, primitive_topology,
     };
+
+    #[test]
+    fn consumed_vertex_streams_deduplicate_attributes_and_cover_stream_31() {
+        use crate::engines::tests::{program_three_d, three_d_channel};
+        let mut channel = three_d_channel();
+        for (method, argument) in [
+            (0x1160, 0x3820_001f),
+            (0x1164, 0x3820_001f),
+            (0x1168, 0x3820_0003),
+            (0x116c, 0x3820_0040),
+        ] {
+            program_three_d(&mut channel, method, argument);
+        }
+        assert_eq!(
+            super::consumed_vertex_streams(channel.three_d()).collect::<Vec<_>>(),
+            [3, 31]
+        );
+    }
 
     #[test]
     fn fingerprint_index_tracks_hits_for_lru_eviction() {

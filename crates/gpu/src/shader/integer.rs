@@ -1,5 +1,12 @@
-//! Integer predicate operations shared by shader output and the test oracle.
+//! Integer operations shared by shader output and the test oracle.
 use super::*;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShaderBitwiseOperation {
+    And,
+    Or,
+    Xor,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShaderIntegerComparison {
@@ -105,6 +112,80 @@ mod tests {
 
     fn instruction(predicate: ShaderPredicate, operation: ShaderOperation) -> ShaderInstruction {
         ShaderInstruction::new(ShaderSourceLocation::new(8), predicate, operation)
+    }
+
+    #[test]
+    fn bitwise_operations_preserve_all_bits_aliasing_and_predication() {
+        let values = [
+            0,
+            1,
+            2,
+            3,
+            0x8000_0000,
+            0xffff_ffff,
+            0xaaaa_5555,
+            0x5555_aaaa,
+        ];
+        for operation in [
+            ShaderBitwiseOperation::And,
+            ShaderBitwiseOperation::Or,
+            ShaderBitwiseOperation::Xor,
+        ] {
+            for left in values {
+                for right in values {
+                    for enabled in [false, true] {
+                        let always = ShaderPredicate::Always;
+                        let shader = program(vec![
+                            instruction(always, immediate(0, left)),
+                            instruction(always, immediate(1, right)),
+                            instruction(
+                                always,
+                                set(if enabled {
+                                    ShaderIntegerComparison::True
+                                } else {
+                                    ShaderIntegerComparison::False
+                                }),
+                            ),
+                            instruction(
+                                predicate(false),
+                                ShaderOperation::Bitwise32 {
+                                    destination: ShaderRegister::new(0),
+                                    left: ShaderRegister::new(0),
+                                    right: ShaderRegister::new(1),
+                                    operation,
+                                },
+                            ),
+                            instruction(always, store(0, 0)),
+                            instruction(always, ShaderOperation::Exit),
+                        ])
+                        .unwrap();
+                        let expected = if enabled {
+                            match operation {
+                                ShaderBitwiseOperation::And => left & right,
+                                ShaderBitwiseOperation::Or => left | right,
+                                ShaderBitwiseOperation::Xor => left ^ right,
+                            }
+                        } else {
+                            left
+                        };
+                        assert_eq!(
+                            evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 16)
+                                .unwrap()
+                                .output_bits(ShaderIoLocation::Position, 0),
+                            Some(expected)
+                        );
+                        let wgsl = lower_shader_ir_to_wgsl(&shader).unwrap();
+                        let module = naga::front::wgsl::parse_str(wgsl.source()).unwrap();
+                        naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::all(),
+                            naga::valid::Capabilities::all(),
+                        )
+                        .validate(&module)
+                        .unwrap();
+                    }
+                }
+            }
+        }
     }
 
     fn immediate(register: u16, bits: u32) -> ShaderOperation {
