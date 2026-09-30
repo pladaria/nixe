@@ -27,7 +27,6 @@ pub use default_control::{
     lower_default_tessellation_control_to_spirv,
 };
 mod interface;
-mod liveness;
 mod operations;
 mod resources;
 #[cfg(test)]
@@ -151,7 +150,8 @@ pub fn lower_shader_ir_to_spirv(
     }
     // Resources are consumed by operations below, so unused declarations do not
     // create descriptors or force unnecessary backend features.
-    let live = liveness::live_instructions(ir)?;
+    let live = liveness::live_instructions(ir)
+        .map_err(|(source, reason)| SpirvShaderError::Instruction { source, reason })?;
     let mut emitter = Emitter::new(options);
     emitter.emit_interfaces(ir)?;
     let bindings = emitter.emit_resources(ir, &live)?;

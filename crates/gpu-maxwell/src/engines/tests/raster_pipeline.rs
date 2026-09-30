@@ -4557,7 +4557,7 @@ fn tir_controls_affect_only_active_draws_and_never_clears() {
 }
 
 #[test]
-fn ps_output_sample_mask_usage_obeys_aa_and_never_blocks_clear() {
+fn ps_output_sample_mask_usage_requires_shader_evidence_and_never_blocks_clear() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
@@ -4607,7 +4607,7 @@ fn ps_output_sample_mask_usage_obeys_aa_and_never_blocks_clear() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPsOutputSampleMaskSemantics)
+        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1534, 0);
@@ -4626,7 +4626,7 @@ fn ps_output_sample_mask_usage_obeys_aa_and_never_blocks_clear() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPsOutputSampleMaskSemantics)
+        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -5482,6 +5482,80 @@ fn pixel_shader_interlock_only_blocks_draws_when_conflict_detection_is_enabled()
             "horizontal rectangle"
         ))
     ));
+}
+
+#[test]
+fn vertex_id_base_is_checked_on_consumption_including_after_cached_draws() {
+    let vertices = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
+    let target = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let mut address_space = resource_address_space();
+    let vertex_address = map_resource(
+        &mut address_space,
+        vertices
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        76,
+        0,
+    )
+    .offset()
+    .get();
+    let target_address = map_resource(
+        &mut address_space,
+        target.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+        77,
+        0xfe,
+    )
+    .offset()
+    .get();
+    let mut channel = three_d_channel();
+    program_basic_draw_state(&mut channel, vertex_address);
+    program_color_target(&mut channel, 0, target_address, 0xd5);
+    program_three_d(&mut channel, 0x121c, 1);
+    let (shaders, mut cache) = translated_graphics_shaders();
+    for base in [0, 1, 0, u32::MAX, 0] {
+        program_three_d(&mut channel, 0x1118, base);
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let resources = resolve_maxwell_three_d_resources(draw.state(), &address_space).unwrap();
+        // Repeat to cover prepared-draw hits, then change the ID base. Neither
+        // cached work nor wrapping signed encodings may bypass consumption.
+        for _ in 0..2 {
+            let result = lower_maxwell_three_d_operation_into_cache(
+                draw.state(),
+                &resources,
+                draw.trigger(),
+                Some(&shaders),
+                FrontendSubmissionId::new(1),
+                vec![],
+                &mut cache,
+            );
+            if base == 0 {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(result, Err(MaxwellThreeDLoweringError::UnsupportedVertexIdBase(value)) if value == base)
+                );
+            }
+        }
+    }
+    program_three_d(&mut channel, 0x1118, 1);
+    program_three_d(&mut channel, 0x10f8, 0);
+    for method in [0x0d80, 0x0d84, 0x0d88, 0x0d8c] {
+        program_three_d(&mut channel, method, 0);
+    }
+    let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
+    let clear = &dispatch.operations()[0];
+    let resources = resolve_maxwell_three_d_resources(clear.state(), &address_space).unwrap();
+    lower_maxwell_three_d_operation_into_cache(
+        clear.state(),
+        &resources,
+        clear.trigger(),
+        None,
+        FrontendSubmissionId::new(2),
+        vec![],
+        &mut cache,
+    )
+    .unwrap();
 }
 
 #[test]

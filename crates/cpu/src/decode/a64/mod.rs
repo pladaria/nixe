@@ -52,7 +52,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0022..=0x0000_002f | 0x0000_005e..=0x0000_005f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a3 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a5 => {
             A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -213,6 +213,103 @@ mod tests {
                 crate::decode::table::AllocationStatus::Reserved(_)
             ));
         }
+    }
+
+    #[test]
+    fn vector_add_decodes_mesh_alias_and_rejects_reserved_shapes() {
+        let platform = TargetPlatform::Switch1;
+        let location =
+            LocationDescriptor::new(GuestVirtualAddress::new(0x7100_51cc), platform.profile_id());
+        for (wide, full) in [(false, false), (false, true), (true, true)] {
+            for subtract in [false, true] {
+                let word = 0x0e37_d7ff
+                    | (u32::from(full) << 30)
+                    | (u32::from(wide) << 22)
+                    | (u32::from(subtract) << 23);
+                let DecodeResult::Decoded(decoded) =
+                    decode(platform, location, InstructionEncoding::from_u32(word))
+                else {
+                    panic!("{word:08x}")
+                };
+                let A64Instruction::FpSimd(fp_simd::Instruction::VectorFloatAdd(fields)) =
+                    normalize(&decoded.instruction, InstructionEncoding::from_u32(word))
+                else {
+                    panic!("{decoded:?}")
+                };
+                assert_eq!((fields.rd, fields.rn, fields.rm), (31, 31, 23));
+                assert_eq!(fields.opc, u8::from(wide));
+                assert_eq!(fields.vector_128, full);
+                assert_eq!(
+                    fields.float_add_operation,
+                    Some(if subtract {
+                        fp_simd::FloatAddOperation::Subtract
+                    } else {
+                        fp_simd::FloatAddOperation::Add
+                    })
+                );
+            }
+        }
+        // Q=0 with 64-bit lanes is reserved; half precision stays unsupported.
+        for word in [0x0e77_d7ff, 0x0ef7_d7ff, 0x4e37_17ff] {
+            assert!(
+                !matches!(
+                    decode(platform, location, InstructionEncoding::from_u32(word)),
+                    DecodeResult::Decoded(_)
+                ),
+                "{word:08x}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_vector_decodes_mesh_operands_and_rejects_reserved_shapes() {
+        let platform = TargetPlatform::Switch1;
+        let location =
+            LocationDescriptor::new(GuestVirtualAddress::new(0x7100_51c4), platform.profile_id());
+        for (wide, full) in [(false, false), (false, true), (true, true)] {
+            for subtract in [false, true] {
+                let word = 0x0e3c_cfbf
+                    | (u32::from(full) << 30)
+                    | (u32::from(wide) << 22)
+                    | (u32::from(subtract) << 23);
+                let DecodeResult::Decoded(decoded) =
+                    decode(platform, location, InstructionEncoding::from_u32(word))
+                else {
+                    panic!("{word:08x}")
+                };
+                let A64Instruction::FpSimd(fp_simd::Instruction::VectorFloatFused(fields)) =
+                    normalize(&decoded.instruction, InstructionEncoding::from_u32(word))
+                else {
+                    panic!("{decoded:?}")
+                };
+                assert_eq!((fields.rd, fields.rn, fields.rm), (31, 29, 28));
+                assert_eq!(fields.opc, u8::from(wide));
+                assert_eq!(fields.vector_128, full);
+                assert_eq!(fields.subtract, subtract);
+            }
+        }
+        for word in [0x0e7c_cfbf, 0x0efc_cfbf] {
+            assert!(!matches!(
+                decode(platform, location, InstructionEncoding::from_u32(word)),
+                DecodeResult::Decoded(_)
+            ));
+            assert!(matches!(
+                crate::decode::allocation::validate_a64(
+                    crate::coverage::CoverageId::new(0xa4),
+                    word
+                ),
+                crate::decode::table::AllocationStatus::Reserved(_)
+            ));
+        }
+        // Half precision is optional and must not alias the binary32 pattern.
+        assert!(!matches!(
+            decode(
+                platform,
+                location,
+                InstructionEncoding::from_u32(0x4e3c_0fbf)
+            ),
+            DecodeResult::Decoded(_)
+        ));
     }
 
     #[test]

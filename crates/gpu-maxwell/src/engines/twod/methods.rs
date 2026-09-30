@@ -56,8 +56,8 @@ macro_rules! methods {
 }
 
 // Method fields and enum values are pinned to NVIDIA's generated public
-// FERMI_TWOD_A header. It publishes no reset values for these registers, so
-// state begins explicitly unset rather than assuming zero.
+// FERMI_TWOD_A header. Initial context values relied upon by deko3d are
+// documented separately in MaxwellTwoDState::default; other state is unset.
 // https://github.com/NVIDIA/open-gpu-doc/blob/9e6d83fe0770bc8644850a0b1bf5ddb1519905ba/classes/twod/cl902d.h#L493-L579
 // SET_COLOR_KEY_ENABLE and its False/True values are defined specifically at:
 // https://github.com/NVIDIA/open-gpu-doc/blob/9e6d83fe0770bc8644850a0b1bf5ddb1519905ba/classes/twod/cl902d.h#L551-L557
@@ -151,6 +151,9 @@ pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellTwoDState,
 ) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
+    if let Some(result) = super::blit::apply(method, candidate) {
+        return result;
+    }
     let source = method.source();
     let declaration = METHODS
         .iter()

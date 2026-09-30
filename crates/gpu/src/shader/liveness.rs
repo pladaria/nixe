@@ -4,7 +4,9 @@
 //! introduced to implement dead guest arithmetic (notably interpolation setup).
 use super::*;
 
-pub(super) fn live_instructions(ir: &ShaderIr) -> Result<Vec<bool>> {
+pub(super) fn live_instructions(
+    ir: &ShaderIr,
+) -> Result<Vec<bool>, (ShaderSourceLocation, &'static str)> {
     let mut end = ir.instructions.len();
     for (index, instruction) in ir.instructions.iter().enumerate() {
         if instruction.predicate == ShaderPredicate::Never {
@@ -24,10 +26,7 @@ pub(super) fn live_instructions(ir: &ShaderIr) -> Result<Vec<bool>> {
             _ => None,
         };
         if let Some(reason) = reason {
-            return Err(SpirvShaderError::Instruction {
-                source: instruction.source,
-                reason,
-            });
+            return Err((instruction.source, reason));
         }
     }
     let mut keep = vec![false; end];
@@ -73,6 +72,7 @@ pub(super) fn live_instructions(ir: &ShaderIr) -> Result<Vec<bool>> {
             | ShaderOperation::LoadControlPoint { .. }
             | ShaderOperation::LoadPatchOutput { .. }
             | ShaderOperation::Multiply32 { .. }
+            | ShaderOperation::FloatMultiplyZero32 { .. }
             | ShaderOperation::Add32 { .. }
             | ShaderOperation::ShiftLeft32 { .. }
             | ShaderOperation::FloatMinMax32 { .. }

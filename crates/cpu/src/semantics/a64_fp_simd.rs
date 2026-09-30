@@ -241,6 +241,24 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
             Ok(())
         }
+        Instruction::VectorFloatAdd(_) => {
+            let outcome = exact_vector_float_add(
+                state.vector(fields.rn).unwrap(),
+                state.vector(fields.rm).unwrap(),
+                if fields.opc == 0 { 32 } else { 64 },
+                if fields.vector_128 { 128 } else { 64 },
+                fields
+                    .float_add_operation
+                    .expect("normalized vector FP add"),
+                state.fpcr(),
+            );
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(A64FpSimdError::Trap);
+            }
+            state.set_vector(fields.rd, outcome.bits);
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+            Ok(())
+        }
         Instruction::VectorFloatDivide(_) => {
             let (value, status) = vector_float_divide(state, fields);
             if fp_status_traps(status, state.fpcr()) {
@@ -261,8 +279,8 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             state.set_fpsr(state.fpsr() | fp_status_bits(status));
             Ok(())
         }
-        Instruction::VectorFloatFusedElement(_) => {
-            let outcome = exact_vector_float_fused_element(
+        Instruction::VectorFloatFusedElement(_) | Instruction::VectorFloatFused(_) => {
+            let outcome = exact_vector_float_fused(
                 state.vector(fields.rn).unwrap(),
                 state.vector(fields.rm).unwrap(),
                 state.vector(fields.rd).unwrap(),
@@ -270,7 +288,8 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
                     if fields.opc == 0 { 32 } else { 64 },
                     if fields.vector_128 { 128 } else { 64 },
                 ),
-                fields.fp_element_lane,
+                matches!(instruction, Instruction::VectorFloatFusedElement(_))
+                    .then_some(fields.fp_element_lane),
                 fields.subtract,
                 state.fpcr(),
             );
@@ -1548,13 +1567,15 @@ pub fn exact_vector_float_divide(
 
 /// FMLA/FMLS perform one fused rounding per active lane, reading the full Rm
 /// before writing any destination lane. The shape is (lane bits, vector bits).
+/// None selects corresponding lanes; Some broadcasts one element of Rm.
+/// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.75–79)
 /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMLA--by-element---Floating-point-fused-Multiply-Add-to-accumulator--by-element--
-pub fn exact_vector_float_fused_element(
+pub fn exact_vector_float_fused(
     lhs: u128,
     rhs: u128,
     accumulator: u128,
     shape: (u8, u8),
-    lane: u8,
+    lane: Option<u8>,
     subtract: bool,
     fpcr: u32,
 ) -> ExactFpOutcome {
@@ -1564,7 +1585,6 @@ pub fn exact_vector_float_fused_element(
     } else {
         u64::from(u32::MAX)
     };
-    let multiplier = (rhs >> (u32::from(lane) * u32::from(lane_bits))) as u64 & mask;
     let operation = if subtract {
         FloatFusedMultiplyOperation::MultiplySubtract
     } else {
@@ -1573,6 +1593,8 @@ pub fn exact_vector_float_fused_element(
     let mut result = 0;
     let mut status = FpStatus::default();
     for shift in (0..u32::from(vector_bits)).step_by(usize::from(lane_bits)) {
+        let multiplier_shift = lane.map_or(shift, |lane| u32::from(lane) * u32::from(lane_bits));
+        let multiplier = (rhs >> multiplier_shift) as u64 & mask;
         let outcome = exact_scalar_float_fused_multiply_add(
             (lhs >> shift) as u64 & mask,
             multiplier,
@@ -2266,6 +2288,37 @@ fn scalar_float_add(
     }
 }
 
+/// Apply the scalar operation to active lanes and merge status before committing.
+/// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.35, D6.100)
+pub fn exact_vector_float_add(
+    lhs: u128,
+    rhs: u128,
+    lane_bits: u8,
+    vector_bits: u8,
+    operation: FloatAddOperation,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let mask = if lane_bits == 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    let mut bits = 0;
+    let mut status = FpStatus::default();
+    for shift in (0..u32::from(vector_bits)).step_by(usize::from(lane_bits)) {
+        let outcome = exact_scalar_float_add(
+            (lhs >> shift) as u64 & mask,
+            (rhs >> shift) as u64 & mask,
+            lane_bits,
+            operation,
+            fpcr,
+        );
+        bits |= outcome.bits << shift;
+        merge_fp_status(&mut status, outcome.status);
+    }
+    ExactFpOutcome { bits, status }
+}
+
 pub fn exact_scalar_float_add(
     lhs: u64,
     rhs: u64,
@@ -2292,13 +2345,17 @@ fn add_ieee_lane(
     let format = BinaryFormat::new(fp_format);
     let mut lhs = DecodedFloat::new(lhs_bits, format);
     let mut rhs = DecodedFloat::new(rhs_bits, format);
-    if subtract {
-        rhs.bits ^= format.sign_mask();
-        rhs.sign = !rhs.sign;
-    }
     let control = FpAddControl::from_fpcr(fpcr);
     let mut status = FpStatus::default();
 
+    // FPUnpack applies FZ and raises IDC before NaN processing, even when
+    // the other operand is NaN.
+    for operand in [&mut lhs, &mut rhs] {
+        if control.flush_to_zero && operand.is_subnormal() {
+            status.input_denormal = true;
+            *operand = DecodedFloat::new(operand.bits & format.sign_mask(), format);
+        }
+    }
     if lhs.is_nan(format) || rhs.is_nan(format) {
         status.invalid_operation = lhs.is_signaling_nan(format) || rhs.is_signaling_nan(format);
         return FpLaneOutcome {
@@ -2306,11 +2363,12 @@ fn add_ieee_lane(
             status,
         };
     }
-    for operand in [&mut lhs, &mut rhs] {
-        if control.flush_to_zero && operand.is_subnormal() {
-            status.input_denormal = true;
-            *operand = DecodedFloat::new(operand.bits & format.sign_mask(), format);
-        }
+    // FPSub processes the original NaN operands before applying subtraction;
+    // unlike FNEG followed by FADD, it preserves a propagated rhs NaN's sign.
+    // https://developer.arm.com/documentation/ddi0602/2025-12/Shared-Pseudocode/shared.functions.float.fpsub.FPSub
+    if subtract {
+        rhs.bits ^= format.sign_mask();
+        rhs.sign = !rhs.sign;
     }
 
     if lhs.is_infinite(format) || rhs.is_infinite(format) {
@@ -3776,29 +3834,100 @@ mod tests {
     }
 
     #[test]
+    fn subtract_preserves_propagated_rhs_nan_sign_and_payload() {
+        use crate::decode::a64::fp_simd::FloatAddOperation::Subtract;
+        for width in [32, 64] {
+            let (one, infinity, quiet, sign) = if width == 32 {
+                (
+                    u64::from(1.0f32.to_bits()),
+                    u64::from(f32::INFINITY.to_bits()),
+                    1u64 << 22,
+                    1u64 << 31,
+                )
+            } else {
+                (
+                    1.0f64.to_bits(),
+                    f64::INFINITY.to_bits(),
+                    1u64 << 51,
+                    1u64 << 63,
+                )
+            };
+            for sign in [0, sign] {
+                for signaling in [false, true] {
+                    let rhs = infinity | sign | 0x123 | if signaling { 0 } else { quiet };
+                    let result = super::exact_scalar_float_add(one, rhs, width, Subtract, 0);
+                    assert_eq!(result.bits, u128::from(rhs | quiet));
+                    assert_eq!(fp_status_bits(result.status), u32::from(signaling));
+                    let vector = super::exact_vector_float_add(
+                        u128::from(one) | (u128::from(one) << width),
+                        u128::from(rhs) | (u128::from(rhs) << width),
+                        width,
+                        2 * width,
+                        Subtract,
+                        0,
+                    );
+                    assert_eq!(vector.bits, result.bits | (result.bits << width));
+                    assert_eq!(fp_status_bits(vector.status), u32::from(signaling));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_corresponding_lanes_round_once_and_ignore_inactive_nan_lanes() {
+        let pack = |a: u32, b: u32| u128::from(a) | (u128::from(b) << 32);
+        let first = pack(0x3f80_0001, 2.0_f32.to_bits()) | (u128::MAX << 64);
+        let second = pack(0x3f7f_fffe, 3.0_f32.to_bits()) | (u128::MAX << 64);
+        for subtract in [false, true] {
+            let accumulator = pack(
+                (if subtract { 1.0_f32 } else { -1.0_f32 }).to_bits(),
+                0.5_f32.to_bits(),
+            ) | (u128::MAX << 64);
+            let outcome = super::exact_vector_float_fused(
+                first,
+                second,
+                accumulator,
+                (32, 64),
+                None,
+                subtract,
+                0,
+            );
+            let epsilon = 2.0_f32.powi(-46);
+            assert_eq!(
+                outcome.bits,
+                pack(
+                    (if subtract { epsilon } else { -epsilon }).to_bits(),
+                    (if subtract { -5.5_f32 } else { 6.5_f32 }).to_bits(),
+                )
+            );
+            assert_eq!(fp_status_bits(outcome.status), 0);
+        }
+    }
+
+    #[test]
     fn fused_element_rounds_once_and_ignores_inactive_nan_lanes() {
         let pack = |a: u32, b: u32| u128::from(a) | (u128::from(b) << 32);
         let first = pack(0x3f80_0001, 0x3f80_0001) | (u128::MAX << 64);
         let second = u128::from(0x3f7f_fffe_u32) << 96;
         let accumulator = pack((-1.0_f32).to_bits(), (-1.0_f32).to_bits()) | (u128::MAX << 64);
-        let result = super::exact_vector_float_fused_element(
+        let result = super::exact_vector_float_fused(
             first,
             second,
             accumulator,
             (32, 64),
-            3,
+            Some(3),
             false,
             0,
         );
         let expected = (-2.0_f32.powi(-46)).to_bits();
         assert_eq!(result.bits, pack(expected, expected));
         assert_eq!(fp_status_bits(result.status), 0);
-        let result = super::exact_vector_float_fused_element(
+        let result = super::exact_vector_float_fused(
             first,
             second,
             pack(1.0_f32.to_bits(), 1.0_f32.to_bits()),
             (32, 64),
-            3,
+            Some(3),
             true,
             0,
         );

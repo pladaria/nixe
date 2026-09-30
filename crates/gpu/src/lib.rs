@@ -58,8 +58,9 @@ pub use command::{
     CopyOperation, CullMode, DepthCompareOperation, DepthState, DispatchOperation, DrawArguments,
     DrawOperation, FrontFace, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
     OperationSubmission, PreparedDraw, PrimitiveTopology, QueryOperation, RenderAttachment,
-    RenderPassOperation, TriangleRasterization, VertexAttribute, VertexBufferLayout,
-    VertexComponentCount, VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
+    RenderPassOperation, ResolveOperation, TriangleRasterization, VertexAttribute,
+    VertexBufferLayout, VertexComponentCount, VertexComponentWidth, VertexFormat, VertexStepMode,
+    ViewportTransform,
 };
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,

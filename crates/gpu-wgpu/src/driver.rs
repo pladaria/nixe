@@ -44,6 +44,7 @@ use crate::{
 };
 
 mod color;
+mod multisample;
 #[cfg(not(target_os = "macos"))]
 #[path = "native/vulkan/draw.rs"]
 mod native_draw;
@@ -381,6 +382,7 @@ impl RenderPipelineKey {
         fragment: BackendResourceHandle,
         color_format: ImageFormat,
         depth_format: Option<ImageFormat>,
+        samples: SampleCount,
         draw: &DrawOperation,
         quad_flat: bool,
     ) -> Self {
@@ -395,6 +397,7 @@ impl RenderPipelineKey {
             color_output: draw.prepared.color_outputs[0],
             color_format,
             depth_format,
+            samples,
             depth_state: draw.prepared.depth_state,
             vertex_buffers: draw
                 .prepared
@@ -405,32 +408,25 @@ impl RenderPipelineKey {
         }
     }
 
-    fn matches(
-        &self,
-        vertex: BackendResourceHandle,
-        fragment: BackendResourceHandle,
-        color_format: ImageFormat,
-        depth_format: Option<ImageFormat>,
-        draw: &DrawOperation,
-        quad_flat: bool,
-    ) -> bool {
-        self.vertex == vertex
-            && self.fragment == fragment
+    fn matches(&self, location: &RenderPipelineLocation, draw: &DrawOperation) -> bool {
+        self.vertex == location.vertex
+            && self.fragment == location.fragment
             && self.topology == draw.prepared.topology
             && self.triangle_rasterization == draw.prepared.triangle_rasterization
             && self.front_face == draw.prepared.front_face
             && self.cull_mode == draw.prepared.cull_mode
             && self.alpha_test == draw.prepared.alpha_test
             && self.color_output == draw.prepared.color_outputs[0]
-            && self.color_format == color_format
-            && self.depth_format == depth_format
+            && self.color_format == location.color_format
+            && self.depth_format == location.depth_format
+            && self.samples == location.samples
             && self.depth_state == draw.prepared.depth_state
             && self.vertex_buffers.len() == draw.prepared.vertex_buffers.len()
             && self
                 .vertex_buffers
                 .iter()
                 .zip(draw.prepared.vertex_buffers.iter())
-                .all(|(cached, current)| cached.matches(current, quad_flat))
+                .all(|(cached, current)| cached.matches(current, location.quad_flat))
     }
 }
 
@@ -446,6 +442,7 @@ struct RenderPipelineFingerprintInput<'a> {
     alpha_test: Option<AlphaTest>,
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
+    samples: SampleCount,
     depth_state: DepthState,
     vertex_buffers: &'a [VertexBufferLayout],
 }
@@ -462,6 +459,7 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.color_output.hash(state);
         self.color_format.hash(state);
         self.depth_format.hash(state);
+        self.samples.hash(state);
         self.depth_state.hash(state);
         self.vertex_buffers.len().hash(state);
         for layout in self.vertex_buffers {
@@ -485,6 +483,7 @@ fn render_pipeline_fingerprint(
     fragment: BackendResourceHandle,
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
+    samples: SampleCount,
     draw: &DrawOperation,
     quad_flat: bool,
 ) -> u128 {
@@ -500,6 +499,7 @@ fn render_pipeline_fingerprint(
         color_output: draw.prepared.color_outputs[0],
         color_format,
         depth_format,
+        samples,
         depth_state: draw.prepared.depth_state,
         vertex_buffers: &draw.prepared.vertex_buffers,
     })
@@ -547,6 +547,7 @@ struct RenderPipelineKey {
     alpha_test: Option<AlphaTest>,
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
+    samples: SampleCount,
     depth_state: DepthState,
     vertex_buffers: Box<[VertexPipelineLayoutKey]>,
 }
@@ -569,6 +570,7 @@ struct PreparedPipelineIdentity {
     fragment: BackendResourceHandle,
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
+    samples: SampleCount,
 }
 
 impl PreparedPipelineIdentity {
@@ -578,6 +580,7 @@ impl PreparedPipelineIdentity {
         fragment: BackendResourceHandle,
         color_format: ImageFormat,
         depth_format: Option<ImageFormat>,
+        samples: SampleCount,
         draw: &DrawOperation,
     ) -> bool {
         Arc::ptr_eq(&self.draw, &draw.prepared)
@@ -585,6 +588,7 @@ impl PreparedPipelineIdentity {
             && self.fragment == fragment
             && self.color_format == color_format
             && self.depth_format == depth_format
+            && self.samples == samples
     }
 }
 
@@ -596,6 +600,7 @@ struct RenderPipelineLocation {
     fragment: BackendResourceHandle,
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
+    samples: SampleCount,
     fingerprint: u128,
     opaque_textures: crate::texture_sampling::OpaqueTextureBindings,
 }
@@ -663,13 +668,14 @@ impl RenderPipelineCache {
         fragment: BackendResourceHandle,
         color_format: ImageFormat,
         depth_format: Option<ImageFormat>,
+        samples: SampleCount,
         draw: &DrawOperation,
     ) -> Option<(u128, crate::texture_sampling::OpaqueTextureBindings, bool)> {
         let current = self.current.as_ref()?;
         current
             .record
             .identity
-            .matches(vertex, fragment, color_format, depth_format, draw)
+            .matches(vertex, fragment, color_format, depth_format, samples, draw)
             .then_some((
                 current.fingerprint,
                 current.record.opaque_textures,
@@ -1501,8 +1507,11 @@ impl WgpuBackendDriver {
         handle: BackendResourceHandle,
         encoder: &mut CommandEncoder,
     ) -> Result<(), BackendDriverError> {
-        let (buffer, view, initialized, cpu_writes) = {
+        let (buffer, logical_size, view, initialized, cpu_writes) = {
             let record = self.resource_record(handle)?;
+            let BackendResourceCreateInfo::Buffer { description, .. } = &record.immutable else {
+                return Err(kind_mismatch(handle));
+            };
             let Resource::Buffer {
                 buffer,
                 view: Some(view),
@@ -1520,6 +1529,7 @@ impl WgpuBackendDriver {
             })?;
             (
                 buffer.clone(),
+                description.size(),
                 view.clone(),
                 content.initialized,
                 cpu_writes,
@@ -1542,14 +1552,27 @@ impl WgpuBackendDriver {
         ranges
             .try_reserve_exact(snapshots.len())
             .map_err(|_| BackendDriverError::failure("buffer upload ranges exhausted"))?;
-        for (offset, bytes) in snapshots {
+        for (offset, mut bytes) in snapshots {
             let size = u64::try_from(bytes.len()).map_err(|_| unsupported("buffer upload size"))?;
             let buffer_offset = view
                 .buffer_offset()
                 .checked_add(offset)
                 .ok_or_else(|| unsupported("buffer upload offset overflow"))?;
-            if !buffer_offset.is_multiple_of(4) || !size.is_multiple_of(4) {
+            if !buffer_offset.is_multiple_of(4) {
                 return Err(unsupported("unaligned canonically backed buffer upload"));
+            }
+            if !size.is_multiple_of(4) {
+                if buffer_offset.checked_add(size) != Some(logical_size) {
+                    return Err(unsupported("unaligned interior buffer upload"));
+                }
+                // Only pad beyond the logical buffer, never over live bytes.
+                // Canonical visibility still covers exactly the original size.
+                let mut padded = bytes.into_vec();
+                padded.resize(
+                    usize_from_u64(align_u64(size, 4)?, "buffer upload padding")?,
+                    0,
+                );
+                bytes = padded.into_boxed_slice();
             }
             self.stage_buffer_upload(encoder, &buffer, buffer_offset, &bytes)?;
             ranges.push(TransferRange { offset, size });
@@ -1746,6 +1769,9 @@ impl WgpuBackendDriver {
         while index < operations.len() {
             match operations[index].command() {
                 GpuCommand::Copy(copy) => self.encode_copy(&mut encoder, dependencies, copy)?,
+                GpuCommand::Resolve(resolve) => {
+                    self.encode_resolve(&mut encoder, dependencies, resolve)?
+                }
                 GpuCommand::Clear(clear) => self.encode_clear(&mut encoder, dependencies, clear)?,
                 GpuCommand::RenderPass(RenderPassOperation::Begin { .. }) => {
                     let end = operations[index + 1..]
@@ -2799,14 +2825,20 @@ impl WgpuBackendDriver {
                 "ordinary graphics currently requires exactly one color attachment",
             ));
         }
+        let samples = attachments[0].samples;
         let depth_format = attachments
             .iter()
             .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
             .map(|attachment| attachment.format);
         let cached = match self.resource(pipeline)? {
-            Resource::Pipeline { render, .. } => {
-                render.current_fingerprint(vertex, fragment, color_format, depth_format, draw)
-            }
+            Resource::Pipeline { render, .. } => render.current_fingerprint(
+                vertex,
+                fragment,
+                color_format,
+                depth_format,
+                samples,
+                draw,
+            ),
             _ => return Err(kind_mismatch(pipeline)),
         };
         // Immutable prepared draws retain an O(1) pipeline fast path. Only a new
@@ -2851,6 +2883,7 @@ impl WgpuBackendDriver {
                 fragment,
                 color_format,
                 depth_format,
+                samples,
                 draw,
                 quad_flat,
             );
@@ -2867,6 +2900,7 @@ impl WgpuBackendDriver {
             fragment,
             color_format,
             depth_format,
+            samples,
             fingerprint,
             opaque_textures,
         })
@@ -2914,14 +2948,7 @@ impl WgpuBackendDriver {
                 && let Some(cached) = render.current_record()
             {
                 assert!(
-                    cached.key.matches(
-                        vertex_handle,
-                        fragment_handle,
-                        location.color_format,
-                        location.depth_format,
-                        draw,
-                        location.quad_flat,
-                    ),
+                    cached.key.matches(&location, draw),
                     "XXH3-128 collision or incomplete WGPU pipeline cache key"
                 );
             }
@@ -2953,12 +2980,14 @@ impl WgpuBackendDriver {
         }
         let color_format = location.color_format;
         let depth_format = location.depth_format;
+        let samples = location.samples;
         #[cfg(debug_assertions)]
         let key = RenderPipelineKey::new(
             vertex_handle,
             fragment_handle,
             color_format,
             depth_format,
+            samples,
             draw,
             location.quad_flat,
         );
@@ -3104,7 +3133,10 @@ impl WgpuBackendDriver {
                     conservative: false,
                 },
                 depth_stencil,
-                multisample: MultisampleState::default(),
+                multisample: MultisampleState {
+                    count: samples as u32,
+                    ..Default::default()
+                },
                 fragment: Some(FragmentState {
                     module: &fragment,
                     entry_point: Some(alpha_test_entry_point(draw.prepared.alpha_test)),
@@ -3141,6 +3173,7 @@ impl WgpuBackendDriver {
                     fragment: fragment_handle,
                     color_format,
                     depth_format,
+                    samples,
                 },
                 #[cfg(debug_assertions)]
                 key,
@@ -3905,7 +3938,10 @@ impl WgpuBackendDriver {
             } => Resource::Buffer {
                 buffer: self.device.create_buffer(&BufferDescriptor {
                     label: Some("Nixe neutral buffer"),
-                    size: description.size(),
+                    // Copy commands require four-byte alignment even for an
+                    // odd number of 16-bit indices. Keep logical views exact.
+                    // https://www.w3.org/TR/webgpu/#dom-gpucommandencoder-copybuffertobuffer
+                    size: align_u64(description.size(), 4)?,
                     usage: BufferUsages::COPY_SRC
                         | BufferUsages::COPY_DST
                         | BufferUsages::VERTEX
@@ -3921,7 +3957,11 @@ impl WgpuBackendDriver {
             BackendResourceCreateInfo::Image {
                 description, view, ..
             } => {
-                let plan = image_texture_plan(description.format(), view.is_some())?;
+                let plan = if description.samples() == SampleCount::One {
+                    image_texture_plan(description.format(), view.is_some())?
+                } else {
+                    multisample::texture_plan(&self.device, *description, view.is_some())?
+                };
                 Resource::Image {
                     texture: self.device.create_texture(&TextureDescriptor {
                         label: Some("Nixe neutral image"),
@@ -3931,7 +3971,19 @@ impl WgpuBackendDriver {
                         dimension: texture_dimension(description.dimension()),
                         format: plan.format,
                         usage: plan.usages,
-                        view_formats: &[],
+                        // Presentation consumes display-encoded bytes, not
+                        // shader-linear colors. Allow a zero-copy UNORM view
+                        // of resolved/single-sample sRGB color images.
+                        // https://www.w3.org/TR/webgpu/#dom-gputexturedescriptor-viewformats
+                        view_formats: match (description.samples(), plan.format) {
+                            (SampleCount::One, TextureFormat::Rgba8UnormSrgb) => {
+                                &[TextureFormat::Rgba8Unorm]
+                            }
+                            (SampleCount::One, TextureFormat::Bgra8UnormSrgb) => {
+                                &[TextureFormat::Bgra8Unorm]
+                            }
+                            _ => &[],
+                        },
                     }),
                     description: *description,
                     view: view.clone(),
@@ -4893,9 +4945,16 @@ fn depth_operations<'a>(
     view: &'a wgpu::TextureView,
     attachment: &RenderAttachment,
 ) -> Result<RenderPassDepthStencilAttachment<'a>, BackendDriverError> {
+    let has_stencil = matches!(
+        attachment.format,
+        ImageFormat::Depth24UnormStencil8Uint | ImageFormat::Depth32FloatStencil8Uint
+    );
     let (depth, stencil) = match attachment.load {
-        AttachmentLoad::Load => (Some(LoadOp::Load), Some(LoadOp::Load)),
-        AttachmentLoad::Discard => (Some(LoadOp::Clear(1.0)), Some(LoadOp::Clear(0))),
+        AttachmentLoad::Load => (Some(LoadOp::Load), has_stencil.then_some(LoadOp::Load)),
+        AttachmentLoad::Discard => (
+            Some(LoadOp::Clear(1.0)),
+            has_stencil.then_some(LoadOp::Clear(0)),
+        ),
         AttachmentLoad::Clear(ClearValue::Depth(depth)) => (Some(LoadOp::Clear(depth)), None),
         AttachmentLoad::Clear(ClearValue::Stencil(stencil)) => {
             (None, Some(LoadOp::Clear(u32::from(stencil))))
@@ -5252,7 +5311,7 @@ fn subtract_buffer_write_range(
 
 fn estimated_resident_bytes(info: &BackendResourceCreateInfo) -> Result<u64, BackendDriverError> {
     match info {
-        BackendResourceCreateInfo::Buffer { description, .. } => Ok(description.size()),
+        BackendResourceCreateInfo::Buffer { description, .. } => align_u64(description.size(), 4),
         BackendResourceCreateInfo::Image { description, .. } => {
             let bytes_per_block =
                 (0..description.format().plane_count()).try_fold(0_u64, |total, plane| {
@@ -5736,6 +5795,7 @@ mod tests {
                 color_output: nixe_gpu::ColorOutputState::REPLACE,
                 color_format: ImageFormat::Rgba8Unorm,
                 depth_format: None,
+                samples: SampleCount::One,
                 depth_state: DepthState::DISABLED,
                 vertex_buffers: std::slice::from_ref(layout),
             })

@@ -9,6 +9,9 @@ mod compressed_textures;
 #[path = "accelerated/resource_lifetime.rs"]
 mod resource_lifetime;
 
+#[path = "accelerated/multisample.rs"]
+mod multisample;
+
 use hardware::initialize_backend;
 use nixe_gpu::{
     AttachmentLoad, AttachmentStore, BackendInstanceId, BackendResourceCreateInfo,

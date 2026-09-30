@@ -166,7 +166,8 @@ pub use twod::{
     MaxwellTwoDOperation, MaxwellTwoDPixelsFromMemoryCorralSize,
     MaxwellTwoDPixelsFromMemorySafeOverlap, MaxwellTwoDPixelsFromMemoryState,
     MaxwellTwoDProcessingClusters, MaxwellTwoDRegister, MaxwellTwoDRegisterOrigin,
-    MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDState,
+    MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDResolveOperation,
+    MaxwellTwoDState,
 };
 
 use std::fmt::{Display, Formatter};
@@ -252,6 +253,7 @@ impl MaxwellEngineMethodMetadata {
 /// One execution-relevant effect produced while applying a method.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PendingEngineOperation {
+    TwoDResolve(twod::MaxwellTwoDResolveOperation),
     HostSynchronization(MaxwellHostSynchronizationOperation),
     ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
     InlineToMemory(MaxwellInlineToMemoryUpload),
@@ -338,6 +340,7 @@ pub struct MaxwellEnginePacketDispatch {
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellEngineOperation {
+    TwoDResolve(twod::MaxwellTwoDResolveOperation),
     HostSynchronization(MaxwellHostSynchronizationOperation),
     ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
     InlineToMemory(MaxwellInlineToMemoryUpload),
@@ -409,6 +412,11 @@ pub enum MaxwellEngineDispatchError {
         defined_mask: u32,
     },
     InvalidMethodEncoding {
+        source: MaxwellMethodSource,
+        method_name: &'static str,
+        reason: &'static str,
+    },
+    InvalidTwoDMethodEncoding {
         source: MaxwellMethodSource,
         method_name: &'static str,
         reason: &'static str,
@@ -513,6 +521,14 @@ impl Display for MaxwellEngineDispatchError {
             } => write!(
                 formatter,
                 "Maxwell method has an invalid verified encoding: {source} class-name=MAXWELL_B method-name={method_name} reason={reason}"
+            ),
+            Self::InvalidTwoDMethodEncoding {
+                source,
+                method_name,
+                reason,
+            } => write!(
+                formatter,
+                "Maxwell 2D method cannot be represented: {source} class-name=FERMI_TWOD_A method-name={method_name} reason={reason}"
             ),
             Self::InvalidComputeMethodEncoding {
                 source,
@@ -790,6 +806,9 @@ pub fn dispatch_maxwell_engine_packet(
         &mut mme_parameters,
         &mut |event| {
             let operation = match event.operation {
+                PendingEngineOperation::TwoDResolve(resolve) => {
+                    MaxwellEngineOperation::TwoDResolve(resolve)
+                }
                 PendingEngineOperation::HostSynchronization(operation) => {
                     MaxwellEngineOperation::HostSynchronization(operation)
                 }

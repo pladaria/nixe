@@ -109,57 +109,13 @@ pub fn lower_tessellation_shaders_to_spirv(
     // Drop dead stores before backward liveness, so their arithmetic/resources
     // disappear too. This is cache-miss compilation, never draw-time filtering.
     // https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-iointerfaces
-    let consumed: std::collections::BTreeSet<_> = fragment
-        .ir()
-        .inputs()
-        .iter()
-        .map(|e| (e.location(), e.component()))
-        .collect();
-    let observable = |location, component| {
-        !matches!(location, ShaderIoLocation::Generic(_))
-            || consumed.contains(&(location, component))
-    };
-    let mut linked_evaluation = evaluation.clone();
-    linked_evaluation.0.outputs = evaluation
-        .ir()
-        .outputs()
-        .iter()
-        .filter(|e| observable(e.location(), e.component()))
-        .copied()
-        .collect();
-    let mut code = Vec::with_capacity(evaluation.ir().instructions().len());
-    for instruction in evaluation.ir().instructions() {
-        if let ShaderOperation::StoreOutput {
-            sources,
-            location,
-            first_component,
-            scalar_type,
-        } = instruction.operation()
-            && sources
-                .iter()
-                .enumerate()
-                .any(|(i, _)| !observable(*location, *first_component + i as u8))
-        {
-            for (i, source) in sources.iter().enumerate() {
-                let component = *first_component + i as u8;
-                if observable(*location, component) {
-                    code.push(ShaderInstruction::new(
-                        instruction.source(),
-                        instruction.predicate(),
-                        ShaderOperation::StoreOutput {
-                            sources: vec![*source].into(),
-                            location: *location,
-                            first_component: component,
-                            scalar_type: *scalar_type,
-                        },
-                    ));
-                }
-            }
-        } else {
-            code.push(instruction.clone());
-        }
-    }
-    linked_evaluation.0.instructions = code.into();
+    let linked_evaluation = evaluation.prune_raster_outputs(
+        fragment
+            .ir()
+            .inputs()
+            .iter()
+            .map(|e| (e.location(), e.component())),
+    );
     let evaluation = &linked_evaluation;
     let base = SpirvShaderOptions {
         input_control_points: 0,

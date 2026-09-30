@@ -47,9 +47,18 @@ pub enum MaxwellTwoDRenderEnableStateWrite {
 }
 
 /// Persistent render-enable configuration on one Fermi 2D channel.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellTwoDRenderEnableState {
     mode: MaxwellTwoDRegister<MaxwellTwoDRenderEnableMode>,
+}
+
+impl Default for MaxwellTwoDRenderEnableState {
+    fn default() -> Self {
+        // Initial-context contract and source: MaxwellTwoDState::default.
+        Self {
+            mode: MaxwellTwoDRegister::context_default(1, MaxwellTwoDRenderEnableMode::Enabled),
+        }
+    }
 }
 
 impl MaxwellTwoDRenderEnableState {

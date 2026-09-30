@@ -6,7 +6,7 @@
 
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::{Display, Formatter},
     sync::Arc,
 };
@@ -57,6 +57,13 @@ const MAXWELL_C128_2CR_KIND: u8 = 0xf5;
 // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/image_formats.cpp#L35-L73
 const MAXWELL_S8Z24_2CZ_KIND: u8 = 0x17;
 const MAXWELL_Z24S8_2CZ_KIND: u8 = 0x51;
+// Four-sample kinds selected by deko3d. Their bytes are never imported as
+// single-sample texels, even when compression of subsequent writes is off.
+// https://github.com/devkitPro/deko3d/blob/master/source/maxwell/image_formats.cpp
+// https://github.com/switchbrew/libnx/blob/master/nx/include/switch/nvidia/types.h
+const MAXWELL_C32_MS4_2CBR_KIND: u8 = 0xe0;
+const MAXWELL_S8Z24_MS4_2CZ_KIND: u8 = 0x19;
+const MAXWELL_Z24S8_MS4_2CZ_KIND: u8 = 0x53;
 const MAXWELL_DESCRIPTOR_SIZE: u64 = 32;
 
 /// Frontend role of one completely resolved resource.
@@ -77,6 +84,8 @@ pub enum MaxwellThreeDResourceRole {
     Sampler(MaxwellThreeDTextureReference),
     ColorTarget(u8),
     DepthStencilTarget,
+    ResolveSource,
+    ResolveDestination,
 }
 
 /// Shader-visible dimensionality required from a Maxwell sampled-image TIC.
@@ -266,7 +275,11 @@ impl MaxwellThreeDPreservedImageLayout {
         self.compression_enabled
             || matches!(
                 self.pte_kind,
-                MAXWELL_S8Z24_2CZ_KIND | MAXWELL_Z24S8_2CZ_KIND
+                MAXWELL_S8Z24_2CZ_KIND
+                    | MAXWELL_Z24S8_2CZ_KIND
+                    | MAXWELL_C32_MS4_2CBR_KIND
+                    | MAXWELL_S8Z24_MS4_2CZ_KIND
+                    | MAXWELL_Z24S8_MS4_2CZ_KIND
             )
     }
 
@@ -661,16 +674,51 @@ fn resolve_maxwell_three_d_resources_inner(
             .ok_or(MaxwellThreeDResourceError::IncompleteState {
                 role: MaxwellThreeDResourceRole::IndexBuffer,
             })?;
-        let limit = unresolved(index.limit_upper().value(), index.limit_lower().value()).ok_or(
-            MaxwellThreeDResourceError::IncompleteState {
-                role: MaxwellThreeDResourceRole::IndexBuffer,
-            },
-        )?;
-        builder.buffer(
-            MaxwellThreeDResourceRole::IndexBuffer,
-            address,
-            inclusive_size(address, limit, MaxwellThreeDResourceRole::IndexBuffer)?,
-        )?;
+        let role = MaxwellThreeDResourceRole::IndexBuffer;
+        let limit = unresolved(index.limit_upper().value(), index.limit_lower().value());
+        if limit.is_none()
+            && (index.limit_upper().raw().is_some() || index.limit_lower().raw().is_some())
+        {
+            return Err(MaxwellThreeDResourceError::IncompleteState { role });
+        }
+        // DRAW_INDEX_BUFFER consumes [first, first+count). deko3d does not
+        // program C/D limits, so resolve the demanded bytes instead of assuming
+        // an allocation-sized limit or reading/scanning index values on CPU.
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/draw.mme
+        let size = if let Some(count) = index.count().value().copied() {
+            let first = index
+                .first()
+                .value()
+                .copied()
+                .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+            let element_size = index
+                .element_size()
+                .value()
+                .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?
+                .bytes();
+            if count == 0 || !address.get().is_multiple_of(element_size) {
+                return Err(MaxwellThreeDResourceError::ContradictoryState { role });
+            }
+            let end = first
+                .checked_add(count)
+                .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+            let size = u64::from(end) * element_size;
+            if let Some(limit) = limit
+                && size > inclusive_size(address, limit, role)?
+            {
+                return Err(MaxwellThreeDResourceError::ContradictoryState { role });
+            }
+            size
+        } else {
+            // Explicit complete-state inspection can resolve a configured
+            // bounded buffer before any draw consumes it.
+            inclusive_size(
+                address,
+                limit.ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
+                role,
+            )?
+        };
+        builder.buffer(role, address, size)?;
     }
 
     let bindings = state.shader_bindings();
@@ -826,8 +874,23 @@ struct MaxwellThreeDResolvedResourceCacheEntry {
     last_used: Cell<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ColorResolveKey {
+    address_space: crate::MaxwellAddressSpaceId,
+    surfaces: [crate::engines::twod::blit::ResolveSurface; 2],
+    destination_compression: bool,
+}
+
+#[derive(Debug)]
+struct ColorResolveCacheEntry {
+    resources: Arc<MaxwellThreeDResolvedResources>,
+    mapping_generation: Cell<u64>,
+    last_used: Cell<u64>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct MaxwellThreeDResolvedResourceCache {
+    resolves: HashMap<ColorResolveKey, ColorResolveCacheEntry>,
     entries: Vec<MaxwellThreeDResolvedResourceCacheEntry>,
     current: Option<usize>,
     retained_backings: MaxwellThreeDRetainedBackingCache,
@@ -835,6 +898,92 @@ pub(crate) struct MaxwellThreeDResolvedResourceCache {
 }
 
 impl MaxwellThreeDResolvedResourceCache {
+    pub(crate) fn resolve_color_images(
+        &mut self,
+        request: &crate::engines::twod::MaxwellTwoDResolveOperation,
+        address_space: &MaxwellGpuAddressSpace,
+        limit: usize,
+    ) -> Result<Arc<MaxwellThreeDResolvedResources>, MaxwellThreeDResourceError> {
+        let key = ColorResolveKey {
+            address_space: address_space.id(),
+            surfaces: request.images,
+            destination_compression: request.destination_compression,
+        };
+        if let Some(entry) = self.resolves.get(&key) {
+            let generation = address_space.mapping_generation().get();
+            if entry.resources.image_content_dependencies_current()
+                && (entry.mapping_generation.get() == generation
+                    || entry.resources.validate_mappings(address_space).is_ok())
+            {
+                entry.mapping_generation.set(generation);
+                entry.last_used.set(self.take_use());
+                return Ok(Arc::clone(&entry.resources));
+            }
+        }
+        let mut builder =
+            ResourceBuilder::new(address_space, None, None, Some(&mut self.retained_backings));
+        for (index, surface) in request.images.iter().enumerate() {
+            let role = if index == 0 {
+                MaxwellThreeDResourceRole::ResolveSource
+            } else {
+                MaxwellThreeDResourceRole::ResolveDestination
+            };
+            builder.sample_mode = Some(if index == 0 {
+                MaxwellThreeDSampleMode::Samples2x2
+            } else {
+                MaxwellThreeDSampleMode::Samples1x1
+            });
+            let description = image_description(MaxwellImageDescriptionRequest {
+                dimension: ImageDimension::Two,
+                extent: ImageExtent {
+                    width: surface.width,
+                    height: surface.height,
+                    depth: 1,
+                },
+                format: color_image_format(surface.format, role)?,
+                kind: ImageKind::Color,
+                layers: 1,
+                role,
+            })?;
+            builder.image(
+                role,
+                MaxwellThreeDUnresolvedAddress::new(
+                    (surface.address >> 32) as u8,
+                    surface.address as u32,
+                ),
+                description,
+                MaxwellThreeDImageLayout::BlockLinear {
+                    block_height_log2: surface.block_height_log2,
+                    block_depth_log2: 0,
+                },
+                None,
+                0,
+                MaxwellThreeDGuestImageFormat::Color(MaxwellThreeDColorTargetFormat::Color(
+                    surface.format,
+                )),
+                index == 1 && request.destination_compression,
+            )?;
+        }
+        let resources = Arc::new(builder.finish()?.0);
+        if self.resolves.len() >= limit && !self.resolves.contains_key(&key) {
+            let oldest = *self
+                .resolves
+                .iter()
+                .min_by_key(|(_, value)| value.last_used.get())
+                .expect("nonzero resolved-resource cache limit")
+                .0;
+            self.resolves.remove(&oldest);
+        }
+        self.resolves.insert(
+            key,
+            ColorResolveCacheEntry {
+                resources: Arc::clone(&resources),
+                mapping_generation: Cell::new(address_space.mapping_generation().get()),
+                last_used: Cell::new(self.take_use()),
+            },
+        );
+        Ok(resources)
+    }
     pub(crate) fn resolve(
         &mut self,
         state: &MaxwellThreeDState,
@@ -1467,20 +1616,7 @@ impl<'a> ResourceBuilder<'a> {
             .value()
             .copied()
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        // NVIDIA names both packed encodings separately, while their logical
-        // components are the same 24-bit depth plus 8-bit stencil pair. Keep
-        // `guest_format` so later layout conversion can distinguish packing.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L947-L974
-        let format = match guest_format {
-            MaxwellThreeDColorTargetFormat::Color(0xcf) => ImageFormat::Bgra8Unorm,
-            MaxwellThreeDColorTargetFormat::Color(0xd5) => ImageFormat::Rgba8Unorm,
-            format => {
-                return Err(MaxwellThreeDResourceError::UnsupportedColorFormat {
-                    role,
-                    format: format.raw(),
-                });
-            }
-        };
+        let format = color_image_format(guest_format.raw(), role)?;
         let (dimension, depth, layers, selected_layer) = match kind {
             MaxwellThreeDImageKind::Array => {
                 let layers = u16::try_from(third)
@@ -1618,20 +1754,64 @@ impl<'a> ResourceBuilder<'a> {
         guest_format: MaxwellThreeDGuestImageFormat,
         compression_enabled: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
-        match self
+        let samples = match self
             .sample_mode
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?
         {
-            MaxwellThreeDSampleMode::Samples1x1 => {}
+            MaxwellThreeDSampleMode::Samples1x1 => SampleCount::One,
+            MaxwellThreeDSampleMode::Samples2x2 => SampleCount::Four,
             mode => return Err(MaxwellThreeDResourceError::UnsupportedSampleMode { role, mode }),
-        }
+        };
+        // Target WIDTH/HEIGHT count stored samples, not raster pixels. Keep
+        // their full footprint for mappings/pitches while the neutral image
+        // carries pixel dimensions and a separate sample count.
+        // https://github.com/devkitPro/deko3d/blob/master/source/dk_image.cpp
+        let extent = description.extent();
+        let description = if samples == SampleCount::Four {
+            if !extent.width.is_multiple_of(2)
+                || !extent.height.is_multiple_of(2)
+                || description.dimension() != ImageDimension::Two
+                || !matches!(
+                    layout,
+                    MaxwellThreeDImageLayout::BlockLinear {
+                        block_depth_log2: 0,
+                        ..
+                    }
+                )
+                || !matches!(
+                    guest_format,
+                    MaxwellThreeDGuestImageFormat::Color(_)
+                        | MaxwellThreeDGuestImageFormat::DepthStencil(
+                            MaxwellThreeDDepthStencilFormat::Stencil8Z24
+                                | MaxwellThreeDDepthStencilFormat::Z24Stencil8
+                        )
+                )
+            {
+                return Err(MaxwellThreeDResourceError::UnsupportedImageLayout { role });
+            }
+            ImageDescription::new(
+                description.dimension(),
+                ImageExtent {
+                    width: extent.width / 2,
+                    height: extent.height / 2,
+                    depth: 1,
+                },
+                description.format(),
+                description.kind(),
+                1,
+                description.array_layers(),
+                samples,
+            )
+            .map_err(|_| MaxwellThreeDResourceError::ContradictoryState { role })?
+        } else {
+            description
+        };
         let bpp = u64::from(
             description
                 .format()
                 .plane_bytes_per_texel(0)
                 .ok_or(MaxwellThreeDResourceError::UnsupportedImageLayout { role })?,
         );
-        let extent = description.extent();
         let compact_row = u64::from(extent.width)
             .checked_mul(bpp)
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
@@ -1673,7 +1853,13 @@ impl<'a> ResourceBuilder<'a> {
                     .and_then(|size| size.checked_mul(depths))
                     .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
                 let stride = array_pitch.filter(|value| *value != 0).unwrap_or(minimum);
+                if samples == SampleCount::Four && stride < minimum {
+                    return Err(MaxwellThreeDResourceError::ContradictoryState { role });
+                }
                 let compressed_color_kind = match guest_format {
+                    MaxwellThreeDGuestImageFormat::Color(_) if samples == SampleCount::Four => {
+                        Some(MAXWELL_C32_MS4_2CBR_KIND)
+                    }
                     MaxwellThreeDGuestImageFormat::Color(_) => {
                         single_sample_compressed_color_kind(bpp)
                     }
@@ -1682,10 +1868,18 @@ impl<'a> ResourceBuilder<'a> {
                 let compressed_depth_kind = match guest_format {
                     MaxwellThreeDGuestImageFormat::DepthStencil(
                         MaxwellThreeDDepthStencilFormat::Stencil8Z24,
-                    ) => Some(MAXWELL_S8Z24_2CZ_KIND),
+                    ) => Some(if samples == SampleCount::Four {
+                        MAXWELL_S8Z24_MS4_2CZ_KIND
+                    } else {
+                        MAXWELL_S8Z24_2CZ_KIND
+                    }),
                     MaxwellThreeDGuestImageFormat::DepthStencil(
                         MaxwellThreeDDepthStencilFormat::Z24Stencil8,
-                    ) => Some(MAXWELL_Z24S8_2CZ_KIND),
+                    ) => Some(if samples == SampleCount::Four {
+                        MAXWELL_Z24S8_MS4_2CZ_KIND
+                    } else {
+                        MAXWELL_Z24S8_2CZ_KIND
+                    }),
                     _ => None,
                 };
                 let expected_kind = compressed_color_kind
@@ -1700,8 +1894,9 @@ impl<'a> ResourceBuilder<'a> {
                     }),
                     stride,
                     expected_kind,
-                    compressed_color_kind.is_some()
-                        || (compressed_depth_kind.is_some() && !compression_enabled),
+                    samples == SampleCount::One
+                        && (compressed_color_kind.is_some()
+                            || (compressed_depth_kind.is_some() && !compression_enabled)),
                 )
             }
         };
@@ -1721,7 +1916,16 @@ impl<'a> ResourceBuilder<'a> {
         let size = layer_stride
             .checked_mul(u64::from(layer_count))
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-        let source = self.resolve(resolved_address, size, MemoryPermissions::WRITE, role)?;
+        let source = self.resolve(
+            resolved_address,
+            size,
+            if role == MaxwellThreeDResourceRole::ResolveSource {
+                MemoryPermissions::READ
+            } else {
+                MemoryPermissions::WRITE
+            },
+            role,
+        )?;
         let actual_kind = source
             .segments()
             .first()
@@ -1772,7 +1976,11 @@ impl<'a> ResourceBuilder<'a> {
         self.resources.push(MaxwellThreeDResolvedResource::Image(
             MaxwellThreeDResolvedImage {
                 role,
-                access: MaxwellThreeDResourceAccess::Write,
+                access: if role == MaxwellThreeDResourceRole::ResolveSource {
+                    MaxwellThreeDResourceAccess::Read
+                } else {
+                    MaxwellThreeDResourceAccess::Write
+                },
                 description,
                 allocation_description,
                 view,
@@ -1895,6 +2103,23 @@ impl<'a> ResourceBuilder<'a> {
         };
         result.validate_mappings(self.address_space)?;
         Ok((result, self.descriptor_reads.into_boxed_slice()))
+    }
+}
+
+// Preserve the transfer function as well as channel order for render targets
+// and 2D resolves. The L components denote sRGB; alpha remains linear UNORM.
+// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+// https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/image_formats.h
+fn color_image_format(
+    format: u8,
+    role: MaxwellThreeDResourceRole,
+) -> Result<ImageFormat, MaxwellThreeDResourceError> {
+    match format {
+        0xcf => Ok(ImageFormat::Bgra8Unorm),
+        0xd0 => Ok(ImageFormat::Bgra8Srgb),
+        0xd5 => Ok(ImageFormat::Rgba8Unorm),
+        0xd6 => Ok(ImageFormat::Rgba8Srgb),
+        _ => Err(MaxwellThreeDResourceError::UnsupportedColorFormat { role, format }),
     }
 }
 

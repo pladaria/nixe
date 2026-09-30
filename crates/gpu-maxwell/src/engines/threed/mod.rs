@@ -387,6 +387,7 @@ enum MethodAction {
     ZCullEnable,
     ZCullBounds,
     DrawVertexArray,
+    DrawIndexBuffer,
     Unsupported,
     Missing(MaxwellEngineCapability),
 }
@@ -933,6 +934,13 @@ methods!(
         "DRAW_VERTEX_ARRAY",
         u32::MAX,
         MethodAction::DrawVertexArray
+    ),
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2830-L2831
+    DRAW_INDEX_BUFFER => (
+        0x17e0,
+        "DRAW_INDEX_BUFFER",
+        u32::MAX,
+        MethodAction::DrawIndexBuffer
     ),
     SET_API_VISIBLE_CALL_LIMIT => (
         0x0d64,
@@ -2518,6 +2526,25 @@ fn preflight_register(
                     vertex_count: source.argument(),
                 })
             }
+            MethodAction::DrawIndexBuffer => {
+                if source.argument() == 0 {
+                    return Err(invalid_encoding(
+                        source,
+                        "DRAW_INDEX_BUFFER",
+                        "index count is zero",
+                    ));
+                }
+                candidate.apply(MaxwellThreeDStateWrite::VertexInput(
+                    MaxwellThreeDVertexInputWrite::IndexCount {
+                        value: source.argument(),
+                        source,
+                    },
+                ));
+                state_operation(MaxwellThreeDOperationTrigger::DrawIndexBuffer {
+                    source,
+                    index_count: source.argument(),
+                })
+            }
             MethodAction::Unsupported => {
                 return Err(MaxwellEngineDispatchError::UnsupportedMethod {
                     source,
@@ -2954,6 +2981,11 @@ fn preflight_vertex_and_binding_state(
                 V::VertexArrayStart { value: raw, source },
                 "SET_VERTEX_ARRAY_START",
             )),
+            // Vertex ID has its own full-width base, distinct from the global
+            // base vertex index. deko3d programs both for indexed draws.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1378-L1379
+            // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/draw.mme
+            0x1118 => Some((V::VertexIdBase { value: raw, source }, "SET_VERTEX_ID_BASE")),
             // NVIDIA publishes both global draw-index registers as complete
             // 32-bit fields.
             // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2633-L2637

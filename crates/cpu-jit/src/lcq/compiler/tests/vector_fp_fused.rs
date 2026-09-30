@@ -1,5 +1,5 @@
 use super::*;
-use crate::lcq::fp::{CompletionError, complete_vector_fused_element};
+use crate::lcq::fp::{CompletionError, complete_vector_fused};
 use nixe_cpu::{exception::ExceptionKind, execution::CpuExit};
 use nixe_cpu_interpreter::{InstructionStep, execute_one};
 
@@ -55,6 +55,8 @@ fn check(
     actual.set_vector(4, first);
     actual.set_vector(5, second);
     actual.set_vector(31, first);
+    actual.set_vector(29, first);
+    actual.set_vector(28, second);
     let mut expected = actual.clone();
     for &word in &words[..3] {
         execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap();
@@ -70,10 +72,10 @@ fn check(
     }
     let (_, exit) = execute_compiler(&memory, words.len(), &mut actual, compiler);
     match exit.kind {
-        EdgeKind::VectorFpFusedElement(operation) => {
+        EdgeKind::VectorFpFused(operation) => {
             assert_eq!(actual, prestate);
             assert_eq!(exit.pc.get(), PC + 12);
-            match complete_vector_fused_element(operation, &mut actual) {
+            match complete_vector_fused(operation, &mut actual) {
                 Ok(()) => {
                     assert_eq!(reference, InstructionStep::Continue);
                     assert_eq!(actual, expected);
@@ -103,14 +105,17 @@ fn check(
     }
     assert_eq!(
         actual, expected,
-        "{word:08x}, {first:x} * element({second:x}), FPCR={fpcr:x}"
+        "{word:08x}, {first:x} * {second:x}, FPCR={fpcr:x}"
     );
     exit.kind
 }
 
 #[test]
-fn fused_element_matches_shapes_rounding_cancellation_aliases_and_traps() {
-    for (wide, full) in [(false, false), (false, true), (true, true)] {
+fn fused_matches_shapes_rounding_cancellation_aliases_and_traps() {
+    for (wide, full, by_element) in [(false, false), (false, true), (true, true)]
+        .into_iter()
+        .flat_map(|(wide, full)| [true, false].map(|element| (wide, full, element)))
+    {
         let bits = |v: f64| {
             if wide {
                 v.to_bits()
@@ -127,7 +132,17 @@ fn fused_element_matches_shapes_rounding_cancellation_aliases_and_traps() {
         let snan = bits(f64::INFINITY) | 1;
         let last = if wide { 1 } else { 3 };
         for subtract in [false, true] {
-            let word = encoding(wide, full, last) | (u32::from(subtract) << 14);
+            let encode = |lane| {
+                if by_element {
+                    encoding(wide, full, lane) | (u32::from(subtract) << 14)
+                } else {
+                    0x0e22_cc20
+                        | (u32::from(full) << 30)
+                        | (u32::from(wide) << 22)
+                        | (u32::from(subtract) << 23)
+                }
+            };
+            let word = encode(last);
             for (a, b, c) in [
                 (bits(1.1), bits(-1.1), bits(0.75)),
                 (bits(1.0) + 1, bits(1.0) - 2, bits(-1.0)),
@@ -153,8 +168,13 @@ fn fused_element_matches_shapes_rounding_cancellation_aliases_and_traps() {
                     first[2..].copy_from_slice(&[snan, 1]);
                     accumulator[2..].copy_from_slice(&[snan, 1]);
                 }
-                let mut second = [snan; 4];
-                second[last as usize] = b;
+                let mut second = [bits(2.0), b, bits(-3.0), bits(4.0)];
+                if by_element {
+                    second = [snan; 4];
+                    second[last as usize] = b;
+                } else if !wide && !full {
+                    second[2..].copy_from_slice(&[snan, 1]);
+                }
                 for mode in 0..16 {
                     check(
                         word,
@@ -176,10 +196,13 @@ fn fused_element_matches_shapes_rounding_cancellation_aliases_and_traps() {
                     );
                 }
             }
-            for lane in 0..=last {
-                let word = encoding(wide, full, lane) | (u32::from(subtract) << 14);
-                let mut second = [snan; 4];
-                second[lane as usize] = bits(1.1);
+            for lane in 0..=if by_element { last } else { 0 } {
+                let word = encode(lane);
+                let mut second = [bits(2.0), bits(1.1), bits(-3.0), bits(4.0)];
+                if by_element {
+                    second = [snan; 4];
+                    second[lane as usize] = bits(1.1);
+                }
                 let edge = check(
                     word,
                     pack([bits(1.1); 4], wide),
@@ -244,6 +267,24 @@ fn rotating_cube_fmla_encoding_stays_native() {
         pack([1.5f32.to_bits() as u64; 4], false),
         pack([2.0f32.to_bits() as u64; 4], false),
         pack([0.5f32.to_bits() as u64; 4], false),
+        0,
+        false,
+    );
+}
+
+#[test]
+fn mesh_lighting_fmla_encoding_matches_corresponding_lanes() {
+    check(
+        0x4e3c_cfbf,
+        pack(
+            [1.5f32, 2.5, 3.5, 4.5].map(|v| u64::from(v.to_bits())),
+            false,
+        ),
+        pack(
+            [2.0f32, 3.0, 4.0, 5.0].map(|v| u64::from(v.to_bits())),
+            false,
+        ),
+        0,
         0,
         false,
     );

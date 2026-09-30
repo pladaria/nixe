@@ -26,6 +26,103 @@ static QEMU_GDB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 #[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
+fn qemu_a64_vector_add_matches_rounding_nan_and_lane_semantics() {
+    for (wide, full) in [(false, false), (false, true), (true, true)] {
+        let bits = |v: f64| {
+            if wide {
+                v.to_bits()
+            } else {
+                u64::from((v as f32).to_bits())
+            }
+        };
+        let sign = 1u64 << if wide { 63 } else { 31 };
+        let tiny = bits(if wide {
+            f64::MIN_POSITIVE
+        } else {
+            f64::from(f32::MIN_POSITIVE)
+        });
+        let largest = bits(if wide { f64::MAX } else { f64::from(f32::MAX) });
+        let snan = bits(f64::INFINITY) | 1;
+        let half_ulp = bits(2.0f64.powi(if wide { -53 } else { -24 }));
+        let pack = |values: [u64; 4]| {
+            if wide {
+                u128::from(values[0]) | (u128::from(values[1]) << 64)
+            } else {
+                values
+                    .into_iter()
+                    .enumerate()
+                    .fold(0, |v, (i, x)| v | (u128::from(x as u32) << (32 * i)))
+            }
+        };
+        for subtract in [false, true] {
+            let mut fixture = A64OracleFixture::new();
+            // Includes the reported Rd=Rn=31 alias, not a zero register.
+            let word = 0x0e37_d7ff
+                | (u32::from(full) << 30)
+                | (u32::from(wide) << 22)
+                | (u32::from(subtract) << 23);
+            fixture.oracle.write_instruction(fixture.slot, word);
+            for (a, b) in [
+                (bits(1.0), half_ulp),
+                (0, sign),
+                (largest, largest),
+                (tiny + 1, tiny | sign),
+                (tiny, tiny + 1),
+                (tiny, tiny | sign),
+                (1, bits(1.0)),
+                (bits(f64::INFINITY), bits(f64::NEG_INFINITY)),
+                (snan, bits(f64::NAN)),
+                (bits(f64::NAN), snan),
+                (bits(f64::NAN), 1),
+                (1, snan),
+            ] {
+                for mode in 0..16 {
+                    let mut expected = A64State::default();
+                    expected.set_pc(fixture.slot);
+                    expected.set_fpcr(mode << 22);
+                    expected.set_fpsr(1 << 27);
+                    let mut first = [bits(1.5), a, bits(-3.0), bits(4.5)];
+                    if !wide && !full {
+                        first[2..].copy_from_slice(&[snan, 1]);
+                    }
+                    expected.set_vector(31, pack(first));
+                    expected.set_vector(23, pack([bits(2.0), b, bits(3.0), bits(-1.5)]));
+                    for register in [23, 31] {
+                        fixture.oracle.write_raw_register(
+                            34 + u32::from(register),
+                            &expected.vector(register).unwrap().to_le_bytes(),
+                        );
+                    }
+                    fixture
+                        .oracle
+                        .write_raw_register(A64_FPCR_REGISTER, &expected.fpcr().to_le_bytes());
+                    fixture
+                        .oracle
+                        .write_raw_register(A64_FPSR_REGISTER, &expected.fpsr().to_le_bytes());
+                    fixture.oracle.write_register(A64_PC_REGISTER, fixture.slot);
+                    assert_eq!(
+                        execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap(),
+                        InstructionStep::Continue
+                    );
+                    fixture.oracle.step("FADD/FSUB vector", word);
+                    assert_eq!(
+                        &fixture.oracle.read_raw_register(34 + 31)[..16],
+                        expected.vector(31).unwrap().to_le_bytes(),
+                        "{word:08x}, a={a:x}, b={b:x}, mode={mode}"
+                    );
+                    assert_eq!(
+                        fixture.oracle.read_raw_register(A64_FPSR_REGISTER),
+                        expected.fpsr().to_le_bytes(),
+                        "status: {word:08x}, mode={mode}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
 fn qemu_a64_vector_multiply_matches_rounding_nan_and_lane_semantics() {
     for (wide, full) in [(false, false), (false, true), (true, true)] {
         let bits = |value: f64| {
@@ -108,8 +205,11 @@ fn qemu_a64_vector_multiply_matches_rounding_nan_and_lane_semantics() {
 
 #[test]
 #[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
-fn qemu_a64_fused_element_matches_rounding_nan_and_accumulator_semantics() {
-    for (wide, full) in [(false, false), (false, true), (true, true)] {
+fn qemu_a64_fused_matches_rounding_nan_and_accumulator_semantics() {
+    for (wide, full, by_element) in [(false, false), (false, true), (true, true)]
+        .into_iter()
+        .flat_map(|(wide, full)| [true, false].map(|element| (wide, full, element)))
+    {
         let bits = |value: f64| {
             if wide {
                 value.to_bits()
@@ -135,11 +235,18 @@ fn qemu_a64_fused_element_matches_rounding_nan_and_accumulator_semantics() {
         };
         for subtract in [false, true] {
             let mut fixture = A64OracleFixture::new();
-            let word = 0x0f82_1820
-                | (u32::from(full) << 30)
-                | (u32::from(wide) << 22)
-                | (u32::from(!wide) << 21)
-                | (u32::from(subtract) << 14);
+            let word = if by_element {
+                0x0f82_1820
+                    | (u32::from(full) << 30)
+                    | (u32::from(wide) << 22)
+                    | (u32::from(!wide) << 21)
+                    | (u32::from(subtract) << 14)
+            } else {
+                0x0e22_cc20
+                    | (u32::from(full) << 30)
+                    | (u32::from(wide) << 22)
+                    | (u32::from(subtract) << 23)
+            };
             fixture.oracle.write_instruction(fixture.slot, word);
             for (a, b, c) in [
                 (bits(1.1), bits(-1.1), bits(0.75)),
@@ -158,8 +265,13 @@ fn qemu_a64_fused_element_matches_rounding_nan_and_accumulator_semantics() {
                     expected.set_fpsr(1 << 27);
                     expected.set_vector(0, pack([c; 4]));
                     expected.set_vector(1, pack([a; 4]));
-                    let mut multiplier = [snan; 4];
-                    multiplier[if wide { 1 } else { 3 }] = b;
+                    let mut multiplier = [bits(2.0), b, bits(-3.0), bits(4.0)];
+                    if by_element {
+                        multiplier = [snan; 4];
+                        multiplier[if wide { 1 } else { 3 }] = b;
+                    } else if !wide && !full {
+                        multiplier[2..].copy_from_slice(&[snan, 1]);
+                    }
                     expected.set_vector(2, pack(multiplier));
                     for register in 0..3 {
                         fixture.oracle.write_raw_register(
@@ -175,7 +287,7 @@ fn qemu_a64_fused_element_matches_rounding_nan_and_accumulator_semantics() {
                         .write_raw_register(A64_FPSR_REGISTER, &expected.fpsr().to_le_bytes());
                     fixture.oracle.write_register(A64_PC_REGISTER, fixture.slot);
                     execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap();
-                    fixture.oracle.step("FMLA/FMLS by element", word);
+                    fixture.oracle.step("FMLA/FMLS vector", word);
                     assert_eq!(
                         &fixture.oracle.read_raw_register(34)[..16],
                         expected.vector(0).unwrap().to_le_bytes(),
@@ -913,6 +1025,10 @@ struct GdbRemote {
 
 impl GdbRemote {
     fn new(stream: TcpStream) -> Self {
+        // Each step exchanges small packets and acknowledgments synchronously.
+        stream
+            .set_nodelay(true)
+            .expect("disable GDB packet buffering");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .expect("set GDB read timeout");

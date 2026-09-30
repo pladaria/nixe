@@ -22,6 +22,7 @@ impl Translator<'_> {
             | Instruction::ConditionalCompare(_) => self.fp_compare(pc, instruction, flags),
             Instruction::ScalarFloatRound(_) => self.fp_round(pc, instruction, flags),
             Instruction::ScalarFloatAdd(_) => self.fp_add(pc, instruction, flags),
+            Instruction::VectorFloatAdd(_) => self.vector_fp_add(pc, instruction, flags),
             Instruction::ScalarFloatDivide(_) => self.fp_divide(pc, instruction, flags),
             Instruction::VectorFloatDivide(_) => self.vector_fp_divide(pc, instruction, flags),
             Instruction::VectorFloatMultiply(_) | Instruction::VectorFloatMultiplyElement(_) => {
@@ -29,8 +30,8 @@ impl Translator<'_> {
             }
             Instruction::ScalarFloatMultiply(_) => self.fp_multiply(pc, instruction, flags),
             Instruction::ScalarFloatFusedMultiplyAdd(_) => self.fp_fused(pc, instruction, flags),
-            Instruction::VectorFloatFusedElement(_) => {
-                self.vector_fp_fused_element(pc, instruction, flags)
+            Instruction::VectorFloatFusedElement(_) | Instruction::VectorFloatFused(_) => {
+                self.vector_fp_fused(pc, instruction, flags)
             }
             Instruction::SignedIntToFloat(_) | Instruction::UnsignedIntToFloat(_) => {
                 self.integer_to_fp(pc, instruction, flags)
@@ -139,6 +140,62 @@ impl Translator<'_> {
         Ok(false)
     }
 
+    fn vector_fp_add(
+        &mut self,
+        pc: GuestVirtualAddress,
+        instruction: Instruction,
+        flags: &mut LazyFlags<ir::Value>,
+    ) -> Result<bool, Error> {
+        let f = instruction.operands();
+        let lane_bits = scalar_width(f.opc)?;
+        let vector_bits = if f.vector_128 { 128 } else { 64 };
+        let operation = crate::abi::VectorFpAddOperation {
+            rn: f.rn,
+            rm: f.rm,
+            rd: f.rd,
+            lane_64: lane_bits == 64,
+            vector_128: f.vector_128,
+            operation: f.float_add_operation.expect("normalized vector FP add"),
+        };
+        let first = self.read_vector(f.rn)?;
+        let second = self.read_vector(f.rm)?;
+        let (first, second) =
+            self.fp_vector_binary_operands(first, second, lane_bits, vector_bits, None);
+        let first_bad = self.fp_vector_nonfinite_or_subnormal_lanes(first, lane_bits);
+        let second_bad = self.fp_vector_nonfinite_or_subnormal_lanes(second, lane_bits);
+        let bad = self.builder.ins().bor(first_bad, second_bad);
+        let bad = self.vector_as(bad, types::I128);
+        let direct = self.builder.ins().icmp_imm_s(IntCC::Equal, bad, 0);
+        let fpcr = self.system_value(GuestValue::Fpcr)?;
+        let compatible = self.fp_add_status_compatible(
+            first,
+            second,
+            lane_bits,
+            operation.operation,
+            fpcr,
+            self.abi,
+        );
+        let direct = self.builder.ins().band(direct, compatible);
+        self.native_fp_path(pc, EdgeKind::VectorFpAdd(operation), direct, flags)?;
+        // Activation starts fresh SSA inputs; mask inactive lanes before status production.
+        let first = self.read_vector(f.rn)?;
+        let second = self.read_vector(f.rm)?;
+        let (first, second) =
+            self.fp_vector_binary_operands(first, second, lane_bits, vector_bits, None);
+        let ty = if lane_bits == 32 {
+            types::F32X4
+        } else {
+            types::F64X2
+        };
+        let first = self.vector_as(first, ty);
+        let second = self.vector_as(second, ty);
+        let result = self.float_add_values(first, second, operation.operation);
+        let result = self.vector_as(result, types::I8X16);
+        let result = self.mask_vector(result, vector_bits);
+        self.write_vector(f.rd, result);
+        Ok(false)
+    }
+
     fn fp_divide(
         &mut self,
         pc: GuestVirtualAddress,
@@ -230,7 +287,7 @@ impl Translator<'_> {
         let first = self.read_vector(f.rn)?;
         let second = self.read_vector(f.rm)?;
         let (first, second) =
-            self.fp_vector_multiply_operands(first, second, lane_bits, vector_bits, lane);
+            self.fp_vector_binary_operands(first, second, lane_bits, vector_bits, lane);
         let direct = self.fp_vector_multiply_domain(first, second, lane_bits, self.abi);
         self.native_fp_path(
             pc,
@@ -249,13 +306,13 @@ impl Translator<'_> {
         let first = self.read_vector(f.rn)?;
         let second = self.read_vector(f.rm)?;
         let (first, second) =
-            self.fp_vector_multiply_operands(first, second, lane_bits, vector_bits, lane);
+            self.fp_vector_binary_operands(first, second, lane_bits, vector_bits, lane);
         let result = self.fp_vector_multiply_value(first, second, lane_bits, vector_bits);
         self.write_vector(f.rd, result);
         Ok(false)
     }
 
-    fn vector_fp_fused_element(
+    fn vector_fp_fused(
         &mut self,
         pc: GuestVirtualAddress,
         instruction: Instruction,
@@ -264,13 +321,15 @@ impl Translator<'_> {
         let f = instruction.operands();
         let lane_bits = scalar_width(f.opc)?;
         let vector_bits = if f.vector_128 { 128 } else { 64 };
-        let edge = EdgeKind::VectorFpFusedElement(crate::abi::VectorFpFusedElementOperation {
+        let lane = matches!(instruction, Instruction::VectorFloatFusedElement(_))
+            .then_some(f.fp_element_lane);
+        let edge = EdgeKind::VectorFpFused(crate::abi::VectorFpFusedOperation {
             rn: f.rn,
             rm: f.rm,
             rd: f.rd,
             lane_64: lane_bits == 64,
             vector_128: f.vector_128,
-            lane: f.fp_element_lane,
+            lane,
             subtract: f.subtract,
         });
         if !self.native_fma {
@@ -280,13 +339,8 @@ impl Translator<'_> {
         let first = self.read_vector(f.rn)?;
         let second = self.read_vector(f.rm)?;
         let third = self.read_vector(f.rd)?;
-        let (first, second) = self.fp_vector_multiply_operands(
-            first,
-            second,
-            lane_bits,
-            vector_bits,
-            Some(f.fp_element_lane),
-        );
+        let (first, second) =
+            self.fp_vector_binary_operands(first, second, lane_bits, vector_bits, lane);
         let third = self.mask_vector(third, vector_bits);
         let ty = self.builder.func.dfg.value_type(first);
         let third = self.vector_as(third, ty);
@@ -296,13 +350,8 @@ impl Translator<'_> {
         let first = self.read_vector(f.rn)?;
         let second = self.read_vector(f.rm)?;
         let third = self.read_vector(f.rd)?;
-        let (first, second) = self.fp_vector_multiply_operands(
-            first,
-            second,
-            lane_bits,
-            vector_bits,
-            Some(f.fp_element_lane),
-        );
+        let (first, second) =
+            self.fp_vector_binary_operands(first, second, lane_bits, vector_bits, lane);
         let third = self.mask_vector(third, vector_bits);
         let ty = if lane_bits == 32 {
             types::F32X4

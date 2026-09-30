@@ -40,9 +40,11 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
                 | Instruction::ScalarFloatAdd(_)
                 | Instruction::ScalarFloatDivide(_)
                 | Instruction::VectorFloatDivide(_)
+                | Instruction::VectorFloatAdd(_)
                 | Instruction::VectorFloatMultiply(_)
                 | Instruction::VectorFloatMultiplyElement(_)
                 | Instruction::VectorFloatFusedElement(_)
+                | Instruction::VectorFloatFused(_)
                 | Instruction::ScalarFloatMultiply(_)
                 | Instruction::ScalarFloatFusedMultiplyAdd(_)
                 | Instruction::ScalarFloatSquareRoot(_)
@@ -332,6 +334,39 @@ pub(crate) fn complete_divide(
     Ok(())
 }
 
+/// Complete every active FADD/FSUB lane after native FP restoration. An enabled
+/// exception leaves the entire instruction's destination/status/PC untouched.
+/// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.35, D6.100)
+pub(crate) fn complete_vector_add(
+    operation: crate::abi::VectorFpAddOperation,
+    state: &mut A64State,
+) -> Result<(), CompletionError> {
+    if operation.rn >= 32
+        || operation.rm >= 32
+        || operation.rd >= 32
+        || (operation.lane_64 && !operation.vector_128)
+    {
+        return Err(CompletionError::Invalid(Error::internal(
+            "invalid exact vector FP add operands",
+        )));
+    }
+    let result = nixe_cpu::semantics::a64_fp_simd::exact_vector_float_add(
+        state.vector(operation.rn).unwrap(),
+        state.vector(operation.rm).unwrap(),
+        if operation.lane_64 { 64 } else { 32 },
+        if operation.vector_128 { 128 } else { 64 },
+        operation.operation,
+        state.fpcr(),
+    );
+    if fp_status_traps(result.status, state.fpcr()) {
+        return Err(CompletionError::Trap(result.status));
+    }
+    state.set_vector(operation.rd, result.bits);
+    state.set_fpsr(state.fpsr() | fp_status_bits(result.status));
+    state.set_pc(state.pc().wrapping_add(4));
+    Ok(())
+}
+
 /// Complete every active FDIV lane after native FP restoration. An enabled
 /// exception leaves the entire instruction's destination/status/PC untouched.
 /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FDIV--vector---Floating-point-Divide--vector--
@@ -401,22 +436,24 @@ pub(crate) fn complete_vector_multiply(
 }
 
 /// Complete all FMLA/FMLS lanes atomically after leaving the native FP region.
-/// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMLA--by-element---Floating-point-fused-Multiply-Add-to-accumulator--by-element--
-pub(crate) fn complete_vector_fused_element(
-    operation: crate::abi::VectorFpFusedElementOperation,
+/// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.75–79)
+pub(crate) fn complete_vector_fused(
+    operation: crate::abi::VectorFpFusedOperation,
     state: &mut A64State,
 ) -> Result<(), CompletionError> {
     if operation.rn >= 32
         || operation.rm >= 32
         || operation.rd >= 32
         || (operation.lane_64 && !operation.vector_128)
-        || operation.lane >= if operation.lane_64 { 2 } else { 4 }
+        || operation
+            .lane
+            .is_some_and(|lane| lane >= if operation.lane_64 { 2 } else { 4 })
     {
         return Err(CompletionError::Invalid(Error::internal(
             "invalid exact vector FMA operands",
         )));
     }
-    let result = nixe_cpu::semantics::a64_fp_simd::exact_vector_float_fused_element(
+    let result = nixe_cpu::semantics::a64_fp_simd::exact_vector_float_fused(
         state.vector(operation.rn).unwrap(),
         state.vector(operation.rm).unwrap(),
         state.vector(operation.rd).unwrap(),

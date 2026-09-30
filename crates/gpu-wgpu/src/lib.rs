@@ -340,6 +340,7 @@ async fn initialize_backend_async(
         &required_limits,
         required_features,
         native_vulkan.is_some_and(|c| c.tessellation_shader),
+        native_vulkan.is_some_and(|c| c.standard_sample_locations),
     );
     let visibility = Arc::new(WgpuVisibilityCoordinator::new(device_id));
     let pipeline_cache_path = configuration
@@ -532,6 +533,7 @@ fn capabilities(
     limits: &wgpu::Limits,
     enabled_features: wgpu::Features,
     native_tessellation: bool,
+    standard_sample_locations: bool,
 ) -> BackendCapabilities {
     let formats = ALL_IMAGE_FORMATS.into_iter().filter(|format| {
         if !enabled_features.contains(required_features_for_image_format(*format)) {
@@ -549,9 +551,15 @@ fn capabilities(
             .union(BackendFeatures::DRAW)
             .union(BackendFeatures::INDEXED_DRAW)
             .union(BackendFeatures::BARRIER)
+            .union(BackendFeatures::RESOLVE)
             .union(BackendFeatures::RENDER_PASS),
         formats,
-        [SampleCount::One],
+        [
+            Some(SampleCount::One),
+            standard_sample_locations.then_some(SampleCount::Four),
+        ]
+        .into_iter()
+        .flatten(),
         [
             Some(ShaderStage::Vertex),
             Some(ShaderStage::Fragment),

@@ -297,6 +297,21 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
     ) -> Result<(), MaxwellSubmissionExecutionError> {
         let MaxwellEngineEvent { operation, three_d } = operation;
         match operation {
+            PendingEngineOperation::TwoDResolve(request) => {
+                let limit = self.cache.resource_cache_limit();
+                let resources = self
+                    .cache
+                    .resolved_resources_mut()
+                    .resolve_color_images(&request, self.address_space, limit)
+                    .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
+                let work = self
+                    .cache
+                    .lower_color_resolve(&resources, self.frontend, self.predecessors.clone())
+                    .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
+                self.steps
+                    .push(MaxwellSubmissionExecutionStep::ThreeD(work));
+                self.prior_work_pending = true;
+            }
             PendingEngineOperation::HostSynchronization(operation) => {
                 let command = match operation.operation() {
                     MaxwellHostMemoryOperation::L2SysmemInvalidate { .. } => {
@@ -415,10 +430,7 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
                 )?;
             }
             PendingEngineOperation::ThreeD(trigger) => {
-                if matches!(
-                    trigger,
-                    crate::MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-                ) {
+                if trigger.is_draw() {
                     let translated = if let Some(translated) =
                         self.cache.reuse_translated_shaders_for_state(
                             three_d,

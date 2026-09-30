@@ -6,8 +6,14 @@
 
 #[path = "draw/color.rs"]
 mod color;
+#[path = "draw/indexed.rs"]
+mod indexed;
+#[path = "draw/multisample.rs"]
+mod multisample;
 #[path = "draw/raster.rs"]
 mod raster;
+#[path = "draw/resolve.rs"]
+mod resolve;
 
 use std::{
     cell::Cell,
@@ -101,22 +107,38 @@ pub enum MaxwellThreeDOperationTrigger {
         source: MaxwellMethodSource,
         vertex_count: u32,
     },
+    DrawIndexBuffer {
+        source: MaxwellMethodSource,
+        index_count: u32,
+    },
 }
 
 impl MaxwellThreeDOperationTrigger {
     #[must_use]
     pub const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::ClearSurface { source } | Self::DrawVertexArray { source, .. } => source,
+            Self::ClearSurface { source }
+            | Self::DrawVertexArray { source, .. }
+            | Self::DrawIndexBuffer { source, .. } => source,
         }
+    }
+
+    pub(crate) const fn is_draw(self) -> bool {
+        matches!(
+            self,
+            Self::DrawVertexArray { .. } | Self::DrawIndexBuffer { .. }
+        )
+    }
+
+    const fn is_indexed(self) -> bool {
+        matches!(self, Self::DrawIndexBuffer { .. })
     }
 
     /// Appends the resources consumed directly by this trigger.
     ///
     /// Shader translation contributes constant-buffer, texture, and sampler
     /// roles separately. Keeping the trigger-specific selection exhaustive
-    /// ensures that future indexed draws cannot silently inherit non-indexed
-    /// resolution.
+    /// ensures that indexed draws also resolve the index storage.
     pub(crate) fn append_resource_roles(
         self,
         state: &MaxwellThreeDState,
@@ -135,7 +157,10 @@ impl MaxwellThreeDOperationTrigger {
                     }
                 }
             }
-            Self::DrawVertexArray { .. } => {
+            Self::DrawVertexArray { .. } | Self::DrawIndexBuffer { .. } => {
+                if self.is_indexed() {
+                    roles.push(MaxwellThreeDResourceRole::IndexBuffer);
+                }
                 for attribute in state.vertex_input().attributes() {
                     if let Some(attribute) = attribute.value().filter(|value| value.enabled()) {
                         let role = MaxwellThreeDResourceRole::VertexStream(attribute.stream());
@@ -564,6 +589,7 @@ struct DescriptorRecord {
 
 #[derive(Debug)]
 struct PreparedDrawRecord {
+    indexed: bool,
     state: super::state::MaxwellThreeDDrawStateIdentity,
     resources: Arc<()>,
     shaders: Arc<()>,
@@ -577,8 +603,10 @@ impl PreparedDrawRecord {
         state: &MaxwellThreeDState,
         resources: &MaxwellThreeDResolvedResources,
         shaders: &MaxwellThreeDTranslatedShaders,
+        indexed: bool,
     ) -> bool {
-        self.state.matches(state)
+        self.indexed == indexed
+            && self.state.matches(state)
             && resources.has_identity(&self.resources)
             && shaders.has_identity(&self.shaders)
     }
@@ -1275,14 +1303,14 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     predecessors: Vec<FrontendSubmissionId>,
     cache: &mut MaxwellThreeDLoweringCache,
 ) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
-    if let (MaxwellThreeDOperationTrigger::DrawVertexArray { vertex_count, .. }, Some(shaders)) =
-        (trigger, translated_shaders)
+    if trigger.is_draw()
+        && let Some(shaders) = translated_shaders
     {
-        let arguments = draw_arguments(state, vertex_count)?;
+        let arguments = draw_arguments(state, trigger)?;
         let prepared = cache
             .prepared_draw
             .as_ref()
-            .filter(|prepared| prepared.matches(state, resources, shaders))
+            .filter(|prepared| prepared.matches(state, resources, shaders, trigger.is_indexed()))
             .map(|prepared| {
                 Ok::<_, MaxwellThreeDLoweringError>((
                     prepared.operations(arguments)?,
@@ -1304,10 +1332,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         }
     }
     let mut raster_state = None;
-    let tessellation = if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) {
+    let tessellation = if trigger.is_draw() {
         super::tessellation::draw_state(state)?
     } else {
         None
@@ -1327,14 +1352,12 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedConditionalLoadConstantBufferSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some(MaxwellThreeDFixedFunctionValue::ShadeMode(MaxwellThreeDShadeMode::Flat)) =
-        state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::ShadeMode)
-            .value()
+    if trigger.is_draw()
+        && let Some(MaxwellThreeDFixedFunctionValue::ShadeMode(MaxwellThreeDShadeMode::Flat)) =
+            state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::ShadeMode)
+                .value()
     {
         // Smooth preserves the interpolation selected by translated shader
         // inputs and therefore needs no fixed-function override. Flat shading
@@ -1344,16 +1367,14 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             MaxwellThreeDShadeMode::Flat,
         ));
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::ProvokingVertex)
-        .value()
-        == Some(&MaxwellThreeDFixedFunctionValue::ProvokingVertex(
-            MaxwellThreeDProvokingVertex::First,
-        ))
+    if trigger.is_draw()
+        && state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::ProvokingVertex)
+            .value()
+            == Some(&MaxwellThreeDFixedFunctionValue::ProvokingVertex(
+                MaxwellThreeDProvokingVertex::First,
+            ))
     {
         return Err(
             MaxwellThreeDLoweringError::UnsupportedProvokingVertexSemantics(
@@ -1361,35 +1382,29 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             ),
         );
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::TwoSidedLightEnable)
-        .value()
-        == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+    if trigger.is_draw()
+        && state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::TwoSidedLightEnable)
+            .value()
+            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedTwoSidedLightSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::ColorClampEnable)
-        .value()
-        == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+    if trigger.is_draw()
+        && state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::ColorClampEnable)
+            .value()
+            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedColorClampSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some(MaxwellThreeDFixedFunctionValue::PixelShaderSaturate(value)) = state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::PixelShaderSaturate)
-        .value()
+    if trigger.is_draw()
+        && let Some(MaxwellThreeDFixedFunctionValue::PixelShaderSaturate(value)) = state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::PixelShaderSaturate)
+            .value()
         && let Some(output) = value.first_enabled_output()
     {
         return Err(
@@ -1401,11 +1416,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             },
         );
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state.shader_bindings().has_enabled_pipeline()
-    {
+    if trigger.is_draw() && state.shader_bindings().has_enabled_pipeline() {
         let local_memory = state.shader_execution().shader_local_memory();
         if local_memory.region_is_partially_programmed() {
             return Err(MaxwellThreeDLoweringError::IncompleteDraw(
@@ -1430,11 +1441,9 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             );
         }
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state.color_reduction().enable().value()
-        == Some(&MaxwellThreeDColorReductionThresholdsEnable::Enabled)
+    if trigger.is_draw()
+        && state.color_reduction().enable().value()
+            == Some(&MaxwellThreeDColorReductionThresholdsEnable::Enabled)
     {
         // NVIDIA exposes a dedicated activation method, so merely programming
         // a threshold is not enough to make it effective. Once explicitly
@@ -1442,51 +1451,40 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         // reduction decision and must stop before cache/backend effects.
         return Err(MaxwellThreeDLoweringError::UnsupportedColorReductionSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state.constant_color_rendering().enabled().value() == Some(&true)
-    {
+    if trigger.is_draw() && state.constant_color_rendering().enabled().value() == Some(&true) {
         return Err(MaxwellThreeDLoweringError::UnsupportedConstantColorRenderingSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state.shader_execution().api_mandated_early_z().value()
-        == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled)
+    if trigger.is_draw()
+        && state.shader_execution().api_mandated_early_z().value()
+            == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled)
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedApiMandatedEarlyZSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state.coverage().post_z_pixel_shader_imask().value()
-        == Some(&MaxwellThreeDPostZPixelShaderImask::Enabled)
+    if trigger.is_draw()
+        && state.coverage().post_z_pixel_shader_imask().value()
+            == Some(&MaxwellThreeDPostZPixelShaderImask::Enabled)
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedPostZPixelShaderImaskSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some(value) = state
-        .shader_execution()
-        .pixel_shader_interlock_control()
-        .value()
-        .copied()
-        .filter(|value| value.conflict_detection_enabled())
+    if trigger.is_draw()
+        && let Some(value) = state
+            .shader_execution()
+            .pixel_shader_interlock_control()
+            .value()
+            .copied()
+            .filter(|value| value.conflict_detection_enabled())
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedPixelShaderInterlockSemantics(value));
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some(base_vertex) = state
-        .vertex_input()
-        .assembly()
-        .global_base_vertex_index()
-        .value()
-        .copied()
-        .filter(|value| *value != 0)
+    if !trigger.is_indexed()
+        && trigger.is_draw()
+        && let Some(base_vertex) = state
+            .vertex_input()
+            .assembly()
+            .global_base_vertex_index()
+            .value()
+            .copied()
+            .filter(|value| *value != 0)
     {
         // The neutral non-indexed draw currently has one first-vertex value,
         // which controls both vertex-buffer addressing and the shader-visible
@@ -1494,10 +1492,24 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         // it to first_vertex would therefore silently fetch different data.
         return Err(MaxwellThreeDLoweringError::UnsupportedGlobalBaseVertexIndex(base_vertex));
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state.coverage().csaa_enable().value() == Some(&MaxwellThreeDCsaaEnable::Enabled)
+    if !trigger.is_indexed()
+        && trigger.is_draw()
+        && let Some(base) = state
+            .vertex_input()
+            .assembly()
+            .vertex_id_base()
+            .value()
+            .copied()
+            .filter(|value| *value != 0)
+    {
+        // A zero base preserves the existing shader-visible index. Nonzero
+        // bases need a separate shader-ID adjustment, not first_vertex (which
+        // would also change vertex-buffer fetches). Keep this register in the
+        // prepared-draw semantic revision so a cached draw cannot bypass it.
+        return Err(MaxwellThreeDLoweringError::UnsupportedVertexIdBase(base));
+    }
+    if trigger.is_draw()
+        && state.coverage().csaa_enable().value() == Some(&MaxwellThreeDCsaaEnable::Enabled)
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedCsaaSemantics);
     }
@@ -1506,16 +1518,14 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     // represented by the current neutral pipeline. Reject their activation,
     // including after a cached draw, rather than ignoring a stored selector.
     // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some(MaxwellThreeDFixedFunctionValue::AlphaControl {
-        alpha_to_coverage,
-        alpha_to_one,
-    }) = state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::AlphaToCoverageEnable)
-        .value()
+    if trigger.is_draw()
+        && let Some(MaxwellThreeDFixedFunctionValue::AlphaControl {
+            alpha_to_coverage,
+            alpha_to_one,
+        }) = state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::AlphaToCoverageEnable)
+            .value()
         && (*alpha_to_coverage || *alpha_to_one)
     {
         return Err(
@@ -1525,100 +1535,63 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             },
         );
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some(value) = state
-        .coverage()
-        .coverage_to_color()
-        .value()
-        .copied()
-        .filter(|value| value.enabled())
+    if trigger.is_draw()
+        && let Some(value) = state
+            .coverage()
+            .coverage_to_color()
+            .value()
+            .copied()
+            .filter(|value| value.enabled())
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedCoverageToColorSemantics(value));
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some(value) = state
-        .coverage()
-        .alpha_to_coverage_override()
-        .value()
-        .copied()
-        .filter(|value| value.raw() != 0)
+    if trigger.is_draw()
+        && let Some(value) = state
+            .coverage()
+            .alpha_to_coverage_override()
+            .value()
+            .copied()
+            .filter(|value| value.raw() != 0)
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedAlphaToCoverageOverrideSemantics(value));
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state.coverage().tir_mode().value() == Some(&MaxwellThreeDTirMode::RasterNTargetM)
+    if trigger.is_draw()
+        && state.coverage().tir_mode().value() == Some(&MaxwellThreeDTirMode::RasterNTargetM)
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedTirSemantics {
             control: state.coverage().tir_control().value().copied(),
         });
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some(value) = state
-        .coverage()
-        .hybrid_anti_alias_control()
-        .value()
-        .copied()
-        .filter(|value| !value.is_single_pass_per_fragment())
+    if trigger.is_draw()
+        && let Some(value) = state
+            .coverage()
+            .hybrid_anti_alias_control()
+            .value()
+            .copied()
+            .filter(|value| !value.is_single_pass_per_fragment())
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedHybridAntiAliasSemantics(value));
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some((group, value)) = state
-        .coverage()
-        .sample_locations()
-        .iter()
-        .enumerate()
-        .find_map(|(group, register)| {
-            register
-                .value()
-                .copied()
-                .filter(|value| !value.is_centered())
-                .map(|value| (group as u8, value))
-        })
-    {
-        return Err(
-            MaxwellThreeDLoweringError::UnsupportedSampleLocationsSemantics { group, value },
-        );
+    if trigger.is_draw() {
+        multisample::validate(state)?;
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state.ps_output_sample_mask_effective() == Some(true)
-    {
-        return Err(MaxwellThreeDLoweringError::UnsupportedPsOutputSampleMaskSemantics);
-    }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) {
+    if trigger.is_draw() {
         draw_viewport_transform(state)?;
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && let Some((viewport, swizzle)) = state
-        .fixed_function()
-        .viewport()
-        .iter()
-        .enumerate()
-        .find_map(|(viewport, state)| {
-            state
-                .coordinate_swizzle()
-                .value()
-                .copied()
-                .filter(|swizzle| !swizzle.is_identity())
-                .map(|swizzle| (viewport as u8, swizzle))
-        })
+    if trigger.is_draw()
+        && let Some((viewport, swizzle)) = state
+            .fixed_function()
+            .viewport()
+            .iter()
+            .enumerate()
+            .find_map(|(viewport, state)| {
+                state
+                    .coordinate_swizzle()
+                    .value()
+                    .copied()
+                    .filter(|swizzle| !swizzle.is_identity())
+                    .map(|swizzle| (viewport as u8, swizzle))
+            })
     {
         return Err(
             MaxwellThreeDLoweringError::UnsupportedViewportCoordinateSwizzleSemantics {
@@ -1627,34 +1600,27 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             },
         );
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable)
-        .value()
-        == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+    if trigger.is_draw()
+        && state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable)
+            .value()
+            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedWindowClipSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) && state
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable)
-        .value()
-        == Some(&MaxwellThreeDFixedFunctionValue::ClipIdTestEnable(
-            MaxwellThreeDClipIdTestEnable::Enabled,
-        ))
+    if trigger.is_draw()
+        && state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable)
+            .value()
+            == Some(&MaxwellThreeDFixedFunctionValue::ClipIdTestEnable(
+                MaxwellThreeDClipIdTestEnable::Enabled,
+            ))
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedClipIdTestSemantics);
     }
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) {
+    if trigger.is_draw() {
         if state.viewport().pixel_center().value()
             == Some(&MaxwellThreeDViewportPixelCenter::Integers)
         {
@@ -1735,14 +1701,12 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     }
     let mut draw_attachments = match trigger {
         MaxwellThreeDOperationTrigger::ClearSurface { .. } => None,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => {
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+        | MaxwellThreeDOperationTrigger::DrawIndexBuffer { .. } => {
             Some(select_draw_attachments(state, resources)?)
         }
     };
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) {
+    if trigger.is_draw() {
         let attachments = draw_attachments
             .as_mut()
             .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?;
@@ -1802,21 +1766,16 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         draw_attachments.as_ref(),
         cache,
     )?;
-    if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) {
+    if trigger.is_draw() {
         validate_draw_stencil_state(state)?;
     }
-    let shaders = if matches!(
-        trigger,
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
-    ) {
+    let shaders = if trigger.is_draw() {
         Some(translated_shaders.ok_or(MaxwellThreeDLoweringError::ShaderTranslationRequired)?)
     } else {
         None
     };
     if let Some(shaders) = shaders {
+        multisample::validate_shader_mask(state, shaders, cache)?;
         validate_visible_call_limit(state, shaders)?;
         validate_shader_memory_configuration(state, shaders)?;
     }
@@ -1843,10 +1802,8 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             record_clear_materialization(state, resources, cache)?;
             lowered
         }
-        MaxwellThreeDOperationTrigger::DrawVertexArray {
-            source: _,
-            vertex_count,
-        } => {
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+        | MaxwellThreeDOperationTrigger::DrawIndexBuffer { .. } => {
             let attachments = draw_attachments
                 .as_ref()
                 .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?;
@@ -1857,13 +1814,13 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
                 &sampler_bindings,
                 shaders.ok_or(MaxwellThreeDLoweringError::ShaderTranslationRequired)?,
                 attachments,
-                vertex_count,
+                draw_arguments(state, trigger)?,
                 tessellation,
                 raster_state.expect("draw consumes raster state"),
                 cache,
                 &mut creations,
             )?;
-            record_draw_color_materializations(state, resources, attachments, cache)?;
+            record_draw_color_materializations(resources, attachments, cache)?;
             lowered
         }
     };
@@ -2152,7 +2109,8 @@ fn validate_compressed_depth_materialization(
             .map_or((false, false), |surface| {
                 (surface.depth(), surface.stencil())
             }),
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => {
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+        | MaxwellThreeDOperationTrigger::DrawIndexBuffer { .. } => {
             if draw_attachments.is_some_and(|attachments| attachments.depth_stencil == Some(index))
             {
                 draw_depth_stencil_aspects(state)
@@ -2248,17 +2206,18 @@ fn record_clear_materialization(
         .value()
         .copied()
         .ok_or(MaxwellThreeDLoweringError::IncompleteClear("CLEAR_SURFACE"))?;
-    if surface.color_mask() != 0
-        && state.render_targets().color()[surface.color_target() as usize]
-            .compression()
-            .value()
-            == Some(&MaxwellThreeDColorCompressionMode::Enabled)
-    {
+    if surface.color_mask() != 0 {
         let index = resource_index(
             resources,
             MaxwellThreeDResourceRole::ColorTarget(surface.color_target()),
         )?;
-        record_color_materialization(resolved_image(resources, index)?, cache);
+        let image = resolved_image(resources, index)?;
+        // Track the same storage requirement consumed by validation and
+        // resource creation. MSAA sample storage needs a resident image even
+        // when compression of subsequent writes is disabled or unspecified.
+        if image.guest_layout().requires_materialization() {
+            record_color_materialization(image, cache);
+        }
     }
     if surface.depth() || surface.stencil() {
         let index = resource_index(resources, MaxwellThreeDResourceRole::DepthStencilTarget)?;
@@ -2287,19 +2246,16 @@ fn record_clear_materialization(
 }
 
 fn record_draw_color_materializations(
-    state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
     attachments: &DrawAttachmentSelection,
     cache: &mut MaxwellThreeDLoweringCache,
 ) -> Result<(), MaxwellThreeDLoweringError> {
-    for target in attachments.color_targets().filter(|target| {
-        state.render_targets().color()[*target as usize]
-            .compression()
-            .value()
-            == Some(&MaxwellThreeDColorCompressionMode::Enabled)
-    }) {
+    for target in attachments.color_targets() {
         let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
-        record_color_materialization(resolved_image(resources, index)?, cache);
+        let image = resolved_image(resources, index)?;
+        if image.guest_layout().requires_materialization() {
+            record_color_materialization(image, cache);
+        }
     }
     Ok(())
 }
@@ -2353,7 +2309,8 @@ fn validate_compressed_color_materialization(
                 )?;
             }
         }
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => {
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+        | MaxwellThreeDOperationTrigger::DrawIndexBuffer { .. } => {
             for target in draw_attachments
                 .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?
                 .color_targets()
@@ -2376,11 +2333,21 @@ fn validate_compressed_color_target(
         .compression()
         .value()
         != Some(&MaxwellThreeDColorCompressionMode::Enabled)
+        && state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::SampleMode)
+            .value()
+            != Some(&MaxwellThreeDFixedFunctionValue::SampleMode(
+                super::MaxwellThreeDSampleMode::Samples2x2,
+            ))
     {
         return Ok(());
     }
     let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
     let image = resolved_image(resources, index)?;
+    if !image.guest_layout().requires_materialization() {
+        return Ok(());
+    }
     if cache
         .color_materializations
         .iter()
@@ -2425,13 +2392,20 @@ fn operation_resource_indices(
             }
             indices
         }
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => draw_resource_indices(
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+        | MaxwellThreeDOperationTrigger::DrawIndexBuffer { .. } => draw_resource_indices(
             state,
             resources,
             draw_attachments.ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?,
             shaders.ok_or(MaxwellThreeDLoweringError::ShaderTranslationRequired)?,
         )?,
     };
+    if trigger.is_indexed() {
+        indices.push(resource_index(
+            resources,
+            MaxwellThreeDResourceRole::IndexBuffer,
+        )?);
+    }
     indices.sort_unstable();
     indices.dedup();
     Ok(indices)
@@ -3306,16 +3280,12 @@ fn lower_draw(
     sampler_bindings: &[(MaxwellThreeDResourceRole, ResourceDependency)],
     shaders: &MaxwellThreeDTranslatedShaders,
     attachment_selection: &DrawAttachmentSelection,
-    vertex_count: u32,
+    arguments: DrawArguments,
     tessellation: Option<nixe_gpu::TessellationState>,
     raster: raster::DrawRasterState,
     cache: &mut MaxwellThreeDLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
 ) -> Result<(Vec<GpuOperation>, Arc<[usize]>), MaxwellThreeDLoweringError> {
-    let arguments = draw_arguments(state, vertex_count)?;
-    let DrawArguments::NonIndexed { first_vertex, .. } = arguments else {
-        unreachable!("Maxwell vertex-array draw arguments are non-indexed")
-    };
     validate_shader_stages(state, shaders)?;
     for translated in &shaders.shaders {
         let record = cache
@@ -3434,6 +3404,16 @@ fn lower_draw(
     {
         MaxwellThreeDFillViaTriangleMode::Disabled => raster.triangles,
         MaxwellThreeDFillViaTriangleMode::FillBoundingBox => {
+            let DrawArguments::NonIndexed {
+                first_vertex,
+                vertex_count,
+                ..
+            } = arguments
+            else {
+                return Err(MaxwellThreeDLoweringError::UnsupportedFillRectangleDraw(
+                    "indexed rectangle expansion",
+                ));
+            };
             if topology != PrimitiveTopology::Triangles {
                 return Err(MaxwellThreeDLoweringError::UnsupportedFillRectangleDraw(
                     "primitive topology is not a triangle list",
@@ -3466,7 +3446,26 @@ fn lower_draw(
     if attachments.is_empty() {
         return Err(MaxwellThreeDLoweringError::IncompleteDraw("render target"));
     }
-    let required_indices = draw_resource_indices(state, resources, attachment_selection, shaders)?;
+    let mut required_indices =
+        draw_resource_indices(state, resources, attachment_selection, shaders)?;
+    let index_buffer = if matches!(arguments, DrawArguments::Indexed { .. }) {
+        let index = resource_index(resources, MaxwellThreeDResourceRole::IndexBuffer)?;
+        required_indices.push(index);
+        let buffer = resolved_buffer(resources, index)?;
+        Some((
+            BufferRegion {
+                buffer: buffer_dependency(binding_at(resources, bindings, index)?)?,
+                range: BufferRange::new(0, buffer.description().size()).map_err(|_| {
+                    MaxwellThreeDLoweringError::InvalidResolvedView {
+                        role: buffer.role(),
+                    }
+                })?,
+            },
+            indexed::index_type(state)?,
+        ))
+    } else {
+        None
+    };
     reject_draw_aliases(
         resources,
         &required_indices,
@@ -3619,7 +3618,7 @@ fn lower_draw(
         topology,
         descriptor_tables,
         vertex_buffers,
-        None,
+        index_buffer,
     )
     .map_err(MaxwellThreeDLoweringError::Command)?;
     draw = draw.with_triangle_rasterization(triangle_rasterization);
@@ -3669,6 +3668,7 @@ fn lower_draw(
         ),
     ];
     let record = PreparedDrawRecord {
+        indexed: matches!(arguments, DrawArguments::Indexed { .. }),
         state: state.draw_state_identity(),
         resources: resources.identity(),
         shaders: shaders.identity(),
@@ -3817,8 +3817,14 @@ fn neutral_first_instance(base: u32, relative: u32) -> Result<u32, MaxwellThreeD
 
 fn draw_arguments(
     state: &MaxwellThreeDState,
-    vertex_count: u32,
+    trigger: MaxwellThreeDOperationTrigger,
 ) -> Result<DrawArguments, MaxwellThreeDLoweringError> {
+    if let MaxwellThreeDOperationTrigger::DrawIndexBuffer { index_count, .. } = trigger {
+        return indexed::draw_arguments(state, index_count);
+    }
+    let MaxwellThreeDOperationTrigger::DrawVertexArray { vertex_count, .. } = trigger else {
+        unreachable!("only drawing triggers have draw arguments")
+    };
     if vertex_count == 0 {
         return Err(MaxwellThreeDLoweringError::EmptyDraw);
     }
@@ -4131,6 +4137,8 @@ fn take_identity(
 /// Typed failure before any cache or backend effect is published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDLoweringError {
+    UnsupportedMultisampleState(&'static str),
+    ResolveSourceNotResident,
     UnsupportedPolygonRasterization(&'static str),
     UnsupportedWindowOrigin(u32),
     ContradictoryState {
@@ -4150,6 +4158,9 @@ pub enum MaxwellThreeDLoweringError {
     UnsupportedPostZPixelShaderImaskSemantics,
     UnsupportedPixelShaderInterlockSemantics(MaxwellThreeDPixelShaderInterlockControl),
     UnsupportedGlobalBaseVertexIndex(u32),
+    UnsupportedVertexIdBase(u32),
+    UnsupportedIndexFormat(super::MaxwellThreeDIndexElementSize),
+    UnsupportedIndexedDraw(&'static str),
     UnsupportedCsaaSemantics,
     UnsupportedAntiAliasAlphaControl {
         alpha_to_coverage: bool,
@@ -4325,6 +4336,8 @@ pub enum MaxwellThreeDLoweringError {
 impl Display for MaxwellThreeDLoweringError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ResolveSourceNotResident => formatter.write_str("Maxwell color resolve requires a current, fully initialized resident multisample source"),
+            Self::UnsupportedMultisampleState(reason) => write!(formatter, "Maxwell multisample state has no neutral lowering: {reason}"),
             Self::UnsupportedPolygonRasterization(reason) => write!(formatter, "MAXWELL_B polygon rasterization is unsupported: {reason}"),
             Self::UnsupportedWindowOrigin(value) => write!(formatter,
                 "MAXWELL_B window origin/flip has no neutral coordinate lowering: value=0x{value:x}"),
@@ -4369,6 +4382,12 @@ impl Display for MaxwellThreeDLoweringError {
                 formatter,
                 "MAXWELL_B global base vertex index cannot be represented independently from vertex-buffer addressing: value={value}"
             ),
+            Self::UnsupportedVertexIdBase(value) => write!(
+                formatter,
+                "MAXWELL_B SET_VERTEX_ID_BASE requires an independent shader vertex-ID adjustment: value=0x{value:08x}"
+            ),
+            Self::UnsupportedIndexFormat(format) => write!(formatter, "Maxwell index format has no neutral representation: {format:?}"),
+            Self::UnsupportedIndexedDraw(reason) => write!(formatter, "Maxwell indexed draw is not represented: {reason}"),
             Self::UnsupportedCsaaSemantics => formatter.write_str(
                 "MAXWELL_B enabled CSAA has no verified coverage sampling, resolve, capability, or coherency semantics",
             ),

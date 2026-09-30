@@ -1836,7 +1836,10 @@ impl MaxwellThreeDStateWrite {
                 | MaxwellThreeDVertexInputWrite::IndexAddressUpper { .. }
                 | MaxwellThreeDVertexInputWrite::IndexAddressLower { .. }
                 | MaxwellThreeDVertexInputWrite::IndexLimitUpper { .. }
-                | MaxwellThreeDVertexInputWrite::IndexLimitLower { .. },
+                | MaxwellThreeDVertexInputWrite::IndexLimitLower { .. }
+                | MaxwellThreeDVertexInputWrite::IndexElementSize { .. }
+                | MaxwellThreeDVertexInputWrite::IndexFirst { .. }
+                | MaxwellThreeDVertexInputWrite::IndexCount { .. },
             ) => MaxwellThreeDResourceSemanticWrites {
                 vertex_resources: true,
                 ..MaxwellThreeDResourceSemanticWrites::default()

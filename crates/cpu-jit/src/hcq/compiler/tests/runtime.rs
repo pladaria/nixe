@@ -24,12 +24,18 @@ mod flags;
 mod memory;
 
 #[test]
-fn hcq_vector_multiply_executes_all_shapes_natively() {
+fn hcq_vector_binary_executes_all_shapes_natively() {
     use nixe_cpu_interpreter::execute_one;
-    for (word, wide, full) in [
-        (0x6e3c_dfbd, false, true),
-        (0x2e3c_dfbd, false, false),
-        (0x6e7c_dfbd, true, true),
+    for (word, wide, full, result) in [
+        (0x6e3c_dfbd, false, true, [6.0, -32.0, 0.75, -0.0]),
+        (0x2e3c_dfbd, false, false, [6.0, -32.0, 0.75, -0.0]),
+        (0x6e7c_dfbd, true, true, [6.0, -32.0, 0.75, -0.0]),
+        (0x4e3c_d7bd, false, true, [5.5, 6.0, 2.0, -4.0]),
+        (0x0e3c_d7bd, false, false, [5.5, 6.0, 2.0, -4.0]),
+        (0x4e7c_d7bd, true, true, [5.5, 6.0, 2.0, -4.0]),
+        (0x4ebc_d7bd, false, true, [-2.5, -10.0, 4.0, 4.0]),
+        (0x0ebc_d7bd, false, false, [-2.5, -10.0, 4.0, 4.0]),
+        (0x4efc_d7bd, true, true, [-2.5, -10.0, 4.0, 4.0]),
     ] {
         let words = [word, word, 0xd420_0000];
         let graph = graph(&[(0x1000, &words)]);
@@ -89,16 +95,13 @@ fn hcq_vector_multiply_executes_all_shapes_natively() {
         } else {
             u128::from(u64::MAX)
         };
-        assert_eq!(
-            state.vector(29),
-            Some(pack([6.0, -32.0, 0.75, -0.0]) & mask)
-        );
+        assert_eq!(state.vector(29), Some(pack(result) & mask));
         assert_eq!(state.fpsr(), 1 << 27);
     }
 }
 
 #[test]
-fn hcq_fused_element_reads_and_updates_the_vector_accumulator() {
+fn hcq_fused_reads_and_updates_the_vector_accumulator() {
     #[cfg(target_arch = "x86_64")]
     if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
         // Baseline x86 terminates capture at each exact FMA boundary, covered
@@ -106,7 +109,13 @@ fn hcq_fused_element_reads_and_updates_the_vector_accumulator() {
         return;
     }
     use nixe_cpu_interpreter::execute_one;
-    let words = [0x4f99_12fb, 0x4f99_5afb, 0xd420_0000];
+    let words = [
+        0x4f99_12fb, // FMLA V27.4S, V23.4S, V25.S[0]
+        0x4f99_5afb, // FMLS V27.4S, V23.4S, V25.S[1]
+        0x4e39_cefb, // FMLA V27.4S, V23.4S, V25.4S
+        0x4ebb_cf7b, // FMLS V27.4S, V27.4S, V27.4S
+        0xd420_0000,
+    ];
     let graph = graph(&[(0x1000, &words)]);
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         if abi == HostAbi::X86_64 && !cfg!(target_arch = "x86_64") {
@@ -131,7 +140,7 @@ fn hcq_fused_element_reads_and_updates_the_vector_accumulator() {
     state.set_vector(25, pack([2.0, 3.0, 4.0, 5.0]));
     state.set_vector(27, pack([0.5; 4]));
     let mut expected = state.clone();
-    for word in &words[..2] {
+    for word in &words[..words.len() - 1] {
         execute_one(
             &nixe_cpu::platform::TargetPlatform::Switch1,
             &mut expected,
@@ -159,15 +168,15 @@ fn hcq_fused_element_reads_and_updates_the_vector_accumulator() {
             panic!("expected native exit")
         };
         match guest.kind {
-            EdgeKind::VectorFpFusedElement(operation) => {
-                crate::lcq::fp::complete_vector_fused_element(operation, &mut state).unwrap()
+            EdgeKind::VectorFpFused(operation) => {
+                crate::lcq::fp::complete_vector_fused(operation, &mut state).unwrap()
             }
             EdgeKind::Breakpoint(0) => break,
             other => panic!("{other:?}"),
         }
     }
     assert_eq!(state, expected);
-    assert_eq!(state.vector(27), Some(pack([-2.5, -4.5, -6.5, -8.5])));
+    assert_eq!(state.vector(27), Some(pack([0.25, -6.0, -48.75, -182.0])));
 }
 
 #[test]

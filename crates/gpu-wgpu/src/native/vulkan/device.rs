@@ -126,6 +126,7 @@ pub(crate) fn create_device(
             hal.get_physical_device_features().get_core(),
         );
         let capabilities = VulkanNativeCapabilities {
+            standard_sample_locations: properties.limits.standard_sample_locations != vk::FALSE,
             tessellation_shader: core.tessellation_shader != vk::FALSE,
             raster: crate::VulkanRasterCapabilities {
                 wireframe: core.fill_mode_non_solid != vk::FALSE,

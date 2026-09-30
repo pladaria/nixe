@@ -1,4 +1,5 @@
-//! Bit-exact GPU oracle for the native emitter, not part of production rendering.
+//! GPU numeric oracle for native SPIR-V and portable absorbing-zero multiply.
+//! Finite/Inf/zero results are bit-exact; propagated NaN payloads are unspecified.
 use super::*;
 use nixe_gpu::*;
 use wgpu::util::DeviceExt;
@@ -12,7 +13,11 @@ use ShaderRegister as R;
 fn shader(operator: u8) -> VerifiedShaderIr {
     let control = ShaderFloatControl::new(
         ShaderRoundingMode::NearestEven,
-        ShaderNanMode::Canonicalize,
+        if operator == 5 {
+            ShaderNanMode::Propagate
+        } else {
+            ShaderNanMode::Canonicalize
+        },
         true,
         true,
         false,
@@ -76,6 +81,12 @@ fn shader(operator: u8) -> VerifiedShaderIr {
             } else {
                 Ty::Unsigned32
             },
+        },
+        5 => Op::FloatMultiplyZero32 {
+            destination: R::new(5),
+            left: R::new(2),
+            right: R::new(3),
+            float_control: control,
         },
         _ => unreachable!(),
     });
@@ -146,6 +157,7 @@ fn cases() -> Vec<[u32; 3]> {
         0x7f80_0000,
         0xff80_0000,
         0x7fc0_0001,
+        0x7f80_0001,
         0x7f7f_ffff,
     ];
     for a in special {
@@ -374,6 +386,16 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
             .into(),
         ),
     });
+    // The portable interface packs Generic locations into vec4, while native
+    // SPIR-V declares only the live scalar component.
+    let vs_wgsl = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(r#"
+struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(flat) index: vec4<u32> }
+@vertex fn main(@location(0) xy: vec2<f32>, @location(1) index: u32) -> Out {
+    var o: Out; o.position = vec4<f32>(xy, 0.0, 1.0); o.index = vec4<u32>(index, 0u, 0u, 0u); return o;
+}"#.into()),
+    });
     // One pixel rectangle per input; the flat integer is independent of float
     // interpolation and reaches the emitted shader without conversions.
     let mut vertices = Vec::new();
@@ -399,7 +421,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
         contents: &vertices,
         usage: wgpu::BufferUsages::VERTEX,
     });
-    for operator in 0..5 {
+    for (operator, wgsl) in (0..6).map(|op| (op, false)).chain([(5, true)]) {
         if operator == 2 && !caps.float32.fused_multiply_add {
             eprintln!(
                 "SKIP FMA GPU oracle: shaderFmaFloat32 unavailable (addition/multiplication still checked)"
@@ -423,22 +445,32 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
         validate(&module);
         // SAFETY: validated SPIR-V; numerical features enabled on the imported
         // device, descriptors/interfaces explicitly match this test pipeline.
-        let fs = unsafe {
-            device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                label: Some("emitted arithmetic oracle"),
-                spirv: Some(std::borrow::Cow::Borrowed(module.words())),
-                entry_points: std::borrow::Cow::Borrowed(&[wgpu::PassthroughShaderEntryPoint {
-                    name: "main".into(),
-                    workgroup_size: (0, 0, 0),
-                }]),
-                ..Default::default()
+        let fs = if wgsl {
+            let module = lower_shader_ir_to_wgsl(&ir).unwrap();
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("WGSL absorbing-zero multiply oracle"),
+                source: wgpu::ShaderSource::Wgsl(module.source().into()),
             })
+        } else {
+            unsafe {
+                device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                    label: Some("emitted arithmetic oracle"),
+                    spirv: Some(std::borrow::Cow::Borrowed(module.words())),
+                    entry_points: std::borrow::Cow::Borrowed(&[
+                        wgpu::PassthroughShaderEntryPoint {
+                            name: "main".into(),
+                            workgroup_size: (0, 0, 0),
+                        },
+                    ]),
+                    ..Default::default()
+                })
+            }
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: Some(&layout),
             vertex: wgpu::VertexState {
-                module: &vs,
+                module: if wgsl { &vs_wgsl } else { &vs },
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
@@ -533,13 +565,20 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
                 .output_bits(Loc::Color(0), 0)
                 .unwrap();
             let actual = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            if operator == 5 && f32::from_bits(expected).is_nan() {
+                assert!(
+                    f32::from_bits(actual).is_nan(),
+                    "NaN propagation case={i}, wgsl={wgsl}"
+                );
+                continue;
+            }
             assert_eq!(
                 actual, expected,
-                "operator={operator}, case={i}, operands={values:08x?}, GPU={actual:08x}, IR={expected:08x}"
+                "operator={operator}, wgsl={wgsl}, case={i}, operands={values:08x?}, GPU={actual:08x}, IR={expected:08x}"
             );
         }
         eprintln!(
-            "operator {operator}: {} bit-exact pixels passed",
+            "operator {operator}, wgsl={wgsl}: {} numeric pixels passed",
             cases.len()
         );
         drop(bytes);

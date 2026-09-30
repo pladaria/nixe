@@ -165,9 +165,9 @@ pub use engines::{
     MaxwellTwoDPixelsFromMemoryCorralSize, MaxwellTwoDPixelsFromMemorySafeOverlap,
     MaxwellTwoDPixelsFromMemoryState, MaxwellTwoDProcessingClusters, MaxwellTwoDRegister,
     MaxwellTwoDRegisterOrigin, MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState,
-    MaxwellTwoDState, lower_maxwell_compute_synchronization, lower_maxwell_three_d_operation,
-    lower_maxwell_three_d_synchronization, resolve_maxwell_three_d_resources,
-    resolve_maxwell_three_d_resources_for_roles,
+    MaxwellTwoDResolveOperation, MaxwellTwoDState, lower_maxwell_compute_synchronization,
+    lower_maxwell_three_d_operation, lower_maxwell_three_d_synchronization,
+    resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
 };
 pub use execution::{
     MaxwellBackendExecution, MaxwellBackendExecutionError, MaxwellBackendSegment,

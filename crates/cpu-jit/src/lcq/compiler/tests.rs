@@ -33,8 +33,9 @@ mod polling;
 mod shape;
 mod simd;
 mod system;
+mod vector_fp_add;
 mod vector_fp_divide;
-mod vector_fp_fused_element;
+mod vector_fp_fused;
 mod vector_fp_multiply;
 mod vector_integer_to_fp;
 

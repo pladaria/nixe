@@ -141,6 +141,7 @@ impl MaxwellThreeDVertexIdUsesArrayStart {
 pub struct MaxwellThreeDVertexAssemblyState {
     attribute_defaults: MaxwellThreeDRegister<MaxwellThreeDAttributeDefaults>,
     vertex_id_uses_array_start: MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart>,
+    vertex_id_base: MaxwellThreeDRegister<u32>,
     global_base_vertex_index: MaxwellThreeDRegister<u32>,
     global_base_instance_index: MaxwellThreeDRegister<u32>,
 }
@@ -158,6 +159,14 @@ impl MaxwellThreeDVertexAssemblyState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart> {
         &self.vertex_id_uses_array_start
+    }
+
+    /// The independently programmed vertex-ID base, not a vertex-buffer offset.
+    ///
+    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1378-L1379
+    #[must_use]
+    pub const fn vertex_id_base(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.vertex_id_base
     }
 
     /// Base added to the vertex index presented to shader execution.
@@ -468,10 +477,15 @@ pub struct MaxwellThreeDIndexBufferState {
     limit_upper: MaxwellThreeDRegister<u8>,
     limit_lower: MaxwellThreeDRegister<u32>,
     element_size: MaxwellThreeDRegister<MaxwellThreeDIndexElementSize>,
+    count: MaxwellThreeDRegister<u32>,
     first: MaxwellThreeDRegister<u32>,
 }
 
 impl MaxwellThreeDIndexBufferState {
+    #[must_use]
+    pub const fn count(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.count
+    }
     #[must_use]
     pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
         &self.address_upper
@@ -924,6 +938,9 @@ impl MaxwellThreeDVertexInputState {
             MaxwellThreeDVertexInputWrite::IndexFirst { value, .. } => {
                 self.index.first = MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDVertexInputWrite::IndexCount { value, .. } => {
+                self.index.count = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDVertexInputWrite::TopologyOverride { value, .. } => {
                 self.primitive.topology_override =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -976,6 +993,9 @@ impl MaxwellThreeDVertexInputState {
                 self.assembly.global_base_vertex_index =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDVertexInputWrite::VertexIdBase { value, .. } => {
+                self.assembly.vertex_id_base = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDVertexInputWrite::GlobalBaseInstanceIndex { value, .. } => {
                 self.assembly.global_base_instance_index =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -994,6 +1014,10 @@ impl MaxwellThreeDVertexInputState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDVertexInputWrite {
+    IndexCount {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     BalancedPrimitiveWorkload {
         value: MaxwellThreeDBalancedPrimitiveWorkload,
         source: MaxwellMethodSource,
@@ -1114,6 +1138,10 @@ pub enum MaxwellThreeDVertexInputWrite {
         value: u32,
         source: MaxwellMethodSource,
     },
+    VertexIdBase {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     GlobalBaseInstanceIndex {
         value: u32,
         source: MaxwellMethodSource,
@@ -1148,6 +1176,7 @@ impl MaxwellThreeDVertexInputWrite {
             | Self::IndexLimitLower { source, .. }
             | Self::IndexElementSize { source, .. }
             | Self::IndexFirst { source, .. }
+            | Self::IndexCount { source, .. }
             | Self::TopologyOverride { source, .. }
             | Self::Topology { source, .. }
             | Self::VertexArrayPrimitiveRestartEnable { source, .. }
@@ -1159,6 +1188,7 @@ impl MaxwellThreeDVertexInputWrite {
             | Self::AttributeDefaults { source, .. }
             | Self::VertexIdUsesArrayStart { source, .. }
             | Self::GlobalBaseVertexIndex { source, .. }
+            | Self::VertexIdBase { source, .. }
             | Self::GlobalBaseInstanceIndex { source, .. }
             | Self::StreamSubstituteAddressUpper { source, .. }
             | Self::StreamSubstituteAddressLower { source, .. } => source,
