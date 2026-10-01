@@ -1,5 +1,14 @@
-use super::*;
-use nixe_gpu::{ShaderEvaluationInputs, evaluate_shader_ir};
+use super::super::conversion::decode_integer_to_float;
+use super::super::error::MaxwellShaderTranslationError;
+use super::{
+    decode_float_add, decode_float_fused_multiply_add, decode_float_multiply, is_float_multiply,
+};
+use crate::MaxwellShaderStage;
+use nixe_gpu::{
+    ShaderEvaluationInputs, ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderIr,
+    ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType, ShaderSourceLocation,
+    ShaderStage, VerifiedShaderIr, evaluate_shader_ir,
+};
 
 #[test]
 fn untranslated_float_cc_writes_cannot_preserve_a_stale_integer_carry() {

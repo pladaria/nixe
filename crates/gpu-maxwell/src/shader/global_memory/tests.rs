@@ -1,4 +1,5 @@
 use super::*;
+use nixe_gpu::ShaderSourceLocation;
 
 const STORE: u64 = 0xeedc_2000_0007_00ff;
 

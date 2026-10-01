@@ -9,7 +9,15 @@
 //! https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_lowering_gm107.cpp#L236-L254
 //! https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L2487-L2515
 //! https://envytools.readthedocs.io/en/latest/hw/graph/maxwell/cuda/int.html#multiply-add-xmad
-use super::*;
+use super::decode::{allocate_shader_temporary, decode_predicate, validate_register_range};
+use super::error::{MaxwellShaderTranslationError, malformed};
+use super::interface::{attribute_location, interface_element, is_attribute_load};
+use super::tessellation;
+use crate::MaxwellShaderStage;
+use nixe_gpu::{
+    ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderOperation, ShaderPredicate,
+    ShaderRegister, ShaderScalarType,
+};
 
 #[cfg(test)]
 mod tests;
