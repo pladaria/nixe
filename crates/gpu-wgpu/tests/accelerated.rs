@@ -18,6 +18,9 @@ mod texel_fetch;
 #[path = "accelerated/multiple_targets.rs"]
 mod multiple_targets;
 
+#[path = "accelerated/compute.rs"]
+mod compute;
+
 use hardware::initialize_backend;
 use nixe_gpu::{
     AttachmentLoad, AttachmentStore, BackendInstanceId, BackendResourceCreateInfo,

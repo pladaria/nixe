@@ -5,7 +5,6 @@ mod color_reduction;
 mod constant_color;
 mod counters;
 mod coverage;
-mod draw;
 mod falcon;
 mod inline_to_memory;
 mod instrumentation;
@@ -18,22 +17,26 @@ mod render_enable;
 mod render_targets;
 mod resource;
 mod shader_execution;
-mod state;
+pub(super) mod state;
 pub(super) mod tessellation;
 mod tiled_cache;
 mod vertex;
 pub use tessellation::{MaxwellTessellationModeError, MaxwellThreeDTessellationMode};
 mod zcull;
 
+pub use super::lowering::{
+    MaxwellLoweredWork, MaxwellLoweringCache, MaxwellLoweringError, MaxwellThreeDOperationTrigger,
+    MaxwellThreeDShaderResourceUse, MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders,
+    lower_maxwell_three_d_operation,
+};
 pub use bindings::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT, MAXWELL_PIPELINE_SHADER_COUNT,
-    MAXWELL_TESSELLATION_LOD_COUNT, MaxwellThreeDBindGroupState,
+    MAXWELL_TESSELLATION_LOD_COUNT, MaxwellShaderStage, MaxwellThreeDBindGroupState,
     MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferLoadState,
     MaxwellThreeDConstantBufferSelectorState, MaxwellThreeDDescriptorPoolState,
     MaxwellThreeDInlineConstantBufferUpload, MaxwellThreeDPipelineBindingState,
     MaxwellThreeDProgramRegionState, MaxwellThreeDSamplerBindingMode,
-    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite, MaxwellThreeDShaderStage,
-    MaxwellThreeDTessellationLod,
+    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite, MaxwellThreeDTessellationLod,
 };
 pub use color_reduction::{
     MaxwellThreeDColorReductionFp16Threshold, MaxwellThreeDColorReductionSrgb8Threshold,
@@ -59,12 +62,6 @@ pub use coverage::{
     MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDSampleLocation,
     MaxwellThreeDSampleLocationGroup, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
     MaxwellThreeDTirModulationComponentSelect, MaxwellThreeDTirModulationFunction,
-};
-pub(crate) use draw::lower_maxwell_three_d_operation_into_cache;
-pub use draw::{
-    MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
-    MaxwellThreeDOperationTrigger, MaxwellThreeDShaderResourceUse, MaxwellThreeDTranslatedShader,
-    MaxwellThreeDTranslatedShaders, lower_maxwell_three_d_operation,
 };
 pub use falcon::{
     MaxwellThreeDFalconError, MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
@@ -3147,7 +3144,7 @@ fn preflight_vertex_and_binding_state(
         let field = (method - 0x2000) % 0x40;
         match field {
             0 if raw & !0x71 == 0 => {
-                let stage = MaxwellThreeDShaderStage::parse((raw >> 4) & 7).ok_or_else(|| {
+                let stage = MaxwellShaderStage::parse((raw >> 4) & 7).ok_or_else(|| {
                     invalid_encoding(source, "SET_PIPELINE_SHADER", "unknown shader stage")
                 })?;
                 Some((

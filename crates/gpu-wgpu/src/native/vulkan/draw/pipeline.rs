@@ -54,7 +54,7 @@ pub(super) struct NativePipeline {
     pub(super) pipeline: vk::Pipeline,
     pub(super) layout: vk::PipelineLayout,
     pub(super) pass: vk::RenderPass,
-    pub(super) shaders: SpirvTessellationShaders,
+    pub(super) shaders: NativeShaders,
     pub(super) set_layout: vk::DescriptorSetLayout,
     pub(super) descriptor_stages: vk::PipelineStageFlags,
     pub(super) descriptors: Mutex<descriptors::DescriptorArena>,
@@ -96,7 +96,7 @@ impl NativePipeline {
     pub(super) fn new(
         device: &Device,
         key: &PipelineKey,
-        shaders: SpirvTessellationShaders,
+        shaders: NativeShaders,
         capabilities: crate::VulkanNativeCapabilities,
         cache: &mut persistent_cache::NativePipelineCache,
     ) -> Result<Arc<Self>, BackendDriverError> {
@@ -226,13 +226,8 @@ impl NativePipeline {
         let stages: Vec<_> = modules
             .1
             .iter()
-            .zip([
-                vk::ShaderStageFlags::VERTEX,
-                vk::ShaderStageFlags::TESSELLATION_CONTROL,
-                vk::ShaderStageFlags::TESSELLATION_EVALUATION,
-                vk::ShaderStageFlags::FRAGMENT,
-            ])
-            .map(|(&module, stage)| {
+            .zip(p.shaders.stages())
+            .map(|(&module, &stage)| {
                 vk::PipelineShaderStageCreateInfo::default()
                     .module(module)
                     .stage(stage)
@@ -269,8 +264,13 @@ impl NativePipeline {
         let vertex = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings)
             .vertex_attribute_descriptions(&attributes);
-        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::PATCH_LIST);
+        let assembly =
+            vk::PipelineInputAssemblyStateCreateInfo::default().topology(match key.draw.topology {
+                PrimitiveTopology::Patches => vk::PrimitiveTopology::PATCH_LIST,
+                PrimitiveTopology::Lines => vk::PrimitiveTopology::LINE_LIST,
+                PrimitiveTopology::LineStrip => vk::PrimitiveTopology::LINE_STRIP,
+                _ => return Err(unsupported("native primitive topology")),
+            });
         // Neutral winding follows the lower-left GLSL domain. Vulkan defaults
         // to upper-left, reversing winding even though TessCoord is unchanged.
         // Do not compensate by changing frontFace or the viewport: both also
@@ -310,6 +310,15 @@ impl NativePipeline {
             raster = raster
                 .polygon_mode(vk::PolygonMode::LINE)
                 .push_next(&mut line);
+        } else if let Some(state) = key.draw.line_rasterization {
+            line.line_rasterization_mode = if state.smooth {
+                vk::LineRasterizationModeKHR::RECTANGULAR_SMOOTH
+            } else {
+                vk::LineRasterizationModeKHR::RECTANGULAR
+            };
+            // Direct line primitives keep polygonMode FILL; fillModeNonSolid
+            // is only needed for polygon wireframe, not for line strips.
+            raster = raster.push_next(&mut line);
         }
         let samples = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -337,18 +346,18 @@ impl NativePipeline {
         let count = if matches!(
             key.draw.triangle_rasterization,
             TriangleRasterization::Wireframe { .. }
-        ) {
+        ) || key.draw.line_rasterization.is_some()
+        {
             3
         } else {
             2
         };
         let dynamic =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states[..count]);
-        let info = vk::GraphicsPipelineCreateInfo::default()
+        let mut info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex)
             .input_assembly_state(&assembly)
-            .tessellation_state(&tess)
             .viewport_state(&viewport)
             .rasterization_state(&raster)
             .multisample_state(&samples)
@@ -357,6 +366,9 @@ impl NativePipeline {
             .dynamic_state(&dynamic)
             .layout(p.layout)
             .render_pass(p.pass);
+        if key.draw.tessellation.is_some() {
+            info = info.tessellation_state(&tess);
+        }
         p.pipeline = match unsafe {
             p.raw
                 .create_graphics_pipelines(cache.handle(), &[info], None)

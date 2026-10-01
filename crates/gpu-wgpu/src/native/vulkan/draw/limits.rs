@@ -109,7 +109,6 @@ pub(super) fn validate_limits(
         Ok((vertex, patch))
     }
     let vs = modules[0].as_ref().unwrap().ir().ir();
-    let te = modules[2].as_ref().unwrap().ir().ir();
     let fs = modules[3].as_ref().unwrap().ir().ir();
     if fs.outputs().iter().any(|output| {
         output.location() == nixe_gpu::ShaderIoLocation::Color(0)
@@ -120,43 +119,46 @@ pub(super) fn validate_limits(
         ));
     }
     usage(vs.outputs(), g.vertex_output_components, 0)?;
-    usage(
-        te.inputs(),
-        t.evaluation_input_components,
-        t.control_per_patch_output_components,
-    )?;
-    usage(te.outputs(), t.evaluation_output_components, 0)?;
     usage(fs.inputs(), g.fragment_input_components, 0)?;
-    let (points, vertex, patch) = if let Some(tc) = &modules[1] {
-        let tc = tc.ir().ir();
-        usage(tc.inputs(), t.control_per_vertex_input_components, 0)?;
-        let (v, p) = usage(
-            tc.outputs(),
-            t.control_per_vertex_output_components,
-            t.control_per_patch_output_components,
-        )?;
-        (tc.tessellation_control_points().unwrap(), v, p)
-    } else {
-        let (v, _) = usage(
+    if let Some(evaluation) = &modules[2] {
+        let te = evaluation.ir().ir();
+        usage(
             te.inputs(),
-            t.control_per_vertex_input_components
-                .min(t.control_per_vertex_output_components),
+            t.evaluation_input_components,
             t.control_per_patch_output_components,
         )?;
-        (
-            u32::from(draw.tessellation.unwrap().input_control_points),
-            v,
-            6,
-        )
-    };
-    if vertex
-        .checked_mul(points)
-        .and_then(|v| v.checked_add(patch))
-        .is_none_or(|v| v > t.control_total_output_components)
-    {
-        return Err(unsupported(
-            "native TCS total output exceeds physical limit",
-        ));
+        usage(te.outputs(), t.evaluation_output_components, 0)?;
+        let (points, vertex, patch) = if let Some(tc) = &modules[1] {
+            let tc = tc.ir().ir();
+            usage(tc.inputs(), t.control_per_vertex_input_components, 0)?;
+            let (v, p) = usage(
+                tc.outputs(),
+                t.control_per_vertex_output_components,
+                t.control_per_patch_output_components,
+            )?;
+            (tc.tessellation_control_points().unwrap(), v, p)
+        } else {
+            let (v, _) = usage(
+                te.inputs(),
+                t.control_per_vertex_input_components
+                    .min(t.control_per_vertex_output_components),
+                t.control_per_patch_output_components,
+            )?;
+            (
+                u32::from(draw.tessellation.unwrap().input_control_points),
+                v,
+                6,
+            )
+        };
+        if vertex
+            .checked_mul(points)
+            .and_then(|v| v.checked_add(patch))
+            .is_none_or(|v| v > t.control_total_output_components)
+        {
+            return Err(unsupported(
+                "native TCS total output exceeds physical limit",
+            ));
+        }
     }
     let layouts = &draw.vertex_buffers;
     if layouts.len() > g.vertex_input_bindings as usize

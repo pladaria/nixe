@@ -620,7 +620,7 @@ impl MaxwellThreeDBlendOp {
 #[repr(transparent)]
 pub struct MaxwellThreeDBlendFactor(u32);
 impl MaxwellThreeDBlendFactor {
-    pub(super) fn parse(raw: u32) -> Option<Self> {
+    pub(in crate::engines) fn parse(raw: u32) -> Option<Self> {
         const OGL: &[u32] = &[
             0x4000, 0x4001, 0x4300, 0x4301, 0x4302, 0x4303, 0x4304, 0x4305, 0x4306, 0x4307, 0x4308,
             0xc001, 0xc002, 0xc003, 0xc004, 0xc900, 0xc901, 0xc902, 0xc903,

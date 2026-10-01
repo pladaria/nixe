@@ -46,6 +46,10 @@ pub enum MaxwellComputeOperationTrigger {
         value: u32,
         source: MaxwellMethodSource,
     },
+    InvalidateShaderCaches {
+        caches: MaxwellComputeShaderCacheInvalidation,
+        source: MaxwellMethodSource,
+    },
     InvalidateShaderCachesNoWfi {
         caches: MaxwellComputeShaderCacheInvalidation,
         source: MaxwellMethodSource,
@@ -56,9 +60,9 @@ impl MaxwellComputeOperationTrigger {
     #[must_use]
     pub const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::WaitForIdle { source, .. } | Self::InvalidateShaderCachesNoWfi { source, .. } => {
-                source
-            }
+            Self::WaitForIdle { source, .. }
+            | Self::InvalidateShaderCaches { source, .. }
+            | Self::InvalidateShaderCachesNoWfi { source, .. } => source,
         }
     }
 }
@@ -97,6 +101,10 @@ pub enum MaxwellComputeSynchronizationPlan {
     /// `prior_work_pending` tells the execution layer whether it must drain an
     /// emitted prefix or whether the barrier is already observably satisfied.
     WaitForIdle { prior_work_pending: bool },
+    InvalidateShaderCaches {
+        caches: MaxwellComputeShaderCacheInvalidation,
+        prior_work_pending: bool,
+    },
     InvalidateShaderCachesNoWfi {
         caches: MaxwellComputeShaderCacheInvalidation,
     },
@@ -116,6 +124,12 @@ pub fn lower_maxwell_compute_synchronization(
     match operation.trigger() {
         MaxwellComputeOperationTrigger::WaitForIdle { .. } => {
             MaxwellComputeSynchronizationPlan::WaitForIdle {
+                prior_work_pending: prior_channel_work_pending,
+            }
+        }
+        MaxwellComputeOperationTrigger::InvalidateShaderCaches { caches, .. } => {
+            MaxwellComputeSynchronizationPlan::InvalidateShaderCaches {
+                caches,
                 prior_work_pending: prior_channel_work_pending,
             }
         }

@@ -109,6 +109,56 @@ fn native_wireframe_pipeline_key_excludes_width_but_includes_coverage_mode() {
 }
 
 #[test]
+fn native_direct_lines_cache_width_dynamically_and_do_not_require_wireframe() {
+    let line = |width: f32, smooth| {
+        let mut draw = prepared();
+        draw.tessellation = None;
+        draw.topology = PrimitiveTopology::LineStrip;
+        draw.line_rasterization = Some(LineRasterization {
+            width_bits: width.to_bits(),
+            smooth,
+        });
+        key(draw)
+    };
+    let a = line(1.0, true);
+    let b = line(16.0, true);
+    assert!(a == b);
+    let mut cache = HashMap::new();
+    cache.insert(a, 42);
+    assert_eq!(cache.get(&b), Some(&42));
+    assert!(b != line(16.0, false));
+    assert!(b != key(prepared()));
+    let caps = crate::VulkanRasterCapabilities {
+        wireframe: false,
+        wide_lines: true,
+        rectangular_lines: false,
+        smooth_lines: true,
+        line_width_range_bits: [1_f32.to_bits(), 16_f32.to_bits()],
+    };
+    raster::validate_line(b.draw.line_rasterization.unwrap(), caps).unwrap();
+    assert!(
+        raster::validate_line(
+            b.draw.line_rasterization.unwrap(),
+            crate::VulkanRasterCapabilities {
+                smooth_lines: false,
+                ..caps
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        raster::validate_line(
+            b.draw.line_rasterization.unwrap(),
+            crate::VulkanRasterCapabilities {
+                wide_lines: false,
+                ..caps
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn native_wireframe_consumes_features_and_width_limits_without_clamping() {
     let caps = crate::VulkanRasterCapabilities {
         wireframe: true,

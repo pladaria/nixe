@@ -170,13 +170,56 @@ pub fn lower_tessellation_shaders_to_spirv(
         )?,
         lower_shader_ir_to_spirv(fragment, base)?,
     ];
-    let mut bindings: [Option<SpirvPipelineBinding>; 256] = [None; 256];
-    for (module, stages) in modules.iter().zip([
+    let bindings = pipeline_bindings(modules.iter().zip([
         PipelineStages::VERTEX_SHADER,
         PipelineStages::TESSELLATION_CONTROL_SHADER,
         PipelineStages::TESSELLATION_EVALUATION_SHADER,
         PipelineStages::FRAGMENT_SHADER,
-    ]) {
+    ]))?;
+    Ok(SpirvTessellationShaders {
+        modules,
+        bindings,
+        input_control_points: options.input_control_points,
+        output_control_points,
+        required_default_levels,
+    })
+}
+
+/// Link a vertex/fragment chain for native rasterization without patch stages.
+pub fn lower_raster_shaders_to_spirv(
+    vertex: &VerifiedShaderIr,
+    fragment: &VerifiedShaderIr,
+    options: SpirvShaderOptions,
+) -> Result<([SpirvShaderModule; 2], Box<[SpirvPipelineBinding]>)> {
+    if vertex.ir().stage() != ShaderStage::Vertex || fragment.ir().stage() != ShaderStage::Fragment
+    {
+        return Err(SpirvShaderError::Options("incorrect raster stage chain"));
+    }
+    validate_shader_stage_link(vertex.ir(), fragment.ir())
+        .map_err(SpirvShaderError::StageInterface)?;
+    let vertex = vertex.prune_raster_outputs(
+        fragment
+            .ir()
+            .inputs()
+            .iter()
+            .map(|e| (e.location(), e.component())),
+    );
+    let modules = [
+        lower_shader_ir_to_spirv(&vertex, options)?,
+        lower_shader_ir_to_spirv(fragment, options)?,
+    ];
+    let bindings = pipeline_bindings(modules.iter().zip([
+        PipelineStages::VERTEX_SHADER,
+        PipelineStages::FRAGMENT_SHADER,
+    ]))?;
+    Ok((modules, bindings))
+}
+
+fn pipeline_bindings<'a>(
+    modules: impl Iterator<Item = (&'a SpirvShaderModule, PipelineStages)>,
+) -> Result<Box<[SpirvPipelineBinding]>> {
+    let mut bindings: [Option<SpirvPipelineBinding>; 256] = [None; 256];
+    for (module, stages) in modules {
         for &resource in module.bindings() {
             let entry = &mut bindings[usize::from(resource.binding())];
             if let Some(previous) = entry {
@@ -191,11 +234,5 @@ pub fn lower_tessellation_shaders_to_spirv(
             }
         }
     }
-    Ok(SpirvTessellationShaders {
-        modules,
-        bindings: bindings.into_iter().flatten().collect(),
-        input_control_points: options.input_control_points,
-        output_control_points,
-        required_default_levels,
-    })
+    Ok(bindings.into_iter().flatten().collect())
 }

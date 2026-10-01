@@ -19,7 +19,7 @@ mod default_control;
 mod pipeline;
 pub use pipeline::{
     SpirvPipelineBinding, SpirvTessellationOptions, SpirvTessellationShaders,
-    lower_tessellation_shaders_to_spirv,
+    lower_raster_shaders_to_spirv, lower_tessellation_shaders_to_spirv,
 };
 mod float;
 pub use default_control::{

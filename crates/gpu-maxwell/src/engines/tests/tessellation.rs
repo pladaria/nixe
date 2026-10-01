@@ -141,7 +141,7 @@ fn tessellation_modes_fail_at_consumption_with_method_provenance() {
     ] {
         program_three_d(&mut channel, 0x320, raw);
         assert!(
-            matches!(draw_state(channel.three_d()), Err(MaxwellThreeDLoweringError::TessellationMode { reason, source: Some(source), .. }) if reason == expected && source.argument() == raw)
+            matches!(draw_state(channel.three_d()), Err(MaxwellLoweringError::TessellationMode { reason, source: Some(source), .. }) if reason == expected && source.argument() == raw)
         );
     }
     program_three_d(&mut channel, 0x320, 0x201);
@@ -151,7 +151,7 @@ fn tessellation_modes_fail_at_consumption_with_method_provenance() {
     program_three_d(&mut channel, 0x20c0, 0x30);
     assert!(matches!(
         draw_state(channel.three_d()),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(
+        Err(MaxwellLoweringError::IncompleteDraw(
             "patch draw requires tessellation evaluation shader"
         ))
     ));
@@ -159,14 +159,14 @@ fn tessellation_modes_fail_at_consumption_with_method_provenance() {
     program_three_d(&mut channel, 0x2100, 0x41);
     assert!(matches!(
         draw_state(channel.three_d()),
-        Err(MaxwellThreeDLoweringError::UnsupportedShaderStage(
-            MaxwellThreeDShaderStage::Geometry
+        Err(MaxwellLoweringError::UnsupportedShaderStage(
+            MaxwellShaderStage::Geometry
         ))
     ));
     program_three_d(&mut channel, 0x1618, 4);
     assert!(matches!(
         draw_state(channel.three_d()),
-        Err(MaxwellThreeDLoweringError::TessellationStageTopology)
+        Err(MaxwellLoweringError::TessellationStageTopology)
     ));
 }
 
@@ -176,7 +176,7 @@ fn default_levels_preserve_bits_and_only_require_domain_consumed_lanes() {
     program_three_d(&mut channel, 0x2080, 0x20);
     assert!(matches!(
         draw_state(channel.three_d()),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(_))
+        Err(MaxwellLoweringError::IncompleteDraw(_))
     ));
     for (method, bits) in [
         (0x324, 0x8000_0000),
@@ -197,7 +197,7 @@ fn default_levels_preserve_bits_and_only_require_domain_consumed_lanes() {
     program_three_d(&mut channel, 0x320, 0x202);
     assert!(matches!(
         draw_state(channel.three_d()),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(_))
+        Err(MaxwellLoweringError::IncompleteDraw(_))
     ));
 }
 
@@ -225,7 +225,7 @@ fn evaluation_reads_cannot_consume_unprogrammed_domain_unused_levels() {
     );
     assert!(matches!(
         validate_default_level_inputs(control, &ir),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(
+        Err(MaxwellLoweringError::IncompleteDraw(
             "default tessellation level consumed by evaluation shader"
         ))
     ));

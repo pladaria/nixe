@@ -7,9 +7,8 @@ use crate::execution::MaxwellSubmissionPlanner;
 use crate::pushbuffer::packet::SubmissionWords;
 use crate::{
     MaxwellDecodedPushbuffer, MaxwellEngineDispatchError, MaxwellFrontendDispatch,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellPushbufferDecodeError,
-    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan, MaxwellThreeDLoweringCache,
-    decode_maxwell_pushbuffer,
+    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellLoweringCache, MaxwellPushbufferDecodeError,
+    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan, decode_maxwell_pushbuffer,
 };
 use nixe_gpu::{FrontendSubmissionId, ReservedTimelinePoint};
 
@@ -73,7 +72,7 @@ pub fn lower_maxwell_frontend(
     frontend: FrontendSubmissionId,
     predecessors: Vec<FrontendSubmissionId>,
     completion: Option<&ReservedTimelinePoint>,
-    cache: &mut MaxwellThreeDLoweringCache,
+    cache: &mut MaxwellLoweringCache,
 ) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
     let submission = dispatch.scheduled().submission();
     let decoded = decode_maxwell_pushbuffer(SubmissionWords::new(submission, address_space))
@@ -101,7 +100,7 @@ pub fn lower_maxwell_pushbuffer(
     frontend: FrontendSubmissionId,
     predecessors: Vec<FrontendSubmissionId>,
     completion: Option<&ReservedTimelinePoint>,
-    cache: &mut MaxwellThreeDLoweringCache,
+    cache: &mut MaxwellLoweringCache,
 ) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
     if decoded.packets().is_empty() {
         return Err(MaxwellFrontendDispatchError::EmptySubmission);

@@ -44,6 +44,7 @@ use crate::{
 };
 
 mod color;
+mod compute;
 mod multisample;
 #[cfg(not(target_os = "macos"))]
 #[path = "native/vulkan/draw.rs"]
@@ -191,6 +192,7 @@ enum Resource {
     Pipeline {
         description: PipelineDescription,
         render: RenderPipelineCache,
+        compute: HashMap<BackendResourceHandle, compute::CachedComputePipeline>,
     },
     DescriptorTable {
         bindings: Box<[nixe_gpu::DescriptorTableBinding]>,
@@ -1157,6 +1159,7 @@ pub(crate) struct WgpuBackendDriver {
     upload_linear: Vec<u8>,
     vertex_pull_binding_key: Vec<(u32, BackendResourceHandle)>,
     draw_bind_groups: Vec<Vec<BindGroup>>,
+    compute_bind_groups: Vec<BindGroup>,
     draw_pipelines: Vec<PreparedRenderPipeline>,
     quad_indices: crate::quad_indices::QuadIndices,
     render_attachment_views: Vec<wgpu::TextureView>,
@@ -1240,6 +1243,7 @@ impl WgpuBackendDriver {
             upload_linear: Vec::new(),
             vertex_pull_binding_key: Vec::new(),
             draw_bind_groups: Vec::new(),
+            compute_bind_groups: Vec::new(),
             draw_pipelines: Vec::new(),
             quad_indices: crate::quad_indices::QuadIndices::default(),
             render_attachment_views: Vec::new(),
@@ -1314,6 +1318,7 @@ impl WgpuBackendDriver {
         self.upload_linear = Vec::new();
         self.vertex_pull_binding_key = Vec::new();
         self.draw_bind_groups = Vec::new();
+        self.compute_bind_groups = Vec::new();
         self.draw_pipelines = Vec::new();
         self.quad_indices = crate::quad_indices::QuadIndices::default();
         self.render_attachment_views = Vec::new();
@@ -1792,14 +1797,14 @@ impl WgpuBackendDriver {
                         })
                         .map(|offset| index + 1 + offset)
                         .ok_or_else(|| unsupported("unterminated render pass"))?;
-                    let patches = operations[index + 1..end].iter().any(|operation| {
+                    let native_raster = operations[index + 1..end].iter().any(|operation| {
                         matches!(operation.command(), GpuCommand::Draw(draw)
-                            if draw.prepared.topology == PrimitiveTopology::Patches)
+                            if draw.prepared.topology == PrimitiveTopology::Patches || draw.prepared.line_rasterization.is_some())
                     });
-                    if patches {
+                    if native_raster {
                         #[cfg(target_os = "macos")]
                         return Err(unsupported(
-                            "native tessellation requires the Vulkan host backend",
+                            "native rasterization requires the Vulkan host backend",
                         ));
                         #[cfg(not(target_os = "macos"))]
                         {
@@ -1838,8 +1843,8 @@ impl WgpuBackendDriver {
                     // commands in sequence preserves the neutral ordering boundary.
                 }
                 GpuCommand::Draw(_) => return Err(unsupported("draw outside render pass")),
-                GpuCommand::Dispatch(_) => {
-                    return Err(unsupported("compute dispatch pipeline binding"));
+                GpuCommand::Dispatch(dispatch) => {
+                    self.encode_dispatch(&mut encoder, dependencies, dispatch)?
                 }
                 GpuCommand::Query(_) => return Err(unsupported("query command")),
             }
@@ -2591,12 +2596,26 @@ impl WgpuBackendDriver {
         prepared: &PreparedRenderPipeline,
         groups: &mut Vec<BindGroup>,
     ) -> Result<(), BackendDriverError> {
-        let pipeline_handle = prepared.location.pipeline;
-        let pipeline_fingerprint = prepared.location.fingerprint;
-        let pipeline = &prepared.pipeline;
-        let pipeline_serial = prepared.serial;
         groups.reserve(draw.prepared.descriptor_tables.len() + 1);
-        for (group, table) in draw.prepared.descriptor_tables.iter().enumerate() {
+        self.create_descriptor_bind_groups(
+            dependencies,
+            &draw.prepared.descriptor_tables,
+            prepared.serial,
+            |group| prepared.pipeline.get_bind_group_layout(group),
+            groups,
+        )?;
+        self.create_vertex_pull_bind_group(dependencies, draw, prepared, groups)
+    }
+
+    fn create_descriptor_bind_groups(
+        &mut self,
+        dependencies: &ResolvedBackendResources,
+        tables: &[nixe_gpu::DescriptorTableId],
+        pipeline_serial: u64,
+        layout: impl Fn(u32) -> wgpu::BindGroupLayout,
+        groups: &mut Vec<BindGroup>,
+    ) -> Result<(), BackendDriverError> {
+        for (group, table) in tables.iter().enumerate() {
             let group =
                 u32::try_from(group).map_err(|_| unsupported("descriptor-table group overflow"))?;
             let table_handle =
@@ -2679,7 +2698,7 @@ impl WgpuBackendDriver {
                 .collect::<Result<Vec<_>, BackendDriverError>>()?;
             let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
                 label: Some("Nixe neutral descriptor table"),
-                layout: &pipeline.get_bind_group_layout(group),
+                layout: &layout(group),
                 entries: &entries,
             });
             let record = self.resource_record_mut(table_handle)?;
@@ -2707,6 +2726,20 @@ impl WgpuBackendDriver {
             );
             groups.push(bind_group);
         }
+        Ok(())
+    }
+
+    fn create_vertex_pull_bind_group(
+        &mut self,
+        dependencies: &ResolvedBackendResources,
+        draw: &DrawOperation,
+        prepared: &PreparedRenderPipeline,
+        groups: &mut Vec<BindGroup>,
+    ) -> Result<(), BackendDriverError> {
+        let pipeline_handle = prepared.location.pipeline;
+        let pipeline_fingerprint = prepared.location.fingerprint;
+        let pipeline_serial = prepared.serial;
+        let pipeline = &prepared.pipeline;
         if prepared.vertex_fetch.pulled_buffers != 0 {
             let group = u32::try_from(draw.prepared.descriptor_tables.len())
                 .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
@@ -3225,12 +3258,20 @@ impl WgpuBackendDriver {
         BackendDriverError,
     > {
         let handle = shader_handle_for_stage(dependencies, operation, stage)?;
+        let (module, neutral) = self.compiled_shader(handle)?;
+        Ok((handle, module, neutral))
+    }
+
+    fn compiled_shader(
+        &mut self,
+        handle: BackendResourceHandle,
+    ) -> Result<(ShaderModule, nixe_gpu::ShaderBackendModule), BackendDriverError> {
         let Resource::Shader { module, neutral } = self.resource(handle)? else {
             return Err(kind_mismatch(handle));
         };
         let neutral = neutral.clone();
         if let Some(module) = module {
-            return Ok((handle, module.clone(), neutral));
+            return Ok((module.clone(), neutral));
         }
         let wgsl = nixe_gpu::lower_shader_ir_to_wgsl(neutral.ir()).map_err(|error| {
             BackendDriverError::failure(format!("WGSL shader lowering failed: {error}"))
@@ -3246,7 +3287,7 @@ impl WgpuBackendDriver {
         {
             *module = Some(compiled.clone());
         }
-        Ok((handle, compiled, neutral))
+        Ok((compiled, neutral))
     }
 
     fn encode_buffer_writeback(
@@ -4028,6 +4069,7 @@ impl WgpuBackendDriver {
             BackendResourceCreateInfo::Pipeline { description, .. } => Resource::Pipeline {
                 description: *description,
                 render: RenderPipelineCache::default(),
+                compute: HashMap::new(),
             },
             BackendResourceCreateInfo::DescriptorTable { bindings, .. } => {
                 Resource::DescriptorTable {

@@ -1,4 +1,4 @@
-//! Native patch execution using the driver's resident resources and sole queue.
+//! Native graphics execution using the driver's resident resources and sole queue.
 //! Kept as a driver child so there is no second resource table/coherence owner.
 use super::*;
 use ash::vk;
@@ -13,10 +13,13 @@ mod limits;
 mod persistent_cache;
 #[path = "draw/pipeline.rs"]
 mod pipeline;
+#[path = "draw/shaders.rs"]
+mod shaders;
 use descriptors::{BufferKey, NativeBindings};
 use encode::encode;
 use limits::{native_viewport, validate_index_range, validate_limits, validate_vertex_range};
 use pipeline::NativePipeline;
+use shaders::NativeShaders;
 #[path = "draw/raster.rs"]
 mod raster;
 #[cfg(test)]
@@ -37,10 +40,16 @@ impl PartialEq for PipelineKey {
             && self.color == other.color
             && self.depth == other.depth
             && (Arc::ptr_eq(&self.draw, &other.draw) || {
-                let a = self.draw.tessellation.unwrap();
-                let b = other.draw.tessellation.unwrap();
-                a.mode == b.mode
-                    && a.input_control_points == b.input_control_points
+                self.draw
+                    .tessellation
+                    .map(|t| (t.mode, t.input_control_points))
+                    == other
+                        .draw
+                        .tessellation
+                        .map(|t| (t.mode, t.input_control_points))
+                    && self.draw.topology == other.draw.topology
+                    && self.draw.line_rasterization.map(|l| l.smooth)
+                        == other.draw.line_rasterization.map(|l| l.smooth)
                     && self.draw.depth_state == other.draw.depth_state
                     && self.draw.front_face == other.draw.front_face
                     && self.draw.cull_mode == other.draw.cull_mode
@@ -67,9 +76,12 @@ impl Hash for PipelineKey {
         self.shaders.hash(h);
         self.color.hash(h);
         self.depth.hash(h);
-        let tess = self.draw.tessellation.unwrap();
-        tess.mode.hash(h);
-        tess.input_control_points.hash(h);
+        self.draw
+            .tessellation
+            .map(|t| (t.mode, t.input_control_points))
+            .hash(h);
+        self.draw.topology.hash(h);
+        self.draw.line_rasterization.map(|l| l.smooth).hash(h);
         self.draw.depth_state.hash(h);
         self.draw.front_face.hash(h);
         self.draw.cull_mode.hash(h);
@@ -200,6 +212,8 @@ impl Drop for NativeFrame {
 }
 
 pub(super) struct RetainedDraw {
+    /// A neutral barrier separates this draw from the preceding native draws.
+    begin_segment: bool,
     frame: Arc<NativeFrame>,
     buffers: Vec<Buffer>,
     offsets: Vec<u64>,
@@ -212,7 +226,7 @@ pub(super) struct RetainedDraw {
 }
 
 fn error(error: impl std::fmt::Display) -> BackendDriverError {
-    BackendDriverError::failure(format!("native tessellation: {error}"))
+    BackendDriverError::failure(format!("native graphics: {error}"))
 }
 
 fn evict<K: Clone + Eq + Hash, V>(map: &mut HashMap<K, (V, u64)>, capacity: usize) -> Option<V> {
@@ -350,10 +364,22 @@ impl WgpuBackendDriver {
                 }),
         );
         let mut draws = Vec::with_capacity(end - begin - 1);
+        let mut begin_segment = true;
         for (offset, operation) in operations[begin + 1..end].iter().enumerate() {
+            if matches!(operation.command(), GpuCommand::Barrier(_)) {
+                // Native descriptors/vertex inputs are read-only; attachment
+                // writes and every supported shader stage are covered by the
+                // segment's entry/exit dependencies. A leading barrier uses
+                // the existing entry dependency; an internal one ends the
+                // current pass before that dependency. Never issue a general
+                // memory barrier inside a Vulkan render pass.
+                begin_segment = true;
+                continue;
+            }
             let GpuCommand::Draw(draw) = operation.command() else {
-                // Internal barriers cannot be ignored by a raw native pass.
-                return Err(unsupported("non-draw command inside native patch pass"));
+                return Err(unsupported(
+                    "command other than draw or barrier inside native graphics pass",
+                ));
             };
             let pipeline = self.native_pipeline(
                 dependencies,
@@ -364,8 +390,7 @@ impl WgpuBackendDriver {
             )?;
             let parameters = pipeline
                 .shaders
-                .parameters(draw.prepared.tessellation.unwrap().control)
-                .map_err(error)?;
+                .parameters(draw.prepared.tessellation.map(|t| t.control))?;
             let viewport = native_viewport(draw.prepared.viewport_transform, extent)?;
             use ash::vk::Handle;
             let key = FrameKey {
@@ -493,7 +518,12 @@ impl WgpuBackendDriver {
                 None
             };
             draws.push(RetainedDraw {
-                line_width_bits: raster::width_bits(draw.prepared.triangle_rasterization),
+                begin_segment: std::mem::replace(&mut begin_segment, false),
+                line_width_bits: draw
+                    .prepared
+                    .line_rasterization
+                    .map(|l| l.width_bits)
+                    .or_else(|| raster::width_bits(draw.prepared.triangle_rasterization)),
                 frame,
                 buffers,
                 offsets,
@@ -564,27 +594,40 @@ impl WgpuBackendDriver {
         let caps = self
             .native
             .capabilities
-            .filter(|c| c.tessellation_shader)
-            .ok_or_else(|| unsupported("native Vulkan tessellation unavailable"))?;
-        let tess = draw
-            .prepared
-            .tessellation
-            .ok_or_else(|| unsupported("native draw without patch state"))?;
-        if draw.prepared.topology != PrimitiveTopology::Patches
-            || draw.prepared.alpha_test.is_some()
-        {
-            return Err(unsupported(
-                "native tessellation requires patch topology without alpha test",
-            ));
+            .ok_or_else(|| unsupported("native Vulkan rasterization unavailable"))?;
+        let tess = draw.prepared.tessellation;
+        if draw.prepared.alpha_test.is_some() {
+            return Err(unsupported("native alpha test"));
         }
         raster::validate(draw.prepared.triangle_rasterization, caps.raster)?;
-        if tess.mode.domain != nixe_gpu::TessellationDomain::Triangles
-            || tess.mode.spacing != nixe_gpu::TessellationSpacing::Equal
-            || !matches!(tess.mode.output, nixe_gpu::TessellationOutput::Triangles(_))
-        {
+        if let Some(line) = draw.prepared.line_rasterization {
+            if !matches!(
+                draw.prepared.topology,
+                PrimitiveTopology::Lines | PrimitiveTopology::LineStrip
+            ) || tess.is_some()
+            {
+                return Err(unsupported(
+                    "explicit line coverage requires direct line topology",
+                ));
+            }
+            raster::validate_line(line, caps.raster)?;
+        } else if tess.is_none() {
             return Err(unsupported(
-                "native tessellation currently executes triangle-domain equal-spacing output",
+                "native raster draw requires explicit line state",
             ));
+        }
+        if let Some(tess) = tess {
+            if !caps.tessellation_shader || draw.prepared.topology != PrimitiveTopology::Patches {
+                return Err(unsupported("native Vulkan tessellation unavailable"));
+            }
+            if tess.mode.domain != nixe_gpu::TessellationDomain::Triangles
+                || tess.mode.spacing != nixe_gpu::TessellationSpacing::Equal
+                || !matches!(tess.mode.output, nixe_gpu::TessellationOutput::Triangles(_))
+            {
+                return Err(unsupported(
+                    "native tessellation currently executes triangle-domain equal-spacing output",
+                ));
+            }
         }
         let pipeline = dependency_handle(
             dependencies,
@@ -614,18 +657,24 @@ impl WgpuBackendDriver {
                 ShaderStage::Vertex,
             )?),
             dependencies.shader(operation, ShaderStage::TessellationControl),
-            Some(shader_handle_for_stage(
-                dependencies,
-                operation,
-                ShaderStage::TessellationEvaluation,
-            )?),
+            if tess.is_some() {
+                Some(shader_handle_for_stage(
+                    dependencies,
+                    operation,
+                    ShaderStage::TessellationEvaluation,
+                )?)
+            } else {
+                None
+            },
             Some(shader_handle_for_stage(
                 dependencies,
                 operation,
                 ShaderStage::Fragment,
             )?),
         ];
-        if shaders[1].is_some() != matches!(tess.control, TessellationControl::Shader) {
+        if shaders[1].is_some()
+            != tess.is_some_and(|t| matches!(t.control, TessellationControl::Shader))
+        {
             return Err(unsupported(
                 "native control shader/default-level state mismatch",
             ));
@@ -669,32 +718,63 @@ impl WgpuBackendDriver {
             .collect::<Result<Vec<_>, _>>()?;
         let vertex = modules[0].as_ref().unwrap().ir();
         let control = modules[1].as_ref().map(|m| m.ir());
-        let evaluation = modules[2].as_ref().unwrap().ir();
         let fragment = modules[3].as_ref().unwrap().ir();
-        if u32::from(tess.input_control_points) > caps.tessellation_limits.patch_size
-            || control
-                .and_then(|c| c.ir().tessellation_control_points())
-                .unwrap_or(u32::from(tess.input_control_points))
-                > caps.tessellation_limits.patch_size
+        if tess.is_none()
+            && fragment
+                .ir()
+                .inputs()
+                .iter()
+                .any(|input| input.interpolation() == Some(nixe_gpu::ShaderInterpolation::Constant))
         {
+            // Maxwell's supported contract uses the last vertex. Vulkan's
+            // default line provoking vertex is first; do not silently change it.
+            // https://docs.vulkan.org/spec/latest/chapters/drawing.html#drawing-provoking-vertex
             return Err(unsupported(
-                "native patch size exceeds physical tessellation limit",
+                "native direct lines with flat interpolation require last-vertex provoking support",
             ));
         }
         validate_limits(caps, &modules, &draw.prepared)?;
-        let compiled = nixe_gpu::lower_tessellation_shaders_to_spirv(
-            vertex,
-            control,
-            evaluation,
-            fragment,
-            nixe_gpu::SpirvTessellationOptions {
-                input_control_points: tess.input_control_points,
-                mode: tess.mode,
-                float32: caps.float32,
-                float64: caps.float64,
-            },
-        )
-        .map_err(error)?;
+        let compiled = if let Some(tess) = tess {
+            let evaluation = modules[2].as_ref().unwrap().ir();
+            if u32::from(tess.input_control_points) > caps.tessellation_limits.patch_size
+                || control
+                    .and_then(|c| c.ir().tessellation_control_points())
+                    .unwrap_or(u32::from(tess.input_control_points))
+                    > caps.tessellation_limits.patch_size
+            {
+                return Err(unsupported(
+                    "native patch size exceeds physical tessellation limit",
+                ));
+            }
+            NativeShaders::Patches(
+                nixe_gpu::lower_tessellation_shaders_to_spirv(
+                    vertex,
+                    control,
+                    evaluation,
+                    fragment,
+                    nixe_gpu::SpirvTessellationOptions {
+                        input_control_points: tess.input_control_points,
+                        mode: tess.mode,
+                        float32: caps.float32,
+                        float64: caps.float64,
+                    },
+                )
+                .map_err(error)?,
+            )
+        } else {
+            let (modules, bindings) = nixe_gpu::lower_raster_shaders_to_spirv(
+                vertex,
+                fragment,
+                nixe_gpu::SpirvShaderOptions {
+                    input_control_points: 0,
+                    tessellation_mode: None,
+                    float32: caps.float32,
+                    float64: caps.float64,
+                },
+            )
+            .map_err(error)?;
+            NativeShaders::Raster { modules, bindings }
+        };
         // Miss-only initialization: no disk I/O, device query or cache lock on
         // an ordinary draw or a warm native pipeline hit.
         if self.native.driver_cache.is_none() {

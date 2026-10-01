@@ -6,8 +6,7 @@ use nixe_gpu::*;
 use nixe_memory::*;
 use std::sync::{Arc, Mutex};
 
-#[path = "../../../../gpu-wgpu/test-support/hardware.rs"]
-mod hardware;
+use super::super::hardware;
 
 struct Validation(Mutex<Vec<String>>);
 static VALIDATION: Validation = Validation(Mutex::new(Vec::new()));

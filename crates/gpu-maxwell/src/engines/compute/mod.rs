@@ -1,8 +1,14 @@
 //! GM20B `MAXWELL_COMPUTE_B` engine boundary.
 
+mod launch;
 mod methods;
 mod operations;
+mod qmd;
 mod state;
+
+pub(crate) use launch::MaxwellResolvedComputeLaunch;
+pub(crate) use launch::resolve_compute_launch;
+pub use launch::{MaxwellComputeLaunch, MaxwellComputeLaunchError};
 
 pub use operations::{
     MaxwellComputeOperationTrigger, MaxwellComputeShaderCacheInvalidation,

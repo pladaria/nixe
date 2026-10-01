@@ -253,7 +253,7 @@ impl MaxwellComputeBindlessTextureConstantBufferSlot {
     }
 }
 
-/// Captured destination layout supported by compute inline-to-memory uploads.
+/// Destination layout supported by compute inline-to-memory uploads.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellComputeInlineToMemoryLayout {
     Pitch,
@@ -263,20 +263,34 @@ pub enum MaxwellComputeInlineToMemoryLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellComputeInlineToMemoryLaunch {
     layout: MaxwellComputeInlineToMemoryLayout,
+    flush_on_completion: bool,
     system_memory_barrier_disabled: bool,
 }
 
 impl MaxwellComputeInlineToMemoryLaunch {
-    pub(super) const fn captured_pitch() -> Self {
-        Self {
-            layout: MaxwellComputeInlineToMemoryLayout::Pitch,
-            system_memory_barrier_disabled: true,
+    /// Decode single-line pitch uploads without reduction, interrupt or semaphore
+    /// configuration. Completion may disable flushing or request a flush only;
+    /// neither mode publishes a semaphore or signals a guest timeline.
+    /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L129-L165>
+    pub(super) const fn parse_pitch(raw: u32) -> Option<Self> {
+        if raw & !0x51 != 0 || raw & 1 == 0 {
+            return None;
         }
+        Some(Self {
+            layout: MaxwellComputeInlineToMemoryLayout::Pitch,
+            flush_on_completion: raw & 0x10 != 0,
+            system_memory_barrier_disabled: raw & 0x40 != 0,
+        })
     }
 
     #[must_use]
     pub const fn layout(self) -> MaxwellComputeInlineToMemoryLayout {
         self.layout
+    }
+
+    #[must_use]
+    pub const fn flush_on_completion(self) -> bool {
+        self.flush_on_completion
     }
 
     #[must_use]
@@ -527,7 +541,7 @@ impl Default for MaxwellComputeCwdRefCounterState {
     }
 }
 
-/// One validated compute shader-memory register transition.
+/// One validated compute register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellComputeStateWrite {
     AddressUpper {
@@ -580,6 +594,14 @@ pub enum MaxwellComputeStateWrite {
     },
     SpaVersion {
         value: MaxwellComputeSpaVersion,
+        source: MaxwellMethodSource,
+    },
+    ShaderExceptionsEnable {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
+    QmdAddress {
+        shifted: u32,
         source: MaxwellMethodSource,
     },
     TextureHeaderAddressUpper {
@@ -648,6 +670,8 @@ pub enum MaxwellComputeStateWrite {
 pub struct MaxwellComputeState {
     shader_local_memory: MaxwellComputeLocalMemoryState,
     program: MaxwellComputeProgramState,
+    shader_exceptions_enable: MaxwellComputeRegister<bool>,
+    qmd_address: MaxwellComputeRegister<MaxwellComputeAddress>,
     texture_headers: MaxwellComputeDescriptorPoolState,
     samplers: MaxwellComputeDescriptorPoolState,
     bindless_texture_constant_buffer_slot:
@@ -670,6 +694,24 @@ impl MaxwellComputeState {
     #[must_use]
     pub const fn program(&self) -> &MaxwellComputeProgramState {
         &self.program
+    }
+
+    /// Whether guest shader-exception reporting is enabled.
+    ///
+    /// This is configuration, not a dispatch or a request to mask emulator
+    /// errors. Preserve both values for execution-time validation; recording
+    /// `true` does not implement guest exception delivery. No reset is assumed.
+    /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L588-L591>
+    #[must_use]
+    pub const fn shader_exceptions_enable(&self) -> &MaxwellComputeRegister<bool> {
+        &self.shader_exceptions_enable
+    }
+
+    /// `SEND_PCAS_A` stores a 40-bit, 256-byte-aligned QMD address.
+    /// The raw register retains the address shifted right by eight bits.
+    #[must_use]
+    pub const fn qmd_address(&self) -> &MaxwellComputeRegister<MaxwellComputeAddress> {
+        &self.qmd_address
     }
 
     #[must_use]
@@ -752,6 +794,17 @@ impl MaxwellComputeState {
             MaxwellComputeStateWrite::SpaVersion { value, source } => {
                 self.program.spa_version =
                     MaxwellComputeRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellComputeStateWrite::ShaderExceptionsEnable { value, source } => {
+                self.shader_exceptions_enable =
+                    MaxwellComputeRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellComputeStateWrite::QmdAddress { shifted, source } => {
+                self.qmd_address = MaxwellComputeRegister::programmed(
+                    shifted,
+                    MaxwellComputeAddress::new((shifted >> 24) as u8, shifted << 8),
+                    source,
+                );
             }
             MaxwellComputeStateWrite::TextureHeaderAddressUpper { value, source } => {
                 self.texture_headers.address_upper =

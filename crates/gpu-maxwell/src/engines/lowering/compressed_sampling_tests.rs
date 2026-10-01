@@ -55,7 +55,7 @@ fn tic(allocation: &CanonicalAllocation, address: u64, width: u32, format: u32) 
 
 #[test]
 fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
-    use super::super::{
+    use super::super::threed::{
         MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
         resolve_maxwell_three_d_resources_for_roles,
     };
@@ -115,12 +115,12 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         assert!(texture.guest_layout().requires_materialization());
         assert!(!texture.guest_layout().has_direct_canonical_representation());
 
-        let mut cache = MaxwellThreeDLoweringCache::default();
+        let mut cache = MaxwellLoweringCache::default();
         let mut creations = Vec::new();
         let mut invalidations = Vec::new();
         let prepare = |resources: &MaxwellThreeDResolvedResources,
                        index,
-                       cache: &mut MaxwellThreeDLoweringCache,
+                       cache: &mut MaxwellLoweringCache,
                        creations: &mut Vec<_>,
                        invalidations: &mut Vec<_>| {
             prepare_resources(resources, &[index], cache, creations, invalidations)
@@ -133,7 +133,7 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
                 &mut creations,
                 &mut invalidations
             ),
-            Err(MaxwellThreeDLoweringError::CompressedSampledImageImportRequired { .. })
+            Err(MaxwellLoweringError::CompressedSampledImageImportRequired { .. })
         ));
         assert!(creations.is_empty());
         let target_binding = prepare(
@@ -267,12 +267,12 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         tic(&metadata, wrong, 64, texture_format);
         assert!(matches!(
             resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &space, &[sampled]),
-            Err(super::super::MaxwellThreeDResourceError::UnsupportedKind { .. })
+            Err(super::super::threed::MaxwellThreeDResourceError::UnsupportedKind { .. })
         ));
         tic(&metadata, address, 64, 0x78d2_4924); // BC1 has 8-byte blocks, not C64 texels.
         assert!(matches!(
             resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &space, &[sampled]),
-            Err(super::super::MaxwellThreeDResourceError::UnsupportedKind { .. })
+            Err(super::super::threed::MaxwellThreeDResourceError::UnsupportedKind { .. })
         ));
     }
 }

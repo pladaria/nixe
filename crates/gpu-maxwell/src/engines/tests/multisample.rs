@@ -152,7 +152,7 @@ fn check_msaa_clear_draw_resolve(compression: Option<u32>, raw: u32, format: Ima
     assert!(Arc::ptr_eq(&resources, &cached));
     assert!(matches!(
         cache.lower_color_resolve(&resources, FrontendSubmissionId::new(1), vec![]),
-        Err(MaxwellThreeDLoweringError::ResolveSourceNotResident)
+        Err(MaxwellLoweringError::ResolveSourceNotResident)
     ));
 
     let clear = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -261,7 +261,7 @@ fn check_msaa_clear_draw_resolve(compression: Option<u32>, raw: u32, format: Ima
         .unwrap();
     assert!(matches!(
         cache.lower_color_resolve(&resources, FrontendSubmissionId::new(5), vec![]),
-        Err(MaxwellThreeDLoweringError::ResolveSourceNotResident)
+        Err(MaxwellLoweringError::ResolveSourceNotResident)
     ));
     assert!(!Arc::ptr_eq(&cached, &resources));
     address_space.unmap(src.offset()).unwrap();
@@ -309,7 +309,7 @@ fn four_sample_depth_clear_materializes_both_guest_packings() {
         let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
         let clear = &dispatch.operations()[0];
         let resources = resolve_maxwell_three_d_resources(clear.state(), &address_space).unwrap();
-        let mut cache = MaxwellThreeDLoweringCache::default();
+        let mut cache = MaxwellLoweringCache::default();
         let work = lower_maxwell_three_d_operation_into_cache(
             clear.state(),
             &resources,

@@ -17,7 +17,7 @@ pub(super) fn header_inputs(
 ) {
     if !matches!(
         header.stage,
-        MaxwellThreeDShaderStage::TessellationInit | MaxwellThreeDShaderStage::Tessellation
+        MaxwellShaderStage::TessellationInit | MaxwellShaderStage::Tessellation
     ) {
         return;
     }
@@ -27,7 +27,7 @@ pub(super) fn header_inputs(
     if header.bit(187) {
         inputs.push(interface_element(ShaderIoLocation::PointSize, 0, None));
     }
-    if header.stage == MaxwellThreeDShaderStage::Tessellation {
+    if header.stage == MaxwellShaderStage::Tessellation {
         for index in 0..6 {
             if header.bit(164 + index) {
                 let (location, component) = patch_location((index * 4) as u16).unwrap();
@@ -41,7 +41,7 @@ pub(super) fn header_outputs(
     header: MaxwellShaderProgramHeader,
     outputs: &mut Vec<ShaderInterfaceElement>,
 ) {
-    if header.stage == MaxwellThreeDShaderStage::TessellationInit {
+    if header.stage == MaxwellShaderStage::TessellationInit {
         // SPH allocates scalar slots, not vec4s. Slots 6/7 are padding before
         // user patch data, while 0..5 hold the six tessellator levels.
         for slot in 0..header.bits(56, 8) {
@@ -52,7 +52,7 @@ pub(super) fn header_outputs(
     }
     if matches!(
         header.stage,
-        MaxwellThreeDShaderStage::TessellationInit | MaxwellThreeDShaderStage::Tessellation
+        MaxwellShaderStage::TessellationInit | MaxwellShaderStage::Tessellation
     ) && header.bit(427)
     {
         outputs.push(interface_element(ShaderIoLocation::PointSize, 0, None));
@@ -154,7 +154,7 @@ pub(super) const fn is_system_register_read(encoding: u64) -> bool {
 }
 
 pub(super) fn decode_system_register(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -171,11 +171,10 @@ pub(super) fn decode_system_register(
     // S2R selector: public GM107 emitSYS/emitS2R, not a shader fingerprint.
     // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L267-L274
     let location = match ((encoding >> 20) & 0xff, stage) {
-        (0x11, MaxwellThreeDShaderStage::TessellationInit) => ShaderIoLocation::InvocationId,
-        (
-            0x10,
-            MaxwellThreeDShaderStage::TessellationInit | MaxwellThreeDShaderStage::Tessellation,
-        ) => ShaderIoLocation::PatchVertices,
+        (0x11, MaxwellShaderStage::TessellationInit) => ShaderIoLocation::InvocationId,
+        (0x10, MaxwellShaderStage::TessellationInit | MaxwellShaderStage::Tessellation) => {
+            ShaderIoLocation::PatchVertices
+        }
         _ => {
             return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
                 stage,
@@ -197,7 +196,7 @@ pub(super) fn decode_system_register(
 }
 
 pub(super) fn decode_control_store(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -276,13 +275,13 @@ mod tests {
     use super::*;
 
     fn header(
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         control_points: u8,
         patch_slots: u8,
     ) -> MaxwellShaderProgramHeader {
         let mut words = [0_u32; 20];
         words[0] = 0x60061
-            | if stage == MaxwellThreeDShaderStage::TessellationInit {
+            | if stage == MaxwellShaderStage::TessellationInit {
                 2 << 10
             } else {
                 3 << 10
@@ -322,7 +321,11 @@ mod tests {
         ];
         let binary = MaxwellShaderBinary {
             address: 0,
-            header: header(MaxwellThreeDShaderStage::TessellationInit, 3, 6),
+            metadata: MaxwellShaderMetadata::Graphics(header(
+                MaxwellShaderStage::TessellationInit,
+                3,
+                6,
+            )),
             bundles: code
                 .into_iter()
                 .enumerate()
@@ -336,8 +339,7 @@ mod tests {
             source_mappings: Box::new([]),
         };
         let translated = translate_shader_binary(&binary, 5, &BTreeMap::new()).unwrap();
-        let ir =
-            finalize_shader_ir(translated.ir, binary.header.stage, &BTreeMap::new(), &[]).unwrap();
+        let ir = finalize_shader_ir(translated.ir, binary.stage(), &BTreeMap::new(), &[]).unwrap();
         for invocation in 0..3 {
             let inputs = nixe_gpu::ShaderEvaluationInputs::default().with_interface_bits(
                 ShaderIoLocation::InvocationId,
@@ -371,7 +373,11 @@ mod tests {
     fn control_sph_and_patch_store_translate_without_wgsl() {
         let binary = MaxwellShaderBinary {
             address: 0,
-            header: header(MaxwellThreeDShaderStage::TessellationInit, 5, 12),
+            metadata: MaxwellShaderMetadata::Graphics(header(
+                MaxwellShaderStage::TessellationInit,
+                5,
+                12,
+            )),
             bundles: vec![MaxwellShaderInstructionBundle {
                 offset: 0,
                 control: 0,
@@ -386,8 +392,7 @@ mod tests {
             source_mappings: Box::new([]),
         };
         let translated = translate_shader_binary(&binary, 4, &BTreeMap::new()).unwrap();
-        let ir =
-            finalize_shader_ir(translated.ir, binary.header.stage, &BTreeMap::new(), &[]).unwrap();
+        let ir = finalize_shader_ir(translated.ir, binary.stage(), &BTreeMap::new(), &[]).unwrap();
         assert_eq!(ir.ir().tessellation_control_points(), Some(5));
         assert!(
             ir.ir()
@@ -419,7 +424,7 @@ mod tests {
     fn direct_control_stores_use_invocation_index_not_input_patch_size() {
         let mut inputs = vec![];
         let operations = decode_control_store(
-            MaxwellThreeDShaderStage::TessellationInit,
+            MaxwellShaderStage::TessellationInit,
             8,
             0xeff1_ff80_0707_ff00,
             4,
@@ -440,7 +445,7 @@ mod tests {
             );
         }
         let operation = decode_system_register(
-            MaxwellThreeDShaderStage::TessellationInit,
+            MaxwellShaderStage::TessellationInit,
             16,
             0xf0c8_0000_0117_0002,
             4,
@@ -457,7 +462,7 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         assert!(matches!(
             decode_system_register(
-                MaxwellThreeDShaderStage::TessellationInit,
+                MaxwellShaderStage::TessellationInit,
                 24,
                 0xf0c8_0000_01d7_0001,
                 4,
@@ -481,6 +486,7 @@ mod tests {
                 .collect()
         };
         TranslatedShaderIr {
+            global_buffers: Default::default(),
             ir: ShaderIr::new(stage, elements(inputs), elements(outputs), vec![], vec![]),
             texture_bindings: Box::new([]),
         }
@@ -527,10 +533,10 @@ mod tests {
     #[test]
     fn fragment_interpolation_links_per_component_only_to_final_producer() {
         let stages = [
-            MaxwellThreeDShaderStage::Vertex,
-            MaxwellThreeDShaderStage::TessellationInit,
-            MaxwellThreeDShaderStage::Tessellation,
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Vertex,
+            MaxwellShaderStage::TessellationInit,
+            MaxwellShaderStage::Tessellation,
+            MaxwellShaderStage::Pixel,
         ];
         let programs: Box<[_]> = stages
             .into_iter()
@@ -538,10 +544,10 @@ mod tests {
             .map(|(index, stage)| {
                 let mut words = [0_u32; 20];
                 words[0] = match stage {
-                    MaxwellThreeDShaderStage::Vertex => 0x0006_0461,
-                    MaxwellThreeDShaderStage::TessellationInit => 0x0006_0861,
-                    MaxwellThreeDShaderStage::Tessellation => 0x0006_0c61,
-                    MaxwellThreeDShaderStage::Pixel => 0x0006_1462,
+                    MaxwellShaderStage::Vertex => 0x0006_0461,
+                    MaxwellShaderStage::TessellationInit => 0x0006_0861,
+                    MaxwellShaderStage::Tessellation => 0x0006_0c61,
+                    MaxwellShaderStage::Pixel => 0x0006_1462,
                     _ => unreachable!(),
                 };
                 match index {
@@ -567,7 +573,7 @@ mod tests {
                 .unwrap();
                 let binary = MaxwellShaderBinary {
                     address: 0,
-                    header,
+                    metadata: MaxwellShaderMetadata::Graphics(header),
                     bundles: vec![MaxwellShaderInstructionBundle {
                         offset: 0,
                         control: 0,

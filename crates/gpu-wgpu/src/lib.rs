@@ -549,6 +549,7 @@ fn capabilities(
         BackendFeatures::COPY
             .union(BackendFeatures::CLEAR)
             .union(BackendFeatures::DRAW)
+            .union(BackendFeatures::DISPATCH)
             .union(BackendFeatures::INDEXED_DRAW)
             .union(BackendFeatures::BARRIER)
             .union(BackendFeatures::RESOLVE)
@@ -563,6 +564,7 @@ fn capabilities(
         [
             Some(ShaderStage::Vertex),
             Some(ShaderStage::Fragment),
+            Some(ShaderStage::Compute),
             native_tessellation.then_some(ShaderStage::TessellationControl),
             native_tessellation.then_some(ShaderStage::TessellationEvaluation),
         ]

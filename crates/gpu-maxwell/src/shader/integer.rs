@@ -15,7 +15,7 @@ pub(super) struct DecodedIntegerOperation {
 }
 
 pub(super) fn decode_bitwise(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -182,20 +182,41 @@ pub(super) const fn is_add(encoding: u64) -> bool {
     opcode & 0xfff8 == 0x5c10 || opcode & 0xfff8 == 0x4c10 || opcode & 0xfef8 == 0x3810
 }
 
+pub(super) const fn is_shift_add(encoding: u64) -> bool {
+    let opcode = (encoding >> 48) as u16;
+    opcode & 0xfffc == 0x5c18 || opcode & 0xfffc == 0x4c18 || opcode & 0xfefc == 0x3818
+}
+
 pub(super) fn decode_add(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
     next_temporary: &mut u16,
+    carry_register: &mut Option<ShaderRegister>,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
-    // IADD uses modulo-2^32 addition. Operand forms, sign extension and flags:
+    // IADD and ISCADD share modulo-2^32 operands; ISCADD shifts the first
+    // operand by an immediate 0..31 before adding, without a carry input.
     // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L1648-L1685
+    let shifted = is_shift_add(encoding);
     for (mask, detail) in [
-        (1 << 47, "IADD condition-code write"),
-        (1 << 43, "IADD extended carry input"),
+        (
+            if shifted { 1 << 47 } else { 0 },
+            if shifted {
+                "ISCADD condition-code write"
+            } else {
+                "IADD condition-code write"
+            },
+        ),
         (1 << 50, "IADD signed saturation"),
-        (3 << 48, "IADD negated operands"),
+        (
+            3 << 48,
+            if shifted {
+                "ISCADD negated operands"
+            } else {
+                "IADD negated operands"
+            },
+        ),
     ] {
         if encoding & mask != 0 {
             return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -207,19 +228,28 @@ pub(super) fn decode_add(
         }
     }
     let opcode = (encoding >> 48) as u16;
-    let register = opcode == 0x5c10;
-    let constant = opcode == 0x4c10;
+    let register = opcode == 0x5c10 || opcode == 0x5c18;
+    let constant = opcode == 0x4c10 || opcode == 0x4c18;
     let operand_mask = if register {
         0xff_u64 << 20
     } else {
         0x7ffff_u64 << 20
     };
-    if encoding & !(0xffff_0000_000f_ffff | operand_mask) != 0 {
+    let shift_mask = if shifted {
+        0x1f << 39
+    } else {
+        (1 << 47) | (1 << 43)
+    };
+    if encoding & !(0xffff_0000_000f_ffff | operand_mask | shift_mask) != 0 {
         return Err(malformed(
             stage,
             offset,
             encoding,
-            "IADD reserved field is nonzero",
+            if shifted {
+                "ISCADD reserved field is nonzero"
+            } else {
+                "IADD reserved field is nonzero"
+            },
         ));
     }
     let mut operations = Vec::with_capacity(3);
@@ -285,19 +315,76 @@ pub(super) fn decode_add(
         }
         destination
     };
-    operations.push(ShaderOperation::Add32 {
-        destination,
-        left,
-        right,
-        scalar_type: ShaderScalarType::Unsigned32,
-        float_control: ShaderFloatControl::new(
-            ShaderRoundingMode::NearestEven,
-            ShaderNanMode::Propagate,
-            false,
-            false,
-            false,
-        ),
-    });
+    let left = if shifted && (encoding >> 39) & 31 != 0 {
+        let amount = temporary()?;
+        let destination = temporary()?;
+        operations.push(ShaderOperation::MoveImmediate32 {
+            destination: amount,
+            bits: ((encoding >> 39) & 31) as u32,
+            scalar_type: ShaderScalarType::Unsigned32,
+        });
+        operations.push(ShaderOperation::ShiftLeft32 {
+            destination,
+            value: left,
+            amount,
+            wrap: false,
+        });
+        destination
+    } else {
+        left
+    };
+    let carry_input = !shifted && encoding & (1 << 43) != 0;
+    let carry_output = !shifted && encoding & (1 << 47) != 0;
+    // IADD.X reads the unsigned carry from the previous CC definition. Do not
+    // fabricate reset flags. Predication of the resulting IR preserves the
+    // previous carry on a false path, and the verifier checks reaching defs.
+    // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp (emitIADD)
+    if carry_input || carry_output {
+        let carry_in = if carry_input {
+            Some(carry_register.ok_or(
+                MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                    stage,
+                    instruction_offset: offset,
+                    encoding,
+                    detail: "IADD.X has no translated carry definition",
+                },
+            )?)
+        } else {
+            None
+        };
+        let carry_out = if carry_output {
+            if let Some(register) = carry_register {
+                *register
+            } else {
+                let register = temporary()?;
+                *carry_register = Some(register);
+                register
+            }
+        } else {
+            temporary()?
+        };
+        operations.push(ShaderOperation::AddCarry32 {
+            destination,
+            carry_out,
+            left,
+            right,
+            carry_in,
+        });
+    } else {
+        operations.push(ShaderOperation::Add32 {
+            destination,
+            left,
+            right,
+            scalar_type: ShaderScalarType::Unsigned32,
+            float_control: ShaderFloatControl::new(
+                ShaderRoundingMode::NearestEven,
+                ShaderNanMode::Propagate,
+                false,
+                false,
+                false,
+            ),
+        });
+    }
     Ok(DecodedIntegerOperation {
         operations,
         constant_buffer_binding,
@@ -305,7 +392,7 @@ pub(super) fn decode_add(
 }
 
 pub(super) fn decode_set_predicate(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -448,7 +535,110 @@ pub(super) fn decode_set_predicate(
 mod tests {
     use super::*;
 
-    const STAGE: MaxwellThreeDShaderStage = MaxwellThreeDShaderStage::TessellationInit;
+    const STAGE: MaxwellShaderStage = MaxwellShaderStage::TessellationInit;
+
+    #[test]
+    fn iadd_extended_consumes_and_preserves_carry_until_another_cc_write() {
+        for (left, right, expected) in [
+            (u32::MAX, 1, 2),
+            (u32::MAX, 0, 1),
+            (0x8000_0000, 0x8000_0000, 2),
+        ] {
+            let mut next = 4;
+            let mut carry = None;
+            let mut decoded =
+                decode_add(STAGE, 8, 0x5c10_8000_0017_0000, 4, &mut next, &mut carry).unwrap();
+            let original = carry;
+            for _ in 0..2 {
+                let high =
+                    decode_add(STAGE, 16, 0x3810_0800_0017_ff00, 4, &mut next, &mut carry).unwrap();
+                decoded.operations.extend(high.operations);
+                assert_eq!(
+                    carry, original,
+                    "IADD.X without CC must not replace the flag"
+                );
+            }
+            assert_eq!(evaluate_integer(decoded, left, right), expected);
+        }
+    }
+
+    #[test]
+    fn iadd_constant_buffer_pointer_pair_carries_across_the_four_gib_boundary() {
+        for offset in [0_u32, 3, 4, 8192, u32::MAX] {
+            let mut next = 4;
+            let mut carry = None;
+            let mut low =
+                decode_add(STAGE, 8, 0x4c10_8008_0037_0000, 4, &mut next, &mut carry).unwrap();
+            let high =
+                decode_add(STAGE, 16, 0x4c10_0808_0047_ff01, 4, &mut next, &mut carry).unwrap();
+            assert_eq!(low.constant_buffer_binding, Some(2));
+            assert_eq!(high.constant_buffer_binding, Some(2));
+            low.operations.extend(high.operations);
+            let expected = 0x0000_0004_ffff_fffc_u64 + u64::from(offset);
+            let high_operations = low.operations.clone();
+            assert_eq!(evaluate_integer(low, offset, 0xffff_fffc), expected as u32);
+            let mut high = DecodedIntegerOperation {
+                operations: high_operations,
+                constant_buffer_binding: Some(2),
+            };
+            high.operations.push(ShaderOperation::Move32 {
+                destination: ShaderRegister::new(0),
+                source: ShaderRegister::new(1),
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
+            assert_eq!(
+                evaluate_integer(high, offset, 0xffff_fffc),
+                (expected >> 32) as u32
+            );
+        }
+    }
+
+    #[test]
+    fn iscadd_preserves_wrapping_shift_add_and_aliased_destination() {
+        for shift in 0..32 {
+            for (left, right) in [
+                (0, 0),
+                (1, 7),
+                (0xffff_ffff_u32, 1),
+                (0x8123_4567, 0xfedc_ba98),
+            ] {
+                let encoding = 0x5c18_0000_0017_0000 | (u64::from(shift) << 39);
+                assert!(is_shift_add(encoding));
+                let decoded = decode_add(STAGE, 8, encoding, 4, &mut 4, &mut None).unwrap();
+                assert_eq!(
+                    evaluate_integer(decoded, left, right),
+                    left.wrapping_shl(shift).wrapping_add(right)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iscadd_signed_immediate_constant_buffer_and_zero_register() {
+        // ISCADD R0, R0, -1, 5 and ISCADD R0, R0, c[2][12], 5.
+        for (encoding, right) in [
+            (0x3918_02ff_fff7_0000, u32::MAX),
+            (0x4c18_0288_0037_0000, 0x8765_4321),
+        ] {
+            assert!(is_shift_add(encoding));
+            let decoded = decode_add(STAGE, 8, encoding, 4, &mut 4, &mut None).unwrap();
+            assert_eq!(
+                evaluate_integer(decoded, 17, right),
+                (17_u32 << 5).wrapping_add(right)
+            );
+        }
+        let decoded = decode_add(STAGE, 8, 0x5c18_0280_0017_ff00, 4, &mut 4, &mut None).unwrap();
+        assert_eq!(evaluate_integer(decoded, 17, 42), 42);
+    }
+
+    #[test]
+    fn iscadd_rejects_untranslated_flags_and_reserved_fields() {
+        for flag in [1 << 47, 1 << 48, 1 << 49, 1 << 44, 1 << 28] {
+            assert!(
+                decode_add(STAGE, 8, 0x5c18_0280_0017_0000 | flag, 4, &mut 4, &mut None).is_err()
+            );
+        }
+    }
 
     fn evaluate_lop(encoding: u64, left: u32, right: u32) -> u32 {
         let decoded = decode_bitwise(STAGE, 8, encoding, 4, &mut 4).unwrap();
@@ -457,7 +647,7 @@ mod tests {
 
     fn evaluate_iadd(encoding: u64, left: u32, right: u32) -> u32 {
         assert!(is_add(encoding));
-        let decoded = decode_add(STAGE, 8, encoding, 4, &mut 4).unwrap();
+        let decoded = decode_add(STAGE, 8, encoding, 4, &mut 4, &mut None).unwrap();
         evaluate_integer(decoded, left, right)
     }
 
@@ -520,7 +710,9 @@ mod tests {
         .unwrap();
         nixe_gpu::evaluate_shader_ir(
             &shader,
-            &nixe_gpu::ShaderEvaluationInputs::default().with_constant_buffer_bits(2, 12, right),
+            &nixe_gpu::ShaderEvaluationInputs::default()
+                .with_constant_buffer_bits(2, 12, right)
+                .with_constant_buffer_bits(2, 16, 4),
             32,
         )
         .unwrap()
@@ -554,15 +746,14 @@ mod tests {
     fn iadd_rejects_unrepresented_modifiers_and_invalid_registers() {
         let captured = 0x3810_0000_0017_0101_u64;
         for (modifier, detail) in [
-            (1 << 47, "IADD condition-code write"),
-            (1 << 43, "IADD extended carry input"),
+            (1 << 43, "IADD.X has no translated carry definition"),
             (1 << 50, "IADD signed saturation"),
             (1 << 48, "IADD negated operands"),
             (1 << 49, "IADD negated operands"),
         ] {
             assert!(is_add(captured | modifier));
             assert!(
-                matches!(decode_add(STAGE, 0x48, captured | modifier, 4, &mut 4),
+                matches!(decode_add(STAGE, 0x48, captured | modifier, 4, &mut 4, &mut None),
                 Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { detail: actual, instruction_offset: 0x48, .. }) if actual == detail)
             );
         }
@@ -575,7 +766,7 @@ mod tests {
             0x5c10_0000_1017_0000,
         ] {
             assert!(
-                decode_add(STAGE, 8, word, 4, &mut 4).is_err(),
+                decode_add(STAGE, 8, word, 4, &mut 4, &mut None).is_err(),
                 "{word:016x}"
             );
         }

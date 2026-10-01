@@ -237,6 +237,13 @@ pub enum TriangleRasterization {
     Wireframe { width_bits: u32, smooth: bool },
 }
 
+/// Explicit rectangular coverage for line primitives, independently of polygon mode.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LineRasterization {
+    pub width_bits: u32,
+    pub smooth: bool,
+}
+
 /// Front-facing winding in framebuffer coordinates (X right, Y down), after
 /// viewport transformation. Counterclockwise means negative shoelace area.
 /// Changing the viewport determinant changes facing; it does not change this
@@ -655,6 +662,7 @@ pub struct PreparedDraw {
     pub topology: PrimitiveTopology,
     pub tessellation: Option<crate::TessellationState>,
     pub triangle_rasterization: TriangleRasterization,
+    pub line_rasterization: Option<LineRasterization>,
     pub front_face: FrontFace,
     pub cull_mode: CullMode,
     pub alpha_test: Option<AlphaTest>,
@@ -736,6 +744,7 @@ impl PreparedDraw {
             topology,
             tessellation: None,
             triangle_rasterization: TriangleRasterization::Fill,
+            line_rasterization: None,
             front_face: FrontFace::CounterClockwise,
             cull_mode: CullMode::None,
             alpha_test: None,
@@ -807,6 +816,7 @@ impl DrawOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DispatchOperation {
     pub pipeline: PipelineId,
+    pub shader: crate::ShaderId,
     pub descriptor_tables: Box<[DescriptorTableId]>,
     pub workgroups: [u32; 3],
 }
@@ -814,6 +824,7 @@ pub struct DispatchOperation {
 impl DispatchOperation {
     pub fn new(
         pipeline: PipelineId,
+        shader: crate::ShaderId,
         descriptor_tables: Vec<DescriptorTableId>,
         workgroups: [u32; 3],
     ) -> Result<Self, CommandDescriptionError> {
@@ -822,6 +833,7 @@ impl DispatchOperation {
         }
         Ok(Self {
             pipeline,
+            shader,
             descriptor_tables: descriptor_tables.into_boxed_slice(),
             workgroups,
         })
@@ -1149,6 +1161,7 @@ impl GpuCommand {
             }
             Self::Dispatch(dispatch) => {
                 dependencies.push(ResourceDependency::Pipeline(dispatch.pipeline));
+                dependencies.push(ResourceDependency::Shader(dispatch.shader));
                 extend_unique(
                     &mut dependencies,
                     dispatch
@@ -1731,7 +1744,12 @@ mod tests {
             Err(CommandDescriptionError::IndexBufferMismatch)
         );
         assert_eq!(
-            DispatchOperation::new(PipelineId::new(2), vec![], [1, 0, 1]),
+            DispatchOperation::new(
+                PipelineId::new(2),
+                crate::ShaderId::new(3),
+                vec![],
+                [1, 0, 1]
+            ),
             Err(CommandDescriptionError::EmptyDispatch)
         );
     }
@@ -1950,7 +1968,13 @@ mod tests {
         );
         let dispatch = GpuOperation::new(
             GpuCommand::Dispatch(
-                DispatchOperation::new(PipelineId::new(2), vec![], [2, 1, 1]).unwrap(),
+                DispatchOperation::new(
+                    PipelineId::new(2),
+                    crate::ShaderId::new(3),
+                    vec![],
+                    [2, 1, 1],
+                )
+                .unwrap(),
             ),
             [],
             [],

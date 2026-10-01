@@ -1057,6 +1057,65 @@ fn check_chain(
                 ),
             );
         }
+        if matches!(scenario, Resources::Wireframe(_)) && serial.is_multiple_of(2) {
+            // Exercise frontend-style leading and internal barriers with core
+            // and synchronization validation. Other frames keep a single raw
+            // segment, covering both cached paths with the same pixel oracle.
+            commands.insert(
+                2,
+                operation(GpuCommand::Barrier(
+                    BarrierOperation::new(vec![
+                        ResourceTransition::new(
+                            AccessTarget::Buffer {
+                                buffer: vertices,
+                                range: BufferRange::new(0, vertex_size).unwrap(),
+                            },
+                            AccessScope::new(
+                                PipelineStages::COPY,
+                                AccessMode::Write,
+                                ResourceUsage::TransferDestination,
+                            )
+                            .unwrap(),
+                            AccessScope::new(
+                                PipelineStages::VERTEX_INPUT,
+                                AccessMode::Read,
+                                ResourceUsage::VertexBuffer,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                )),
+            );
+            commands.insert(
+                4,
+                operation(GpuCommand::Barrier(
+                    BarrierOperation::new(vec![
+                        ResourceTransition::new(
+                            AccessTarget::Image {
+                                image,
+                                subresources,
+                            },
+                            AccessScope::new(
+                                PipelineStages::COLOR_OUTPUT,
+                                AccessMode::Write,
+                                ResourceUsage::ColorAttachment,
+                            )
+                            .unwrap(),
+                            AccessScope::new(
+                                PipelineStages::COLOR_OUTPUT,
+                                AccessMode::ReadWrite,
+                                ResourceUsage::ColorAttachment,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                )),
+            );
+        }
         let discard = serial == 4
             && !matches!(
                 scenario,

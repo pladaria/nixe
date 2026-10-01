@@ -4,8 +4,8 @@ use super::*;
 pub(super) fn validate_shader_mask(
     state: &MaxwellThreeDState,
     shaders: &MaxwellThreeDTranslatedShaders,
-    cache: &MaxwellThreeDLoweringCache,
-) -> Result<(), MaxwellThreeDLoweringError> {
+    cache: &MaxwellLoweringCache,
+) -> Result<(), MaxwellLoweringError> {
     if state.ps_output_sample_mask_effective() != Some(true) {
         return Ok(());
     }
@@ -13,11 +13,11 @@ pub(super) fn validate_shader_mask(
         .shaders()
         .iter()
         .find(|shader| shader.stage() == ShaderStage::Fragment)
-        .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
+        .ok_or(MaxwellLoweringError::InvalidTranslatedShaders)?;
     let record = cache
         .shader_translations
         .get(fragment.cache_fingerprint)
-        .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
+        .ok_or(MaxwellLoweringError::InvalidTranslatedShaders)?;
     // SET_PS_OUTPUT_SAMPLE_MASK_USAGE enables consumption, not shader export.
     // The SPH OMAP_SAMPLE_MASK bit independently declares that export and is
     // retained in the translated interface. A color-only shader has no mask
@@ -32,22 +32,22 @@ pub(super) fn validate_shader_mask(
         .iter()
         .any(|output| output.location() == nixe_gpu::ShaderIoLocation::SampleMask)
     {
-        return Err(MaxwellThreeDLoweringError::UnsupportedPsOutputSampleMaskSemantics);
+        return Err(MaxwellLoweringError::UnsupportedPsOutputSampleMaskSemantics);
     }
     Ok(())
 }
 
-pub(super) fn validate(state: &MaxwellThreeDState) -> Result<(), MaxwellThreeDLoweringError> {
+pub(super) fn validate(state: &MaxwellThreeDState) -> Result<(), MaxwellLoweringError> {
     use MaxwellThreeDFixedFunctionRegister as R;
     use MaxwellThreeDFixedFunctionValue as V;
     let four = state.fixed_function().register(R::SampleMode).value()
         == Some(&V::SampleMode(
-            super::super::MaxwellThreeDSampleMode::Samples2x2,
+            super::super::threed::MaxwellThreeDSampleMode::Samples2x2,
         ));
     for (group, register) in state.coverage().sample_locations().iter().enumerate() {
         let Some(value) = register.value().copied() else {
             if four {
-                return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+                return Err(MaxwellLoweringError::IncompleteDraw(
                     "SET_ANTI_ALIAS_SAMPLE_POSITIONS",
                 ));
             }
@@ -62,19 +62,17 @@ pub(super) fn validate(state: &MaxwellThreeDState) -> Result<(), MaxwellThreeDLo
         } else {
             !value.is_centered()
         } {
-            return Err(
-                MaxwellThreeDLoweringError::UnsupportedSampleLocationsSemantics {
-                    group: group as u8,
-                    value,
-                },
-            );
+            return Err(MaxwellLoweringError::UnsupportedSampleLocationsSemantics {
+                group: group as u8,
+                value,
+            });
         }
     }
     if !four {
         return Ok(());
     }
     if state.fixed_function().register(R::AntiAliasEnable).value() != Some(&V::Boolean(true)) {
-        return Err(MaxwellThreeDLoweringError::UnsupportedMultisampleState(
+        return Err(MaxwellLoweringError::UnsupportedMultisampleState(
             "four-sample targets require multisample rasterization enabled",
         ));
     }
@@ -83,7 +81,7 @@ pub(super) fn validate(state: &MaxwellThreeDState) -> Result<(), MaxwellThreeDLo
         .register(R::SampleMaskControl)
         .value();
     if matches!(control, Some(V::Mask(value)) if value & 0x10 != 0) {
-        return Err(MaxwellThreeDLoweringError::UnsupportedMultisampleState(
+        return Err(MaxwellLoweringError::UnsupportedMultisampleState(
             "color-target sample masking",
         ));
     }
@@ -98,7 +96,7 @@ pub(super) fn validate(state: &MaxwellThreeDState) -> Result<(), MaxwellThreeDLo
         ] {
             if !matches!(state.fixed_function().register(register).value(), Some(V::Mask(mask)) if mask & 0xf == 0xf)
             {
-                return Err(MaxwellThreeDLoweringError::UnsupportedMultisampleState(
+                return Err(MaxwellLoweringError::UnsupportedMultisampleState(
                     "missing or non-full per-quadrant four-sample mask",
                 ));
             }
@@ -131,7 +129,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let mut cache = MaxwellThreeDLoweringCache::default();
+        let mut cache = MaxwellLoweringCache::default();
         cache.seed_test_shader_translations(&shaders);
         program_three_d(&mut channel, 0x1534, 1);
         program_three_d(&mut channel, 0x0300, 3);
@@ -170,14 +168,14 @@ mod tests {
             ShaderBackendModule::new(VerifiedShaderIr::verify(ir).unwrap());
         assert_eq!(
             validate_shader_mask(channel.three_d(), &shaders, &cache),
-            Err(MaxwellThreeDLoweringError::UnsupportedPsOutputSampleMaskSemantics)
+            Err(MaxwellLoweringError::UnsupportedPsOutputSampleMaskSemantics)
         );
         program_three_d(&mut channel, 0x1534, 0);
         validate_shader_mask(channel.three_d(), &shaders, &cache).unwrap();
         program_three_d(&mut channel, 0x0300, 1);
         assert_eq!(
             validate_shader_mask(channel.three_d(), &shaders, &cache),
-            Err(MaxwellThreeDLoweringError::UnsupportedPsOutputSampleMaskSemantics)
+            Err(MaxwellLoweringError::UnsupportedPsOutputSampleMaskSemantics)
         );
     }
 

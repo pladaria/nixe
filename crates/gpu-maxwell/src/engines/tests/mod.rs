@@ -7,6 +7,8 @@ use nixe_gpu::{
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions};
 
 use super::*;
+
+mod compute_launch;
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellAddressSpaceId,
     MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellChannelId, MaxwellChannelOwner,
@@ -385,7 +387,7 @@ fn program_polygon_fill(channel: &mut MaxwellGpuChannel) {
     }
 }
 
-fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellThreeDLoweringCache) {
+fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellLoweringCache) {
     let shaders = MaxwellThreeDTranslatedShaders::new(
         vec![
             MaxwellThreeDTranslatedShader::new(
@@ -406,7 +408,7 @@ fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellThre
         Vec::new(),
     )
     .unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     cache.seed_test_shader_translations(&shaders);
     (shaders, cache)
 }

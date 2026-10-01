@@ -89,7 +89,7 @@ impl PatchAddresses {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn lower(
         &mut self,
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         offset: u32,
         encoding: u64,
         register_count: u8,
@@ -98,7 +98,7 @@ impl PatchAddresses {
     ) -> Result<Option<Vec<ShaderOperation>>, MaxwellShaderTranslationError> {
         if !matches!(
             stage,
-            MaxwellThreeDShaderStage::TessellationInit | MaxwellThreeDShaderStage::Tessellation
+            MaxwellShaderStage::TessellationInit | MaxwellShaderStage::Tessellation
         ) {
             return Ok(None);
         }
@@ -121,8 +121,7 @@ impl PatchAddresses {
         let bfe = opcode & 0xfffe == 0x3800;
         let xmad = opcode & 0xffc0 == 0x5b00;
         let intercepted = (system
-            && (selector == 0x1d
-                || (selector == 0 && stage == MaxwellThreeDShaderStage::Tessellation)))
+            && (selector == 0x1d || (selector == 0 && stage == MaxwellShaderStage::Tessellation)))
             || isberd
             || ald
             || (lop && self.abstracted(a))
@@ -308,9 +307,7 @@ impl PatchAddresses {
             }
             let output = encoding & (1 << 32) != 0;
             let patch = encoding & (1 << 31) != 0;
-            if patch
-                && !(output && stage == MaxwellThreeDShaderStage::TessellationInit && c == 0xff)
-            {
+            if patch && !(output && stage == MaxwellShaderStage::TessellationInit && c == 0xff) {
                 return Err(error(
                     "patch ALD requires a direct control-shader output address",
                 ));
@@ -340,7 +337,7 @@ impl PatchAddresses {
                     match handle {
                         Value::EvaluationLane
                             if output
-                                && stage == MaxwellThreeDShaderStage::Tessellation
+                                && stage == MaxwellShaderStage::Tessellation
                                 && matches!(address, 0x2f0 | 0x2f4) =>
                         {
                             let component = ((address - 0x2f0) / 4) as u8;
@@ -397,13 +394,13 @@ impl PatchAddresses {
     /// observe their numeric representation. Operands are checked before writes.
     pub(super) fn ordinary(
         &mut self,
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         encoding: u64,
         instructions: &[ShaderInstruction],
     ) -> Result<(), MaxwellShaderTranslationError> {
         if matches!(
             stage,
-            MaxwellThreeDShaderStage::TessellationInit | MaxwellThreeDShaderStage::Tessellation
+            MaxwellShaderStage::TessellationInit | MaxwellShaderStage::Tessellation
         ) && instructions
             .iter()
             .any(|instruction| matches!(instruction.operation(), ShaderOperation::Branch { .. }))

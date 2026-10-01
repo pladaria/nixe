@@ -394,7 +394,7 @@ impl MaxwellThreeDShaderLocalMemoryState {
         &self.window_base_address
     }
 
-    pub(super) fn region_is_partially_programmed(&self) -> bool {
+    pub(in crate::engines) fn region_is_partially_programmed(&self) -> bool {
         let programmed = self.address_upper.raw().is_some()
             || self.address_lower.raw().is_some()
             || self.size_upper.raw().is_some()

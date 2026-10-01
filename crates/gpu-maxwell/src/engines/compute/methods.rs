@@ -38,6 +38,9 @@ enum MethodAction {
     ProgramRegionAddressUpper,
     ProgramRegionAddressLower,
     SpaVersion,
+    ShaderExceptionsEnable,
+    QmdAddress,
+    SendSignalingPcas,
     TextureHeaderAddressUpper,
     TextureHeaderAddressLower,
     TextureHeaderMaximumIndex,
@@ -47,6 +50,7 @@ enum MethodAction {
     BindlessTextureConstantBufferSlot,
     CwdReferenceCounter,
     WaitForIdle,
+    InvalidateShaderCaches,
     InvalidateShaderCachesNoWfi,
 }
 
@@ -88,8 +92,13 @@ macro_rules! methods {
 // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L701-L702
 // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L83-L170
 // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L631-L640
+// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L588-L591
+// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L349-L362
+// INVALIDATE_SHADER_CACHES and its LOCKS/FLUSH_DATA selectors:
+// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L214-L229
 methods!(
     WAIT_FOR_IDLE => (0x0110, "WAIT_FOR_IDLE", u32::MAX, MethodAction::WaitForIdle),
+    INVALIDATE_SHADER_CACHES => (0x021c, "INVALIDATE_SHADER_CACHES", 0x0000_1017, MethodAction::InvalidateShaderCaches),
     LINE_LENGTH_IN => (0x0180, "LINE_LENGTH_IN", u32::MAX, MethodAction::InlineToMemoryLineLength),
     LINE_COUNT => (0x0184, "LINE_COUNT", u32::MAX, MethodAction::InlineToMemoryLineCount),
     OFFSET_OUT_UPPER => (0x0188, "OFFSET_OUT_UPPER", 0x0000_00ff, MethodAction::InlineToMemoryAddressUpper),
@@ -107,6 +116,9 @@ methods!(
     SET_SHADER_LOCAL_MEMORY_A => (0x0790, "SET_SHADER_LOCAL_MEMORY_A", 0x0000_00ff, MethodAction::AddressUpper),
     SET_SHADER_LOCAL_MEMORY_B => (0x0794, "SET_SHADER_LOCAL_MEMORY_B", u32::MAX, MethodAction::AddressLower),
     SET_SPA_VERSION => (0x0310, "SET_SPA_VERSION", 0x0000_ffff, MethodAction::SpaVersion),
+    SET_SHADER_EXCEPTIONS => (0x1528, "SET_SHADER_EXCEPTIONS", 0x0000_0001, MethodAction::ShaderExceptionsEnable),
+    SEND_PCAS_A => (0x02b4, "SEND_PCAS_A", u32::MAX, MethodAction::QmdAddress),
+    SEND_SIGNALING_PCAS_B => (0x02bc, "SEND_SIGNALING_PCAS_B", 0x0000_0003, MethodAction::SendSignalingPcas),
     SET_PROGRAM_REGION_A => (0x1608, "SET_PROGRAM_REGION_A", 0x0000_00ff, MethodAction::ProgramRegionAddressUpper),
     SET_PROGRAM_REGION_B => (0x160c, "SET_PROGRAM_REGION_B", u32::MAX, MethodAction::ProgramRegionAddressLower),
     INVALIDATE_SHADER_CACHES_NO_WFI => (0x1698, "INVALIDATE_SHADER_CACHES_NO_WFI", 0x0000_1011, MethodAction::InvalidateShaderCachesNoWfi),
@@ -137,20 +149,63 @@ pub(super) fn preflight(
     }
 
     let raw = source.argument();
+    if matches!(declaration.action, MethodAction::SendSignalingPcas) {
+        if raw & 2 == 0 {
+            return Err(invalid_encoding(
+                source,
+                declaration.metadata.method_name(),
+                "PCAS without SCHEDULE is not implemented",
+            ));
+        }
+        let address = *candidate.qmd_address().value().ok_or_else(|| {
+            invalid_encoding(
+                source,
+                declaration.metadata.method_name(),
+                "SCHEDULE requires SEND_PCAS_A",
+            )
+        })?;
+        return Ok(AppliedMethod::new(
+            method,
+            *declaration.metadata,
+            Some(PendingEngineOperation::ComputeLaunch(
+                super::MaxwellComputeLaunch::new(address, raw & 1 != 0, source),
+            )),
+        ));
+    }
     let trigger = match declaration.action {
         MethodAction::WaitForIdle => {
             Some(MaxwellComputeOperationTrigger::WaitForIdle { value: raw, source })
         }
-        MethodAction::InvalidateShaderCachesNoWfi => Some(
-            MaxwellComputeOperationTrigger::InvalidateShaderCachesNoWfi {
-                caches: MaxwellComputeShaderCacheInvalidation::new(
-                    raw & 1 != 0,
-                    raw & 0x10 != 0,
-                    raw & 0x1000 != 0,
-                ),
-                source,
-            },
-        ),
+        MethodAction::InvalidateShaderCaches | MethodAction::InvalidateShaderCachesNoWfi => {
+            // clb1c0.h defines LOCKS/FLUSH_DATA only for the WFI variant.
+            // Neither can be represented by read-cache invalidation alone.
+            if raw & 2 != 0 {
+                return Err(invalid_encoding(
+                    source,
+                    declaration.metadata.method_name(),
+                    "shader cache lock invalidation is not implemented",
+                ));
+            }
+            if raw & 4 != 0 {
+                return Err(invalid_encoding(
+                    source,
+                    declaration.metadata.method_name(),
+                    "shader data cache flush is not implemented",
+                ));
+            }
+            let caches = MaxwellComputeShaderCacheInvalidation::new(
+                raw & 1 != 0,
+                raw & 0x10 != 0,
+                raw & 0x1000 != 0,
+            );
+            Some(
+                if matches!(declaration.action, MethodAction::InvalidateShaderCaches) {
+                    MaxwellComputeOperationTrigger::InvalidateShaderCaches { caches, source }
+                } else {
+                    MaxwellComputeOperationTrigger::InvalidateShaderCachesNoWfi { caches, source }
+                },
+            )
+        }
         _ => None,
     };
     if let Some(trigger) = trigger {
@@ -254,13 +309,13 @@ pub(super) fn preflight(
             MaxwellComputeStateWrite::InlineToMemoryAddressLower { value: raw, source }
         }
         MethodAction::InlineToMemoryLaunch => {
-            if raw != 0x0000_0041 {
-                return Err(invalid_encoding(
+            let launch = MaxwellComputeInlineToMemoryLaunch::parse_pitch(raw).ok_or_else(|| {
+                invalid_encoding(
                     source,
                     declaration.metadata.method_name(),
-                    "only the captured pitch, no-reduction, no-completion inline upload is implemented",
-                ));
-            }
+                    "only pitch uploads with flush-disabled or flush-only completion and no reduction, interrupt or semaphore configuration are implemented",
+                )
+            })?;
             let inline = candidate.inline_to_memory();
             if inline.pending().is_some() {
                 return Err(invalid_encoding(
@@ -294,7 +349,7 @@ pub(super) fn preflight(
                 return Err(invalid_encoding(
                     source,
                     declaration.metadata.method_name(),
-                    "captured inline upload length must be nonzero and word-aligned",
+                    "inline upload length must be nonzero and word-aligned",
                 ));
             }
             if line_count != 1 {
@@ -316,7 +371,7 @@ pub(super) fn preflight(
                 ));
             }
             MaxwellComputeStateWrite::InlineToMemoryLaunch {
-                value: MaxwellComputeInlineToMemoryLaunch::captured_pitch(),
+                value: launch,
                 pending: MaxwellComputeInlineToMemoryPendingTransfer::new(address, line_length),
                 source,
             }
@@ -335,6 +390,17 @@ pub(super) fn preflight(
                 .ok_or_else(|| invalid_value(source, declaration))?,
             source,
         },
+        MethodAction::ShaderExceptionsEnable => MaxwellComputeStateWrite::ShaderExceptionsEnable {
+            value: raw != 0,
+            source,
+        },
+        MethodAction::QmdAddress => MaxwellComputeStateWrite::QmdAddress {
+            shifted: raw,
+            source,
+        },
+        MethodAction::SendSignalingPcas => {
+            unreachable!("PCAS scheduling returns before state decoding")
+        }
         MethodAction::TextureHeaderAddressUpper => {
             MaxwellComputeStateWrite::TextureHeaderAddressUpper {
                 value: raw as u8,
@@ -371,8 +437,8 @@ pub(super) fn preflight(
             source,
         },
         MethodAction::WaitForIdle => unreachable!("WAIT_FOR_IDLE returns before state decoding"),
-        MethodAction::InvalidateShaderCachesNoWfi => {
-            unreachable!("INVALIDATE_SHADER_CACHES_NO_WFI returns before state decoding")
+        MethodAction::InvalidateShaderCaches | MethodAction::InvalidateShaderCachesNoWfi => {
+            unreachable!("shader cache invalidation returns before state decoding")
         }
         MethodAction::InlineToMemoryData => {
             unreachable!("LOAD_INLINE_DATA returns before state decoding")

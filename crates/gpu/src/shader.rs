@@ -8,6 +8,7 @@ use std::{collections::BTreeSet, fmt::Display, sync::Arc};
 
 use crate::{ShaderStage, VertexBufferLayout, VertexStepMode};
 
+mod compute;
 mod integer;
 mod linkage;
 mod liveness;
@@ -16,6 +17,7 @@ pub mod spirv;
 mod tessellation;
 mod vertex_fetch;
 
+pub use compute::ShaderComputeBuiltin;
 pub use integer::{ShaderBitwiseOperation, ShaderIntegerComparison};
 
 /// Stable location within the original guest shader byte stream.
@@ -383,6 +385,22 @@ impl ShaderInterfaceElement {
 /// Minimal operation vocabulary shared by frontend translation and backends.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShaderOperation {
+    LoadComputeBuiltin32 {
+        destination: ShaderRegister,
+        builtin: ShaderComputeBuiltin,
+        component: u8,
+    },
+    /// Word-aligned storage access; the index is an unsigned 32-bit word index.
+    LoadStorageBuffer32 {
+        destination: ShaderRegister,
+        binding: u8,
+        word_index: ShaderRegister,
+    },
+    StoreStorageBuffer32 {
+        source: ShaderRegister,
+        binding: u8,
+        word_index: ShaderRegister,
+    },
     Undefined32 {
         destination: ShaderRegister,
     },
@@ -484,7 +502,23 @@ pub enum ShaderOperation {
         scalar_type: ShaderScalarType,
         float_control: ShaderFloatControl,
     },
+    /// Unsigned addition with an optional low-bit carry input and a 0/1
+    /// carry output. Both results consume the original operands, even when
+    /// registers alias. This does not represent ISA-specific flag registers.
+    AddCarry32 {
+        destination: ShaderRegister,
+        carry_out: ShaderRegister,
+        left: ShaderRegister,
+        right: ShaderRegister,
+        carry_in: Option<ShaderRegister>,
+    },
     ShiftLeft32 {
+        destination: ShaderRegister,
+        value: ShaderRegister,
+        amount: ShaderRegister,
+        wrap: bool,
+    },
+    ShiftRightLogical32 {
         destination: ShaderRegister,
         value: ShaderRegister,
         amount: ShaderRegister,
@@ -653,6 +687,7 @@ impl ShaderInstruction {
 pub struct ShaderIr {
     stage: ShaderStage,
     tessellation_control_points: Option<u32>,
+    workgroup_size: Option<[u32; 3]>,
     inputs: Box<[ShaderInterfaceElement]>,
     outputs: Box<[ShaderInterfaceElement]>,
     resources: Box<[ShaderResourceAccess]>,
@@ -671,6 +706,7 @@ impl ShaderIr {
         Self {
             stage,
             tessellation_control_points: None,
+            workgroup_size: None,
             inputs: inputs.into_boxed_slice(),
             outputs: outputs.into_boxed_slice(),
             resources: resources.into_boxed_slice(),
@@ -681,6 +717,17 @@ impl ShaderIr {
     #[must_use]
     pub const fn stage(&self) -> ShaderStage {
         self.stage
+    }
+
+    #[must_use]
+    pub fn with_workgroup_size(mut self, size: [u32; 3]) -> Self {
+        self.workgroup_size = Some(size);
+        self
+    }
+
+    #[must_use]
+    pub const fn workgroup_size(&self) -> Option<[u32; 3]> {
+        self.workgroup_size
     }
 
     /// Control-stage output cardinality; never the draw's input patch size.
@@ -739,6 +786,7 @@ pub struct VerifiedShaderIr(ShaderIr);
 impl VerifiedShaderIr {
     pub fn verify(ir: ShaderIr) -> Result<Self, ShaderVerificationError> {
         tessellation::verify_metadata(&ir)?;
+        compute::verify(&ir)?;
         verify_interface_set(ir.stage, &ir.inputs, true)?;
         verify_interface_set(ir.stage, &ir.outputs, false)?;
         verify_resource_set(&ir.resources)?;
@@ -826,6 +874,7 @@ pub enum ShaderEvaluationError {
         component: u8,
     },
     PatchExecutionRequired(ShaderSourceLocation),
+    ComputeExecutionRequired(ShaderSourceLocation),
     MissingInterfaceInput {
         location: ShaderIoLocation,
         component: u8,
@@ -874,6 +923,13 @@ pub fn evaluate_shader_ir(
             continue;
         }
         match instruction.operation() {
+            ShaderOperation::LoadComputeBuiltin32 { .. }
+            | ShaderOperation::LoadStorageBuffer32 { .. }
+            | ShaderOperation::StoreStorageBuffer32 { .. } => {
+                return Err(ShaderEvaluationError::ComputeExecutionRequired(
+                    instruction.source,
+                ));
+            }
             ShaderOperation::LoadControlPoint {
                 destination,
                 vertex,
@@ -1098,6 +1154,25 @@ pub fn evaluate_shader_ir(
                 };
                 registers[destination.index() as usize] = Some(value);
             }
+            ShaderOperation::AddCarry32 {
+                destination,
+                carry_out,
+                left,
+                right,
+                carry_in,
+            } => {
+                let total = u64::from(register_bits(&registers, *left)?)
+                    + u64::from(register_bits(&registers, *right)?)
+                    + u64::from(
+                        carry_in
+                            .map(|r| register_bits(&registers, r))
+                            .transpose()?
+                            .unwrap_or(0)
+                            & 1,
+                    );
+                registers[destination.index() as usize] = Some(total as u32);
+                registers[carry_out.index() as usize] = Some((total >> 32) as u32);
+            }
             ShaderOperation::Bitwise32 {
                 destination,
                 left,
@@ -1117,15 +1192,24 @@ pub fn evaluate_shader_ir(
                 value,
                 amount,
                 wrap,
+            }
+            | ShaderOperation::ShiftRightLogical32 {
+                destination,
+                value,
+                amount,
+                wrap,
             } => {
                 let value = register_bits(&registers, *value)?;
                 let amount = register_bits(&registers, *amount)?;
-                let shifted = if *wrap {
-                    value.wrapping_shl(amount & 31)
-                } else if amount < 32 {
-                    value << amount
-                } else {
+                let shifted = if !*wrap && amount >= 32 {
                     0
+                } else if matches!(
+                    instruction.operation,
+                    ShaderOperation::ShiftRightLogical32 { .. }
+                ) {
+                    value >> (amount & 31)
+                } else {
+                    value << (amount & 31)
                 };
                 registers[destination.index() as usize] = Some(shifted);
             }
@@ -1595,7 +1679,10 @@ fn lower_shader_ir_to_wgsl_impl(
     quad_flat: bool,
 ) -> Result<WgslShaderModule, ShaderBackendLoweringError> {
     let ir = shader.ir();
-    if !matches!(ir.stage, ShaderStage::Vertex | ShaderStage::Fragment) {
+    if !matches!(
+        ir.stage,
+        ShaderStage::Vertex | ShaderStage::Fragment | ShaderStage::Compute
+    ) {
         return Err(ShaderBackendLoweringError::UnsupportedStage(ir.stage));
     }
     let mut input_groups = interface_groups(&ir.inputs)?;
@@ -1688,13 +1775,26 @@ fn lower_shader_ir_to_wgsl_impl(
     if !input_groups.is_empty() {
         emit_interface_struct(&mut source, "ShaderInput", ir.stage, true, &input_groups)?;
     }
-    emit_interface_struct(&mut source, "ShaderOutput", ir.stage, false, &output_groups)?;
+    let return_statement = if ir.stage == ShaderStage::Compute {
+        "return;"
+    } else {
+        "return output;"
+    };
+    if ir.stage != ShaderStage::Compute {
+        emit_interface_struct(&mut source, "ShaderOutput", ir.stage, false, &output_groups)?;
+    }
     let entry_point = match ir.stage {
         ShaderStage::Vertex => "nixe_guest_vertex",
         ShaderStage::Fragment => "nixe_guest_fragment",
+        ShaderStage::Compute => "main",
         _ => unreachable!("unsupported stages returned above"),
     };
-    if input_groups.is_empty() {
+    if ir.stage == ShaderStage::Compute {
+        compute::emit_entry(
+            &mut source,
+            ir.workgroup_size.expect("verified compute metadata"),
+        );
+    } else if input_groups.is_empty() {
         source.push_str(&format!("fn {entry_point}() -> ShaderOutput {{\n"));
     } else {
         source.push_str(&format!(
@@ -1703,13 +1803,15 @@ fn lower_shader_ir_to_wgsl_impl(
     }
     source.push_str("  var registers: array<u32, 256>;\n");
     source.push_str("  var predicates: array<bool, 7>;\n");
-    source.push_str("  var output: ShaderOutput;\n");
+    if ir.stage != ShaderStage::Compute {
+        source.push_str("  var output: ShaderOutput;\n");
+    }
     if ir
         .instructions
         .iter()
         .any(|instruction| matches!(instruction.operation, ShaderOperation::Branch { .. }))
     {
-        emit_wgsl_control_flow(&mut source, ir)?;
+        emit_wgsl_control_flow(&mut source, ir, return_statement)?;
         source.push_str("}\n");
     } else {
         for instruction in &ir.instructions {
@@ -1730,7 +1832,7 @@ fn lower_shader_ir_to_wgsl_impl(
                 }
                 ShaderPredicate::Always => false,
             };
-            emit_wgsl_operation(&mut source, instruction)?;
+            emit_wgsl_operation(&mut source, instruction, return_statement)?;
             if conditional {
                 source.push_str("  }\n");
             }
@@ -1747,7 +1849,7 @@ fn lower_shader_ir_to_wgsl_impl(
         source.push_str(
             "\n@vertex\nfn main(input: ShaderInput) -> ShaderOutput {\n  return nixe_guest_vertex(input);\n}\n",
         );
-    } else {
+    } else if ir.stage == ShaderStage::Fragment {
         emit_wgsl_fragment_entry_points(&mut source, &input_groups, &output_groups);
     }
     if let Some((layouts, _)) = vertex_pulling {
@@ -2005,6 +2107,7 @@ fn emit_wgsl_vertex_entry_points(
 fn emit_wgsl_control_flow(
     source: &mut String,
     ir: &ShaderIr,
+    return_statement: &str,
 ) -> Result<(), ShaderBackendLoweringError> {
     let locations = shader_instruction_entry_points(ir);
     let mut leaders = BTreeSet::from([0_usize]);
@@ -2055,6 +2158,7 @@ fn emit_wgsl_control_flow(
                         instruction.predicate,
                         target_block,
                         fallthrough,
+                        return_statement,
                     );
                     terminated = true;
                 }
@@ -2063,10 +2167,11 @@ fn emit_wgsl_control_flow(
                         source,
                         instruction.predicate,
                         instruction_blocks.get(instruction_index + 1).copied(),
+                        return_statement,
                     );
                     terminated = true;
                 }
-                _ => emit_wgsl_nested_operation(source, instruction)?,
+                _ => emit_wgsl_nested_operation(source, instruction, return_statement)?,
             }
         }
         if !terminated {
@@ -2076,21 +2181,22 @@ fn emit_wgsl_control_flow(
                     instruction_blocks[*next]
                 ));
             } else {
-                source.push_str("        return output;\n");
+                source.push_str(&format!("        {return_statement}\n"));
             }
         }
         source.push_str("      }\n");
     }
-    source.push_str("      default: { return output; }\n");
+    source.push_str(&format!("      default: {{ {return_statement} }}\n"));
     source.push_str("    }\n");
     source.push_str("  }\n");
-    source.push_str("  return output;\n");
+    source.push_str(&format!("  {return_statement}\n"));
     Ok(())
 }
 
 fn emit_wgsl_nested_operation(
     source: &mut String,
     instruction: &ShaderInstruction,
+    return_statement: &str,
 ) -> Result<(), ShaderBackendLoweringError> {
     if instruction.predicate == ShaderPredicate::Never {
         return Ok(());
@@ -2106,7 +2212,7 @@ fn emit_wgsl_nested_operation(
             false
         };
     let mut operation = String::new();
-    emit_wgsl_operation(&mut operation, instruction)?;
+    emit_wgsl_operation(&mut operation, instruction, return_statement)?;
     for line in operation.lines() {
         source.push_str("      ");
         source.push_str(line);
@@ -2123,12 +2229,13 @@ fn emit_wgsl_block_transfer(
     predicate: ShaderPredicate,
     target: usize,
     fallthrough: Option<usize>,
+    return_statement: &str,
 ) {
     match predicate {
         ShaderPredicate::Always => source.push_str(&format!(
             "        nixe_block = {target}u;\n        continue;\n"
         )),
-        ShaderPredicate::Never => emit_wgsl_fallthrough(source, fallthrough),
+        ShaderPredicate::Never => emit_wgsl_fallthrough(source, fallthrough, return_statement),
         ShaderPredicate::Register { .. } => {
             let condition = wgsl_predicate_expression(predicate);
             source.push_str(&format!(
@@ -2137,7 +2244,7 @@ fn emit_wgsl_block_transfer(
             if let Some(fallthrough) = fallthrough {
                 source.push_str(&format!("          nixe_block = {fallthrough}u;\n"));
             } else {
-                source.push_str("          return output;\n");
+                source.push_str(&format!("          {return_statement}\n"));
             }
             source.push_str("        }\n        continue;\n");
         }
@@ -2148,27 +2255,28 @@ fn emit_wgsl_block_exit(
     source: &mut String,
     predicate: ShaderPredicate,
     fallthrough: Option<usize>,
+    return_statement: &str,
 ) {
     match predicate {
-        ShaderPredicate::Always => source.push_str("        return output;\n"),
-        ShaderPredicate::Never => emit_wgsl_fallthrough(source, fallthrough),
+        ShaderPredicate::Always => source.push_str(&format!("        {return_statement}\n")),
+        ShaderPredicate::Never => emit_wgsl_fallthrough(source, fallthrough, return_statement),
         ShaderPredicate::Register { .. } => {
             let condition = wgsl_predicate_expression(predicate);
             source.push_str(&format!(
-                "        if ({condition}) {{\n          return output;\n        }}\n"
+                "        if ({condition}) {{\n          {return_statement}\n        }}\n"
             ));
-            emit_wgsl_fallthrough(source, fallthrough);
+            emit_wgsl_fallthrough(source, fallthrough, return_statement);
         }
     }
 }
 
-fn emit_wgsl_fallthrough(source: &mut String, fallthrough: Option<usize>) {
+fn emit_wgsl_fallthrough(source: &mut String, fallthrough: Option<usize>, return_statement: &str) {
     if let Some(fallthrough) = fallthrough {
         source.push_str(&format!(
             "        nixe_block = {fallthrough}u;\n        continue;\n"
         ));
     } else {
-        source.push_str("        return output;\n");
+        source.push_str(&format!("        {return_statement}\n"));
     }
 }
 
@@ -2177,6 +2285,18 @@ fn emit_wgsl_resources(
     ir: &ShaderIr,
 ) -> Result<(), ShaderBackendLoweringError> {
     for resource in &ir.resources {
+        if resource.kind == ShaderResourceKind::StorageBuffer && ir.stage == ShaderStage::Compute {
+            let access = if resource.writable {
+                "read_write"
+            } else {
+                "read"
+            };
+            source.push_str(&format!(
+                "@group(0) @binding({}) var<storage, {access}> storage_buffer_{}: array<u32>;\n",
+                resource.binding, resource.binding
+            ));
+            continue;
+        }
         if !resource.readable || resource.writable {
             return Err(ShaderBackendLoweringError::ResourceAccess(
                 ir.instructions[0].source,
@@ -2350,8 +2470,47 @@ fn wgsl_type(location: ShaderIoLocation, scalar_type: ShaderScalarType, componen
 fn emit_wgsl_operation(
     source: &mut String,
     instruction: &ShaderInstruction,
+    return_statement: &str,
 ) -> Result<(), ShaderBackendLoweringError> {
     match instruction.operation() {
+        ShaderOperation::LoadComputeBuiltin32 {
+            destination,
+            builtin,
+            component,
+        } => {
+            let component = if *builtin == ShaderComputeBuiltin::LocalInvocationIndex {
+                ""
+            } else {
+                wgsl_component(*component)
+            };
+            source.push_str(&format!(
+                "  registers[{}] = {}{component};\n",
+                destination.index(),
+                builtin.wgsl_name()
+            ));
+        }
+        ShaderOperation::LoadStorageBuffer32 {
+            destination,
+            binding,
+            word_index,
+        } => {
+            source.push_str(&format!(
+                "  registers[{}] = storage_buffer_{binding}[registers[{}]];\n",
+                destination.index(),
+                word_index.index()
+            ));
+        }
+        ShaderOperation::StoreStorageBuffer32 {
+            source: value,
+            binding,
+            word_index,
+        } => {
+            source.push_str(&format!(
+                "  storage_buffer_{binding}[registers[{}]] = registers[{}];\n",
+                word_index.index(),
+                value.index()
+            ));
+        }
         ShaderOperation::LoadControlPoint { .. }
         | ShaderOperation::StoreControlPoint { .. }
         | ShaderOperation::LoadPatchOutput { .. }
@@ -2649,6 +2808,21 @@ fn emit_wgsl_operation(
                 destination.index()
             ));
         }
+        ShaderOperation::AddCarry32 {
+            destination,
+            carry_out,
+            left,
+            right,
+            carry_in,
+        } => {
+            let carry = carry_in.map_or_else(
+                || "0u".to_owned(),
+                |r| format!("registers[{}] & 1u", r.index()),
+            );
+            source.push_str(&format!(
+                "  {{\n    let a = registers[{}];\n    let b = registers[{}];\n    let c = {carry};\n    let sum = a + b;\n    let total = sum + c;\n    registers[{}] = total;\n    registers[{}] = select(0u, 1u, sum < a || total < sum);\n  }}\n",
+                left.index(), right.index(), destination.index(), carry_out.index()));
+        }
         ShaderOperation::Bitwise32 {
             destination,
             left,
@@ -2672,9 +2846,23 @@ fn emit_wgsl_operation(
             value,
             amount,
             wrap,
+        }
+        | ShaderOperation::ShiftRightLogical32 {
+            destination,
+            value,
+            amount,
+            wrap,
         } => {
+            let operator = if matches!(
+                instruction.operation,
+                ShaderOperation::ShiftRightLogical32 { .. }
+            ) {
+                ">>"
+            } else {
+                "<<"
+            };
             let shifted = format!(
-                "registers[{}] << (registers[{}] & 31u)",
+                "registers[{}] {operator} (registers[{}] & 31u)",
                 value.index(),
                 amount.index()
             );
@@ -2959,7 +3147,7 @@ fn emit_wgsl_operation(
         ShaderOperation::Branch { .. } => {
             return Err(ShaderBackendLoweringError::ControlFlow(instruction.source));
         }
-        ShaderOperation::Exit => source.push_str("  return output;\n"),
+        ShaderOperation::Exit => source.push_str(&format!("  {return_statement}\n")),
     }
     Ok(())
 }
@@ -3167,6 +3355,14 @@ fn wgsl_unpack_expression(scalar_type: ShaderScalarType, register: u16) -> Strin
 /// Typed reason why translated IR cannot be consumed by any backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShaderVerificationError {
+    AliasedCarryDestinations {
+        source: ShaderSourceLocation,
+    },
+    InvalidComputeMetadata,
+    InvalidComputeOperation {
+        source: ShaderSourceLocation,
+        reason: &'static str,
+    },
     AliasedPredicateDestinations {
         source: ShaderSourceLocation,
     },
@@ -3228,7 +3424,10 @@ pub enum ShaderVerificationError {
 impl Display for ShaderVerificationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AliasedCarryDestinations { source } => write!(formatter, "shader sum and carry destinations alias at byte offset 0x{:x}", source.byte_offset()),
             Self::InvalidTessellationMetadata => formatter.write_str("shader IR requires nonzero output control-point count exactly for the control stage"),
+            Self::InvalidComputeMetadata => formatter.write_str("compute requires a nonzero workgroup size and no graphics interface; other stages cannot declare a workgroup size"),
+            Self::InvalidComputeOperation { source, reason } => write!(formatter, "invalid compute operation at {source:?}: {reason}"),
             Self::InvalidTessellationInterface { stage, input, location } => write!(formatter, "invalid tessellation interface: stage={stage:?} input={input} location={location:?}"),
             Self::InvalidPatchOperation { source, reason } => write!(formatter, "invalid patch operation at {source:?}: {reason}"),
             Self::EmptyProgram => formatter.write_str("shader IR contains no instructions"),
@@ -3410,8 +3609,15 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     definitions.registers.insert(*destination);
                 }
             }
-            ShaderOperation::StoreControlPoint { .. } | ShaderOperation::PatchBarrier => {
-                tessellation::verify_operation(ir, instruction, index)?;
+            ShaderOperation::StoreControlPoint { .. }
+            | ShaderOperation::PatchBarrier
+            | ShaderOperation::StoreStorageBuffer32 { .. } => {
+                if !matches!(
+                    instruction.operation,
+                    ShaderOperation::StoreStorageBuffer32 { .. }
+                ) {
+                    tessellation::verify_operation(ir, instruction, index)?;
+                }
                 for source in operation_sources(&instruction.operation) {
                     require_definition(
                         instruction.source,
@@ -3421,7 +3627,31 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     )?;
                 }
             }
+            ShaderOperation::AddCarry32 {
+                destination,
+                carry_out,
+                ..
+            } => {
+                if destination == carry_out {
+                    return Err(ShaderVerificationError::AliasedCarryDestinations {
+                        source: instruction.source,
+                    });
+                }
+                for source in operation_sources(&instruction.operation) {
+                    require_definition(
+                        instruction.source,
+                        source,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
+                }
+                if !conditional {
+                    definitions.registers.extend([*destination, *carry_out]);
+                }
+            }
             ShaderOperation::Undefined32 { destination }
+            | ShaderOperation::LoadComputeBuiltin32 { destination, .. }
+            | ShaderOperation::LoadStorageBuffer32 { destination, .. }
             | ShaderOperation::MoveImmediate32 { destination, .. }
             | ShaderOperation::Move32 { destination, .. }
             | ShaderOperation::FloatAbsolute32 { destination, .. }
@@ -3438,6 +3668,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::FloatMultiplyZero32 { destination, .. }
             | ShaderOperation::Add32 { destination, .. }
             | ShaderOperation::ShiftLeft32 { destination, .. }
+            | ShaderOperation::ShiftRightLogical32 { destination, .. }
             | ShaderOperation::Bitwise32 { destination, .. }
             | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
             | ShaderOperation::InterpolateInput { destination, .. } => {
@@ -3810,7 +4041,17 @@ fn visit_operation_destinations(
     mut visit: impl FnMut(ShaderRegister),
 ) {
     match operation {
+        ShaderOperation::AddCarry32 {
+            destination,
+            carry_out,
+            ..
+        } => {
+            visit(*destination);
+            visit(*carry_out);
+        }
         ShaderOperation::Undefined32 { destination }
+        | ShaderOperation::LoadComputeBuiltin32 { destination, .. }
+        | ShaderOperation::LoadStorageBuffer32 { destination, .. }
         | ShaderOperation::MoveImmediate32 { destination, .. }
         | ShaderOperation::Move32 { destination, .. }
         | ShaderOperation::FloatAbsolute32 { destination, .. }
@@ -3824,6 +4065,7 @@ fn visit_operation_destinations(
         | ShaderOperation::FloatMultiplyZero32 { destination, .. }
         | ShaderOperation::Add32 { destination, .. }
         | ShaderOperation::ShiftLeft32 { destination, .. }
+        | ShaderOperation::ShiftRightLogical32 { destination, .. }
         | ShaderOperation::Bitwise32 { destination, .. }
         | ShaderOperation::FloatMinMax32 { destination, .. }
         | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
@@ -3901,14 +4143,29 @@ fn enqueue_shader_successor(
 fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
     match operation {
         ShaderOperation::StoreOutput { sources, .. } => sources.to_vec(),
+        ShaderOperation::LoadStorageBuffer32 { word_index, .. } => vec![*word_index],
+        ShaderOperation::StoreStorageBuffer32 {
+            source, word_index, ..
+        } => vec![*source, *word_index],
         ShaderOperation::LoadControlPoint { vertex, .. } => vec![*vertex],
         ShaderOperation::StoreControlPoint { source, vertex, .. } => vec![*source, *vertex],
         ShaderOperation::Multiply32 { left, right, .. }
         | ShaderOperation::FloatMultiplyZero32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::Move32 { source, .. } => vec![*source],
         ShaderOperation::Add32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::AddCarry32 {
+            left,
+            right,
+            carry_in,
+            ..
+        } => {
+            let mut sources = vec![*left, *right];
+            sources.extend(carry_in);
+            sources
+        }
         ShaderOperation::Bitwise32 { left, right, .. } => vec![*left, *right],
-        ShaderOperation::ShiftLeft32 { value, amount, .. } => vec![*value, *amount],
+        ShaderOperation::ShiftLeft32 { value, amount, .. }
+        | ShaderOperation::ShiftRightLogical32 { value, amount, .. } => vec![*value, *amount],
         ShaderOperation::FloatMinMax32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::FloatAbsolute32 { source, .. }
         | ShaderOperation::FloatNegate32 { source, .. }

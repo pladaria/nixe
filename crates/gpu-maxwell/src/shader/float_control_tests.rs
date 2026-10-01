@@ -1,12 +1,102 @@
 use super::*;
 use nixe_gpu::{ShaderEvaluationInputs, evaluate_shader_ir};
 
+#[test]
+fn untranslated_float_cc_writes_cannot_preserve_a_stale_integer_carry() {
+    let stage = MaxwellShaderStage::Compute;
+    for (encoding, kind) in [
+        (0x5cb8_0000_0007_0a01_u64, 0),
+        (0x5c58_0000_0017_0003, 1),
+        (0x5980_0100_0017_0003, 2),
+    ] {
+        let encoding = encoding | (1 << 47);
+        let error = match kind {
+            0 => decode_integer_to_float(stage, 8, encoding, 4, &mut 4).err(),
+            1 => decode_float_add(stage, 8, encoding, 4, &mut 4).err(),
+            _ => decode_float_fused_multiply_add(stage, 8, encoding, 4, &mut 4).err(),
+        };
+        assert!(
+            matches!(error, Some(MaxwellShaderTranslationError::UnsupportedSemanticDetail { detail, .. }) if detail.contains("condition-code output"))
+        );
+    }
+}
+
+#[test]
+fn fmul32i_preserves_all_immediate_bits_and_uses_its_own_modifier_fields() {
+    for bits in [
+        0,
+        0x8000_0000,
+        1,
+        0x807f_ffff,
+        0x3f80_0001,
+        0x40c9_0fdb,
+        0xc049_0fdb,
+        0x7f80_0000,
+    ] {
+        let encoding = 0x1e00_0000_0007_0003 | (u64::from(bits) << 20);
+        assert!(is_float_multiply(encoding));
+        let decoded =
+            decode_float_multiply(MaxwellShaderStage::Compute, 8, encoding, 4, &mut 4).unwrap();
+        assert_eq!(decoded.constant_buffer_binding, None);
+        assert!(matches!(decoded.operations.as_slice(), [
+            ShaderOperation::MoveImmediate32 { bits: actual, .. },
+            ShaderOperation::Multiply32 { float_control, .. },
+        ] if *actual == bits && !float_control.denormals_are_zero()
+            && !float_control.flush_denormals_to_zero()));
+        assert_eq!(
+            evaluate_operations(decoded.operations, [1.0_f32.to_bits(), 0, 0]),
+            bits
+        );
+    }
+    // FTZ and DNZ moved to bits 53/54, outside the full-width immediate.
+    let immediate = u64::from(f32::INFINITY.to_bits()) << 20;
+    for (mode, expected_zero) in [(1 << 53, false), (1 << 54, true)] {
+        let decoded = decode_float_multiply(
+            MaxwellShaderStage::Compute,
+            8,
+            0x1e00_0000_0007_0003 | immediate | mode,
+            4,
+            &mut 4,
+        )
+        .unwrap();
+        let result = evaluate_operations(decoded.operations, [0x8000_0001, 0, 0]);
+        if expected_zero {
+            assert_eq!(result, 0);
+        } else {
+            assert!(f32::from_bits(result).is_nan());
+        }
+    }
+    for flags in [1 << 52, 1 << 55, 3 << 53] {
+        assert!(
+            decode_float_multiply(
+                MaxwellShaderStage::Compute,
+                8,
+                0x1e00_0000_0007_0003 | flags,
+                4,
+                &mut 4
+            )
+            .is_err()
+        );
+    }
+    // The compact form's CC field must not be silently discarded either.
+    assert!(
+        decode_float_multiply(
+            MaxwellShaderStage::Compute,
+            8,
+            0x5c68_8000_0017_0003,
+            4,
+            &mut 4
+        )
+        .is_err()
+    );
+}
+
 fn decoded(
     kind: u8,
     ftz: bool,
     dnz: bool,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
-    let stage = MaxwellThreeDShaderStage::Vertex;
+    let stage = MaxwellShaderStage::Vertex;
     let mut temporary = 4;
     match kind {
         0 => decode_float_add(
@@ -141,7 +231,7 @@ fn unsupported_dnz_combinations_remain_explicit() {
     for ftz in [false, true] {
         assert!(matches!(decoded(2,ftz,true),
                 Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-                    stage: MaxwellThreeDShaderStage::Vertex, instruction_offset: 8, detail, ..
+                    stage: MaxwellShaderStage::Vertex, instruction_offset: 8, detail, ..
                 }) if detail.contains("DNZ zero-multiply")));
     }
 }
@@ -194,7 +284,7 @@ fn fmul_dnz_absorbs_signed_zero_and_subnormals_before_multiplication() {
 fn fmul_dnz_constant_buffer_encoding_and_immediate_form() {
     let mut temporary = 4;
     let decoded = decode_float_multiply(
-        MaxwellThreeDShaderStage::Pixel,
+        MaxwellShaderStage::Pixel,
         0x250,
         0x4c68_2008_00f7_0000,
         4,
@@ -207,7 +297,7 @@ fn fmul_dnz_constant_buffer_encoding_and_immediate_form() {
         ShaderOperation::FloatMultiplyZero32 { destination, left, right, .. },
     ] if destination.index() == 0 && left.index() == 0 && *right == *load));
     let decoded = decode_float_multiply(
-        MaxwellThreeDShaderStage::Pixel,
+        MaxwellShaderStage::Pixel,
         8,
         0x3868_2000_0007_0003,
         4,
