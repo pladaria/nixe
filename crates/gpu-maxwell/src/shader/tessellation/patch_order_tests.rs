@@ -1,4 +1,5 @@
 use super::*;
+use nixe_gpu::ShaderSourceLocation;
 
 fn access(slot: u16, write: bool) -> ShaderOperation {
     let (location, component) = patch_location(slot * 4).unwrap();

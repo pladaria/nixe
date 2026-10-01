@@ -1,5 +1,18 @@
 use super::*;
+use crate::shader::{
+    binary::{
+        MaxwellShaderBinary, MaxwellShaderInstructionBundle, MaxwellShaderMetadata,
+        decode_program_header,
+    },
+    data::is_move_immediate,
+    integer,
+    interface::is_attribute_store,
+    link::{finalize_shader_ir, graphics_output_interpolation, validate_graphics_stage_interfaces},
+    translate::translate_shader_binary,
+};
+use nixe_gpu::VerifiedShaderIr;
 use nixe_gpu::{ShaderEvaluationInputs, evaluate_shader_ir};
+use std::collections::BTreeMap;
 
 #[cfg(not(target_os = "macos"))]
 #[path = "guest_execution.rs"]

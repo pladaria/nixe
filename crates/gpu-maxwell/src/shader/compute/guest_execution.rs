@@ -3,7 +3,7 @@
 use super::tests::sinewave_kernel;
 use wgpu::util::DeviceExt;
 
-use super::super::hardware;
+use crate::shader::hardware;
 
 #[test]
 #[ignore = "requires a physical Vulkan GPU"]

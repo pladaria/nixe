@@ -47,7 +47,7 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
 }
 
 #[test]
-fn vertex_rgba_output_links_to_fragment_rgb_without_qualifying_unused_alpha() {
+fn vertex_rgba_output_prunes_unconsumed_alpha_before_backend_lowering() {
     captured_color_shader_pipeline(true);
 }
 
@@ -240,18 +240,14 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
                 .iter()
                 .filter(|output| output.location() == nixe_gpu::ShaderIoLocation::Generic(0))
                 .collect::<Vec<_>>();
-            assert_eq!(color.len(), 4);
-            for component in &color[..3] {
+            assert_eq!(color.len(), 3, "unconsumed alpha is pruned from neutral IR");
+            for (index, component) in color.iter().enumerate() {
+                assert_eq!(component.component(), index as u8);
                 assert_eq!(
                     component.interpolation(),
                     Some(nixe_gpu::ShaderInterpolation::Perspective)
                 );
             }
-            assert_eq!(
-                color[3].interpolation(),
-                None,
-                "unconsumed alpha stays unlinked in neutral IR"
-            );
         }
         let wgsl = nixe_gpu::lower_shader_ir_to_wgsl(module.ir()).unwrap();
         let parsed = naga::front::wgsl::parse_str(wgsl.source()).unwrap();

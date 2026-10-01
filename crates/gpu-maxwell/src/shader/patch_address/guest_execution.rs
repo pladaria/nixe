@@ -6,7 +6,7 @@ use nixe_gpu::*;
 use nixe_memory::*;
 use std::sync::{Arc, Mutex};
 
-use super::super::hardware;
+use crate::shader::hardware;
 
 struct Validation(Mutex<Vec<String>>);
 static VALIDATION: Validation = Validation(Mutex::new(Vec::new()));

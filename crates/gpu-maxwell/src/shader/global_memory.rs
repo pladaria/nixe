@@ -5,7 +5,14 @@
 //!
 //! STG fields: public UAM GM107 emitSTG/emitLDSTs/emitLDSTc.
 //! https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
-use super::*;
+use super::decode::{allocate_shader_temporary, decode_predicate, validate_register_range};
+use super::error::MaxwellShaderTranslationError;
+use crate::MaxwellShaderStage;
+use nixe_gpu::{
+    ShaderFloatControl, ShaderInstruction, ShaderOperation, ShaderPredicate, ShaderRegister,
+    ShaderScalarType,
+};
+use std::collections::BTreeMap;
 
 #[cfg(test)]
 mod tests;

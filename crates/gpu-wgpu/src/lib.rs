@@ -10,11 +10,12 @@ mod quad_indices;
 mod texture_sampling;
 mod visibility;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 extern crate self as nixe_gpu_wgpu;
-#[cfg(test)]
+/// Physical-GPU helpers for this crate's tests and consumers enabling `test-support`.
+#[cfg(any(test, feature = "test-support"))]
 #[path = "../test-support/hardware.rs"]
-mod test_hardware;
+pub mod test_hardware;
 
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
