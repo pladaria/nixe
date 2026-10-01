@@ -11,7 +11,7 @@ use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelError, MaxwellChannelPriority,
     MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError, MaxwellGpfifoSubmitRequest,
     MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellInvalidGpfifoSubmission,
-    MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellThreeDLoweringCache,
+    MaxwellLoweringCache, MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler,
     MaxwellZCullMode, decode_gpfifo_submission, lower_maxwell_frontend, resolve_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
@@ -81,7 +81,7 @@ pub(super) struct NvHostGpu {
     error_events: BTreeMap<NvDrvFileDescriptor, NvHostGpuErrorEvent>,
     next_frontend_submission: u64,
     scheduler: MaxwellScheduler,
-    lowering_cache: MaxwellThreeDLoweringCache,
+    lowering_cache: MaxwellLoweringCache,
 }
 
 pub(super) struct NvHostGpuIoctlResources<'a> {
@@ -103,7 +103,7 @@ struct NvHostGpuSubmit<'a> {
 struct NvHostGpuSubmissionState<'a> {
     scheduler: &'a mut MaxwellScheduler,
     next_frontend_submission: &'a mut u64,
-    lowering_cache: &'a mut MaxwellThreeDLoweringCache,
+    lowering_cache: &'a mut MaxwellLoweringCache,
 }
 
 impl NvHostGpu {
@@ -113,7 +113,7 @@ impl NvHostGpu {
             error_events: BTreeMap::new(),
             next_frontend_submission: 1,
             scheduler: MaxwellScheduler::default(),
-            lowering_cache: MaxwellThreeDLoweringCache::new(cache_configuration),
+            lowering_cache: MaxwellLoweringCache::new(cache_configuration),
         }
     }
     pub(super) fn open(&mut self, fd: NvDrvFileDescriptor, channel: MaxwellGpuChannel) {

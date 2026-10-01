@@ -39,3 +39,5 @@ docker run --rm \
     --user "$(id -u):$(id -g)" \
     --volume "$input_directory:/input:ro" \
     "$image" "/input/$input_filename" "$architecture"
+
+echo "nv_push_dump completed successfully" >&2

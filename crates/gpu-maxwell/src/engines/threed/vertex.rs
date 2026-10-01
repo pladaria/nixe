@@ -340,7 +340,7 @@ pub struct MaxwellThreeDVertexAttributeFormat {
 }
 
 impl MaxwellThreeDVertexAttributeFormat {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
+    pub(in crate::engines) const fn parse(raw: u32) -> Option<Self> {
         let stream = (raw & 0x1f) as u8;
         let enabled = raw & (1 << 6) == 0;
         let offset = ((raw >> 7) & 0x3fff) as u16;
@@ -772,7 +772,7 @@ pub struct MaxwellThreeDBegin {
 }
 
 impl MaxwellThreeDBegin {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
+    pub(in crate::engines) const fn parse(raw: u32) -> Option<Self> {
         if raw & !0x6d00_ffff != 0 || raw & 0xffff > 0x0e || ((raw >> 26) & 3) == 3 {
             return None;
         }

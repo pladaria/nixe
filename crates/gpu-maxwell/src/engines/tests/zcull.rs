@@ -301,9 +301,9 @@ fn zcull_geometry_does_not_fabricate_draw_resources_or_counter_operations() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &mut MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellLoweringCache::default(),
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
     // Configuring subregions must not accidentally accept the separate report,
     // allocation or guest-storage operations before they are implemented.

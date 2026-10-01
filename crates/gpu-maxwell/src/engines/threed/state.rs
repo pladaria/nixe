@@ -916,7 +916,7 @@ impl MaxwellThreeDDrawStateIdentity {
 
 /// Primitive class consumed by raster state, independent of assembly/winding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum GeneratedPrimitive {
+pub(in crate::engines) enum GeneratedPrimitive {
     Points,
     Lines,
     Triangles,
@@ -1265,7 +1265,7 @@ impl MaxwellThreeDState {
     }
 
     /// Patches consume the tessellator's output primitive, not their input topology.
-    pub(super) fn generated_primitive(&self) -> Option<GeneratedPrimitive> {
+    pub(in crate::engines) fn generated_primitive(&self) -> Option<GeneratedPrimitive> {
         use GeneratedPrimitive as Output;
         match self.vertex_input.primitive().active_begin()?.topology() {
             0 => Some(Output::Points),

@@ -110,6 +110,139 @@ pub(super) fn emit_wgsl(source: &mut String, operation: &ShaderOperation) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn logical_right_shift_is_unsigned_alias_safe_and_checks_unwrapped_amounts() {
+        for value in [0, 1, 0x8000_0000, u32::MAX] {
+            for amount in [0, 1, 31, 32, 33, u32::MAX] {
+                for wrap in [false, true] {
+                    let shader = program(vec![
+                        instruction(ShaderPredicate::Always, immediate(0, value)),
+                        instruction(ShaderPredicate::Always, immediate(1, amount)),
+                        instruction(
+                            ShaderPredicate::Always,
+                            ShaderOperation::ShiftRightLogical32 {
+                                destination: ShaderRegister::new(0),
+                                value: ShaderRegister::new(0),
+                                amount: ShaderRegister::new(1),
+                                wrap,
+                            },
+                        ),
+                        instruction(ShaderPredicate::Always, store(0, 0)),
+                        instruction(ShaderPredicate::Always, ShaderOperation::Exit),
+                    ])
+                    .unwrap();
+                    let result =
+                        evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 16)
+                            .unwrap();
+                    let expected = if wrap {
+                        value >> (amount & 31)
+                    } else {
+                        value.checked_shr(amount).unwrap_or(0)
+                    };
+                    assert_eq!(
+                        result.output_bits(ShaderIoLocation::Position, 0),
+                        Some(expected)
+                    );
+                    let wgsl = lower_shader_ir_to_wgsl(&shader).unwrap();
+                    let module = naga::front::wgsl::parse_str(wgsl.source()).unwrap();
+                    naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all(),
+                        naga::valid::Capabilities::all(),
+                    )
+                    .validate(&module)
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn add_carry_handles_two_overflows_aliasing_and_false_predicates() {
+        let r = ShaderRegister::new;
+        let always = ShaderPredicate::Always;
+        for (left, right, carry) in [
+            (0_u32, 0_u32, 0_u32),
+            (u32::MAX, 1, 0),
+            (u32::MAX, 0, 1),
+            (u32::MAX, u32::MAX, 1),
+            (0x8000_0000, 0x8000_0000, 0),
+            (17, 25, 3),
+        ] {
+            for enabled in [false, true] {
+                let shader = program(vec![
+                    instruction(always, immediate(0, left)),
+                    instruction(always, immediate(1, right)),
+                    instruction(always, immediate(2, carry)),
+                    instruction(
+                        always,
+                        set(if enabled {
+                            ShaderIntegerComparison::True
+                        } else {
+                            ShaderIntegerComparison::False
+                        }),
+                    ),
+                    instruction(
+                        predicate(false),
+                        ShaderOperation::AddCarry32 {
+                            destination: r(0),
+                            carry_out: r(2),
+                            left: r(0),
+                            right: r(1),
+                            carry_in: Some(r(2)),
+                        },
+                    ),
+                    instruction(always, store(0, 0)),
+                    instruction(always, store(2, 1)),
+                    instruction(always, ShaderOperation::Exit),
+                ])
+                .unwrap();
+                let result =
+                    evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 32).unwrap();
+                let total = u64::from(left) + u64::from(right) + u64::from(carry & 1);
+                assert_eq!(
+                    result.output_bits(ShaderIoLocation::Position, 0),
+                    Some(if enabled { total as u32 } else { left })
+                );
+                assert_eq!(
+                    result.output_bits(ShaderIoLocation::Position, 1),
+                    Some(if enabled { (total >> 32) as u32 } else { carry })
+                );
+                let wgsl = lower_shader_ir_to_wgsl(&shader).unwrap();
+                let module = naga::front::wgsl::parse_str(wgsl.source()).unwrap();
+                naga::valid::Validator::new(
+                    naga::valid::ValidationFlags::all(),
+                    naga::valid::Capabilities::all(),
+                )
+                .validate(&module)
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn add_carry_requires_distinct_outputs_and_a_defined_carry_input() {
+        let r = ShaderRegister::new;
+        for (carry_out, carry_in) in [(r(0), None), (r(2), Some(r(2)))] {
+            assert!(
+                program(vec![
+                    instruction(ShaderPredicate::Always, immediate(0, 0)),
+                    instruction(
+                        ShaderPredicate::Always,
+                        ShaderOperation::AddCarry32 {
+                            destination: r(0),
+                            carry_out,
+                            left: r(0),
+                            right: r(0),
+                            carry_in,
+                        }
+                    ),
+                    instruction(ShaderPredicate::Always, ShaderOperation::Exit),
+                ])
+                .is_err()
+            );
+        }
+    }
+
     fn instruction(predicate: ShaderPredicate, operation: ShaderOperation) -> ShaderInstruction {
         ShaderInstruction::new(ShaderSourceLocation::new(8), predicate, operation)
     }

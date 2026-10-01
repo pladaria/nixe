@@ -78,12 +78,12 @@ fn programmed_sm_timeout_is_preserved_while_preflight_reaches_draw_state_validat
         FrontendSubmissionId::new(10),
         Vec::new(),
         &lowering_capabilities(BackendFeatures::empty()),
-        &mut MaxwellThreeDLoweringCache::default(),
+        &mut MaxwellLoweringCache::default(),
     );
 
     assert_eq!(
         result.err(),
-        Some(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))
+        Some(MaxwellLoweringError::IncompleteDraw("SET_CT_SELECT"))
     );
     let register = channel
         .three_d()
@@ -197,7 +197,7 @@ fn hybrid_anti_alias_only_blocks_non_neutral_draw_configuration() {
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x0754, 1);
     let source = channel
@@ -220,7 +220,7 @@ fn hybrid_anti_alias_only_blocks_non_neutral_draw_configuration() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0754, 0);
@@ -244,7 +244,7 @@ fn hybrid_anti_alias_only_blocks_non_neutral_draw_configuration() {
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedHybridAntiAliasSemantics(actual))
+        Err(MaxwellLoweringError::UnsupportedHybridAntiAliasSemantics(actual))
             if actual == value
     ));
 }
@@ -308,7 +308,7 @@ fn centered_sample_locations_are_neutral_and_custom_locations_stop_draws() {
     }
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let source = channel.three_d().coverage().sample_locations()[0]
         .source()
         .unwrap();
@@ -327,7 +327,7 @@ fn centered_sample_locations_are_neutral_and_custom_locations_stop_draws() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x11e8, 0x8888_8887);
@@ -348,7 +348,7 @@ fn centered_sample_locations_are_neutral_and_custom_locations_stop_draws() {
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedSampleLocationsSemantics {
+        Err(MaxwellLoweringError::UnsupportedSampleLocationsSemantics {
             group: 2,
             value,
         }) if value == expected
@@ -1195,7 +1195,7 @@ fn active_iterated_blend_is_rejected_at_draw_consumption() {
             Vec::new(),
             &capabilities,
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedIteratedBlendSemantics {
+        Err(MaxwellLoweringError::UnsupportedIteratedBlendSemantics {
             value,
             pass_count: Some(4),
         }) if value.color_enabled() && value.alpha_enabled()
@@ -1590,7 +1590,7 @@ fn effective_viewport_coordinate_swizzles_stop_draws_before_publication() {
         program_three_d(&mut channel, method, argument);
     }
     let address_space = resource_address_space();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -1619,16 +1619,13 @@ fn effective_viewport_coordinate_swizzles_stop_draws_before_publication() {
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
     program_three_d(&mut channel, 0x0a18, 0x6421);
     assert!(matches!(
         preflight(&channel),
         Err(
-            MaxwellThreeDLoweringError::UnsupportedViewportCoordinateSwizzleSemantics {
-                viewport: 0,
-                ..
-            }
+            MaxwellLoweringError::UnsupportedViewportCoordinateSwizzleSemantics { viewport: 0, .. }
         )
     ));
 }
@@ -1641,7 +1638,7 @@ fn integer_viewport_pixel_centers_stop_draws_before_publication() {
         program_three_d(&mut channel, method, argument);
     }
     let address_space = resource_address_space();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -1670,13 +1667,13 @@ fn integer_viewport_pixel_centers_stop_draws_before_publication() {
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
     program_three_d(&mut channel, 0x1924, 1);
     assert!(matches!(
         preflight(&channel),
         Err(
-            MaxwellThreeDLoweringError::UnsupportedViewportPixelCenterSemantics(
+            MaxwellLoweringError::UnsupportedViewportPixelCenterSemantics(
                 MaxwellThreeDViewportPixelCenter::Integers
             )
         )
@@ -1691,7 +1688,7 @@ fn effective_polygon_smoothing_and_stipple_are_topology_aware() {
         program_three_d(&mut channel, method, argument);
     }
     let address_space = resource_address_space();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -1720,7 +1717,7 @@ fn effective_polygon_smoothing_and_stipple_are_topology_aware() {
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
     program_three_d(&mut channel, 0x1700, 0x1234_5678);
     for topology in [4, 7] {
@@ -1728,20 +1725,20 @@ fn effective_polygon_smoothing_and_stipple_are_topology_aware() {
         program_three_d(&mut channel, 0x0db4, 1);
         assert!(matches!(
             preflight(&channel),
-            Err(MaxwellThreeDLoweringError::UnsupportedPolygonSmoothSemantics)
+            Err(MaxwellLoweringError::UnsupportedPolygonSmoothSemantics)
         ));
         program_three_d(&mut channel, 0x0db4, 0);
         program_three_d(&mut channel, 0x168c, 1);
         assert!(matches!(
             preflight(&channel),
-            Err(MaxwellThreeDLoweringError::UnsupportedPolygonStippleSemantics)
+            Err(MaxwellLoweringError::UnsupportedPolygonStippleSemantics)
         ));
     }
 
     program_three_d(&mut channel, 0x1618, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 }
 
@@ -1753,7 +1750,7 @@ fn effective_triangle_fill_modes_preserve_supported_bounding_box_semantics() {
         program_three_d(&mut channel, method, argument);
     }
     let address_space = resource_address_space();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -1782,30 +1779,28 @@ fn effective_triangle_fill_modes_preserve_supported_bounding_box_semantics() {
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x113c, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(
-            MaxwellThreeDLoweringError::UnsupportedFillViaTriangleSemantics(
-                MaxwellThreeDFillViaTriangleMode::FillAll
-            )
-        )
+        Err(MaxwellLoweringError::UnsupportedFillViaTriangleSemantics(
+            MaxwellThreeDFillViaTriangleMode::FillAll
+        ))
     ));
 
     program_three_d(&mut channel, 0x113c, 2);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x113c, 0);
     program_three_d(&mut channel, 0x1148, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedConservativeRasterSemantics)
+        Err(MaxwellLoweringError::UnsupportedConservativeRasterSemantics)
     ));
 }
 
@@ -1824,7 +1819,7 @@ fn point_controls_are_topology_aware_and_effective_modes_stop_before_publication
         program_three_d(&mut channel, method, argument);
     }
     let address_space = resource_address_space();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -1853,25 +1848,25 @@ fn point_controls_are_topology_aware_and_effective_modes_stop_before_publication
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1618, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedPointSpriteSemantics)
+        Err(MaxwellLoweringError::UnsupportedPointSpriteSemantics)
     ));
     program_three_d(&mut channel, 0x1520, 0);
     program_three_d(&mut channel, 0x1910, 0x0711);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedAttributePointSizeSemantics { slot: 0x71 })
+        Err(MaxwellLoweringError::UnsupportedAttributePointSizeSemantics { slot: 0x71 })
     ));
     program_three_d(&mut channel, 0x1910, 0);
     program_three_d(&mut channel, 0x1658, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedAntiAliasedPointSemantics)
+        Err(MaxwellLoweringError::UnsupportedAntiAliasedPointSemantics)
     ));
 }
 
@@ -2133,7 +2128,7 @@ fn smooth_shade_mode_reaches_shader_translation_while_flat_remains_typed() {
     let mut channel = three_d_channel();
     let address_space = resource_address_space();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x12d4, 0x1d00);
     let source = channel
@@ -2157,7 +2152,7 @@ fn smooth_shade_mode_reaches_shader_translation_while_flat_remains_typed() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedShadeModeSemantics(
+        Err(MaxwellLoweringError::UnsupportedShadeModeSemantics(
             MaxwellThreeDShadeMode::Flat
         ))
     ));
@@ -2185,7 +2180,7 @@ fn smooth_shade_mode_reaches_shader_translation_while_flat_remains_typed() {
         &mut cache,
     );
     match smooth {
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired) => {}
+        Err(MaxwellLoweringError::ShaderTranslationRequired) => {}
         Err(error) => panic!("unexpected smooth-shading boundary: {error}"),
         Ok(_) => panic!("smooth shading unexpectedly completed without translated shaders"),
     }
@@ -2204,7 +2199,7 @@ fn smooth_shade_mode_reaches_shader_translation_while_flat_remains_typed() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -2541,7 +2536,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     program_color_target(&mut channel, 0, target, 0xd5);
     program_three_d(&mut channel, 0x15d0, 0);
     program_three_d(&mut channel, 0x121c, 1);
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -2570,7 +2565,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+        Err(MaxwellLoweringError::IncompleteBlendState {
             target: None,
             field: "SET_BLEND_STATE_PER_TARGET"
         })
@@ -2578,7 +2573,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     program_three_d(&mut channel, 0x12e4, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+        Err(MaxwellLoweringError::IncompleteBlendState {
             target: None,
             field: "SET_BLEND_ENABLE_COMMON"
         })
@@ -2586,13 +2581,13 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     program_three_d(&mut channel, 0x135c, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x135c, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+        Err(MaxwellLoweringError::IncompleteBlendState {
             target: None,
             field: "SET_BLEND_SEPARATE_FOR_ALPHA"
         })
@@ -2602,7 +2597,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     }
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+        Err(MaxwellLoweringError::IncompleteBlendState {
             target: None,
             field: "SET_BLEND_OP_ALPHA"
         })
@@ -2612,13 +2607,13 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     }
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x12e4, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+        Err(MaxwellLoweringError::IncompleteBlendState {
             target: Some(0),
             field: "SET_BLEND(i)"
         })
@@ -2626,12 +2621,12 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     program_three_d(&mut channel, 0x1360, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
     program_three_d(&mut channel, 0x1360, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+        Err(MaxwellLoweringError::IncompleteBlendState {
             target: Some(0),
             field: "SET_BLEND_PER_TARGET_OP_COLOR"
         })
@@ -2641,7 +2636,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     }
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+        Err(MaxwellLoweringError::IncompleteBlendState {
             target: Some(0),
             field: "SET_BLEND_PER_TARGET_OP_ALPHA"
         })
@@ -2651,7 +2646,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     }
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -2668,7 +2663,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -2791,7 +2786,7 @@ fn disabled_logic_operation_is_neutral_and_enabled_operation_stops_draws() {
     ] {
         program_three_d(&mut channel, method, argument);
     }
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -2819,19 +2814,19 @@ fn disabled_logic_operation_is_neutral_and_enabled_operation_stops_draws() {
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x19c4, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteLogicOpState)
+        Err(MaxwellLoweringError::IncompleteLogicOpState)
     ));
 
     program_three_d(&mut channel, 0x19c8, MaxwellThreeDLogicOp::Xor.raw());
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedLogicOpSemantics(
+        Err(MaxwellLoweringError::UnsupportedLogicOpSemantics(
             MaxwellThreeDLogicOp::Xor
         ))
     ));
@@ -3101,7 +3096,7 @@ fn captured_provoking_vertex_and_lighting_path_is_neutral_but_alternatives_stop_
         .source()
         .unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let mut preflight = |channel: &MaxwellGpuChannel| {
         let resources =
             resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
@@ -3122,24 +3117,22 @@ fn captured_provoking_vertex_and_lighting_path_is_neutral_but_alternatives_stop_
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1684, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(
-            MaxwellThreeDLoweringError::UnsupportedProvokingVertexSemantics(
-                MaxwellThreeDProvokingVertex::First
-            )
-        )
+        Err(MaxwellLoweringError::UnsupportedProvokingVertexSemantics(
+            MaxwellThreeDProvokingVertex::First
+        ))
     ));
 
     program_three_d(&mut channel, 0x1684, 1);
     program_three_d(&mut channel, 0x1688, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedTwoSidedLightSemantics)
+        Err(MaxwellLoweringError::UnsupportedTwoSidedLightSemantics)
     ));
 }
 
@@ -3259,7 +3252,7 @@ fn disabled_color_clamping_is_neutral_but_effective_clamps_stop_draws() {
         .source()
         .unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let mut preflight = |channel: &MaxwellGpuChannel| {
         let resources =
             resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
@@ -3280,19 +3273,19 @@ fn disabled_color_clamping_is_neutral_but_effective_clamps_stop_draws() {
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
     // Range bits are inert while all per-output enables remain clear.
     program_three_d(&mut channel, 0x13a8, 0x2222_2222);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x2600, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedColorClampSemantics)
+        Err(MaxwellLoweringError::UnsupportedColorClampSemantics)
     ));
 
     program_three_d(&mut channel, 0x2600, 0);
@@ -3300,7 +3293,7 @@ fn disabled_color_clamping_is_neutral_but_effective_clamps_stop_draws() {
     assert!(matches!(
         preflight(&channel),
         Err(
-            MaxwellThreeDLoweringError::UnsupportedPixelShaderSaturateSemantics {
+            MaxwellLoweringError::UnsupportedPixelShaderSaturateSemantics {
                 output: 3,
                 range: MaxwellThreeDPixelShaderClampRange::MinusOneToOne,
             }
@@ -3334,7 +3327,7 @@ fn disabled_alpha_test_is_neutral_and_enabled_test_stops_draws() {
     ] {
         program_three_d(&mut channel, method, argument);
     }
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -3362,27 +3355,23 @@ fn disabled_alpha_test_is_neutral_and_enabled_test_stops_draws() {
 
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x12ec, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteAlphaTestState(
-            "reference"
-        ))
+        Err(MaxwellLoweringError::IncompleteAlphaTestState("reference"))
     ));
     program_three_d(&mut channel, 0x1310, 0x3f00_0000);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteAlphaTestState(
-            "function"
-        ))
+        Err(MaxwellLoweringError::IncompleteAlphaTestState("function"))
     ));
     program_three_d(&mut channel, 0x1314, 0x204);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 }
 
@@ -3416,7 +3405,7 @@ fn effective_color_write_mask_is_selected_and_validated_before_draw_publication(
     ] {
         program_three_d(&mut channel, method, argument);
     }
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -3445,13 +3434,13 @@ fn effective_color_write_mask_is_selected_and_validated_before_draw_publication(
     // Single-mask mode routes target 1 through SET_CT_WRITE(0).
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0f90, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::IncompleteColorWriteState {
+        Err(MaxwellLoweringError::IncompleteColorWriteState {
             target: 1,
             mask_register: 1,
         })
@@ -3461,20 +3450,20 @@ fn effective_color_write_mask_is_selected_and_validated_before_draw_publication(
     program_three_d(&mut channel, 0x1a04, 0x0111);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     // Per-target mode now makes target 1's partial mask effective.
     program_three_d(&mut channel, 0x0f90, 0);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1a04, 0x1111);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 }
 
@@ -3483,7 +3472,7 @@ fn enabled_vertex_array_restart_uses_each_neutral_draw_boundary() {
     let mut channel = three_d_channel();
     program_polygon_fill(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
 
     program_three_d(&mut channel, 0x0de8, 0);
@@ -3510,7 +3499,7 @@ fn enabled_vertex_array_restart_uses_each_neutral_draw_boundary() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0de8, 1);
@@ -3536,7 +3525,7 @@ fn enabled_vertex_array_restart_uses_each_neutral_draw_boundary() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     for (topology, vertex_count) in [(4, 2), (5, 7), (6, 6)] {
@@ -3557,7 +3546,7 @@ fn enabled_vertex_array_restart_uses_each_neutral_draw_boundary() {
         let error = result.err().expect("draw must reach a later preflight gap");
         assert_eq!(
             error,
-            MaxwellThreeDLoweringError::ShaderTranslationRequired,
+            MaxwellLoweringError::ShaderTranslationRequired,
             "topology={topology:#x} vertex-count={vertex_count}"
         );
     }
@@ -3577,7 +3566,7 @@ fn enabled_vertex_array_restart_uses_each_neutral_draw_boundary() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -3706,7 +3695,7 @@ fn polygon_clip_edge_suppression_is_rejected_only_for_polygon_line_draws() {
     program_three_d(&mut channel, 0x0f8c, 1);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let source = channel
         .three_d()
         .vertex_input()
@@ -3729,7 +3718,7 @@ fn polygon_clip_edge_suppression_is_rejected_only_for_polygon_line_draws() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPolygonClipGeneratedEdgeSemantics)
+        Err(MaxwellLoweringError::UnsupportedPolygonClipGeneratedEdgeSemantics)
     ));
 
     program_three_d(&mut channel, 0x0f8c, 0);
@@ -3747,7 +3736,7 @@ fn polygon_clip_edge_suppression_is_rejected_only_for_polygon_line_draws() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPolygonClipGeneratedEdgeSemantics)
+        Err(MaxwellLoweringError::UnsupportedPolygonClipGeneratedEdgeSemantics)
     ));
 }
 
@@ -3867,7 +3856,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
     program_three_d(&mut channel, 0x1618, 1);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -3891,7 +3880,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(
+        Err(MaxwellLoweringError::IncompleteDraw(
             "SET_ALIASED_LINE_WIDTH_ENABLE"
         ))
     ));
@@ -3911,9 +3900,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(
-            "SET_LINE_WIDTH_FLOAT"
-        ))
+        Err(MaxwellLoweringError::IncompleteDraw("SET_LINE_WIDTH_FLOAT"))
     ));
     program_three_d(&mut channel, 0x13b0, 0x3f80_0000);
     program_three_d(&mut channel, 0x1570, 0);
@@ -3933,7 +3920,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1570, 1);
@@ -3951,7 +3938,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedAntiAliasedLineSemantics)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1570, 0);
@@ -3970,7 +3957,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(
+        Err(MaxwellLoweringError::IncompleteDraw(
             "SET_LINE_STIPPLE_PARAMETERS"
         ))
     ));
@@ -3989,12 +3976,10 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(
-            MaxwellThreeDLoweringError::UnsupportedLineStippleSemantics {
-                factor: 3,
-                pattern: 0xa5a5,
-            }
-        )
+        Err(MaxwellLoweringError::UnsupportedLineStippleSemantics {
+            factor: 3,
+            pattern: 0xa5a5,
+        })
     ));
 
     program_three_d(&mut channel, 0x166c, 0);
@@ -4014,7 +3999,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedAliasedLineWidthSemantics)
+        Err(MaxwellLoweringError::UnsupportedAliasedLineWidthSemantics)
     ));
 
     program_three_d(&mut channel, 0x1618, 4);
@@ -4034,7 +4019,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1618, 0);
@@ -4052,7 +4037,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1618, 4);
@@ -4072,9 +4057,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
-            _
-        ))
+        Err(MaxwellLoweringError::UnsupportedPolygonRasterization(_))
     ));
 
     // Polygon mode does not turn point primitives into line primitives.
@@ -4093,7 +4076,7 @@ fn aliased_line_width_is_consumed_only_by_line_rasterization() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 }
 
@@ -4115,9 +4098,9 @@ fn aliased_line_width_selector_does_not_change_clear_semantics() {
             FrontendSubmissionId::new(18),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &mut MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellLoweringCache::default(),
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -4129,7 +4112,7 @@ fn csaa_only_blocks_draws_when_explicitly_enabled_and_never_blocks_clear() {
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x15b4, 0);
     let source = channel.three_d().coverage().csaa_enable().source().unwrap();
@@ -4147,7 +4130,7 @@ fn csaa_only_blocks_draws_when_explicitly_enabled_and_never_blocks_clear() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x15b4, 1);
@@ -4166,7 +4149,7 @@ fn csaa_only_blocks_draws_when_explicitly_enabled_and_never_blocks_clear() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedCsaaSemantics)
+        Err(MaxwellLoweringError::UnsupportedCsaaSemantics)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -4182,7 +4165,7 @@ fn csaa_only_blocks_draws_when_explicitly_enabled_and_never_blocks_clear() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -4366,7 +4349,7 @@ fn coverage_output_controls_affect_only_active_draws_and_never_clears() {
 
     let address_space = resource_address_space();
     let resources = resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let source = channel
         .three_d()
         .coverage()
@@ -4388,7 +4371,7 @@ fn coverage_output_controls_affect_only_active_draws_and_never_clears() {
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedCoverageToColorSemantics(value))
+        Err(MaxwellLoweringError::UnsupportedCoverageToColorSemantics(value))
             if value.color_target() == 7
     ));
 
@@ -4408,7 +4391,7 @@ fn coverage_output_controls_affect_only_active_draws_and_never_clears() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,        ),
         Err(
-            MaxwellThreeDLoweringError::UnsupportedAlphaToCoverageOverrideSemantics(value)
+            MaxwellLoweringError::UnsupportedAlphaToCoverageOverrideSemantics(value)
         ) if value.raw() == 3
     ));
 
@@ -4425,7 +4408,7 @@ fn coverage_output_controls_affect_only_active_draws_and_never_clears() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -4499,7 +4482,7 @@ fn tir_controls_affect_only_active_draws_and_never_clears() {
     program_three_d(&mut channel, 0x0fd8, 1);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let source = channel.three_d().coverage().tir_control().source().unwrap();
     assert!(matches!(
         lower_maxwell_three_d_operation(
@@ -4515,7 +4498,7 @@ fn tir_controls_affect_only_active_draws_and_never_clears() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0fb4, 1);
@@ -4532,7 +4515,7 @@ fn tir_controls_affect_only_active_draws_and_never_clears() {
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedTirSemantics {
+        Err(MaxwellLoweringError::UnsupportedTirSemantics {
             control: Some(value),
         }) if value.raw() == 0x13
     ));
@@ -4550,7 +4533,7 @@ fn tir_controls_affect_only_active_draws_and_never_clears() {
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -4562,7 +4545,7 @@ fn ps_output_sample_mask_usage_requires_shader_evidence_and_never_blocks_clear()
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x1534, 0);
     program_three_d(&mut channel, 0x0300, 3);
@@ -4586,7 +4569,7 @@ fn ps_output_sample_mask_usage_requires_shader_evidence_and_never_blocks_clear()
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0300, 0);
@@ -4607,7 +4590,7 @@ fn ps_output_sample_mask_usage_requires_shader_evidence_and_never_blocks_clear()
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1534, 0);
@@ -4626,7 +4609,7 @@ fn ps_output_sample_mask_usage_requires_shader_evidence_and_never_blocks_clear()
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -4642,7 +4625,7 @@ fn ps_output_sample_mask_usage_requires_shader_evidence_and_never_blocks_clear()
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -4655,7 +4638,7 @@ fn primitive_circular_buffer_throttle_does_not_change_draw_or_clear_semantics() 
     program_three_d(&mut channel, 0x02d0, MAXWELL_THREE_D_PRIMITIVE_AREA_MAX);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let source = channel
         .three_d()
         .vertex_input()
@@ -4678,7 +4661,7 @@ fn primitive_circular_buffer_throttle_does_not_change_draw_or_clear_semantics() 
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -4694,7 +4677,7 @@ fn primitive_circular_buffer_throttle_does_not_change_draw_or_clear_semantics() 
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -4717,7 +4700,7 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
     program_three_d(&mut channel, 0x0dcc, 3);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -4740,7 +4723,7 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1618, 14);
@@ -4766,7 +4749,7 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(
+        Err(MaxwellLoweringError::IncompleteDraw(
             "SET_TESSELLATION_PARAMETERS"
         ))
     ));
@@ -4785,7 +4768,7 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
             Vec::new(),
             &capabilities,
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::InvalidPatchSize(size))
+        Err(MaxwellLoweringError::InvalidPatchSize(size))
             if size.control_points() == 0
     ));
 
@@ -4806,7 +4789,7 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw("SET_PATCH"))
+        Err(MaxwellLoweringError::IncompleteDraw("SET_PATCH"))
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -4822,7 +4805,7 @@ fn patch_size_is_consumed_only_by_patch_draws_and_never_by_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -4840,7 +4823,7 @@ fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears
 
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -4863,7 +4846,7 @@ fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1618, 0);
@@ -4889,7 +4872,7 @@ fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears
             Vec::new(),
             &capabilities,
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPointSpriteCoordinatesSemantics(
+        Err(MaxwellLoweringError::UnsupportedPointSpriteCoordinatesSemantics(
             select
         )) if select.generated_texture_mask() == 1
             && select.r_mode() == MaxwellThreeDPointSpriteRMode::FromR
@@ -4911,7 +4894,7 @@ fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPointCenterSemantics(
+        Err(MaxwellLoweringError::UnsupportedPointCenterSemantics(
             MaxwellThreeDPointCenterMode::Direct3D
         ))
     ));
@@ -4929,7 +4912,7 @@ fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -4962,7 +4945,7 @@ fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 }
 
@@ -4978,7 +4961,7 @@ fn edge_flag_is_consumed_only_by_non_fill_polygon_draws_and_never_by_clears() {
 
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let source = channel
         .three_d()
@@ -5001,7 +4984,7 @@ fn edge_flag_is_consumed_only_by_non_fill_polygon_draws_and_never_by_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0dac, 0x1b01);
@@ -5021,7 +5004,7 @@ fn edge_flag_is_consumed_only_by_non_fill_polygon_draws_and_never_by_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedEdgeFlagSemantics(
+        Err(MaxwellLoweringError::UnsupportedEdgeFlagSemantics(
             MaxwellThreeDEdgeFlag::Disabled
         ))
     ));
@@ -5046,7 +5029,7 @@ fn edge_flag_is_consumed_only_by_non_fill_polygon_draws_and_never_by_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -5061,7 +5044,7 @@ fn color_reduction_only_blocks_draws_when_explicitly_enabled_and_never_blocks_cl
     program_three_d(&mut channel, 0x10e4, 0x0000_00ff);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let threshold_source = channel
         .three_d()
         .color_reduction()
@@ -5082,7 +5065,7 @@ fn color_reduction_only_blocks_draws_when_explicitly_enabled_and_never_blocks_cl
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     for (argument, expected) in [
@@ -5123,7 +5106,7 @@ fn color_reduction_only_blocks_draws_when_explicitly_enabled_and_never_blocks_cl
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0d9c, 1);
@@ -5147,7 +5130,7 @@ fn color_reduction_only_blocks_draws_when_explicitly_enabled_and_never_blocks_cl
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedColorReductionSemantics)
+        Err(MaxwellLoweringError::UnsupportedColorReductionSemantics)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -5163,7 +5146,7 @@ fn color_reduction_only_blocks_draws_when_explicitly_enabled_and_never_blocks_cl
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -5183,7 +5166,7 @@ fn constant_color_rendering_only_blocks_draws_when_enabled_and_never_blocks_clea
     }
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x0f40, 0);
     let source = channel
@@ -5206,7 +5189,7 @@ fn constant_color_rendering_only_blocks_draws_when_enabled_and_never_blocks_clea
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0f40, 1);
@@ -5230,7 +5213,7 @@ fn constant_color_rendering_only_blocks_draws_when_enabled_and_never_blocks_clea
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedConstantColorRenderingSemantics)
+        Err(MaxwellLoweringError::UnsupportedConstantColorRenderingSemantics)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -5246,7 +5229,7 @@ fn constant_color_rendering_only_blocks_draws_when_enabled_and_never_blocks_clea
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -5258,7 +5241,7 @@ fn api_mandated_early_z_only_blocks_draws_when_enabled_and_never_blocks_clear() 
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x0210, 0);
     let source = channel
@@ -5281,7 +5264,7 @@ fn api_mandated_early_z_only_blocks_draws_when_enabled_and_never_blocks_clear() 
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0210, 1);
@@ -5305,7 +5288,7 @@ fn api_mandated_early_z_only_blocks_draws_when_enabled_and_never_blocks_clear() 
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedApiMandatedEarlyZSemantics)
+        Err(MaxwellLoweringError::UnsupportedApiMandatedEarlyZSemantics)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -5321,7 +5304,7 @@ fn api_mandated_early_z_only_blocks_draws_when_enabled_and_never_blocks_clear() 
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -5333,7 +5316,7 @@ fn post_z_pixel_shader_imask_only_blocks_draws_when_enabled_and_never_blocks_cle
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x0f1c, 0);
     let source = channel
@@ -5356,7 +5339,7 @@ fn post_z_pixel_shader_imask_only_blocks_draws_when_enabled_and_never_blocks_cle
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0f1c, 1);
@@ -5380,7 +5363,7 @@ fn post_z_pixel_shader_imask_only_blocks_draws_when_enabled_and_never_blocks_cle
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPostZPixelShaderImaskSemantics)
+        Err(MaxwellLoweringError::UnsupportedPostZPixelShaderImaskSemantics)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -5396,7 +5379,7 @@ fn post_z_pixel_shader_imask_only_blocks_draws_when_enabled_and_never_blocks_cle
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -5408,7 +5391,7 @@ fn pixel_shader_interlock_only_blocks_draws_when_conflict_detection_is_enabled()
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x1224, 0);
     let source = channel
@@ -5431,7 +5414,7 @@ fn pixel_shader_interlock_only_blocks_draws_when_conflict_detection_is_enabled()
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1224, 1);
@@ -5460,7 +5443,7 @@ fn pixel_shader_interlock_only_blocks_draws_when_conflict_detection_is_enabled()
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedPixelShaderInterlockSemantics(
+        Err(MaxwellLoweringError::UnsupportedPixelShaderInterlockSemantics(
             rejected
         )) if rejected == value
     ));
@@ -5478,7 +5461,7 @@ fn pixel_shader_interlock_only_blocks_draws_when_conflict_detection_is_enabled()
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -5533,7 +5516,7 @@ fn vertex_id_base_is_checked_on_consumption_including_after_cached_draws() {
                 result.unwrap();
             } else {
                 assert!(
-                    matches!(result, Err(MaxwellThreeDLoweringError::UnsupportedVertexIdBase(value)) if value == base)
+                    matches!(result, Err(MaxwellLoweringError::UnsupportedVertexIdBase(value)) if value == base)
                 );
             }
         }
@@ -5564,7 +5547,7 @@ fn global_draw_indices_are_dynamic_and_base_vertex_requires_distinct_neutral_sem
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x1434, 0);
     program_three_d(&mut channel, 0x1438, 7);
@@ -5589,7 +5572,7 @@ fn global_draw_indices_are_dynamic_and_base_vertex_requires_distinct_neutral_sem
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x1434, 0xffff_fffe);
@@ -5614,7 +5597,9 @@ fn global_draw_indices_are_dynamic_and_base_vertex_requires_distinct_neutral_sem
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedGlobalBaseVertexIndex(0xffff_fffe))
+        Err(MaxwellLoweringError::UnsupportedGlobalBaseVertexIndex(
+            0xffff_fffe
+        ))
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -5630,7 +5615,7 @@ fn global_draw_indices_are_dynamic_and_base_vertex_requires_distinct_neutral_sem
             &lowering_capabilities(BackendFeatures::empty()),
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));

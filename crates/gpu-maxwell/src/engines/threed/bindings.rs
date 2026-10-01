@@ -86,23 +86,15 @@ impl MaxwellThreeDProgramRegionState {
         ))
     }
 
-    pub(super) fn is_partially_programmed(&self) -> bool {
+    pub(in crate::engines) fn is_partially_programmed(&self) -> bool {
         self.address().is_none()
             && (self.address_upper.raw().is_some() || self.address_lower.raw().is_some())
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum MaxwellThreeDShaderStage {
-    VertexCullBeforeFetch,
-    Vertex,
-    TessellationInit,
-    Tessellation,
-    Geometry,
-    Pixel,
-}
+pub use crate::shader_stage::MaxwellShaderStage;
 
-impl MaxwellThreeDShaderStage {
+impl MaxwellShaderStage {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         match raw {
             0 => Some(Self::VertexCullBeforeFetch),
@@ -121,21 +113,22 @@ impl MaxwellThreeDShaderStage {
     /// Switchbrew documents the stage-indexed bind-group constant-buffer
     /// ranges used by the Maxwell 3D class:
     /// <https://switchbrew.org/wiki/GPU_Classes#3D_engine_class>
-    const fn default_binding_group(self) -> u8 {
-        match self {
+    const fn default_binding_group(self) -> Option<u8> {
+        Some(match self {
             Self::VertexCullBeforeFetch | Self::Vertex => 0,
             Self::TessellationInit => 1,
             Self::Tessellation => 2,
             Self::Geometry => 3,
             Self::Pixel => 4,
-        }
+            Self::Compute => return None,
+        })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDPipelineBindingState {
     enabled: MaxwellThreeDRegister<bool>,
-    stage: MaxwellThreeDRegister<MaxwellThreeDShaderStage>,
+    stage: MaxwellThreeDRegister<MaxwellShaderStage>,
     program_offset: MaxwellThreeDRegister<u32>,
     register_count: MaxwellThreeDRegister<u8>,
     group: MaxwellThreeDRegister<u8>,
@@ -150,7 +143,7 @@ impl Default for MaxwellThreeDPipelineBindingState {
             ),
             stage: MaxwellThreeDRegister::verified_reset(
                 MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
-                Some(MaxwellThreeDShaderStage::VertexCullBeforeFetch),
+                Some(MaxwellShaderStage::VertexCullBeforeFetch),
             ),
             program_offset: MaxwellThreeDRegister::default(),
             register_count: MaxwellThreeDRegister::default(),
@@ -168,7 +161,7 @@ impl MaxwellThreeDPipelineBindingState {
         &self.enabled
     }
     #[must_use]
-    pub const fn stage(&self) -> &MaxwellThreeDRegister<MaxwellThreeDShaderStage> {
+    pub const fn stage(&self) -> &MaxwellThreeDRegister<MaxwellShaderStage> {
         &self.stage
     }
     #[must_use]
@@ -194,7 +187,7 @@ impl MaxwellThreeDPipelineBindingState {
                 .stage
                 .value()
                 .copied()
-                .map(MaxwellThreeDShaderStage::default_binding_group),
+                .and_then(MaxwellShaderStage::default_binding_group),
             MaxwellThreeDRegisterOrigin::Unset => None,
         }
     }
@@ -437,13 +430,13 @@ impl MaxwellThreeDShaderBindingState {
         &self.program_region
     }
 
-    pub(super) fn has_enabled_pipeline(&self) -> bool {
+    pub(in crate::engines) fn has_enabled_pipeline(&self) -> bool {
         self.pipeline
             .iter()
             .any(|pipeline| pipeline.enabled.value() == Some(&true))
     }
 
-    pub(super) fn has_enabled_stage(&self, stage: MaxwellThreeDShaderStage) -> bool {
+    pub(in crate::engines) fn has_enabled_stage(&self, stage: MaxwellShaderStage) -> bool {
         self.pipeline.iter().any(|pipeline| {
             pipeline.enabled.value() == Some(&true) && pipeline.stage.value() == Some(&stage)
         })
@@ -658,7 +651,7 @@ pub enum MaxwellThreeDShaderBindingWrite {
     PipelineShader {
         pipeline: u8,
         enabled: bool,
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         source: MaxwellMethodSource,
     },
     PipelineProgram {

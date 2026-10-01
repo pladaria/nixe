@@ -7,10 +7,10 @@ use nixe_gpu_headless::backend as headless_backend;
 use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
     MaxwellChannelId, MaxwellChannelOwner, MaxwellDecodedPushbuffer, MaxwellGpfifoSourceLocation,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellGpuMapping, MaxwellMapRequest,
-    MaxwellMappingId, MaxwellPushbufferWord, MaxwellSubmissionExecutionPlan,
-    MaxwellSubmissionExecutionStep, MaxwellThreeDLoweringCache, SWITCH_1_GM20B_PROFILE,
-    decode_maxwell_pushbuffer, lower_maxwell_pushbuffer,
+    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellGpuMapping, MaxwellLoweringCache,
+    MaxwellMapRequest, MaxwellMappingId, MaxwellPushbufferWord, MaxwellSubmissionExecutionPlan,
+    MaxwellSubmissionExecutionStep, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
+    lower_maxwell_pushbuffer,
 };
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions};
 
@@ -112,7 +112,7 @@ fn dispatch_stream(
         FRONTEND_STATE,
         Vec::new(),
         None,
-        &mut MaxwellThreeDLoweringCache::default(),
+        &mut MaxwellLoweringCache::default(),
     )
     .unwrap()
 }
@@ -159,7 +159,7 @@ fn synthetic_maxwell_clear_executes_through_headless_contract() {
         &address_space,
         &clear_stream(target_mapping.offset().get()),
     );
-    let [MaxwellSubmissionExecutionStep::ThreeD(clear)] = plan.steps() else {
+    let [MaxwellSubmissionExecutionStep::Gpu(clear)] = plan.steps() else {
         panic!("clear stream did not lower to one 3D work item");
     };
     let capabilities = capabilities();

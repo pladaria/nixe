@@ -133,6 +133,17 @@ pub struct MaxwellThreeDMappingReference {
 }
 
 impl MaxwellThreeDMappingReference {
+    pub(in crate::engines) fn from_segment(segment: &crate::MaxwellResolvedMapping) -> Self {
+        let mapping = segment.mapping();
+        Self {
+            mapping: mapping.id(),
+            generation: mapping.generation(),
+            allocation: mapping.allocation(),
+            backing_offset: segment.backing_offset(),
+            size: segment.size(),
+            kind: mapping.kind(),
+        }
+    }
     #[must_use]
     pub const fn mapping(self) -> MaxwellMappingId {
         self.mapping
@@ -201,7 +212,7 @@ impl MaxwellThreeDResolvedBuffer {
         &self.mappings
     }
 
-    pub(super) fn shared_mappings(&self) -> Arc<[MaxwellThreeDMappingReference]> {
+    pub(in crate::engines) fn shared_mappings(&self) -> Arc<[MaxwellThreeDMappingReference]> {
         Arc::clone(&self.mappings)
     }
 }
@@ -337,10 +348,10 @@ impl MaxwellThreeDResolvedImage {
     pub fn mappings(&self) -> &[MaxwellThreeDMappingReference] {
         &self.mappings
     }
-    pub(super) fn shared_mappings(&self) -> Arc<[MaxwellThreeDMappingReference]> {
+    pub(in crate::engines) fn shared_mappings(&self) -> Arc<[MaxwellThreeDMappingReference]> {
         Arc::clone(&self.mappings)
     }
-    pub(super) fn cpu_write_dependency(&self) -> &CanonicalCpuWriteDependency {
+    pub(in crate::engines) fn cpu_write_dependency(&self) -> &CanonicalCpuWriteDependency {
         &self.cpu_writes
     }
     #[must_use]
@@ -462,11 +473,11 @@ pub struct MaxwellThreeDResolvedResources {
 }
 
 impl MaxwellThreeDResolvedResources {
-    pub(super) fn identity(&self) -> Arc<()> {
+    pub(in crate::engines) fn identity(&self) -> Arc<()> {
         Arc::clone(&self.identity)
     }
 
-    pub(super) fn has_identity(&self, identity: &Arc<()>) -> bool {
+    pub(in crate::engines) fn has_identity(&self, identity: &Arc<()>) -> bool {
         Arc::ptr_eq(&self.identity, identity)
     }
     #[must_use]

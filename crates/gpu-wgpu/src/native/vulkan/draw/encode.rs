@@ -1,7 +1,24 @@
-//! Raw commands for an ordered patch segment over resident resources.
+//! Raw graphics segments over resident resources, separated by neutral barriers.
 use super::*;
 
 pub(super) unsafe fn encode(cmd: vk::CommandBuffer, draws: &[RetainedDraw]) {
+    let mut start = 0;
+    for (index, draw) in draws.iter().enumerate().skip(1) {
+        if draw.begin_segment {
+            unsafe {
+                encode_segment(cmd, &draws[start..index]);
+            }
+            start = index;
+        }
+    }
+    if start < draws.len() {
+        unsafe {
+            encode_segment(cmd, &draws[start..]);
+        }
+    }
+}
+
+unsafe fn encode_segment(cmd: vk::CommandBuffer, draws: &[RetainedDraw]) {
     let first = &draws[0].frame;
     let raw = &first.pipeline.raw;
     let attachments = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
@@ -35,6 +52,9 @@ pub(super) unsafe fn encode(cmd: vk::CommandBuffer, draws: &[RetainedDraw]) {
     // consumers, including TCS/TES. Exit execution scopes also cover native reads
     // before subsequent uploads/writes (WAR), not only attachment writes (RAW).
     // No ALL_COMMANDS or per-draw barrier is needed for read-only descriptors.
+    // Neutral barriers split segments, so internal dependencies run outside
+    // render passes. Native passes use LOAD/STORE: guest clears run exactly
+    // once in the normal initialization pass, never on a segment restart.
     // https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-dependencies
     unsafe {
         raw.cmd_pipeline_barrier(

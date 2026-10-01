@@ -33,11 +33,19 @@ pub(super) fn validate(
     if !caps.wireframe {
         return Err(unsupported("native wireframe requires fillModeNonSolid"));
     }
+    validate_line(nixe_gpu::LineRasterization { width_bits, smooth }, caps)
+}
+
+pub(super) fn validate_line(
+    line: nixe_gpu::LineRasterization,
+    caps: crate::VulkanRasterCapabilities,
+) -> Result<(), BackendDriverError> {
+    let nixe_gpu::LineRasterization { width_bits, smooth } = line;
     if (smooth && !caps.smooth_lines) || (!smooth && !caps.rectangular_lines) {
         return Err(unsupported(if smooth {
-            "native smooth wireframe requires line-rasterization smoothLines"
+            "native smooth lines require line-rasterization smoothLines"
         } else {
-            "native rectangular wireframe requires line-rasterization rectangularLines"
+            "native rectangular lines require line-rasterization rectangularLines"
         }));
     }
     let width = f32::from_bits(width_bits);

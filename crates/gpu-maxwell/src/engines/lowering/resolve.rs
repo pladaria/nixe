@@ -1,17 +1,17 @@
 //! Color resolves using the same resident image identities as clear and draw.
 use super::*;
 
-impl MaxwellThreeDLoweringCache {
+impl MaxwellLoweringCache {
     pub(crate) fn lower_color_resolve(
         &mut self,
         resources: &MaxwellThreeDResolvedResources,
         submission: FrontendSubmissionId,
         predecessors: Vec<FrontendSubmissionId>,
-    ) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
+    ) -> Result<MaxwellLoweredWork, MaxwellLoweringError> {
         let source = resolved_image(resources, 0)?;
         let destination = resolved_image(resources, 1)?;
         if !resources.aliases().is_empty() {
-            return Err(MaxwellThreeDLoweringError::AliasedDrawResources {
+            return Err(MaxwellLoweringError::AliasedDrawResources {
                 first: source.role(),
                 second: destination.role(),
             });
@@ -27,15 +27,15 @@ impl MaxwellThreeDLoweringCache {
                 .iter()
                 .any(|image| image.remains_materialized_for(source))
         {
-            return Err(MaxwellThreeDLoweringError::ResolveSourceNotResident);
+            return Err(MaxwellLoweringError::ResolveSourceNotResident);
         }
         let mut creations = Vec::new();
         let mut invalidations = std::mem::take(&mut self.retired_resources);
         let bindings =
             prepare_resources(resources, &[0, 1], self, &mut creations, &mut invalidations)?;
         let region = |index,
-                      image: &super::super::MaxwellThreeDResolvedImage|
-         -> Result<ImageRegion, MaxwellThreeDLoweringError> {
+                      image: &super::super::threed::MaxwellThreeDResolvedImage|
+         -> Result<ImageRegion, MaxwellLoweringError> {
             Ok(ImageRegion {
                 image: image_dependency(binding_at(resources, &bindings, index)?)?,
                 subresources: image.view().bindings()[0].subresources(),
@@ -49,7 +49,7 @@ impl MaxwellThreeDLoweringCache {
             source.description().format(),
             source.description().samples(),
         )
-        .map_err(MaxwellThreeDLoweringError::Command)?;
+        .map_err(MaxwellLoweringError::Command)?;
         record_color_materialization(destination, self);
         finish_lowered_work(
             self,

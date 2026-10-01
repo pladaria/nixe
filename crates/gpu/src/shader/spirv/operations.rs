@@ -4,6 +4,11 @@ impl Emitter {
     pub(super) fn operation(&mut self, operation: &ShaderOperation) -> Result<()> {
         use ShaderOperation::*;
         match operation {
+            LoadComputeBuiltin32 { .. }
+            | LoadStorageBuffer32 { .. }
+            | StoreStorageBuffer32 { .. } => {
+                return Err(self.unsupported("compute operations require the WGSL compute backend"));
+            }
             Undefined32 { destination } => {
                 self.write(*destination, self.undefined_uint);
             }
@@ -219,6 +224,32 @@ impl Emitter {
                     }
                 };
                 self.write(*destination, value);
+            }
+            AddCarry32 {
+                destination,
+                carry_out,
+                left,
+                right,
+                carry_in,
+            } => {
+                let left = self.read(*left)?;
+                let right = self.read(*right)?;
+                let zero = self.constant(0);
+                let one = self.constant(1);
+                let carry = if let Some(register) = carry_in {
+                    let value = self.read(*register)?;
+                    self.b.bitwise_and(self.uint, None, value, one)?
+                } else {
+                    zero
+                };
+                let sum = self.b.i_add(self.uint, None, left, right)?;
+                let total = self.b.i_add(self.uint, None, sum, carry)?;
+                let first = self.b.u_less_than(self.boolean, None, sum, left)?;
+                let second = self.b.u_less_than(self.boolean, None, total, sum)?;
+                let overflow = self.b.logical_or(self.boolean, None, first, second)?;
+                let carry = self.b.select(self.uint, None, overflow, one, zero)?;
+                self.write(*destination, total);
+                self.write(*carry_out, carry);
             }
             Add32 {
                 destination,

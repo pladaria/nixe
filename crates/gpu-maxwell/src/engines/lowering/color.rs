@@ -1,7 +1,7 @@
 //! Consumed color state, routed from physical Maxwell targets to fragment slots.
 //! Register encodings:
 //! https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1980-L2165
-use super::super::MaxwellThreeDBlendOp;
+use super::super::threed::MaxwellThreeDBlendOp;
 use super::*;
 use MaxwellThreeDFixedFunctionRegister as R;
 use MaxwellThreeDFixedFunctionValue as V;
@@ -14,7 +14,7 @@ pub(super) fn draw_color_outputs(
     state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
     attachments: &DrawAttachmentSelection,
-) -> Result<[ColorOutputState; 8], MaxwellThreeDLoweringError> {
+) -> Result<[ColorOutputState; 8], MaxwellLoweringError> {
     let mut outputs = [ColorOutputState::REPLACE; 8];
     if attachments.colors.is_empty() {
         return Ok(outputs);
@@ -31,13 +31,13 @@ pub(super) fn draw_color_outputs(
             fixed.blend_enable()[usize::from(target)]
                 .value()
                 .copied()
-                .ok_or(MaxwellThreeDLoweringError::IncompleteBlendState {
+                .ok_or(MaxwellLoweringError::IncompleteBlendState {
                     target: selected,
                     field: "SET_BLEND(i)",
                 })?
         } else {
             *fixed.blend_enable_common().value().ok_or(
-                MaxwellThreeDLoweringError::IncompleteBlendState {
+                MaxwellLoweringError::IncompleteBlendState {
                     target: None,
                     field: "SET_BLEND_ENABLE_COMMON",
                 },
@@ -56,7 +56,7 @@ pub(super) fn draw_color_outputs(
                     | nixe_gpu::ImageFormat::Rgba8Srgb
                     | nixe_gpu::ImageFormat::Bgra8Srgb
             ) {
-                return Err(MaxwellThreeDLoweringError::UnsupportedBlendFormat { target, format });
+                return Err(MaxwellLoweringError::UnsupportedBlendFormat { target, format });
             }
             let read = |index: usize| {
                 let (register, common, per) = [
@@ -109,7 +109,7 @@ pub(super) fn draw_color_outputs(
                 )
             };
             let separate = boolean(read(0)?)?;
-            let component = |index| -> Result<BlendComponent, MaxwellThreeDLoweringError> {
+            let component = |index| -> Result<BlendComponent, MaxwellLoweringError> {
                 let V::BlendOp(operation) = read(index)? else {
                     return Err(wrong_type());
                 };
@@ -143,7 +143,7 @@ pub(super) fn draw_color_outputs(
             let mask_register = if *single { 0 } else { target };
             let mask = fixed.color_mask()[usize::from(mask_register)]
                 .value()
-                .ok_or(MaxwellThreeDLoweringError::IncompleteColorWriteState {
+                .ok_or(MaxwellLoweringError::IncompleteColorWriteState {
                     target,
                     mask_register,
                 })?;
@@ -158,22 +158,22 @@ fn required(
     value: Option<V>,
     target: Option<u8>,
     field: &'static str,
-) -> Result<V, MaxwellThreeDLoweringError> {
-    value.ok_or(MaxwellThreeDLoweringError::IncompleteBlendState { target, field })
+) -> Result<V, MaxwellLoweringError> {
+    value.ok_or(MaxwellLoweringError::IncompleteBlendState { target, field })
 }
-fn wrong_type() -> MaxwellThreeDLoweringError {
-    MaxwellThreeDLoweringError::ContradictoryState {
+fn wrong_type() -> MaxwellLoweringError {
+    MaxwellLoweringError::ContradictoryState {
         reason: "color state register has the wrong typed value",
     }
 }
-fn boolean(value: V) -> Result<bool, MaxwellThreeDLoweringError> {
+fn boolean(value: V) -> Result<bool, MaxwellLoweringError> {
     if let V::Boolean(value) = value {
         Ok(value)
     } else {
         Err(wrong_type())
     }
 }
-fn factor(value: V, target: Option<u8>) -> Result<F, MaxwellThreeDLoweringError> {
+fn factor(value: V, target: Option<u8>) -> Result<F, MaxwellLoweringError> {
     let V::BlendFactor(value) = value else {
         return Err(wrong_type());
     };
@@ -189,13 +189,13 @@ fn factor(value: V, target: Option<u8>) -> Result<F, MaxwellThreeDLoweringError>
         9 | 0x4306 => F::DestinationColor,
         10 | 0x4307 => F::OneMinusDestinationColor,
         11 | 0x4308 => F::SourceAlphaSaturated,
-        value => return Err(MaxwellThreeDLoweringError::UnsupportedBlendFactor { target, value }),
+        value => return Err(MaxwellLoweringError::UnsupportedBlendFactor { target, value }),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::MaxwellThreeDBlendFactor;
+    use super::super::super::threed::MaxwellThreeDBlendFactor;
     use super::*;
 
     #[test]

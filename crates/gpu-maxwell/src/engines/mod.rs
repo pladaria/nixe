@@ -7,10 +7,11 @@
 mod compute;
 mod dma_copy;
 mod inline_to_memory;
+mod lowering;
 mod spa;
 mod threed;
+pub(crate) use lowering::lower_maxwell_three_d_operation_into_cache;
 pub(crate) use threed::MaxwellThreeDFrontendState;
-pub(crate) use threed::lower_maxwell_three_d_operation_into_cache;
 mod twod;
 
 pub use spa::MaxwellSpaVersion;
@@ -21,14 +22,16 @@ pub use compute::{
     MaxwellComputeCwdRefCounterState, MaxwellComputeCwdRefCounterValue,
     MaxwellComputeDescriptorPoolState, MaxwellComputeInlineToMemoryLaunch,
     MaxwellComputeInlineToMemoryLayout, MaxwellComputeInlineToMemoryPendingTransfer,
-    MaxwellComputeInlineToMemoryState, MaxwellComputeInlineToMemoryUpload,
-    MaxwellComputeLocalMemoryAllocation, MaxwellComputeLocalMemoryState,
+    MaxwellComputeInlineToMemoryState, MaxwellComputeInlineToMemoryUpload, MaxwellComputeLaunch,
+    MaxwellComputeLaunchError, MaxwellComputeLocalMemoryAllocation, MaxwellComputeLocalMemoryState,
     MaxwellComputeOperationTrigger, MaxwellComputeProgramState, MaxwellComputeRegister,
     MaxwellComputeRegisterOrigin, MaxwellComputeShaderCacheInvalidation, MaxwellComputeSmCount,
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeSynchronizationPlan,
     MaxwellComputeTriggeredOperation, MaxwellShaderCacheInvalidation,
     lower_maxwell_compute_synchronization,
 };
+
+pub(crate) use compute::resolve_compute_launch;
 pub use dma_copy::{
     MaxwellDmaCopyComponentSource, MaxwellDmaCopyError, MaxwellDmaCopyMemoryLayout,
     MaxwellDmaCopyOperation, MaxwellDmaCopyRegister, MaxwellDmaCopyRegisterName,
@@ -52,6 +55,7 @@ pub use threed::{
     MAXWELL_THREE_D_PRIMITIVE_AREA_MAX, MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
     MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
     MAXWELL_VERTEX_STREAM_COUNT, MAXWELL_VIEWPORT_COUNT, MAXWELL_WINDOW_CLIP_COUNT,
+    MaxwellLoweredWork, MaxwellLoweringCache, MaxwellLoweringError, MaxwellShaderStage,
     MaxwellTessellationModeError, MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
     MaxwellThreeDAlphaToCoverageDither, MaxwellThreeDAlphaToCoverageOverride,
     MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDApiMandatedEarlyZ,
@@ -93,8 +97,7 @@ pub use threed::{
     MaxwellThreeDInstrumentationValue, MaxwellThreeDIteratedBlend,
     MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDL2CacheEvictionPolicy,
     MaxwellThreeDL2CacheState, MaxwellThreeDLineState, MaxwellThreeDLineStippleParameters,
-    MaxwellThreeDLogicOp, MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache,
-    MaxwellThreeDLoweringError, MaxwellThreeDMappingReference, MaxwellThreeDMmeExecutionError,
+    MaxwellThreeDLogicOp, MaxwellThreeDMappingReference, MaxwellThreeDMmeExecutionError,
     MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError, MaxwellThreeDMmeRam,
     MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl, MaxwellThreeDMmeShadowRamError,
     MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState, MaxwellThreeDMutableMethodControl,
@@ -125,7 +128,7 @@ pub use threed::{
     MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode, MaxwellThreeDShaderBindingState,
     MaxwellThreeDShaderCacheInvalidation, MaxwellThreeDShaderExceptionsEnable,
     MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderLocalMemoryPerWarpSize,
-    MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderResourceUse, MaxwellThreeDShaderStage,
+    MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderResourceUse,
     MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
     MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDStencilOp,
     MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB, MaxwellThreeDSurfaceClipAxis,
@@ -259,6 +262,7 @@ pub(crate) enum PendingEngineOperation {
     InlineToMemory(MaxwellInlineToMemoryUpload),
     DmaCopy(MaxwellDmaCopyOperation),
     ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
+    ComputeLaunch(MaxwellComputeLaunch),
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
     ThreeD(MaxwellThreeDOperationTrigger),
     ThreeDSynchronization(MaxwellThreeDSynchronizationTrigger),
@@ -268,6 +272,8 @@ pub(crate) enum PendingEngineOperation {
 pub(crate) struct MaxwellEngineEvent<'a> {
     pub(crate) operation: PendingEngineOperation,
     pub(crate) three_d: &'a MaxwellThreeDState,
+    /// Present for direct class methods; MME-expanded 3D effects have no compute state.
+    pub(crate) compute: Option<&'a MaxwellComputeState>,
 }
 
 /// One validated host cache operation at its exact pushbuffer source.
@@ -346,6 +352,10 @@ pub enum MaxwellEngineOperation {
     InlineToMemory(MaxwellInlineToMemoryUpload),
     DmaCopy(MaxwellDmaCopyOperation),
     ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
+    ComputeLaunch {
+        launch: MaxwellComputeLaunch,
+        state: Box<MaxwellComputeState>,
+    },
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
     ThreeD(Box<MaxwellThreeDTriggeredOperation>),
     ThreeDSynchronization(Box<MaxwellThreeDSynchronizationOperation>),
@@ -631,9 +641,14 @@ impl<E> MaxwellEngineStreamError<E> {
 fn emit_pending_operation<E>(
     operation: PendingEngineOperation,
     three_d: &MaxwellThreeDState,
+    compute: Option<&MaxwellComputeState>,
     consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
-    consume(MaxwellEngineEvent { operation, three_d })
+    consume(MaxwellEngineEvent {
+        operation,
+        three_d,
+        compute,
+    })
 }
 
 /// Applies one packet and streams sparse execution effects in exact method order.
@@ -673,8 +688,13 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
         if let MaxwellMethodDispatchKind::HostMethod(host) = method.kind() {
             let applied = preflight_host_method(method, host);
             if let Some(operation) = applied.operation {
-                emit_pending_operation(operation, channel.three_d(), consume)
-                    .map_err(MaxwellEngineStreamError::Consumer)?;
+                emit_pending_operation(
+                    operation,
+                    channel.three_d(),
+                    Some(channel.compute()),
+                    consume,
+                )
+                .map_err(MaxwellEngineStreamError::Consumer)?;
             }
             if let Some(methods) = methods.as_deref_mut() {
                 methods.push(applied.dispatch);
@@ -704,8 +724,13 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
             let applied = dispatch_class_method(channel, method)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
             if let Some(operation) = applied.operation {
-                emit_pending_operation(operation, channel.three_d(), consume)
-                    .map_err(MaxwellEngineStreamError::Consumer)?;
+                emit_pending_operation(
+                    operation,
+                    channel.three_d(),
+                    Some(channel.compute()),
+                    consume,
+                )
+                .map_err(MaxwellEngineStreamError::Consumer)?;
             }
             if let Some(methods) = methods.as_deref_mut() {
                 methods.push(applied.dispatch);
@@ -745,7 +770,7 @@ fn flush_mme_methods<E>(
         parameters,
         channel.three_d_mut(),
         methods.as_deref_mut(),
-        &mut |operation, state| emit_pending_operation(operation, state, consume),
+        &mut |operation, state| emit_pending_operation(operation, state, None, consume),
     )
     .map_err(|error| match error {
         threed::MaxwellThreeDMmePreflightError::Dispatch(error) => {
@@ -823,6 +848,17 @@ pub fn dispatch_maxwell_engine_packet(
                 }
                 PendingEngineOperation::ComputeSynchronization(operation) => {
                     MaxwellEngineOperation::ComputeSynchronization(operation)
+                }
+                PendingEngineOperation::ComputeLaunch(launch) => {
+                    MaxwellEngineOperation::ComputeLaunch {
+                        launch,
+                        state: Box::new(
+                            event
+                                .compute
+                                .expect("compute launch has live state")
+                                .clone(),
+                        ),
+                    }
                 }
                 PendingEngineOperation::ThreeDInlineConstantBuffer(upload) => {
                     MaxwellEngineOperation::ThreeDInlineConstantBuffer(upload)

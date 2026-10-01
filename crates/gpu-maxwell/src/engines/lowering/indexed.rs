@@ -3,30 +3,27 @@ use super::*;
 use crate::engines::threed::MaxwellThreeDIndexElementSize;
 use nixe_gpu::IndexType;
 
-pub(super) fn index_type(
-    state: &MaxwellThreeDState,
-) -> Result<IndexType, MaxwellThreeDLoweringError> {
+pub(super) fn index_type(state: &MaxwellThreeDState) -> Result<IndexType, MaxwellLoweringError> {
     match state
         .vertex_input()
         .index()
         .element_size()
         .value()
         .copied()
-        .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
-            "SET_INDEX_BUFFER_E",
-        ))? {
+        .ok_or(MaxwellLoweringError::IncompleteDraw("SET_INDEX_BUFFER_E"))?
+    {
         MaxwellThreeDIndexElementSize::TwoBytes => Ok(IndexType::Uint16),
         MaxwellThreeDIndexElementSize::FourBytes => Ok(IndexType::Uint32),
-        format => Err(MaxwellThreeDLoweringError::UnsupportedIndexFormat(format)),
+        format => Err(MaxwellLoweringError::UnsupportedIndexFormat(format)),
     }
 }
 
 pub(super) fn draw_arguments(
     state: &MaxwellThreeDState,
     index_count: u32,
-) -> Result<DrawArguments, MaxwellThreeDLoweringError> {
+) -> Result<DrawArguments, MaxwellLoweringError> {
     if index_count == 0 {
-        return Err(MaxwellThreeDLoweringError::EmptyDraw);
+        return Err(MaxwellLoweringError::EmptyDraw);
     }
     index_type(state)?;
     let input = state.vertex_input();
@@ -35,7 +32,7 @@ pub(super) fn draw_arguments(
             .primitive()
             .active_begin()
             .copied()
-            .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("BEGIN"))?,
+            .ok_or(MaxwellLoweringError::IncompleteDraw("BEGIN"))?,
     )?;
     if !matches!(
         topology,
@@ -46,19 +43,24 @@ pub(super) fn draw_arguments(
     ) {
         // Host strips enable restart implicitly; indexed quads/fans need index
         // assembly conversion. Neither may silently use a triangle-list draw.
-        return Err(MaxwellThreeDLoweringError::UnsupportedIndexedDraw(
+        return Err(MaxwellLoweringError::UnsupportedIndexedDraw(
             "topology requires index assembly conversion",
         ));
     }
     if input.index().count().value() != Some(&index_count) {
-        return Err(MaxwellThreeDLoweringError::TriggerStateMismatch);
+        return Err(MaxwellLoweringError::TriggerStateMismatch);
     }
-    let first_index = input.index().first().value().copied().ok_or(
-        MaxwellThreeDLoweringError::IncompleteDraw("SET_INDEX_BUFFER_F"),
-    )?;
-    first_index.checked_add(index_count).ok_or(
-        MaxwellThreeDLoweringError::UnsupportedIndexedDraw("index range overflow"),
-    )?;
+    let first_index = input
+        .index()
+        .first()
+        .value()
+        .copied()
+        .ok_or(MaxwellLoweringError::IncompleteDraw("SET_INDEX_BUFFER_F"))?;
+    first_index
+        .checked_add(index_count)
+        .ok_or(MaxwellLoweringError::UnsupportedIndexedDraw(
+            "index range overflow",
+        ))?;
     let assembly = input.assembly();
     let base_vertex = assembly
         .global_base_vertex_index()
@@ -71,12 +73,12 @@ pub(super) fn draw_arguments(
     // bases require an independent shader adjustment, not rebasing the buffer.
     // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/draw.mme
     if base_vertex != vertex_id_base {
-        return Err(MaxwellThreeDLoweringError::UnsupportedIndexedDraw(
+        return Err(MaxwellLoweringError::UnsupportedIndexedDraw(
             "distinct vertex-fetch and shader-ID bases",
         ));
     }
     if input.primitive().restart_enabled().value() == Some(&true) {
-        return Err(MaxwellThreeDLoweringError::UnsupportedIndexedDraw(
+        return Err(MaxwellLoweringError::UnsupportedIndexedDraw(
             "primitive restart",
         ));
     }

@@ -65,7 +65,7 @@ fn deko_blending_consumes_initial_separate_alpha_without_selector_write() {
             &capabilities,
             &mut cache,
         )?;
-        Ok::<_, MaxwellThreeDLoweringError>(
+        Ok::<_, MaxwellLoweringError>(
             plan.submission()
                 .operations()
                 .iter()
@@ -83,7 +83,7 @@ fn deko_blending_consumes_initial_separate_alpha_without_selector_write() {
     // still fail instead of inheriting fabricated blending defaults.
     assert!(matches!(
         lower(&mut channel),
-        Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+        Err(MaxwellLoweringError::IncompleteBlendState {
             target: Some(0),
             field: "SET_BLEND_PER_TARGET_COEFF_DESTINATION_ALPHA"
         })
@@ -122,12 +122,10 @@ fn deko_blending_consumes_initial_separate_alpha_without_selector_write() {
     program_three_d(&mut channel, 0x153c, 1);
     assert!(matches!(
         lower(&mut channel),
-        Err(
-            MaxwellThreeDLoweringError::UnsupportedAntiAliasAlphaControl {
-                alpha_to_coverage: true,
-                alpha_to_one: false
-            }
-        )
+        Err(MaxwellLoweringError::UnsupportedAntiAliasAlphaControl {
+            alpha_to_coverage: true,
+            alpha_to_one: false
+        })
     ));
     program_three_d(&mut channel, 0x153c, 0);
     assert_eq!(lower(&mut channel).unwrap().pipeline, separate.pipeline);
@@ -268,7 +266,7 @@ fn consumed_color_state_routes_physical_targets_and_invalidates_prepared_draws()
             &capabilities,
             &mut cache,
         )?;
-        Ok::<_, MaxwellThreeDLoweringError>(
+        Ok::<_, MaxwellLoweringError>(
             plan.submission()
                 .operations()
                 .iter()
@@ -329,7 +327,7 @@ fn consumed_color_state_routes_physical_targets_and_invalidates_prepared_draws()
         program_three_d(&mut channel, 0x1e28, value);
         program_three_d(&mut channel, 0x1e2c, 2);
         assert!(
-            matches!(lower(&mut channel), Err(MaxwellThreeDLoweringError::UnsupportedBlendFactor { target: Some(1), value: actual }) if actual == value)
+            matches!(lower(&mut channel), Err(MaxwellLoweringError::UnsupportedBlendFactor { target: Some(1), value: actual }) if actual == value)
         );
     }
     // A disabled equation does not consume those factors, and state changes do

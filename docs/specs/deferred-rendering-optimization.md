@@ -53,7 +53,7 @@ Inspect these locations before designing changes:
 
 | Area | Existing implementation | Implication |
 | --- | --- | --- |
-| Draw lowering | `crates/gpu-maxwell/src/engines/threed/draw.rs` emits begin/draw/end operations; draw attachments normally use Load/Store | A per-draw lowered pass is not necessarily a separate host pass |
+| Draw lowering | `crates/gpu-maxwell/src/engines/lowering.rs` emits begin/draw/end operations; draw attachments normally use Load/Store | A per-draw lowered pass is not necessarily a separate host pass |
 | Pass batching | `append_batchable_operations`, `batchable_render_pass`, `render_passes_can_merge` in `crates/gpu-maxwell/src/execution.rs` | Adjacent compatible passes are already merged; extend or replace this mechanism, do not add a second batcher |
 | Ordering | `three_d_synchronization_operation` in the same file | Pixel/tile barriers currently become conservative ordered-write boundaries |
 | Discard | `MethodAction::DiscardRenderTarget` in `crates/gpu-maxwell/src/engines/threed/mod.rs` | Currently retains contents, which discard permits; does not propagate a store-elimination opportunity |

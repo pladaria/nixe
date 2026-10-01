@@ -50,7 +50,7 @@ fn resource_cache_does_not_alias_equal_revision_counters_from_different_channels
     );
     assert!(first_state.draw_state_identity().matches(&snapshot));
     assert!(first_state.shader_state_identity().matches(&snapshot));
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let first = cache
         .resolved_resources_mut()
         .resolve(first_state, &address_space, &roles, None, false, 4)
@@ -801,8 +801,7 @@ fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot
             max_compute_workgroups: [1, 1, 1],
         },
     );
-    let lower = |operation: &MaxwellThreeDTriggeredOperation,
-                 cache: &mut MaxwellThreeDLoweringCache| {
+    let lower = |operation: &MaxwellThreeDTriggeredOperation, cache: &mut MaxwellLoweringCache| {
         let resources =
             resolve_maxwell_three_d_resources(operation.state(), &address_space).unwrap();
         lower_maxwell_three_d_operation(
@@ -816,13 +815,11 @@ fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot
             cache,
         )
     };
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let missing = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
     assert!(matches!(
         lower(missing.operations()[0], &mut cache),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
-            "SET_STENCIL_MASK"
-        ))
+        Err(MaxwellLoweringError::IncompleteClear("SET_STENCIL_MASK"))
     ));
 
     // Depth-only clears neither read nor initialize stencil, even when the
@@ -830,7 +827,7 @@ fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot
     let depth_only = dispatch_method(&mut channel, 0x19d0 / 4, 1).unwrap();
     let depth_plan = lower(
         depth_only.operations()[0],
-        &mut MaxwellThreeDLoweringCache::default(),
+        &mut MaxwellLoweringCache::default(),
     )
     .unwrap();
     assert!(matches!(
@@ -846,7 +843,7 @@ fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot
         let partial = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
         assert!(matches!(
             lower(partial.operations()[0], &mut cache),
-            Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x51 })
+            Err(MaxwellLoweringError::CompressedDepthImportRequired { kind: 0x51 })
         ));
     }
 
@@ -887,9 +884,9 @@ fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot
     assert!(matches!(
         lower(
             partial.operations()[0],
-            &mut MaxwellThreeDLoweringCache::default()
+            &mut MaxwellLoweringCache::default()
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x51 })
+        Err(MaxwellLoweringError::CompressedDepthImportRequired { kind: 0x51 })
     ));
 
     // Masked bit-preserving clears are still unsupported, even after the
@@ -899,7 +896,7 @@ fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot
         let masked = dispatch_method(&mut channel, 0x19d0 / 4, 3).unwrap();
         assert!(matches!(
             lower(masked.operations()[0], &mut cache),
-            Err(MaxwellThreeDLoweringError::UnsupportedClearStencilMaskSemantics)
+            Err(MaxwellLoweringError::UnsupportedClearStencilMaskSemantics)
         ));
     }
 }
@@ -1068,7 +1065,7 @@ fn check_depth_2cz_materialization(
             max_compute_workgroups: [1, 1, 1],
         },
     );
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     assert!(matches!(
         lower_maxwell_three_d_operation(
             partial.state(),
@@ -1080,7 +1077,7 @@ fn check_depth_2cz_materialization(
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
+        Err(MaxwellLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
     ));
     // Disabling the clear rectangle selects the complete attachment. The
     // neutral image can therefore be initialized without decoding any 2CZ
@@ -1194,7 +1191,7 @@ fn check_depth_2cz_materialization(
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
+        Err(MaxwellLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
     ));
 }
 
@@ -1460,7 +1457,7 @@ fn check_draw_compressed_depth_aspects(format: u32, kind: u8) {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
+        Err(MaxwellLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
     ));
 
     // textured_cube clears the complete depth aspect but deliberately leaves
@@ -1522,7 +1519,7 @@ fn check_draw_compressed_depth_aspects(format: u32, kind: u8) {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
+        Err(MaxwellLoweringError::CompressedDepthImportRequired { kind: actual }) if actual == kind
     ));
 }
 
@@ -1597,11 +1594,11 @@ fn three_d_surface_clip_pair_preserves_sources_and_controls_draw_validation() {
         FrontendSubmissionId::new(4),
         Vec::new(),
         &capabilities,
-        &mut MaxwellThreeDLoweringCache::default(),
+        &mut MaxwellLoweringCache::default(),
     );
     assert!(!matches!(
         result,
-        Err(MaxwellThreeDLoweringError::UnsupportedSurfaceClipSemantics)
+        Err(MaxwellLoweringError::UnsupportedSurfaceClipSemantics)
     ));
 
     program_three_d(&mut channel, 0x0ff4, 0x04ff_0000);
@@ -1623,9 +1620,9 @@ fn three_d_surface_clip_pair_preserves_sources_and_controls_draw_validation() {
             FrontendSubmissionId::new(5),
             Vec::new(),
             &capabilities,
-            &mut MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellLoweringCache::default(),
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedSurfaceClipSemantics)
+        Err(MaxwellLoweringError::UnsupportedSurfaceClipSemantics)
     ));
 }
 
@@ -2081,7 +2078,7 @@ fn clear_trigger_lowers_directly_and_reuses_cached_resources() {
     let triggered = &dispatch.operations()[0];
     let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::CLEAR);
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     let first = lower_maxwell_three_d_operation(
         triggered.state(),
         &resources,
@@ -2128,7 +2125,7 @@ fn clear_trigger_lowers_directly_and_reuses_cached_resources() {
         FrontendSubmissionId::new(12),
         Vec::new(),
         &capabilities,
-        &mut MaxwellThreeDLoweringCache::default(),
+        &mut MaxwellLoweringCache::default(),
     )
     .unwrap();
     let GpuCommand::Clear(nixe_gpu::ClearOperation::Image { target, .. }) =
@@ -2173,7 +2170,7 @@ fn clear_trigger_lowers_directly_and_reuses_cached_resources() {
             &insufficient,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::Capability(_))
+        Err(MaxwellLoweringError::Capability(_))
     ));
 }
 
@@ -2250,7 +2247,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
     let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
     let capabilities =
         lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     assert!(matches!(
         lower_maxwell_three_d_operation(
             triggered.state(),
@@ -2262,7 +2259,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     let shaders = MaxwellThreeDTranslatedShaders::new(
@@ -2296,9 +2293,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteDraw(
-            "SET_L1_CONFIGURATION"
-        ))
+        Err(MaxwellLoweringError::IncompleteDraw("SET_L1_CONFIGURATION"))
     ));
     let memory_independent_shaders = MaxwellThreeDTranslatedShaders::new(
         vec![
@@ -2320,7 +2315,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
         &mut cache,
     )
     .unwrap();
-    cache = MaxwellThreeDLoweringCache::default();
+    cache = MaxwellLoweringCache::default();
     let accepted_calls = MaxwellThreeDTranslatedShaders::new(
         vec![
             MaxwellThreeDTranslatedShader::new(
@@ -2381,7 +2376,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::VisibleCallLimitExceeded {
+        Err(MaxwellLoweringError::VisibleCallLimitExceeded {
             stage: ShaderStage::Vertex,
             required: 129,
             limit: 128,
@@ -2419,7 +2414,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             &mut cache,
         ),
         Err(
-            MaxwellThreeDLoweringError::TranslatedShaderMemoryConfigurationMismatch {
+            MaxwellLoweringError::TranslatedShaderMemoryConfigurationMismatch {
                 configured: MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 required: MaxwellThreeDDirectlyAddressableMemory::Size16KiB,
                 ..
@@ -2437,7 +2432,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders)
+        Err(MaxwellLoweringError::InvalidTranslatedShaders)
     ));
     cache.seed_test_shader_translations(&accepted_calls);
     let plan = lower_maxwell_three_d_operation(
@@ -2658,7 +2653,7 @@ fn procedural_draw_lowers_without_fabricating_a_vertex_stream() {
         Vec::new(),
     )
     .unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     cache.seed_test_shader_translations(&shaders);
     let plan = lower_maxwell_three_d_operation(
         triggered.state(),
@@ -2957,7 +2952,7 @@ fn draw_alias_validation_ignores_unselected_targets_and_rejects_selected_aliases
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::AliasedDrawResources { .. })
+        Err(MaxwellLoweringError::AliasedDrawResources { .. })
     ));
 }
 
@@ -3129,7 +3124,7 @@ fn ct_mrt_enable_only_affects_multi_target_draws_and_not_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedReplicatedColorTargetOutputSemantics)
+        Err(MaxwellLoweringError::UnsupportedReplicatedColorTargetOutputSemantics)
     ));
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -3145,7 +3140,7 @@ fn ct_mrt_enable_only_affects_multi_target_draws_and_not_clears() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -3182,7 +3177,7 @@ fn render_target_layer_only_blocks_effective_layered_draws() {
     program_three_d(&mut channel, 0x121c, 1);
     let capabilities =
         lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
 
     program_three_d(&mut channel, 0x15cc, 0);
     let resources = resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
@@ -3206,7 +3201,7 @@ fn render_target_layer_only_blocks_effective_layered_draws() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x15cc, 1);
@@ -3229,7 +3224,7 @@ fn render_target_layer_only_blocks_effective_layered_draws() {
             Vec::new(),
             &capabilities,
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedRenderTargetLayerSemantics(value))
+        Err(MaxwellLoweringError::UnsupportedRenderTargetLayerSemantics(value))
             if value.raw() == 1
     ));
 
@@ -3255,7 +3250,7 @@ fn render_target_layer_only_blocks_effective_layered_draws() {
                 &capabilities,
                 &mut cache,
             ),
-            Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+            Err(MaxwellLoweringError::ShaderTranslationRequired)
         ));
     }
 
@@ -3280,7 +3275,7 @@ fn render_target_layer_only_blocks_effective_layered_draws() {
             Vec::new(),
             &capabilities,
             &mut cache,        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedRenderTargetLayerSemantics(value))
+        Err(MaxwellLoweringError::UnsupportedRenderTargetLayerSemantics(value))
             if value.raw() == 0x0001_0000
     ));
 
@@ -3307,7 +3302,7 @@ fn render_target_layer_only_blocks_effective_layered_draws() {
             &mut cache,
         ),
         Err(
-            MaxwellThreeDLoweringError::UnsupportedRenderTargetIndexOffsetSemantics(
+            MaxwellLoweringError::UnsupportedRenderTargetIndexOffsetSemantics(
                 MaxwellThreeDRenderTargetIndexOffset::ByViewportIndex
             )
         )
@@ -3326,7 +3321,7 @@ fn render_target_layer_only_blocks_effective_layered_draws() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellThreeDLoweringError::IncompleteClear(
+        Err(MaxwellLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
@@ -3433,6 +3428,83 @@ fn compute_shader_memory_state_is_typed_source_preserving_and_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_ne!(channel.compute(), &compute_before);
+}
+
+#[test]
+fn compute_shader_exceptions_preserve_configuration_without_emitting_work() {
+    let mut channel = compute_channel();
+    let three_d_before = channel.three_d().clone();
+    let two_d_before = channel.two_d().clone();
+    let register = channel.compute().shader_exceptions_enable();
+    assert_eq!(register.origin(), MaxwellComputeRegisterOrigin::Unset);
+    assert_eq!(register.raw(), None);
+    assert_eq!(register.value(), None);
+    assert_eq!(register.source(), None);
+
+    // The captured initialization disables exceptions. Enabling and disabling
+    // again are valid configuration writes, not launches or completion events.
+    for raw in [0, 1, 0] {
+        let packet = packet_on_subchannel(1, 0x1528 / 4, raw);
+        let dispatch = dispatch_first(&mut channel, &packet).unwrap();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_SHADER_EXCEPTIONS"
+        );
+        assert!(dispatch.ordered_operations().is_empty());
+        let register = channel.compute().shader_exceptions_enable();
+        assert_eq!(register.origin(), MaxwellComputeRegisterOrigin::Programmed);
+        assert_eq!(register.raw(), Some(raw));
+        assert_eq!(register.value(), Some(&(raw != 0)));
+        let source = register.source().unwrap();
+        assert_eq!(source.method(), GpuMethodId(0x1528));
+        assert_eq!(source.argument(), raw);
+
+        // Existing operation snapshots must retain the configuration, including
+        // its provenance, independently of subsequent register writes.
+        let sync = packet_on_subchannel(1, 0x1698 / 4, 0x1011);
+        let snapshot = dispatch_first(&mut channel, &sync).unwrap();
+        let saved = *snapshot.compute_operations()[0]
+            .state()
+            .shader_exceptions_enable();
+        assert_eq!(saved, *channel.compute().shader_exceptions_enable());
+        let opposite = packet_on_subchannel(1, 0x1528 / 4, raw ^ 1);
+        dispatch_first(&mut channel, &opposite).unwrap();
+        assert_eq!(
+            snapshot.compute_operations()[0]
+                .state()
+                .shader_exceptions_enable(),
+            &saved
+        );
+    }
+
+    assert_eq!(channel.three_d(), &three_d_before);
+    assert_eq!(channel.two_d(), &two_d_before);
+    assert_eq!(
+        compute_channel()
+            .compute()
+            .shader_exceptions_enable()
+            .value(),
+        None
+    );
+}
+
+#[test]
+fn compute_shader_exceptions_reject_reserved_bits_without_mutation() {
+    let mut channel = compute_channel();
+    dispatch_first(&mut channel, &packet_on_subchannel(1, 0x1528 / 4, 1)).unwrap();
+    for raw in [2, 3, 0x8000_0000, u32::MAX] {
+        let before = channel.clone();
+        let packet = packet_on_subchannel(1, 0x1528 / 4, raw);
+        assert!(matches!(
+            dispatch_first(&mut channel, &packet),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                source, metadata, defined_mask: 1,
+            }) if source.method() == GpuMethodId(0x1528)
+                && source.argument() == raw
+                && metadata.method_name() == "SET_SHADER_EXCEPTIONS"
+        ));
+        assert_eq!(channel, before);
+    }
 }
 
 #[test]
@@ -3637,6 +3709,80 @@ fn compute_bindless_texture_slot_is_typed_source_preserving_and_atomic() {
 }
 
 #[test]
+fn compute_inline_pitch_completion_modes_preserve_split_transfer_state() {
+    for (raw, flush, barrier_disabled) in [
+        (0x01, false, false),
+        (0x11, true, false),
+        (0x41, false, true),
+        (0x51, true, true),
+    ] {
+        let mut channel = compute_channel();
+        let setup = incrementing_packet_on_subchannel(1, 0x0180 / 4, &[8, 1, 0, 0x0408_3000]);
+        dispatch_first(&mut channel, &setup).unwrap();
+        let launch = packet_on_subchannel(1, 0x01b0 / 4, raw);
+        let dispatch = dispatch_first(&mut channel, &launch).unwrap();
+        assert!(dispatch.ordered_operations().is_empty());
+        let inline = channel.compute().inline_to_memory();
+        assert_eq!(inline.launch().raw(), Some(raw));
+        assert_eq!(inline.launch().source().unwrap().argument(), raw);
+        let config = *inline.launch().value().unwrap();
+        assert_eq!(config.layout(), MaxwellComputeInlineToMemoryLayout::Pitch);
+        assert_eq!(config.flush_on_completion(), flush);
+        assert_eq!(config.system_memory_barrier_disabled(), barrier_disabled);
+
+        for (index, value) in [0x1122_3344, 0x5566_7788].into_iter().enumerate() {
+            let data = packet_on_subchannel(1, 0x01b4 / 4, value);
+            let dispatch = dispatch_first(&mut channel, &data).unwrap();
+            let [MaxwellEngineOperation::ComputeInlineToMemory(upload)] =
+                dispatch.ordered_operations()
+            else {
+                panic!("one inline word must emit exactly one write, not a completion signal");
+            };
+            assert_eq!(upload.address().get(), 0x0408_3000);
+            assert_eq!(upload.offset(), index as u32 * 4);
+            assert_eq!(upload.value(), value);
+            assert_eq!(upload.source().argument(), value);
+            let inline = channel.compute().inline_to_memory();
+            assert_eq!(*inline.launch().value().unwrap(), config);
+            assert_eq!(
+                inline.pending().map(|pending| pending.next_offset()),
+                if index == 0 { Some(4) } else { None }
+            );
+            if index == 0 {
+                let before = channel.compute().clone();
+                assert!(matches!(
+                    dispatch_first(&mut channel, &launch),
+                    Err(MaxwellEngineDispatchError::InvalidComputeMethodEncoding {
+                        reason: "cannot replace an incomplete inline upload",
+                        ..
+                    })
+                ));
+                assert_eq!(channel.compute(), &before);
+            }
+        }
+    }
+}
+
+#[test]
+fn compute_inline_pitch_unsupported_launch_modes_do_not_arm_transfers() {
+    let mut channel = compute_channel();
+    let setup = incrementing_packet_on_subchannel(1, 0x0180 / 4, &[4, 1, 0, 0x0408_3000]);
+    dispatch_first(&mut channel, &setup).unwrap();
+    // Block-linear, semaphore release, reserved completion selector, reduction,
+    // interrupt and semaphore structure configuration remain unsupported.
+    for raw in [0x10, 0x21, 0x31, 0x13, 0x15, 0x2011, 0x111, 0x1011] {
+        let before = channel.clone();
+        assert!(matches!(
+            dispatch_first(&mut channel, &packet_on_subchannel(1, 0x01b0 / 4, raw)),
+            Err(MaxwellEngineDispatchError::InvalidComputeMethodEncoding {
+                method_name: "LAUNCH_DMA", source, ..
+            }) if source.argument() == raw
+        ));
+        assert_eq!(channel, before);
+    }
+}
+
+#[test]
 fn compute_inline_to_memory_pitch_upload_is_typed_ordered_and_atomic() {
     let mut channel = compute_channel();
 
@@ -3772,6 +3918,54 @@ fn compute_shader_cache_invalidation_is_typed_ordered_and_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.compute(), &compute_before);
+}
+
+#[test]
+fn compute_shader_cache_invalidation_with_wfi_preserves_selectors_and_rejects_unsupported_flags() {
+    let mut channel = compute_channel();
+    let before = channel.compute().clone();
+    for raw in [0, 1, 0x10, 0x1000, 0x1011] {
+        let dispatch =
+            dispatch_first(&mut channel, &packet_on_subchannel(1, 0x021c / 4, raw)).unwrap();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "INVALIDATE_SHADER_CACHES"
+        );
+        let operation = dispatch.compute_operations()[0];
+        assert_eq!(operation.state(), &before);
+        assert_eq!(operation.trigger().source().argument(), raw);
+        let expected = MaxwellComputeShaderCacheInvalidation::new(
+            raw & 1 != 0,
+            raw & 0x10 != 0,
+            raw & 0x1000 != 0,
+        );
+        for pending in [false, true] {
+            assert_eq!(
+                lower_maxwell_compute_synchronization(operation, pending),
+                MaxwellComputeSynchronizationPlan::InvalidateShaderCaches {
+                    caches: expected,
+                    prior_work_pending: pending,
+                }
+            );
+        }
+    }
+    for (raw, detail) in [
+        (2, "shader cache lock invalidation is not implemented"),
+        (4, "shader data cache flush is not implemented"),
+    ] {
+        assert!(
+            matches!(dispatch_first(&mut channel, &packet_on_subchannel(1, 0x021c / 4, raw)),
+            Err(MaxwellEngineDispatchError::InvalidComputeMethodEncoding { reason, .. }) if reason == detail)
+        );
+    }
+    assert!(matches!(
+        dispatch_first(&mut channel, &packet_on_subchannel(1, 0x021c / 4, 8)),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue {
+            defined_mask: 0x1017,
+            ..
+        })
+    ));
+    assert_eq!(channel.compute(), &before);
 }
 
 #[test]

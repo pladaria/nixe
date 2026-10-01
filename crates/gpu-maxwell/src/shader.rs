@@ -22,17 +22,28 @@ use nixe_gpu::{
     ShaderSourceLocation, ShaderSpecialFunction, ShaderStage, ShaderTextureSampleOutput,
     ShaderVerificationError, VerifiedShaderIr,
 };
-use nixe_memory::{CanonicalBackingRange, CanonicalCpuWriteDependency, MemoryPermissions};
+use nixe_memory::{
+    CanonicalBackingRange, CanonicalCpuWriteDependency, CanonicalWriteBatch,
+    CanonicalWriteBatchError, MemoryPermissions,
+};
 
+mod compute;
 #[cfg(test)]
 mod float_control_tests;
+mod global_memory;
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "../../gpu-wgpu/test-support/hardware.rs"]
+pub(crate) mod hardware;
 mod integer;
+pub(crate) use compute::MaxwellComputeProgram;
+pub(crate) use compute::translate_compute_program;
 mod patch_address;
 mod tessellation;
 
 use crate::{
     MAXWELL_PIPELINE_SHADER_COUNT, MAXWELL_VERTEX_ATTRIBUTE_COUNT, MaxwellGpuAccessError,
-    MaxwellGpuAddressSpace, MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDShaderStage,
+    MaxwellGpuAddressSpace, MaxwellShaderStage, MaxwellThreeDDirectlyAddressableMemory,
     MaxwellThreeDState, MaxwellThreeDVertexNumericalType,
 };
 
@@ -58,10 +69,7 @@ struct MaxwellShaderExecutableRange {
 }
 
 impl MaxwellShaderExecutableRange {
-    fn new(
-        stage: MaxwellThreeDShaderStage,
-        start: u64,
-    ) -> Result<Self, MaxwellShaderTranslationError> {
+    fn new(stage: MaxwellShaderStage, start: u64) -> Result<Self, MaxwellShaderTranslationError> {
         let end = start.checked_add(MAXWELL_SHADER_READ_LIMIT as u64).ok_or(
             MaxwellShaderTranslationError::Memory {
                 stage,
@@ -93,7 +101,7 @@ pub(crate) struct MaxwellShaderProgramHeader {
     words: [u32; MAXWELL_SHADER_PROGRAM_HEADER_SIZE / 4],
     sph_type: u8,
     version: u8,
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     kills_pixels: bool,
     does_global_store: bool,
     sass_version: u8,
@@ -114,10 +122,19 @@ pub(crate) struct MaxwellShaderInstructionBundle {
 #[derive(Clone, Debug)]
 pub(crate) struct MaxwellShaderBinary {
     address: u64,
-    header: MaxwellShaderProgramHeader,
+    metadata: MaxwellShaderMetadata,
     bundles: Box<[MaxwellShaderInstructionBundle]>,
     source_cpu_writes: Box<[CanonicalCpuWriteDependency]>,
     source_mappings: Box<[crate::MaxwellGpuMapping]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MaxwellShaderMetadata {
+    Graphics(MaxwellShaderProgramHeader),
+    Compute {
+        workgroup_size: [u32; 3],
+        register_count: u8,
+    },
 }
 
 // Mapping identity and page dirty dependencies prove that the snapshot remains
@@ -125,7 +142,7 @@ pub(crate) struct MaxwellShaderBinary {
 // follows only bytes which can affect translation.
 impl PartialEq for MaxwellShaderBinary {
     fn eq(&self, other: &Self) -> bool {
-        self.header == other.header && self.bundles == other.bundles
+        self.metadata == other.metadata && self.bundles == other.bundles
     }
 }
 
@@ -133,7 +150,7 @@ impl Eq for MaxwellShaderBinary {}
 
 impl Hash for MaxwellShaderBinary {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.header.hash(state);
+        self.metadata.hash(state);
         self.bundles.hash(state);
     }
 }
@@ -327,7 +344,7 @@ impl Hash for MaxwellShaderTranslationSourceKey<'_> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct MaxwellShaderSourceProgram {
     pipeline: u8,
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     address: u64,
     register_count: u8,
     effective_group: Option<u8>,
@@ -466,12 +483,23 @@ impl MaxwellTextureResourceBinding {
 struct TranslatedShaderIr {
     ir: ShaderIr,
     texture_bindings: Box<[MaxwellTextureResourceBinding]>,
+    global_buffers: global_memory::GlobalBufferBindings,
 }
 
 impl MaxwellShaderBinary {
     #[must_use]
     const fn header(&self) -> MaxwellShaderProgramHeader {
-        self.header
+        match self.metadata {
+            MaxwellShaderMetadata::Graphics(header) => header,
+            MaxwellShaderMetadata::Compute { .. } => panic!("compute kernels have no SPH"),
+        }
+    }
+
+    const fn stage(&self) -> MaxwellShaderStage {
+        match self.metadata {
+            MaxwellShaderMetadata::Graphics(header) => header.stage,
+            MaxwellShaderMetadata::Compute { .. } => MaxwellShaderStage::Compute,
+        }
     }
 
     #[must_use]
@@ -513,7 +541,7 @@ impl MaxwellShaderProgramHeader {
 
     #[cfg(test)]
     #[must_use]
-    const fn stage(self) -> MaxwellThreeDShaderStage {
+    const fn stage(self) -> MaxwellShaderStage {
         self.stage
     }
 
@@ -540,6 +568,11 @@ impl MaxwellStagedShaderWrite {
 /// Failure before a Maxwell shader can become verified neutral shader IR.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellShaderTranslationError {
+    StagedMemory {
+        stage: MaxwellShaderStage,
+        address: u64,
+        error: CanonicalWriteBatchError,
+    },
     MissingProgramRegion,
     MissingEnabledShader,
     IncompletePipelineBinding {
@@ -554,52 +587,52 @@ pub enum MaxwellShaderTranslationError {
         limit: usize,
     },
     ReadOutsideExecutableRange {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         address: u64,
         size: usize,
     },
     Memory {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         address: u64,
         error: MaxwellGpuAccessError,
     },
     UnsupportedHeaderVersion {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         version: u8,
     },
     InvalidHeaderType {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         sph_type: u8,
     },
     HeaderStageMismatch {
-        configured: MaxwellThreeDShaderStage,
-        encoded: MaxwellThreeDShaderStage,
+        configured: MaxwellShaderStage,
+        encoded: MaxwellShaderStage,
     },
     InvalidHeaderStage {
         raw: u8,
     },
     UnsupportedSassVersion {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         version: u8,
     },
     UnsupportedInstruction {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         program_address: u64,
         instruction_offset: u32,
         encoding: u64,
     },
     MalformedInstruction {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         instruction_offset: u32,
         encoding: u64,
         reason: &'static str,
     },
     UnsupportedHeaderFeature {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         feature: &'static str,
     },
     UnsupportedSemanticDetail {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         instruction_offset: u32,
         encoding: u64,
         detail: &'static str,
@@ -613,16 +646,16 @@ pub enum MaxwellShaderTranslationError {
     },
     Verification(ShaderVerificationError),
     ProgramDoesNotExit {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         limit: usize,
     },
     SourceChangedDuringRead {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         address: u64,
     },
     ResourceBindingExhausted,
     MissingResourceBindingRemap {
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         binding: u8,
     },
 }
@@ -630,6 +663,14 @@ pub enum MaxwellShaderTranslationError {
 impl Display for MaxwellShaderTranslationError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::StagedMemory {
+                stage,
+                address,
+                error,
+            } => write!(
+                formatter,
+                "Maxwell {stage:?} staged shader memory read failed at {address:#012x}: {error}"
+            ),
             Self::MissingProgramRegion => formatter
                 .write_str("enabled Maxwell shader pipelines require SET_PROGRAM_REGION_A/B"),
             Self::MissingEnabledShader => {
@@ -759,7 +800,51 @@ impl From<ShaderVerificationError> for MaxwellShaderTranslationError {
 
 struct MaxwellShaderMemoryView<'a> {
     address_space: &'a MaxwellGpuAddressSpace,
-    staged_writes: &'a [MaxwellStagedShaderWrite],
+    staged_writes: &'a CanonicalWriteBatch,
+}
+
+// Graphics cache keys retain ordered VA writes; resolve their bytes once on a
+// translation miss. Both graphics and compute then read one canonical overlay,
+// including GPU-VA aliases, without materializing overwritten source bytes.
+fn canonical_shader_writes(
+    address_space: &MaxwellGpuAddressSpace,
+    writes: &[MaxwellStagedShaderWrite],
+    stage: MaxwellShaderStage,
+) -> Result<CanonicalWriteBatch, MaxwellShaderTranslationError> {
+    let mut batch = CanonicalWriteBatch::new();
+    for write in writes {
+        let address = write.address;
+        let memory_error = |error| MaxwellShaderTranslationError::Memory {
+            stage,
+            address,
+            error,
+        };
+        let gpu_address = address_space
+            .address(address)
+            .map_err(MaxwellGpuAccessError::Address)
+            .map_err(memory_error)?;
+        let range = address_space
+            .resolve_range(gpu_address, 4, MemoryPermissions::READ)
+            .map_err(memory_error)?;
+        let mut offset = 0;
+        let bytes = write.value.to_le_bytes();
+        for segment in range.segments() {
+            let end = offset + segment.size() as usize;
+            batch
+                .stage(
+                    segment.mapping().backing(),
+                    segment.backing_offset(),
+                    &bytes[offset..end],
+                )
+                .map_err(|error| MaxwellShaderTranslationError::StagedMemory {
+                    stage,
+                    address,
+                    error,
+                })?;
+            offset = end;
+        }
+    }
+    Ok(batch)
 }
 
 struct MaxwellShaderRead {
@@ -772,7 +857,7 @@ struct MaxwellShaderRead {
 impl<'a> MaxwellShaderMemoryView<'a> {
     const fn new(
         address_space: &'a MaxwellGpuAddressSpace,
-        staged_writes: &'a [MaxwellStagedShaderWrite],
+        staged_writes: &'a CanonicalWriteBatch,
     ) -> Self {
         Self {
             address_space,
@@ -782,7 +867,7 @@ impl<'a> MaxwellShaderMemoryView<'a> {
 
     fn read_executable(
         &self,
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         executable: MaxwellShaderExecutableRange,
         address: u64,
         size: usize,
@@ -799,7 +884,7 @@ impl<'a> MaxwellShaderMemoryView<'a> {
 
     fn read(
         &self,
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         address: u64,
         size: usize,
     ) -> Result<MaxwellShaderRead, MaxwellShaderTranslationError> {
@@ -863,62 +948,14 @@ impl<'a> MaxwellShaderMemoryView<'a> {
                 error: MaxwellGpuAccessError::Backing(error),
             }
         })?;
-        let mut bytes = cpu_writes
-            .snapshot_all(&snapshot)
-            .map_err(|error| MaxwellShaderTranslationError::Memory {
+        let mut bytes = vec![0; size];
+        self.staged_writes
+            .read_staged(&snapshot, 0, &mut bytes)
+            .map_err(|error| MaxwellShaderTranslationError::StagedMemory {
                 stage,
                 address,
-                error: MaxwellGpuAccessError::Backing(error),
-            })?
-            .into_vec();
-
-        let read_end =
-            address
-                .checked_add(size_u64)
-                .ok_or(MaxwellShaderTranslationError::Memory {
-                    stage,
-                    address,
-                    error: MaxwellGpuAccessError::ArithmeticOverflow,
-                })?;
-        for write in self.staged_writes {
-            let write_end =
-                write
-                    .address
-                    .checked_add(4)
-                    .ok_or(MaxwellShaderTranslationError::Memory {
-                        stage,
-                        address,
-                        error: MaxwellGpuAccessError::ArithmeticOverflow,
-                    })?;
-            let overlap_start = address.max(write.address);
-            let overlap_end = read_end.min(write_end);
-            if overlap_start >= overlap_end {
-                continue;
-            }
-            let source_start = usize::try_from(overlap_start - write.address).map_err(|_| {
-                MaxwellShaderTranslationError::Memory {
-                    stage,
-                    address,
-                    error: MaxwellGpuAccessError::ArithmeticOverflow,
-                }
+                error,
             })?;
-            let target_start = usize::try_from(overlap_start - address).map_err(|_| {
-                MaxwellShaderTranslationError::Memory {
-                    stage,
-                    address,
-                    error: MaxwellGpuAccessError::ArithmeticOverflow,
-                }
-            })?;
-            let length = usize::try_from(overlap_end - overlap_start).map_err(|_| {
-                MaxwellShaderTranslationError::Memory {
-                    stage,
-                    address,
-                    error: MaxwellGpuAccessError::ArithmeticOverflow,
-                }
-            })?;
-            bytes[target_start..target_start + length]
-                .copy_from_slice(&write.value.to_le_bytes()[source_start..source_start + length]);
-        }
         Ok(MaxwellShaderRead {
             bytes,
             snapshot,
@@ -942,10 +979,15 @@ fn translate_shader_binary(
     register_count: u8,
     vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
 ) -> Result<TranslatedShaderIr, MaxwellShaderTranslationError> {
-    let stage = binary.header.stage;
+    let stage = binary.stage();
     let neutral_stage = neutral_stage(stage);
-    let mut inputs = decode_header_inputs(binary.header, vertex_input_types)?;
-    let outputs = decode_header_outputs(binary.header)?;
+    let (mut inputs, outputs) = match binary.metadata {
+        MaxwellShaderMetadata::Graphics(header) => (
+            decode_header_inputs(header, vertex_input_types)?,
+            decode_header_outputs(header)?,
+        ),
+        MaxwellShaderMetadata::Compute { .. } => (Vec::new(), Vec::new()),
+    };
     let mut instructions = preload_vertex_inputs(neutral_stage, &inputs);
     let mut constant_buffer_bindings = BTreeSet::new();
     let mut texture_bindings = BTreeMap::new();
@@ -955,6 +997,9 @@ fn translate_shader_binary(
     let mut pending_range_reduction = None;
     let mut exited = false;
     let mut patch_addresses = patch_address::PatchAddresses::default();
+    let mut integer_carry = None;
+    let mut global_memory =
+        (stage == MaxwellShaderStage::Compute).then(global_memory::GlobalMemory::default);
     let code_size = u32::try_from(binary.bundles().len() * MAXWELL_SCHEDULE_BUNDLE_SIZE)
         .expect("bounded Maxwell shader code size fits u32");
 
@@ -966,6 +1011,11 @@ fn translate_shader_binary(
             let source = ShaderSourceLocation::new(offset);
             let predicate = decode_predicate(encoding);
             let translated_start = instructions.len();
+            if let Some(memory) = &mut global_memory
+                && (is_branch(encoding) || is_set_sync_point(encoding) || is_synchronize(encoding))
+            {
+                memory.observe_control_flow(offset, encoding)?;
+            }
 
             if let Some(range_reduction) = pending_range_reduction.as_ref()
                 && !is_compatible_mufu(range_reduction, encoding, predicate)
@@ -989,15 +1039,16 @@ fn translate_shader_binary(
             if is_exit(encoding) {
                 if matches!(
                     stage,
-                    MaxwellThreeDShaderStage::TessellationInit
-                        | MaxwellThreeDShaderStage::Tessellation
+                    MaxwellShaderStage::TessellationInit
+                        | MaxwellShaderStage::Tessellation
+                        | MaxwellShaderStage::Compute
                 ) && predicate != ShaderPredicate::Always
                 {
                     return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
                         stage,
                         instruction_offset: offset,
                         encoding,
-                        detail: "conditional tessellation EXIT requires complete shader control-flow discovery",
+                        detail: "conditional EXIT requires complete shader control-flow discovery",
                     });
                 }
                 append_implicit_outputs(
@@ -1088,18 +1139,30 @@ fn translate_shader_binary(
                 continue;
             }
             'instruction: {
-                let operation = if is_branch(encoding) {
+                let operation = if global_memory::is_store(encoding) {
+                    let memory = global_memory
+                        .as_mut()
+                        .ok_or_else(|| unsupported_instruction(binary, offset, encoding))?;
+                    let operations =
+                        memory.store(offset, encoding, register_count, &mut next_temporary)?;
+                    append_expanded_operations(&mut instructions, source, predicate, operations);
+                    break 'instruction;
+                } else if is_branch(encoding) {
                     ShaderOperation::Branch {
                         target: decode_shader_control_target(stage, offset, encoding, code_size)?,
                     }
                 } else if tessellation::is_system_register_read(encoding) {
-                    tessellation::decode_system_register(
-                        stage,
-                        offset,
-                        encoding,
-                        register_count,
-                        &mut inputs,
-                    )?
+                    if stage == MaxwellShaderStage::Compute {
+                        compute::system_register(offset, encoding, register_count)?
+                    } else {
+                        tessellation::decode_system_register(
+                            stage,
+                            offset,
+                            encoding,
+                            register_count,
+                            &mut inputs,
+                        )?
+                    }
                 } else if is_attribute_load(encoding) {
                     let operations = decode_attribute_load(
                         stage,
@@ -1130,7 +1193,7 @@ fn translate_shader_binary(
                     );
                     break 'instruction;
                 } else if is_attribute_store(encoding) {
-                    if stage == MaxwellThreeDShaderStage::TessellationInit {
+                    if stage == MaxwellShaderStage::TessellationInit {
                         let operations = tessellation::decode_control_store(
                             stage,
                             offset,
@@ -1261,6 +1324,14 @@ fn translate_shader_binary(
                     instructions.push(ShaderInstruction::new(source, predicate, decoded.operation));
                     break 'instruction;
                 } else if is_texture_access_simplified(encoding) {
+                    if stage == MaxwellShaderStage::Compute {
+                        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                            stage,
+                            instruction_offset: offset,
+                            encoding,
+                            detail: "compute texture binding ABI is not implemented",
+                        });
+                    }
                     decode_texture_access_simplified(
                         stage,
                         offset,
@@ -1369,17 +1440,26 @@ fn translate_shader_binary(
                     break 'instruction;
                 } else if integer::is_bitwise(encoding)
                     || integer::is_add(encoding)
+                    || integer::is_shift_add(encoding)
                     || integer::is_set_predicate(encoding)
                 {
-                    let decode = if integer::is_bitwise(encoding) {
-                        integer::decode_bitwise
-                    } else if integer::is_add(encoding) {
-                        integer::decode_add
+                    let decoded = if integer::is_add(encoding) || integer::is_shift_add(encoding) {
+                        integer::decode_add(
+                            stage,
+                            offset,
+                            encoding,
+                            register_count,
+                            &mut next_temporary,
+                            &mut integer_carry,
+                        )?
                     } else {
-                        integer::decode_set_predicate
+                        let decode = if integer::is_bitwise(encoding) {
+                            integer::decode_bitwise
+                        } else {
+                            integer::decode_set_predicate
+                        };
+                        decode(stage, offset, encoding, register_count, &mut next_temporary)?
                     };
-                    let decoded =
-                        decode(stage, offset, encoding, register_count, &mut next_temporary)?;
                     if let Some(binding) = decoded.constant_buffer_binding {
                         constant_buffer_bindings.insert(binding);
                     }
@@ -1416,6 +1496,14 @@ fn translate_shader_binary(
                 instructions.push(ShaderInstruction::new(source, predicate, operation));
             }
             patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
+            if let Some(memory) = &mut global_memory {
+                memory.observe(
+                    &mut instructions,
+                    translated_start,
+                    encoding,
+                    &mut next_temporary,
+                )?;
+            }
         }
     }
     debug_assert!(
@@ -1430,6 +1518,20 @@ fn translate_shader_binary(
                 .expect("read-only constant-buffer access is valid")
         })
         .collect::<Vec<_>>();
+    let global_buffers = global_memory
+        .map(|memory| memory.bindings)
+        .unwrap_or_default();
+    for buffer in &global_buffers.buffers {
+        resources.push(
+            ShaderResourceAccess::new(
+                buffer.binding,
+                ShaderResourceKind::StorageBuffer,
+                false,
+                true,
+            )
+            .expect("storage buffer writes are valid"),
+        );
+    }
     for binding in texture_bindings.values().copied() {
         resources.push(
             ShaderResourceAccess::new(binding.image_binding, binding.image_kind, true, false)
@@ -1447,17 +1549,21 @@ fn translate_shader_binary(
             );
         }
     }
-    if stage == MaxwellThreeDShaderStage::TessellationInit {
+    if stage == MaxwellShaderStage::TessellationInit {
         tessellation::order_patch_outputs(&mut instructions);
     }
-    let ir = ShaderIr::new(neutral_stage, inputs, outputs, resources, instructions)
+    let mut ir = ShaderIr::new(neutral_stage, inputs, outputs, resources, instructions)
         .with_tessellation_control_points(
-            (stage == MaxwellThreeDShaderStage::TessellationInit)
-                .then(|| binary.header.bits(88, 8) as u32),
+            (stage == MaxwellShaderStage::TessellationInit)
+                .then(|| binary.header().bits(88, 8) as u32),
         );
+    if let MaxwellShaderMetadata::Compute { workgroup_size, .. } = binary.metadata {
+        ir = ir.with_workgroup_size(workgroup_size);
+    }
     Ok(TranslatedShaderIr {
         ir,
         texture_bindings: texture_bindings.values().copied().collect(),
+        global_buffers,
     })
 }
 
@@ -1486,15 +1592,16 @@ fn append_expanded_operations(
     );
 }
 
-fn neutral_stage(stage: MaxwellThreeDShaderStage) -> ShaderStage {
+fn neutral_stage(stage: MaxwellShaderStage) -> ShaderStage {
     match stage {
-        MaxwellThreeDShaderStage::Vertex | MaxwellThreeDShaderStage::VertexCullBeforeFetch => {
+        MaxwellShaderStage::Vertex | MaxwellShaderStage::VertexCullBeforeFetch => {
             ShaderStage::Vertex
         }
-        MaxwellThreeDShaderStage::TessellationInit => ShaderStage::TessellationControl,
-        MaxwellThreeDShaderStage::Tessellation => ShaderStage::TessellationEvaluation,
-        MaxwellThreeDShaderStage::Geometry => ShaderStage::Geometry,
-        MaxwellThreeDShaderStage::Pixel => ShaderStage::Fragment,
+        MaxwellShaderStage::TessellationInit => ShaderStage::TessellationControl,
+        MaxwellShaderStage::Tessellation => ShaderStage::TessellationEvaluation,
+        MaxwellShaderStage::Geometry => ShaderStage::Geometry,
+        MaxwellShaderStage::Pixel => ShaderStage::Fragment,
+        MaxwellShaderStage::Compute => ShaderStage::Compute,
     }
 }
 
@@ -1503,7 +1610,7 @@ fn decode_header_inputs(
     vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
 ) -> Result<Vec<ShaderInterfaceElement>, MaxwellShaderTranslationError> {
     let mut inputs = Vec::new();
-    if header.stage == MaxwellThreeDShaderStage::Pixel {
+    if header.stage == MaxwellShaderStage::Pixel {
         for component in 0..4_u8 {
             if header.bit(188 + component as usize) {
                 inputs.push(interface_element(
@@ -1568,7 +1675,7 @@ fn decode_header_outputs(
     header: MaxwellShaderProgramHeader,
 ) -> Result<Vec<ShaderInterfaceElement>, MaxwellShaderTranslationError> {
     let mut outputs = Vec::new();
-    if header.stage == MaxwellThreeDShaderStage::Pixel {
+    if header.stage == MaxwellShaderStage::Pixel {
         for target in 0..8_u8 {
             for component in 0..4_u8 {
                 if header.bit(576 + target as usize * 4 + component as usize) {
@@ -1717,7 +1824,7 @@ fn append_implicit_outputs(
             }
             ShaderIoLocation::FragmentDepth | ShaderIoLocation::SampleMask => {
                 return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-                    stage: MaxwellThreeDShaderStage::Pixel,
+                    stage: MaxwellShaderStage::Pixel,
                     instruction_offset: source.byte_offset(),
                     encoding: 0,
                     detail: "implicit depth or sample-mask output register mapping",
@@ -1725,7 +1832,7 @@ fn append_implicit_outputs(
             }
             _ => {
                 return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-                    stage: MaxwellThreeDShaderStage::Pixel,
+                    stage: MaxwellShaderStage::Pixel,
                     instruction_offset: source.byte_offset(),
                     encoding: 0,
                     detail: "implicit system-value output register mapping",
@@ -1839,7 +1946,10 @@ const fn is_range_reduction(encoding: u64) -> bool {
 
 const fn is_float_multiply(encoding: u64) -> bool {
     let opcode = (encoding >> 48) as u16;
-    opcode & 0xfffa == 0x5c68 || opcode & 0xfffa == 0x4c68 || opcode & 0xfefa == 0x3868
+    opcode & 0xfffa == 0x5c68
+        || opcode & 0xfffa == 0x4c68
+        || opcode & 0xfefa == 0x3868
+        || encoding >> 56 == 0x1e
 }
 
 const fn is_float_min_max(encoding: u64) -> bool {
@@ -1871,6 +1981,7 @@ const fn is_texture_access_simplified(encoding: u64) -> bool {
 
 const fn is_supported_family(encoding: u64) -> bool {
     is_exit(encoding)
+        || global_memory::is_store(encoding)
         || tessellation::is_system_register_read(encoding)
         || is_branch(encoding)
         || is_set_sync_point(encoding)
@@ -1896,11 +2007,12 @@ const fn is_supported_family(encoding: u64) -> bool {
         || integer::is_set_predicate(encoding)
         || integer::is_bitwise(encoding)
         || integer::is_add(encoding)
+        || integer::is_shift_add(encoding)
         || patch_address::is_supported_family(encoding)
 }
 
 fn decode_texture_access_simplified(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -1923,7 +2035,7 @@ fn decode_texture_access_simplified(
             detail: "TLDS mode other than F32 2D level-zero without offsets",
         });
     }
-    if !fetch && (stage != MaxwellThreeDShaderStage::Pixel || !matches!(selector, 1 | 7)) {
+    if !fetch && (stage != MaxwellShaderStage::Pixel || !matches!(selector, 1 | 7)) {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
@@ -2099,7 +2211,7 @@ fn decode_texture_access_simplified(
 }
 
 fn decode_shader_control_target(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     code_size: u32,
@@ -2177,7 +2289,7 @@ struct DecodedFloatToInteger {
 }
 
 fn decode_float_to_integer(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -2309,7 +2421,7 @@ fn decode_float_to_integer(
 }
 
 fn decode_float_to_float(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -2441,12 +2553,20 @@ fn decode_float_to_float(
 }
 
 fn decode_integer_to_float(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
     next_temporary: &mut u16,
 ) -> Result<DecodedIntegerToFloat, MaxwellShaderTranslationError> {
+    if encoding & (1 << 47) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "I2F condition-code output",
+        });
+    }
     // Operand forms and type/modifier fields follow Mesa NAK's pinned SM50
     // I2F encoder:
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L1842-L1880
@@ -2563,7 +2683,7 @@ struct DecodedConstantBufferLoad {
 }
 
 fn decode_constant_buffer_load(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -2614,7 +2734,7 @@ fn decode_constant_buffer_load(
 }
 
 fn decode_shift_left(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -2734,7 +2854,7 @@ struct PendingRangeReduction {
 }
 
 fn decode_float_multiply(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -2746,8 +2866,21 @@ fn decode_float_multiply(
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/a3fcccb47bfbaf49a5d1ffa56547973462e70ab0/src/nouveau/compiler/nak/from_nir.rs
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul
-    let dnz = encoding & (1 << 45) != 0;
-    let ftz = encoding & (1 << 44) != 0;
+    // FMUL32I carries every immediate bit at 20..51 and moves the modifier
+    // fields above it. Negation is encoded in the immediate's sign bit; there
+    // is no rounding or PDIV field in this form.
+    // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp (emitFMUL)
+    let full_immediate = encoding >> 56 == 0x1e;
+    let dnz = encoding & (1 << if full_immediate { 54 } else { 45 }) != 0;
+    let ftz = encoding & (1 << if full_immediate { 53 } else { 44 }) != 0;
+    if encoding & (1 << if full_immediate { 52 } else { 47 }) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "FMUL condition-code write",
+        });
+    }
     if dnz && ftz {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
@@ -2760,7 +2893,7 @@ fn decode_float_multiply(
     let left = ((encoding >> 8) & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
     validate_register_range(stage, offset, encoding, left, 1, register_count)?;
-    if (encoding >> 41) & 0x7 != 0 {
+    if !full_immediate && (encoding >> 41) & 0x7 != 0 {
         return Err(malformed(
             stage,
             offset,
@@ -2768,7 +2901,7 @@ fn decode_float_multiply(
             "FMUL encodes reserved PDIV bits",
         ));
     }
-    if encoding & (1 << 48) != 0 {
+    if !full_immediate && encoding & (1 << 48) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
@@ -2776,7 +2909,7 @@ fn decode_float_multiply(
             detail: "FMUL source negation",
         });
     }
-    if encoding & (1 << 50) != 0 {
+    if encoding & (1 << if full_immediate { 55 } else { 50 }) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
@@ -2784,7 +2917,11 @@ fn decode_float_multiply(
             detail: "FMUL saturation",
         });
     }
-    let rounding = match (encoding >> 39) & 0x3 {
+    let rounding = match if full_immediate {
+        0
+    } else {
+        (encoding >> 39) & 0x3
+    } {
         0 => ShaderRoundingMode::NearestEven,
         1 => ShaderRoundingMode::TowardNegative,
         2 => ShaderRoundingMode::TowardPositive,
@@ -2828,12 +2965,16 @@ fn decode_float_multiply(
                 Some(binding),
             )
         } else {
-            let bits = ((((encoding >> 20) & 0x7ffff) as u32) << 12)
-                | if encoding & (1 << 56) != 0 {
-                    1 << 31
-                } else {
-                    0
-                };
+            let bits = if full_immediate {
+                (encoding >> 20) as u32
+            } else {
+                ((((encoding >> 20) & 0x7ffff) as u32) << 12)
+                    | if encoding & (1 << 56) != 0 {
+                        1 << 31
+                    } else {
+                        0
+                    }
+            };
             (
                 temporary,
                 Some(ShaderOperation::MoveImmediate32 {
@@ -2872,7 +3013,7 @@ fn decode_float_multiply(
 }
 
 fn decode_float_min_max(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -2984,12 +3125,20 @@ fn decode_float_min_max(
 }
 
 fn decode_float_add(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
     next_temporary: &mut u16,
 ) -> Result<DecodedFloatAdd, MaxwellShaderTranslationError> {
+    if encoding & (1 << 47) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "FADD condition-code output",
+        });
+    }
     let destination = (encoding & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
     if encoding & (1 << 50) != 0 {
@@ -3101,7 +3250,7 @@ fn decode_float_add(
 }
 
 fn decode_float_set_predicate(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -3252,7 +3401,7 @@ fn decode_float_set_predicate(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_float_register_source(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     raw: u8,
@@ -3294,7 +3443,7 @@ fn prepare_float_register_source(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_float_source_modifiers(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     mut source: ShaderRegister,
@@ -3335,12 +3484,22 @@ fn apply_float_source_modifiers(
 }
 
 fn decode_float_fused_multiply_add(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
     next_temporary: &mut u16,
 ) -> Result<DecodedFloatFusedMultiplyAdd, MaxwellShaderTranslationError> {
+    // A floating CC write must not leave a preceding integer carry live.
+    // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp (emitFFMA)
+    if encoding & (1 << 47) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "FFMA condition-code output",
+        });
+    }
     // FTZ flushes all three inputs and the fused result. DNZ is a different
     // multiplication mode, not the IR's independent denormals-are-zero flag.
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-fma
@@ -3526,7 +3685,7 @@ fn decode_float_fused_multiply_add(
 }
 
 fn allocate_shader_temporary(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     detail: &'static str,
@@ -3541,7 +3700,7 @@ fn allocate_shader_temporary(
 }
 
 fn decode_attribute_load(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -3549,7 +3708,7 @@ fn decode_attribute_load(
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     if matches!(
         stage,
-        MaxwellThreeDShaderStage::TessellationInit | MaxwellThreeDShaderStage::Tessellation
+        MaxwellShaderStage::TessellationInit | MaxwellShaderStage::Tessellation
     ) {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
@@ -3623,7 +3782,7 @@ fn decode_attribute_load(
 }
 
 fn input_attribute_location(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     address: u16,
@@ -3639,7 +3798,7 @@ fn input_attribute_location(
     if let Some(location) = system_value {
         if !matches!(
             stage,
-            MaxwellThreeDShaderStage::Vertex | MaxwellThreeDShaderStage::VertexCullBeforeFetch
+            MaxwellShaderStage::Vertex | MaxwellShaderStage::VertexCullBeforeFetch
         ) {
             return Err(malformed(
                 stage,
@@ -3656,7 +3815,7 @@ fn input_attribute_location(
 }
 
 fn decode_attribute_store(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -3702,7 +3861,7 @@ fn decode_attribute_store(
 }
 
 fn decode_move_immediate(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -3725,7 +3884,7 @@ fn decode_move_immediate(
 }
 
 fn decode_move(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -3795,13 +3954,13 @@ fn decode_move(
 }
 
 fn decode_interpolate(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
     inputs: &[ShaderInterfaceElement],
 ) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
-    if stage != MaxwellThreeDShaderStage::Pixel {
+    if stage != MaxwellShaderStage::Pixel {
         return Err(malformed(
             stage,
             offset,
@@ -3922,7 +4081,7 @@ fn decode_interpolate(
 }
 
 fn decode_range_reduction(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     predicate: ShaderPredicate,
@@ -4038,7 +4197,7 @@ fn is_compatible_mufu(
 }
 
 fn decode_range_reduced_mufu(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -4076,7 +4235,7 @@ fn decode_range_reduced_mufu(
 }
 
 fn decode_mufu(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
@@ -4145,7 +4304,7 @@ fn decode_mufu(
 }
 
 fn validate_register_range(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     first: u8,
@@ -4168,7 +4327,7 @@ fn validate_register_range(
 }
 
 fn attribute_location(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     address: u16,
@@ -4192,7 +4351,7 @@ fn attribute_location(
 }
 
 const fn malformed(
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     instruction_offset: u32,
     encoding: u64,
     reason: &'static str,
@@ -4211,7 +4370,7 @@ fn unsupported_instruction(
     encoding: u64,
 ) -> MaxwellShaderTranslationError {
     MaxwellShaderTranslationError::UnsupportedInstruction {
-        stage: binary.header.stage,
+        stage: binary.stage(),
         program_address: binary.address,
         instruction_offset,
         encoding,
@@ -4298,7 +4457,13 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
     address_space: &MaxwellGpuAddressSpace,
 ) -> Result<MaxwellShaderTranslationInputs, MaxwellShaderTranslationError> {
     let mapping_generation = address_space.mapping_generation();
-    let memory = MaxwellShaderMemoryView::new(address_space, &source.staged_writes);
+    let stage = source
+        .programs
+        .first()
+        .ok_or(MaxwellShaderTranslationError::MissingEnabledShader)?
+        .stage;
+    let staged = canonical_shader_writes(address_space, &source.staged_writes, stage)?;
+    let memory = MaxwellShaderMemoryView::new(address_space, &staged);
     let mut programs = Vec::with_capacity(source.programs.len());
     for program in &source.programs {
         let binary = read_shader_binary(&memory, program.stage, program.address)?;
@@ -4370,7 +4535,7 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
         });
     let mut programs = Vec::with_capacity(translated.len());
     for (input, mut translated) in inputs.programs.iter().zip(translated) {
-        let stage = input.binary.header.stage;
+        let stage = input.binary.stage();
         let local_bindings = program_resource_bindings(input, &translated, &global_bindings)?;
         for texture in &mut translated.texture_bindings {
             texture.image_binding =
@@ -4532,7 +4697,7 @@ fn program_resource_bindings(
                 .get(&(group, resource.kind(), resource.binding()))
                 .copied()
                 .ok_or(MaxwellShaderTranslationError::MissingResourceBindingRemap {
-                    stage: input.binary.header.stage,
+                    stage: input.binary.stage(),
                     binding: resource.binding(),
                 })
                 .map(|binding| (resource.binding(), binding))
@@ -4542,7 +4707,7 @@ fn program_resource_bindings(
 
 fn finalize_shader_ir(
     ir: ShaderIr,
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     bindings: &BTreeMap<u8, u8>,
     output_interpolation: &[((ShaderIoLocation, u8), ShaderInterpolation)],
 ) -> Result<VerifiedShaderIr, MaxwellShaderTranslationError> {
@@ -4667,7 +4832,7 @@ fn finalize_shader_ir(
 
 fn remapped_binding(
     bindings: &BTreeMap<u8, u8>,
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     binding: u8,
 ) -> Result<u8, MaxwellShaderTranslationError> {
     bindings
@@ -4712,7 +4877,7 @@ fn validate_graphics_stage_interfaces(
 
 fn read_shader_binary(
     memory: &MaxwellShaderMemoryView<'_>,
-    stage: MaxwellThreeDShaderStage,
+    stage: MaxwellShaderStage,
     address: u64,
 ) -> Result<MaxwellShaderBinary, MaxwellShaderTranslationError> {
     let executable = MaxwellShaderExecutableRange::new(stage, address)?;
@@ -4723,24 +4888,47 @@ fn read_shader_binary(
         MAXWELL_SHADER_PROGRAM_HEADER_SIZE,
     )?;
     let header = decode_program_header(&header_read.bytes)?;
+    read_shader_code(
+        memory,
+        stage,
+        address,
+        MaxwellShaderMetadata::Graphics(header),
+        Some(header_read),
+    )
+}
+
+fn read_shader_code(
+    memory: &MaxwellShaderMemoryView<'_>,
+    stage: MaxwellShaderStage,
+    address: u64,
+    metadata: MaxwellShaderMetadata,
+    header_read: Option<MaxwellShaderRead>,
+) -> Result<MaxwellShaderBinary, MaxwellShaderTranslationError> {
+    let executable = MaxwellShaderExecutableRange::new(stage, address)?;
     let mut source_pages = BTreeSet::new();
     let mut source_cpu_writes = Vec::new();
     let mut source_mappings = BTreeMap::new();
-    retain_shader_read_evidence(
-        &header_read,
-        &mut source_pages,
-        &mut source_cpu_writes,
-        &mut source_mappings,
-    );
+    let header_size = if let Some(header_read) = header_read {
+        retain_shader_read_evidence(
+            &header_read,
+            &mut source_pages,
+            &mut source_cpu_writes,
+            &mut source_mappings,
+        );
+        MAXWELL_SHADER_PROGRAM_HEADER_SIZE
+    } else {
+        0
+    };
     let mut bundles = Vec::new();
-    let code_address = address
-        .checked_add(MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64)
-        .ok_or(MaxwellShaderTranslationError::Memory {
-            stage,
-            address,
-            error: MaxwellGpuAccessError::ArithmeticOverflow,
-        })?;
-    let max_code_bytes = MAXWELL_SHADER_READ_LIMIT - MAXWELL_SHADER_PROGRAM_HEADER_SIZE;
+    let code_address =
+        address
+            .checked_add(header_size as u64)
+            .ok_or(MaxwellShaderTranslationError::Memory {
+                stage,
+                address,
+                error: MaxwellGpuAccessError::ArithmeticOverflow,
+            })?;
+    let max_code_bytes = MAXWELL_SHADER_READ_LIMIT - header_size;
 
     for bundle_offset in (0..max_code_bytes).step_by(MAXWELL_SCHEDULE_BUNDLE_SIZE) {
         let bundle_address = code_address.checked_add(bundle_offset as u64).ok_or(
@@ -4789,7 +4977,7 @@ fn read_shader_binary(
             }
             return Ok(MaxwellShaderBinary {
                 address,
-                header,
+                metadata,
                 bundles: bundles.into_boxed_slice(),
                 source_cpu_writes: source_cpu_writes.into_boxed_slice(),
                 source_mappings: source_mappings.into_values().collect(),
@@ -4833,11 +5021,11 @@ fn decode_program_header(
     let common = words[0];
     let raw_stage = ((common >> 10) & 0xf) as u8;
     let stage = match raw_stage {
-        1 => MaxwellThreeDShaderStage::Vertex,
-        2 => MaxwellThreeDShaderStage::TessellationInit,
-        3 => MaxwellThreeDShaderStage::Tessellation,
-        4 => MaxwellThreeDShaderStage::Geometry,
-        5 => MaxwellThreeDShaderStage::Pixel,
+        1 => MaxwellShaderStage::Vertex,
+        2 => MaxwellShaderStage::TessellationInit,
+        3 => MaxwellShaderStage::Tessellation,
+        4 => MaxwellShaderStage::Geometry,
+        5 => MaxwellShaderStage::Pixel,
         raw => return Err(MaxwellShaderTranslationError::InvalidHeaderStage { raw }),
     };
     Ok(MaxwellShaderProgramHeader {
@@ -4855,7 +5043,7 @@ fn decode_program_header(
 }
 
 fn validate_program_header(
-    configured_stage: MaxwellThreeDShaderStage,
+    configured_stage: MaxwellShaderStage,
     header: MaxwellShaderProgramHeader,
 ) -> Result<(), MaxwellShaderTranslationError> {
     if header.version != 3 {
@@ -4864,7 +5052,7 @@ fn validate_program_header(
             version: header.version,
         });
     }
-    let required_type = if configured_stage == MaxwellThreeDShaderStage::Pixel {
+    let required_type = if configured_stage == MaxwellShaderStage::Pixel {
         2
     } else {
         1
@@ -4922,8 +5110,8 @@ mod tests {
     use crate::{
         MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
         MaxwellChannelId, MaxwellChannelOwner, MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace,
-        MaxwellGpuChannel, MaxwellMapRequest, MaxwellMappingId, MaxwellPushbufferWord,
-        MaxwellThreeDLoweringCache, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
+        MaxwellGpuChannel, MaxwellLoweringCache, MaxwellMapRequest, MaxwellMappingId,
+        MaxwellPushbufferWord, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
     };
 
     fn translate_maxwell_shader_programs(
@@ -4944,7 +5132,7 @@ mod tests {
         translate_maxwell_shader_programs(state, address_space, staged_writes).map(|_| ())
     }
 
-    fn mapped_memory() -> (CanonicalAllocation, MaxwellGpuAddressSpace, u64) {
+    pub(super) fn mapped_memory() -> (CanonicalAllocation, MaxwellGpuAddressSpace, u64) {
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         let mut address_space =
             MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
@@ -4993,7 +5181,7 @@ mod tests {
     }
 
     fn translated_fixture(
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         header_words: [u32; 20],
         code_words: &[u64],
     ) -> VerifiedShaderIr {
@@ -5001,7 +5189,7 @@ mod tests {
     }
 
     fn translated_fixture_with_register_count(
-        stage: MaxwellThreeDShaderStage,
+        stage: MaxwellShaderStage,
         header_words: [u32; 20],
         code_words: &[u64],
         register_count: u8,
@@ -5013,7 +5201,8 @@ mod tests {
             .collect::<Vec<_>>();
         bytes.extend(code_words.iter().flat_map(|word| word.to_le_bytes()));
         allocation.write(0, &bytes).unwrap();
-        let memory = MaxwellShaderMemoryView::new(&address_space, &[]);
+        let writes = CanonicalWriteBatch::new();
+        let memory = MaxwellShaderMemoryView::new(&address_space, &writes);
         let binary = read_shader_binary(&memory, stage, address).unwrap();
         validate_program_header(stage, binary.header()).unwrap();
         VerifiedShaderIr::verify(
@@ -5024,7 +5213,7 @@ mod tests {
         .unwrap()
     }
 
-    fn validate_wgsl(module: &nixe_gpu::WgslShaderModule) {
+    pub(super) fn validate_wgsl(module: &nixe_gpu::WgslShaderModule) {
         let parsed = naga::front::wgsl::parse_str(module.source()).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -5044,8 +5233,10 @@ mod tests {
             MaxwellStagedShaderWrite::new(address + 2, 0xaabb_ccdd),
             MaxwellStagedShaderWrite::new(address + 4, 0x1122_3344),
         ];
+        let writes =
+            canonical_shader_writes(&address_space, &writes, MaxwellShaderStage::Vertex).unwrap();
         let bytes = MaxwellShaderMemoryView::new(&address_space, &writes)
-            .read(MaxwellThreeDShaderStage::Vertex, address, 8)
+            .read(MaxwellShaderStage::Vertex, address, 8)
             .unwrap()
             .bytes;
 
@@ -5062,18 +5253,18 @@ mod tests {
         let decoded = decode_program_header(&vertex).unwrap();
         assert_eq!(decoded.sph_type(), 1);
         assert_eq!(decoded.version(), 3);
-        assert_eq!(decoded.stage(), MaxwellThreeDShaderStage::Vertex);
+        assert_eq!(decoded.stage(), MaxwellShaderStage::Vertex);
         assert_eq!(decoded.sass_version(), 1);
-        validate_program_header(MaxwellThreeDShaderStage::Vertex, decoded).unwrap();
+        validate_program_header(MaxwellShaderStage::Vertex, decoded).unwrap();
 
         let mut pixel = [0_u8; MAXWELL_SHADER_PROGRAM_HEADER_SIZE];
         pixel[..4].copy_from_slice(&0x0002_5462_u32.to_le_bytes());
         let decoded = decode_program_header(&pixel).unwrap();
         assert_eq!(decoded.sph_type(), 2);
         assert_eq!(decoded.version(), 3);
-        assert_eq!(decoded.stage(), MaxwellThreeDShaderStage::Pixel);
+        assert_eq!(decoded.stage(), MaxwellShaderStage::Pixel);
         assert_eq!(decoded.sass_version(), 1);
-        validate_program_header(MaxwellThreeDShaderStage::Pixel, decoded).unwrap();
+        validate_program_header(MaxwellShaderStage::Pixel, decoded).unwrap();
     }
 
     #[test]
@@ -5087,13 +5278,9 @@ mod tests {
         version_three_header[0] = 0x0006_0461;
         let code = [0x0100_0000_0077_f000, 0xe300_0000_0007_000f];
 
-        let version_one =
-            translated_fixture(MaxwellThreeDShaderStage::Vertex, version_one_header, &code);
-        let version_three = translated_fixture(
-            MaxwellThreeDShaderStage::Vertex,
-            version_three_header,
-            &code,
-        );
+        let version_one = translated_fixture(MaxwellShaderStage::Vertex, version_one_header, &code);
+        let version_three =
+            translated_fixture(MaxwellShaderStage::Vertex, version_three_header, &code);
 
         assert_eq!(version_three, version_one);
     }
@@ -5108,7 +5295,7 @@ mod tests {
             (0xefd8_7f80_2fc7_ff00, ShaderIoLocation::VertexId),
         ] {
             let translated = translated_fixture(
-                MaxwellThreeDShaderStage::Vertex,
+                MaxwellShaderStage::Vertex,
                 header,
                 &[0, encoding, 0xe300_0000_0007_000f, 0],
             );
@@ -5138,7 +5325,7 @@ mod tests {
         header[0] = 0x0006_0461;
         header[13] = 0x0000_1000;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -5172,7 +5359,7 @@ mod tests {
         header[0] = 0x0006_0461;
         header[13] = 0x0000_1000;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -5205,7 +5392,7 @@ mod tests {
         header[0] = 0x0006_0461;
         header[13] = 0x0000_1000;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -5246,7 +5433,7 @@ mod tests {
                 let encoding =
                     0x5cb0_0000_0037_0802 | (width_field << 8) | (rounding_field << 39) | (1 << 12);
                 let decoded = decode_float_to_integer(
-                    MaxwellThreeDShaderStage::Vertex,
+                    MaxwellShaderStage::Vertex,
                     16,
                     encoding,
                     8,
@@ -5267,7 +5454,7 @@ mod tests {
 
         let mut next_temporary = 8;
         let constant = decode_float_to_integer(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             0x4cb0_0088_0037_0902,
             8,
@@ -5301,7 +5488,7 @@ mod tests {
         ] {
             let mut next_temporary = 8;
             let decoded = decode_float_to_float(
-                MaxwellThreeDShaderStage::Vertex,
+                MaxwellShaderStage::Vertex,
                 16,
                 0x5ca8_0400_0037_0a02 | (field << 39),
                 8,
@@ -5322,7 +5509,7 @@ mod tests {
 
         let mut next_temporary = 8;
         let constant = decode_float_to_float(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             0x4ca8_0488_0037_0a02,
             8,
@@ -5350,7 +5537,7 @@ mod tests {
     fn integer_to_float_decodes_register_immediate_and_constant_buffer_forms() {
         let mut next_temporary = 8;
         let register = decode_integer_to_float(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             0x5cb8_0000_0037_0a02,
             8,
@@ -5368,7 +5555,7 @@ mod tests {
         ));
 
         let immediate = decode_integer_to_float(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             0x39b8_0000_0037_2a02,
             8,
@@ -5392,7 +5579,7 @@ mod tests {
         ));
 
         let constant = decode_integer_to_float(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             0x4cb8_0008_0037_0a02,
             8,
@@ -5427,7 +5614,7 @@ mod tests {
             let mut next_temporary = 8;
             assert!(matches!(
                 decode_integer_to_float(
-                    MaxwellThreeDShaderStage::Vertex,
+                    MaxwellShaderStage::Vertex,
                     16,
                     0x5cb8_0000_0037_0a02 | modifier,
                     8,
@@ -5449,7 +5636,7 @@ mod tests {
             let mut next_temporary = 8;
             assert!(matches!(
                 decode_integer_to_float(
-                    MaxwellThreeDShaderStage::Vertex,
+                    MaxwellShaderStage::Vertex,
                     16,
                     encoding,
                     8,
@@ -5469,7 +5656,7 @@ mod tests {
         header[0] = 0x0006_0461;
         header[13] = 0x0000_8000;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -5501,7 +5688,7 @@ mod tests {
         header[0] = 0x0006_0461;
         header[13] = 0x0000_8000;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -5527,7 +5714,7 @@ mod tests {
         header[0] = 0x0006_0461;
         header[13] = 0x0000_8000;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -5561,7 +5748,7 @@ mod tests {
         header[0] = 0x0006_0461;
         header[13] = 0x0000_8000;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -5598,7 +5785,7 @@ mod tests {
         header[0] = 0x0006_0461;
         header[13] = 0x0000_8000;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -5640,7 +5827,7 @@ mod tests {
         let captured = 0xef94_0010_0307_0700_u64;
         assert!(matches!(
             decode_constant_buffer_load(
-                MaxwellThreeDShaderStage::Vertex,
+                MaxwellShaderStage::Vertex,
                 24,
                 (captured & !(0x7 << 48)) | (0x2 << 48),
                 8,
@@ -5651,12 +5838,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            decode_constant_buffer_load(
-                MaxwellThreeDShaderStage::Vertex,
-                24,
-                captured | (1 << 44),
-                8,
-            ),
+            decode_constant_buffer_load(MaxwellShaderStage::Vertex, 24, captured | (1 << 44), 8,),
             Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
                 detail: "LDC addressing mode other than indexed",
                 ..
@@ -5668,7 +5850,7 @@ mod tests {
     fn shift_left_decodes_register_immediate_and_constant_buffer_forms() {
         let mut next_temporary = 16;
         let register = decode_shift_left(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             0x5c48_0080_0017_0002,
             16,
@@ -5687,7 +5869,7 @@ mod tests {
         ));
 
         let immediate = decode_shift_left(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             0x3948_0000_0037_0002,
             16,
@@ -5706,7 +5888,7 @@ mod tests {
         ));
 
         let constant = decode_shift_left(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             0x4c48_0008_0037_0002,
             16,
@@ -5737,7 +5919,7 @@ mod tests {
             let mut next_temporary = 16;
             assert!(matches!(
                 decode_shift_left(
-                    MaxwellThreeDShaderStage::Vertex,
+                    MaxwellShaderStage::Vertex,
                     8,
                     0x3848_0000_0047_0002 | modifier,
                     16,
@@ -5754,7 +5936,7 @@ mod tests {
     #[test]
     fn vertex_system_value_ald_spans_adjacent_instance_and_vertex_id_slots() {
         let operations = decode_attribute_load(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             0xefd8_ff80_2f87_ff00,
             4,
@@ -5780,7 +5962,7 @@ mod tests {
         ));
         assert!(matches!(
             decode_attribute_load(
-                MaxwellThreeDShaderStage::Pixel,
+                MaxwellShaderStage::Pixel,
                 8,
                 0xefd8_7f80_2fc7_ff00,
                 4,
@@ -5796,7 +5978,7 @@ mod tests {
     #[test]
     fn attribute_load_spans_generic_vectors_without_losing_register_order() {
         let operations = decode_attribute_load(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             0xefd8_ff80_08c7_ff02,
             8,
@@ -5831,9 +6013,9 @@ mod tests {
             let header = decode_program_header(&bytes).unwrap();
 
             assert_eq!(
-                validate_program_header(MaxwellThreeDShaderStage::Vertex, header),
+                validate_program_header(MaxwellShaderStage::Vertex, header),
                 Err(MaxwellShaderTranslationError::UnsupportedSassVersion {
-                    stage: MaxwellThreeDShaderStage::Vertex,
+                    stage: MaxwellShaderStage::Vertex,
                     version: version as u8,
                 })
             );
@@ -5846,9 +6028,9 @@ mod tests {
         bytes[..4].copy_from_slice(&0x0002_0461_u32.to_le_bytes());
         let header = decode_program_header(&bytes).unwrap();
         assert_eq!(
-            validate_program_header(MaxwellThreeDShaderStage::Pixel, header),
+            validate_program_header(MaxwellShaderStage::Pixel, header),
             Err(MaxwellShaderTranslationError::InvalidHeaderType {
-                stage: MaxwellThreeDShaderStage::Pixel,
+                stage: MaxwellShaderStage::Pixel,
                 sph_type: 1,
             })
         );
@@ -5868,9 +6050,9 @@ mod tests {
             bytes[..4].copy_from_slice(&common.to_le_bytes());
             let header = decode_program_header(&bytes).unwrap();
             assert_eq!(
-                validate_program_header(MaxwellThreeDShaderStage::Pixel, header),
+                validate_program_header(MaxwellShaderStage::Pixel, header),
                 Err(MaxwellShaderTranslationError::UnsupportedHeaderFeature {
-                    stage: MaxwellThreeDShaderStage::Pixel,
+                    stage: MaxwellShaderStage::Pixel,
                     feature,
                 })
             );
@@ -5881,8 +6063,8 @@ mod tests {
     fn shader_reads_are_bounded_before_address_space_access() {
         let (_, address_space, address) = mapped_memory();
         assert!(matches!(
-            MaxwellShaderMemoryView::new(&address_space, &[]).read(
-                MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderMemoryView::new(&address_space, &CanonicalWriteBatch::new()).read(
+                MaxwellShaderStage::Vertex,
                 address,
                 MAXWELL_SHADER_READ_LIMIT + 1,
             ),
@@ -5895,18 +6077,19 @@ mod tests {
     #[test]
     fn shader_fetches_cannot_escape_the_bound_executable_program_range() {
         let (_, address_space, address) = mapped_memory();
-        let memory = MaxwellShaderMemoryView::new(&address_space, &[]);
+        let writes = CanonicalWriteBatch::new();
+        let memory = MaxwellShaderMemoryView::new(&address_space, &writes);
         let executable =
-            MaxwellShaderExecutableRange::new(MaxwellThreeDShaderStage::Vertex, address).unwrap();
+            MaxwellShaderExecutableRange::new(MaxwellShaderStage::Vertex, address).unwrap();
         assert!(matches!(
             memory.read_executable(
-                MaxwellThreeDShaderStage::Vertex,
+                MaxwellShaderStage::Vertex,
                 executable,
                 address + MAXWELL_SHADER_READ_LIMIT as u64 - 4,
                 8,
             ),
             Err(MaxwellShaderTranslationError::ReadOutsideExecutableRange {
-                stage: MaxwellThreeDShaderStage::Vertex,
+                stage: MaxwellShaderStage::Vertex,
                 size: 8,
                 ..
             })
@@ -5944,7 +6127,7 @@ mod tests {
         assert_eq!(
             preflight_maxwell_shader_translation(channel.three_d(), &address_space, &writes),
             Err(MaxwellShaderTranslationError::UnsupportedInstruction {
-                stage: MaxwellThreeDShaderStage::Vertex,
+                stage: MaxwellShaderStage::Vertex,
                 program_address: address,
                 instruction_offset: 8,
                 encoding: instruction,
@@ -5973,7 +6156,7 @@ mod tests {
             0xeff0_7f80_0887_ff02,
             0xe300_0000_0007_000f,
         ];
-        let translated = translated_fixture(MaxwellThreeDShaderStage::Vertex, header, &code);
+        let translated = translated_fixture(MaxwellShaderStage::Vertex, header, &code);
         let ir = translated.ir();
 
         assert_eq!(ir.stage(), ShaderStage::Vertex);
@@ -6018,7 +6201,7 @@ mod tests {
         header[6] = 0x0000_0077;
         header[13] = 0x0007_f000;
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -6073,7 +6256,7 @@ mod tests {
     fn fmul_register_and_compact_immediate_forms_decode_consistently() {
         let mut temporary = 4;
         let register = decode_float_multiply(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             0x5c68_0000_0017_0102,
             4,
@@ -6095,7 +6278,7 @@ mod tests {
         let immediate_encoding =
             0x3868_0000_0007_0102_u64 | (u64::from((immediate_bits >> 12) & 0x7ffff) << 20);
         let immediate = decode_float_multiply(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             immediate_encoding,
             4,
@@ -6126,7 +6309,7 @@ mod tests {
                 | u64::from(destination)
         };
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -6174,7 +6357,7 @@ mod tests {
         let mut temporary = 4;
         let register_encoding = 0x5980_0000_0007_0100_u64 | (2 << 20) | (3 << 39);
         let register = decode_float_fused_multiply_add(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             register_encoding,
             4,
@@ -6200,7 +6383,7 @@ mod tests {
             | (u64::from((immediate_bits >> 12) & 0x7ffff) << 20)
             | (3 << 39);
         let immediate = decode_float_fused_multiply_add(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             immediate_encoding,
             4,
@@ -6217,7 +6400,7 @@ mod tests {
 
         let constant_addend_encoding = 0x5180_0000_0007_0100_u64 | (2 << 20) | (2 << 39);
         let constant_addend = decode_float_fused_multiply_add(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             24,
             constant_addend_encoding,
             4,
@@ -6241,7 +6424,7 @@ mod tests {
     fn captured_pixel_ffma_decodes_product_and_addend_sign_modifiers() {
         let mut temporary = 16;
         let captured = decode_float_fused_multiply_add(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             0xf8,
             0x59a2_0500_0057_0605,
             16,
@@ -6272,7 +6455,7 @@ mod tests {
 
         let mut temporary = 8;
         let product_negated = decode_float_fused_multiply_add(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             0x100,
             0x5981_0000_0007_0201_u64 | (3 << 20) | (4 << 39),
             8,
@@ -6305,7 +6488,7 @@ mod tests {
         let captured = 0xe290_0000_1000_0000;
         assert!(is_set_sync_point(captured));
         assert_eq!(
-            decode_shader_control_target(MaxwellThreeDShaderStage::Pixel, 0x138, captured, 0x260,)
+            decode_shader_control_target(MaxwellShaderStage::Pixel, 0x138, captured, 0x260,)
                 .unwrap()
                 .byte_offset(),
             0x248
@@ -6313,7 +6496,7 @@ mod tests {
 
         let misaligned = 0xe290_0000_0010_0000;
         assert!(matches!(
-            decode_shader_control_target(MaxwellThreeDShaderStage::Pixel, 0x138, misaligned, 0x260,),
+            decode_shader_control_target(MaxwellShaderStage::Pixel, 0x138, misaligned, 0x260,),
             Err(MaxwellShaderTranslationError::MalformedInstruction {
                 reason: "shader control target is not an executable instruction slot",
                 ..
@@ -6326,7 +6509,7 @@ mod tests {
         let captured = 0xe240_0000_0788_000f;
         assert!(is_branch(captured));
         assert_eq!(
-            decode_shader_control_target(MaxwellThreeDShaderStage::Pixel, 0x150, captured, 0x300,)
+            decode_shader_control_target(MaxwellShaderStage::Pixel, 0x150, captured, 0x300,)
                 .unwrap()
                 .byte_offset(),
             0x1d0
@@ -6356,7 +6539,7 @@ mod tests {
                 | u64::from(destination)
         };
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -6409,7 +6592,7 @@ mod tests {
                 | u64::from(destination)
         };
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             header,
             &[
                 0,
@@ -6451,7 +6634,7 @@ mod tests {
                 | u64::from(destination)
         };
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -6497,7 +6680,7 @@ mod tests {
     fn fadd_register_and_compact_immediate_forms_decode() {
         let mut temporary = 4;
         let register = decode_float_add(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             0x5c58_0000_0027_0100,
             4,
@@ -6519,7 +6702,7 @@ mod tests {
             | (u64::from((immediate_bits >> 12) & 0x7ffff) << 20)
             | (u64::from(immediate_bits >> 31) << 56);
         let immediate = decode_float_add(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             immediate_encoding,
             4,
@@ -6550,7 +6733,7 @@ mod tests {
                 | u64::from(destination)
         };
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -6609,7 +6792,7 @@ mod tests {
     fn captured_fsetp_lt_ftz_writes_p0_from_rz_and_r0() {
         let mut temporary = 8;
         let decoded = decode_float_set_predicate(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             0x270,
             0x5bb1_8380_0007_ff07,
             8,
@@ -6644,7 +6827,7 @@ mod tests {
         let captured = 0x5c98_0780_0078_0005_u64;
         let mut temporary = 8;
         let decoded = decode_move(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             0x2b0,
             captured,
             8,
@@ -6668,7 +6851,7 @@ mod tests {
         ));
 
         let constant = decode_move(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             0x4c98_0788_0047_0001,
             8,
@@ -6693,7 +6876,7 @@ mod tests {
         ));
 
         let zero = decode_move(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             0x5c98_0780_0ff7_0002,
             8,
@@ -6711,7 +6894,7 @@ mod tests {
 
         assert!(matches!(
             decode_move(
-                MaxwellThreeDShaderStage::Vertex,
+                MaxwellShaderStage::Vertex,
                 24,
                 captured & !(0xf << 39),
                 8,
@@ -6730,7 +6913,7 @@ mod tests {
         let register_encoding =
             0x5bb2_0000_0007_0107_u64 | (2 << 3) | (3 << 20) | (4 << 39) | (1 << 42) | (1 << 45);
         let register = decode_float_set_predicate(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             8,
             register_encoding,
             8,
@@ -6758,7 +6941,7 @@ mod tests {
             | (u64::from((immediate_bits >> 12) & 0x7ffff) << 20)
             | (u64::from(immediate_bits >> 31) << 56);
         let immediate = decode_float_set_predicate(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             16,
             immediate_encoding,
             8,
@@ -6778,7 +6961,7 @@ mod tests {
 
         let constant_encoding = 0x4bb6_0000_0007_0107_u64 | (4 << 20) | (2 << 34);
         let constant = decode_float_set_predicate(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             24,
             constant_encoding,
             8,
@@ -6817,7 +7000,7 @@ mod tests {
                 | u64::from(destination)
         };
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[
                 0,
@@ -6858,7 +7041,7 @@ mod tests {
         let captured = 0x5080_0000_0080_0007_u64;
         let mut temporary = 8;
         let decoded = decode_mufu(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             0x278,
             captured,
             8,
@@ -6891,14 +7074,8 @@ mod tests {
             (8, ShaderSpecialFunction::SquareRoot),
         ] {
             let encoding = 0x5080_0000_0007_0100_u64 | (operation << 20);
-            let decoded = decode_mufu(
-                MaxwellThreeDShaderStage::Vertex,
-                8,
-                encoding,
-                8,
-                &mut temporary,
-            )
-            .unwrap();
+            let decoded =
+                decode_mufu(MaxwellShaderStage::Vertex, 8, encoding, 8, &mut temporary).unwrap();
             assert!(matches!(
                 decoded.as_slice(),
                 [ShaderOperation::SpecialFunction32 { function, .. }] if *function == expected
@@ -6911,7 +7088,7 @@ mod tests {
         let captured = 0x5c90_0080_00a7_000a_u64;
         let mut temporary = 16;
         let range_reduction = decode_range_reduction(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             0x338,
             captured,
             decode_predicate(captured),
@@ -6932,7 +7109,7 @@ mod tests {
         ));
         assert!(matches!(
             decode_range_reduced_mufu(
-                MaxwellThreeDShaderStage::Pixel,
+                MaxwellShaderStage::Pixel,
                 0x348,
                 mufu,
                 16,
@@ -6954,7 +7131,7 @@ mod tests {
         let mut temporary = 16;
         let register = 0x5c90_0000_0027_0001_u64 | (2 << 20) | (1 << 45) | (1 << 49);
         let register = decode_range_reduction(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             8,
             register,
             ShaderPredicate::Always,
@@ -6973,7 +7150,7 @@ mod tests {
 
         let constant = 0x4c90_0000_0007_0001_u64 | (3 << 34) | (5 << 20) | (1 << 39);
         let constant = decode_range_reduction(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             16,
             constant,
             ShaderPredicate::Always,
@@ -6998,7 +7175,7 @@ mod tests {
             | (u64::from(immediate_bits >> 31) << 56)
             | (1 << 39);
         let immediate = decode_range_reduction(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             24,
             immediate,
             ShaderPredicate::Always,
@@ -7017,7 +7194,7 @@ mod tests {
         let encoding = 0x5c90_0080_0017_0101_u64;
         let mut temporary = 4;
         let range_reduction = decode_range_reduction(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             8,
             encoding,
             ShaderPredicate::Always,
@@ -7057,7 +7234,7 @@ mod tests {
         let rro = 0x5c90_0000_0007_0001_u64 | (1 << 20) | (1 << 39);
         let mufu = 0x5080_0000_0007_0101_u64 | (2 << 20);
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Vertex,
+            MaxwellShaderStage::Vertex,
             header,
             &[0, rro, mufu, 0xe300_0000_0007_000f],
         );
@@ -7102,7 +7279,7 @@ mod tests {
             0,
             0,
         ];
-        let translated = translated_fixture(MaxwellThreeDShaderStage::Pixel, header, &code);
+        let translated = translated_fixture(MaxwellShaderStage::Pixel, header, &code);
         let ir = translated.ir();
 
         assert_eq!(ir.stage(), ShaderStage::Fragment);
@@ -7152,7 +7329,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             decode_interpolate(
-                MaxwellThreeDShaderStage::Pixel,
+                MaxwellShaderStage::Pixel,
                 0x38,
                 captured,
                 1,
@@ -7176,13 +7353,7 @@ mod tests {
         .unwrap();
         let sc = (captured & !(3_u64 << 54)) | (3_u64 << 54);
         assert!(matches!(
-            decode_interpolate(
-                MaxwellThreeDShaderStage::Pixel,
-                0x38,
-                sc,
-                1,
-                &[screen_input],
-            ),
+            decode_interpolate(MaxwellShaderStage::Pixel, 0x38, sc, 1, &[screen_input],),
             Ok(ShaderOperation::InterpolateInput {
                 interpolation: ShaderInterpolation::ScreenLinear,
                 ..
@@ -7196,7 +7367,7 @@ mod tests {
         ] {
             assert!(matches!(
                 decode_interpolate(
-                    MaxwellThreeDShaderStage::Pixel,
+                    MaxwellShaderStage::Pixel,
                     0x38,
                     unsupported,
                     1,
@@ -7224,7 +7395,7 @@ mod tests {
                     | (0xf << 12)
                     | u64::from(destination);
                 let translated = translated_fixture(
-                    MaxwellThreeDShaderStage::Vertex,
+                    MaxwellShaderStage::Vertex,
                     header,
                     &[0, encoding, 0xe300_0000_0007_000f, 0],
                 );
@@ -7410,7 +7581,7 @@ mod tests {
         program_three_d(&mut channel, 0x2004, 0);
         program_three_d(&mut channel, 0x200c, 4);
 
-        let mut cache = MaxwellThreeDLoweringCache::default();
+        let mut cache = MaxwellLoweringCache::default();
         let first_source =
             prepare_maxwell_shader_translation_source(channel.three_d(), &[]).unwrap();
         let owned_first_source = first_source.materialize();
@@ -7645,7 +7816,7 @@ mod tests {
                 .contains("@binding(1)")
         );
 
-        let lowered = MaxwellThreeDLoweringCache::default()
+        let lowered = MaxwellLoweringCache::default()
             .stage_shader_translations(&translated)
             .unwrap();
         assert_eq!(
@@ -7663,7 +7834,7 @@ mod tests {
         let mut bindings = BTreeMap::new();
         let captured = 0xda50_1a40_2077_0600;
         let operation = decode_texture_access_simplified(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             0x30,
             captured,
             8,
@@ -7689,18 +7860,12 @@ mod tests {
         assert_eq!(bindings[&420].sampler_binding, None);
         // The same descriptor can later be filtered: reserve its sampler once.
         let sample = (captured & !(0x1f << 53)) | (1 << 53);
-        decode_texture_access_simplified(
-            MaxwellThreeDShaderStage::Pixel,
-            0x38,
-            sample,
-            8,
-            &mut bindings,
-        )
-        .unwrap();
+        decode_texture_access_simplified(MaxwellShaderStage::Pixel, 0x38, sample, 8, &mut bindings)
+            .unwrap();
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[&420].sampler_binding, Some(33));
         decode_texture_access_simplified(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             0x40,
             captured,
             8,
@@ -7715,7 +7880,7 @@ mod tests {
         ] {
             assert!(matches!(
                 decode_texture_access_simplified(
-                    MaxwellThreeDShaderStage::Pixel,
+                    MaxwellShaderStage::Pixel,
                     0x30,
                     word,
                     8,
@@ -7732,7 +7897,7 @@ mod tests {
         header[0] = 0x0002_5462;
         header[18] = 0xf;
         let translated = translated_fixture_with_register_count(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             header,
             &[
                 0,
@@ -7757,7 +7922,7 @@ mod tests {
         let mapping = BTreeMap::from([(32, 4)]);
         let remapped = finalize_shader_ir(
             translated.ir().clone(),
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             &mapping,
             &[],
         )
@@ -7782,7 +7947,7 @@ mod tests {
         let encoding = 0xd830_0080_2007_0100;
         let mut bindings = BTreeMap::new();
         let operation = decode_texture_access_simplified(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             0x2a8,
             encoding,
             4,
@@ -7824,7 +7989,7 @@ mod tests {
         let encoding = 0xd8e0_1a4f_f027_0003;
         let mut bindings = BTreeMap::new();
         let operation = decode_texture_access_simplified(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             0x30,
             encoding,
             4,
@@ -7860,7 +8025,7 @@ mod tests {
         header[0] = 0x0002_5462;
         header[18] = 0x0000_000f;
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             header,
             &[
                 0,
@@ -7891,7 +8056,7 @@ mod tests {
         let move_x = 0x0100_0000_0007_f000_u64 | (u64::from(0.25_f32.to_bits()) << 20);
         let move_y = 0x0100_0000_0007_f001_u64 | (u64::from(0.75_f32.to_bits()) << 20);
         let translated = translated_fixture(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             header,
             &[
                 0,
@@ -7921,7 +8086,7 @@ mod tests {
         let captured = 0x5c60_1780_0ff7_0a0a;
         let mut temporary = 16;
         let register = decode_float_min_max(
-            MaxwellThreeDShaderStage::Pixel,
+            MaxwellShaderStage::Pixel,
             0x318,
             captured,
             16,
@@ -7949,14 +8114,9 @@ mod tests {
         let immediate_bits = 1.5_f32.to_bits();
         let immediate =
             0x3860_0000_0007_0100_u64 | (u64::from(immediate_bits >> 12) << 20) | (7 << 39);
-        let immediate = decode_float_min_max(
-            MaxwellThreeDShaderStage::Pixel,
-            8,
-            immediate,
-            16,
-            &mut temporary,
-        )
-        .unwrap();
+        let immediate =
+            decode_float_min_max(MaxwellShaderStage::Pixel, 8, immediate, 16, &mut temporary)
+                .unwrap();
         assert_eq!(immediate.constant_buffer_binding, None);
         assert!(matches!(
             immediate.operations.as_slice(),
@@ -7970,14 +8130,9 @@ mod tests {
         ));
 
         let constant = 0x4c60_0000_0007_0100_u64 | (3 << 34) | (4 << 20) | (7 << 39);
-        let constant = decode_float_min_max(
-            MaxwellThreeDShaderStage::Pixel,
-            8,
-            constant,
-            16,
-            &mut temporary,
-        )
-        .unwrap();
+        let constant =
+            decode_float_min_max(MaxwellShaderStage::Pixel, 8, constant, 16, &mut temporary)
+                .unwrap();
         assert_eq!(constant.constant_buffer_binding, Some(3));
         assert!(matches!(
             constant.operations.as_slice(),

@@ -1,6 +1,6 @@
 //! Consumed polygon facing, mode and line state. Host-independent framebuffer
 //! convention; do not compensate for the viewport Y sign again in the backend.
-use super::super::{MaxwellThreeDCullFace, MaxwellThreeDFrontFace};
+use super::super::threed::{MaxwellThreeDCullFace, MaxwellThreeDFrontFace};
 use super::*;
 use MaxwellThreeDFixedFunctionRegister as R;
 use MaxwellThreeDFixedFunctionValue as V;
@@ -15,20 +15,20 @@ pub(super) struct DrawRasterState {
 
 pub(super) fn draw_state(
     state: &MaxwellThreeDState,
-) -> Result<DrawRasterState, MaxwellThreeDLoweringError> {
+) -> Result<DrawRasterState, MaxwellLoweringError> {
     if state.fixed_function().register(R::RasterEnable).value() == Some(&V::Boolean(false)) {
-        return Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+        return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
             "rasterizer discard",
         ));
     }
     let (front_face, cull_mode) = face_state(state)?;
     let triangles = if state.generated_primitive()
-        == Some(super::super::state::GeneratedPrimitive::Triangles)
+        == Some(super::super::threed::state::GeneratedPrimitive::Triangles)
         && cull_mode != CullMode::FrontAndBack
     {
         let mode = |register, name| match state.fixed_function().register(register).value() {
             Some(V::PolygonMode(mode)) => Ok(*mode),
-            None => Err(MaxwellThreeDLoweringError::IncompleteDraw(name)),
+            None => Err(MaxwellLoweringError::IncompleteDraw(name)),
             _ => Err(wrong_type()),
         };
         let selected = match cull_mode {
@@ -38,7 +38,7 @@ pub(super) fn draw_state(
                 let front = mode(R::FrontPolygonMode, "SET_FRONT_POLYGON_MODE")?;
                 let back = mode(R::BackPolygonMode, "SET_BACK_POLYGON_MODE")?;
                 if front != back {
-                    return Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+                    return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
                         "different front/back polygon modes without face culling",
                     ));
                 }
@@ -50,13 +50,13 @@ pub(super) fn draw_state(
             MaxwellThreeDPolygonMode::Fill => R::PolygonOffsetFillEnable,
             MaxwellThreeDPolygonMode::Line => R::PolygonOffsetLineEnable,
             MaxwellThreeDPolygonMode::Point => {
-                return Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+                return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
                     "point polygon mode",
                 ));
             }
         };
         if state.fixed_function().register(offset).value() == Some(&V::Boolean(true)) {
-            return Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+            return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
                 "depth bias for the consumed polygon mode",
             ));
         }
@@ -65,10 +65,10 @@ pub(super) fn draw_state(
                 // Point/line/fill smoothing and depth bias are independent.
                 // https://github.com/devkitPro/deko3d/blob/master/source/maxwell/gpu_3d_state.cpp#L61-L66
                 if state.raster().polygon_smooth_enable().value() == Some(&true) {
-                    return Err(MaxwellThreeDLoweringError::UnsupportedPolygonSmoothSemantics);
+                    return Err(MaxwellLoweringError::UnsupportedPolygonSmoothSemantics);
                 }
                 if state.raster().polygon_stipple_enable().value() == Some(&true) {
-                    return Err(MaxwellThreeDLoweringError::UnsupportedPolygonStippleSemantics);
+                    return Err(MaxwellLoweringError::UnsupportedPolygonStippleSemantics);
                 }
                 TriangleRasterization::Fill
             }
@@ -88,44 +88,48 @@ pub(super) fn draw_state(
 
 fn smooth_wireframe(
     state: &MaxwellThreeDState,
-) -> Result<TriangleRasterization, MaxwellThreeDLoweringError> {
+) -> Result<TriangleRasterization, MaxwellLoweringError> {
     if state
         .raster()
         .fill_via_triangle()
         .value()
         .is_some_and(|mode| *mode != MaxwellThreeDFillViaTriangleMode::Disabled)
     {
-        return Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+        return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
             "non-fill polygon mode with fill-via-triangle",
         ));
     }
     match state.line().anti_aliased_line_enable().value() {
         Some(MaxwellThreeDAntiAliasedLineEnable::Enabled) => {}
         Some(MaxwellThreeDAntiAliasedLineEnable::Disabled) => {
-            return Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+            return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
                 "aliased polygon-line coverage",
             ));
         }
         None => {
-            return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+            return Err(MaxwellLoweringError::IncompleteDraw(
                 "SET_ANTI_ALIASED_LINE",
             ));
         }
     }
-    if state.line().stipple_enable().value().copied().ok_or(
-        MaxwellThreeDLoweringError::IncompleteDraw("SET_LINE_STIPPLE"),
-    )? {
-        return Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+    if state
+        .line()
+        .stipple_enable()
+        .value()
+        .copied()
+        .ok_or(MaxwellLoweringError::IncompleteDraw("SET_LINE_STIPPLE"))?
+    {
+        return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
             "stippled polygon lines",
         ));
     }
     match state.line().polygon_clip_generated_edge().value() {
         Some(MaxwellThreeDPolygonClipGeneratedEdge::DrawLine) => {}
         Some(MaxwellThreeDPolygonClipGeneratedEdge::DoNotDrawLine) => {
-            return Err(MaxwellThreeDLoweringError::UnsupportedPolygonClipGeneratedEdgeSemantics);
+            return Err(MaxwellLoweringError::UnsupportedPolygonClipGeneratedEdgeSemantics);
         }
         None => {
-            return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+            return Err(MaxwellLoweringError::IncompleteDraw(
                 "SET_POLYGON_CLIP_GENERATED_EDGE",
             ));
         }
@@ -133,11 +137,26 @@ fn smooth_wireframe(
     match state.raster().edge_flag().value() {
         Some(MaxwellThreeDEdgeFlag::Enabled) => {}
         Some(MaxwellThreeDEdgeFlag::Disabled) => {
-            return Err(MaxwellThreeDLoweringError::UnsupportedEdgeFlagSemantics(
+            return Err(MaxwellLoweringError::UnsupportedEdgeFlagSemantics(
                 MaxwellThreeDEdgeFlag::Disabled,
             ));
         }
-        None => return Err(MaxwellThreeDLoweringError::IncompleteDraw("SET_EDGE_FLAG")),
+        None => return Err(MaxwellLoweringError::IncompleteDraw("SET_EDGE_FLAG")),
+    }
+    let line = smooth_line(state)?;
+    Ok(TriangleRasterization::Wireframe {
+        width_bits: line.width_bits,
+        smooth: line.smooth,
+    })
+}
+
+pub(super) fn smooth_line(
+    state: &MaxwellThreeDState,
+) -> Result<nixe_gpu::LineRasterization, MaxwellLoweringError> {
+    if state.line().stipple_enable().value() == Some(&true) {
+        return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
+            "stippled smooth lines",
+        ));
     }
     // Smooth lines consume the smooth width regardless of the aliased-width
     // selector. Do not approximate aliased coverage with rectangular lines.
@@ -149,11 +168,9 @@ fn smooth_wireframe(
         .value()
         .copied()
     else {
-        return Err(MaxwellThreeDLoweringError::IncompleteDraw(
-            "SET_LINE_WIDTH_FLOAT",
-        ));
+        return Err(MaxwellLoweringError::IncompleteDraw("SET_LINE_WIDTH_FLOAT"));
     };
-    Ok(TriangleRasterization::Wireframe {
+    Ok(nixe_gpu::LineRasterization {
         width_bits: width_bits.get(),
         smooth: true,
     })
@@ -161,8 +178,10 @@ fn smooth_wireframe(
 
 pub(super) fn face_state(
     state: &MaxwellThreeDState,
-) -> Result<(FrontFace, CullMode), MaxwellThreeDLoweringError> {
-    if state.generated_primitive() != Some(super::super::state::GeneratedPrimitive::Triangles) {
+) -> Result<(FrontFace, CullMode), MaxwellLoweringError> {
+    if state.generated_primitive()
+        != Some(super::super::threed::state::GeneratedPrimitive::Triangles)
+    {
         return Ok((FrontFace::CounterClockwise, CullMode::None));
     }
     let required = |register, name| {
@@ -171,7 +190,7 @@ pub(super) fn face_state(
             .register(register)
             .value()
             .copied()
-            .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(name))
+            .ok_or(MaxwellLoweringError::IncompleteDraw(name))
     };
     // Upper-left/no-flip is the supported framebuffer convention. Other origins
     // also affect coordinate generation and cannot be fixed by culling alone.
@@ -180,7 +199,7 @@ pub(super) fn face_state(
         return Err(wrong_type());
     };
     if origin != 0 {
-        return Err(MaxwellThreeDLoweringError::UnsupportedWindowOrigin(origin));
+        return Err(MaxwellLoweringError::UnsupportedWindowOrigin(origin));
     }
     let V::FrontFace(face) = required(R::FrontFace, "SET_FRONT_FACE")? else {
         return Err(wrong_type());
@@ -207,8 +226,8 @@ pub(super) fn face_state(
     Ok((face, mode))
 }
 
-fn wrong_type() -> MaxwellThreeDLoweringError {
-    MaxwellThreeDLoweringError::ContradictoryState {
+fn wrong_type() -> MaxwellLoweringError {
+    MaxwellLoweringError::ContradictoryState {
         reason: "polygon raster register has an inconsistent typed value",
     }
 }
@@ -217,6 +236,23 @@ fn wrong_type() -> MaxwellThreeDLoweringError {
 mod tests {
     use super::*;
     use crate::engines::tests::{program_three_d, three_d_channel};
+
+    #[test]
+    fn smooth_direct_lines_preserve_width_without_polygon_edge_state() {
+        let mut channel = three_d_channel();
+        // Direct lines do not consume polygon clip-edge, edge-flag or mode state.
+        program_three_d(&mut channel, 0x1618, 3);
+        program_three_d(&mut channel, 0x1570, 1);
+        program_three_d(&mut channel, 0x166c, 0);
+        for width in [1.0_f32, 4.0, 16.0] {
+            program_three_d(&mut channel, 0x13b0, width.to_bits());
+            let line = super::smooth_line(channel.three_d()).unwrap();
+            assert_eq!(line.width_bits, width.to_bits());
+            assert!(line.smooth);
+        }
+        program_three_d(&mut channel, 0x166c, 1);
+        assert!(super::smooth_line(channel.three_d()).is_err());
+    }
 
     fn wireframe_channel() -> crate::MaxwellGpuChannel {
         let mut channel = three_d_channel();
@@ -273,7 +309,7 @@ mod tests {
         program_three_d(&mut channel, 0x0dac, 0x1b02);
         assert!(matches!(
             draw_state(channel.three_d()),
-            Err(MaxwellThreeDLoweringError::UnsupportedPolygonSmoothSemantics)
+            Err(MaxwellLoweringError::UnsupportedPolygonSmoothSemantics)
         ));
         program_three_d(&mut channel, 0x0db4, 0);
         assert_eq!(
@@ -290,15 +326,13 @@ mod tests {
         program_three_d(&mut channel, 0x1918, 0);
         assert!(matches!(
             draw_state(channel.three_d()),
-            Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
-                _
-            ))
+            Err(MaxwellLoweringError::UnsupportedPolygonRasterization(_))
         ));
         program_three_d(&mut channel, 0x1918, 1);
         program_three_d(&mut channel, 0x1920, 0x404);
         assert!(matches!(
             draw_state(channel.three_d()),
-            Err(MaxwellThreeDLoweringError::UnsupportedPolygonRasterization(
+            Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
                 "point polygon mode"
             ))
         ));
@@ -354,14 +388,12 @@ mod tests {
         program_three_d(&mut channel, 0x1618, 4);
         assert!(matches!(
             face_state(channel.three_d()),
-            Err(MaxwellThreeDLoweringError::IncompleteDraw("SET_FRONT_FACE"))
+            Err(MaxwellLoweringError::IncompleteDraw("SET_FRONT_FACE"))
         ));
         program_three_d(&mut channel, 0x191c, 0x901);
         assert!(matches!(
             face_state(channel.three_d()),
-            Err(MaxwellThreeDLoweringError::IncompleteDraw(
-                "SET_CULL_FACE_ENABLE"
-            ))
+            Err(MaxwellLoweringError::IncompleteDraw("SET_CULL_FACE_ENABLE"))
         ));
         program_three_d(&mut channel, 0x1918, 0);
         assert_eq!(
@@ -371,7 +403,7 @@ mod tests {
         program_three_d(&mut channel, 0x1918, 1);
         assert!(matches!(
             face_state(channel.three_d()),
-            Err(MaxwellThreeDLoweringError::IncompleteDraw("SET_CULL_FACE"))
+            Err(MaxwellLoweringError::IncompleteDraw("SET_CULL_FACE"))
         ));
         for (raw, face) in [
             (0x900, FrontFace::Clockwise),
@@ -390,7 +422,7 @@ mod tests {
         program_three_d(&mut channel, 0x13ac, 0x10);
         assert!(matches!(
             face_state(channel.three_d()),
-            Err(MaxwellThreeDLoweringError::UnsupportedWindowOrigin(0x10))
+            Err(MaxwellLoweringError::UnsupportedWindowOrigin(0x10))
         ));
         // Direct lines/points do not consume polygon facing, including stale
         // unsupported polygon state left by the previous draw.

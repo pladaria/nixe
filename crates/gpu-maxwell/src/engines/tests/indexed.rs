@@ -199,8 +199,8 @@ fn indexed_draw_preserves_bindings_arguments_and_cached_draw_kind() {
         assert!(
             matches!(
                 result,
-                Err(MaxwellThreeDLoweringError::UnsupportedIndexFormat(_))
-                    | Err(MaxwellThreeDLoweringError::UnsupportedIndexedDraw(_))
+                Err(MaxwellLoweringError::UnsupportedIndexFormat(_))
+                    | Err(MaxwellLoweringError::UnsupportedIndexedDraw(_))
             ),
             "method={method:x}"
         );

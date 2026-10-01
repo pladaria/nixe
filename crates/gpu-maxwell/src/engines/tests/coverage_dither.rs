@@ -94,7 +94,7 @@ fn active_alpha_coverage_rejects_draws_but_does_not_affect_clears() {
     program_three_d(&mut channel, 0x12e0, 1);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellLoweringCache::default();
     for control in [1, 0x10, 0x11] {
         program_three_d(&mut channel, 0x153c, control);
         let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
@@ -103,7 +103,7 @@ fn active_alpha_coverage_rejects_draws_but_does_not_affect_clears() {
             triggered.state(), &resources, triggered.trigger(), None,
             FrontendSubmissionId::new(1), vec![],
             &lowering_capabilities(BackendFeatures::empty()), &mut cache,
-        ), Err(MaxwellThreeDLoweringError::UnsupportedAntiAliasAlphaControl { alpha_to_coverage, alpha_to_one })
+        ), Err(MaxwellLoweringError::UnsupportedAntiAliasAlphaControl { alpha_to_coverage, alpha_to_one })
             if alpha_to_coverage == (control & 1 != 0) && alpha_to_one == (control & 0x10 != 0)));
         let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
         let triggered = &dispatch.operations()[0];
@@ -118,7 +118,7 @@ fn active_alpha_coverage_rejects_draws_but_does_not_affect_clears() {
                 &lowering_capabilities(BackendFeatures::empty()),
                 &mut cache,
             ),
-            Err(MaxwellThreeDLoweringError::IncompleteClear(
+            Err(MaxwellLoweringError::IncompleteClear(
                 "horizontal rectangle"
             ))
         ));

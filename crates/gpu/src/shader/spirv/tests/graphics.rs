@@ -1,5 +1,46 @@
 use super::*;
 
+#[test]
+fn add_carry_spirv_snapshots_both_inputs_and_keeps_a_live_carry_only_definition() {
+    let ir = shader(
+        ShaderStage::Vertex,
+        vec![],
+        vec![interface(
+            ShaderIoLocation::Generic(0),
+            0,
+            ShaderScalarType::Unsigned32,
+        )],
+        vec![],
+        vec![
+            immediate(0, u32::MAX),
+            immediate(1, 1),
+            ShaderOperation::AddCarry32 {
+                destination: ShaderRegister(0),
+                carry_out: ShaderRegister(1),
+                left: ShaderRegister(0),
+                right: ShaderRegister(1),
+                carry_in: Some(ShaderRegister(1)),
+            },
+            output(
+                1,
+                ShaderIoLocation::Generic(0),
+                ShaderScalarType::Unsigned32,
+            ),
+            ShaderOperation::Exit,
+        ],
+    );
+    let module = module(&ir, graphics_options());
+    assert_eq!(ops(&module, spv::Op::IAdd).len(), 2);
+    assert_eq!(ops(&module, spv::Op::ULessThan).len(), 2);
+    assert_eq!(ops(&module, spv::Op::LogicalOr).len(), 1);
+    assert_eq!(
+        evaluate_shader_ir(&ir, &ShaderEvaluationInputs::default(), 16)
+            .unwrap()
+            .output_bits(ShaderIoLocation::Generic(0), 0),
+        Some(1)
+    );
+}
+
 fn graphics_options() -> SpirvShaderOptions {
     SpirvShaderOptions {
         input_control_points: 0,

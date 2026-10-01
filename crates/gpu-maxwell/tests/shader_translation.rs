@@ -148,7 +148,7 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
         MaxwellChannelOwner::new(1),
         SWITCH_1_GM20B_PROFILE,
     );
-    let mut lowering_cache = MaxwellThreeDLoweringCache::default();
+    let mut lowering_cache = MaxwellLoweringCache::default();
     let mut dispatch = |method: u32, argument: u32| {
         let decoded = packet(0, method / 4, &[argument]);
         lower_maxwell_pushbuffer(
@@ -205,7 +205,7 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
         let _ = dispatch(method, argument);
     }
     let draw = dispatch(0x0d78, 3);
-    let [MaxwellSubmissionExecutionStep::ThreeD(work)] = draw.steps() else {
+    let [MaxwellSubmissionExecutionStep::Gpu(work)] = draw.steps() else {
         panic!("captured draw did not lower to one neutral 3D work item");
     };
     let shader_modules = work
@@ -267,7 +267,7 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
         .write(0, &vertex_header[0].to_le_bytes())
         .unwrap();
     let replacement = dispatch(0x0d78, 3);
-    let [MaxwellSubmissionExecutionStep::ThreeD(replacement_work)] = replacement.steps() else {
+    let [MaxwellSubmissionExecutionStep::Gpu(replacement_work)] = replacement.steps() else {
         panic!("replacement draw did not lower to one neutral 3D work item");
     };
     assert!(replacement_work.resource_invalidations().is_empty());
@@ -284,7 +284,7 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
             .any(|creation| matches!(creation, BackendResourceCreateInfo::Pipeline { .. }))
     );
 
-    let prepared = |work: &MaxwellThreeDLoweredWork| {
+    let prepared = |work: &MaxwellLoweredWork| {
         work.submission()
             .operations()
             .iter()
@@ -312,7 +312,7 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
     for width in [1_f32, 4.0, 4.0] {
         let _ = dispatch(0x13b0, width.to_bits());
         let result = dispatch(0x0d78, 3);
-        let [MaxwellSubmissionExecutionStep::ThreeD(work)] = result.steps() else {
+        let [MaxwellSubmissionExecutionStep::Gpu(work)] = result.steps() else {
             panic!("wireframe draw");
         };
         let current = prepared(work);
@@ -339,7 +339,7 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
         let _ = dispatch(method, argument);
     }
     let result = dispatch(0x0d78, 3);
-    let [MaxwellSubmissionExecutionStep::ThreeD(work)] = result.steps() else {
+    let [MaxwellSubmissionExecutionStep::Gpu(work)] = result.steps() else {
         panic!("filled draw");
     };
     assert_eq!(

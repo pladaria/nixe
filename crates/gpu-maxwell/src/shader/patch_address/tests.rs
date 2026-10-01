@@ -70,13 +70,15 @@ fn binary(control: bool, code: &[[u64; 3]]) -> MaxwellShaderBinary {
 fn binary_from_words(words: [u32; 20], code: &[[u64; 3]]) -> MaxwellShaderBinary {
     MaxwellShaderBinary {
         address: 0,
-        header: decode_program_header(
-            &words
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap(),
+        metadata: MaxwellShaderMetadata::Graphics(
+            decode_program_header(
+                &words
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        ),
         bundles: code
             .iter()
             .enumerate()
@@ -131,7 +133,7 @@ fn graphics_chain_with_control(control: MaxwellShaderBinary) -> Vec<VerifiedShad
             } else {
                 &[]
             };
-            finalize_shader_ir(program.ir, binary.header.stage, &BTreeMap::new(), output).unwrap()
+            finalize_shader_ir(program.ir, binary.stage(), &BTreeMap::new(), output).unwrap()
         })
         .collect()
 }
@@ -214,7 +216,7 @@ fn translate(
     let binary = binary(control, code);
     let translated =
         translate_shader_binary(&binary, if control { 5 } else { 16 }, &BTreeMap::new())?;
-    finalize_shader_ir(translated.ir, binary.header.stage, &BTreeMap::new(), &[])
+    finalize_shader_ir(translated.ir, binary.stage(), &BTreeMap::new(), &[])
 }
 
 fn inputs() -> ShaderEvaluationInputs {
@@ -439,7 +441,7 @@ fn internal_addresses_cannot_escape_or_silently_change_addressing_modes() {
             0,
             0,
             0xe30000000000000f,
-            "conditional tessellation EXIT requires complete shader control-flow discovery",
+            "conditional EXIT requires complete shader control-flow discovery",
         ),
         (
             true,
@@ -548,7 +550,7 @@ fn address_proof_is_independent_of_guest_register_numbers() {
     }
     let binary = binary(true, &code);
     let translated = translate_shader_binary(&binary, 13, &BTreeMap::new()).unwrap();
-    let ir = finalize_shader_ir(translated.ir, binary.header.stage, &BTreeMap::new(), &[]).unwrap();
+    let ir = finalize_shader_ir(translated.ir, binary.stage(), &BTreeMap::new(), &[]).unwrap();
     for vertex in 0..3 {
         let result = evaluate_shader_ir(
             &ir,

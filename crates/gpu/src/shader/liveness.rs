@@ -57,10 +57,13 @@ pub(super) fn live_instructions(
         // not silently classify it as removable. There is no shader FP status.
         let observable = match instruction.operation {
             ShaderOperation::StoreOutput { .. }
+            | ShaderOperation::StoreStorageBuffer32 { .. }
             | ShaderOperation::StoreControlPoint { .. }
             | ShaderOperation::PatchBarrier
             | ShaderOperation::Exit => true,
             ShaderOperation::Undefined32 { .. }
+            | ShaderOperation::LoadComputeBuiltin32 { .. }
+            | ShaderOperation::LoadStorageBuffer32 { .. }
             | ShaderOperation::MoveImmediate32 { .. }
             | ShaderOperation::Move32 { .. }
             | ShaderOperation::FloatAbsolute32 { .. }
@@ -74,7 +77,9 @@ pub(super) fn live_instructions(
             | ShaderOperation::Multiply32 { .. }
             | ShaderOperation::FloatMultiplyZero32 { .. }
             | ShaderOperation::Add32 { .. }
+            | ShaderOperation::AddCarry32 { .. }
             | ShaderOperation::ShiftLeft32 { .. }
+            | ShaderOperation::ShiftRightLogical32 { .. }
             | ShaderOperation::Bitwise32 { .. }
             | ShaderOperation::FloatMinMax32 { .. }
             | ShaderOperation::FusedMultiplyAdd32 { .. }
