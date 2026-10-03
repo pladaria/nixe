@@ -1454,13 +1454,21 @@ fn effective_crop(crop: CropRect, width: u32, height: u32) -> CropRect {
     }
 }
 
-pub(crate) fn encode_native_window(binder_id: i32) -> [u8; 0x1c] {
-    let mut parcel = [0_u8; 0x1c];
-    parcel[0..4].copy_from_slice(&12_u32.to_le_bytes());
+pub(crate) fn encode_native_window(binder_id: i32) -> [u8; 0x3c] {
+    // NativeWindow contains a complete flattened Binder handle and an object
+    // offset table. Reading only the ID at payload offset 8 (as libnx does)
+    // misses the fields required by Android Parcel::readStrongBinder.
+    // https://switchbrew.org/wiki/Display_services#NativeWindow
+    let mut parcel = [0_u8; 0x3c];
+    parcel[0..4].copy_from_slice(&0x28_u32.to_le_bytes());
     parcel[4..8].copy_from_slice(&16_u32.to_le_bytes());
-    parcel[8..12].copy_from_slice(&0_u32.to_le_bytes());
-    parcel[12..16].copy_from_slice(&28_u32.to_le_bytes());
+    parcel[8..12].copy_from_slice(&4_u32.to_le_bytes());
+    parcel[12..16].copy_from_slice(&0x38_u32.to_le_bytes());
+    parcel[16..20].copy_from_slice(&2_u32.to_le_bytes()); // Remote Binder handle.
     parcel[24..28].copy_from_slice(&binder_id.to_le_bytes());
+    parcel[40..48].copy_from_slice(b"dispdrv\0");
+    // The sole object table entry at 0x38 is zero: the payload-relative offset
+    // of the flattened Binder handle. All reserved fields remain zero.
     parcel
 }
 
@@ -1695,11 +1703,23 @@ mod tests {
     }
 
     #[test]
-    fn native_window_places_binder_id_in_the_libnx_payload_slot() {
+    fn native_window_contains_a_flattened_binder_and_its_object_offset() {
         let encoded = encode_native_window(7);
-        assert_eq!(u32::from_le_bytes(encoded[0..4].try_into().unwrap()), 12);
-        assert_eq!(u32::from_le_bytes(encoded[4..8].try_into().unwrap()), 16);
-        assert_eq!(i32::from_le_bytes(encoded[24..28].try_into().unwrap()), 7);
+        let word =
+            |offset| u32::from_le_bytes(encoded[offset..offset + 4].try_into().unwrap()) as usize;
+        let data = &encoded[word(4)..word(4) + word(0)];
+        let objects = &encoded[word(12)..word(12) + word(8)];
+        assert_eq!(objects.len(), 4);
+        let object_offset = u32::from_le_bytes(objects.try_into().unwrap()) as usize;
+        assert_eq!(object_offset, 0);
+        let binder = &data[object_offset..object_offset + 0x28];
+        assert_eq!(u32::from_le_bytes(binder[..4].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(binder[8..12].try_into().unwrap()), 7);
+        assert_eq!(&binder[0x18..0x20], b"dispdrv\0");
+        assert_eq!(&binder[4..8], &[0; 4]);
+        assert_eq!(&binder[12..24], &[0; 12]);
+        assert_eq!(&binder[32..40], &[0; 8]);
+        assert_eq!(word(12) + objects.len(), encoded.len());
     }
 
     #[test]

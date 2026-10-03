@@ -959,6 +959,98 @@ fn virtual_deadlines_are_deterministic_and_do_not_sleep_the_host() {
 }
 
 #[test]
+fn realtime_device_waits_allow_completion_before_timeout_in_both_execution_modes() {
+    for mode in [
+        VcpuExecutionMode::Deterministic,
+        VcpuExecutionMode::Parallel,
+    ] {
+        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+            profile(),
+            crate::VirtualClock::default(),
+            mode,
+        )
+        .unwrap();
+        coordinator
+            .register_process(
+                synthetic_process_for_coordinator(1),
+                registration(&coordinator),
+            )
+            .unwrap();
+        let execution = coordinator.run_next(2).unwrap().unwrap();
+        let thread = execution.lease.thread;
+        let (signal, event) = crate::EventObject::create_pair();
+        coordinator
+            .register_event_wait(
+                thread,
+                [event],
+                Some(60_000_000_000),
+                crate::ExternalEventSource::Device,
+            )
+            .unwrap();
+        let deadline = coordinator.deadlines.first_key_value().unwrap().0.0;
+        let idle = match mode {
+            VcpuExecutionMode::Deterministic => coordinator.run_next(1).unwrap().is_none(),
+            VcpuExecutionMode::Parallel => coordinator.run_parallel_wave(1).unwrap().is_empty(),
+        };
+        assert!(idle, "a device timeout must not be fast-forwarded");
+        assert!(coordinator.virtual_time_ns() < deadline);
+        std::thread::spawn(move || signal.signal()).join().unwrap();
+        let report = coordinator
+            .wait_for_external_event_for(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.woken, 1);
+        assert!(coordinator.deadlines.is_empty());
+        assert_eq!(
+            coordinator.scheduler().thread(thread).unwrap().lifecycle,
+            nixe_scheduler::ThreadLifecycle::Ready
+        );
+    }
+}
+
+#[test]
+fn realtime_idle_sleep_is_bounded_by_guest_timeout_and_expiry_resumes_the_thread() {
+    for mode in [
+        VcpuExecutionMode::Deterministic,
+        VcpuExecutionMode::Parallel,
+    ] {
+        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+            profile(),
+            crate::VirtualClock::default(),
+            mode,
+        )
+        .unwrap();
+        coordinator
+            .register_process(
+                synthetic_process_for_coordinator(1),
+                registration(&coordinator),
+            )
+            .unwrap();
+        let execution = coordinator.run_next(2).unwrap().unwrap();
+        let thread = execution.lease.thread;
+        coordinator
+            .register_timed_wait(thread, Some(20_000_000))
+            .unwrap();
+        let deadline = coordinator.deadlines.first_key_value().unwrap().0.0;
+        let started = std::time::Instant::now();
+        assert!(
+            coordinator
+                .wait_for_external_event_for(std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(900));
+        assert!(coordinator.virtual_time_ns() >= deadline);
+        let execution = match mode {
+            VcpuExecutionMode::Deterministic => coordinator.run_next(1).unwrap().unwrap(),
+            VcpuExecutionMode::Parallel => coordinator.run_parallel_wave(1).unwrap().remove(0),
+        };
+        assert_eq!(execution.lease.thread, thread);
+        assert!(coordinator.deadlines.is_empty());
+    }
+}
+
+#[test]
 fn process_removal_cancels_deadlines_and_external_observers() {
     let mut coordinator = RuntimeCoordinator::new(profile());
     let process_id = coordinator

@@ -383,6 +383,8 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
                 )?;
             }
             PendingEngineOperation::InlineToMemory(upload) => {
+                // Embedded MAXWELL_B uploads have the same coherent write
+                // ordering as compute uploads, including FLUSH_ONLY/SYSMEMBAR.
                 self.push_inline_write(
                     upload.address().get(),
                     upload.offset(),
@@ -2006,11 +2008,27 @@ mod tests {
 
     #[test]
     fn compute_inline_flush_modes_commit_between_backend_segments_without_extra_work() {
+        inline_flush_modes_commit_between_backend_segments(
+            SWITCH_1_GM20B_PROFILE.classes().compute().0,
+            &[0x01, 0x11, 0x41, 0x51],
+        );
+    }
+
+    #[test]
+    fn three_d_inline_flush_modes_commit_between_backend_segments_without_extra_work() {
+        inline_flush_modes_commit_between_backend_segments(
+            SWITCH_1_GM20B_PROFILE.classes().three_d().0,
+            &[0x01, 0x11, 0x41, 0x51, 0x1001, 0x1011, 0x1041, 0x1051],
+        );
+    }
+
+    fn inline_flush_modes_commit_between_backend_segments(class: u32, launches: &[u32]) {
+        let subchannel = u32::from(class == SWITCH_1_GM20B_PROFILE.classes().compute().0);
         // Match the observed 0x340-byte upload, including a packet boundary in
         // the payload. Data is synthetic; command and visibility paths are real.
         let data: Vec<u32> = (0..0x340 / 4).map(|index| 0xcafe_0000 | index).collect();
         let expected: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
-        for raw in [0x01, 0x11, 0x41, 0x51] {
+        for &raw in launches {
             for with_backend in [false, true] {
                 let mut address_space = address_space();
                 let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
@@ -2036,23 +2054,26 @@ mod tests {
                     MaxwellChannelOwner::new(1),
                     SWITCH_1_GM20B_PROFILE,
                 );
-                let mut packets = vec![packet(
-                    1,
-                    0,
-                    &[SWITCH_1_GM20B_PROFILE.classes().compute().0],
-                )];
+                let mut packets = vec![packet(subchannel, 0, &[class])];
                 if with_backend {
+                    if subchannel != 1 {
+                        packets.push(packet(
+                            1,
+                            0,
+                            &[SWITCH_1_GM20B_PROFILE.classes().compute().0],
+                        ));
+                    }
                     packets.push(packet(1, 0x1698 / 4, &[0x1000]));
                 }
                 packets.extend([
                     packet(
-                        1,
+                        subchannel,
                         0x0180 / 4,
                         &[0x340, 1, (address >> 32) as u32, address as u32],
                     ),
-                    packet(1, 0x01b0 / 4, &[raw]),
-                    non_incrementing_packet(1, 0x01b4 / 4, &data[..17]),
-                    non_incrementing_packet(1, 0x01b4 / 4, &data[17..]),
+                    packet(subchannel, 0x01b0 / 4, &[raw]),
+                    non_incrementing_packet(subchannel, 0x01b4 / 4, &data[..17]),
+                    non_incrementing_packet(subchannel, 0x01b4 / 4, &data[17..]),
                 ]);
                 if with_backend {
                     packets.push(packet(1, 0x1698 / 4, &[0x1011]));
@@ -2067,7 +2088,9 @@ mod tests {
                     &mut MaxwellLoweringCache::default(),
                 )
                 .unwrap();
-                assert_eq!(channel.compute().inline_to_memory().pending(), None);
+                if class == SWITCH_1_GM20B_PROFILE.classes().compute().0 {
+                    assert_eq!(channel.compute().inline_to_memory().pending(), None);
+                }
                 assert!(plan.has_deferred_canonical_writes());
                 assert_eq!(plan.requires_backend(), with_backend);
                 assert_eq!(plan.completion(), None);

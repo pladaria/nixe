@@ -21,6 +21,7 @@ mod fp_add;
 mod fp_divide;
 mod fp_effects;
 mod fp_fused;
+mod fp_min_max_number;
 mod fp_multiply;
 mod fp_to_integer;
 mod fp_unary;

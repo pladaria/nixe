@@ -39,6 +39,11 @@ const IOCTL_CHANNEL_ALLOC_OBJ_CTX: u32 = 0xc010_4809;
 const IOCTL_CHANNEL_ZCULL_BIND: u32 = 0xc010_480b;
 const IOCTL_CHANNEL_SET_ERROR_NOTIFIER: u32 = 0xc018_480c;
 const IOCTL_CHANNEL_SET_PRIORITY: u32 = 0x4004_480d;
+// These channel requests use type 0x47, despite belonging to /dev/nvhost-gpu.
+// https://github.com/switchbrew/libnx/blob/master/nx/source/nvidia/ioctl/nvchannel.c#L176-L185
+// https://switchbrew.org/wiki/NV_services#NVGPU_IOCTL_CHANNEL_GET_USER_DATA
+const IOCTL_CHANNEL_SET_USER_DATA: u32 = 0x4008_4714;
+const IOCTL_CHANNEL_GET_USER_DATA: u32 = 0x8008_4715;
 const IOCTL_CHANNEL_ALLOC_GPFIFO_EX2: u32 = 0xc020_481a;
 const IOCTL_CHANNEL_SUBMIT_GPFIFO2: u32 = 0xc018_481b;
 const IOCTL_CHANNEL_SET_TIMESLICE: u32 = 0xc004_481d;
@@ -290,13 +295,12 @@ impl NvHostGpu {
             }
             IOCTL_CHANNEL_SET_ERROR_NOTIFIER => {
                 require_input_size(input, 24)?;
-                if input_u64(input, 0)? != 0 || input_u64(input, 8)? != 0 {
-                    return Err(unsupported_configuration(descriptor, request));
-                }
+                // Horizon ignores the Linux buffer offset/size and reserved
+                // word; the former memory handle is a nonzero enable value.
+                // Error records are retrieved by separate channel ioctls.
+                // https://switchbrew.org/wiki/NV_services#NVGPU_IOCTL_CHANNEL_SET_ERROR_NOTIFIER
+                // https://github.com/switchbrew/libnx/blob/master/nx/source/nvidia/ioctl/nvchannel.c#L104-L118
                 let enable = input_u32(input, 16)?;
-                if input_u32(input, 20)? != 0 || enable > 1 {
-                    return Err(NvDrvCallError::GuestResult(NV_BAD_VALUE));
-                }
                 channel.set_error_notifier(enable != 0);
                 Ok(input.to_vec())
             }
@@ -306,6 +310,15 @@ impl NvHostGpu {
                     .map_err(|error| channel_driver_result(descriptor, request, error))?;
                 channel.set_priority(priority);
                 Ok(input.to_vec())
+            }
+            IOCTL_CHANNEL_SET_USER_DATA => {
+                require_input_size(input, 8)?;
+                channel.set_user_data(input_u64(input, 0)?);
+                Ok(input.to_vec())
+            }
+            IOCTL_CHANNEL_GET_USER_DATA => {
+                require_input_size(input, 0)?;
+                Ok(channel.user_data().to_le_bytes().to_vec())
             }
             IOCTL_CHANNEL_SET_TIMESLICE => {
                 require_input_size(input, 4)?;

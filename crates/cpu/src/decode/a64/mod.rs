@@ -52,7 +52,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0022..=0x0000_002f | 0x0000_005e..=0x0000_005f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a5 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a8 => {
             A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -169,6 +169,80 @@ mod tests {
                 };
                 assert_eq!(coverage_id, pattern.coverage_id);
                 assert_eq!(support, pattern.decoder);
+            }
+        }
+    }
+
+    #[test]
+    fn fminmaxnm_decodes_single_double_and_keeps_half_precision_unsupported() {
+        for minimum in [false, true] {
+            for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+                let location =
+                    LocationDescriptor::new(GuestVirtualAddress::new(0), platform.profile_id());
+                for (word, rd, rn, rm, opc) in
+                    [(0x1e21_6802, 2, 0, 1, 0), (0x1e7f_6bff, 31, 31, 31, 1)]
+                {
+                    let word = word | (u32::from(minimum) << 12);
+                    let encoding = InstructionEncoding::from_u32(word);
+                    let DecodeResult::Decoded(decoded) = decode(platform, location, encoding)
+                    else {
+                        panic!("FMAXNM {word:08x} did not decode");
+                    };
+                    let instruction = normalize(&decoded.instruction, encoding);
+                    let fields =
+                        match instruction {
+                            A64Instruction::FpSimd(fp_simd::Instruction::ScalarFloatMinNumber(
+                                f,
+                            )) if minimum => f,
+                            A64Instruction::FpSimd(fp_simd::Instruction::ScalarFloatMaxNumber(
+                                f,
+                            )) if !minimum => f,
+                            _ => panic!("{decoded:?}"),
+                        };
+                    assert_eq!(
+                        (fields.rd, fields.rn, fields.rm, fields.opc),
+                        (rd, rn, rm, opc)
+                    );
+                }
+                assert!(!matches!(
+                    decode(
+                        platform,
+                        location,
+                        InstructionEncoding::from_u32(0x1ee1_6802 | (u32::from(minimum) << 12))
+                    ),
+                    DecodeResult::Decoded(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn uaddlv_decodes_all_arrangements_and_rejects_reserved_sizes() {
+        for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+            let location =
+                LocationDescriptor::new(GuestVirtualAddress::new(0), platform.profile_id());
+            for (size, full) in [(0, false), (0, true), (1, false), (1, true), (2, true)] {
+                let word = 0x2e30_3800 | (size << 22) | (u32::from(full) << 30) | (31 << 5) | 31;
+                let encoding = InstructionEncoding::from_u32(word);
+                let DecodeResult::Decoded(decoded) = decode(platform, location, encoding) else {
+                    panic!("UADDLV {word:08x} was not decoded");
+                };
+                let A64Instruction::FpSimd(fp_simd::Instruction::UnsignedAddLongAcrossVector(
+                    fields,
+                )) = normalize(&decoded.instruction, encoding)
+                else {
+                    panic!("{decoded:?}");
+                };
+                assert_eq!(
+                    (fields.rd, fields.rn, fields.opc, fields.vector_128),
+                    (31, 31, size as u8, full)
+                );
+            }
+            for word in [0x2eb0_3800, 0x2ef0_3800, 0x6ef0_3800] {
+                assert!(!matches!(
+                    decode(platform, location, InstructionEncoding::from_u32(word)),
+                    DecodeResult::Decoded(_)
+                ));
             }
         }
     }

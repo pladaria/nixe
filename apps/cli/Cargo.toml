@@ -5,6 +5,8 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+sdl3.workspace = true
+nixe-audio.workspace = true
 ctrlc.workspace = true
 log.workspace = true
 sha2.workspace = true

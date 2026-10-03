@@ -52,3 +52,33 @@ SAHF is an x86 instruction and imposes no requirement on AArch64 hosts. Their
 native boundary reads and writes the architecture's NZCV register directly.
 128-bit atomics do not require LSE: the JIT uses CASPAL when available and a
 validated LDAXP/STLXP loop otherwise.
+
+## Audio output
+
+`audout:u` uses SDL3 to open the host's default output when a guest opens
+`DeviceOut`. The emulated output is currently stereo signed-16-bit PCM at 48 kHz.
+SDL adapts this PCM stream to the physical device's format and sample rate.
+SDL is initialized once on the application's main thread; input sampling and
+SDL's audio callback run independently. No audio feeder worker is required.
+
+The optional `nixe.toml` setting is:
+
+```toml
+[audio]
+output = "stereo"
+```
+
+Omitting it selects the same stereo (2.0) mode. Other layouts, including 5.1,
+are rejected until their Horizon semantics and channel routing are implemented.
+The output layout and PCM format are explicit types shared by configuration and
+the host adapter, so future modes do not require another playback backend.
+
+SDL consumes PCM on demand. Empty or stopped queues supply silence without
+manufacturing buffer completions. Stopping an active guest output releases its
+pending buffers; closing its last session handle destroys the SDL stream.
+Application shutdown closes any remaining streams before the SDL audio subsystem.
+Flush/volume commands and six-channel guest buffers remain unsupported.
+
+See [SDL3 audio streams](https://wiki.libsdl.org/SDL3/SDL_AudioStream) for host
+format conversion and [SDL3 audio devices](https://wiki.libsdl.org/SDL3/CategoryAudio)
+for default-device migration.

@@ -45,6 +45,7 @@ pub(crate) fn is_register_simd(instruction: Instruction) -> bool {
             | Instruction::VectorUnsignedShiftRegister(_)
             | Instruction::CountBits(_)
             | Instruction::AddAcrossVector(_)
+            | Instruction::UnsignedAddLongAcrossVector(_)
             | Instruction::ScalarFloatImmediate(_)
             | Instruction::VectorFloatImmediate(_)
             | Instruction::ScalarFloatConditionalSelect(_)
@@ -215,7 +216,8 @@ impl Translator<'_> {
                 self.write_vector(fields.rd, value);
                 Ok(())
             }
-            Instruction::AddAcrossVector(_) => self.emit_add_across(fields),
+            Instruction::AddAcrossVector(_) => self.emit_add_across(fields, false),
+            Instruction::UnsignedAddLongAcrossVector(_) => self.emit_add_across(fields, true),
             Instruction::ScalarFloatImmediate(_) | Instruction::VectorFloatImmediate(_) => {
                 self.emit_float_immediate(instruction, fields)
             }
@@ -733,12 +735,26 @@ impl Translator<'_> {
         Ok(())
     }
 
-    pub(crate) fn emit_add_across(&mut self, fields: Operands) -> Result<(), Error> {
-        let lane_bits = 8_u32 << fields.opc;
-        let lane_count = (if fields.vector_128 { 128 } else { 64 }) / lane_bits;
+    // UADDLV widens before adding, preserving carries across source lane widths.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pub(crate) fn emit_add_across(&mut self, fields: Operands, widen: bool) -> Result<(), Error> {
+        let mut lane_bits = 8_u32 << fields.opc;
+        let mut lane_count = (if fields.vector_128 { 128 } else { 64 }) / lane_bits;
         let lane = integer_lane_type(lane_bits)?;
-        let vector_ty = vector_type(lane, lane_bits)?;
+        let mut vector_ty = vector_type(lane, lane_bits)?;
         let mut value = self.read_vector_as(fields.rn, vector_ty)?;
+        if widen {
+            let low = self.builder.ins().uwiden_low(value);
+            value = if fields.vector_128 {
+                let high = self.builder.ins().uwiden_high(value);
+                self.builder.ins().iadd(low, high)
+            } else {
+                low
+            };
+            lane_bits *= 2;
+            lane_count = 128 / lane_bits;
+            vector_ty = vector_type(integer_lane_type(lane_bits)?, lane_bits)?;
+        }
         let lane_bytes = lane_bits / 8;
         let mut distance = lane_count / 2;
         while distance != 0 {

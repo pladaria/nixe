@@ -15,8 +15,9 @@ pub fn run() -> Result<(), String> {
     }
 
     let interrupted = install_interrupt_handler()?;
-    let mut input =
-        InputWorker::unmapped().map_err(|error| format!("cannot start input worker: {error}"))?;
+    let sdl = sdl3::init().map_err(|error| format!("cannot initialize SDL: {error}"))?;
+    let mut input = InputWorker::unmapped(&sdl)
+        .map_err(|error| format!("cannot start input worker: {error}"))?;
     let _terminal = TerminalSession::enter()?;
     render(&None)?;
     let mut previous = None;

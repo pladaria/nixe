@@ -76,14 +76,21 @@ impl VirtualClock {
         self.state.mode
     }
 
-    /// Deterministic scheduler timeline. Unlike service wall time, this value
-    /// advances only through coordinator decisions and never samples the host.
+    /// Scheduler time follows the same monotonic host clock in realtime mode,
+    /// so host device events can arrive before guest wait deadlines expire.
+    /// Fixed-clock runs advance only through explicit coordinator decisions.
     #[must_use]
     pub fn scheduler_time_ns(&self) -> u64 {
-        self.state.scheduler_time_ns.load(Ordering::Acquire)
+        let scheduled = self.state.scheduler_time_ns.load(Ordering::Acquire);
+        match self.state.mode {
+            VirtualClockMode::Realtime => {
+                scheduled.max(self.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+            }
+            VirtualClockMode::Fixed { .. } => scheduled,
+        }
     }
 
-    /// Advances the deterministic scheduler timeline monotonically. Runtime
+    /// Advances the explicit scheduler timeline monotonically. Runtime
     /// coordinators are the production authority; adapters use this only to
     /// synchronize compatibility dispatch paths with that authority.
     pub fn advance_scheduler_to(&self, nanoseconds: u64) {

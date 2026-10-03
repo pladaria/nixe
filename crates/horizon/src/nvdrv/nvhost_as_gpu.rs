@@ -308,6 +308,10 @@ fn address_space_driver_result(
     request: u32,
     error: MaxwellAddressSpaceError,
 ) -> NvDrvCallError {
+    log::debug!(
+        "nvdrv GPU address-space operation failed: fd={} request={request:#010x} reason={error}",
+        descriptor.fd(),
+    );
     // Invalid-state, bad-value, unsupported sparse-small-page, allocation
     // exhaustion, and overflow remain distinct NVIDIA results in the public
     // frontend behavior pinned here:

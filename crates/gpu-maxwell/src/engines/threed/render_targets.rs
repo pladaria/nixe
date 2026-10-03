@@ -879,6 +879,8 @@ pub struct MaxwellThreeDRenderTargetState {
     color: [MaxwellThreeDColorTargetState; MAXWELL_COLOR_TARGET_COUNT],
     color_target_selection: MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection>,
     compression_threshold: MaxwellThreeDRegister<MaxwellThreeDCompressionThreshold>,
+    color_zero_bandwidth_clear: MaxwellThreeDRegister<u16>,
+    depth_zero_bandwidth_clear: MaxwellThreeDRegister<u16>,
     separate_fragment_data: MaxwellThreeDRegister<MaxwellThreeDSeparateFragmentData>,
     render_target_layer: MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer>,
     render_target_index_offset: MaxwellThreeDRegister<MaxwellThreeDRenderTargetIndexOffset>,
@@ -903,6 +905,25 @@ impl MaxwellThreeDRenderTargetState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDCompressionThreshold> {
         &self.compression_threshold
+    }
+    /// Fifteen-bit disable mask for the color ZBC table slots.
+    ///
+    /// ZBC encodes constant tiles using table indices instead of pixel bytes:
+    /// <https://patents.google.com/patent/US8862823B1/en>.
+    /// These masks restrict that storage optimization, not the clear value or
+    /// affected attachments. Our clear path materializes resident images and
+    /// does not emit guest ZBC tags, so neither mask changes neutral GPU work.
+    /// Compressed imports still require their existing explicit support.
+    /// Field definitions:
+    /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h>.
+    #[must_use]
+    pub const fn color_zero_bandwidth_clear(&self) -> &MaxwellThreeDRegister<u16> {
+        &self.color_zero_bandwidth_clear
+    }
+    /// Fifteen-bit disable mask for the depth ZBC table slots, independent of color.
+    #[must_use]
+    pub const fn depth_zero_bandwidth_clear(&self) -> &MaxwellThreeDRegister<u16> {
+        &self.depth_zero_bandwidth_clear
     }
     #[must_use]
     pub const fn separate_fragment_data(
@@ -993,6 +1014,14 @@ impl MaxwellThreeDRenderTargetState {
             }
             MaxwellThreeDRenderTargetWrite::CompressionThreshold { value, .. } => {
                 self.compression_threshold = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDRenderTargetWrite::ColorZeroBandwidthClear { value, .. } => {
+                self.color_zero_bandwidth_clear =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDRenderTargetWrite::DepthZeroBandwidthClear { value, .. } => {
+                self.depth_zero_bandwidth_clear =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDRenderTargetWrite::SeparateFragmentData { value, .. } => {
                 self.separate_fragment_data = MaxwellThreeDRegister::programmed(raw, value, source)
@@ -1133,6 +1162,14 @@ pub enum MaxwellThreeDRenderTargetWrite {
         value: MaxwellThreeDCompressionThreshold,
         source: MaxwellMethodSource,
     },
+    ColorZeroBandwidthClear {
+        value: u16,
+        source: MaxwellMethodSource,
+    },
+    DepthZeroBandwidthClear {
+        value: u16,
+        source: MaxwellMethodSource,
+    },
     SeparateFragmentData {
         value: MaxwellThreeDSeparateFragmentData,
         source: MaxwellMethodSource,
@@ -1236,6 +1273,8 @@ impl MaxwellThreeDRenderTargetWrite {
             | Self::ColorCompression { source, .. }
             | Self::ColorTargetSelection { source, .. }
             | Self::CompressionThreshold { source, .. }
+            | Self::ColorZeroBandwidthClear { source, .. }
+            | Self::DepthZeroBandwidthClear { source, .. }
             | Self::SeparateFragmentData { source, .. }
             | Self::RenderTargetLayer { source, .. }
             | Self::RenderTargetIndexOffset { source, .. }

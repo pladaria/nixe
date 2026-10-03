@@ -142,22 +142,44 @@ fn three_d_embedded_inline_upload_rejects_unrepresented_block_linear_rows() {
 
 #[test]
 fn three_d_embedded_inline_upload_retains_pitch_flush_only_launch() {
-    let mut channel = three_d_channel();
-    dispatch_incrementing(&mut channel, 0x0180 / 4, &[4, 1, 0, 0x0409_3000]).unwrap();
-    program_three_d(&mut channel, 0x01b0, 0x11);
+    for raw in [0x11, 0x1011] {
+        let mut channel = three_d_channel();
+        dispatch_incrementing(&mut channel, 0x0180 / 4, &[4, 1, 0, 0x0409_3000]).unwrap();
+        program_three_d(&mut channel, 0x01b0, raw);
 
-    let launch = channel
-        .three_d()
-        .inline_to_memory()
-        .launch()
-        .value()
-        .copied()
-        .unwrap();
-    assert_eq!(launch.layout(), MaxwellThreeDInlineToMemoryLayout::Pitch);
-    assert_eq!(
-        launch.completion(),
-        MaxwellThreeDInlineToMemoryCompletion::FlushOnly
-    );
+        let register = channel.three_d().inline_to_memory().launch();
+        assert_eq!(register.raw(), Some(raw));
+        let launch = register.value().unwrap();
+        assert_eq!(launch.layout(), MaxwellThreeDInlineToMemoryLayout::Pitch);
+        assert_eq!(
+            launch.completion(),
+            MaxwellThreeDInlineToMemoryCompletion::FlushOnly
+        );
+        assert!(!launch.system_memory_barrier_disabled());
+    }
+}
+
+#[test]
+fn three_d_embedded_inline_upload_still_rejects_active_unsupported_launch_modes() {
+    for raw in [
+        0x1021, // One-word semaphore release.
+        0x1031, // Undefined completion type.
+        0x1111, // Interrupt enabled.
+        0x1013, // Reduction enabled.
+        0x1091, // Undefined bit 7.
+    ] {
+        let mut channel = three_d_channel();
+        dispatch_incrementing(&mut channel, 0x0180 / 4, &[4, 1, 0, 0x0409_3000]).unwrap();
+        let before = channel.three_d().inline_to_memory().clone();
+        assert!(matches!(
+            dispatch_first(&mut channel, &packet(0x01b0 / 4, raw)),
+            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                method_name: "LAUNCH_DMA",
+                ..
+            })
+        ));
+        assert_eq!(channel.three_d().inline_to_memory(), &before);
+    }
 }
 
 #[test]

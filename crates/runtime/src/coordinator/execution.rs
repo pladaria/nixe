@@ -35,6 +35,7 @@ impl RuntimeCoordinator {
         if let Some(lease) = self.scheduler.active_leases().next() {
             return Err(CoordinatorError::InFlightLease(lease));
         }
+        self.wake_due_deadlines()?;
         let replay_dispatch = self.replay_dispatches.front().copied();
         let select = replay_dispatch.map_or(SchedulerCommand::SelectNext, |(_, lease, _)| {
             SchedulerCommand::Select(lease.vcpu)
@@ -76,6 +77,7 @@ impl RuntimeCoordinator {
         if let Some(lease) = self.scheduler.active_leases().next() {
             return Err(CoordinatorError::InFlightLease(lease));
         }
+        self.wake_due_deadlines()?;
         let mut dispatched = Vec::new();
         let mut first_error = None;
         loop {

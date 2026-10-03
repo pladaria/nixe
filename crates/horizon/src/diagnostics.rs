@@ -1,6 +1,6 @@
 //! Guest-visible diagnostic policy and host-side guest log routing.
 
-/// Host severity policy applied to messages received from Horizon's `lm` service.
+/// Host severity policy for `lm` messages and OutputDebugString (Info by default).
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum GuestLogLevel {
     /// Preserve the severity encoded in each guest log packet.

@@ -97,9 +97,10 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::ScalarFloatMultiply(_)
         | Instruction::ScalarFloatFusedMultiplyAdd(_)
         | Instruction::ScalarFloatSquareRoot(_) => FpLoweringDisposition::GuardedNative,
-        Instruction::CompareRegister(_) | Instruction::CompareZero(_) => {
-            FpLoweringDisposition::GuardedExact
-        }
+        Instruction::ScalarFloatMaxNumber(_)
+        | Instruction::ScalarFloatMinNumber(_)
+        | Instruction::CompareRegister(_)
+        | Instruction::CompareZero(_) => FpLoweringDisposition::GuardedExact,
         Instruction::ScalarFloatRound(_)
             if host == crate::abi::HostAbi::Aarch64
                 && !matches!(
@@ -157,6 +158,7 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::VectorUnsignedShiftRegister(_)
         | Instruction::CountBits(_)
         | Instruction::AddAcrossVector(_)
+        | Instruction::UnsignedAddLongAcrossVector(_)
         | Instruction::ExtractNarrow(_)
         | Instruction::VectorFloatImmediate(_)
         | Instruction::ScalarFloatImmediate(_)

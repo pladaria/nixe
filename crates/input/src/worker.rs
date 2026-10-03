@@ -28,6 +28,8 @@ struct Shared<T> {
     pending: Mutex<Option<InputSample<T>>>,
     available: AtomicBool,
     stop: AtomicBool,
+    finished: AtomicBool,
+    failure: Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -47,14 +49,15 @@ impl<N: Fn()> Drop for NotifyOnExit<'_, N> {
 
 /// Owns the input thread and consumes its most recent complete state.
 ///
-/// SDL initialization, device I/O, profile mapping and destruction all happen
-/// on `nixe-input`. Only owned states cross threads; SDL handles never do.
+/// SDL initialization and subsystem shutdown stay on the calling main thread.
+/// Device I/O, profile mapping and device destruction happen on `nixe-input`.
+/// A separate InputReader can be moved to the emulation thread.
 /// Reading does not wait for device I/O or for the mailbox lock. Dropping the
 /// worker requests shutdown and joins it, including any in-flight device I/O.
 pub struct InputWorker<T> {
     shared: Arc<Shared<T>>,
     thread: Option<JoinHandle<Result<(), String>>>,
-    failure: Option<String>,
+    _subsystems: Option<crate::sdl::InputSubsystems>,
 }
 
 impl InputWorker<Option<ProfiledControllerState>> {
@@ -62,30 +65,39 @@ impl InputWorker<Option<ProfiledControllerState>> {
     /// empty mailbox receives a sample, and when the worker exits. It runs on
     /// the input thread and must return promptly without panicking.
     pub fn with_profiles(
+        sdl: &sdl3::Sdl,
         profiles: GamepadProfiles,
         notify: impl Fn() + Send + 'static,
     ) -> io::Result<Self> {
-        Self::spawn(
+        let owner = crate::sdl::InputSubsystems::new(sdl).map_err(io::Error::other)?;
+        let subsystems = WorkerSubsystems(owner.clone());
+        let mut worker = Self::spawn(
             move || {
-                let backend = SdlInputBackend::new()?;
+                let backend = SdlInputBackend::new(subsystems.take());
                 let mut input = InputManager::with_profiles(backend, profiles);
-                Ok(move || input.read_profiled_input())
+                Ok::<_, crate::sdl::SdlInputError>(move || input.read_profiled_input())
             },
             notify,
-        )
+        )?;
+        worker._subsystems = Some(owner);
+        Ok(worker)
     }
 }
 
 impl InputWorker<Option<ControllerState>> {
-    pub fn unmapped() -> io::Result<Self> {
-        Self::spawn(
-            || {
-                let backend = SdlInputBackend::new()?;
+    pub fn unmapped(sdl: &sdl3::Sdl) -> io::Result<Self> {
+        let owner = crate::sdl::InputSubsystems::new(sdl).map_err(io::Error::other)?;
+        let subsystems = WorkerSubsystems(owner.clone());
+        let mut worker = Self::spawn(
+            move || {
+                let backend = SdlInputBackend::new(subsystems.take());
                 let mut input = InputManager::new(backend);
-                Ok(move || input.read_input())
+                Ok::<_, crate::sdl::SdlInputError>(move || input.read_input())
             },
             || {},
-        )
+        )?;
+        worker._subsystems = Some(owner);
+        Ok(worker)
     }
 }
 
@@ -103,63 +115,89 @@ impl<T: Send + 'static> InputWorker<T> {
             pending: Mutex::new(None),
             available: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            failure: Mutex::new(None),
         });
         let producer = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("nixe-input".to_owned())
             .spawn(move || {
                 let _notify_on_exit = NotifyOnExit(&notify);
-                let mut poll = initialize().map_err(|error| error.to_string())?;
-                while !producer.stop.load(Ordering::Acquire) {
-                    let deadline = Instant::now() + POLL_INTERVAL;
-                    let state = poll().map_err(|error| error.to_string())?;
-                    // Never hold the mailbox across backend work or destruction
-                    // of an overwritten state. Slow consumers skip old samples.
-                    let old = {
-                        let mut pending = producer.pending.lock().unwrap();
-                        let old = pending.replace(InputSample {
-                            captured_at: Instant::now(),
-                            state,
-                        });
-                        producer.available.store(true, Ordering::Release);
-                        old
-                    };
-                    if old.is_none() {
-                        notify();
-                    }
-                    drop(old);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut poll = initialize().map_err(|error| error.to_string())?;
                     while !producer.stop.load(Ordering::Acquire) {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            break;
+                        let deadline = Instant::now() + POLL_INTERVAL;
+                        let state = poll().map_err(|error| error.to_string())?;
+                        // Never hold the mailbox across backend work or destruction
+                        // of an overwritten state. Slow consumers skip old samples.
+                        let old = {
+                            let mut pending = producer.pending.lock().unwrap();
+                            let old = pending.replace(InputSample {
+                                captured_at: Instant::now(),
+                                state,
+                            });
+                            producer.available.store(true, Ordering::Release);
+                            old
+                        };
+                        if old.is_none() {
+                            notify();
                         }
-                        thread::park_timeout(remaining);
+                        drop(old);
+                        while !producer.stop.load(Ordering::Acquire) {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            thread::park_timeout(remaining);
+                        }
                     }
-                }
-                Ok(())
+                    Ok(())
+                }))
+                .unwrap_or_else(|payload| Err(panic_message(payload)));
+                *producer.failure.lock().unwrap() = Some(match &result {
+                    Ok(()) => "input worker stopped unexpectedly".to_owned(),
+                    Err(error) => error.clone(),
+                });
+                producer.finished.store(true, Ordering::Release);
+                result
             })?;
         Ok(Self {
             shared,
             thread: Some(thread),
-            failure: None,
+            _subsystems: None,
         })
     }
 }
 
+/// SDL remains owned by InputWorker; only sampled states cross to consumers.
+pub struct InputReader<T> {
+    shared: Arc<Shared<T>>,
+}
+
 impl<T> InputWorker<T> {
-    /// Takes the latest unread sample, or `None` if no new sample is available.
-    /// Each sample is delivered at most once. A disconnected controller is
-    /// represented by the state's inner `None`, not by an absent sample.
-    /// Backend failures and unexpected worker exits are errors, not disconnects.
-    pub fn take_latest(&mut self) -> Result<Option<InputSample<T>>, InputWorkerError> {
-        if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
-            self.failure = Some(match join(self.thread.take().unwrap()) {
-                Ok(()) => "input worker stopped unexpectedly".to_owned(),
-                Err(error) => error,
-            });
+    pub fn reader(&self) -> InputReader<T> {
+        InputReader {
+            shared: Arc::clone(&self.shared),
         }
-        if let Some(error) = &self.failure {
-            return Err(InputWorkerError(error.clone()));
+    }
+
+    pub fn take_latest(&mut self) -> Result<Option<InputSample<T>>, InputWorkerError> {
+        self.reader().take_latest()
+    }
+}
+
+impl<T> InputReader<T> {
+    /// Takes the latest unread sample without waiting for device I/O.
+    pub fn take_latest(&mut self) -> Result<Option<InputSample<T>>, InputWorkerError> {
+        if self.shared.finished.load(Ordering::Acquire) {
+            return Err(InputWorkerError(
+                self.shared
+                    .failure
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("finished worker publishes its failure first"),
+            ));
         }
         if !self.shared.available.load(Ordering::Acquire) {
             return Ok(None);
@@ -179,15 +217,33 @@ impl<T> InputWorker<T> {
     }
 }
 
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    let reason = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic payload");
+    format!("input worker panicked: {reason}")
+}
+
 fn join(thread: JoinHandle<Result<(), String>>) -> Result<(), String> {
-    thread.join().unwrap_or_else(|payload| {
-        let reason = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("unknown panic payload");
-        Err(format!("input worker panicked: {reason}"))
-    })
+    thread
+        .join()
+        .unwrap_or_else(|payload| Err(panic_message(payload)))
+}
+
+// Only clones cross threads; the !Send InputWorker keeps the original SDL
+// references and joins before releasing them on the main thread. These
+// subsystem operations are thread-safe, unlike initialization/finalization:
+// https://wiki.libsdl.org/SDL3/SDL_UpdateGamepads
+// https://wiki.libsdl.org/SDL3/SDL_OpenGamepad
+// https://wiki.libsdl.org/SDL3/SDL_AddEventWatch
+struct WorkerSubsystems(crate::sdl::InputSubsystems);
+unsafe impl Send for WorkerSubsystems {}
+impl WorkerSubsystems {
+    fn take(self) -> crate::sdl::InputSubsystems {
+        self.0
+    }
 }
 
 impl<T> Drop for InputWorker<T> {
@@ -387,5 +443,29 @@ mod tests {
         let owner = ready.recv_timeout(TEST_TIMEOUT).unwrap();
         drop(worker);
         assert_eq!(destruction.try_recv().unwrap(), owner);
+    }
+    #[test]
+    fn reader_crosses_threads_without_owning_sdl_or_outliving_shutdown_silently() {
+        let (notified, notifications) = mpsc::channel();
+        let worker = InputWorker::spawn(
+            || Ok::<_, &'static str>(|| Ok(Some(7_u32))),
+            move || {
+                let _ = notified.send(());
+            },
+        )
+        .unwrap();
+        notifications.recv_timeout(TEST_TIMEOUT).unwrap();
+        let mut reader = worker.reader();
+        let mut reader = thread::spawn(move || {
+            assert_eq!(reader.take_latest().unwrap().unwrap().state, Some(7));
+            reader
+        })
+        .join()
+        .unwrap();
+        drop(worker);
+        assert_eq!(
+            reader.take_latest().unwrap_err().to_string(),
+            "input worker stopped unexpectedly"
+        );
     }
 }

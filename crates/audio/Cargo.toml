@@ -1,0 +1,10 @@
+[package]
+name = "nixe-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sdl3.workspace = true
+sdl3-sys.workspace = true
+serde.workspace = true

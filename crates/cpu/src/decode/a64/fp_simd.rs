@@ -600,6 +600,17 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         205,
         &[],
     ),
+    // UADDLV sums unsigned lanes into a scalar twice their width.
+    // Arm A64 ISA (2025), UADDLV:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-unsigned-add-long-across-vector",
+        0xbf3f_fc00,
+        0x2e30_3800,
+        0x0000_00a6,
+        205,
+        &[],
+    ),
     // Arm A64 XTN/XTN2 extract the low half of every source element into the
     // lower or upper 64-bit half of the destination, respectively. Arm ARM
     // DDI 0602 (2025-12):
@@ -812,6 +823,26 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x1e20_1800,
         0x0000_0071,
         166,
+        &[],
+    ),
+    // FMAXNM S/D, Arm ISA D4.27 (half precision retains its unsupported boundary).
+    // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab
+    pattern(
+        "fp-scalar-maximum-number",
+        0xffa0_fc00,
+        0x1e20_6800,
+        0x0000_00a7,
+        168,
+        &[],
+    ),
+    // FMINNM S/D shares FMAXNM's NaN processing, selecting the smaller number.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "fp-scalar-minimum-number",
+        0xffa0_fc00,
+        0x1e20_7800,
+        0x0000_00a8,
+        168,
         &[],
     ),
     // Arm A64 FADD/FSUB (scalar), base single/double precision forms. They
@@ -1416,6 +1447,7 @@ instructions!(
     VectorUnsignedShiftRegister,
     CountBits,
     AddAcrossVector,
+    UnsignedAddLongAcrossVector,
     ExtractNarrow,
     VectorSignedIntToFloat,
     VectorUnsignedIntToFloat,
@@ -1433,6 +1465,8 @@ instructions!(
     ScalarFloatDivide,
     ScalarFloatRound,
     ScalarFloatAdd,
+    ScalarFloatMaxNumber,
+    ScalarFloatMinNumber,
     ScalarFloatMultiply,
     ScalarFloatFusedMultiplyAdd,
     ScalarFloatSquareRoot,
@@ -1608,6 +1642,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_0096 => Instruction::VectorUnsignedShiftRegister(operands),
         0x0000_0093 => Instruction::CountBits(operands),
         0x0000_0094 => Instruction::AddAcrossVector(operands),
+        0x0000_00a6 => Instruction::UnsignedAddLongAcrossVector(operands),
         0x0000_0088 => Instruction::ExtractNarrow(operands),
         0x0000_0066..=0x0000_0069 => Instruction::IntegerMinMax(operands),
         0x0000_006a => Instruction::VectorSignedIntToFloat(operands),
@@ -1625,6 +1660,8 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_006f..=0x0000_0070 => Instruction::ScalarFloatConvert(operands),
         0x0000_0071 => Instruction::ScalarFloatDivide(operands),
         0x0000_0072..=0x0000_0078 => Instruction::ScalarFloatRound(operands),
+        0x0000_00a8 => Instruction::ScalarFloatMinNumber(operands),
+        0x0000_00a7 => Instruction::ScalarFloatMaxNumber(operands),
         0x0000_0079..=0x0000_007a => Instruction::ScalarFloatAdd(operands),
         0x0000_007b..=0x0000_007c => Instruction::ScalarFloatMultiply(operands),
         0x0000_0097 => Instruction::ScalarFloatFusedMultiplyAdd(operands),

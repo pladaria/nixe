@@ -20,9 +20,10 @@ use nixe_horizon::{
     switch_1_machine_profile,
 };
 use nixe_input::{
-    ControllerId, EmulatedButtonState, GamepadProfiles, InputWorker, ProfiledControllerState,
+    ControllerId, EmulatedButtonState, GamepadProfiles, InputReader, InputWorker,
+    ProfiledControllerState,
 };
-use nixe_loader_title::NacpLanguage;
+use nixe_loader_title::{NacpLanguage, SupportedLanguages};
 use nixe_memory::NonCpuDeviceId;
 use nixe_runtime::{
     CpuBackendConfig, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
@@ -216,6 +217,12 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         operation_mode: initial_operation_mode,
         time: time_environment,
         settings: settings_environment,
+        application_language: plan.control_metadata().and_then(|control| {
+            desired_application_language(
+                control.supported_languages(),
+                &config.system.preferred_languages,
+            )
+        }),
         diagnostics: horizon_diagnostics(diagnostics_configuration),
     };
     log::debug!(
@@ -241,6 +248,18 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let video_system =
         VideoSystem::with_gpu_backend(presenter, gpu_backend.into_runtime(), config.gpu);
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
+    // SDL initialization and final subsystem shutdown remain on the main thread.
+    // The owners outlive guest execution in both windowed and headless modes.
+    let sdl = sdl3::init().map_err(|error| format!("cannot initialize SDL: {error}"))?;
+    let audio = nixe_audio::HostAudioRuntime::new(&sdl, config.audio.output)
+        .map_err(|error| error.to_string())?;
+    let input_events = coordinator.event_sender();
+    let input_owner = InputWorker::with_profiles(&sdl, gamepad_profiles, move || {
+        input_events.notify_host_service(nixe_runtime::ExternalEventSource::Input);
+    })
+    .map_err(|error| format!("cannot start input worker: {error}"))?;
+    let input = input_owner.reader();
+    let audio_backend = audio.backend();
 
     let Some(frontend) = frontend else {
         return finish_execution(execute_worker(
@@ -248,7 +267,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             process,
             horizon_environment,
             video_system,
-            gamepad_profiles,
+            input,
+            audio_backend,
             trace_interpreter,
         ));
     };
@@ -289,7 +309,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
                 process,
                 horizon_environment,
                 video_system,
-                gamepad_profiles,
+                input,
+                audio_backend,
                 trace_interpreter,
             )
         })
@@ -312,6 +333,22 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         .map_err(|_| "guest execution worker panicked".to_owned())?;
     let execution_result = finish_execution(worker_result);
     frontend_result.map(|_| ()).and(execution_result)
+}
+
+fn desired_application_language(
+    supported: SupportedLanguages,
+    preferences: &[NacpLanguage],
+) -> Option<SystemLanguage> {
+    // The configured preference order is frontend policy. AM receives a
+    // language the title actually declares; settings retain the system locale.
+    // https://switchbrew.org/wiki/NACP#Structure
+    preferences
+        .iter()
+        .copied()
+        .chain([NacpLanguage::AmericanEnglish])
+        .chain(NacpLanguage::ALL)
+        .find(|language| supported.contains(*language))
+        .map(system_language)
 }
 
 const fn system_language(language: NacpLanguage) -> SystemLanguage {
@@ -479,6 +516,7 @@ struct HorizonEnvironment {
     operation_mode: OperationMode,
     time: TimeEnvironment,
     settings: SettingsEnvironment,
+    application_language: Option<SystemLanguage>,
     diagnostics: HorizonDiagnostics,
 }
 
@@ -487,7 +525,8 @@ fn execute_worker(
     process: RunnableProcess,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
-    gamepad_profiles: GamepadProfiles,
+    mut input: InputReader<Option<ProfiledControllerState>>,
+    audio_backend: Arc<dyn nixe_audio::AudioBackend>,
     trace_interpreter: bool,
 ) -> WorkerResult {
     let registration = ProcessRegistration {
@@ -500,24 +539,18 @@ fn execute_worker(
         .expect("CLI process and verified Switch 1 scheduler profile are compatible");
     let execution_started = Instant::now();
     let execution_video = video_system.clone();
-    let input_events = coordinator.event_sender();
-    let mut execution = InputWorker::with_profiles(gamepad_profiles, move || {
-        input_events.notify_host_service(nixe_runtime::ExternalEventSource::Input);
-    })
-    .map_err(|error| format!("cannot start input worker: {error}"))
-    .and_then(|mut input| {
-        let mut scheduled = ScheduledProcess {
-            coordinator: &mut coordinator,
-            process_id,
-        };
-        execute(
-            &mut scheduled,
-            horizon_environment,
-            execution_video,
-            &mut input,
-            trace_interpreter,
-        )
-    });
+    let mut scheduled = ScheduledProcess {
+        coordinator: &mut coordinator,
+        process_id,
+    };
+    let mut execution = execute(
+        &mut scheduled,
+        horizon_environment,
+        execution_video,
+        &mut input,
+        audio_backend,
+        trace_interpreter,
+    );
     log::debug!(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
@@ -595,6 +628,9 @@ fn finish_execution(result: WorkerResult) -> Result<(), String> {
         exit_cause,
         exit_code
     );
+    if let Some(exit) = teardown.exit.as_ref() {
+        log::debug!("guest exit context: {}", exit_context(exit));
+    }
     classify_exit(teardown.exit)
 }
 
@@ -612,7 +648,8 @@ fn execute(
     scheduled: &mut ScheduledProcess<'_>,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
-    input: &mut InputWorker<Option<ProfiledControllerState>>,
+    input: &mut InputReader<Option<ProfiledControllerState>>,
+    audio_backend: Arc<dyn nixe_audio::AudioBackend>,
     trace_interpreter: bool,
 ) -> Result<ExecutionSummary, String> {
     let coordinator = &mut *scheduled.coordinator;
@@ -623,7 +660,11 @@ fn execute(
         horizon_environment.settings,
         video_system,
     )
-    .with_diagnostics(horizon_environment.diagnostics);
+    .with_diagnostics(horizon_environment.diagnostics)
+    .with_audio_backend(audio_backend);
+    if let Some(language) = horizon_environment.application_language {
+        dispatcher = dispatcher.with_application_language(language);
+    }
     let execution_started = Instant::now();
     let execution_rate_enabled = log::log_enabled!(log::Level::Info);
     let mut execution_completions = 0_u64;
@@ -635,7 +676,6 @@ fn execute(
     let mut input_observed = false;
     let mut active_buttons = EmulatedButtonState::default();
     loop {
-        dispatcher.synchronize_virtual_time(coordinator.virtual_time_ns());
         coordinator
             .drain_external_events()
             .map_err(|error| error.to_string())?;
@@ -915,6 +955,31 @@ fn button_transitions(
     .filter_map(|(name, previous, current)| (previous != current).then_some((name, current)))
 }
 
+fn exit_context(exit: &ProcessExit) -> String {
+    let source = exit
+        .source
+        .map_or_else(|| "unknown".to_owned(), |source| source.to_string());
+    let registers = exit
+        .context
+        .as_ref()
+        .map_or_else(|| "unavailable".to_owned(), |context| context.to_string());
+    let frames = exit
+        .frames
+        .iter()
+        .map(|frame| {
+            format!(
+                "fp=0x{:016x} lr=0x{:016x}",
+                frame.frame_pointer, frame.return_address
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "source=[{source}], thread={}, registers=[{registers}], frames=[{frames}]",
+        exit.thread_id
+    )
+}
+
 fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
     let Some(exit) = exit else {
         return Err("guest execution ended without an exit record".to_owned());
@@ -967,27 +1032,10 @@ fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
                     format!(", payload=0x{encoded}")
                 }
             });
-            let source = exit
-                .source
-                .map_or_else(|| "unknown".to_owned(), |source| source.to_string());
-            let registers = exit
-                .context
-                .as_ref()
-                .map_or_else(|| "unavailable".to_owned(), |context| context.to_string());
-            let frames = exit
-                .frames
-                .iter()
-                .map(|frame| {
-                    format!(
-                        "fp=0x{:016x} lr=0x{:016x}",
-                        frame.frame_pointer, frame.return_address
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            let context = exit_context(&exit);
             Err(format!(
-                "guest requested a fatal break: reason={reason:#x}, info={info:#x}, size={size:#x}{payload}, source=[{source}], thread={}, registers=[{registers}], frames=[{frames}], code={:#x}",
-                exit.thread_id, exit.exit_code
+                "guest requested a fatal break: reason={reason:#x}, info={info:#x}, size={size:#x}{payload}, {context}, code={:#x}",
+                exit.exit_code
             ))
         }
     }
@@ -1037,6 +1085,46 @@ fn execution_stop_error(stop: &ExecutionStop, report: &nixe_runtime::ExecutionRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_language_respects_preferences_and_declared_support() {
+        let supported = SupportedLanguages::from_raw(
+            NacpLanguage::Spanish.bit() | NacpLanguage::AmericanEnglish.bit(),
+        );
+        assert_eq!(
+            desired_application_language(
+                supported,
+                &[NacpLanguage::Japanese, NacpLanguage::Spanish]
+            ),
+            Some(SystemLanguage::Spanish)
+        );
+        assert_eq!(
+            desired_application_language(
+                supported,
+                &[NacpLanguage::Spanish, NacpLanguage::AmericanEnglish]
+            ),
+            Some(SystemLanguage::Spanish)
+        );
+        assert_eq!(
+            desired_application_language(supported, &[NacpLanguage::Japanese]),
+            Some(SystemLanguage::AmericanEnglish)
+        );
+        assert_eq!(
+            desired_application_language(
+                SupportedLanguages::from_raw(NacpLanguage::Japanese.bit()),
+                &[]
+            ),
+            Some(SystemLanguage::Japanese)
+        );
+        assert_eq!(
+            desired_application_language(SupportedLanguages::default(), &[]),
+            None
+        );
+        assert_eq!(
+            desired_application_language(SupportedLanguages::from_raw(1 << 31), &[]),
+            None
+        );
+    }
 
     #[test]
     fn teardown_failure_preserves_execution_error_without_panicking() {

@@ -27,8 +27,10 @@ const CMIF_COMMAND_CLOSE: u16 = 2;
 #[derive(Clone, Copy)]
 pub(crate) struct HostSystems<'a> {
     pub video: &'a VideoSystem,
+    pub audio_backend: Option<&'a std::sync::Arc<dyn nixe_audio::AudioBackend>>,
     pub hid: &'a HidSystem,
     pub settings: &'a SettingsEnvironment,
+    pub application_language: Option<crate::SystemLanguage>,
     pub diagnostics: &'a crate::HorizonDiagnostics,
     pub caller_thread_id: u64,
 }
@@ -43,6 +45,7 @@ impl HorizonIpcObject {
             Self::NetworkInterface(session) => session.is_domain(),
             Self::Account(session) => session.is_domain(),
             Self::Bsd(session) => session.is_domain(),
+            Self::Ssl(session) => session.is_domain(),
             _ => false,
         }
     }
@@ -78,6 +81,9 @@ impl HorizonIpcObject {
                 }),
             Self::AccountManagerForApplication(_) => "IManagerForApplication",
             Self::Bsd(_) => "bsd:u",
+            Self::Ssl(_) => "ssl",
+            Self::AudioOutManager(_) => "audout:u",
+            Self::AudioOut(_) => "IAudioOut",
             Self::Hid(_) => "hid",
             Self::HidAppletResource(_) => "IAppletResource",
             Self::Time(session) => domain_object
@@ -244,9 +250,14 @@ pub(crate) fn send_sync_request_from_buffer(
         HorizonIpcObject::Performance(session) => {
             services::dispatch_performance_session(&session, request)?
         }
-        HorizonIpcObject::Applet(applet) => {
-            services::dispatch_applet(process, &applet, request, &hipc, host_systems.video)?
-        }
+        HorizonIpcObject::Applet(applet) => services::dispatch_applet(
+            process,
+            &applet,
+            request,
+            &hipc,
+            host_systems.video,
+            host_systems.application_language,
+        )?,
         HorizonIpcObject::Account(account) => {
             services::dispatch_account(process, &account, request, &hipc)?
         }
@@ -255,6 +266,13 @@ pub(crate) fn send_sync_request_from_buffer(
         }
         HorizonIpcObject::Bsd(session) => {
             services::dispatch_bsd(process, &session, request, &hipc)?
+        }
+        HorizonIpcObject::Ssl(session) => services::dispatch_ssl(&session, request, &hipc)?,
+        HorizonIpcObject::AudioOutManager(session) => {
+            services::dispatch_audio_out_manager(process, &session, request, &hipc)?
+        }
+        HorizonIpcObject::AudioOut(session) => {
+            services::dispatch_audio_out(process, &session, request, &hipc)?
         }
         HorizonIpcObject::Hid(hid) => {
             services::dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?

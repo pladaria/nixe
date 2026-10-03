@@ -22,6 +22,9 @@ impl Translator<'_> {
             | Instruction::ConditionalCompare(_) => self.fp_compare(pc, instruction, flags),
             Instruction::ScalarFloatRound(_) => self.fp_round(pc, instruction, flags),
             Instruction::ScalarFloatAdd(_) => self.fp_add(pc, instruction, flags),
+            Instruction::ScalarFloatMaxNumber(_) | Instruction::ScalarFloatMinNumber(_) => {
+                self.fp_min_max_number(pc, instruction, flags)
+            }
             Instruction::VectorFloatAdd(_) => self.vector_fp_add(pc, instruction, flags),
             Instruction::ScalarFloatDivide(_) => self.fp_divide(pc, instruction, flags),
             Instruction::VectorFloatDivide(_) => self.vector_fp_divide(pc, instruction, flags),
@@ -89,6 +92,68 @@ impl Translator<'_> {
             operation.signed,
         );
         self.write_register(f.rd, result);
+        Ok(false)
+    }
+
+    // FMINNM/FMAXNM's normal/zero domain needs only integer ordering, so it cannot
+    // modify host FP status and does not need to activate a host FP epoch.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    fn fp_min_max_number(
+        &mut self,
+        pc: GuestVirtualAddress,
+        instruction: Instruction,
+        flags: &LazyFlags<ir::Value>,
+    ) -> Result<bool, Error> {
+        let f = instruction.operands();
+        let width = scalar_width(f.opc)?;
+        let first = self.scalar_fp_bits(f.rn, width)?;
+        let second = self.scalar_fp_bits(f.rm, width)?;
+        let first_ok = self.fp_finite_or_zero(first, width);
+        let second_ok = self.fp_finite_or_zero(second, width);
+        let direct = self.builder.ins().band(first_ok, second_ok);
+        let native = self.builder.create_block();
+        let exact = self.builder.create_block();
+        self.builder.set_cold_block(exact);
+        self.builder.ins().brif(direct, native, &[], exact, &[]);
+        self.builder.switch_to_block(exact);
+        self.constant_exit(
+            pc,
+            pc,
+            EdgeKind::FpMinMaxNumber(crate::abi::FpMinMaxNumberOperation {
+                minimum: matches!(instruction, Instruction::ScalarFloatMinNumber(_)),
+                rn: f.rn,
+                rm: f.rm,
+                rd: f.rd,
+                width_64: width == 64,
+            }),
+            NativeExitReason::Architectural,
+            flags,
+        )?;
+        self.builder.switch_to_block(native);
+        let sign = self.builder.ins().iconst(
+            if width == 32 { types::I32 } else { types::I64 },
+            (1_u64 << (width - 1)) as i64,
+        );
+        let mut keys = [first, second];
+        for key in &mut keys {
+            let negative = self
+                .builder
+                .ins()
+                .icmp_imm_s(IntCC::SignedLessThan, *key, 0);
+            let inverted = self.builder.ins().bnot(*key);
+            let positive = self.builder.ins().bor(*key, sign);
+            *key = self.builder.ins().select(negative, inverted, positive);
+        }
+        let comparison = if matches!(instruction, Instruction::ScalarFloatMinNumber(_)) {
+            IntCC::UnsignedLessThan
+        } else {
+            IntCC::UnsignedGreaterThan
+        };
+        let selected = self.builder.ins().icmp(comparison, keys[0], keys[1]);
+        let result = self.builder.ins().select(selected, first, second);
+        let result = self.builder.ins().uextend(types::I128, result);
+        let result = self.vector_as(result, types::I8X16);
+        self.write_vector(f.rd, result);
         Ok(false)
     }
 

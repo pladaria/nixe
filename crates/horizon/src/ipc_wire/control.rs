@@ -106,6 +106,26 @@ pub(super) fn dispatch_control(
             write_domain_conversion(process, address, size, request.token, object_id)?;
             log::debug!("bsd:u converted to domain with root object {object_id:#x}");
         }
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Ssl(session)) => {
+            let object_id = session.convert_to_domain();
+            write_domain_conversion(process, address, size, request.token, object_id)?;
+            log::debug!("ssl converted to domain with root object {object_id:#x}");
+        }
+        (
+            CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
+            HorizonIpcObject::Ssl(session),
+        ) => {
+            // SSL's session manager sends requests through clones of its domain.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/ssl.c
+            install_clone(
+                process,
+                address,
+                size,
+                request.token,
+                HorizonIpcObject::Ssl(session.clone()),
+                "cloning an SSL session handle",
+            )?;
+        }
         (
             CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
             HorizonIpcObject::SemanticService(service),
@@ -186,6 +206,19 @@ pub(super) fn dispatch_control(
                 "cloning a BSD session handle",
             )?;
             log::debug!("bsd:u cloned session {handle:#x} as {cloned_handle:#x}");
+        }
+        (
+            CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
+            HorizonIpcObject::AudioOutManager(_) | HorizonIpcObject::AudioOut(_),
+        ) => {
+            install_clone(
+                process,
+                address,
+                size,
+                request.token,
+                target.clone(),
+                "cloning an audio session handle",
+            )?;
         }
         (CmifControlCommand::QueryPointerBufferSize, _) => {
             // Zero makes libnx use map-alias buffers, which the descriptor
