@@ -2220,6 +2220,8 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
     let vertex = vertex_mapping.offset().get();
     let target = target_mapping.offset().get();
     let mut channel = three_d_channel();
+    // The fixture assigns its two synthetic stages to slots 0/1.
+    program_three_d(&mut channel, 0x2140, 0x50);
     program_polygon_fill(&mut channel);
     for (method, argument) in [
         (0x1918, 1),
@@ -2620,6 +2622,8 @@ fn procedural_draw_lowers_without_fabricating_a_vertex_stream() {
     .offset()
     .get();
     let mut channel = three_d_channel();
+    // The fixture assigns its two synthetic stages to slots 0/1.
+    program_three_d(&mut channel, 0x2140, 0x50);
     program_polygon_fill(&mut channel);
     for (method, argument) in [
         (0x1918, 0),

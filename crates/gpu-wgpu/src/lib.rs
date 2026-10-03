@@ -522,9 +522,10 @@ fn required_features_for_image_format(format: ImageFormat) -> wgpu::Features {
         // The neutral format capability currently covers every supported use of
         // a format. Keep the float32 family out of that contract unless wgpu can
         // also represent its filtered sampled-image use exactly.
-        ImageFormat::R32Float | ImageFormat::Rg32Float | ImageFormat::Rgba32Float => {
-            wgpu::Features::FLOAT32_FILTERABLE
-        }
+        ImageFormat::Rgb565Unorm
+        | ImageFormat::R32Float
+        | ImageFormat::Rg32Float
+        | ImageFormat::Rgba32Float => wgpu::Features::FLOAT32_FILTERABLE,
         _ => wgpu::Features::empty(),
     }
 }
@@ -580,7 +581,8 @@ fn capabilities(
     )
 }
 
-const ALL_IMAGE_FORMATS: [ImageFormat; 20] = [
+const ALL_IMAGE_FORMATS: [ImageFormat; 21] = [
+    ImageFormat::Rgb565Unorm,
     ImageFormat::Bc1RgbUnorm,
     ImageFormat::Bc1RgbSrgb,
     ImageFormat::Bc1RgbaUnorm,

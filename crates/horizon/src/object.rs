@@ -1,6 +1,6 @@
 //! Horizon-owned objects retained in the generic runtime handle table.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io;
@@ -43,6 +43,7 @@ pub enum HorizonIpcObject {
     AudioOut(crate::AudioOutSession),
     Hid(HidSession),
     HidAppletResource(HidAppletResource),
+    HidActiveVibrationDeviceList(HidActiveVibrationDeviceList),
     Time(TimeServiceSession),
     SystemClock(SystemClockSession),
     SteadyClock(SteadyClockSession),
@@ -849,6 +850,68 @@ pub struct HidAppletResource {
 impl HidAppletResource {
     pub(crate) fn shared_memory(&self) -> SharedMemoryObject {
         self.shared_memory.clone()
+    }
+}
+
+/// Session-owned actuator registrations returned by HID command 203.
+/// Registering an actuator does not submit a vibration value to the host.
+#[derive(Clone, Debug, Default)]
+pub struct HidActiveVibrationDeviceList {
+    active_devices: Arc<Mutex<BTreeSet<u32>>>,
+}
+
+impl HidActiveVibrationDeviceList {
+    pub(crate) fn activate(&self, handle: u32) -> bool {
+        if crate::hid::vibration_device_position(handle).is_none() {
+            return false;
+        }
+        self.active_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(handle);
+        true
+    }
+}
+
+#[cfg(test)]
+mod hid_vibration_tests {
+    use super::*;
+
+    #[test]
+    fn active_vibration_lists_own_deduplicated_registrations_until_last_close() {
+        let list = HidActiveVibrationDeviceList::default();
+        let clone = list.clone();
+        let other = HidActiveVibrationDeviceList::default();
+        for handle in [
+            0x0000_0003,
+            0x0001_0003,
+            0x0000_0003,
+            0x0000_2004,
+            0x0001_1005,
+            0x0000_0106,
+            0x0001_0107,
+        ] {
+            assert!(list.activate(handle));
+        }
+        let devices = clone.active_devices.lock().unwrap().clone();
+        assert_eq!(devices.len(), 6);
+        for invalid in [
+            0x0100_0003,
+            0x0002_0003,
+            0x0000_0803,
+            0x0001_0006,
+            0x0000_0007,
+            0,
+        ] {
+            assert!(!list.activate(invalid));
+        }
+        assert_eq!(*list.active_devices.lock().unwrap(), devices);
+        assert!(other.active_devices.lock().unwrap().is_empty());
+        let weak = Arc::downgrade(&list.active_devices);
+        drop(list);
+        assert!(weak.upgrade().is_some());
+        drop(clone);
+        assert!(weak.upgrade().is_none());
     }
 }
 

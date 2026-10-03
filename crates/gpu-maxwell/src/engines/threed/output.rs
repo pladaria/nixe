@@ -27,6 +27,14 @@ pub(super) const BLEND_TARGET_STRIDE: u32 = 0x20;
 /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3309-L3312
 pub(super) const BLEND_SEPARATE_ALPHA_RESET: u32 = 1;
 
+/// Initial channel depth-clip interval for each of the sixteen viewports.
+/// GM200's public method initialization writes 0x0c08 + i*0x10 = 0 and
+/// 0x0c0c + i*0x10 = 0x3f800000. The table hash and decoding references above
+/// apply to these entries too; no firmware contents are embedded here.
+/// https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/engines/maxwell_3d.cpp#L51-L57
+pub(super) const VIEWPORT_CLIP_MIN_Z_RESET: u32 = 0;
+pub(super) const VIEWPORT_CLIP_MAX_Z_RESET: u32 = 0x3f80_0000;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellThreeDCompareOp {
     Never,
@@ -879,7 +887,7 @@ impl MaxwellThreeDSurfaceClipAxis {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDViewportTransformState {
     scale: [MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3],
     offset: [MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3],
@@ -888,6 +896,26 @@ pub struct MaxwellThreeDViewportTransformState {
     clip_min_z: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
     clip_max_z: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
     coordinate_swizzle: MaxwellThreeDRegister<MaxwellThreeDViewportCoordinateSwizzle>,
+}
+
+impl Default for MaxwellThreeDViewportTransformState {
+    fn default() -> Self {
+        Self {
+            scale: Default::default(),
+            offset: Default::default(),
+            clip_horizontal: Default::default(),
+            clip_vertical: Default::default(),
+            clip_min_z: MaxwellThreeDRegister::verified_reset(
+                VIEWPORT_CLIP_MIN_Z_RESET,
+                Some(MaxwellThreeDRawValue::new(VIEWPORT_CLIP_MIN_Z_RESET)),
+            ),
+            clip_max_z: MaxwellThreeDRegister::verified_reset(
+                VIEWPORT_CLIP_MAX_Z_RESET,
+                Some(MaxwellThreeDRawValue::new(VIEWPORT_CLIP_MAX_Z_RESET)),
+            ),
+            coordinate_swizzle: Default::default(),
+        }
+    }
 }
 
 /// One signed source component selected by viewport coordinate swizzling.
@@ -1070,8 +1098,12 @@ impl Default for MaxwellThreeDFixedFunctionState {
             MaxwellThreeDFixedFunctionRegister::FrontPolygonMode,
             MaxwellThreeDFixedFunctionRegister::BackPolygonMode,
         ] {
-            registers[register.index()] =
-                MaxwellThreeDRegister::verified_reset(MAXWELL_THREE_D_POLYGON_MODE_RESET, None);
+            registers[register.index()] = MaxwellThreeDRegister::verified_reset(
+                MAXWELL_THREE_D_POLYGON_MODE_RESET,
+                Some(MaxwellThreeDFixedFunctionValue::PolygonMode(
+                    MaxwellThreeDPolygonMode::Fill,
+                )),
+            );
         }
         registers[MaxwellThreeDFixedFunctionRegister::WindowOrigin.index()] =
             MaxwellThreeDRegister::verified_reset(
@@ -1080,6 +1112,29 @@ impl Default for MaxwellThreeDFixedFunctionState {
                     MAXWELL_THREE_D_WINDOW_ORIGIN_RESET,
                 )),
             );
+        // Initialized channel-context encodings share the raw lookup used by
+        // MME shadow reads; provenance and firmware table hash live in state.rs.
+        for (register, method, value) in [
+            (
+                MaxwellThreeDFixedFunctionRegister::FrontFace,
+                0x191c,
+                MaxwellThreeDFixedFunctionValue::FrontFace(MaxwellThreeDFrontFace::Clockwise),
+            ),
+            (
+                MaxwellThreeDFixedFunctionRegister::CullEnable,
+                0x1918,
+                MaxwellThreeDFixedFunctionValue::Boolean(false),
+            ),
+            (
+                MaxwellThreeDFixedFunctionRegister::CullFace,
+                0x1920,
+                MaxwellThreeDFixedFunctionValue::CullFace(MaxwellThreeDCullFace::Back),
+            ),
+        ] {
+            let raw =
+                super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(method)).unwrap();
+            registers[register.index()] = MaxwellThreeDRegister::verified_reset(raw, Some(value));
+        }
         Self {
             surface_clip_horizontal: Default::default(),
             surface_clip_vertical: Default::default(),
@@ -1088,8 +1143,20 @@ impl Default for MaxwellThreeDFixedFunctionState {
             window_clip: std::array::from_fn(|_| Default::default()),
             registers,
             blend_enable_common: Default::default(),
-            blend_enable: Default::default(),
-            color_mask: Default::default(),
+            blend_enable: std::array::from_fn(|index| {
+                let raw = super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(
+                    0x1360 + index as u32 * 4,
+                ))
+                .unwrap();
+                MaxwellThreeDRegister::verified_reset(raw, Some(false))
+            }),
+            color_mask: std::array::from_fn(|index| {
+                let raw = super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(
+                    0x1a00 + index as u32 * 4,
+                ))
+                .unwrap();
+                MaxwellThreeDRegister::verified_reset(raw, MaxwellThreeDColorMask::parse(raw))
+            }),
             per_target_blend: std::array::from_fn(|_| {
                 let mut blend = std::array::from_fn(|_| Default::default());
                 blend[0] = MaxwellThreeDRegister::verified_reset(

@@ -15,7 +15,10 @@ use nixe_horizon::{
     HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, IpcDispatcher, IpcService,
     OperationMode, UnsupportedServiceOperation, switch_1_machine_profile,
 };
-use nixe_input::{EmulatedButtonState, EmulatedControllerState};
+use nixe_input::{
+    EmulatedButtonState, EmulatedControllerState, EmulatedTouchContact, TOUCH_ATTRIBUTE_START,
+    touch_screen_channel,
+};
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use nixe_runtime::{
     CpuBackendConfig, EventObject, ExceptionHandlingResult, ExceptionTerminationReason,
@@ -2203,9 +2206,330 @@ fn nvdrv_firmware_memory_margin_uses_a_u64_input_and_no_output() {
 }
 
 #[test]
+fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 26));
+    instructions.push(svc(0x16));
+    let (_directory, mut process) = fixture_process(&instructions);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..35].copy_from_slice(b"hid");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let hid_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+
+    let mut info = [0_u8; 0x100];
+    put_u32(&mut info, 0, 4);
+    put_u32(&mut info, 4, 9);
+    put_u32(&mut info, 16, 0x4943_4653);
+    put_u32(&mut info, 24, 200);
+    info[36..44].fill(0xa5);
+    // Querying metadata does not require prior activation or a connected
+    // controller. Include the 0x2003 FullKey handle used by the guest SDK.
+    for (actuator, position) in [
+        (0x0000_2003, 1),
+        (0x0001_2003, 2),
+        (0x0000_2004, 1),
+        (0x0001_2004, 2),
+        (0x0000_1005, 1),
+        (0x0001_1005, 2),
+        (0x0000_0106, 1),
+        (0x0001_0107, 2),
+    ] {
+        put_u32(&mut info, 32, actuator);
+        write_guest_bytes(&process, tls, &info);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+        assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(36).unwrap()),
+            position
+        );
+    }
+    for invalid in [
+        0x0100_0003,
+        0x0000_0803,
+        0x0002_0003,
+        0x0001_0006,
+        0x0000_0007,
+    ] {
+        put_u32(&mut info, 32, invalid);
+        write_guest_bytes(&process, tls, &info);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw()
+        );
+    }
+    let mut truncated_info = info;
+    put_u32(&mut truncated_info, 4, 6);
+    let mut info_with_pid = register;
+    put_u32(&mut info_with_pid, 40, 200);
+    put_u32(&mut info_with_pid, 48, 3);
+    let mut info_with_descriptor = info;
+    put_u32(&mut info_with_descriptor, 0, 4 | (1 << 16));
+    put_send_static(&mut info_with_descriptor, 8, 0, 0);
+    for malformed in [truncated_info, info_with_pid, info_with_descriptor] {
+        write_guest_bytes(&process, tls, &malformed);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+        );
+    }
+
+    let mut create_list = [0_u8; 0x100];
+    put_u32(&mut create_list, 0, 4);
+    put_u32(&mut create_list, 4, 8);
+    put_u32(&mut create_list, 16, 0x4943_4653);
+    put_u32(&mut create_list, 24, 203);
+    // Stale plain-CMIF alignment slack is not semantic command input.
+    create_list[32..40].fill(0xa5);
+    write_guest_bytes(&process, tls, &create_list);
+    state(&mut process).write_w(x(0), hid_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(8).unwrap()),
+        1 << 5
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    let list_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(matches!(
+        process.handles().get_as::<HorizonIpcObject>(list_handle),
+        Some(HorizonIpcObject::HidActiveVibrationDeviceList(_))
+    ));
+
+    let mut activate = [0_u8; 0x100];
+    put_u32(&mut activate, 0, 4);
+    put_u32(&mut activate, 4, 9);
+    put_u32(&mut activate, 16, 0x4943_4653);
+    activate[36..44].fill(0xa5);
+    // FullKey left, right, and duplicate activation all succeed.
+    for actuator in [0x0000_0003, 0x0001_0003, 0x0000_0003] {
+        put_u32(&mut activate, 32, actuator);
+        write_guest_bytes(&process, tls, &activate);
+        state(&mut process).write_w(x(0), list_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    }
+    put_u32(&mut activate, 32, 0x0002_0003);
+    write_guest_bytes(&process, tls, &activate);
+    state(&mut process).write_w(x(0), list_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(24).unwrap()),
+        HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw()
+    );
+
+    let mut truncated = activate;
+    put_u32(&mut truncated, 4, 6);
+    write_guest_bytes(&process, tls, &truncated);
+    state(&mut process).write_w(x(0), list_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(24).unwrap()),
+        HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+    );
+
+    let mut malformed_factory = create_list;
+    put_u32(&mut malformed_factory, 0, 4 | (1 << 16));
+    put_send_static(&mut malformed_factory, 8, 0, 0);
+    write_guest_bytes(&process, tls, &malformed_factory);
+    state(&mut process).write_w(x(0), hid_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(24).unwrap()),
+        HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+    );
+
+    // CloseSession retains the kernel handle until CloseHandle.
+    write_guest_bytes(&process, tls, &[2, 0, 0, 0, 0, 0, 0, 0]);
+    state(&mut process).write_w(x(0), list_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert!(process.handles().get(list_handle).is_some());
+    state(&mut process).write_w(x(0), list_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert!(process.handles().get(list_handle).is_none());
+}
+
+#[test]
+fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation() {
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 32));
+    let (_directory, mut process) = fixture_process(&instructions);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..35].copy_from_slice(b"hid");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let hid_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+
+    let mut get = register;
+    put_u32(&mut get, 40, 121);
+    // ARUID deliberately differs from both valid orientations to detect
+    // swapped payload fields. Nonzero trailing bytes are transport slack.
+    put_u64(&mut get, 48, 0x1234);
+    put_u64(&mut get, 56, u64::MAX);
+    let mut send = |request: &[u8; 0x100]| {
+        write_guest_bytes(&process, tls, request);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(state(&mut process).read_w(x(0)), 0);
+        (
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            u64::from_le_bytes(
+                read_guest_bytes(&process, tls.checked_add(32).unwrap(), 8)
+                    .try_into()
+                    .unwrap(),
+            ),
+        )
+    };
+    assert_eq!(send(&get), (0, 0));
+
+    let mut set = get;
+    put_u32(&mut set, 4, 12 | (1 << 31));
+    put_u32(&mut set, 40, 120);
+    put_u64(&mut set, 56, 1);
+    set[64..68].fill(0xa5);
+    assert_eq!(send(&set).0, 0);
+    assert_eq!(send(&get), (0, 1));
+    for invalid_type in [2, 0x1_0000_0001, u64::MAX] {
+        let mut invalid = set;
+        put_u64(&mut invalid, 56, invalid_type);
+        assert_eq!(
+            send(&invalid).0,
+            HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw()
+        );
+        assert_eq!(send(&get), (0, 1));
+    }
+
+    let mut truncated_set = set;
+    // HIPC data ends at byte 56, so ARUID exists but the hold type does not.
+    put_u32(&mut truncated_set, 4, 9 | (1 << 31));
+    let mut truncated_get = get;
+    put_u32(&mut truncated_get, 4, 7 | (1 << 31));
+    let mut no_pid = [0_u8; 0x100];
+    put_u32(&mut no_pid, 0, 4);
+    put_u32(&mut no_pid, 4, 12);
+    put_u32(&mut no_pid, 16, 0x4943_4653);
+    put_u32(&mut no_pid, 24, 120);
+    put_u64(&mut no_pid, 32, 0x1234);
+    put_u64(&mut no_pid, 40, 0);
+    let mut unexpected_descriptor = set;
+    put_u32(&mut unexpected_descriptor, 0, 4 | (1 << 16));
+    put_send_static(&mut unexpected_descriptor, 20, 0, 0);
+    for invalid in [truncated_set, truncated_get, no_pid, unexpected_descriptor] {
+        assert_eq!(
+            send(&invalid).0,
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+        );
+        assert_eq!(send(&get), (0, 1));
+    }
+    put_u64(&mut set, 56, 0);
+    assert_eq!(send(&set).0, 0);
+    assert_eq!(send(&get), (0, 0));
+}
+
+#[test]
 fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut instructions = vec![svc(0x1f)];
-    instructions.extend(std::iter::repeat_n(svc(0x21), 49));
+    instructions.extend(std::iter::repeat_n(svc(0x21), 52));
     instructions.extend([svc(0x13), svc(0x14), svc(0x21)]);
     let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::new(
@@ -2926,6 +3250,37 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         Some(HorizonIpcObject::Hid(_))
     ));
 
+    let mut activate_touch_screen = [0_u8; 0x100];
+    put_u32(&mut activate_touch_screen, 0, 4);
+    put_u32(&mut activate_touch_screen, 4, 10 | (1 << 31));
+    put_u32(&mut activate_touch_screen, 8, 1);
+    put_u32(&mut activate_touch_screen, 32, 0x4943_4653);
+    put_u32(&mut activate_touch_screen, 40, 11);
+    put_u64(&mut activate_touch_screen, 48, 1);
+    // libnx does not initialize the plain-CMIF alignment slack after the
+    // semantic u64 payload. The service must not treat those bytes as input.
+    activate_touch_screen[56] = 0xa5;
+    write_guest_bytes(&process, tls, &activate_touch_screen);
+    state(&mut process).write_w(x(0), hid_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let mut malformed_touch_screen_activation = activate_touch_screen;
+    put_u32(&mut malformed_touch_screen_activation, 4, 8 | (1 << 31));
+    write_guest_bytes(&process, tls, &malformed_touch_screen_activation);
+    state(&mut process).write_w(x(0), hid_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(24).unwrap()),
+        HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+    );
+
     // Configure the same FullKey/Player-1 Npad publication contract that
     // libnx establishes before consuming HID shared memory.
     let mut activate_npad = [0_u8; 0x100];
@@ -2954,15 +3309,43 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     );
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
 
-    let id_address = tls.checked_add(0xf0).unwrap();
+    // nn::sf queries the pointer budget before serializing a pointer-only
+    // InArray. A zero result aborts locally without sending command 102.
+    let mut query_hid_pointer_size = [0_u8; 0x100];
+    put_u32(&mut query_hid_pointer_size, 0, 5);
+    put_u32(&mut query_hid_pointer_size, 4, 8);
+    put_u32(&mut query_hid_pointer_size, 16, 0x4943_4653);
+    put_u32(&mut query_hid_pointer_size, 24, 3);
+    write_guest_bytes(&process, tls, &query_hid_pointer_size);
+    state(&mut process).write_w(x(0), hid_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    let pointer_budget = u16::from_le_bytes(
+        read_guest_bytes(&process, tls.checked_add(32).unwrap(), 2)
+            .try_into()
+            .unwrap(),
+    );
+    assert!(
+        pointer_budget >= 48,
+        "ten Npad IDs require 48 aligned bytes"
+    );
+
+    let id_address = tls.checked_add(0xe0).unwrap();
     let mut set_ids = [0_u8; 0x100];
+    // Match nn::sf/libnx: one pointer descriptor, PID and an ARUID payload.
     put_u32(&mut set_ids, 0, 4 | (1 << 16));
     put_u32(&mut set_ids, 4, 10 | (1 << 31));
     put_u32(&mut set_ids, 8, 1);
-    put_send_static(&mut set_ids, 20, id_address.get(), 4);
+    put_send_static(&mut set_ids, 20, id_address.get(), 20);
     put_u32(&mut set_ids, 32, 0x4943_4653);
     put_u32(&mut set_ids, 40, 102);
-    put_u32(&mut set_ids, 0xf0, 0);
+    put_u64(&mut set_ids, 48, 1);
+    for (index, id) in [0, 1, 2, 3, 0x20].into_iter().enumerate() {
+        put_u32(&mut set_ids, 0xe0 + index * 4, id);
+    }
     write_guest_bytes(&process, tls, &set_ids);
     state(&mut process).write_w(x(0), hid_handle);
     assert_eq!(
@@ -3031,6 +3414,40 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             .unwrap()
             .purpose,
         MemoryMappingPurpose::SharedMemory
+    );
+
+    let (touch_writer, mut touch_reader) = touch_screen_channel();
+    assert!(touch_writer.begin(EmulatedTouchContact {
+        finger_id: 4,
+        x: 320,
+        y: 180,
+        diameter_x: 1,
+        diameter_y: 1,
+        ..EmulatedTouchContact::default()
+    }));
+    dispatcher
+        .advance_touch_screen(&touch_reader.sample(), Duration::from_millis(5))
+        .unwrap();
+    let touch_entry = mapping_address.checked_add(0x420).unwrap();
+    assert_eq!(
+        read_guest_u32(&process, touch_entry.checked_add(0x10).unwrap()),
+        1
+    );
+    assert_eq!(
+        read_guest_u32(&process, touch_entry.checked_add(0x20).unwrap()),
+        TOUCH_ATTRIBUTE_START
+    );
+    assert_eq!(
+        read_guest_u32(&process, touch_entry.checked_add(0x24).unwrap()),
+        4
+    );
+    assert_eq!(
+        read_guest_u32(&process, touch_entry.checked_add(0x28).unwrap()),
+        320
+    );
+    assert_eq!(
+        read_guest_u32(&process, touch_entry.checked_add(0x2c).unwrap()),
+        180
     );
 
     let controller = EmulatedControllerState {
@@ -5456,6 +5873,59 @@ fn break_retains_guest_payload_in_the_process_exit_record() {
     assert_eq!(exit.frames[0].frame_pointer, frame_pointer.get());
     assert_eq!(exit.frames[0].return_address, 0x7100_1234);
     assert_eq!(exit.frames[1].frame_pointer, caller_frame_pointer.get());
+    assert_eq!(exit.frames[1].return_address, 0x7100_5678);
+}
+
+#[test]
+fn break_captures_frames_on_a_guest_created_thread_stack() {
+    let (_directory, mut process) = fixture_process(&[svc(0x26)]);
+    let entry = GuestVirtualAddress::new(instruction_address(&process));
+    let stack_top = process.main_thread().stack_top;
+    let frame_pointer = stack_top.checked_sub(0x100).unwrap();
+    let caller_frame_pointer = frame_pointer.checked_add(0x20).unwrap();
+    let mut frame = [0; 16];
+    frame[..8].copy_from_slice(&caller_frame_pointer.get().to_le_bytes());
+    frame[8..].copy_from_slice(&0x7100_1234_u64.to_le_bytes());
+    write_guest_bytes(&process, frame_pointer, &frame);
+    frame[..8].fill(0);
+    frame[8..].copy_from_slice(&0x7100_5678_u64.to_le_bytes());
+    write_guest_bytes(&process, caller_frame_pointer, &frame);
+
+    let process_id = process.scheduler_process_id();
+    let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+    let child = process
+        .coordinator_mut()
+        .create_thread(
+            process_id,
+            nixe_runtime::ThreadCreateRequest {
+                entry,
+                argument: 2,
+                stack_top,
+                priority: 20,
+                ideal_vcpu: Some(nixe_scheduler::VirtualCpuId::new(0)),
+                affinity,
+            },
+        )
+        .unwrap();
+    let thread = process.thread_mut(child.id).unwrap();
+    assert_eq!(thread.stack_bottom, thread.stack_top);
+    thread.state_mut().write_x(x(29), frame_pointer.get());
+    thread
+        .state_mut()
+        .write_x(A64Register::StackPointer, frame_pointer.get() - 0x40);
+    let object_id = thread.object().thread_id();
+    process.coordinator_mut().start_thread(object_id).unwrap();
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let (selected, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    assert_eq!(selected, child.id);
+    assert!(matches!(
+        handling,
+        ExceptionHandlingResult::Terminated { .. }
+    ));
+    let exit = process.exit().unwrap();
+    assert_eq!(exit.thread_id, child.id.get());
+    assert_eq!(exit.frames.len(), 2);
+    assert_eq!(exit.frames[0].return_address, 0x7100_1234);
     assert_eq!(exit.frames[1].return_address, 0x7100_5678);
 }
 

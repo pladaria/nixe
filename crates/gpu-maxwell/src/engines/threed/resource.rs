@@ -1485,11 +1485,14 @@ impl<'a> ResourceBuilder<'a> {
                 })?,
             ),
         };
-        if header_version != 3
-            || texture_type != required_texture_type
+        let pitch_linear = header_version == 2;
+        let texture_type_matches = texture_type == required_texture_type
+            || (required_dimension == MaxwellThreeDTextureDimension::Two && texture_type == 7);
+        if !matches!(header_version, 2 | 3)
+            || !texture_type_matches
+            || (pitch_linear && required_dimension != MaxwellThreeDTextureDimension::Two)
             || (required_dimension == MaxwellThreeDTextureDimension::Two && depth != 1)
-            || block_width_log2 != 0
-            || block_depth_log2 != 0
+            || (!pitch_linear && (block_width_log2 != 0 || block_depth_log2 != 0))
             || mip_max != 0
             || view_mip_min != 0
             || view_mip_max != 0
@@ -1498,9 +1501,12 @@ impl<'a> ResourceBuilder<'a> {
             || !normalized
             || layer_base != 0
         {
+            log::debug!(
+                "unsupported Maxwell TIC shape: descriptor={descriptor_index} dimension={required_dimension:?} words={words:08x?}"
+            );
             return Err(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
                 descriptor: descriptor_index,
-                field: "2D/2D-array block-linear shape",
+                field: "2D/2D-array shape",
                 value: words[2] ^ words[3] ^ words[4] ^ words[5] ^ words[7],
             });
         }
@@ -1509,19 +1515,48 @@ impl<'a> ResourceBuilder<'a> {
         let bytes_per_block = format
             .plane_bytes_per_block(0)
             .expect("decoded sampled image has one plane");
-        let row = align_up(
-            u64::from(width.div_ceil(block_width)) * u64::from(bytes_per_block),
-            64,
-            role,
-        )?;
-        let rows = align_up(
-            u64::from(height.div_ceil(block_height)),
-            8_u64 << block_height_log2,
-            role,
-        )?;
-        let layer_stride = row
-            .checked_mul(rows)
-            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+        let row_bytes = u64::from(width.div_ceil(block_width)) * u64::from(bytes_per_block);
+        let (layout, layer_stride) = if pitch_linear {
+            // Pitch occupies bits 5:20 of the byte stride; the low five bits
+            // are implicitly zero. Only non-array, non-mipmapped 2D is enabled.
+            let row_pitch = u64::from(words[3] & 0xffff) << 5;
+            if row_pitch < row_bytes {
+                return Err(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+                    descriptor: descriptor_index,
+                    field: "pitch smaller than texel row",
+                    value: row_pitch as u32,
+                });
+            }
+            let layer_stride = row_pitch
+                .checked_mul(u64::from(height.div_ceil(block_height)))
+                .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+            (
+                ImageMemoryLayout::PitchLinear {
+                    row_pitch,
+                    layer_stride,
+                },
+                layer_stride,
+            )
+        } else {
+            let row = align_up(row_bytes, 64, role)?;
+            let rows = align_up(
+                u64::from(height.div_ceil(block_height)),
+                8_u64 << block_height_log2,
+                role,
+            )?;
+            let layer_stride = row
+                .checked_mul(rows)
+                .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+            (
+                ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                    block_width_log2,
+                    block_height_log2,
+                    block_depth_log2,
+                    layer_stride,
+                }),
+                layer_stride,
+            )
+        };
         let unresolved = MaxwellThreeDUnresolvedAddress::new((address >> 32) as u8, address as u32);
         let size = layer_stride
             .checked_mul(u64::from(layers))
@@ -1540,14 +1575,26 @@ impl<'a> ResourceBuilder<'a> {
         let compressed_kind = (block_width == 1 && block_height == 1)
             .then(|| single_sample_compressed_color_kind(u64::from(bytes_per_block)))
             .flatten();
+        let expected_kind = if pitch_linear {
+            MAXWELL_PITCH_KIND
+        } else {
+            MAXWELL_GENERIC_BLOCK_LINEAR_KIND
+        };
         if source.segments().iter().any(|segment| {
             segment.mapping().kind() != actual_kind
-                || (actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND
-                    && Some(actual_kind) != compressed_kind)
+                || if pitch_linear {
+                    !matches!(
+                        actual_kind,
+                        MAXWELL_PITCH_KIND | MAXWELL_PITCH_NO_SWIZZLE_KIND
+                    )
+                } else {
+                    actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND
+                        && Some(actual_kind) != compressed_kind
+                }
         }) {
             return Err(MaxwellThreeDResourceError::UnsupportedKind {
                 role,
-                expected: MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+                expected: expected_kind,
                 actual: actual_kind,
             });
         }
@@ -1566,12 +1613,6 @@ impl<'a> ResourceBuilder<'a> {
         let retained = self.retained_backing(&source, role)?;
         let allocation_description = retained.allocation_description;
         let cpu_writes = retained.cpu_writes.clone();
-        let layout = ImageMemoryLayout::BlockLinear(BlockLinearLayout {
-            block_width_log2,
-            block_height_log2,
-            block_depth_log2,
-            layer_stride,
-        });
         let id = ImageId::new(resource_id(self.resources.len())?);
         let view = ImageView::new(
             id,
@@ -1605,7 +1646,8 @@ impl<'a> ResourceBuilder<'a> {
                     // A TIC cannot establish whether previous render-target
                     // writes used compression. Require the resident representation
                     // for compressed color kinds instead of importing opaque bytes.
-                    compression_enabled: actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+                    compression_enabled: !pitch_linear
+                        && actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
                 },
                 guest_format: MaxwellThreeDGuestImageFormat::Texture(format_word),
             },
@@ -2176,8 +2218,8 @@ fn constant_buffer_is_required(
     })
 }
 
-/// Decodes only Maxwell TIC format/component/swizzle tuples with a direct
-/// neutral and wgpu representation. Numeric component and swizzle values are
+/// Decodes verified Maxwell TIC format/component/swizzle tuples into their
+/// neutral storage and sampling semantics. Numeric component and swizzle values are
 /// defined by deko3d's pinned public Maxwell tables:
 /// https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/image_formats.h
 fn decode_sampled_texture_format(
@@ -2191,6 +2233,10 @@ fn decode_sampled_texture_format(
         return None;
     }
     match (image_format, components, swizzle, srgb) {
+        // B5G6R5 stores R in the low bits. The B,G,R swizzle makes the high
+        // five bits the observable red channel (packed RGB565).
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc
+        (0x15, [2, 2, 2, 2], [4, 3, 2, 7], false) => Some(ImageFormat::Rgb565Unorm),
         (0x24, [2, 2, 2, 2], [2, 3, 4, 7], false) => Some(ImageFormat::Bc1RgbUnorm),
         (0x24, [2, 2, 2, 2], [2, 3, 4, 7], true) => Some(ImageFormat::Bc1RgbSrgb),
         (0x24, [2, 2, 2, 2], [2, 3, 4, 5], false) => Some(ImageFormat::Bc1RgbaUnorm),
@@ -3020,6 +3066,31 @@ mod tests {
     }
 
     #[test]
+    fn rgb565_descriptor_swizzle_selects_high_red_low_blue_and_opaque_alpha() {
+        let word = 0x74e2_4915_u32;
+        let components = [7, 10, 13, 16].map(|shift| ((word >> shift) & 7) as u8);
+        let swizzle = [19, 22, 25, 28].map(|shift| ((word >> shift) & 7) as u8);
+        assert_eq!(
+            decode_sampled_texture_format(
+                (word & 0x7f) as u8,
+                components,
+                swizzle,
+                false,
+                word >> 31
+            ),
+            Some(nixe_gpu::ImageFormat::Rgb565Unorm)
+        );
+        assert_eq!(
+            decode_sampled_texture_format(0x15, components, swizzle, true, 0),
+            None
+        );
+        assert_eq!(
+            decode_sampled_texture_format(0x15, components, [2, 3, 4, 7], false, 0),
+            None
+        );
+    }
+
+    #[test]
     fn rgba16_float_target_and_texture_encodings_have_the_same_interpretation() {
         let target =
             super::color_image_format(0xca, MaxwellThreeDResourceRole::ColorTarget(0)).unwrap();
@@ -3113,6 +3184,82 @@ mod tests {
             decode_sampled_texture_format(0x24, components, swizzle, false, 1),
             None
         );
+    }
+
+    #[test]
+    fn pitch_texture_resolves_padded_rows_and_nomipmap_2d_type() {
+        let mut address_space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        address_space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let backing = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mapping = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                size: backing.size(),
+                backing,
+                backing_offset: 0,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: super::MAXWELL_PITCH_KIND,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let address = mapping.offset().get();
+        for texture_type in [1, 7] {
+            let mut words = [
+                0x74e2_4915,
+                address as u32,
+                (address >> 32) as u32 | (2 << 21),
+                2,
+                18 | (texture_type << 23),
+                16 | (1 << 31),
+                0,
+                0,
+            ];
+            let mut builder = super::ResourceBuilder::new(&address_space, None, None, None);
+            builder
+                .sampled_image(
+                    super::MaxwellThreeDTextureReference::new(4, 0, 0),
+                    MaxwellThreeDTextureDimension::Two,
+                    256,
+                    descriptor_bytes(words),
+                )
+                .unwrap();
+            let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+                panic!("expected sampled image");
+            };
+            assert_eq!(
+                image.description.format(),
+                nixe_gpu::ImageFormat::Rgb565Unorm
+            );
+            assert_eq!(image.view.bindings()[0].backing().range().size(), 64 * 17);
+            assert_eq!(
+                image.view.bindings()[0].layout(),
+                ImageMemoryLayout::PitchLinear {
+                    row_pitch: 64,
+                    layer_stride: 64 * 17,
+                }
+            );
+            assert!(!image.guest_layout.requires_materialization());
+            words[3] = 1; // Thirty-two bytes cannot hold nineteen RGB565 texels.
+            assert!(
+                builder
+                    .sampled_image(
+                        super::MaxwellThreeDTextureReference::new(4, 0, 0),
+                        MaxwellThreeDTextureDimension::Two,
+                        256,
+                        descriptor_bytes(words)
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]

@@ -7,10 +7,7 @@
 
 use crate::{MaxwellMethodSource, MaxwellSpaVersion};
 
-use super::state::{
-    MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
-    MaxwellThreeDRegisterOrigin,
-};
+use super::state::{MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET};
 use super::{MaxwellThreeDRegister, MaxwellThreeDTessellationMode, MaxwellThreeDUnresolvedAddress};
 
 pub const MAXWELL_PIPELINE_SHADER_COUNT: usize = 6;
@@ -106,23 +103,6 @@ impl MaxwellShaderStage {
             _ => None,
         }
     }
-
-    /// Binding group selected by the Switch graphics-driver shader-stage ABI
-    /// when `SET_PIPELINE_BINDING` remains at its hardware reset value.
-    ///
-    /// Switchbrew documents the stage-indexed bind-group constant-buffer
-    /// ranges used by the Maxwell 3D class:
-    /// <https://switchbrew.org/wiki/GPU_Classes#3D_engine_class>
-    const fn default_binding_group(self) -> Option<u8> {
-        Some(match self {
-            Self::VertexCullBeforeFetch | Self::Vertex => 0,
-            Self::TessellationInit => 1,
-            Self::Tessellation => 2,
-            Self::Geometry => 3,
-            Self::Pixel => 4,
-            Self::Compute => return None,
-        })
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,23 +114,19 @@ pub struct MaxwellThreeDPipelineBindingState {
     group: MaxwellThreeDRegister<u8>,
 }
 
-impl Default for MaxwellThreeDPipelineBindingState {
-    fn default() -> Self {
+impl MaxwellThreeDPipelineBindingState {
+    fn initialized(pipeline: usize) -> Self {
+        let header = MAXWELL_THREE_D_PIPELINE_SHADER_RESET[pipeline];
+        let group = MAXWELL_THREE_D_PIPELINE_BINDING_RESET[pipeline];
         Self {
-            enabled: MaxwellThreeDRegister::verified_reset(
-                MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
-                Some(false),
-            ),
+            enabled: MaxwellThreeDRegister::verified_reset(header, Some(header & 1 != 0)),
             stage: MaxwellThreeDRegister::verified_reset(
-                MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
-                Some(MaxwellShaderStage::VertexCullBeforeFetch),
+                header,
+                MaxwellShaderStage::parse(header >> 4),
             ),
             program_offset: MaxwellThreeDRegister::default(),
             register_count: MaxwellThreeDRegister::default(),
-            group: MaxwellThreeDRegister::verified_reset(
-                MAXWELL_THREE_D_PIPELINE_BINDING_RESET,
-                Some(MAXWELL_THREE_D_PIPELINE_BINDING_RESET as u8),
-            ),
+            group: MaxwellThreeDRegister::verified_reset(group, Some(group as u8)),
         }
     }
 }
@@ -177,19 +153,10 @@ impl MaxwellThreeDPipelineBindingState {
         &self.group
     }
 
-    /// Resolves the shader-visible group without changing the raw register
-    /// value observed by MME register reads.
+    /// Returns the hardware binding group, including the initialized context.
     #[must_use]
     pub fn effective_group(&self) -> Option<u8> {
-        match self.group.origin() {
-            MaxwellThreeDRegisterOrigin::Programmed => self.group.value().copied(),
-            MaxwellThreeDRegisterOrigin::VerifiedReset => self
-                .stage
-                .value()
-                .copied()
-                .and_then(MaxwellShaderStage::default_binding_group),
-            MaxwellThreeDRegisterOrigin::Unset => None,
-        }
+        self.group.value().copied()
     }
 }
 
@@ -404,7 +371,7 @@ impl Default for MaxwellThreeDShaderBindingState {
     fn default() -> Self {
         Self {
             program_region: MaxwellThreeDProgramRegionState::default(),
-            pipeline: std::array::from_fn(|_| MaxwellThreeDPipelineBindingState::default()),
+            pipeline: std::array::from_fn(MaxwellThreeDPipelineBindingState::initialized),
             selector: MaxwellThreeDConstantBufferSelectorState::default(),
             constant_buffer_load: MaxwellThreeDConstantBufferLoadState::default(),
             groups: Box::new(std::array::from_fn(|_| {

@@ -1418,6 +1418,7 @@ dependencies = [
  "nixe-config",
  "nixe-gpu",
  "nixe-gpu-wgpu",
+ "nixe-input",
  "nixe-video",
  "png",
  "pollster",

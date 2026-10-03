@@ -3,10 +3,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use nixe_cpu::memory::ExecutionMemory;
-use nixe_input::EmulatedControllerState;
+use nixe_input::{EmulatedControllerState, EmulatedTouchScreenState};
 use nixe_runtime::{HandleError, SharedMemoryObject};
 
 const HID_SHARED_MEMORY_SIZE: usize = 0x40000;
+const TOUCH_SCREEN_OFFSET: usize = 0x400;
+const TOUCH_SCREEN_ENTRY_SIZE: usize = 0x298;
+const TOUCH_STATE_SIZE: usize = 0x28;
 const NPAD_OFFSET: usize = 0x9a00;
 const NPAD_ENTRY_SIZE: usize = 0x5000;
 const FULL_KEY_LIFO_OFFSET: usize = 0x28;
@@ -26,11 +29,35 @@ const SIX_AXIS_ATTRIBUTE_CONNECTED: u32 = 1;
 const APPLET_FOOTER_SWITCH_PRO_CONTROLLER: u8 = 12;
 const STANDARD_GRAVITY: f32 = 9.806_65;
 
+/// Position of a modeled LRA actuator: left (1) or right (2).
+pub(crate) fn vibration_device_position(handle: u32) -> Option<u32> {
+    // The style, Npad ID and actuator index are packed into consecutive bytes.
+    // FullKey, Handheld and paired Joy-Con expose both sides; single Joy-Con
+    // expose only their own side. The final byte is reserved.
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1157-L1232
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h#L486-L497
+    let [style, npad_id, device_index, reserved] = handle.to_le_bytes();
+    if reserved != 0
+        || !matches!(npad_id, 0..=7 | 0x10 | 0x20)
+        || !match style {
+            3..=5 => device_index <= 1,
+            6 => device_index == 0,
+            7 => device_index == 1,
+            _ => false,
+        }
+    {
+        return None;
+    }
+    Some(u32::from(device_index) + 1)
+}
+
 /// Host-controlled producer for Horizon's HID shared memory.
 #[derive(Debug)]
 pub struct HidSystem {
     shared_memory: OnceLock<SharedMemoryObject>,
     sampling_number: u64,
+    touch_screen_sampling_number: u64,
+    touch_screen: Lifo,
     full_key: Lifo,
     six_axis: Lifo,
     home: Lifo,
@@ -41,9 +68,11 @@ pub struct HidSystem {
 
 #[derive(Debug, Default)]
 struct HidConfiguration {
+    touch_screen_active: bool,
     npad_active: bool,
     supported_style_set: u32,
     supported_ids: BTreeSet<u32>,
+    npad_joy_hold_type: u64,
     active_six_axis_handles: BTreeSet<u32>,
 }
 
@@ -92,6 +121,8 @@ impl HidSystem {
         Self {
             shared_memory: OnceLock::new(),
             sampling_number: 0,
+            touch_screen_sampling_number: 0,
+            touch_screen: Lifo::default(),
             full_key: Lifo::default(),
             six_axis: Lifo::default(),
             home: Lifo::default(),
@@ -129,6 +160,13 @@ impl HidSystem {
         configuration.npad_active = true;
     }
 
+    pub(crate) fn activate_touch_screen(&self) {
+        self.configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .touch_screen_active = true;
+    }
+
     pub(crate) fn set_supported_npad_style_set(&self, style_set: u32) {
         self.configuration
             .lock()
@@ -148,6 +186,27 @@ impl HidSystem {
         true
     }
 
+    pub(crate) fn set_npad_joy_hold_type(&self, hold_type: u64) -> bool {
+        // Vertical (0) is the default; horizontal (1) affects single Joy-Con
+        // orientation. FullKey publication does not consume this setting.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h
+        if !matches!(hold_type, 0 | 1) {
+            return false;
+        }
+        self.configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .npad_joy_hold_type = hold_type;
+        true
+    }
+
+    pub(crate) fn npad_joy_hold_type(&self) -> u64 {
+        self.configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .npad_joy_hold_type
+    }
+
     pub(crate) fn set_six_axis_sensor_active(&self, handle: u32, active: bool) {
         let mut configuration = self
             .configuration
@@ -158,6 +217,53 @@ impl HidSystem {
         } else {
             configuration.active_six_axis_handles.remove(&handle);
         }
+    }
+
+    /// Publishes one complete touch-screen sample.
+    pub fn publish_touch_screen(
+        &mut self,
+        state: &EmulatedTouchScreenState,
+        delta: Duration,
+    ) -> Result<(), HandleError> {
+        if self.shared_memory.get().is_none()
+            || !self
+                .configuration
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .touch_screen_active
+        {
+            return Ok(());
+        }
+        self.touch_screen_sampling_number = self.touch_screen_sampling_number.saturating_add(1);
+        let mut entry = [0_u8; TOUCH_SCREEN_ENTRY_SIZE];
+        put_u64(&mut entry, 0, self.touch_screen_sampling_number);
+        put_u64(&mut entry, 8, self.touch_screen_sampling_number);
+        put_u32(
+            &mut entry,
+            16,
+            u32::try_from(state.contacts().len()).expect("touch count is ABI-bounded"),
+        );
+        let delta_time = u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX);
+        for (index, contact) in state.contacts().iter().enumerate() {
+            let offset = 24 + index * TOUCH_STATE_SIZE;
+            put_u64(&mut entry, offset, delta_time);
+            put_u32(&mut entry, offset + 8, contact.attributes);
+            put_u32(&mut entry, offset + 12, contact.finger_id);
+            put_u32(&mut entry, offset + 16, contact.x);
+            put_u32(&mut entry, offset + 20, contact.y);
+            put_u32(&mut entry, offset + 24, contact.diameter_x);
+            put_u32(&mut entry, offset + 28, contact.diameter_y);
+            put_u32(&mut entry, offset + 32, contact.rotation_angle);
+        }
+        // Switch HID exposes a 17-entry atomic touchscreen LIFO at 0x400.
+        // HidTouchScreenStateAtomicStorage is 0x298 bytes and carries up to 16
+        // contacts in the public libnx ABI:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h#L666-L713
+        self.touch_screen.publish(
+            self.shared_memory.get().expect("HID initialized"),
+            TOUCH_SCREEN_OFFSET,
+            &entry,
+        )
     }
 
     /// Publishes one player-one Pro Controller sample.
@@ -361,7 +467,10 @@ fn put_f32(output: &mut [u8], offset: usize, value: f32) {
 
 #[cfg(test)]
 mod tests {
-    use nixe_input::{EmulatedButtonState, MotionVector, StickState};
+    use nixe_input::{
+        EmulatedButtonState, EmulatedTouchContact, MotionVector, StickState, TOUCH_ATTRIBUTE_END,
+        TOUCH_ATTRIBUTE_START, touch_screen_channel,
+    };
 
     use super::*;
 
@@ -414,9 +523,67 @@ mod tests {
     }
 
     #[test]
+    fn publishes_atomic_multitouch_samples_after_activation() {
+        let mut hid = HidSystem::new();
+        let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let (writer, mut reader) = touch_screen_channel();
+        let first = EmulatedTouchContact {
+            finger_id: 3,
+            x: 120,
+            y: 240,
+            diameter_x: 4,
+            diameter_y: 5,
+            rotation_angle: 6,
+            ..EmulatedTouchContact::default()
+        };
+        let second = EmulatedTouchContact {
+            finger_id: 8,
+            x: 640,
+            y: 360,
+            diameter_x: 1,
+            diameter_y: 1,
+            ..EmulatedTouchContact::default()
+        };
+        assert!(writer.begin(first));
+        assert!(writer.begin(second));
+
+        hid.publish_touch_screen(&reader.sample(), Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(read_u64(&memory, TOUCH_SCREEN_OFFSET + 8), 0);
+
+        hid.activate_touch_screen();
+        hid.publish_touch_screen(&reader.sample(), Duration::from_millis(5))
+            .unwrap();
+        let entry = TOUCH_SCREEN_OFFSET + 0x20;
+        assert_eq!(read_u64(&memory, TOUCH_SCREEN_OFFSET + 8), LIFO_CAPACITY);
+        assert_eq!(read_u64(&memory, TOUCH_SCREEN_OFFSET + 16), 0);
+        assert_eq!(read_u64(&memory, TOUCH_SCREEN_OFFSET + 24), 1);
+        assert_eq!(read_u64(&memory, entry), 1);
+        assert_eq!(read_u64(&memory, entry + 8), 1);
+        assert_eq!(read_u32(&memory, entry + 16), 2);
+        assert_eq!(read_u64(&memory, entry + 24), 5_000_000);
+        assert_eq!(read_u32(&memory, entry + 32), 0);
+        assert_eq!(read_u32(&memory, entry + 36), 3);
+        assert_eq!(read_u32(&memory, entry + 40), 120);
+        assert_eq!(read_u32(&memory, entry + 44), 240);
+        assert_eq!(read_u32(&memory, entry + 48), 4);
+        assert_eq!(read_u32(&memory, entry + 52), 5);
+        assert_eq!(read_u32(&memory, entry + 56), 6);
+        assert_eq!(read_u32(&memory, entry + 24 + TOUCH_STATE_SIZE + 12), 8);
+
+        assert!(writer.end(first));
+        let ended = reader.sample();
+        assert_eq!(ended.contacts()[0].attributes, TOUCH_ATTRIBUTE_END);
+        assert_eq!(ended.contacts()[1].attributes, 0);
+        assert_ne!(ended.contacts()[0].attributes, TOUCH_ATTRIBUTE_START);
+    }
+
+    #[test]
     fn publishes_player_one_full_key_state_and_disconnects_it() {
         let mut hid = HidSystem::new();
         configure_player_one(&hid, false);
+        // Joy-Con orientation must not rotate a FullKey controller's input.
+        assert!(hid.set_npad_joy_hold_type(1));
         let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
         let state = EmulatedControllerState {
             buttons: EmulatedButtonState {

@@ -1775,13 +1775,32 @@ fn lower_shader_ir_to_wgsl_impl(
     if !input_groups.is_empty() {
         emit_interface_struct(&mut source, "ShaderInput", ir.stage, true, &input_groups)?;
     }
+    let has_vertex_position = ir.stage == ShaderStage::Vertex
+        && output_groups
+            .get(&ShaderIoLocation::Position)
+            .is_some_and(|position| position.scalar_type == ShaderScalarType::Float32);
     let return_statement = if ir.stage == ShaderStage::Compute {
         "return;"
+    } else if has_vertex_position {
+        "return nixe_host_vertex_position(output);"
     } else {
         "return output;"
     };
     if ir.stage != ShaderStage::Compute {
         emit_interface_struct(&mut source, "ShaderOutput", ir.stage, false, &output_groups)?;
+    }
+    if has_vertex_position {
+        // WebGPU's viewport has a fixed negative Y coefficient. Specialize
+        // positive neutral Y transforms at the final vertex output only;
+        // shader-visible guest registers and varyings remain unchanged.
+        // https://www.w3.org/TR/webgpu/#coordinate-systems
+        source.push_str(
+            "override nixe_viewport_y_flip: bool = false;\n\
+            fn nixe_host_vertex_position(guest: ShaderOutput) -> ShaderOutput {\n\
+                var host = guest;\n\
+                if (nixe_viewport_y_flip) { host.position.y = -host.position.y; }\n\
+                return host;\n}\n",
+        );
     }
     let entry_point = match ir.stage {
         ShaderStage::Vertex => "nixe_guest_vertex",

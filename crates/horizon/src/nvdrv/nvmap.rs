@@ -64,7 +64,7 @@ impl Display for NvMapObjectId {
     }
 }
 
-/// Guest-visible ID used to import another handle to an existing object.
+/// Guest-visible ID used to retain a reference to an existing object.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NvMapExportedId(u32);
 
@@ -376,6 +376,7 @@ impl std::error::Error for NvMapViewError {}
 struct NvMapObjectRecord {
     object: NvMapObject,
     owner: NvMapOwner,
+    handle: NvMapHandle,
     handle_references: u32,
     exported_id: Option<NvMapExportedId>,
 }
@@ -397,7 +398,6 @@ struct NvMapExportedIdRecord {
 pub(super) struct NvMapObjects {
     next_object_id: u64,
     next_handle: u32,
-    next_exported_id: u32,
     objects: BTreeMap<NvMapObjectId, NvMapObjectRecord>,
     handles: BTreeMap<NvMapHandle, NvMapHandleRecord>,
     exported_ids: BTreeMap<NvMapExportedId, NvMapExportedIdRecord>,
@@ -408,7 +408,6 @@ impl Default for NvMapObjects {
         Self {
             next_object_id: NvMapObjectId::FIRST.raw(),
             next_handle: 1,
-            next_exported_id: 1,
             objects: BTreeMap::new(),
             handles: BTreeMap::new(),
             exported_ids: BTreeMap::new(),
@@ -445,6 +444,7 @@ impl NvMapObjects {
                     storage: None,
                 },
                 owner,
+                handle,
                 handle_references: 1,
                 exported_id: None,
             },
@@ -470,11 +470,6 @@ impl NvMapObjects {
             return Err(NvMapStateError::InvalidOwner);
         }
         let object_id = exported.object_id;
-        let handle = NvMapHandle::new(self.next_handle);
-        let next_handle = self
-            .next_handle
-            .checked_add(1)
-            .ok_or(NvMapStateError::InvalidState)?;
         let record = self
             .objects
             .get_mut(&object_id)
@@ -487,11 +482,12 @@ impl NvMapObjects {
             .checked_add(1)
             .ok_or(NvMapStateError::InvalidState)?;
 
+        // Importing an object already held by this client retains the same
+        // handle and increments its duplicate count. The SDK compares these
+        // handles when matching a dequeued native buffer to a window texture.
+        // https://android.googlesource.com/kernel/tegra.git/+/d28c42ee85e186bf02189e9cdacaff0c3c55f2e9/drivers/video/tegra/nvmap/nvmap_handle.c
         record.handle_references = references;
-        self.handles
-            .insert(handle, NvMapHandleRecord { object_id, owner });
-        self.next_handle = next_handle;
-        Ok(handle)
+        Ok(record.handle)
     }
 
     pub(super) fn allocation_backing_size(
@@ -576,7 +572,6 @@ impl NvMapObjects {
         let size = record.object.size;
         if record.handle_references > 1 {
             record.handle_references -= 1;
-            self.handles.remove(&handle);
             return Ok(NvMapFreeResult {
                 address: 0,
                 size,
@@ -647,18 +642,17 @@ impl NvMapObjects {
         {
             return Ok(exported_id);
         }
-        let exported_id = NvMapExportedId::new(self.next_exported_id);
-        let next_exported_id = self
-            .next_exported_id
-            .checked_add(1)
-            .ok_or(NvMapStateError::InvalidState)?;
+        // Switch GetId exposes the object's canonical handle value. Native
+        // window buffers carry it in NvSurface.hMem, which NVN compares with
+        // the texture memory-pool handle without a FromId round trip.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvmap.c
+        let exported_id = NvMapExportedId::new(handle.raw());
         self.exported_ids
             .insert(exported_id, NvMapExportedIdRecord { object_id, owner });
         self.objects
             .get_mut(&object_id)
             .ok_or(NvMapStateError::InvalidState)?
             .exported_id = Some(exported_id);
-        self.next_exported_id = next_exported_id;
         Ok(exported_id)
     }
 
@@ -777,6 +771,34 @@ mod tests {
             read_write.gpu_mapping_permissions(),
             MemoryPermissions::READ_WRITE
         );
+    }
+
+    #[test]
+    fn exported_ids_preserve_handle_identity_independently_of_export_order() {
+        let owner = NvMapOwner::new(7);
+        let mut objects = NvMapObjects::default();
+        let first = objects.create(owner, 0x1000).unwrap();
+        let second = objects.create(owner, 0x2000).unwrap();
+        let third = objects.create(owner, 0x3000).unwrap();
+
+        // Window buffers may be exported long after other GPU allocations.
+        for handle in [third, first, second] {
+            let id = objects.exported_id(owner, handle).unwrap();
+            assert_eq!(id.raw(), handle.raw());
+            assert_eq!(objects.exported_id(owner, handle), Ok(id));
+            assert_eq!(objects.import(owner, id), Ok(handle));
+            let object = objects.object_by_handle(handle).unwrap();
+            assert_eq!(objects.object_by_exported_id(id).unwrap().id(), object.id());
+
+            objects.free(owner, handle).unwrap();
+            assert!(objects.object_by_exported_id(id).is_some());
+            objects.free(owner, handle).unwrap();
+            assert!(objects.object_by_exported_id(id).is_none());
+            assert_eq!(
+                objects.import(owner, id),
+                Err(NvMapStateError::BadParameter)
+            );
+        }
     }
 
     #[test]

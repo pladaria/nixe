@@ -11,6 +11,7 @@ log.workspace = true
 nixe-config.workspace = true
 nixe-gpu.workspace = true
 nixe-gpu-wgpu.workspace = true
+nixe-input.workspace = true
 nixe-video.workspace = true
 png.workspace = true
 wgpu.workspace = true

@@ -763,6 +763,9 @@ pub(crate) struct QueuedBufferRequest {
 struct BufferSlot {
     ownership: SlotOwnership,
     buffer: GraphicBuffer,
+    // RequestBuffer must return the complete registered descriptor, including
+    // native-handle fields not consumed by the presentation path.
+    flattened_buffer: Box<[u8]>,
     presentation_source: Option<PresentationImageRequest>,
     release_fences: Box<[NvFence]>,
 }
@@ -858,14 +861,26 @@ impl BufferQueue {
         let mut queued = None;
         match code {
             1 => {
-                let slot = reader.read_i32()?;
-                let status = if self.slots.contains_key(&slot) {
-                    0
+                let slot_index = reader.read_i32()?;
+                // RequestBuffer returns presence, the flattened GraphicBuffer,
+                // then status. Only a connected producer's dequeued slot is valid.
+                // https://android.googlesource.com/platform/frameworks/native/+/778b6f4/libs/gui/IGraphicBufferProducer.cpp
+                // https://android.googlesource.com/platform/frameworks/native/+/eb7980c/libs/gui/BufferQueueProducer.cpp
+                let slot = self
+                    .slots
+                    .get(&slot_index)
+                    .filter(|slot| slot.ownership == SlotOwnership::Dequeued);
+                if !self.connected {
+                    writer.write_i32(0);
+                    writer.write_i32(-19);
+                } else if let Some(slot) = slot {
+                    writer.write_i32(1);
+                    writer.write_flattened(&slot.flattened_buffer)?;
+                    writer.write_i32(0);
                 } else {
-                    -75
-                };
-                writer.write_i32(0);
-                writer.write_i32(status);
+                    writer.write_i32(0);
+                    writer.write_i32(-22);
+                }
             }
             3 => {
                 let _async = reader.read_i32()?;
@@ -991,6 +1006,7 @@ impl BufferQueue {
                         BufferSlot {
                             ownership: SlotOwnership::Free,
                             buffer,
+                            flattened_buffer: flattened.into(),
                             presentation_source: None,
                             release_fences: Box::default(),
                         },
@@ -1906,6 +1922,115 @@ mod tests {
         assert_eq!(parsed.planes[0].flags, (u64::from(12_u32) << 32) | 11);
     }
 
+    fn producer_request() -> ParcelWriter {
+        let mut writer = ParcelWriter::default();
+        writer.write_u32(0x100);
+        let token = IGRAPHIC_BUFFER_PRODUCER.encode_utf16().collect::<Vec<_>>();
+        writer.write_i32(i32::try_from(token.len()).unwrap());
+        let mut bytes = token
+            .into_iter()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        bytes.resize((bytes.len() + 3) & !3, 0);
+        for word in bytes.chunks_exact(4) {
+            writer.write_u32(u32::from_le_bytes(word.try_into().unwrap()));
+        }
+        writer
+    }
+
+    #[test]
+    fn request_buffer_returns_the_registered_descriptor_only_to_its_producer() {
+        let mut queue = BufferQueue::new(4);
+        let request = |slot| {
+            let mut writer = producer_request();
+            writer.write_i32(slot);
+            writer.finish().unwrap()
+        };
+        let assert_error = |reply: &[u8], status| {
+            let mut reader = ParcelReader::decode(reply).unwrap();
+            assert_eq!(reader.read_i32().unwrap(), 0);
+            assert_eq!(reader.read_i32().unwrap(), status);
+        };
+        assert_error(&queue.transact(1, &request(0)).unwrap().reply, -19);
+
+        let mut connect = producer_request();
+        for value in [0, 2, 0] {
+            connect.write_i32(value);
+        }
+        let reply = queue.transact(10, &connect.finish().unwrap()).unwrap();
+        let mut reader = ParcelReader::decode(&reply.reply).unwrap();
+        for _ in 0..4 {
+            reader.read_u32().unwrap();
+        }
+        assert_eq!(reader.read_i32().unwrap(), 0);
+
+        // Include native-handle words the normalized presentation metadata does
+        // not retain, so reconstruction from GraphicBuffer cannot pass this test.
+        let mut words = (0..45_u32)
+            .map(|word| 0x1234_0000 + word)
+            .collect::<Vec<_>>();
+        words[..10].copy_from_slice(&[0x4742_4652, 128, 64, 128, 1, 0x300, 42, 0, 0, 35]);
+        words[11] = 77;
+        words[13] = 0xdaff_caff;
+        words[16..22].copy_from_slice(&[0x300, 1, 1, 128, 0x8000, 1]);
+        words[23..29].copy_from_slice(&[128, 64, 0x532120, 1, 1, 512]);
+        words[30..39].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x8000, 0]);
+        let flattened = words
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut register = producer_request();
+        register.write_i32(0);
+        register.write_i32(1);
+        register.write_flattened(&flattened).unwrap();
+        queue.transact(14, &register.finish().unwrap()).unwrap();
+        assert_error(&queue.transact(1, &request(0)).unwrap().reply, -22);
+
+        let mut dequeue = producer_request();
+        for value in [0, 128, 64, 1, 0x300] {
+            dequeue.write_u32(value);
+        }
+        let reply = queue.transact(3, &dequeue.finish().unwrap()).unwrap();
+        let mut reader = ParcelReader::decode(&reply.reply).unwrap();
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert!(
+            parse_nv_multi_fence(reader.read_flattened().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reader.read_i32().unwrap(), 0);
+
+        for _ in 0..2 {
+            let reply = queue.transact(1, &request(0)).unwrap();
+            let mut reader = ParcelReader::decode(&reply.reply).unwrap();
+            assert_eq!(reader.read_i32().unwrap(), 1);
+            assert_eq!(reader.read_flattened().unwrap(), flattened);
+            assert_eq!(reader.read_i32().unwrap(), 0);
+            assert_eq!(queue.slots[&0].ownership, SlotOwnership::Dequeued);
+        }
+        for slot in [-1, 1, MAX_BUFFER_SLOTS] {
+            assert_error(&queue.transact(1, &request(slot)).unwrap().reply, -22);
+        }
+        for ownership in [SlotOwnership::Queueing, SlotOwnership::Queued] {
+            queue.slots.get_mut(&0).unwrap().ownership = ownership;
+            assert_error(&queue.transact(1, &request(0)).unwrap().reply, -22);
+        }
+        queue.slots.get_mut(&0).unwrap().ownership = SlotOwnership::Dequeued;
+        let mut cancel = producer_request();
+        cancel.write_i32(0);
+        cancel.write_flattened(&encode_nv_multi_fence(&[])).unwrap();
+        queue.transact(8, &cancel.finish().unwrap()).unwrap();
+        assert_error(&queue.transact(1, &request(0)).unwrap().reply, -22);
+
+        let mut disconnect = producer_request();
+        disconnect.write_i32(2);
+        queue.transact(11, &disconnect.finish().unwrap()).unwrap();
+        assert!(queue.slots.is_empty());
+        assert_error(&queue.transact(1, &request(0)).unwrap().reply, -19);
+    }
+
     #[test]
     fn queue_reservation_rolls_back_without_releasing_producer_ownership() {
         let buffer = GraphicBuffer {
@@ -1937,6 +2062,7 @@ mod tests {
             BufferSlot {
                 ownership: SlotOwnership::Queueing,
                 buffer,
+                flattened_buffer: Box::default(),
                 presentation_source: None,
                 release_fences: Box::default(),
             },
@@ -1964,6 +2090,7 @@ mod tests {
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
                     buffer: buffer.clone(),
+                    flattened_buffer: Box::default(),
                     presentation_source: None,
                     release_fences: Box::default(),
                 },
@@ -2030,6 +2157,7 @@ mod tests {
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
                     buffer: buffer.clone(),
+                    flattened_buffer: Box::default(),
                     presentation_source: None,
                     release_fences: Box::default(),
                 },
@@ -2096,6 +2224,7 @@ mod tests {
                     BufferSlot {
                         ownership: SlotOwnership::Queueing,
                         buffer: buffer.clone(),
+                        flattened_buffer: Box::default(),
                         presentation_source: None,
                         release_fences: Box::default(),
                     },
@@ -2167,6 +2296,7 @@ mod tests {
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
                     buffer: buffer.clone(),
+                    flattened_buffer: Box::default(),
                     presentation_source: None,
                     release_fences: Box::default(),
                 },

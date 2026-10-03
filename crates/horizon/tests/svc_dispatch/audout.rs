@@ -254,7 +254,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             if auto { 8 } else { 5 },
             &[],
             None,
-            Some((releases.get(), 8)),
+            Some((releases.get(), 16)),
             auto,
             false,
         );
@@ -269,8 +269,14 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             0
         );
         assert_eq!(data32(&process), 1); // stopped
+        write_guest_bytes(&process, releases, &[0xa5; 24]);
         assert_eq!(call(&mut process, &mut dispatcher, audio, &release), 0);
         assert_eq!(data32(&process), 0);
+        assert_eq!(read_guest_bytes(&process, releases, 16), [0; 16]);
+        assert_eq!(
+            read_guest_bytes(&process, releases.checked_add(16).unwrap(), 8),
+            [0xa5; 8]
+        );
         let feed = backend.feed.lock().unwrap().clone().unwrap();
         let mut pcm = [9; 2];
         feed.render(&mut pcm);
@@ -323,10 +329,21 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                 0
             );
             assert_eq!(data32(&process), 1);
+            write_guest_bytes(&process, releases, &[0xa5; 24]);
             assert_eq!(call(&mut process, &mut dispatcher, audio, &release), 0);
             assert_eq!(data32(&process), 1);
-            assert_eq!(read_guest_u32(&process, releases), 123);
+            let mut expected = [0; 16];
+            expected[..8].copy_from_slice(&123_u64.to_le_bytes());
+            assert_eq!(read_guest_bytes(&process, releases, 16), expected);
+            assert_eq!(
+                read_guest_bytes(&process, releases.checked_add(16).unwrap(), 8),
+                [0xa5; 8]
+            );
             assert!(!event.is_signalled());
+            // Polling again must not return the previous tag from reused RAM.
+            assert_eq!(call(&mut process, &mut dispatcher, audio, &release), 0);
+            assert_eq!(data32(&process), 0);
+            assert_eq!(read_guest_bytes(&process, releases, 16), [0; 16]);
             assert_eq!(
                 call(
                     &mut process,

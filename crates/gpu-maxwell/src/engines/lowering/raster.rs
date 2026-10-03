@@ -192,21 +192,25 @@ pub(super) fn face_state(
             .copied()
             .ok_or(MaxwellLoweringError::IncompleteDraw(name))
     };
-    // Upper-left/no-flip is the supported framebuffer convention. Other origins
-    // also affect coordinate generation and cannot be fixed by culling alone.
+    // FLIP_Y reverses polygon facing; it does not negate viewport coordinates.
+    // Lower-left origin additionally changes window coordinates and remains
+    // unsupported here. Keep it distinct from the facing-only FLIP_Y bit.
     // Encodings: https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2599-L2605
+    // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L1338-L1349
     let V::Mask(origin) = required(R::WindowOrigin, "SET_WINDOW_ORIGIN")? else {
         return Err(wrong_type());
     };
-    if origin != 0 {
+    if origin & !0x10 != 0 {
         return Err(MaxwellLoweringError::UnsupportedWindowOrigin(origin));
     }
     let V::FrontFace(face) = required(R::FrontFace, "SET_FRONT_FACE")? else {
         return Err(wrong_type());
     };
-    let face = match face {
-        MaxwellThreeDFrontFace::Clockwise => FrontFace::Clockwise,
-        MaxwellThreeDFrontFace::CounterClockwise => FrontFace::CounterClockwise,
+    let face = match (face, origin & 0x10 != 0) {
+        (MaxwellThreeDFrontFace::Clockwise, false)
+        | (MaxwellThreeDFrontFace::CounterClockwise, true) => FrontFace::Clockwise,
+        (MaxwellThreeDFrontFace::CounterClockwise, false)
+        | (MaxwellThreeDFrontFace::Clockwise, true) => FrontFace::CounterClockwise,
     };
     let V::Boolean(enabled) = required(R::CullEnable, "SET_CULL_FACE_ENABLE")? else {
         return Err(wrong_type());
@@ -383,28 +387,23 @@ mod tests {
     }
 
     #[test]
-    fn consumed_faces_require_explicit_state_and_preserve_all_cull_modes() {
+    fn consumed_faces_use_initialized_context_and_preserve_all_cull_modes() {
         let mut channel = three_d_channel();
         program_three_d(&mut channel, 0x1618, 4);
-        assert!(matches!(
-            face_state(channel.three_d()),
-            Err(MaxwellLoweringError::IncompleteDraw("SET_FRONT_FACE"))
-        ));
+        assert_eq!(
+            face_state(channel.three_d()).unwrap(),
+            (FrontFace::Clockwise, CullMode::None)
+        );
         program_three_d(&mut channel, 0x191c, 0x901);
-        assert!(matches!(
-            face_state(channel.three_d()),
-            Err(MaxwellLoweringError::IncompleteDraw("SET_CULL_FACE_ENABLE"))
-        ));
-        program_three_d(&mut channel, 0x1918, 0);
         assert_eq!(
             face_state(channel.three_d()).unwrap(),
             (FrontFace::CounterClockwise, CullMode::None)
         );
         program_three_d(&mut channel, 0x1918, 1);
-        assert!(matches!(
-            face_state(channel.three_d()),
-            Err(MaxwellLoweringError::IncompleteDraw("SET_CULL_FACE"))
-        ));
+        assert_eq!(
+            face_state(channel.three_d()).unwrap(),
+            (FrontFace::CounterClockwise, CullMode::Back)
+        );
         for (raw, face) in [
             (0x900, FrontFace::Clockwise),
             (0x901, FrontFace::CounterClockwise),
@@ -420,9 +419,19 @@ mod tests {
             }
         }
         program_three_d(&mut channel, 0x13ac, 0x10);
+        assert_eq!(
+            face_state(channel.three_d()).unwrap(),
+            (FrontFace::Clockwise, CullMode::FrontAndBack)
+        );
+        program_three_d(&mut channel, 0x191c, 0x900);
+        assert_eq!(
+            face_state(channel.three_d()).unwrap(),
+            (FrontFace::CounterClockwise, CullMode::FrontAndBack)
+        );
+        program_three_d(&mut channel, 0x13ac, 0x1);
         assert!(matches!(
             face_state(channel.three_d()),
-            Err(MaxwellLoweringError::UnsupportedWindowOrigin(0x10))
+            Err(MaxwellLoweringError::UnsupportedWindowOrigin(0x1))
         ));
         // Direct lines/points do not consume polygon facing, including stale
         // unsupported polygon state left by the previous draw.
@@ -435,6 +444,7 @@ mod tests {
         }
         // Patches consume the generated primitive, not their input topology.
         program_three_d(&mut channel, 0x13ac, 0);
+        program_three_d(&mut channel, 0x191c, 0x901);
         program_three_d(&mut channel, 0x1618, 14);
         program_three_d(&mut channel, 0x320, 0x201);
         assert_eq!(

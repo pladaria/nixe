@@ -393,6 +393,7 @@ impl RenderPipelineKey {
             fragment,
             topology: draw.prepared.topology,
             triangle_rasterization: draw.prepared.triangle_rasterization,
+            viewport_y_flip: viewport_y_flip(draw.prepared.viewport_transform),
             front_face: draw.prepared.front_face,
             cull_mode: draw.prepared.cull_mode,
             alpha_test: draw.prepared.alpha_test,
@@ -415,6 +416,7 @@ impl RenderPipelineKey {
             && self.fragment == location.fragment
             && self.topology == draw.prepared.topology
             && self.triangle_rasterization == draw.prepared.triangle_rasterization
+            && self.viewport_y_flip == viewport_y_flip(draw.prepared.viewport_transform)
             && self.front_face == draw.prepared.front_face
             && self.cull_mode == draw.prepared.cull_mode
             && self.alpha_test == draw.prepared.alpha_test
@@ -435,6 +437,7 @@ impl RenderPipelineKey {
 }
 
 struct RenderPipelineFingerprintInput<'a> {
+    viewport_y_flip: bool,
     front_face: nixe_gpu::FrontFace,
     cull_mode: nixe_gpu::CullMode,
     color_outputs: [nixe_gpu::ColorOutputState; MAX_COLOR_ATTACHMENTS],
@@ -457,6 +460,7 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.fragment.hash(state);
         self.topology.hash(state);
         self.triangle_rasterization.hash(state);
+        self.viewport_y_flip.hash(state);
         self.front_face.hash(state);
         self.cull_mode.hash(state);
         self.alpha_test.hash(state);
@@ -497,6 +501,7 @@ fn render_pipeline_fingerprint(
     quad_flat: bool,
 ) -> u128 {
     nixe_gpu::cache_fingerprint(&RenderPipelineFingerprintInput {
+        viewport_y_flip: viewport_y_flip(draw.prepared.viewport_transform),
         front_face: draw.prepared.front_face,
         cull_mode: draw.prepared.cull_mode,
         quad_flat,
@@ -546,6 +551,7 @@ impl VertexPipelineLayoutKey {
 #[cfg(debug_assertions)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RenderPipelineKey {
+    viewport_y_flip: bool,
     front_face: nixe_gpu::FrontFace,
     cull_mode: nixe_gpu::CullMode,
     color_outputs: [nixe_gpu::ColorOutputState; MAX_COLOR_ATTACHMENTS],
@@ -1707,7 +1713,13 @@ impl WgpuBackendDriver {
             );
             let host_row_pitch = align_u32(
                 block_columns
-                    .checked_mul(u32::try_from(bytes_per_texel).unwrap())
+                    .checked_mul(
+                        u32::try_from(host_bytes_per_block(
+                            description.format(),
+                            subresources.plane,
+                        )?)
+                        .unwrap(),
+                    )
                     .ok_or_else(|| unsupported("image upload row size"))?,
                 wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
             )?;
@@ -1723,6 +1735,9 @@ impl WgpuBackendDriver {
                     host_row_pitch,
                 },
             )?;
+            if description.format() == ImageFormat::Rgb565Unorm {
+                expand_rgb565_rows(&mut self.upload_linear, block_columns, host_row_pitch);
+            }
             let upload_linear = std::mem::take(&mut self.upload_linear);
             self.stage_texture_upload(
                 encoder,
@@ -2007,6 +2022,11 @@ impl WgpuBackendDriver {
                 };
                 let texture = texture.clone();
                 let description = *description;
+                if description.format() == ImageFormat::Rgb565Unorm {
+                    return Err(unsupported(
+                        "RGB565 clear without packed-format quantization",
+                    ));
+                }
                 if description.kind() != *kind
                     || description.format() != *format
                     || description.samples() != *samples
@@ -3123,7 +3143,10 @@ impl WgpuBackendDriver {
                 })
             })
             .collect::<Vec<_>>();
-        let vertex_constants = location.opaque_textures.constants(&vertex_ir);
+        let mut vertex_constants = location.opaque_textures.constants(&vertex_ir);
+        if viewport_y_flip(draw.prepared.viewport_transform) {
+            vertex_constants.push(("nixe_viewport_y_flip".to_owned(), 1.0));
+        }
         let mut fragment_constants = location.opaque_textures.constants(&fragment_ir);
         if let Some(test) = draw.prepared.alpha_test {
             fragment_constants.push((
@@ -3355,6 +3378,11 @@ impl WgpuBackendDriver {
             .bindings()
             .get(binding_index)
             .ok_or_else(|| unsupported("missing image writeback binding"))?;
+        if description.format() == ImageFormat::Rgb565Unorm {
+            return Err(unsupported(
+                "RGB565 device writes without packed-format quantization",
+            ));
+        }
         let subresources = binding.subresources();
         let extent = description
             .mip_extent(subresources.mip_level)
@@ -3557,6 +3585,7 @@ impl WgpuBackendDriver {
                 Some(Resource::Image {
                     texture,
                     attachment_views,
+                    description,
                     ..
                 }),
             ..
@@ -3564,6 +3593,11 @@ impl WgpuBackendDriver {
         else {
             return Err(kind_mismatch(handle));
         };
+        if description.format() == ImageFormat::Rgb565Unorm {
+            return Err(unsupported(
+                "RGB565 render attachment without packed-format quantization",
+            ));
+        }
         Ok(attachment_views
             .entry(attachment.subresources)
             .or_insert_with(|| {
@@ -4698,6 +4732,10 @@ struct WebGpuViewport {
     max_depth: f32,
 }
 
+fn viewport_y_flip(transform: Option<ViewportTransform>) -> bool {
+    transform.is_some_and(|transform| transform.scale()[1] > 0.0)
+}
+
 fn webgpu_viewport(transform: ViewportTransform) -> Result<WebGpuViewport, BackendDriverError> {
     let scale = transform.scale();
     let offset = transform.offset();
@@ -4709,9 +4747,6 @@ fn webgpu_viewport(transform: ViewportTransform) -> Result<WebGpuViewport, Backe
     // draws. See https://www.w3.org/TR/webgpu/#coordinate-systems.
     if scale[0] <= 0.0 {
         return Err(unsupported("non-positive Maxwell X viewport scale"));
-    }
-    if scale[1] >= 0.0 {
-        return Err(unsupported("non-negative Maxwell Y viewport scale"));
     }
     if scale[2] < 0.0 {
         return Err(unsupported("reversed Maxwell depth viewport scale"));
@@ -4727,9 +4762,9 @@ fn webgpu_viewport(transform: ViewportTransform) -> Result<WebGpuViewport, Backe
 
     let viewport = WebGpuViewport {
         x: offset[0] - scale[0],
-        y: offset[1] + scale[1],
+        y: offset[1] - scale[1].abs(),
         width: scale[0] * 2.0,
-        height: scale[1] * -2.0,
+        height: scale[1].abs() * 2.0,
         min_depth,
         max_depth,
     };
@@ -4751,6 +4786,11 @@ fn webgpu_viewport(transform: ViewportTransform) -> Result<WebGpuViewport, Backe
 
 pub(crate) const fn texture_format(format: ImageFormat) -> Option<TextureFormat> {
     Some(match format {
+        // WebGPU has no packed RGB565 format. Decode once at a dirty upload,
+        // then use native filtering on exact f32 UNORM component values. RGBA8
+        // would round 5/6-bit fractions before filtering and change samples.
+        // https://www.w3.org/TR/webgpu/#texture-format-caps
+        ImageFormat::Rgb565Unorm => TextureFormat::Rgba32Float,
         ImageFormat::Bc1RgbUnorm | ImageFormat::Bc1RgbaUnorm => TextureFormat::Bc1RgbaUnorm,
         ImageFormat::Bc1RgbSrgb | ImageFormat::Bc1RgbaSrgb => TextureFormat::Bc1RgbaUnormSrgb,
         ImageFormat::R8Unorm => TextureFormat::R8Unorm,
@@ -4819,7 +4859,7 @@ fn image_texture_plan(
 }
 
 pub(crate) fn required_texture_usages(format: ImageFormat) -> TextureUsages {
-    if format.block_extent() != [1, 1] {
+    if format.block_extent() != [1, 1] || format == ImageFormat::Rgb565Unorm {
         TextureUsages::COPY_SRC | TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING
     } else if format == ImageFormat::Depth24UnormStencil8Uint {
         TextureUsages::RENDER_ATTACHMENT
@@ -5372,12 +5412,7 @@ fn estimated_resident_bytes(info: &BackendResourceCreateInfo) -> Result<u64, Bac
             let bytes_per_block =
                 (0..description.format().plane_count()).try_fold(0_u64, |total, plane| {
                     total
-                        .checked_add(u64::from(
-                            description
-                                .format()
-                                .plane_bytes_per_block(plane)
-                                .ok_or_else(|| unsupported("image plane format"))?,
-                        ))
+                        .checked_add(host_bytes_per_block(description.format(), plane)? as u64)
                         .ok_or_else(|| unsupported("image residency size overflow"))
                 })?;
             let mut blocks = 0_u64;
@@ -5420,6 +5455,38 @@ struct ImageCopyShape {
     layers: u32,
     bytes_per_texel: usize,
     host_row_pitch: u32,
+}
+
+fn host_bytes_per_block(format: ImageFormat, plane: u8) -> Result<usize, BackendDriverError> {
+    let canonical = format
+        .plane_bytes_per_block(plane)
+        .ok_or_else(|| unsupported("image plane format"))?;
+    Ok(if format == ImageFormat::Rgb565Unorm {
+        16
+    } else {
+        usize::from(canonical)
+    })
+}
+
+/// Expand backwards in the reusable upload rows so no second image allocation
+/// or per-sample shader unpacking is needed. Layout decoding still addresses
+/// the original two-byte texels; host rows hold four f32 sampling components.
+fn expand_rgb565_rows(bytes: &mut [u8], width: u32, row_pitch: u32) {
+    for row in bytes.chunks_exact_mut(row_pitch as usize) {
+        for x in (0..width as usize).rev() {
+            let packed = u16::from_le_bytes([row[x * 2], row[x * 2 + 1]]);
+            let components = [
+                f32::from(packed >> 11) / 31.0,
+                f32::from((packed >> 5) & 63) / 63.0,
+                f32::from(packed & 31) / 31.0,
+                1.0,
+            ];
+            for (component, value) in components.into_iter().enumerate() {
+                let offset = x * 16 + component * 4;
+                row[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5810,6 +5877,7 @@ mod tests {
             )
         };
         let mut input = super::RenderPipelineFingerprintInput {
+            viewport_y_flip: false,
             front_face: nixe_gpu::FrontFace::CounterClockwise,
             cull_mode: nixe_gpu::CullMode::None,
             color_outputs: [nixe_gpu::ColorOutputState::REPLACE; super::MAX_COLOR_ATTACHMENTS],
@@ -5840,6 +5908,8 @@ mod tests {
         input.color_outputs[7].write_mask =
             nixe_gpu::ColorWriteMask::new(false, false, false, false);
         assert_eq!(multiple, nixe_gpu::cache_fingerprint(&input));
+        input.viewport_y_flip = true;
+        assert_ne!(multiple, nixe_gpu::cache_fingerprint(&input));
     }
 
     #[test]
@@ -5883,6 +5953,7 @@ mod tests {
         };
         let fingerprint = |layout: &VertexBufferLayout, topology, quad_flat| {
             nixe_gpu::cache_fingerprint(&super::RenderPipelineFingerprintInput {
+                viewport_y_flip: false,
                 front_face: nixe_gpu::FrontFace::CounterClockwise,
                 cull_mode: nixe_gpu::CullMode::None,
                 quad_flat,
@@ -6201,14 +6272,17 @@ mod tests {
     }
 
     #[test]
-    fn viewport_axis_signs_without_an_exact_webgpu_mapping_remain_typed_failures() {
+    fn viewport_y_sign_specializes_output_while_negative_x_remains_unsupported() {
         let flipped_x =
             ViewportTransform::new([-32.0, -16.0, 0.5], [32.0, 16.0, 0.5], [0.0, 1.0]).unwrap();
         let flipped_y =
             ViewportTransform::new([32.0, 16.0, 0.5], [32.0, 16.0, 0.5], [0.0, 1.0]).unwrap();
 
         assert!(webgpu_viewport(flipped_x).is_err());
-        assert!(webgpu_viewport(flipped_y).is_err());
+        let viewport = webgpu_viewport(flipped_y).unwrap();
+        assert_eq!((viewport.y, viewport.height), (0.0, 32.0));
+        assert!(super::viewport_y_flip(Some(flipped_y)));
+        assert!(!super::viewport_y_flip(None));
     }
 
     #[test]
@@ -6227,6 +6301,87 @@ mod tests {
             ViewportTransform::new([32.0, -16.0, 1.0], [32.0, 16.0, 0.0], [-1.0, 1.0]).unwrap();
 
         assert!(webgpu_viewport(transform).is_err());
+    }
+
+    #[test]
+    fn rgb565_upload_preserves_every_normalized_component_and_opaque_alpha() {
+        let width = 65536;
+        let row_pitch = width * 16;
+        let mut bytes = vec![0xa5; row_pitch as usize * 2];
+        for row in bytes.chunks_exact_mut(row_pitch as usize) {
+            for packed in 0..=u16::MAX {
+                let offset = usize::from(packed) * 2;
+                row[offset..offset + 2].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+        super::expand_rgb565_rows(&mut bytes, width, row_pitch);
+        for row in bytes.chunks_exact(row_pitch as usize) {
+            for packed in 0..=u16::MAX {
+                let pixel = &row[usize::from(packed) * 16..][..16];
+                let values: Vec<_> = pixel
+                    .chunks_exact(4)
+                    .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+                    .collect();
+                assert_eq!(
+                    values,
+                    [
+                        f32::from(packed >> 11) / 31.0,
+                        f32::from((packed >> 5) & 63) / 63.0,
+                        f32::from(packed & 31) / 31.0,
+                        1.0
+                    ]
+                );
+            }
+        }
+        assert_eq!(
+            super::host_bytes_per_block(ImageFormat::Rgb565Unorm, 0).unwrap(),
+            16
+        );
+        assert_eq!(ImageFormat::Rgb565Unorm.plane_bytes_per_texel(0), Some(2));
+        assert!(
+            !super::required_texture_usages(ImageFormat::Rgb565Unorm)
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        );
+    }
+
+    #[test]
+    fn rgb565_expansion_reads_packed_block_linear_layers_before_overwriting_rows() {
+        let layout = ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            layer_stride: 512,
+        });
+        let shape = ImageCopyShape {
+            width: 9,
+            height: 8,
+            layers: 2,
+            bytes_per_texel: 2,
+            host_row_pitch: 256,
+        };
+        let mut rows = vec![0; 256 * 8 * 2];
+        for (row_index, row) in rows.chunks_exact_mut(256).enumerate() {
+            for x in 0..9 {
+                let pixel = ((row_index as u16) << 11) | ((x as u16) << 5) | 3;
+                row[x * 2..x * 2 + 2].copy_from_slice(&pixel.to_le_bytes());
+            }
+        }
+        let mut canonical = vec![0; 1024];
+        write_linear_image_to_canonical(&rows, &mut canonical, layout, shape).unwrap();
+        let mut decoded = linearize_canonical_image(&canonical, layout, shape).unwrap();
+        super::expand_rgb565_rows(&mut decoded, shape.width, shape.host_row_pitch);
+        for (row_index, row) in decoded.chunks_exact(256).enumerate() {
+            for x in 0..9 {
+                let actual: Vec<_> = row[x * 16..x * 16 + 16]
+                    .chunks_exact(4)
+                    .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+                    .collect();
+                assert_eq!(
+                    actual,
+                    [row_index as f32 / 31.0, x as f32 / 63.0, 3.0 / 31.0, 1.0]
+                );
+            }
+        }
     }
 
     #[test]

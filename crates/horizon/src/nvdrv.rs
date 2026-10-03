@@ -1425,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn nvmap_handles_ids_and_views_have_independent_lifetimes() {
+    fn nvmap_import_preserves_handle_identity_until_the_last_reference_is_freed() {
         let session = NvDrvSession::new();
         let memory = ExecutionMemory::new();
         let address_space = AddressSpaceId::new(3);
@@ -1478,7 +1478,7 @@ mod tests {
         assert_eq!(error, NV_SUCCESS);
         let second_handle =
             NvMapHandle::new(u32::from_le_bytes(imported[4..8].try_into().unwrap()));
-        assert_ne!(first_handle, second_handle);
+        assert_eq!(first_handle, second_handle);
         let retained_object = session.nvmap_object_by_id(exported_id).unwrap();
         assert_eq!(
             session.nvmap_object(first_handle).unwrap().id(),
@@ -1493,7 +1493,7 @@ mod tests {
             assert_eq!(
                 state.nvmap.handle_references(first_handle),
                 Ok(2),
-                "both handles must retain one semantic object"
+                "import must retain another reference to the same handle"
             );
             assert_eq!(
                 state.nvmap.object_by_handle(first_handle).unwrap().id(),
@@ -1511,6 +1511,16 @@ mod tests {
             0
         );
         assert!(session.nvmap_object_by_id(exported_id).is_some());
+        assert!(session.nvmap_object(first_handle).is_some());
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .unwrap()
+                .nvmap
+                .handle_references(first_handle),
+            Ok(1)
+        );
 
         let mut free_second = [0_u8; 24];
         free_second[0..4].copy_from_slice(&second_handle.raw().to_le_bytes());
@@ -1863,6 +1873,7 @@ mod tests {
         assert_eq!(error, NV_SUCCESS);
         let imported_handle =
             NvMapHandle::new(u32::from_le_bytes(imported[4..8].try_into().unwrap()));
+        assert_eq!(imported_handle, first_handle);
         assert_eq!(
             session.nvmap_object(imported_handle).unwrap().id(),
             first_object.id()

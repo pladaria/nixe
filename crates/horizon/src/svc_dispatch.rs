@@ -578,6 +578,15 @@ impl HorizonSvcDispatcher {
         self.hid_system.publish(state, delta)
     }
 
+    /// Publishes the latest host touch-screen state to Horizon HID.
+    pub fn advance_touch_screen(
+        &mut self,
+        state: &nixe_input::EmulatedTouchScreenState,
+        delta: Duration,
+    ) -> Result<(), nixe_runtime::HandleError> {
+        self.hid_system.publish_touch_screen(state, delta)
+    }
+
     #[must_use]
     pub fn coverage(&self) -> Vec<HorizonSvcCoverageEntry> {
         self.observed

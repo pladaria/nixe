@@ -86,6 +86,7 @@ impl HorizonIpcObject {
             Self::AudioOut(_) => "IAudioOut",
             Self::Hid(_) => "hid",
             Self::HidAppletResource(_) => "IAppletResource",
+            Self::HidActiveVibrationDeviceList(_) => "IActiveVibrationDeviceList",
             Self::Time(session) => domain_object
                 .and_then(|object_id| session.object(object_id))
                 .map_or("time:u", |object| match object {
@@ -279,6 +280,9 @@ pub(crate) fn send_sync_request_from_buffer(
         }
         HorizonIpcObject::HidAppletResource(resource) => {
             services::dispatch_hid_applet_resource(process, &resource, request)?
+        }
+        HorizonIpcObject::HidActiveVibrationDeviceList(list) => {
+            services::dispatch_hid_active_vibration_device_list(&list, request, &hipc)?
         }
         HorizonIpcObject::Time(time) => services::dispatch_time(process, &time, request, &hipc)?,
         HorizonIpcObject::SystemClock(clock) => {

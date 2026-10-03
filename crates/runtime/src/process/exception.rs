@@ -233,8 +233,15 @@ impl RunnableProcess {
         let Some(thread) = self.thread(thread_id) else {
             return Box::new([]);
         };
-        let stack_bottom = thread.stack_bottom.get();
         let stack_top = thread.stack_top.get();
+        // CreateThread supplies only the top of a guest-owned stack. Its
+        // allocation's lower bound is unknown; walk the active stack above SP
+        // and let bounded memory reads reject unmapped frame records.
+        let stack_bottom = if thread.stack_bottom == thread.stack_top {
+            context.sp
+        } else {
+            thread.stack_bottom.get()
+        };
         let mut frame_pointer = context.x[29];
         let mut frames = Vec::with_capacity(MAX_EXIT_STACK_FRAMES);
         while frames.len() < MAX_EXIT_STACK_FRAMES
