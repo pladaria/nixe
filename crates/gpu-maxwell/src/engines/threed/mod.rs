@@ -3885,6 +3885,25 @@ fn preflight_output_state(
                 "SET_CT_SELECT",
             ))
         }
+        // Both ZBC slot-disable masks occupy bits 14:0 in NVIDIA's B197 header.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+        0x07a4 | 0x07a8 => {
+            let name = if method == 0x07a4 {
+                "SET_COLOR_ZERO_BANDWIDTH_CLEAR"
+            } else {
+                "SET_Z_ZERO_BANDWIDTH_CLEAR"
+            };
+            if raw & !0x7fff != 0 {
+                return Err(invalid_encoding(source, name, "reserved bits are set"));
+            }
+            let value = raw as u16;
+            let write = if method == 0x07a4 {
+                MaxwellThreeDRenderTargetWrite::ColorZeroBandwidthClear { value, source }
+            } else {
+                MaxwellThreeDRenderTargetWrite::DepthZeroBandwidthClear { value, source }
+            };
+            Some((write, name))
+        }
         0x1220 => {
             let value = MaxwellThreeDCompressionThreshold::parse(raw).ok_or_else(|| {
                 invalid_encoding(

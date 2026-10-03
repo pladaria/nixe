@@ -358,11 +358,15 @@ fn preflight_launch(
     state: &MaxwellThreeDInlineToMemoryState,
 ) -> PreflightResult {
     let raw = source.argument();
-    if raw & !0x51 != 0 {
+    // SEMAPHORE_STRUCT_SIZE (bit 12) only selects the payload format for
+    // RELEASE_SEMAPHORE. Both sizes are inert for FLUSH_DISABLE/FLUSH_ONLY;
+    // accepting the selector must not enable semaphore release (bit 5).
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+    if raw & !0x1051 != 0 {
         return Err(invalid(
             source,
             "LAUNCH_DMA",
-            "completion, interrupt, reduction, and semaphore modes are not implemented",
+            "interrupt, reduction, and semaphore release modes are not implemented, or undefined launch bits are set",
         ));
     }
     if state.pending.is_some() {

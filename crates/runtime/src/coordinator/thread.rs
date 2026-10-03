@@ -135,7 +135,20 @@ impl RuntimeCoordinator {
             })
             .map_err(|_| ThreadOperationError::Internal)?;
         self.recompute_effective_priorities()
-            .map_err(|_| ThreadOperationError::Internal)
+            .map_err(|_| ThreadOperationError::Internal)?;
+        // SetPriority also replaces the scheduler's effective priority, so
+        // recomputation may see no subsequent change to notify the wait queue.
+        let view = self
+            .scheduler
+            .thread(info.thread)
+            .ok_or(ThreadOperationError::Internal)?;
+        self.processes
+            .get_mut(&view.process)
+            .ok_or(ThreadOperationError::Internal)?
+            .address_waits_mut()
+            .priority_waits_mut()
+            .change_priority(info.thread, view.effective_priority);
+        Ok(())
     }
 
     pub fn set_thread_affinity(
@@ -263,6 +276,17 @@ impl RuntimeCoordinator {
             if view.effective_priority != priority {
                 self.scheduler
                     .apply(SchedulerCommand::SetEffectivePriority { thread, priority })?;
+                let process_id = self
+                    .scheduler
+                    .thread(thread)
+                    .expect("thread exists")
+                    .process;
+                self.processes
+                    .get_mut(&process_id)
+                    .expect("thread owns a process")
+                    .address_waits_mut()
+                    .priority_waits_mut()
+                    .change_priority(thread, priority);
             }
         }
         Ok(())

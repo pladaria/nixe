@@ -15,7 +15,7 @@ mod process;
 mod process_mount;
 mod virtual_time;
 
-pub use address_wait::AddressWaitRegistry;
+pub use address_wait::{AddressWaitRegistry, AddressWaitResult, PriorityAddressWaitQueue};
 pub use coordinator::{
     CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
     CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, ThreadOperationError,

@@ -74,10 +74,29 @@ impl EventWatchCallback for DeviceChanges {
     }
 }
 
-/// Thread-affine SDL3 backend for host gamepads.
-///
-/// SDL owns its gamepad subsystem on the creating thread, so this backend
-/// deliberately does not claim `Send` or `Sync`.
+/// Main-thread subsystem references. InputWorker retains these until its
+/// worker has joined, so no SDL subsystem is finalized by the polling thread.
+#[derive(Clone)]
+pub(crate) struct InputSubsystems {
+    pub(crate) events: EventSubsystem,
+    pub(crate) gamepads: GamepadSubsystem,
+}
+
+impl InputSubsystems {
+    pub(crate) fn new(sdl: &Sdl) -> Result<Self, SdlInputError> {
+        Ok(Self {
+            events: sdl
+                .event()
+                .map_err(|e| SdlInputError::new("event initialization", e))?,
+            gamepads: sdl
+                .gamepad()
+                .map_err(|e| SdlInputError::new("gamepad initialization", e))?,
+        })
+    }
+}
+
+/// Created and destroyed on the polling thread; initialization and final
+/// subsystem shutdown belong to InputWorker's main-thread owner.
 pub(crate) struct SdlInputBackend {
     open_gamepads: Vec<OpenGamepad>,
     failed_gamepads: Vec<JoystickId>,
@@ -86,23 +105,19 @@ pub(crate) struct SdlInputBackend {
     events: EventSubsystem,
     gamepad_subsystem: GamepadSubsystem,
     next_controller_id: u64,
-    _sdl: Sdl,
 }
 
 impl SdlInputBackend {
-    pub fn new() -> Result<Self, SdlInputError> {
-        let sdl = sdl3::init().map_err(|error| SdlInputError::new("initialization", error))?;
-        let events = sdl
-            .event()
-            .map_err(|error| SdlInputError::new("event initialization", error))?;
+    pub(crate) fn new(subsystems: InputSubsystems) -> Self {
+        let InputSubsystems {
+            events,
+            gamepads: gamepad_subsystem,
+        } = subsystems;
         // Callbacks can run on another thread. Only mark topology dirty here;
         // all device operations remain on the input thread.
         // https://wiki.libsdl.org/SDL3/SDL_AddEventWatch
         let devices_changed = Arc::new(AtomicBool::new(true));
         let device_watch = events.add_event_watch(DeviceChanges(Arc::clone(&devices_changed)));
-        let gamepad_subsystem = sdl
-            .gamepad()
-            .map_err(|error| SdlInputError::new("gamepad initialization", error))?;
         // Controls are sampled, not handled as events. Keep device events for
         // hotplug, including the joystick events SDL uses to discover gamepads.
         for event in [
@@ -120,7 +135,7 @@ impl SdlInputBackend {
         ] {
             EventSubsystem::set_event_enabled(event, false);
         }
-        Ok(Self {
+        Self {
             open_gamepads: Vec::new(),
             failed_gamepads: Vec::new(),
             devices_changed,
@@ -128,8 +143,7 @@ impl SdlInputBackend {
             events,
             gamepad_subsystem,
             next_controller_id: 1,
-            _sdl: sdl,
-        })
+        }
     }
 
     fn reconcile_gamepads(&mut self) -> Result<(), SdlInputError> {
@@ -489,7 +503,9 @@ mod tests {
     fn backend_ignores_open_failures_and_recognizes_reconnections() {
         use sdl3::joystick::{JoystickType, VirtualJoystickDescription};
 
-        let mut backend = SdlInputBackend::new().unwrap();
+        let sdl = sdl3::init().unwrap();
+        let subsystems = InputSubsystems::new(&sdl).unwrap();
+        let mut backend = SdlInputBackend::new(subsystems.clone());
         assert!(!EventSubsystem::event_enabled(
             EventType::ControllerButtonDown
         ));
@@ -506,7 +522,7 @@ mod tests {
             EventType::ControllerDeviceRemoved
         ));
         backend.poll().unwrap();
-        let joystick = backend._sdl.joystick().unwrap();
+        let joystick = sdl.joystick().unwrap();
         let attach = || {
             joystick
                 .attach_virtual_joystick(

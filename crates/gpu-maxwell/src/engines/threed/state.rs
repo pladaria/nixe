@@ -1770,6 +1770,8 @@ impl MaxwellThreeDStateWrite {
                     | MaxwellThreeDRenderTargetWrite::ClearVertical { .. }
                     | MaxwellThreeDRenderTargetWrite::ClearSurfaceControl { .. }
                     | MaxwellThreeDRenderTargetWrite::ClearSurface { .. }
+                    | MaxwellThreeDRenderTargetWrite::ColorZeroBandwidthClear { .. }
+                    | MaxwellThreeDRenderTargetWrite::DepthZeroBandwidthClear { .. }
             ),
             Self::VertexInput(write) => !matches!(
                 write,

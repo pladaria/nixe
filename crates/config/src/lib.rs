@@ -45,6 +45,8 @@ pub struct NixeConfig {
     pub gpu: GpuCacheConfiguration,
     /// Host gamepad identification and emulated-controller mappings.
     pub input: InputConfig,
+    /// Application audio output layout.
+    pub audio: AudioConfig,
     source_path: PathBuf,
 }
 
@@ -111,6 +113,7 @@ impl NixeConfig {
             cpu,
             gpu,
             input: raw.input,
+            audio: raw.audio,
             source_path,
         })
     }
@@ -356,6 +359,14 @@ impl Error for ConfigError {
     }
 }
 
+/// Only implemented output modes can be selected; unknown layouts are errors.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AudioConfig {
+    #[serde(default)]
+    pub output: nixe_audio::ChannelLayout,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -372,6 +383,8 @@ struct RawConfig {
     gpu: RawGpuConfig,
     #[serde(default)]
     input: InputConfig,
+    #[serde(default)]
+    audio: AudioConfig,
 }
 
 #[derive(Default, Deserialize)]
@@ -773,6 +786,33 @@ mod tests {
         assert!(!config.diagnostics.file_system_access_log);
         assert_eq!(config.gpu, GpuCacheConfiguration::default());
         assert!(config.input.profiles.is_empty());
+    }
+
+    #[test]
+    fn audio_defaults_to_stereo_and_rejects_unimplemented_layouts() {
+        let base = r#"
+            version = 2
+            [library]
+            paths = []
+            [system]
+            preferred_languages = []
+            keys = "keys"
+            initial_operation_mode = "handheld"
+        "#;
+        for suffix in ["", "\n[audio]\noutput = \"stereo\"\n"] {
+            let file = TemporaryConfig::new(&format!("{base}{suffix}"));
+            assert_eq!(
+                NixeConfig::load(&file.path).unwrap().audio.output,
+                nixe_audio::ChannelLayout::Stereo
+            );
+        }
+        for layout in ["5.1", "surround", "automatic"] {
+            let file = TemporaryConfig::new(&format!("{base}\n[audio]\noutput = {layout:?}\n"));
+            assert!(matches!(
+                NixeConfig::load(&file.path),
+                Err(ConfigError::Parse { .. })
+            ));
+        }
     }
 
     #[test]

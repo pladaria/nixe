@@ -32,7 +32,7 @@ impl RuntimeCoordinator {
         self.virtual_clock.scheduler_time_ns()
     }
 
-    /// Suspends a caller until a deterministic virtual deadline. Non-positive
+    /// Suspends a caller until a monotonic scheduler deadline. Non-positive
     /// Horizon sleep values are scheduler yields and become ready immediately.
     pub fn sleep_thread(
         &mut self,
@@ -103,6 +103,11 @@ impl RuntimeCoordinator {
     }
 
     pub(super) fn fast_forward_to_next_deadline(&mut self) -> Result<bool, CoordinatorError> {
+        // Live audio/input/device completion follows host time. Jumping ahead
+        // would turn a pending device operation into an immediate guest timeout.
+        if self.virtual_clock.mode() == crate::VirtualClockMode::Realtime {
+            return Ok(false);
+        }
         let Some((&(deadline, _), _)) = self.deadlines.first_key_value() else {
             return Ok(false);
         };
@@ -112,13 +117,15 @@ impl RuntimeCoordinator {
     }
 
     pub(super) fn wake_due_deadlines(&mut self) -> Result<usize, CoordinatorError> {
-        let due: Vec<_> = self
-            .deadlines
-            .range(..=(self.virtual_time_ns(), u64::MAX))
-            .map(|(key, token)| (*key, *token))
-            .collect();
+        if self.deadlines.is_empty() {
+            return Ok(0);
+        }
+        let now = self.virtual_time_ns();
         let mut woken = 0;
-        for (key, token) in due {
+        while let Some((&key, &token)) = self.deadlines.first_key_value() {
+            if key.0 > now {
+                break;
+            }
             self.deadlines.remove(&key);
             if self.apply_wake(token, false)? {
                 woken += 1;
@@ -144,6 +151,19 @@ impl RuntimeCoordinator {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<Option<CoordinatorDrainReport>, CoordinatorError> {
+        // The host service deadline and the earliest guest timeout both bound
+        // idle sleeping. The next scheduler pass wakes expired guest waits.
+        let timeout = if self.virtual_clock.mode() == crate::VirtualClockMode::Realtime {
+            self.deadlines
+                .first_key_value()
+                .map_or(timeout, |((deadline, _), _)| {
+                    timeout.min(std::time::Duration::from_nanos(
+                        deadline.saturating_sub(self.virtual_time_ns()),
+                    ))
+                })
+        } else {
+            timeout
+        };
         let Some(event) = self.inbox.recv_sequenced_timeout(timeout)? else {
             return Ok(None);
         };

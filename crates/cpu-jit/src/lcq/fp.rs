@@ -38,6 +38,8 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
             instruction,
             Instruction::ScalarFloatRound(_)
                 | Instruction::ScalarFloatAdd(_)
+                | Instruction::ScalarFloatMaxNumber(_)
+                | Instruction::ScalarFloatMinNumber(_)
                 | Instruction::ScalarFloatDivide(_)
                 | Instruction::VectorFloatDivide(_)
                 | Instruction::VectorFloatAdd(_)
@@ -323,6 +325,34 @@ pub(crate) fn complete_divide(
         scalar_bits(state, operation.rn, operation.width_64),
         scalar_bits(state, operation.rm, operation.width_64),
         if operation.width_64 { 64 } else { 32 },
+        state.fpcr(),
+    );
+    if fp_status_traps(result.status, state.fpcr()) {
+        return Err(CompletionError::Trap(result.status));
+    }
+    state.set_vector(operation.rd, result.bits);
+    state.set_fpsr(state.fpsr() | fp_status_bits(result.status));
+    state.set_pc(state.pc().wrapping_add(4));
+    Ok(())
+}
+
+/// Exact FMINNM/FMAXNM cold completion after native FPSR merge and epoch release.
+/// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+pub(crate) fn complete_min_max_number(
+    operation: crate::abi::FpMinMaxNumberOperation,
+    state: &mut A64State,
+) -> Result<(), CompletionError> {
+    use nixe_cpu::semantics::a64_fp_simd::exact_scalar_float_min_max_number;
+    if operation.rn >= 32 || operation.rm >= 32 || operation.rd >= 32 {
+        return Err(CompletionError::Invalid(Error::internal(
+            "invalid exact FP minimum/maximum-number operands",
+        )));
+    }
+    let result = exact_scalar_float_min_max_number(
+        scalar_bits(state, operation.rn, operation.width_64),
+        scalar_bits(state, operation.rm, operation.width_64),
+        if operation.width_64 { 64 } else { 32 },
+        operation.minimum,
         state.fpcr(),
     );
     if fp_status_traps(result.status, state.fpcr()) {

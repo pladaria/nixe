@@ -1158,11 +1158,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nixe-audio"
+version = "0.1.0"
+dependencies = [
+ "sdl3",
+ "sdl3-sys",
+ "serde",
+]
+
+[[package]]
 name = "nixe-cli"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
  "log",
+ "nixe-audio",
  "nixe-config",
  "nixe-cpu",
  "nixe-cpu-interpreter",
@@ -1180,6 +1190,7 @@ dependencies = [
  "nixe-scheduler",
  "nixe-video",
  "nixe-video-winit",
+ "sdl3",
  "sha2",
 ]
 
@@ -1188,6 +1199,7 @@ name = "nixe-config"
 version = "0.1.0"
 dependencies = [
  "chrono-tz",
+ "nixe-audio",
  "nixe-gpu",
  "nixe-input",
  "nixe-loader-title",
@@ -1293,6 +1305,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "log",
+ "nixe-audio",
  "nixe-cpu",
  "nixe-gpu",
  "nixe-gpu-maxwell",

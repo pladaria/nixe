@@ -727,6 +727,50 @@ fn a64_simd_count_bits_covers_both_vector_widths_and_captured_alias() {
 }
 
 #[test]
+fn a64_simd_uaddlv_widens_unsigned_sums_and_clears_the_destination() {
+    for (word, expected) in [
+        (0x2e30_3800_u32, 0x7f8_u128),
+        (0x6e30_3800, 0xff0),
+        (0x2e70_3800, 0x3fffc),
+        (0x6e70_3800, 0x7fff8),
+        (0x6eb0_3800, 0x3_ffff_fffc),
+    ] {
+        for (rd, rn) in [(0, 0), (31, 31), (2, 31), (31, 2)] {
+            let mut state = A64State::default();
+            state.set_vector(rd, u128::MAX);
+            state.set_vector(rn, u128::MAX);
+            state.set_fpsr(0x0800_009f);
+            let flags = state.nzcv();
+            execute_one(
+                &TargetPlatform::Switch1,
+                &mut state,
+                word | (u32::from(rn) << 5) | u32::from(rd),
+            )
+            .unwrap();
+            assert_eq!(
+                state.vector(rd),
+                Some(expected),
+                "{word:08x} Rd={rd} Rn={rn}"
+            );
+            if rd != rn {
+                assert_eq!(state.vector(rn), Some(u128::MAX));
+            }
+            assert_eq!(state.fpsr(), 0x0800_009f);
+            assert_eq!(state.nzcv(), flags);
+            assert_eq!(state.pc(), 4);
+        }
+    }
+    let mut state = A64State::default();
+    state.set_vector(0, 0xffff_ffff_ffff_ffff_0807_0605_0403_0201);
+    execute_one(&TargetPlatform::Switch1, &mut state, 0x2e30_3800).unwrap();
+    assert_eq!(state.vector(0), Some(36));
+    // Both short forms must ignore poisoned upper lanes.
+    state.set_vector(0, 0xffff_ffff_ffff_ffff_0000_0000_0000_0000);
+    execute_one(&TargetPlatform::Switch1, &mut state, 0x2e70_3800).unwrap();
+    assert_eq!(state.vector(0), Some(0));
+}
+
+#[test]
 fn a64_simd_add_across_vector_covers_every_allocated_arrangement_and_alias() {
     let profile = TargetPlatform::Switch1;
     let mut state = A64State::default();
@@ -3901,4 +3945,148 @@ fn a64_control_reference_semantics_update_link_and_pc() {
         )),
         4
     );
+}
+
+#[test]
+fn a64_fmaxnm_handles_numbers_nans_zeros_and_fp_exceptions() {
+    for wide in [false, true] {
+        let bits = |v: f64| {
+            if wide {
+                v.to_bits()
+            } else {
+                u64::from((v as f32).to_bits())
+            }
+        };
+        let sign = 1_u64 << if wide { 63 } else { 31 };
+        let quiet = 1_u64 << if wide { 51 } else { 22 };
+        let snan = bits(f64::INFINITY) | 0x123;
+        let qnan = snan | quiet | sign;
+        let word = 0x1e21_6802 | (u32::from(wide) << 22);
+        for (a, b, fpcr, result, status) in [
+            (bits(1.0), bits(2.0), 0, bits(2.0), 0),
+            (bits(-1.0), bits(-2.0), 0, bits(-1.0), 0),
+            (sign, 0, 0, 0, 0),
+            (0, sign, 0, 0, 0),
+            (sign, sign, 0, sign, 0),
+            (
+                bits(f64::NEG_INFINITY),
+                bits(f64::INFINITY),
+                0,
+                bits(f64::INFINITY),
+                0,
+            ),
+            (qnan, bits(2.0), 1 << 25, bits(2.0), 0),
+            (bits(2.0), qnan, 0, bits(2.0), 0),
+            (qnan, snan, 0, snan | quiet, 1),
+            (snan, bits(2.0), 0, snan | quiet, 1),
+            (qnan, qnan, 0, qnan, 0),
+            (qnan, qnan, 1 << 25, bits(f64::INFINITY) | quiet, 0),
+            (1, 0, 0, 1, 0),
+            (1, 0, 1 << 24, 0, 0x80),
+            (qnan, sign | 1, 1 << 24, sign, 0x80),
+        ] {
+            for rd in [0, 1, 2, 31] {
+                let mut state = A64State::default();
+                state.set_fpcr(fpcr);
+                state.set_fpsr(1 << 27);
+                state.set_vector(rd, u128::MAX);
+                state.set_vector(0, u128::from(a) | (u128::MAX << 64));
+                state.set_vector(1, u128::from(b) | (u128::MAX << 64));
+                let flags = state.nzcv();
+                execute_one(
+                    &TargetPlatform::Switch1,
+                    &mut state,
+                    (word & !31) | u32::from(rd),
+                )
+                .unwrap();
+                assert_eq!(
+                    state.vector(rd),
+                    Some(u128::from(result)),
+                    "{word:x} {a:x} {b:x}"
+                );
+                assert_eq!(state.fpsr(), (1 << 27) | status);
+                assert_eq!(state.nzcv(), flags);
+                assert_eq!(state.pc(), 4);
+            }
+        }
+        for (a, fpcr) in [(snan, 1 << 8), (1, (1 << 24) | (1 << 15))] {
+            let mut state = A64State::default();
+            state.set_fpcr(fpcr);
+            state.set_vector(0, u128::from(a));
+            state.set_vector(2, u128::MAX);
+            let before = state.clone();
+            assert_floating_point_exception(
+                execute_one(&TargetPlatform::Switch1, &mut state, word).unwrap(),
+            );
+            assert_eq!(state, before);
+        }
+    }
+}
+
+#[test]
+fn a64_fminnm_handles_captured_alias_nans_signed_zeros_and_traps() {
+    for wide in [false, true] {
+        let bits = |v: f64| {
+            if wide {
+                v.to_bits()
+            } else {
+                u64::from((v as f32).to_bits())
+            }
+        };
+        let sign = 1_u64 << if wide { 63 } else { 31 };
+        let quiet = 1_u64 << if wide { 51 } else { 22 };
+        let snan = bits(f64::INFINITY) | 0x123;
+        let qnan = snan | quiet | sign;
+        // Captured FMINNM S2,S2,S0, plus the corresponding double form.
+        let word = 0x1e20_7842 | (u32::from(wide) << 22);
+        for (a, b, fpcr, result, status) in [
+            (bits(1.0), bits(2.0), 0, bits(1.0), 0),
+            (bits(-1.0), bits(-2.0), 0, bits(-2.0), 0),
+            (sign, 0, 0, sign, 0),
+            (0, sign, 0, sign, 0),
+            (0, 0, 0, 0, 0),
+            (
+                bits(f64::NEG_INFINITY),
+                bits(f64::INFINITY),
+                0,
+                bits(f64::NEG_INFINITY),
+                0,
+            ),
+            (qnan, bits(2.0), 1 << 25, bits(2.0), 0),
+            (bits(2.0), qnan, 0, bits(2.0), 0),
+            (qnan, snan, 0, snan | quiet, 1),
+            (snan, bits(2.0), 0, snan | quiet, 1),
+            (qnan, qnan, 0, qnan, 0),
+            (snan, qnan, 1 << 25, bits(f64::INFINITY) | quiet, 1),
+            (sign | 1, 0, 0, sign | 1, 0),
+            (sign | 1, 0, 1 << 24, sign, 0x80),
+            (qnan, 1, 1 << 24, 0, 0x80),
+        ] {
+            let mut state = A64State::default();
+            state.set_fpcr(fpcr);
+            state.set_fpsr(1 << 27);
+            state.set_vector(2, u128::from(a) | (u128::MAX << 64));
+            state.set_vector(0, u128::from(b) | (u128::MAX << 64));
+            let flags = state.nzcv();
+            execute_one(&TargetPlatform::Switch1, &mut state, word).unwrap();
+            assert_eq!(
+                state.vector(2),
+                Some(u128::from(result)),
+                "{word:x} {a:x} {b:x}"
+            );
+            assert_eq!(state.fpsr(), (1 << 27) | status);
+            assert_eq!(state.nzcv(), flags);
+            assert_eq!(state.pc(), 4);
+        }
+        for (a, fpcr) in [(snan, 1 << 8), (1, (1 << 24) | (1 << 15))] {
+            let mut state = A64State::default();
+            state.set_fpcr(fpcr);
+            state.set_vector(2, u128::from(a) | (u128::MAX << 64));
+            let before = state.clone();
+            assert_floating_point_exception(
+                execute_one(&TargetPlatform::Switch1, &mut state, word).unwrap(),
+            );
+            assert_eq!(state, before);
+        }
+    }
 }

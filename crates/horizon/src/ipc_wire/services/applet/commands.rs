@@ -118,6 +118,7 @@ command_enum!(SelfControllerCommand {
     11 => SetOperationModeChangedNotification,
     12 => SetPerformanceModeChangedNotification,
     13 => SetFocusHandlingMode,
+    14 => SetRestartMessageEnabled,
     16 => SetOutOfFocusSuspendingEnabled,
     40 => CreateManagedDisplayLayer,
 });
@@ -129,6 +130,7 @@ command_enum!(WindowControllerCommand {
 
 command_enum!(ApplicationFunctionsCommand {
     1 => PopLaunchParameter,
+    21 => GetDesiredLanguage,
     22 => SetTerminateResult,
     40 => NotifyRunning,
 });

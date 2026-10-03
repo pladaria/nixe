@@ -148,6 +148,16 @@ impl NvMapAllocationMetadata {
         self.alignment
     }
 
+    /// Extent pinned for GPU access, which can exceed the logical object size.
+    /// The public nvmap reference rounds to the allocation alignment before
+    /// pinning into the device address space (Handle::Alloc / PinHandle):
+    /// https://github.com/strato-emu/strato/blob/ae1566a48285816a87e81d4aeb40bd2f4e56e60b/app/src/main/cpp/skyline/services/nvdrv/core/nvmap.cpp
+    pub(super) fn backing_size(self, logical_size: u32) -> Result<u64, NvMapStateError> {
+        self.validate()?;
+        let alignment = u64::from(self.alignment);
+        Ok(u64::from(logical_size).div_ceil(alignment) * alignment)
+    }
+
     pub const fn kind(self) -> u8 {
         self.kind
     }
@@ -484,16 +494,17 @@ impl NvMapObjects {
         Ok(handle)
     }
 
-    pub(super) fn allocation_size(
+    pub(super) fn allocation_backing_size(
         &self,
         owner: NvMapOwner,
         handle: NvMapHandle,
-    ) -> Result<u32, NvMapStateError> {
+        allocation: NvMapAllocationMetadata,
+    ) -> Result<u64, NvMapStateError> {
         let object = self.object_by_owned_handle(owner, handle)?;
         if object.storage.is_some() {
             return Err(NvMapStateError::AlreadyAllocated);
         }
-        Ok(object.size)
+        allocation.backing_size(object.size)
     }
 
     pub(super) fn allocate(
@@ -506,7 +517,8 @@ impl NvMapObjects {
     ) -> Result<(), NvMapStateError> {
         allocation.validate()?;
         if backing.size() == 0
-            || backing.size() != u64::from(self.object_by_owned_handle(owner, handle)?.size())
+            || backing.size()
+                != allocation.backing_size(self.object_by_owned_handle(owner, handle)?.size())?
             || backing.segments().iter().any(|segment| {
                 !segment
                     .permissions()
@@ -775,7 +787,11 @@ mod tests {
         let handle = objects.create(owner, 0x1000).unwrap();
 
         assert_eq!(
-            objects.allocation_size(foreign, handle),
+            objects.allocation_backing_size(
+                foreign,
+                handle,
+                NvMapAllocationMetadata::new(0, 0, 0x1000, 0),
+            ),
             Err(NvMapStateError::InvalidOwner)
         );
         assert_eq!(

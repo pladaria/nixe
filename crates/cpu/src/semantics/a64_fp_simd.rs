@@ -174,7 +174,11 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             Ok(())
         }
         Instruction::AddAcrossVector(_) => {
-            add_across_vector(state, fields);
+            add_across_vector(state, fields, false);
+            Ok(())
+        }
+        Instruction::UnsignedAddLongAcrossVector(_) => {
+            add_across_vector(state, fields, true);
             Ok(())
         }
         Instruction::ExtractNarrow(_) => {
@@ -352,6 +356,33 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
                 return Err(A64FpSimdError::Trap);
             }
             assert!(state.set_vector(fields.rd, u128::from(outcome.bits)));
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+            Ok(())
+        }
+        Instruction::ScalarFloatMaxNumber(_) | Instruction::ScalarFloatMinNumber(_) => {
+            let width = if fields.opc == 0 { 32 } else { 64 };
+            let mask = if width == 32 {
+                u64::from(u32::MAX)
+            } else {
+                u64::MAX
+            };
+            let outcome = exact_scalar_float_min_max_number(
+                state
+                    .vector(fields.rn)
+                    .expect("normalized FP min/max-number source") as u64
+                    & mask,
+                state
+                    .vector(fields.rm)
+                    .expect("normalized FP min/max-number source") as u64
+                    & mask,
+                width,
+                matches!(instruction, Instruction::ScalarFloatMinNumber(_)),
+                state.fpcr(),
+            );
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(A64FpSimdError::Trap);
+            }
+            assert!(state.set_vector(fields.rd, outcome.bits));
             state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
             Ok(())
         }
@@ -2335,6 +2366,62 @@ pub fn exact_scalar_float_add(
     ))
 }
 
+/// FMINNM/FMAXNM prefer a number to a quiet NaN, but propagate signaling NaNs.
+/// FPUnpack applies FZ/IDC before selection; +0 is greater than -0.
+/// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+pub fn exact_scalar_float_min_max_number(
+    lhs: u64,
+    rhs: u64,
+    precision: u8,
+    minimum: bool,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let format = BinaryFormat::new(fp_format(precision));
+    let control = FpAddControl::from_fpcr(fpcr);
+    let mut status = FpStatus::default();
+    let mut lhs = DecodedFloat::new(lhs, format);
+    let mut rhs = DecodedFloat::new(rhs, format);
+    for operand in [&mut lhs, &mut rhs] {
+        if control.flush_to_zero && operand.is_subnormal() {
+            status.input_denormal = true;
+            *operand = DecodedFloat::new(operand.bits & format.sign_mask(), format);
+        }
+    }
+    status.invalid_operation = lhs.is_signaling_nan(format) || rhs.is_signaling_nan(format);
+    let bits = if status.invalid_operation || (lhs.is_nan(format) && rhs.is_nan(format)) {
+        propagate_nan(lhs, rhs, format, control.default_nan)
+    } else if lhs.is_nan(format) {
+        rhs.bits
+    } else if rhs.is_nan(format) {
+        lhs.bits
+    } else {
+        // Integer keys preserve numerical order, including signed zeros.
+        let key = |operand: DecodedFloat| {
+            if operand.sign {
+                !operand.bits
+            } else {
+                operand.bits | format.sign_mask()
+            }
+        };
+        // Truncate the complemented single-precision key to its actual width.
+        let mask = if precision == 32 {
+            u64::from(u32::MAX)
+        } else {
+            u64::MAX
+        };
+        let select_lhs = if minimum {
+            (key(lhs) & mask) < (key(rhs) & mask)
+        } else {
+            (key(lhs) & mask) > (key(rhs) & mask)
+        };
+        if select_lhs { lhs.bits } else { rhs.bits }
+    };
+    ExactFpOutcome {
+        bits: u128::from(bits),
+        status,
+    }
+}
+
 fn add_ieee_lane(
     lhs_bits: u64,
     rhs_bits: u64,
@@ -3618,19 +3705,27 @@ fn count_bits(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operand
 // scalar result, clearing every destination bit above the result element.
 // Arm ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDV--Add-across-vector-
-fn add_across_vector(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+// UADDLV uses the same unsigned reduction with a result twice the lane width.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+fn add_across_vector(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    widen: bool,
+) {
     let lane_bits = 8_u32 << fields.opc;
     let vector_bits = if fields.vector_128 { 128 } else { 64 };
     let lane_count = vector_bits / lane_bits;
     let lane_mask = (1_u128 << lane_bits) - 1;
+    let result_bits = if widen { lane_bits * 2 } else { lane_bits };
+    let result_mask = (1_u128 << result_bits) - 1;
     let source = state
         .vector(fields.rn)
-        .expect("normalized ADDV source register");
+        .expect("normalized across-vector sum source register");
     let mut result = 0_u128;
     for lane in 0..lane_count {
-        result = result.wrapping_add((source >> (lane * lane_bits)) & lane_mask) & lane_mask;
+        result += (source >> (lane * lane_bits)) & lane_mask;
     }
-    assert!(state.set_vector(fields.rd, result));
+    assert!(state.set_vector(fields.rd, result & result_mask));
 }
 
 // XTN copies the least-significant half of every source lane to the lower

@@ -12,6 +12,7 @@ pub(crate) enum IpcWireError {
     HostResourceExhausted(&'static str),
     ResponseCommit(DataAccessFault),
     GraphicsBackend(Box<str>),
+    AudioBackend(Box<str>),
     ErrorApplet(Box<crate::ErrorAppletDiagnostic>),
     UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
@@ -68,6 +69,9 @@ impl std::fmt::Display for HorizonIpcFault {
             }
             IpcWireError::GraphicsBackend(reason) => {
                 write!(formatter, "GPU presentation export failed: {reason}")
+            }
+            IpcWireError::AudioBackend(reason) => {
+                write!(formatter, "audio output failed: {reason}")
             }
             IpcWireError::ErrorApplet(diagnostic) => {
                 write!(

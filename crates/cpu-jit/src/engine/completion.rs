@@ -117,6 +117,7 @@ impl JitThread {
                     | EdgeKind::FpRound(_)
                     | EdgeKind::FpAdd(_)
                     | EdgeKind::VectorFpAdd(_)
+                    | EdgeKind::FpMinMaxNumber(_)
                     | EdgeKind::FpDivide(_)
                     | EdgeKind::VectorFpDivide(_)
                     | EdgeKind::VectorFpMultiply(_)
@@ -132,6 +133,7 @@ impl JitThread {
                             EdgeKind::FpRound(op) => fp::complete_round(op, state),
                             EdgeKind::FpAdd(op) => fp::complete_add(op, state),
                             EdgeKind::VectorFpAdd(op) => fp::complete_vector_add(op, state),
+                            EdgeKind::FpMinMaxNumber(op) => fp::complete_min_max_number(op, state),
                             EdgeKind::FpDivide(op) => fp::complete_divide(op, state),
                             EdgeKind::VectorFpDivide(op) => fp::complete_vector_divide(op, state),
                             EdgeKind::VectorFpMultiply(op) => {

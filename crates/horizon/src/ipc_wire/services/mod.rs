@@ -13,6 +13,7 @@ mod account;
 mod aoc;
 mod apm;
 mod applet;
+mod audout;
 mod bsd;
 pub(super) mod content;
 pub(super) mod fsp;
@@ -25,12 +26,14 @@ mod prelude;
 pub(super) mod response;
 mod settings;
 mod sm;
+mod ssl;
 mod time;
 mod vi;
 
 pub(super) use account::{dispatch_account, dispatch_account_manager_for_application};
 pub(super) use apm::{dispatch_performance_manager, dispatch_performance_session};
 pub(super) use applet::{applet_object_name, applet_requests_self_exit, dispatch_applet};
+pub(super) use audout::{dispatch_audio_out, dispatch_audio_out_manager};
 pub(super) use bsd::dispatch_bsd;
 pub(super) use hid::{dispatch_hid, dispatch_hid_applet_resource};
 pub(super) use lm::{dispatch_log_manager, dispatch_logger};
@@ -39,6 +42,7 @@ pub(super) use nvdrv::dispatch_nvdrv;
 pub(super) use pctl::{dispatch_parental_control, dispatch_parental_control_service};
 pub(super) use settings::{dispatch_system_settings, dispatch_user_settings};
 pub(super) use sm::dispatch_service_manager;
+pub(super) use ssl::dispatch_ssl;
 pub(super) use time::{
     dispatch_steady_clock, dispatch_system_clock, dispatch_time, dispatch_timezone,
 };

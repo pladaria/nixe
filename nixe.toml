@@ -45,6 +45,10 @@ guest_logs_level = "inherit"
 # Ask the guest filesystem SDK to emit access logs through Horizon's logger.
 file_system_access_log = true
 
+# Emulated output layout. Only stereo (2.0) is currently implemented.
+[audio]
+output = "stereo"
+
 [cpu]
 # CPU backend: "jit" or "interpreter". Neither backend falls back to the other.
 backend = "jit"

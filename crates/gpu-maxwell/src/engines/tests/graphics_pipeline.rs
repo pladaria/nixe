@@ -354,6 +354,74 @@ fn invalid_color_compression_values_are_rejected_atomically() {
 }
 
 #[test]
+fn zero_bandwidth_clear_masks_preserve_independent_state_without_gpu_work() {
+    let mut channel = three_d_channel();
+    let targets = channel.three_d().render_targets();
+    assert_eq!(targets.color_zero_bandwidth_clear().value(), None);
+    assert_eq!(targets.depth_zero_bandwidth_clear().value(), None);
+    let draw_identity = channel.three_d().draw_state_identity();
+    let resource_identity = channel.three_d().resource_state_identity(
+        &[
+            MaxwellThreeDResourceRole::ColorTarget(0),
+            MaxwellThreeDResourceRole::DepthStencilTarget,
+        ],
+        false,
+    );
+    let two_d = channel.two_d().clone();
+    for (method, name) in [
+        (0x07a4, "SET_COLOR_ZERO_BANDWIDTH_CLEAR"),
+        (0x07a8, "SET_Z_ZERO_BANDWIDTH_CLEAR"),
+    ] {
+        for mask in [0x7ff8, 0, 0x7fff, 1, 0x4000] {
+            let before = channel.three_d().render_targets().clone();
+            let dispatch = dispatch_method(&mut channel, method / 4, mask).unwrap();
+            assert!(dispatch.ordered_operations().is_empty());
+            assert_eq!(dispatch.methods()[0].metadata().method_name(), name);
+            let targets = channel.three_d().render_targets();
+            let register = if method == 0x07a4 {
+                assert_eq!(
+                    targets.depth_zero_bandwidth_clear(),
+                    before.depth_zero_bandwidth_clear()
+                );
+                targets.color_zero_bandwidth_clear()
+            } else {
+                assert_eq!(
+                    targets.color_zero_bandwidth_clear(),
+                    before.color_zero_bandwidth_clear()
+                );
+                targets.depth_zero_bandwidth_clear()
+            };
+            assert_eq!(register.raw(), Some(mask));
+            assert_eq!(register.value(), Some(&(mask as u16)));
+            assert_eq!(
+                register.source(),
+                Some(dispatch.methods()[0].method().source())
+            );
+            assert!(draw_identity.matches(channel.three_d()));
+            assert!(resource_identity.matches(channel.three_d()));
+            assert_eq!(channel.two_d(), &two_d);
+        }
+    }
+}
+
+#[test]
+fn zero_bandwidth_clear_masks_reject_reserved_bits_without_mutating_state() {
+    let mut channel = three_d_channel();
+    program_three_d(&mut channel, 0x07a4, 0x7ff8);
+    program_three_d(&mut channel, 0x07a8, 0x7ffe);
+    for method in [0x07a4, 0x07a8] {
+        for mask in [0x8000, 0xffff, 0x10000, 0x8000_0000, u32::MAX] {
+            let before = channel.clone();
+            assert!(matches!(
+                dispatch_method(&mut channel, method / 4, mask),
+                Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
+            ));
+            assert_eq!(channel, before);
+        }
+    }
+}
+
+#[test]
 fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
@@ -427,11 +495,18 @@ fn compression_threshold_reserved_values_and_failed_packet_keeps_valid_prefix() 
 #[test]
 fn compressed_color_clears_materialize_resident_images_and_generic_writeback() {
     for (format, kind) in [(0xd5, 0xfe), (0xca, 0xfe), (0xca, 0xe9)] {
-        check_compressed_color_materialization(format, kind);
+        check_compressed_color_materialization(format, kind, None);
     }
 }
 
-fn check_compressed_color_materialization(format: u32, kind: u8) {
+#[test]
+fn zero_bandwidth_clear_masks_preserve_clear_materialization_and_compressed_import_errors() {
+    for mask in [0, 0x7ff8, 0x7fff] {
+        check_compressed_color_materialization(0xd5, 0xfe, Some(mask));
+    }
+}
+
+fn check_compressed_color_materialization(format: u32, kind: u8, zbc_mask: Option<u32>) {
     let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
     let mapping = map_resource(
@@ -444,6 +519,10 @@ fn check_compressed_color_materialization(format: u32, kind: u8) {
     );
     let address = mapping.offset().get();
     let mut channel = three_d_channel();
+    if let Some(mask) = zbc_mask {
+        program_three_d(&mut channel, 0x07a4, mask);
+        program_three_d(&mut channel, 0x07a8, mask);
+    }
     for (method, argument) in [
         (0x0800, (address >> 32) as u32),
         (0x0804, address as u32),

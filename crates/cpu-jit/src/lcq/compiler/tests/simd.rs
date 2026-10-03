@@ -1,6 +1,32 @@
 use super::integer::{compare, initial_state};
 
 #[test]
+fn uaddlv_native_lowering_matches_all_unsigned_arrangements_and_aliases() {
+    for word in [
+        0x2e30_3800_u32,
+        0x6e30_3800,
+        0x2e70_3800,
+        0x6e70_3800,
+        0x6eb0_3800,
+    ] {
+        for (rd, rn) in [(0, 0), (31, 31), (2, 31), (31, 2)] {
+            for value in [
+                0,
+                u128::MAX,
+                0xffff_ffff_ffff_ffff_0807_0605_0403_0201,
+                0xffff_ffff_ffff_ffff_0000_0000_0000_0000,
+            ] {
+                let mut initial = initial_state();
+                initial.set_vector(rd, u128::MAX);
+                initial.set_vector(rn, value);
+                initial.set_fpsr(0x0800_009f);
+                compare(word | (u32::from(rn) << 5) | u32::from(rd), initial);
+            }
+        }
+    }
+}
+
+#[test]
 fn simd_integer_moves_permutations_and_shifts_match_the_interpreter() {
     let cases = [
         0x4e01_0c20_u32, // DUP V0.16B,W1

@@ -906,6 +906,16 @@ pub struct FpDivideOperation {
     pub width_64: bool,
 }
 
+/// Typed exact scalar FMINNM/FMAXNM over canonical PRE-state operands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpMinMaxNumberOperation {
+    pub minimum: bool,
+    pub rn: u8,
+    pub rm: u8,
+    pub rd: u8,
+    pub width_64: bool,
+}
+
 /// Packed FDIV over canonical vectors; only 2S, 4S and 2D are valid shapes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VectorFpDivideOperation {

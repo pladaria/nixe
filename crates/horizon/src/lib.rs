@@ -3,8 +3,10 @@
 //! Runtime stays console-agnostic; Horizon-specific sessions and services are
 //! layered on its process, mount, and extensible handle primitives.
 
+mod audio;
 mod bsd;
 mod diagnostics;
+pub use audio::{AudioOutManagerSession, AudioOutSession};
 mod error_applet;
 mod graphics;
 mod graphics_event;
@@ -49,7 +51,7 @@ pub use object::{
     NetworkInterfaceManagerSession, OperationMode, ParentalControlFactorySession,
     ParentalControlSession, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory,
     ReadOnlyFile, ReadOnlyFileSystem, ReadOnlyStorage, RegionCode, SemanticIpcObject,
-    ServiceManagerSession, SettingsEnvironment, SteadyClockSession, SystemClockKind,
+    ServiceManagerSession, SettingsEnvironment, SslSession, SteadyClockSession, SystemClockKind,
     SystemClockSession, SystemLanguage, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
     TimeZoneServiceSession, UserSettingsSession,
 };

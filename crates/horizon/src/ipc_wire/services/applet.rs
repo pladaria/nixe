@@ -25,6 +25,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
     video_system: &VideoSystem,
+    application_language: Option<crate::SystemLanguage>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     // The startup order, command IDs, input PID/process handle, returned
     // objects, and scalar result layouts implemented below follow libnx:
@@ -280,6 +281,20 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                     session.set_focus_handling_mode([mode[0] != 0, mode[1] != 0, mode[2] != 0]);
                     applet_data(request.token, &[])
                 }
+                // This controls AM restart notifications, not a restart request.
+                // Enabling it alone must not enqueue a message or signal an event.
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c
+                // https://switchbrew.org/wiki/AM_services#SetRestartMessageEnabled
+                SelfControllerCommand::SetRestartMessageEnabled => {
+                    let Some(enabled) = applet_request_bool(request.data, hipc) else {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    };
+                    session.set_restart_message_enabled(enabled);
+                    applet_data(request.token, &[])
+                }
                 // SetOutOfFocusSuspendingEnabled completes the focus policy set by
                 // command 13. It has no immediate scheduling effect while the
                 // emulated application remains permanently in focus.
@@ -392,6 +407,28 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             ))
                         }
                     }
+                }
+                // No input; returns the application's selected language code as
+                // a null-padded, little-endian u64, not a SetLanguage enum value.
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c
+                // https://switchbrew.org/wiki/AM_services#GetDesiredLanguage
+                ApplicationFunctionsCommand::GetDesiredLanguage => {
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let Some(language) = application_language else {
+                        return Err(IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "IApplicationFunctions",
+                                command_id: request.command_id,
+                                detail: "application language is unavailable: supply a language selected from control.nacp supported languages",
+                            },
+                        ));
+                    };
+                    applet_data(request.token, &language.code().to_le_bytes())
                 }
                 // SetTerminateResult stores the application result in AM. It does
                 // not terminate the process or replace the kernel exit code.

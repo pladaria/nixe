@@ -6,6 +6,9 @@ use nixe_scheduler::GuestThreadId;
 
 use crate::{EventObject, ReadableEventObject, WritableEventObject};
 
+mod priority;
+pub use priority::{AddressWaitResult, PriorityAddressWaitQueue};
+
 #[derive(Clone, Debug)]
 struct AddressWaiter {
     thread: GuestThreadId,
@@ -19,9 +22,20 @@ struct AddressWaiter {
 pub struct AddressWaitRegistry {
     waiters: BTreeMap<u64, VecDeque<AddressWaiter>>,
     owners: BTreeMap<u64, GuestThreadId>,
+    priority_waits: PriorityAddressWaitQueue,
 }
 
 impl AddressWaitRegistry {
+    /// Priority-ordered address signals have an independent queue namespace
+    /// from mutex ownership and condition-variable keys.
+    pub const fn priority_waits(&self) -> &PriorityAddressWaitQueue {
+        &self.priority_waits
+    }
+
+    pub const fn priority_waits_mut(&mut self) -> &mut PriorityAddressWaitQueue {
+        &mut self.priority_waits
+    }
+
     #[must_use]
     pub fn contains(&self, address: u64, thread: GuestThreadId) -> bool {
         self.waiters
@@ -101,6 +115,7 @@ impl AddressWaitRegistry {
     /// Removes one terminating thread and wakes the next waiter for every mutex
     /// it owned. The caller separately removes scheduler wait tokens.
     pub fn release_thread(&mut self, thread: GuestThreadId) {
+        self.priority_waits.remove(thread);
         let addresses: Vec<_> = self.waiters.keys().copied().collect();
         for address in addresses {
             self.remove(address, thread);
@@ -118,7 +133,7 @@ impl AddressWaitRegistry {
 
     #[must_use]
     pub fn waiter_count(&self) -> usize {
-        self.waiters.values().map(VecDeque::len).sum()
+        self.waiters.values().map(VecDeque::len).sum::<usize>() + self.priority_waits.len()
     }
 }
 

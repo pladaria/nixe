@@ -36,6 +36,8 @@ use crate::{
     HorizonSvcDescriptor, HorizonSvcReturnKind, UnsupportedHorizonSvc, decode_horizon_svc,
 };
 
+mod address_arbitration;
+mod debug_string;
 mod ipc;
 mod memory;
 mod scheduled;
@@ -75,6 +77,8 @@ impl HorizonKernelResult {
     pub const TIMED_OUT: Self = Self(0xea01);
     pub const CANCELLED: Self = Self(0xec01);
     pub const OUT_OF_RANGE: Self = Self(0xee01);
+    // https://switchbrew.org/wiki/Error_codes#Kernel
+    pub const INVALID_ENUM_VALUE: Self = Self(0xf001);
     pub const INVALID_STATE: Self = Self(0xfa01);
     pub const RESOURCE_LIMIT: Self = Self(0x10801);
     pub const NOT_SUPPORTED: Self = Self(0xfe01);
@@ -105,6 +109,7 @@ impl HorizonKernelResult {
             Self::TIMED_OUT => "TimedOut",
             Self::CANCELLED => "Cancelled",
             Self::OUT_OF_RANGE => "OutOfRange",
+            Self::INVALID_ENUM_VALUE => "InvalidEnumValue",
             Self::INVALID_STATE => "InvalidState",
             Self::RESOURCE_LIMIT => "ResourceLimit",
             Self::NOT_SUPPORTED => "NotSupported",
@@ -363,9 +368,11 @@ pub struct HorizonSvcDispatcher {
     initial_operation_mode: crate::OperationMode,
     time_environment: crate::TimeEnvironment,
     settings_environment: crate::SettingsEnvironment,
+    application_language: Option<crate::SystemLanguage>,
     diagnostics: crate::HorizonDiagnostics,
     video_system: crate::VideoSystem,
     hid_system: crate::HidSystem,
+    audio_backend: Option<std::sync::Arc<dyn nixe_audio::AudioBackend>>,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
     reply_sent: BTreeSet<u64>,
     wait_deadlines: BTreeMap<(u64, u32), u64>,
@@ -423,6 +430,10 @@ enum PendingRuntimeRequest {
     },
     ReapThread {
         object_id: u64,
+    },
+    RegisterAddressWait {
+        address: u64,
+        deadline: Option<u64>,
     },
 }
 
@@ -506,9 +517,11 @@ impl HorizonSvcDispatcher {
             initial_operation_mode,
             time_environment,
             settings_environment,
+            application_language: None,
             diagnostics: crate::HorizonDiagnostics::default(),
             video_system,
             hid_system: crate::HidSystem::new(),
+            audio_backend: None,
             named_ports: BTreeMap::new(),
             reply_sent: BTreeSet::new(),
             wait_deadlines: BTreeMap::new(),
@@ -518,10 +531,27 @@ impl HorizonSvcDispatcher {
         }
     }
 
+    /// Sets the language selected from this application's control metadata.
+    /// Without it, GetDesiredLanguage reports unsupported application metadata.
+    #[must_use]
+    pub fn with_application_language(mut self, language: crate::SystemLanguage) -> Self {
+        self.application_language = Some(language);
+        self
+    }
+
     /// Applies guest-log and filesystem diagnostic policy to service dispatch.
     #[must_use]
     pub fn with_diagnostics(mut self, diagnostics: crate::HorizonDiagnostics) -> Self {
         self.diagnostics = diagnostics;
+        self
+    }
+
+    /// Supplies a host PCM backend. Audio remains explicitly unavailable until configured.
+    pub fn with_audio_backend(
+        mut self,
+        backend: std::sync::Arc<dyn nixe_audio::AudioBackend>,
+    ) -> Self {
+        self.audio_backend = Some(backend);
         self
     }
 
@@ -645,6 +675,28 @@ impl HorizonSvcDispatcher {
         };
         let mut fully_handled = true;
         match request {
+            PendingRuntimeRequest::RegisterAddressWait { address, deadline } => {
+                let priority = coordinator
+                    .scheduler()
+                    .thread(thread_id)
+                    .ok_or_else(|| runtime_fault("WaitForAddress thread priority"))?
+                    .effective_priority;
+                let event = coordinator
+                    .process_mut(process_id)
+                    .ok_or_else(|| runtime_fault("WaitForAddress process"))?
+                    .address_waits_mut()
+                    .priority_waits_mut()
+                    .enqueue(address, thread_id, priority, deadline)
+                    .ok_or_else(|| runtime_fault("WaitForAddress duplicate registration"))?;
+                self.pending_wakes.insert(
+                    thread_id.get(),
+                    PendingThreadWake {
+                        events: vec![event],
+                        deadline,
+                    },
+                );
+                fully_handled = false;
+            }
             PendingRuntimeRequest::CreateThread {
                 entry,
                 argument,
@@ -1075,9 +1127,12 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x24 => get_process_id(context),
             0x25 => get_thread_id(context),
             0x26 => break_process(context),
+            0x27 => debug_string::output_debug_string(context, self.diagnostics.guest_logs_level),
             0x29 => get_info(context),
             0x32 => self.set_thread_activity(context),
             0x33 => self.get_thread_context(context),
+            0x34 => self.wait_for_address(context),
+            0x35 => self.signal_to_address(context),
             0x40 => create_session(context),
             0x41 => accept_session(context),
             0x42 => self.reply_and_receive_light(context),
@@ -1112,9 +1167,8 @@ impl Default for HorizonSvcDispatcher {
 const fn svc_support(immediate: u32) -> HorizonSvcSupport {
     match immediate {
         0x04 | 0x05 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f | 0x10
-        | 0x13 | 0x14 | 0x15 | 0x16 | 0x25 | 0x32 | 0x40 | 0x41 | 0x45 | 0x70 | 0x71 | 0x72 => {
-            HorizonSvcSupport::Complete
-        }
+        | 0x13 | 0x14 | 0x15 | 0x16 | 0x25 | 0x27 | 0x32 | 0x34 | 0x35 | 0x40 | 0x41 | 0x45
+        | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
         0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x1a | 0x1b | 0x1c | 0x1d
         | 0x20 | 0x21 | 0x22 | 0x24 | 0x26 | 0x29 | 0x33 | 0x42 | 0x43 | 0x44 => {
             HorizonSvcSupport::Partial

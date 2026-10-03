@@ -14,6 +14,7 @@ const MODULE_SF: u32 = 10;
 const MODULE_SM: u32 = 21;
 const MODULE_TIME: u32 = 116;
 const MODULE_AM: u32 = 128;
+const MODULE_AUDIO: u32 = 153;
 const MODULE_MASK: u32 = 0x1ff;
 const DESCRIPTION_MASK: u32 = 0x1fff;
 const DESCRIPTION_SHIFT: u32 = 9;
@@ -53,6 +54,15 @@ impl HorizonIpcResult {
     /// `ICommonStateGetter::ReceiveMessage` found no queued applet message.
     /// https://switchbrew.org/w/index.php?title=Applet_Manager_services&oldid=14818#ReceiveMessage
     pub const AM_NO_MESSAGES: Self = Self::new(MODULE_AM, 3);
+    // https://github.com/skyline-emu/audio-core/blob/76440e0a3554433398c0ef03233f862a6e86f5ee/core/hle/service/audio/errors.h
+    pub const AUDIO_NOT_FOUND: Self = Self::new(MODULE_AUDIO, 1);
+    pub const AUDIO_OPERATION_FAILED: Self = Self::new(MODULE_AUDIO, 2);
+    pub const AUDIO_INVALID_SAMPLE_RATE: Self = Self::new(MODULE_AUDIO, 3);
+    pub const AUDIO_INSUFFICIENT_BUFFER: Self = Self::new(MODULE_AUDIO, 4);
+    pub const AUDIO_BUFFER_COUNT_REACHED: Self = Self::new(MODULE_AUDIO, 8);
+    pub const AUDIO_INVALID_CHANNEL_COUNT: Self = Self::new(MODULE_AUDIO, 10);
+    pub const AUDIO_INVALID_ADDRESS_INFO: Self = Self::new(MODULE_AUDIO, 42);
+    pub const AUDIO_INVALID_HANDLE: Self = Self::new(MODULE_AUDIO, 1536);
     pub const FS_PATH_NOT_FOUND: Self = Self::new(MODULE_FS, 1);
     pub const FS_OUT_OF_RANGE: Self = Self::new(MODULE_FS, 3005);
     pub const FS_ALLOCATION_MEMORY_FAILED: Self = Self::new(MODULE_FS, 3420);

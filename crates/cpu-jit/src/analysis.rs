@@ -683,6 +683,8 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::VectorFloatMultiplyElement(_)
         | fp_simd::Instruction::ScalarFloatDivide(_)
         | fp_simd::Instruction::ScalarFloatAdd(_)
+        | fp_simd::Instruction::ScalarFloatMaxNumber(_)
+        | fp_simd::Instruction::ScalarFloatMinNumber(_)
         | fp_simd::Instruction::ScalarFloatMultiply(_)
         | fp_simd::Instruction::ScalarFloatConditionalSelect(_) => {
             read(accessed, fields.rn);
@@ -715,6 +717,7 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::ShiftLeftLong(_)
         | fp_simd::Instruction::CountBits(_)
         | fp_simd::Instruction::AddAcrossVector(_)
+        | fp_simd::Instruction::UnsignedAddLongAcrossVector(_)
         | fp_simd::Instruction::VectorSignedIntToFloat(_)
         | fp_simd::Instruction::VectorUnsignedIntToFloat(_)
         | fp_simd::Instruction::ScalarVectorSignedIntToFloat(_)

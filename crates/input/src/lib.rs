@@ -6,7 +6,7 @@ mod profile;
 mod sdl;
 mod worker;
 
-pub use worker::{InputSample, InputWorker, InputWorkerError};
+pub use worker::{InputReader, InputSample, InputWorker, InputWorkerError};
 
 pub use model::{
     Axis, Button, ButtonLabel, ButtonSet, ControllerId, ControllerKind, ControllerState, DPadState,

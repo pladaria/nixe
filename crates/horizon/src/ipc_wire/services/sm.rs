@@ -10,6 +10,8 @@ enum ServiceKind {
     Time,
     Account,
     Bsd,
+    Ssl,
+    AudioOut,
     Vi(ViServiceKind),
     NvDrv,
     LogManager,
@@ -29,6 +31,8 @@ impl ServiceKind {
             b"time:u" => Some(Self::Time),
             b"acc:u0" => Some(Self::Account),
             b"bsd:u" => Some(Self::Bsd),
+            b"ssl" => Some(Self::Ssl),
+            b"audout:u" => Some(Self::AudioOut),
             b"nvdrv" | b"nvdrv:a" | b"nvdrv:s" => Some(Self::NvDrv),
             b"lm" => Some(Self::LogManager),
             b"pctl" | b"pctl:a" | b"pctl:r" | b"pctl:s" => Some(Self::ParentalControl),
@@ -217,6 +221,14 @@ fn connect_service(
         ServiceKind::Bsd => process
             .handles_mut()
             .insert(HorizonIpcObject::Bsd(manager.bsd_session())),
+        ServiceKind::Ssl => process
+            .handles_mut()
+            .insert(HorizonIpcObject::Ssl(SslSession::new())),
+        ServiceKind::AudioOut => process
+            .handles_mut()
+            .insert(HorizonIpcObject::AudioOutManager(
+                crate::AudioOutManagerSession(host_systems.audio_backend.cloned()),
+            )),
         ServiceKind::Vi(kind) => {
             process
                 .handles_mut()

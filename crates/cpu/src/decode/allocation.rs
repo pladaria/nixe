@@ -201,7 +201,7 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
             }
         }
         0x0000_0095 | 0x0000_0096 => validate_a64_simd_shift_register(bits),
-        0x0000_0094 => validate_a64_simd_add_across_vector(bits),
+        0x0000_0094 | 0x0000_00a6 => validate_a64_simd_add_across_vector(bits),
         0x0000_0088 => validate_a64_simd_extract_narrow(bits),
         0x0000_0066..=0x0000_0069 => validate_a64_simd_min_max_pairwise(bits),
         0x0000_006a | 0x0000_006b => validate_a64_simd_integer_to_float(bits),
@@ -266,9 +266,11 @@ fn validate_a64_simd_add_across_vector(bits: u32) -> AllocationStatus {
     let size = (bits >> 22) & 3;
     let vector_128 = bits & (1 << 30) != 0;
     if size == 3 {
-        AllocationStatus::Unallocated("ADDV has no 64-bit element form")
+        AllocationStatus::Unallocated("across-vector sum has no 64-bit element form")
     } else if size == 2 && !vector_128 {
-        AllocationStatus::Reserved("ADDV 32-bit elements require a 128-bit vector")
+        AllocationStatus::Reserved(
+            "across-vector sum with 32-bit elements requires a 128-bit vector",
+        )
     } else {
         AllocationStatus::Allocated
     }

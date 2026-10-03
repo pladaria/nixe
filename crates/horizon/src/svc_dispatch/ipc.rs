@@ -137,8 +137,10 @@ impl HorizonSvcDispatcher {
             &self.time_environment,
             crate::ipc_wire::HostSystems {
                 video: &self.video_system,
+                audio_backend: self.audio_backend.as_ref(),
                 hid: &self.hid_system,
                 settings: &self.settings_environment,
+                application_language: self.application_language,
                 diagnostics: &self.diagnostics,
                 caller_thread_id,
             },
@@ -225,8 +227,10 @@ impl HorizonSvcDispatcher {
             &self.time_environment,
             crate::ipc_wire::HostSystems {
                 video: &self.video_system,
+                audio_backend: self.audio_backend.as_ref(),
                 hid: &self.hid_system,
                 settings: &self.settings_environment,
+                application_language: self.application_language,
                 diagnostics: &self.diagnostics,
                 caller_thread_id,
             },

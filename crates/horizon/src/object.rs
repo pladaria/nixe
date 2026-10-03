@@ -5,7 +5,7 @@ use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono_tz::Tz;
@@ -38,6 +38,9 @@ pub enum HorizonIpcObject {
     Account(AccountSession),
     AccountManagerForApplication(AccountManagerForApplicationSession),
     Bsd(BsdSession),
+    Ssl(SslSession),
+    AudioOutManager(crate::AudioOutManagerSession),
+    AudioOut(crate::AudioOutSession),
     Hid(HidSession),
     HidAppletResource(HidAppletResource),
     Time(TimeServiceSession),
@@ -452,6 +455,50 @@ impl ParentalControlSession {
 
     pub(crate) fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
+    }
+}
+
+/// Root `nn::ssl::sf::ISslService` session. Clones retain the domain and
+/// negotiated interface version of the source session.
+///
+/// Initialization protocol:
+/// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/ssl.c
+#[derive(Clone, Debug)]
+pub struct SslSession {
+    state: Arc<SslSessionState>,
+}
+
+#[derive(Debug, Default)]
+struct SslSessionState {
+    domain: AtomicBool,
+    interface_version: AtomicU32,
+}
+
+impl SslSession {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(SslSessionState::default()),
+        }
+    }
+
+    pub(crate) fn is_domain(&self) -> bool {
+        self.state.domain.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn convert_to_domain(&self) -> u32 {
+        self.state.domain.store(true, Ordering::Release);
+        IPC_ROOT_OBJECT_ID
+    }
+
+    /// The client-selected SSL interface version, or zero before negotiation.
+    pub fn interface_version(&self) -> u32 {
+        self.state.interface_version.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_interface_version(&self, version: u32) {
+        self.state
+            .interface_version
+            .store(version, Ordering::Release);
     }
 }
 
@@ -1471,6 +1518,7 @@ struct AppletDomain {
     operation_mode: OperationMode,
     operation_mode_changed_notification: bool,
     performance_mode_changed_notification: bool,
+    restart_message_enabled: bool,
     focus_policy: AppletFocusPolicy,
     foreground_rights_acquired: bool,
     exit_locked: bool,
@@ -1519,6 +1567,7 @@ impl AppletSession {
                 operation_mode,
                 operation_mode_changed_notification: false,
                 performance_mode_changed_notification: false,
+                restart_message_enabled: false,
                 focus_policy: AppletFocusPolicy::default(),
                 foreground_rights_acquired: false,
                 exit_locked: false,
@@ -1985,6 +2034,14 @@ impl AppletSession {
         domain.performance_mode_changed_notification = enabled;
     }
 
+    pub(crate) fn set_restart_message_enabled(&self, enabled: bool) {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        domain.restart_message_enabled = enabled;
+    }
+
     pub(crate) fn set_focus_handling_mode(&self, mode: [bool; 3]) {
         let mut domain = self
             .domain
@@ -2097,6 +2154,23 @@ fn encode_preselected_user_launch_parameter(user: UserIdentity) -> Vec<u8> {
 #[cfg(test)]
 mod applet_tests {
     use super::*;
+
+    #[test]
+    fn restart_message_policy_is_shared_without_generating_notifications() {
+        let session = AppletSession::new(OperationMode::Console);
+        let cloned = session.clone();
+        assert_eq!(session.receive_message(), Some(15));
+        let event = session.message_event();
+        for enabled in [true, true, false] {
+            cloned.set_restart_message_enabled(enabled);
+            assert_eq!(
+                session.domain.lock().unwrap().restart_message_enabled,
+                enabled
+            );
+            assert_eq!(session.receive_message(), None);
+            assert!(!event.is_signalled());
+        }
+    }
 
     #[test]
     fn applet_domain_owns_bounded_child_object_ids() {

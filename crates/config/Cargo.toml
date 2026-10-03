@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nixe-audio.workspace = true
 chrono-tz.workspace = true
 serde.workspace = true
 nixe-input.workspace = true

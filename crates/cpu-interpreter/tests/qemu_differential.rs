@@ -26,6 +26,80 @@ static QEMU_GDB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 #[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
+fn qemu_a64_fminmaxnm_matches_nan_zero_and_denormal_semantics() {
+    for minimum in [false, true] {
+        let mut fixture = A64OracleFixture::new();
+        for wide in [false, true] {
+            let bits = |v: f64| {
+                if wide {
+                    v.to_bits()
+                } else {
+                    u64::from((v as f32).to_bits())
+                }
+            };
+            let sign = 1_u64 << if wide { 63 } else { 31 };
+            let quiet = 1_u64 << if wide { 51 } else { 22 };
+            let snan = bits(f64::INFINITY) | 0x123;
+            let qnan = snan | quiet | sign;
+            let word = 0x1e21_6802 | (u32::from(wide) << 22) | (u32::from(minimum) << 12);
+            fixture.oracle.write_instruction(fixture.slot, word);
+            for (a, b) in [
+                (bits(1.0), bits(2.0)),
+                (bits(-1.0), bits(-2.0)),
+                (sign, 0),
+                (0, sign),
+                (sign, sign),
+                (1, sign | 1),
+                (qnan, bits(2.0)),
+                (bits(2.0), qnan),
+                (snan, qnan),
+                (qnan, snan),
+                (qnan, qnan),
+                (qnan, sign | 1),
+                (1, qnan),
+                (bits(f64::NEG_INFINITY), bits(f64::INFINITY)),
+            ] {
+                for mode in 0..16 {
+                    let mut expected = A64State::default();
+                    expected.set_pc(fixture.slot);
+                    expected.set_fpcr(mode << 22);
+                    expected.set_fpsr(1 << 27);
+                    expected.set_vector(0, u128::from(a) | (u128::MAX << 64));
+                    expected.set_vector(1, u128::from(b) | (u128::MAX << 64));
+                    expected.set_vector(2, u128::MAX);
+                    for register in 0..3 {
+                        fixture.oracle.write_raw_register(
+                            34 + u32::from(register),
+                            &expected.vector(register).unwrap().to_le_bytes(),
+                        );
+                    }
+                    fixture
+                        .oracle
+                        .write_raw_register(A64_FPCR_REGISTER, &expected.fpcr().to_le_bytes());
+                    fixture
+                        .oracle
+                        .write_raw_register(A64_FPSR_REGISTER, &expected.fpsr().to_le_bytes());
+                    fixture.oracle.write_register(A64_PC_REGISTER, fixture.slot);
+                    execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap();
+                    fixture.oracle.step("FMINNM/FMAXNM", word);
+                    assert_eq!(
+                        &fixture.oracle.read_raw_register(36)[..16],
+                        expected.vector(2).unwrap().to_le_bytes(),
+                        "{word:x} {a:x} {b:x} mode={mode}"
+                    );
+                    assert_eq!(
+                        fixture.oracle.read_raw_register(A64_FPSR_REGISTER),
+                        expected.fpsr().to_le_bytes(),
+                        "status {word:x} {a:x} {b:x} mode={mode}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
 fn qemu_a64_vector_add_matches_rounding_nan_and_lane_semantics() {
     for (wide, full) in [(false, false), (false, true), (true, true)] {
         let bits = |v: f64| {
@@ -508,6 +582,15 @@ fn qemu_a64_matches_every_register_semantic_family() {
     if filter.matches(0x94, "simd-add-across-vector") {
         cases.push((0x0e31_bbde, "ADDV B30,V30.8B (captured)"));
     }
+    if filter.matches(0xa6, "simd-unsigned-add-long-across-vector") {
+        cases.extend([
+            (0x2e30_3800, "UADDLV H0,V0.8B (captured)"),
+            (0x6e30_3bff, "UADDLV H31,V31.16B"),
+            (0x2e70_3be2, "UADDLV S2,V31.4H"),
+            (0x6e70_385f, "UADDLV S31,V2.8H"),
+            (0x6eb0_3bff, "UADDLV D31,V31.4S"),
+        ]);
+    }
     if filter.matches(0x95, "simd-signed-shift-left-register") {
         cases.extend([
             (0x0e22_4420, "SSHL V0.8B,V1.8B,V2.8B"),
@@ -651,6 +734,7 @@ fn register_semantic_id(id: u32) -> bool {
             | 0x0000_009b
             | 0x0000_009c..=0x0000_009d
             | 0x0000_009e..=0x0000_009f
+            | 0x0000_00a6..=0x0000_00a8
             | 0x0000_0048
             | 0x0000_004a..=0x0000_004b
             | 0x0000_004e..=0x0000_0061

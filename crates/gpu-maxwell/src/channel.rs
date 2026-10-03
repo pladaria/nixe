@@ -287,6 +287,7 @@ pub struct MaxwellGpuChannel {
     priority: MaxwellChannelPriority,
     timeslice: MaxwellChannelTimeslice,
     timeout: MaxwellChannelTimeout,
+    user_data: u64,
     scheduling_policy: MaxwellChannelSchedulingPolicy,
 }
 
@@ -321,6 +322,7 @@ impl MaxwellGpuChannel {
             priority: MaxwellChannelPriority::Medium,
             timeslice: MaxwellChannelTimeslice::DriverDefault,
             timeout: MaxwellChannelTimeout::DriverDefault,
+            user_data: 0,
             scheduling_policy: MaxwellChannelSchedulingPolicy::DeterministicSingleQueue,
         }
     }
@@ -528,6 +530,17 @@ impl MaxwellGpuChannel {
 
     pub fn set_error_notifier(&mut self, enabled: bool) {
         self.frontend.error_notifier_enabled = enabled;
+    }
+
+    /// Opaque client value retained for this channel's lifetime, never dereferenced.
+    /// https://switchbrew.org/wiki/NV_services#NVGPU_IOCTL_CHANNEL_SET_USER_DATA
+    pub fn set_user_data(&mut self, data: u64) {
+        self.user_data = data;
+    }
+
+    #[must_use]
+    pub const fn user_data(&self) -> u64 {
+        self.user_data
     }
 
     pub fn bind_z_cull(
