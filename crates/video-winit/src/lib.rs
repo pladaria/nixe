@@ -2,6 +2,7 @@
 
 mod screenshot;
 
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +10,10 @@ use std::time::{Duration, Instant};
 
 use nixe_config::WindowState;
 use nixe_gpu_wgpu::{WgpuPresentationContext, WgpuQueueAccess, resident_texture};
+use nixe_input::{
+    EmulatedTouchContact, TOUCH_SCREEN_HEIGHT, TOUCH_SCREEN_WIDTH, TouchScreenReader,
+    TouchScreenWriter, touch_screen_channel,
+};
 use nixe_video::{FrameMailbox, FrameNotifier, PresentationFrame};
 use wgpu::{
     Backend, BindGroup, BindGroupLayout, Buffer, BufferDescriptor, BufferUsages, Color,
@@ -22,7 +27,7 @@ use wgpu::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -91,6 +96,7 @@ pub struct WindowFrontend {
     event_loop: EventLoop<FrontendEvent>,
     application: PresenterApplication,
     control: FrontendControl,
+    touch_screen: Option<TouchScreenReader>,
 }
 
 impl WindowFrontend {
@@ -106,6 +112,7 @@ impl WindowFrontend {
             proxy: proxy.clone(),
             pending: Arc::clone(&frame_wakeup_pending),
         }));
+        let (touch_screen_writer, touch_screen) = touch_screen_channel();
         Ok(Self {
             event_loop,
             application: PresenterApplication {
@@ -119,11 +126,14 @@ impl WindowFrontend {
                 initial_window_state: None,
                 last_window_state: None,
                 screenshots: None,
+                touch_screen_writer,
+                touch_tracker: TouchTracker::default(),
             },
             control: FrontendControl {
                 proxy,
                 worker_completion,
             },
+            touch_screen: Some(touch_screen),
         })
     }
 
@@ -135,6 +145,12 @@ impl WindowFrontend {
     #[must_use]
     pub fn control(&self) -> FrontendControl {
         self.control.clone()
+    }
+
+    pub fn take_touch_screen(&mut self) -> TouchScreenReader {
+        self.touch_screen
+            .take()
+            .expect("window frontend touch-screen reader is taken only once")
     }
 
     /// Binds the one accelerated WGPU context before entering the event loop.
@@ -164,6 +180,7 @@ impl WindowFrontend {
             event_loop,
             mut application,
             control: _,
+            touch_screen: _,
         } = self;
         let event_result = event_loop.run_app(&mut application);
         application.capture_window_state();
@@ -435,6 +452,18 @@ impl Presenter {
         Ok(())
     }
 
+    fn touch_position(&self, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
+        let viewport = letterbox_viewport(
+            self.frame_dimensions
+                .unwrap_or((TOUCH_SCREEN_WIDTH, TOUCH_SCREEN_HEIGHT)),
+            (
+                self.surface_configuration.width,
+                self.surface_configuration.height,
+            ),
+        );
+        map_touch_position(position, viewport)
+    }
+
     fn create_frame_bind_group(&self, view: &wgpu::TextureView) -> BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Nixe presentation image bind group"),
@@ -659,6 +688,140 @@ const fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
+const DEFAULT_TOUCH_DIAMETER: u32 = 1;
+
+#[derive(Debug, Default)]
+struct TouchTracker {
+    native: BTreeMap<u64, EmulatedTouchContact>,
+    mouse: Option<EmulatedTouchContact>,
+    mouse_position: Option<PhysicalPosition<f64>>,
+    mouse_pressed: bool,
+    next_finger_id: u32,
+}
+
+impl TouchTracker {
+    fn contact(&mut self, position: (u32, u32)) -> EmulatedTouchContact {
+        let finger_id = self.next_finger_id;
+        self.next_finger_id = self.next_finger_id.wrapping_add(1);
+        EmulatedTouchContact {
+            finger_id,
+            x: position.0,
+            y: position.1,
+            diameter_x: DEFAULT_TOUCH_DIAMETER,
+            diameter_y: DEFAULT_TOUCH_DIAMETER,
+            ..EmulatedTouchContact::default()
+        }
+    }
+
+    fn native_event(
+        &mut self,
+        event: Touch,
+        position: Option<(u32, u32)>,
+        writer: &TouchScreenWriter,
+    ) {
+        match event.phase {
+            TouchPhase::Started => {
+                let Some(position) = position else {
+                    return;
+                };
+                if let Some(previous) = self.native.remove(&event.id) {
+                    writer.end(previous);
+                }
+                let contact = self.contact(position);
+                if writer.begin(contact) {
+                    self.native.insert(event.id, contact);
+                }
+            }
+            TouchPhase::Moved => {
+                let Some(mut contact) = self.native.remove(&event.id) else {
+                    return;
+                };
+                if let Some((x, y)) = position {
+                    contact.x = x;
+                    contact.y = y;
+                    writer.update(contact);
+                    self.native.insert(event.id, contact);
+                } else {
+                    writer.end(contact);
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                let Some(mut contact) = self.native.remove(&event.id) else {
+                    return;
+                };
+                if let Some((x, y)) = position {
+                    contact.x = x;
+                    contact.y = y;
+                }
+                writer.end(contact);
+            }
+        }
+    }
+
+    fn cursor_moved(
+        &mut self,
+        physical: PhysicalPosition<f64>,
+        position: Option<(u32, u32)>,
+        writer: &TouchScreenWriter,
+    ) {
+        self.mouse_position = Some(physical);
+        self.sync_mouse(position, writer);
+    }
+
+    fn mouse_button(
+        &mut self,
+        pressed: bool,
+        position: Option<(u32, u32)>,
+        writer: &TouchScreenWriter,
+    ) {
+        self.mouse_pressed = pressed;
+        if pressed {
+            self.sync_mouse(position, writer);
+        } else {
+            self.end_mouse(writer);
+        }
+    }
+
+    fn sync_mouse(&mut self, position: Option<(u32, u32)>, writer: &TouchScreenWriter) {
+        if !self.mouse_pressed {
+            return;
+        }
+        let Some((x, y)) = position else {
+            self.end_mouse(writer);
+            return;
+        };
+        if let Some(contact) = &mut self.mouse {
+            contact.x = x;
+            contact.y = y;
+            writer.update(*contact);
+        } else {
+            let contact = self.contact((x, y));
+            if writer.begin(contact) {
+                self.mouse = Some(contact);
+            }
+        }
+    }
+
+    fn end_mouse(&mut self, writer: &TouchScreenWriter) {
+        if let Some(contact) = self.mouse.take() {
+            writer.end(contact);
+        }
+    }
+
+    fn cursor_left(&mut self, writer: &TouchScreenWriter) {
+        self.mouse_position = None;
+        self.end_mouse(writer);
+    }
+
+    fn cancel_all(&mut self, writer: &TouchScreenWriter) {
+        writer.cancel_all();
+        self.native.clear();
+        self.mouse = None;
+        self.mouse_position = None;
+        self.mouse_pressed = false;
+    }
+}
+
 fn window_title(backend: &str, output: Option<(u32, u32)>, fps: Option<f64>) -> String {
     let output = output.map_or_else(
         || "-".to_owned(),
@@ -679,6 +842,8 @@ struct PresenterApplication {
     initial_window_state: Option<WindowState>,
     last_window_state: Option<WindowState>,
     screenshots: Option<screenshot::Screenshots>,
+    touch_screen_writer: TouchScreenWriter,
+    touch_tracker: TouchTracker,
 }
 
 impl PresenterApplication {
@@ -799,6 +964,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
         }
         match event {
             WindowEvent::CloseRequested => {
+                self.touch_tracker.cancel_all(&self.touch_screen_writer);
                 self.stop_requested.store(true, Ordering::Release);
                 self.capture_window_state();
                 self.presenter = None;
@@ -821,6 +987,44 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 if let Some(state) = &mut self.last_window_state {
                     state.position = Some((position.x, position.y));
                 }
+            }
+            WindowEvent::Focused(false) => {
+                self.touch_tracker.cancel_all(&self.touch_screen_writer);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.touch_tracker.cursor_left(&self.touch_screen_writer);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let mapped = self
+                    .presenter
+                    .as_ref()
+                    .and_then(|presenter| presenter.touch_position(position));
+                self.touch_tracker
+                    .cursor_moved(position, mapped, &self.touch_screen_writer);
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let mapped = self.touch_tracker.mouse_position.and_then(|position| {
+                    self.presenter
+                        .as_ref()
+                        .and_then(|presenter| presenter.touch_position(position))
+                });
+                self.touch_tracker.mouse_button(
+                    state == ElementState::Pressed,
+                    mapped,
+                    &self.touch_screen_writer,
+                );
+            }
+            WindowEvent::Touch(event) => {
+                let mapped = self
+                    .presenter
+                    .as_ref()
+                    .and_then(|presenter| presenter.touch_position(event.location));
+                self.touch_tracker
+                    .native_event(event, mapped, &self.touch_screen_writer);
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -910,6 +1114,28 @@ fn letterbox_viewport(source: (u32, u32), output: (u32, u32)) -> Viewport {
         width: draw_width as f32,
         height: draw_height as f32,
     }
+}
+
+fn map_touch_position(position: PhysicalPosition<f64>, viewport: Viewport) -> Option<(u32, u32)> {
+    let x = position.x - f64::from(viewport.x);
+    let y = position.y - f64::from(viewport.y);
+    let width = f64::from(viewport.width);
+    let height = f64::from(viewport.height);
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x >= width
+        || y >= height
+        || width <= 0.0
+        || height <= 0.0
+    {
+        return None;
+    }
+    Some((
+        ((x * f64::from(TOUCH_SCREEN_WIDTH) / width).floor() as u32).min(TOUCH_SCREEN_WIDTH - 1),
+        ((y * f64::from(TOUCH_SCREEN_HEIGHT) / height).floor() as u32).min(TOUCH_SCREEN_HEIGHT - 1),
+    ))
 }
 
 #[derive(Debug)]
@@ -1084,5 +1310,103 @@ mod tests {
                 height: 720.0,
             }
         );
+    }
+
+    #[test]
+    fn touch_coordinates_ignore_letterboxing_and_cover_the_switch_panel() {
+        let viewport = letterbox_viewport((1280, 720), (1000, 1000));
+        assert_eq!(
+            viewport,
+            Viewport {
+                x: 0.0,
+                y: 219.0,
+                width: 1000.0,
+                height: 562.0,
+            }
+        );
+        assert_eq!(
+            map_touch_position(PhysicalPosition::new(0.0, 219.0), viewport),
+            Some((0, 0))
+        );
+        assert_eq!(
+            map_touch_position(PhysicalPosition::new(999.9, 780.9), viewport),
+            Some((1279, 719))
+        );
+        assert_eq!(
+            map_touch_position(PhysicalPosition::new(500.0, 500.0), viewport),
+            Some((640, 360))
+        );
+        assert_eq!(
+            map_touch_position(PhysicalPosition::new(500.0, 218.9), viewport),
+            None
+        );
+        assert_eq!(
+            map_touch_position(PhysicalPosition::new(500.0, 781.0), viewport),
+            None
+        );
+    }
+
+    #[test]
+    fn left_mouse_button_behaves_as_one_touch_contact() {
+        let (writer, mut reader) = touch_screen_channel();
+        let mut tracker = TouchTracker::default();
+        tracker.cursor_moved(PhysicalPosition::new(10.0, 20.0), Some((100, 200)), &writer);
+        tracker.mouse_button(true, Some((100, 200)), &writer);
+        let started = reader.sample();
+        assert_eq!(started.contacts().len(), 1);
+        assert_eq!(
+            (started.contacts()[0].x, started.contacts()[0].y),
+            (100, 200)
+        );
+        assert_eq!(
+            started.contacts()[0].attributes,
+            nixe_input::TOUCH_ATTRIBUTE_START
+        );
+
+        tracker.cursor_moved(PhysicalPosition::new(20.0, 30.0), Some((300, 400)), &writer);
+        let moved = reader.sample();
+        assert_eq!((moved.contacts()[0].x, moved.contacts()[0].y), (300, 400));
+        assert_eq!(moved.contacts()[0].attributes, 0);
+
+        tracker.mouse_button(false, Some((300, 400)), &writer);
+        assert_eq!(
+            reader.sample().contacts()[0].attributes,
+            nixe_input::TOUCH_ATTRIBUTE_END
+        );
+        assert!(reader.sample().contacts().is_empty());
+    }
+
+    #[test]
+    fn native_multitouch_and_mouse_contacts_coexist() {
+        let (writer, mut reader) = touch_screen_channel();
+        let mut tracker = TouchTracker::default();
+        tracker.cursor_moved(PhysicalPosition::new(10.0, 20.0), Some((100, 200)), &writer);
+        tracker.mouse_button(true, Some((100, 200)), &writer);
+        tracker.native_event(
+            Touch {
+                device_id: winit::event::DeviceId::dummy(),
+                phase: TouchPhase::Started,
+                location: PhysicalPosition::new(30.0, 40.0),
+                force: None,
+                id: 17,
+            },
+            Some((300, 400)),
+            &writer,
+        );
+
+        let state = reader.sample();
+        assert_eq!(state.contacts().len(), 2);
+        assert_eq!((state.contacts()[0].x, state.contacts()[0].y), (100, 200));
+        assert_eq!((state.contacts()[1].x, state.contacts()[1].y), (300, 400));
+        assert_ne!(state.contacts()[0].finger_id, state.contacts()[1].finger_id);
+
+        tracker.cursor_left(&writer);
+        let state = reader.sample();
+        assert_eq!(state.contacts().len(), 2);
+        assert_eq!(
+            state.contacts()[0].attributes,
+            nixe_input::TOUCH_ATTRIBUTE_END
+        );
+        assert_eq!(state.contacts()[1].attributes, 0);
     }
 }

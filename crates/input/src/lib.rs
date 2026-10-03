@@ -4,6 +4,7 @@ mod model;
 mod motion;
 mod profile;
 mod sdl;
+mod touch;
 mod worker;
 
 pub use worker::{InputReader, InputSample, InputWorker, InputWorkerError};
@@ -17,6 +18,11 @@ pub use motion::MotionEstimate;
 pub use profile::{
     EmulatedButtonState, EmulatedControllerState, GamepadProfile, GamepadProfiles,
     ProfiledControllerState,
+};
+pub use touch::{
+    EmulatedTouchContact, EmulatedTouchScreenState, MAX_TOUCH_CONTACTS, TOUCH_ATTRIBUTE_END,
+    TOUCH_ATTRIBUTE_START, TOUCH_SCREEN_HEIGHT, TOUCH_SCREEN_WIDTH, TouchScreenReader,
+    TouchScreenWriter, touch_screen_channel,
 };
 
 /// Samples the first attached controller without allocating a device list.

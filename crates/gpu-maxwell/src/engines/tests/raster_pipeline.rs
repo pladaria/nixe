@@ -2613,10 +2613,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     program_three_d(&mut channel, 0x12e4, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellLoweringError::IncompleteBlendState {
-            target: Some(0),
-            field: "SET_BLEND(i)"
-        })
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
     program_three_d(&mut channel, 0x1360, 0);
     assert!(matches!(
@@ -3438,12 +3435,15 @@ fn effective_color_write_mask_is_selected_and_validated_before_draw_publication(
     ));
 
     program_three_d(&mut channel, 0x0f90, 0);
+    // Target one's initialized mask disables all writes; it is established
+    // channel state even before the application programs SET_CT_WRITE(1).
+    assert_eq!(
+        channel.three_d().fixed_function().color_mask()[1].raw(),
+        Some(0)
+    );
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellLoweringError::IncompleteColorWriteState {
-            target: 1,
-            mask_register: 1,
-        })
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x0f90, 1);

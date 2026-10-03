@@ -24,6 +24,10 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
         eprintln!("SKIP: physical GPU lacks native BC texture compression");
         return;
     }
+    let packed_supported = presentation
+        .device()
+        .features()
+        .contains(wgpu::Features::FLOAT32_FILTERABLE);
     let runtime = RuntimeOwner::new(initialized.into_runtime());
     let (mut creations, target_backing, target, subresources) =
         backed_color_image(ImageFormat::Rgba8Unorm, 4, 4, &[initialized_page(&[0; 64])]);
@@ -115,12 +119,15 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
         )
         .unwrap(),
     });
-    let formats = [
+    let mut formats = vec![
         ImageFormat::Bc1RgbUnorm,
         ImageFormat::Bc1RgbaUnorm,
         ImageFormat::Bc1RgbSrgb,
         ImageFormat::Bc1RgbaSrgb,
     ];
+    if packed_supported {
+        formats.push(ImageFormat::Rgb565Unorm);
+    }
     let mut serial = 720;
     for array in [false, true] {
         let fragment = ShaderId::new(if array { 722 } else { 721 });
@@ -133,8 +140,8 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
         });
         let layers = if array { 2 } else { 1 };
         let mut draws = Vec::new();
-        for (index, format) in formats.into_iter().enumerate() {
-            let id = 730 + index as u64 + if array { 4 } else { 0 };
+        for (index, format) in formats.iter().copied().enumerate() {
+            let id = 730 + index as u64 + if array { formats.len() as u64 } else { 0 };
             let allocation = GpuAllocationId::new(id);
             let image = ImageId::new(id);
             let table = DescriptorTableId::new(id);
@@ -142,7 +149,17 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
             // In a 64-byte x 8-row GOB, block (1,1) starts at byte 24.
             let mut bytes = vec![0; usize::from(layers) * 512];
             let selected = usize::from(layers - 1) * 512 + 24;
-            bytes[selected..selected + 8].copy_from_slice(&[0, 0, 255, 255, 255, 255, 255, 255]);
+            if format == ImageFormat::Rgb565Unorm {
+                // UV .75 samples texels (5,5), (6,5), (5,6), (6,6).
+                // Distinct endpoint channels expose RGB/BGR swaps and filtering.
+                for offset in [154, 156, 202, 204] {
+                    let offset = usize::from(layers - 1) * 512 + offset;
+                    bytes[offset..offset + 2].copy_from_slice(&0xf800_u16.to_le_bytes());
+                }
+            } else {
+                bytes[selected..selected + 8]
+                    .copy_from_slice(&[0, 0, 255, 255, 255, 255, 255, 255]);
+            }
             let allocation_description =
                 GpuAllocationDescription::new(bytes.len() as u64, 4).unwrap();
             let texture_page = initialized_page(&bytes);
@@ -234,21 +251,44 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
             draws.push((prepared, image, texture_page, selected));
         }
         // Revisit the RGB and RGBA pipelines after their initial compilation.
-        for (iteration, index) in [0, 1, 2, 3, 0, 1, 2, 3].into_iter().enumerate() {
+        for (iteration, index) in (0..formats.len())
+            .cycle()
+            .take(formats.len() * 2)
+            .enumerate()
+        {
             let (prepared, image, texture_page, selected) = &draws[index];
-            let colored = iteration >= 4;
+            let colored = iteration >= formats.len();
             if colored {
                 // Mid-gray RGB565 endpoint, selector zero: sRGB must decode.
                 texture_page.prepare_write().unwrap();
                 let generation = texture_page.content_generation();
-                texture_page
-                    .write_preflighted(
-                        *selected,
-                        &[0x10, 0x84, 0, 0, 0, 0, 0, 0],
-                        generation,
-                        generation.next().unwrap(),
-                    )
-                    .unwrap();
+                if formats[index] == ImageFormat::Rgb565Unorm {
+                    for (offset, value) in [154, 156, 202, 204].into_iter().zip([
+                        (1_u16 << 11) | (3 << 5) | 5,
+                        (2 << 11) | (3 << 5) | 6,
+                        (1 << 11) | (4 << 5) | 5,
+                        (2 << 11) | (4 << 5) | 6,
+                    ]) {
+                        let generation = texture_page.content_generation();
+                        texture_page
+                            .write_preflighted(
+                                usize::from(layers - 1) * 512 + offset,
+                                &value.to_le_bytes(),
+                                generation,
+                                generation.next().unwrap(),
+                            )
+                            .unwrap();
+                    }
+                } else {
+                    texture_page
+                        .write_preflighted(
+                            *selected,
+                            &[0x10, 0x84, 0, 0, 0, 0, 0, 0],
+                            generation,
+                            generation.next().unwrap(),
+                        )
+                        .unwrap();
+                }
             }
             let begin = RenderPassOperation::begin(
                 render_pass,
@@ -327,7 +367,13 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
             creations.clear();
             let mut pixels = [0; 64];
             target_backing.range().read(0, &mut pixels).unwrap();
-            let expected = if colored {
+            let expected = if formats[index] == ImageFormat::Rgb565Unorm {
+                if colored {
+                    [12, 14, 45, 255]
+                } else {
+                    [255, 0, 0, 255]
+                }
+            } else if colored {
                 if index >= 2 {
                     [59_u8, 57, 59, 255]
                 } else {

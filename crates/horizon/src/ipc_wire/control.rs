@@ -221,12 +221,20 @@ pub(super) fn dispatch_control(
             )?;
         }
         (CmifControlCommand::QueryPointerBufferSize, _) => {
-            // Zero makes libnx use map-alias buffers, which the descriptor
-            // bridge validates explicitly.
+            // HID has pointer-only inputs (not auto-select), including the
+            // Npad ID array. A zero budget makes nn::sf reject these locally
+            // before SendSyncRequest. Reserve 0x100 bytes for the emulated
+            // HID server, enough for all ten IDs including 16-byte alignment.
+            // Other servers continue to select map-alias for auto-select IO.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
+            let pointer_buffer_size: u16 = match target {
+                HorizonIpcObject::Hid(_) => 0x100,
+                _ => 0,
+            };
             let response = encode_response(
                 request.token,
                 HorizonIpcResult::SUCCESS,
-                &0_u16.to_le_bytes(),
+                &pointer_buffer_size.to_le_bytes(),
                 None,
             )?;
             write_response(process, address, size, &response)?;

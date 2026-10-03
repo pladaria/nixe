@@ -10,7 +10,10 @@ use nixe_gpu::GpuMethodId;
 
 use crate::MaxwellMethodSource;
 
-use super::output::{BLEND_SEPARATE_ALPHA_BASE, BLEND_SEPARATE_ALPHA_RESET, BLEND_TARGET_STRIDE};
+use super::output::{
+    BLEND_SEPARATE_ALPHA_BASE, BLEND_SEPARATE_ALPHA_RESET, BLEND_TARGET_STRIDE,
+    VIEWPORT_CLIP_MAX_Z_RESET, VIEWPORT_CLIP_MIN_Z_RESET,
+};
 
 use super::{
     MAXWELL_COLOR_TARGET_COUNT, MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
@@ -50,30 +53,23 @@ pub(super) const MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD: u32 = 0x13ac;
 pub(super) const MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD: u32 = 0x2000;
 pub(super) const MAXWELL_THREE_D_PIPELINE_SHADER_STRIDE: u32 = 0x40;
 
-/// Raw reset bits observed by MME register reads before either method is set.
-///
-/// yuzu explicitly zero-initializes the complete Maxwell 3D register file, and
-/// Ryujinx independently exposes its zero-initialized unmanaged class state
-/// directly to MME reads. The value is intentionally retained as raw-only:
-/// zero is not one of NVIDIA's published polygon-mode enum encodings.
-/// <https://source.hodakov.me/hdkv/yuzu/src/commit/8a674958a730a36dbcc43910412521420a804c69/src/video_core/engines/maxwell_3d.cpp#L37-L42>
-/// <https://git.axenov.dev/Museum/ryujinx/src/commit/ec3e848d7998038ce22c41acdbf81032bf47991f/Ryujinx.Graphics.Device/DeviceState.cs#L16-L30>
-pub(super) const MAXWELL_THREE_D_POLYGON_MODE_RESET: u32 = 0;
+/// Initial GM20B/GM200 channel context selects filled polygons. NVIDIA's
+/// public method initialization writes 0x1b02 to both 0x0dac and 0x0db0.
+/// Table hash and class/address decoding are documented in output.rs beside
+/// BLEND_SEPARATE_ALPHA_RESET. This is the initialized context presented to
+/// applications, rather than the register file before firmware initialization.
+/// https://gitlab.com/kernel-firmware/linux-firmware/-/blob/main/WHENCE
+/// https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
+pub(super) const MAXWELL_THREE_D_POLYGON_MODE_RESET: u32 = 0x1b02;
 
-/// Raw reset header shared by the six `SET_PIPELINE_SHADER(i)` slots.
-///
-/// The same pinned register-file sources above establish zero before guest
-/// programming. Unlike polygon mode, this is also a valid typed header:
-/// disabled, with the zero-valued `VERTEX_CULL_BEFORE_FETCH` type field.
-pub(super) const MAXWELL_THREE_D_PIPELINE_SHADER_RESET: u32 = 0;
-
-/// Reset binding group for every pipeline slot.
-///
-/// The pinned zero-initialized Maxwell register-file implementations cited
-/// above cover `SET_PIPELINE_BINDING` as well as the pipeline header. Group
-/// zero is a valid typed value and is observable when a guest relies on reset
-/// state rather than redundantly programming the method.
-pub(super) const MAXWELL_THREE_D_PIPELINE_BINDING_RESET: u32 = 0;
+/// Pipeline headers and constant-buffer groups in NVIDIA's initialized
+/// context. Vertex B and pixel stages are enabled; the remaining stage slots
+/// retain their matching type fields while disabled. The public method table
+/// provenance, hash and decoding are documented beside the polygon reset.
+/// https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
+pub(super) const MAXWELL_THREE_D_PIPELINE_SHADER_RESET: [u32; 6] =
+    [0, 0x11, 0x20, 0x30, 0x40, 0x51];
+pub(super) const MAXWELL_THREE_D_PIPELINE_BINDING_RESET: [u32; 6] = [0, 0, 1, 2, 3, 4];
 
 /// Reset value of `SET_WINDOW_ORIGIN`: upper-left with no Y flip.
 ///
@@ -94,6 +90,12 @@ pub(super) const MAXWELL_THREE_D_WINDOW_ORIGIN_RESET: u32 = 0;
 /// unknown rather than being silently fabricated as zero.
 pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u32> {
     match method.0 {
+        raw if raw >= 0x0c00 && raw < 0x0d00 && (raw - 0x0c00) % 0x10 == 8 => {
+            Some(VIEWPORT_CLIP_MIN_Z_RESET)
+        }
+        raw if raw >= 0x0c00 && raw < 0x0d00 && (raw - 0x0c00) % 0x10 == 12 => {
+            Some(VIEWPORT_CLIP_MAX_Z_RESET)
+        }
         raw if raw >= BLEND_SEPARATE_ALPHA_BASE
             && raw
                 < BLEND_SEPARATE_ALPHA_BASE
@@ -102,6 +104,15 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
         {
             Some(BLEND_SEPARATE_ALPHA_RESET)
         }
+        // GM200 method initialization: disabled culling, clockwise front
+        // faces, back-face cull selector, and target-zero RGBA write enable.
+        // The same public table provenance as the polygon context above.
+        0x1918 => Some(0),
+        0x191c => Some(0x900),
+        0x1920 => Some(0x405),
+        0x1a00 => Some(0x1111),
+        raw @ 0x1360..=0x137c if raw.is_multiple_of(4) => Some(0),
+        raw if raw >= 0x1a04 && raw <= 0x1a1c && raw.is_multiple_of(4) => Some(0),
         // Typed line-state defaults and sources live in line.rs.
         0x0f8c | 0x166c => Some(0),
         MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD | MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD => {
@@ -138,8 +149,8 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
             let register = offset % MAXWELL_THREE_D_PIPELINE_SHADER_STRIDE;
             if pipeline < MAXWELL_PIPELINE_SHADER_COUNT as u32 {
                 match register {
-                    0 => Some(MAXWELL_THREE_D_PIPELINE_SHADER_RESET),
-                    0x10 => Some(MAXWELL_THREE_D_PIPELINE_BINDING_RESET),
+                    0 => Some(MAXWELL_THREE_D_PIPELINE_SHADER_RESET[pipeline as usize]),
+                    0x10 => Some(MAXWELL_THREE_D_PIPELINE_BINDING_RESET[pipeline as usize]),
                     _ => None,
                 }
             } else {
@@ -986,6 +997,9 @@ impl Default for MaxwellThreeDFrontendState {
         for method in [
             0x0f8c,
             0x166c,
+            0x1918,
+            0x191c,
+            0x1920,
             MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD,
@@ -1891,6 +1905,42 @@ mod tests {
     use super::{
         MaxwellThreeDFrontendState, MaxwellThreeDResourceRole, MaxwellThreeDResourceSemanticWrites,
     };
+
+    #[test]
+    fn viewport_depth_reset_is_shared_by_typed_live_state_and_mme_shadow_reads() {
+        let frontend = MaxwellThreeDFrontendState::default();
+        for (index, viewport) in frontend
+            .operation_state()
+            .fixed_function()
+            .viewport()
+            .iter()
+            .enumerate()
+        {
+            for (offset, register, expected) in [
+                (8, viewport.clip_min_z(), 0),
+                (12, viewport.clip_max_z(), 1.0_f32.to_bits()),
+            ] {
+                assert_eq!(register.raw(), Some(expected));
+                assert_eq!(register.value().map(|value| value.get()), Some(expected));
+                assert_eq!(
+                    register.origin(),
+                    super::MaxwellThreeDRegisterOrigin::VerifiedReset
+                );
+                assert_eq!(
+                    super::verified_raw_register_reset(nixe_gpu::GpuMethodId(
+                        0x0c00 + index as u32 * 16 + offset
+                    )),
+                    Some(expected)
+                );
+            }
+            assert!(
+                viewport
+                    .scale()
+                    .iter()
+                    .all(|register| register.value().is_none())
+            );
+        }
+    }
 
     #[test]
     fn semantic_identity_ignores_provenance_only_rewrites() {

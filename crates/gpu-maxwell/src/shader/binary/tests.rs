@@ -158,6 +158,9 @@ fn staged_header_and_code_reach_the_precise_first_instruction_boundary() {
         0,
         SWITCH_1_GM20B_PROFILE.classes().three_d().0,
     );
+    // Only the stage under test is active in this single-program fixture.
+    program_three_d(&mut channel, 0x2040, 0x10);
+    program_three_d(&mut channel, 0x2140, 0x50);
     program_three_d(&mut channel, 0x1608, (address >> 32) as u32);
     program_three_d(&mut channel, 0x160c, address as u32);
     program_three_d(&mut channel, 0x2000, 0x11);

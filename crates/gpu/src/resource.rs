@@ -136,6 +136,8 @@ impl ImageExtent {
 /// requires another format.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ImageFormat {
+    /// Little-endian packed UNORM: R in bits 15:11, G in 10:5, B in 4:0; alpha one.
+    Rgb565Unorm,
     R8Unorm,
     Rg8Unorm,
     Rgba8Unorm,
@@ -220,7 +222,7 @@ impl ImageFormat {
                 return None;
             }
             Self::R8Unorm => 1,
-            Self::Rg8Unorm | Self::R16Float | Self::Depth16Unorm => 2,
+            Self::Rgb565Unorm | Self::Rg8Unorm | Self::R16Float | Self::Depth16Unorm => 2,
             Self::Rgba8Unorm
             | Self::Rgba8Srgb
             | Self::Bgra8Unorm

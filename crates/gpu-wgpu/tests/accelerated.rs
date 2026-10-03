@@ -1392,7 +1392,15 @@ fn accelerated_polygon_draw(
     mixed: bool,
     color_format: VertexFormat,
 ) {
-    accelerated_polygon_color_draw(topology, interpolation, mixed, color_format, None, None);
+    accelerated_polygon_color_draw(
+        topology,
+        interpolation,
+        mixed,
+        color_format,
+        None,
+        None,
+        false,
+    );
 }
 
 #[test]
@@ -1452,6 +1460,7 @@ fn accelerated_blending_and_write_masks_preserve_destination_components() {
             VertexFormat::Float32x3,
             Some((output, expected)),
             None,
+            false,
         );
     }
 }
@@ -1473,11 +1482,32 @@ fn accelerated_polygon_facing_preserves_winding_for_triangles_and_quads() {
                 VertexFormat::Float32x3,
                 None,
                 Some((front, cull, visible)),
+                false,
             );
         }
     }
 }
 
+#[test]
+fn accelerated_positive_y_viewport_preserves_interpolation_and_polygon_facing() {
+    for topology in [PrimitiveTopology::Triangles, PrimitiveTopology::Quads] {
+        accelerated_polygon_color_draw(
+            topology,
+            ShaderInterpolation::Perspective,
+            false,
+            VertexFormat::Float32x3,
+            None,
+            Some((
+                nixe_gpu::FrontFace::CounterClockwise,
+                nixe_gpu::CullMode::Back,
+                true,
+            )),
+            true,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn accelerated_polygon_color_draw(
     topology: PrimitiveTopology,
     interpolation: ShaderInterpolation,
@@ -1485,6 +1515,7 @@ fn accelerated_polygon_color_draw(
     color_format: VertexFormat,
     color_output: Option<(nixe_gpu::ColorOutputState, [u8; 4])>,
     facing: Option<(nixe_gpu::FrontFace, nixe_gpu::CullMode, bool)>,
+    positive_y: bool,
 ) {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x12);
@@ -1730,11 +1761,23 @@ fn accelerated_polygon_color_draw(
     )
     .unwrap()
     .with_viewport_transform(
-        ViewportTransform::new([16.0, -16.0, 0.5], [16.0, 16.0, 0.5], [0.0, 1.0]).unwrap(),
+        ViewportTransform::new(
+            [16.0, if positive_y { 16.0 } else { -16.0 }, 0.5],
+            [16.0, 16.0, 0.5],
+            [0.0, 1.0],
+        )
+        .unwrap(),
     );
     let mut prepared = prepared;
     if let Some((front, cull, _)) = facing {
-        prepared.front_face = front;
+        prepared.front_face = if positive_y {
+            match front {
+                nixe_gpu::FrontFace::Clockwise => nixe_gpu::FrontFace::CounterClockwise,
+                nixe_gpu::FrontFace::CounterClockwise => nixe_gpu::FrontFace::Clockwise,
+            }
+        } else {
+            front
+        };
         prepared.cull_mode = cull;
     }
     if let Some((output, _)) = color_output {
@@ -1847,6 +1890,7 @@ fn accelerated_polygon_color_draw(
     let mut pixels = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
     image_backing.range().read(0, &mut pixels).unwrap();
     let pixel = |x: u32, y: u32| {
+        let y = if positive_y { HEIGHT - 1 - y } else { y };
         let offset = ((y * WIDTH + x) * 4) as usize;
         <[u8; 4]>::try_from(&pixels[offset..offset + 4]).unwrap()
     };

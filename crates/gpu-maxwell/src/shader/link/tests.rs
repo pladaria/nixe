@@ -59,6 +59,7 @@ fn enabled_vertex_and_fragment_interfaces_are_linked_before_backend_lowering() {
         0,
         SWITCH_1_GM20B_PROFILE.classes().three_d().0,
     );
+    program_three_d(&mut channel, 0x2140, 0x50);
     for (method, argument) in [
         (0x1608, (address >> 32) as u32),
         (0x160c, address as u32),
@@ -148,6 +149,8 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
         0,
         SWITCH_1_GM20B_PROFILE.classes().three_d().0,
     );
+    program_three_d(&mut channel, 0x2140, 0x50);
+    program_three_d(&mut channel, 0x2040, 0x10);
     program_three_d(&mut channel, 0x1608, (address >> 32) as u32);
     program_three_d(&mut channel, 0x160c, address as u32);
     program_three_d(&mut channel, 0x2000, 0x11);
@@ -303,6 +306,8 @@ fn shader_resources_use_reset_binding_group_zero_when_guest_omits_write() {
         0,
         SWITCH_1_GM20B_PROFILE.classes().three_d().0,
     );
+    program_three_d(&mut channel, 0x2140, 0x50);
+    program_three_d(&mut channel, 0x2040, 0x10);
     program_three_d(&mut channel, 0x1608, (address >> 32) as u32);
     program_three_d(&mut channel, 0x160c, address as u32);
     program_three_d(&mut channel, 0x2000, 0x11);

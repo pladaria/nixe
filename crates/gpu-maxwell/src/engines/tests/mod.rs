@@ -352,6 +352,9 @@ fn program_color_target(channel: &mut MaxwellGpuChannel, target: u8, address: u6
 }
 
 fn program_basic_draw_state(channel: &mut MaxwellGpuChannel, vertex: u64) {
+    // This synthetic fixture assigns VS/FS to slots 0/1. Disable the context's
+    // pixel slot 5 so it does not add a second active fragment program.
+    program_three_d(channel, 0x2140, 0x50);
     program_polygon_fill(channel);
     for (method, argument) in [
         (0x1c00, 0x1010),

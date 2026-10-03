@@ -21,7 +21,7 @@ use nixe_horizon::{
 };
 use nixe_input::{
     ControllerId, EmulatedButtonState, GamepadProfiles, InputReader, InputWorker,
-    ProfiledControllerState,
+    ProfiledControllerState, TouchScreenReader,
 };
 use nixe_loader_title::{NacpLanguage, SupportedLanguages};
 use nixe_memory::NonCpuDeviceId;
@@ -63,15 +63,21 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         file_system_access_log_override,
     } = arguments;
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
-    let (frontend, frontend_control, presenter) = if headless {
+    let (frontend, frontend_control, presenter, touch_screen) = if headless {
         log::info!("headless presentation enabled; no host window will be created");
-        (None, None, None)
+        (None, None, None, None)
     } else {
-        let frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
+        let mut frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
             .map_err(|error| error.to_string())?;
         let control = frontend.control();
         let mailbox = frontend.mailbox();
-        (Some(frontend), Some(control), Some(mailbox))
+        let touch_screen = frontend.take_touch_screen();
+        (
+            Some(frontend),
+            Some(control),
+            Some(mailbox),
+            Some(touch_screen),
+        )
     };
     let machine_profile = switch_1_machine_profile();
     let scheduler_profile = machine_profile.scheduler().clone();
@@ -259,6 +265,10 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     })
     .map_err(|error| format!("cannot start input worker: {error}"))?;
     let input = input_owner.reader();
+    let host_input = HostInputReaders {
+        controller: input,
+        touch_screen,
+    };
     let audio_backend = audio.backend();
 
     let Some(frontend) = frontend else {
@@ -267,7 +277,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             process,
             horizon_environment,
             video_system,
-            input,
+            host_input,
             audio_backend,
             trace_interpreter,
         ));
@@ -309,7 +319,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
                 process,
                 horizon_environment,
                 video_system,
-                input,
+                host_input,
                 audio_backend,
                 trace_interpreter,
             )
@@ -520,12 +530,17 @@ struct HorizonEnvironment {
     diagnostics: HorizonDiagnostics,
 }
 
+struct HostInputReaders {
+    controller: InputReader<Option<ProfiledControllerState>>,
+    touch_screen: Option<TouchScreenReader>,
+}
+
 fn execute_worker(
     mut coordinator: RuntimeCoordinator,
     process: RunnableProcess,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
-    mut input: InputReader<Option<ProfiledControllerState>>,
+    mut host_input: HostInputReaders,
     audio_backend: Arc<dyn nixe_audio::AudioBackend>,
     trace_interpreter: bool,
 ) -> WorkerResult {
@@ -547,7 +562,7 @@ fn execute_worker(
         &mut scheduled,
         horizon_environment,
         execution_video,
-        &mut input,
+        &mut host_input,
         audio_backend,
         trace_interpreter,
     );
@@ -648,7 +663,7 @@ fn execute(
     scheduled: &mut ScheduledProcess<'_>,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
-    input: &mut InputReader<Option<ProfiledControllerState>>,
+    host_input: &mut HostInputReaders,
     audio_backend: Arc<dyn nixe_audio::AudioBackend>,
     trace_interpreter: bool,
 ) -> Result<ExecutionSummary, String> {
@@ -693,7 +708,11 @@ fn execute(
         dispatcher
             .advance_video(elapsed)
             .map_err(|error| error.to_string())?;
-        if let Some(sample) = input.take_latest().map_err(|error| error.to_string())? {
+        if let Some(sample) = host_input
+            .controller
+            .take_latest()
+            .map_err(|error| error.to_string())?
+        {
             // The input worker owns the only sampling timer. Publish each
             // consumed sample once, using capture time rather than host delay.
             report_input_change(&mut active_input, &sample.state, input_observed);
@@ -712,14 +731,19 @@ fn execute(
                 }
             }
             active_buttons = current_buttons;
+            let delta = last_input_sample.map_or(Duration::ZERO, |previous| {
+                sample.captured_at.saturating_duration_since(previous)
+            });
             dispatcher
-                .advance_input(
-                    profiled.map(|controller| &controller.state),
-                    last_input_sample.map_or(Duration::ZERO, |previous| {
-                        sample.captured_at.saturating_duration_since(previous)
-                    }),
-                )
+                .advance_input(profiled.map(|controller| &controller.state), delta)
                 .map_err(|error| format!("cannot publish Horizon HID state: {error}"))?;
+            let touch_state = host_input
+                .touch_screen
+                .as_mut()
+                .map_or_else(Default::default, TouchScreenReader::sample);
+            dispatcher
+                .advance_touch_screen(&touch_state, delta)
+                .map_err(|error| format!("cannot publish Horizon touch-screen state: {error}"))?;
             last_input_sample = Some(sample.captured_at);
         }
         let executions = match coordinator.execution_mode() {
@@ -812,7 +836,13 @@ fn execute(
                             }
                         }
                         ExceptionHandlingResult::Terminated { .. } => {
-                            return Ok(execution_summary(&dispatcher, rejected.len()));
+                            // ExitThread can leave the rest of the process runnable.
+                            // Only the runtime's process lifecycle ends this launch.
+                            if coordinator.process(process_id).is_some_and(|process| {
+                                process.lifecycle() == nixe_scheduler::ProcessLifecycle::Exited
+                            }) {
+                                return Ok(execution_summary(&dispatcher, rejected.len()));
+                            }
                         }
                         ExceptionHandlingResult::Suspended => {}
                         ExceptionHandlingResult::Fault(error) => {

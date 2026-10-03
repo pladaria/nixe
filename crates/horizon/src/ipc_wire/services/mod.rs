@@ -35,7 +35,9 @@ pub(super) use apm::{dispatch_performance_manager, dispatch_performance_session}
 pub(super) use applet::{applet_object_name, applet_requests_self_exit, dispatch_applet};
 pub(super) use audout::{dispatch_audio_out, dispatch_audio_out_manager};
 pub(super) use bsd::dispatch_bsd;
-pub(super) use hid::{dispatch_hid, dispatch_hid_applet_resource};
+pub(super) use hid::{
+    dispatch_hid, dispatch_hid_active_vibration_device_list, dispatch_hid_applet_resource,
+};
 pub(super) use lm::{dispatch_log_manager, dispatch_logger};
 pub(super) use nifm::{dispatch_network_general_service, dispatch_network_interface};
 pub(super) use nvdrv::dispatch_nvdrv;

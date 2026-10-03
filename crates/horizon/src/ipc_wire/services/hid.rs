@@ -3,24 +3,34 @@ use super::prelude::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HidCommand {
     CreateAppletResource,
+    ActivateTouchScreen,
     StartSixAxisSensor,
     StopSixAxisSensor,
     SetSupportedNpadStyleSet,
     SetSupportedNpadIdType,
     ActivateNpad,
     SetSupportedNpadStyleSetUpdateEventHandle,
+    SetNpadJoyHoldType,
+    GetNpadJoyHoldType,
+    GetVibrationDeviceInfo,
+    CreateActiveVibrationDeviceList,
 }
 
 impl HidCommand {
     const fn decode(command_id: u32) -> Option<Self> {
         match command_id {
             0 => Some(Self::CreateAppletResource),
+            11 => Some(Self::ActivateTouchScreen),
             66 => Some(Self::StartSixAxisSensor),
             67 => Some(Self::StopSixAxisSensor),
             100 => Some(Self::SetSupportedNpadStyleSet),
             102 => Some(Self::SetSupportedNpadIdType),
             103 => Some(Self::ActivateNpad),
             109 => Some(Self::SetSupportedNpadStyleSetUpdateEventHandle),
+            120 => Some(Self::SetNpadJoyHoldType),
+            121 => Some(Self::GetNpadJoyHoldType),
+            200 => Some(Self::GetVibrationDeviceInfo),
+            203 => Some(Self::CreateActiveVibrationDeviceList),
             _ => None,
         }
     }
@@ -52,6 +62,52 @@ pub(in crate::ipc_wire) fn dispatch_hid(
     };
 
     match command {
+        // One u32 handle, no PID or descriptors. The output is two u32s:
+        // actuator type (LRA = 1) and its left/right position (1/2).
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1039-L1041
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h#L1326-L1330
+        HidCommand::GetVibrationDeviceInfo => {
+            let Some(handle) = request_u32(request.data, 0) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            if has_ipc_descriptors(hipc) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            if !matches!(handle as u8, 3..=7) {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::CommandVariant {
+                        service: "hid",
+                        command_id: 200,
+                        detail: "vibration device style outside FullKey, Handheld and Joy-Con",
+                    },
+                ));
+            }
+            let Some(position) = crate::hid::vibration_device_position(handle) else {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            };
+            let mut info = [0; 8];
+            info[..4].copy_from_slice(&1_u32.to_le_bytes());
+            info[4..].copy_from_slice(&position.to_le_bytes());
+            semantic_success(request.token, false, &info, &[], &[], None)
+        }
+        // No input or PID. The client expects a moved session handle.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1066-L1072
+        HidCommand::CreateActiveVibrationDeviceList => {
+            if has_ipc_descriptors(hipc) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let handle = process
+                .handles_mut()
+                .insert(HorizonIpcObject::HidActiveVibrationDeviceList(
+                    HidActiveVibrationDeviceList::default(),
+                ))
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted(
+                        "installing a HID active vibration device list",
+                    )
+                })?;
+            semantic_success(request.token, false, &[], &[], &[], Some(handle))
+        }
         // libnx sends the process ID and the applet-resource user ID:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L800-L808
         HidCommand::CreateAppletResource => {
@@ -68,6 +124,25 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                 })?;
             log::debug!("hid created IAppletResource handle {handle:#x}");
             semantic_success(request.token, false, &[], &[], &[], Some(handle))
+        }
+        // Activating the touch screen carries the caller PID and its applet
+        // resource user ID. Host contacts are published through HID shared
+        // memory only after this command succeeds.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L538-L543
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L734-L735
+        HidCommand::ActivateTouchScreen => {
+            // Plain CMIF carries alignment slack after this u64. libnx writes
+            // only the semantic payload, so those trailing bytes retain prior
+            // TLS contents and are not command input:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L93-L146
+            if hipc.pid.is_none()
+                || request_u64(request.data, 0).is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            hid_system.activate_touch_screen();
+            semantic_success(request.token, false, &[], &[], &[], None)
         }
         command @ (HidCommand::StartSixAxisSensor | HidCommand::StopSixAxisSensor) => {
             if hipc.pid.is_none() || request.data.len() < 16 {
@@ -87,25 +162,19 @@ pub(in crate::ipc_wire) fn dispatch_hid(
             semantic_success(request.token, false, &[], &[], &[], None)
         }
         HidCommand::SetSupportedNpadIdType => {
-            if hipc.pid.is_none()
-                || request.data.len() < 8
-                || !matches!(
-                    (hipc.send_statics.as_slice(), hipc.send_buffers.as_slice()),
-                    ([_], []) | ([], [_])
-                )
-            {
+            if hipc.pid.is_none() || request.data.len() < 8 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            let (address, size) = match (hipc.send_statics.as_slice(), hipc.send_buffers.as_slice())
-            {
-                ([descriptor], []) => (descriptor.address, usize::from(descriptor.size)),
-                ([], [descriptor]) if descriptor.mode != BufferMode::Invalid => (
-                    descriptor.address,
-                    usize::try_from(descriptor.size)
-                        .map_err(|_| IpcWireError::Malformed("HID Npad ID buffer is too large"))?,
-                ),
-                _ => unreachable!("validated HID Npad ID descriptor"),
+            // This InArray is pointer-only, so QueryPointerBufferSize must
+            // advertise enough space before the SDK can serialize it.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
+            let [descriptor] = hipc.send_statics.as_slice() else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
+            if descriptor.index != 0 || !hipc.send_buffers.is_empty() {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let (address, size) = (descriptor.address, usize::from(descriptor.size));
             if size == 0 || !size.is_multiple_of(4) || size > 10 * 4 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
@@ -118,6 +187,36 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             }
             semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        // Set carries ARUID then the hold type as u64; Get carries only
+        // ARUID and returns a u64. Both send PID, with no buffer descriptors.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L615-L622
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L922-L930
+        command @ (HidCommand::SetNpadJoyHoldType | HidCommand::GetNpadJoyHoldType) => {
+            if hipc.pid.is_none()
+                || request_u64(request.data, 0).is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            if command == HidCommand::SetNpadJoyHoldType {
+                let Some(hold_type) = request_u64(request.data, 8) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                if !hid_system.set_npad_joy_hold_type(hold_type) {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                }
+                semantic_success(request.token, false, &[], &[], &[], None)
+            } else {
+                semantic_success(
+                    request.token,
+                    false,
+                    &hid_system.npad_joy_hold_type().to_le_bytes(),
+                    &[],
+                    &[],
+                    None,
+                )
+            }
         }
         HidCommand::ActivateNpad => {
             if hipc.pid.is_none() || request.data.len() < 8 {
@@ -168,4 +267,37 @@ pub(in crate::ipc_wire) fn dispatch_hid_applet_resource(
         })?;
     log::debug!("hid returned shared-memory handle {handle:#x}");
     semantic_success(request.token, false, &[], &[handle], &[], None)
+}
+
+pub(in crate::ipc_wire) fn dispatch_hid_active_vibration_device_list(
+    list: &HidActiveVibrationDeviceList,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if request.command_id != 0 {
+        return unsupported_service_command("IActiveVibrationDeviceList", request.command_id);
+    }
+    // ActivateVibrationDevice sends one packed u32, without PID or buffers.
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1070-L1072
+    let Some(handle) = request_u32(request.data, 0) else {
+        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+    };
+    if has_ipc_descriptors(hipc) {
+        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+    }
+    // Actuator types outside the currently modeled Npad styles remain an
+    // explicit emulator gap, rather than masquerading as invalid guest input.
+    if !matches!(handle as u8, 3..=7) {
+        return Err(IpcWireError::UnsupportedService(
+            UnsupportedServiceOperation::CommandVariant {
+                service: "IActiveVibrationDeviceList",
+                command_id: 0,
+                detail: "vibration device style outside FullKey, Handheld and Joy-Con",
+            },
+        ));
+    }
+    if !list.activate(handle) {
+        return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+    }
+    semantic_success(request.token, false, &[], &[], &[], None)
 }

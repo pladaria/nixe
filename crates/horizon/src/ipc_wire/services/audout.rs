@@ -281,8 +281,18 @@ pub(in crate::ipc_wire) fn dispatch_audio_out(
             let capacity = (size / 8).min(BUFFER_LIMIT);
             validate_writable_ram_range(process, GuestVirtualAddress::new(address), capacity * 8)?;
             let tags = audio.released(capacity).map_err(audio_error)?;
-            let bytes: Vec<u8> = tags.iter().flat_map(|t| t.to_le_bytes()).collect();
-            write_bytes(process, GuestVirtualAddress::new(address), &bytes)?;
+            // Unused tag entries are null, including an empty release list.
+            // The SDK's single-buffer wrapper reads the first tag directly.
+            // https://github.com/strato-emu/strato/blob/ae1566a48285816a87e81d4aeb40bd2f4e56e60b/app/src/main/cpp/skyline/services/audio/IAudioOut.cpp
+            let mut bytes = [0; BUFFER_LIMIT * 8];
+            for (tag, entry) in tags.iter().zip(bytes.chunks_exact_mut(8)) {
+                entry.copy_from_slice(&tag.to_le_bytes());
+            }
+            write_bytes(
+                process,
+                GuestVirtualAddress::new(address),
+                &bytes[..capacity * 8],
+            )?;
             data.extend_from_slice(&(tags.len() as u32).to_le_bytes());
         }
         6 => data.extend_from_slice(

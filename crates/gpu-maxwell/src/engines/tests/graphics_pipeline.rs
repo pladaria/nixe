@@ -2101,14 +2101,19 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
             .raw_register(GpuMethodId(method))
             .unwrap();
         assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-        assert_eq!(raw.raw(), Some(0));
-        assert_eq!(raw.value(), Some(&0));
+        assert_eq!(raw.raw(), Some(0x1b02));
+        assert_eq!(raw.value(), Some(&0x1b02));
         assert_eq!(raw.source(), None);
 
         let typed = channel.three_d().fixed_function().register(register);
         assert_eq!(typed.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-        assert_eq!(typed.raw(), Some(0));
-        assert_eq!(typed.value(), None);
+        assert_eq!(typed.raw(), Some(0x1b02));
+        assert_eq!(
+            typed.value(),
+            Some(&MaxwellThreeDFixedFunctionValue::PolygonMode(
+                MaxwellThreeDPolygonMode::Fill
+            ))
+        );
         assert_eq!(typed.source(), None);
     }
 
@@ -2160,13 +2165,23 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
 
     for pipeline in 0..MAXWELL_PIPELINE_SHADER_COUNT {
         let method = 0x2000 + pipeline as u32 * 0x40;
+        let header = [0, 0x11, 0x20, 0x30, 0x40, 0x51][pipeline];
+        let group = [0_u8, 0, 1, 2, 3, 4][pipeline];
+        let stage = [
+            MaxwellShaderStage::VertexCullBeforeFetch,
+            MaxwellShaderStage::Vertex,
+            MaxwellShaderStage::TessellationInit,
+            MaxwellShaderStage::Tessellation,
+            MaxwellShaderStage::Geometry,
+            MaxwellShaderStage::Pixel,
+        ][pipeline];
         let raw = channel
             .three_d_mut()
             .raw_register(GpuMethodId(method))
             .unwrap();
         assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-        assert_eq!(raw.raw(), Some(0));
-        assert_eq!(raw.value(), Some(&0));
+        assert_eq!(raw.raw(), Some(header));
+        assert_eq!(raw.value(), Some(&header));
         assert_eq!(raw.source(), None);
 
         let binding = &channel.three_d().shader_bindings().pipeline()[pipeline];
@@ -2174,25 +2189,22 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
             binding.enabled().origin(),
             MaxwellThreeDRegisterOrigin::VerifiedReset
         );
-        assert_eq!(binding.enabled().raw(), Some(0));
-        assert_eq!(binding.enabled().value(), Some(&false));
+        assert_eq!(binding.enabled().raw(), Some(header));
+        assert_eq!(binding.enabled().value(), Some(&(header & 1 != 0)));
         assert_eq!(binding.enabled().source(), None);
         assert_eq!(
             binding.stage().origin(),
             MaxwellThreeDRegisterOrigin::VerifiedReset
         );
-        assert_eq!(binding.stage().raw(), Some(0));
-        assert_eq!(
-            binding.stage().value(),
-            Some(&MaxwellShaderStage::VertexCullBeforeFetch)
-        );
+        assert_eq!(binding.stage().raw(), Some(header));
+        assert_eq!(binding.stage().value(), Some(&stage));
         assert_eq!(binding.stage().source(), None);
         assert_eq!(
             binding.group().origin(),
             MaxwellThreeDRegisterOrigin::VerifiedReset
         );
-        assert_eq!(binding.group().raw(), Some(0));
-        assert_eq!(binding.group().value(), Some(&0));
+        assert_eq!(binding.group().raw(), Some(u32::from(group)));
+        assert_eq!(binding.group().value(), Some(&group));
         assert_eq!(binding.group().source(), None);
 
         let raw_binding = channel
@@ -2203,8 +2215,8 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
             raw_binding.origin(),
             MaxwellThreeDRegisterOrigin::VerifiedReset
         );
-        assert_eq!(raw_binding.raw(), Some(0));
-        assert_eq!(raw_binding.value(), Some(&0));
+        assert_eq!(raw_binding.raw(), Some(u32::from(group)));
+        assert_eq!(raw_binding.value(), Some(&u32::from(group)));
         assert_eq!(raw_binding.source(), None);
     }
 
@@ -2252,10 +2264,10 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
         MaxwellThreeDRegisterOrigin::Programmed
     );
     assert_eq!(binding.stage().value(), Some(&MaxwellShaderStage::Geometry));
-    assert_eq!(binding.group().value(), Some(&0));
-    assert_eq!(binding.effective_group(), Some(3));
+    assert_eq!(binding.group().value(), Some(&2));
+    assert_eq!(binding.effective_group(), Some(2));
     assert!(
-        channel.three_d().shader_bindings().stage_visibility(3)
+        channel.three_d().shader_bindings().stage_visibility(2)
             [MaxwellShaderStage::Geometry as usize]
     );
     program_three_d(&mut channel, 0x20d0, 6);
