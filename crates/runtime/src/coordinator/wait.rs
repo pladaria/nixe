@@ -134,6 +134,20 @@ impl RuntimeCoordinator {
             }
             self.deadlines.remove(&key);
             if self.apply_wake(token, false)? {
+                // Address waits complete at timer expiry, before a later mutex
+                // unlock or condition signal can transfer ownership to them.
+                let process_id = self.scheduler.thread(token.thread).unwrap().process;
+                if self
+                    .processes
+                    .get_mut(&process_id)
+                    .unwrap()
+                    .address_waits_mut()
+                    .expire_thread_wait(token.thread)
+                {
+                    self.priority_donations
+                        .retain(|donation| donation.waiter != token.thread);
+                    self.recompute_effective_priorities()?;
+                }
                 woken += 1;
             }
         }

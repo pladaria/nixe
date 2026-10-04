@@ -244,13 +244,9 @@ fn discovery_distinguishes_missing_inputs_from_stable_foreign_frontiers() {
         frozen.check().unwrap(); // The positive candidate contract is unaffected.
         let key = result_key(&process);
         let prepared = frozen.prepare_unchanged();
-        if foreign {
-            assert!(prepared.unwrap().install().unwrap());
-            assert!(process.lock().units.negatives.get(key).is_some());
-        } else {
-            assert!(matches!(prepared, Err(Error::StalePublication)));
-            assert!(process.lock().units.negatives.get(key).is_none());
-        }
+        assert!(prepared.unwrap().install().unwrap());
+        assert!(process.lock().units.negatives.get(key).is_some());
+        assert_suppressed(&process, key.source, key.boundary);
         drop(frozen);
         drop(work);
         if let Some(owner) = foreign_owner {
@@ -258,6 +254,7 @@ fn discovery_distinguishes_missing_inputs_from_stable_foreign_frontiers() {
             assert!(process.lock().units.negatives.get(key).is_none());
         } else {
             publish_words(&process, 32, &[0xd65f03c0]);
+            assert!(process.lock().units.negatives.get(key).is_none());
         }
         let work = reshape(&process, 0, 0, 16);
         let frozen = work
@@ -287,7 +284,7 @@ fn discovery_evidence_is_charged_weak_and_rejects_retired_input() {
     inspections.push(input.inspection(&work.extent(&input).unwrap(), &mut leaders));
     let before = process.cache.usage().unwrap().metadata;
     let weak = work
-        .discovery_evidence(inspections, Vec::new(), leaders, true)
+        .discovery_evidence(inspections, Vec::new(), leaders, Vec::new())
         .unwrap();
     assert!(process.cache.usage().unwrap().metadata > before);
     assert_eq!(
@@ -325,7 +322,7 @@ fn discovery_evidence_pressure_defers_without_leaking_storage_or_code_pins() {
             vec![input.inspection(&extent, &mut leaders)],
             Vec::new(),
             leaders,
-            true
+            Vec::new()
         ),
         Err(Error::Capacity(_))
     ));
@@ -341,7 +338,7 @@ fn discovery_evidence_pressure_defers_without_leaking_storage_or_code_pins() {
             vec![input.inspection(&extent, &mut leaders)],
             Vec::new(),
             leaders,
-            true,
+            Vec::new(),
         )
         .unwrap();
     drop(evidence);

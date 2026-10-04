@@ -61,6 +61,8 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
                 | Instruction::ScalarVectorUnsignedIntToFloat(_)
                 | Instruction::FloatToSignedInt(_)
                 | Instruction::FloatToUnsignedInt(_)
+                | Instruction::VectorFloatToSignedInt(_)
+                | Instruction::VectorFloatToUnsignedInt(_)
                 | Instruction::ScalarVectorFloatToSignedInt(_)
                 | Instruction::ScalarVectorFloatToUnsignedInt(_)
         )
@@ -220,6 +222,38 @@ pub(crate) fn complete_from_vector_integer(
     }
     state.set_vector(operation.rd, bits);
     state.set_fpsr(state.fpsr() | fp_status_bits(status));
+    state.set_pc(state.pc().wrapping_add(4));
+    Ok(())
+}
+
+/// Exact lane conversion with a single architectural commit.
+/// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1330-1332, 1344-1346)
+pub(crate) fn complete_vector_to_integer(
+    operation: crate::abi::VectorFpToIntegerOperation,
+    state: &mut A64State,
+) -> Result<(), CompletionError> {
+    let lane_bits = if operation.lane_64 { 64 } else { 32 };
+    if operation.rn >= 32
+        || operation.rd >= 32
+        || !matches!(operation.vector_bits, 64 | 128)
+        || (operation.lane_64 && operation.vector_bits != 128)
+    {
+        return Err(CompletionError::Invalid(Error::internal(
+            "invalid SIMD FP-to-integer operands",
+        )));
+    }
+    let outcome = nixe_cpu::semantics::a64_fp_simd::exact_vector_float_to_integer(
+        state.vector(operation.rn).unwrap(),
+        lane_bits,
+        operation.vector_bits,
+        operation.signed,
+        state.fpcr(),
+    );
+    if fp_status_traps(outcome.status, state.fpcr()) {
+        return Err(CompletionError::Trap(outcome.status));
+    }
+    state.set_vector(operation.rd, outcome.bits);
+    state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
     state.set_pc(state.pc().wrapping_add(4));
     Ok(())
 }

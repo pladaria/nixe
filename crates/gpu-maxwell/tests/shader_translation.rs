@@ -195,9 +195,10 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
         (0x2000, 0x11),
         (0x2004, 0),
         (0x200c, 4),
-        (0x2040, 0x51),
-        (0x2044, 0x200),
-        (0x204c, 4),
+        (0x2040, 0x20), // Disable the context's default vertex-B program.
+        (0x2140, 0x51),
+        (0x2144, 0x200),
+        (0x214c, 4),
         (0x12e4, 0),
         (0x135c, 0),
         (0x121c, 1),

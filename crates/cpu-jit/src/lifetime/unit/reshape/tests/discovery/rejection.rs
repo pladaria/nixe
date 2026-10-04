@@ -91,16 +91,25 @@ fn cap_result_names_the_input_that_did_not_fit_and_revalidates_it() {
 fn exactly_full_discovery_still_distinguishes_missing_frontier_from_cap_rejection() {
     let process = process();
     chain(&process, true);
+    let negative_key = crate::lifetime::unit::reshape::negative::Key {
+        source: key(0),
+        boundary: boundary(&process, 0, 0x4000, 0x8000),
+    };
     {
         let work = reshape(&process, 0, 0x4000, 0x8000);
         let before = process.cache.usage().unwrap().metadata;
-        assert!(matches!(
-            Graph::discover(&work),
-            Err(DiscoveryError::Interrupted(CompileError::Deferred))
-        ));
-        assert_eq!(process.cache.usage().unwrap().metadata, before);
+        let Err(DiscoveryError::Structural(result)) = Graph::discover(&work) else {
+            panic!("expected watched missing frontier at the cap");
+        };
+        assert_eq!(result.reason(), StructuralReason::Disconnected);
+        let prepared = result.prepare().unwrap();
+        assert!(prepared.install().unwrap());
+        drop(result);
+        assert!(process.cache.usage().unwrap().metadata > before);
     }
+    assert!(process.lock().units.negatives.get(negative_key).is_some());
     publish_words(&process, 0x6000, &[branch(0x6000, 0x4000)]);
+    assert!(process.lock().units.negatives.get(negative_key).is_none());
     let work = reshape(&process, 0, 0x4000, 0x8000);
     let Err(DiscoveryError::Structural(result)) = Graph::discover(&work) else {
         panic!("demanded frontier should be a cap outcome, not missing input");
@@ -119,10 +128,11 @@ fn incomplete_disconnected_discovery_and_pressure_remain_retryable() {
     owned(&process, &[(0, RET), (16, branch(16, 32))]);
     {
         let work = reshape(&process, 0, 16, 32);
-        assert!(matches!(
-            Graph::discover(&work),
-            Err(DiscoveryError::Interrupted(CompileError::Deferred))
-        ));
+        let Err(DiscoveryError::Structural(result)) = Graph::discover(&work) else {
+            panic!("expected watched missing frontier");
+        };
+        assert_eq!(result.reason(), StructuralReason::Disconnected);
+        assert!(result.prepare().unwrap().install().unwrap());
     }
     publish_words(&process, 48, &[RET]);
     let work = reshape(&process, 0, 16, 32);

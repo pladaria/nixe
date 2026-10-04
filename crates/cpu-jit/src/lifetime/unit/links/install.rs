@@ -115,14 +115,32 @@ impl<'p> Transition<'p> {
         // Preparation/allocation stay off the generated edge. The transfer
         // must include selective canonical writeback,
         // not just compare the two sets of physical input bindings.
-        let bridge = super::super::bridge::install(
+        let bridge = match super::super::bridge::install(
             process,
             &prepared.source_code,
             prepared.state_map,
             &prepared.target_code,
             prepared.target_entry,
             super::super::bridge::Tail::StaticIsland,
-        )?;
+        ) {
+            Ok(bridge) => bridge,
+            Err(Error::Capacity(_)) => {
+                // As with an indirect bridge, a static transfer is optional
+                // reachability. Its canonical source-local fallback already
+                // implements the transfer, including writeback and dispatch.
+                // A replaced callable link was restored above; release only
+                // this unpublished successor, never overrun the cache budget
+                // or fail an otherwise executable guest instruction.
+                let removed = {
+                    let mut state = process.lock();
+                    self.require_closed(&state)?;
+                    state.units.remove_uninstalled_link(handle.0).unwrap()
+                };
+                drop(removed);
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         let allocation = &prepared.source_code.code.allocation;
         let map = &prepared.source_code.states[prepared.state_map as usize];
         let target = &prepared.target_code.entries[prepared.target_entry];

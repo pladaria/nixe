@@ -4,6 +4,7 @@ impl Emitter {
     pub(super) fn operation(&mut self, operation: &ShaderOperation) -> Result<()> {
         use ShaderOperation::*;
         match operation {
+            Nop => {}
             LoadComputeBuiltin32 { .. }
             | LoadStorageBuffer32 { .. }
             | StoreStorageBuffer32 { .. } => {
@@ -419,10 +420,8 @@ impl Emitter {
     }
 
     fn require_float(&mut self, control: ShaderFloatControl) -> Result<()> {
-        if control.rounding != ShaderRoundingMode::NearestEven || control.saturate {
-            return Err(self.unsupported(
-                "native float arithmetic requires nearest-even rounding without saturation",
-            ));
+        if control.rounding != ShaderRoundingMode::NearestEven {
+            return Err(self.unsupported("native float arithmetic requires nearest-even rounding"));
         }
         let caps = self.options.float32;
         if !caps.rounding_mode_rte || !caps.signed_zero_inf_nan_preserve {
@@ -524,6 +523,20 @@ impl Emitter {
         }
         if control.flush_denormals_to_zero {
             bits = self.flush_denormal(bits)?;
+        }
+        if control.saturate {
+            let sign = self.constant(0x8000_0000);
+            let negative = self
+                .b
+                .u_greater_than_equal(self.boolean, None, bits, sign)?;
+            let infinity = self.constant(0x7f80_0000);
+            let nan = self.b.u_greater_than(self.boolean, None, bits, infinity)?;
+            let zero_result = self.b.logical_or(self.boolean, None, negative, nan)?;
+            let one = self.constant(0x3f80_0000);
+            let above_one = self.b.u_greater_than(self.boolean, None, bits, one)?;
+            bits = self.b.select(self.uint, None, above_one, one, bits)?;
+            let zero = self.constant(0);
+            bits = self.b.select(self.uint, None, zero_result, zero, bits)?;
         }
         Ok(bits)
     }

@@ -89,3 +89,70 @@ fn all_conditions_match_every_nzcv_combination() {
         }
     }
 }
+
+#[test]
+fn logical_immediate_register_31_is_sp_only_for_non_flag_setting_destinations() {
+    for wide in [false, true] {
+        for opcode in 0..4 {
+            for source in [1_u32, 31] {
+                // AND/ORR/EOR/ANDS {X,W}{SP,ZR}, {X,W}{1,ZR}, #0xff.
+                let word = 0x1200_1c1f
+                    | (u32::from(wide) << 31)
+                    | (u32::from(wide) << 22)
+                    | (opcode << 29)
+                    | (source << 5);
+                let input = 0xabcd_ef01_2345_67a5_u64;
+                let lhs = if source == 31 {
+                    0
+                } else if wide {
+                    input
+                } else {
+                    input as u32 as u64
+                };
+                let value = match opcode {
+                    0 | 3 => lhs & 0xff,
+                    1 => lhs | 0xff,
+                    2 => lhs ^ 0xff,
+                    _ => unreachable!(),
+                };
+                let mut initial = initial_state();
+                initial.general_register_storage_mut()[1] = input;
+                *initial.stack_pointer_storage_mut() = 0xfeed_beef_dead_bee0;
+                let mut reference = initial.clone();
+                nixe_cpu_interpreter::execute_one(&TargetPlatform::Switch1, &mut reference, word)
+                    .unwrap();
+                assert_eq!(
+                    *reference.stack_pointer_storage_mut(),
+                    if opcode == 3 {
+                        0xfeed_beef_dead_bee0
+                    } else {
+                        value
+                    },
+                    "{word:08x}"
+                );
+                assert_eq!(
+                    reference.nzcv(),
+                    if opcode == 3 {
+                        Nzcv::from_bits(if value == 0 { 0x4000_0000 } else { 0 })
+                    } else {
+                        initial.nzcv()
+                    }
+                );
+                compare(word, initial);
+            }
+        }
+    }
+    // This stack-alignment instruction must persist SP through the native exit.
+    let mut state = initial_state();
+    state.general_register_storage_mut()[9] = 0x10_da07_382f;
+    compare(0x927b_e93f, state);
+    // Register forms always discard a destination of 31, including ANDS.
+    for opcode in 0..4 {
+        let word = 0x8a02_003f | (opcode << 29);
+        let initial = initial_state();
+        let mut reference = initial.clone();
+        nixe_cpu_interpreter::execute_one(&TargetPlatform::Switch1, &mut reference, word).unwrap();
+        assert_eq!(*reference.stack_pointer_storage_mut(), 0x1234_5670);
+        compare(word, initial);
+    }
+}

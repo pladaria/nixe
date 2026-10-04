@@ -27,6 +27,16 @@ pub(crate) fn build(abi: HostAbi, policy: Policy) -> Result<Arc<dyn TargetIsa>, 
         ("opt_level", optimization),
         ("regalloc_algorithm", allocator),
         ("machine_code_cfg_info", "true"),
+        // IR verification belongs to development/tests, like the register
+        // allocator checker below, rather than every production compilation.
+        (
+            "enable_verifier",
+            if cfg!(debug_assertions) {
+                "true"
+            } else {
+                "false"
+            },
+        ),
         (
             "regalloc_checker",
             if cfg!(debug_assertions) {

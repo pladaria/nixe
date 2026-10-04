@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aes::Aes128;
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{Block, BlockDecrypt, BlockEncrypt, KeyInit};
 use nixe_loader_storage::{Storage, StorageError, StorageRef};
 
 const AES_BLOCK_SIZE: u64 = 0x10;
@@ -99,67 +99,60 @@ impl Storage for AesCtrStorage {
             return Ok(());
         }
 
-        let request_end = offset
-            .checked_add(u64::try_from(buffer.len()).map_err(|_| StorageError::OutOfBounds)?)
-            .ok_or(StorageError::OutOfBounds)?;
-        let aligned_start = offset & !(AES_BLOCK_SIZE - 1);
-        let aligned_end = align_up(request_end, AES_BLOCK_SIZE)?;
-        let aligned_len =
-            usize::try_from(aligned_end - aligned_start).map_err(|_| StorageError::OutOfBounds)?;
-        let mut encrypted = vec![0_u8; aligned_len];
-        self.parent.read_at(aligned_start, &mut encrypted)?;
-
         let absolute_start = self
             .absolute_offset
-            .checked_add(aligned_start)
+            .checked_add(offset)
             .ok_or(StorageError::OutOfBounds)?;
-        apply_ctr(
-            &self.key,
-            self.counter_prefix,
-            absolute_start / AES_BLOCK_SIZE,
-            &mut encrypted,
-        );
-
-        let within =
-            usize::try_from(offset - aligned_start).map_err(|_| StorageError::OutOfBounds)?;
-        buffer.copy_from_slice(&encrypted[within..within + buffer.len()]);
+        self.parent.read_at(offset, buffer)?;
+        apply_ctr_at(&self.key, self.counter_prefix, absolute_start, buffer);
         Ok(())
     }
 }
 
 pub(crate) fn apply_ctr(key: &[u8; 16], prefix: [u8; 8], first_block: u64, data: &mut [u8]) {
-    let cipher = Aes128::new(key.into());
-    for (index, block) in data.chunks_mut(AES_BLOCK_SIZE as usize).enumerate() {
-        let mut counter = [0_u8; 16];
-        counter[..8].copy_from_slice(&prefix);
-        let block_number =
-            first_block + u64::try_from(index).expect("in-memory block index always fits");
-        counter[8..].copy_from_slice(&block_number.to_be_bytes());
-        cipher.encrypt_block((&mut counter).into());
-        for (byte, key_byte) in block.iter_mut().zip(counter) {
-            *byte ^= key_byte;
+    apply_ctr_blocks(&Aes128::new(key.into()), prefix, first_block, data);
+}
+
+// Encrypt independent counters in batches so the AES backend can interleave
+// rounds using its hardware parallel-block implementation. No allocation or
+// cipher reinitialization occurs per block.
+fn apply_ctr_blocks(cipher: &Aes128, prefix: [u8; 8], mut block_number: u64, data: &mut [u8]) {
+    let mut counters = [Block::<Aes128>::default(); 8];
+    for batch in data.chunks_mut(8 * AES_BLOCK_SIZE as usize) {
+        let count = batch.len().div_ceil(AES_BLOCK_SIZE as usize);
+        for (i, counter) in counters[..count].iter_mut().enumerate() {
+            counter[..8].copy_from_slice(&prefix);
+            counter[8..].copy_from_slice(&(block_number + i as u64).to_be_bytes());
         }
+        cipher.encrypt_blocks(&mut counters[..count]);
+        for (block, counter) in batch.chunks_mut(AES_BLOCK_SIZE as usize).zip(&counters) {
+            for (byte, key_byte) in block.iter_mut().zip(counter) {
+                *byte ^= key_byte;
+            }
+        }
+        block_number += count as u64;
     }
 }
 
 pub(crate) fn apply_ctr_at(key: &[u8; 16], prefix: [u8; 8], absolute_offset: u64, data: &mut [u8]) {
     let cipher = Aes128::new(key.into());
-    let mut position = absolute_offset;
-    let mut output_offset = 0_usize;
-    while output_offset < data.len() {
-        let mut key_stream = [0_u8; AES_BLOCK_SIZE as usize];
-        key_stream[..8].copy_from_slice(&prefix);
-        key_stream[8..].copy_from_slice(&(position / AES_BLOCK_SIZE).to_be_bytes());
-        cipher.encrypt_block((&mut key_stream).into());
-
-        let within_block = usize::try_from(position % AES_BLOCK_SIZE).expect("AES offset fits");
-        let count = (AES_BLOCK_SIZE as usize - within_block).min(data.len() - output_offset);
-        for index in 0..count {
-            data[output_offset + index] ^= key_stream[within_block + index];
+    let within = (absolute_offset % AES_BLOCK_SIZE) as usize;
+    let mut block_number = absolute_offset / AES_BLOCK_SIZE;
+    let head = if within != 0 {
+        let mut counter = Block::<Aes128>::default();
+        counter[..8].copy_from_slice(&prefix);
+        counter[8..].copy_from_slice(&block_number.to_be_bytes());
+        cipher.encrypt_block(&mut counter);
+        let count = (AES_BLOCK_SIZE as usize - within).min(data.len());
+        for (byte, key_byte) in data[..count].iter_mut().zip(&counter[within..]) {
+            *byte ^= key_byte;
         }
-        output_offset += count;
-        position += u64::try_from(count).expect("AES chunk length fits u64");
-    }
+        block_number += 1;
+        count
+    } else {
+        0
+    };
+    apply_ctr_blocks(&cipher, prefix, block_number, &mut data[head..]);
 }
 
 #[derive(Clone)]
@@ -307,5 +300,38 @@ mod tests {
         let mut partial = [0xFF_u8; 7];
         view.read_at(3, &mut partial).unwrap();
         assert_eq!(partial, [0_u8; 7]);
+    }
+    #[test]
+    fn batched_ctr_matches_independent_counters_and_unaligned_slices() {
+        let key = [0x37; 16];
+        let prefix = [0x9a; 8];
+        let first = 0x1234_ffff;
+        let plain: Vec<u8> = (0..4099).map(|i| i as u8).collect();
+        let cipher = Aes128::new((&key).into());
+        let mut expected = plain.clone();
+        for (i, block) in expected.chunks_mut(16).enumerate() {
+            let mut counter = Block::<Aes128>::default();
+            counter[..8].copy_from_slice(&prefix);
+            counter[8..].copy_from_slice(&(first + i as u64).to_be_bytes());
+            cipher.encrypt_block(&mut counter);
+            for (byte, key_byte) in block.iter_mut().zip(counter) {
+                *byte ^= key_byte;
+            }
+        }
+        let mut actual = plain.clone();
+        apply_ctr(&key, prefix, first, &mut actual);
+        assert_eq!(actual, expected);
+        for start in 0..32 {
+            for len in [0, 1, 7, 16, 127, 128, 129, 259] {
+                let mut slice = expected[start..start + len].to_vec();
+                apply_ctr_at(&key, prefix, first * 16 + start as u64, &mut slice);
+                assert_eq!(slice, plain[start..start + len]);
+            }
+        }
+        let parent: StorageRef = Arc::new(VecStorage(expected));
+        let view = AesCtrStorage::new(parent, key, prefix, first * 16);
+        let mut tail = [0; 5];
+        view.read_at(4094, &mut tail).unwrap();
+        assert_eq!(tail, plain[4094..]);
     }
 }

@@ -93,11 +93,14 @@ impl RuntimeCoordinator {
         object_id: u64,
     ) -> Result<nixe_cpu::state::ThreadCpuState, ThreadOperationError> {
         let id = GuestThreadId::new(object_id);
-        let process_id = self
+        let view = self
             .scheduler
             .thread(id)
-            .ok_or(ThreadOperationError::InvalidHandle)?
-            .process;
+            .ok_or(ThreadOperationError::InvalidHandle)?;
+        if view.lifecycle == nixe_scheduler::ThreadLifecycle::Running {
+            return Err(ThreadOperationError::InvalidState);
+        }
+        let process_id = view.process;
         let process = self
             .processes
             .get(&process_id)
@@ -134,6 +137,7 @@ impl RuntimeCoordinator {
                 priority,
             })
             .map_err(|_| ThreadOperationError::Internal)?;
+        self.preempt_running_thread(info.thread);
         self.recompute_effective_priorities()
             .map_err(|_| ThreadOperationError::Internal)?;
         // SetPriority also replaces the scheduler's effective priority, so
@@ -146,7 +150,6 @@ impl RuntimeCoordinator {
             .get_mut(&view.process)
             .ok_or(ThreadOperationError::Internal)?
             .address_waits_mut()
-            .priority_waits_mut()
             .change_priority(info.thread, view.effective_priority);
         Ok(())
     }
@@ -178,6 +181,9 @@ impl RuntimeCoordinator {
         paused: bool,
     ) -> Result<(), ThreadOperationError> {
         let info = self.thread_scheduling_info(object_id)?;
+        if info.lifecycle == nixe_scheduler::ThreadLifecycle::Running {
+            self.quiesce().map_err(|_| ThreadOperationError::Internal)?;
+        }
         self.scheduler
             .apply(SchedulerCommand::SetActivity {
                 thread: info.thread,
@@ -216,6 +222,55 @@ impl RuntimeCoordinator {
             .map_err(|_| ThreadOperationError::InvalidState)
     }
 
+    /// Rebuild donations only for mutexes whose ownership/wait lists changed.
+    /// Called by the exception dispatcher after one complete serialized handoff.
+    pub fn synchronize_mutex_waits(
+        &mut self,
+        process_id: ProcessId,
+        addresses: &[u64],
+    ) -> Result<(), ThreadOperationError> {
+        self.priority_donations.retain(|donation| {
+            !addresses.contains(&donation.key)
+                || self
+                    .scheduler
+                    .thread(donation.owner)
+                    .is_none_or(|owner| owner.process != process_id)
+        });
+        let process = self
+            .processes
+            .get(&process_id)
+            .ok_or(ThreadOperationError::Internal)?;
+        for address in addresses {
+            if let Some(owner) = process.address_waits().owner(*address) {
+                for waiter in process.address_waits().pending_threads(*address) {
+                    self.priority_donations.insert(PriorityDonation {
+                        owner,
+                        waiter,
+                        key: *address,
+                    });
+                }
+            }
+        }
+        self.recompute_effective_priorities()
+            .map_err(|_| ThreadOperationError::Internal)?;
+        // New waiters may have unchanged scheduler priorities. Initialize them
+        // too, rather than relying only on priority-change notifications.
+        let process = self
+            .processes
+            .get_mut(&process_id)
+            .ok_or(ThreadOperationError::Internal)?;
+        let scheduler = &self.scheduler;
+        process
+            .address_waits_mut()
+            .refresh_mutex_priorities(|thread| {
+                scheduler
+                    .thread(thread)
+                    .expect("registered mutex waiter")
+                    .effective_priority
+            });
+        Ok(())
+    }
+
     pub fn reap_thread(&mut self, object_id: u64) -> Result<(), ThreadOperationError> {
         let thread = GuestThreadId::new(object_id);
         let view = self
@@ -239,6 +294,16 @@ impl RuntimeCoordinator {
             .map_err(|_| ThreadOperationError::Internal)
     }
 
+    fn preempt_running_thread(&self, thread: GuestThreadId) {
+        if let Some(lease) = self
+            .scheduler
+            .active_leases()
+            .find(|lease| lease.thread == thread)
+        {
+            self.processes[&lease.process].request_vcpu_safepoint(lease.vcpu);
+        }
+    }
+
     pub(super) fn recompute_effective_priorities(&mut self) -> Result<(), SchedulerError> {
         let mut priorities = BTreeMap::new();
         for process in self.processes.values() {
@@ -247,7 +312,13 @@ impl RuntimeCoordinator {
                     .scheduler
                     .thread(*thread)
                     .ok_or(SchedulerError::UnknownThread(*thread))?;
-                priorities.insert(*thread, view.base_priority);
+                if !matches!(
+                    view.lifecycle,
+                    nixe_scheduler::ThreadLifecycle::Exited
+                        | nixe_scheduler::ThreadLifecycle::Faulted
+                ) {
+                    priorities.insert(*thread, view.base_priority);
+                }
             }
         }
         for _ in 0..priorities.len() {
@@ -276,6 +347,7 @@ impl RuntimeCoordinator {
             if view.effective_priority != priority {
                 self.scheduler
                     .apply(SchedulerCommand::SetEffectivePriority { thread, priority })?;
+                self.preempt_running_thread(thread);
                 let process_id = self
                     .scheduler
                     .thread(thread)
@@ -285,7 +357,6 @@ impl RuntimeCoordinator {
                     .get_mut(&process_id)
                     .expect("thread owns a process")
                     .address_waits_mut()
-                    .priority_waits_mut()
                     .change_priority(thread, priority);
             }
         }
@@ -298,6 +369,10 @@ impl RuntimeCoordinator {
         current: GuestThreadId,
         exit_code: u64,
     ) -> Result<(), CoordinatorRouteError> {
+        self.quiesce()
+            .map_err(|error| CoordinatorRouteError::Coordinator(Box::new(error)))?;
+        self.completed_executions
+            .retain(|execution| execution.lease.process != process_id);
         let targets: Vec<_> = self
             .processes
             .get(&process_id)
@@ -353,6 +428,13 @@ impl RuntimeCoordinator {
         ideal_vcpu: Option<VirtualCpuId>,
         affinity: CoreSet,
     ) -> Result<(), CoordinatorError> {
+        if self
+            .scheduler
+            .thread(thread)
+            .is_some_and(|view| view.lifecycle == nixe_scheduler::ThreadLifecycle::Running)
+        {
+            self.quiesce()?;
+        }
         let process = self
             .scheduler
             .thread(thread)

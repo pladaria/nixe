@@ -174,12 +174,11 @@ fn decrement_if_less_than(
     // the comparison fails. Consume that requirement without a dummy write.
     // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/include/mesosphere/arch/arm64/kern_cpu.hpp
     let process = context.process();
-    let mapping = process
+    let (region, mapping) = process
         .memory()
-        .query_memory(
+        .query_page(
             process.cpu().address_space_id(),
             GuestVirtualAddress::new(address),
-            GuestVirtualAddress::new(process.address_space_limit()),
         )
         .ok_or_else(|| {
             DataAccessFault::new(
@@ -189,7 +188,7 @@ fn decrement_if_less_than(
                 DataAccessFaultReason::Unmapped,
             )
         })?;
-    if mapping.region != Some(MemoryRegionKind::Ram)
+    if region != MemoryRegionKind::Ram
         || !mapping.permissions.contains(MemoryPermissions::READ_WRITE)
     {
         return Err(DataAccessFault::new(
@@ -212,7 +211,7 @@ fn decrement_if_less_than(
     }
 }
 
-fn compare_exchange(
+pub(super) fn compare_exchange(
     context: &ExceptionDispatchContext<'_>,
     address: u64,
     expected: u32,

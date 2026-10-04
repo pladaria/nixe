@@ -117,11 +117,36 @@ impl CanonicalBackingSegment {
 }
 
 /// A validated logical byte range represented by retained page segments.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CanonicalBackingRange {
-    segments: Arc<[CanonicalBackingSegment]>,
+    layout: Arc<CanonicalRangeLayout>,
     size: u64,
 }
+
+#[derive(Debug)]
+struct CanonicalRangeLayout {
+    segments: Box<[CanonicalBackingSegment]>,
+    // Indices retain first-occurrence order without duplicating page authority.
+    pages: Box<[usize]>,
+    // Stable identity order is also the lock order for multi-store transitions.
+    stores: Box<[CanonicalRangeStore]>,
+}
+
+#[derive(Debug)]
+struct CanonicalRangeStore {
+    store: crate::CanonicalBackingStore,
+    changes: Box<[crate::MemoryInvalidationKind]>,
+}
+
+impl PartialEq for CanonicalBackingRange {
+    fn eq(&self, other: &Self) -> bool {
+        self.size == other.size
+            && (Arc::ptr_eq(&self.layout, &other.layout)
+                || self.layout.segments == other.layout.segments)
+    }
+}
+
+impl Eq for CanonicalBackingRange {}
 
 struct CpuWriteDependencyPage {
     page: CanonicalBackingPage,
@@ -347,9 +372,8 @@ impl CanonicalCpuWriteDependency {
             return Ok(Vec::new());
         }
         loop {
-            let stores = range.execution_stores();
-            let mut transitions = stores
-                .iter()
+            let mut transitions = range
+                .execution_stores()
                 .map(|store| store.execution_gate().acquire_mutation(&[]))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(CanonicalRangeAccessError::Mutation)?;
@@ -549,42 +573,31 @@ impl CanonicalBackingRange {
     /// closure, and its newly captured page must be included too. Reads also
     /// change visibility authority and can leave a page Invalid on failure;
     /// no code derived from that page may survive the transition in that case.
-    fn begin_device_transition<'a>(
+    fn begin_device_transition(
         &self,
-        stores: &'a [crate::CanonicalBackingStore],
-    ) -> Result<Vec<crate::ExecutionMutationGuard<'a>>, VisibilityError> {
-        let mut transitions = Vec::with_capacity(stores.len());
-        for store in stores {
-            let changes = self
-                .segments
-                .iter()
-                .map(CanonicalBackingSegment::page)
-                .filter(|page| page.store() == store.identity())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .map(|page| crate::MemoryInvalidationKind::ExecutableContent {
-                    first: page.page(),
-                    second: None,
-                })
-                .collect::<Vec<_>>();
-            transitions.push(
-                store
+    ) -> Result<Vec<crate::ExecutionMutationGuard<'_>>, VisibilityError> {
+        self.layout
+            .stores
+            .iter()
+            .map(|entry| {
+                entry
+                    .store
                     .execution_gate()
-                    .acquire_mutation(&changes)
-                    .map_err(VisibilityError::ExecutionMutation)?,
-            );
-        }
-        Ok(transitions)
+                    .acquire_mutation(&entry.changes)
+                    .map_err(VisibilityError::ExecutionMutation)
+            })
+            .collect()
     }
 
-    fn execution_stores(&self) -> Vec<crate::CanonicalBackingStore> {
-        let mut stores = BTreeMap::new();
-        for segment in self.segments.iter() {
-            stores
-                .entry(segment.backing.store().identity())
-                .or_insert_with(|| segment.backing.store().clone());
-        }
-        stores.into_values().collect()
+    fn execution_stores(&self) -> impl Iterator<Item = &crate::CanonicalBackingStore> {
+        self.layout.stores.iter().map(|entry| &entry.store)
+    }
+
+    fn pages(&self) -> impl Iterator<Item = &CanonicalBackingPage> {
+        self.layout
+            .pages
+            .iter()
+            .map(|index| self.layout.segments[*index].backing())
     }
 
     /// Creates a non-empty range and checks its total length.
@@ -598,8 +611,37 @@ impl CanonicalBackingRange {
                 .checked_add(segment.size)
                 .ok_or(CanonicalRangeError::RangeOverflow)?;
         }
+        let mut seen_pages = BTreeSet::new();
+        let mut pages = Vec::new();
+        let mut stores = BTreeMap::new();
+        for (index, segment) in segments.iter().enumerate() {
+            if seen_pages.insert(segment.page()) {
+                pages.push(index);
+                let (_, changes) = stores
+                    .entry(segment.page().store())
+                    .or_insert_with(|| (segment.backing.store().clone(), BTreeSet::new()));
+                changes.insert(segment.page().page());
+            }
+        }
+        let stores = stores
+            .into_values()
+            .map(|(store, pages)| CanonicalRangeStore {
+                store,
+                changes: pages
+                    .into_iter()
+                    .map(|first| crate::MemoryInvalidationKind::ExecutableContent {
+                        first,
+                        second: None,
+                    })
+                    .collect(),
+            })
+            .collect();
         Ok(Self {
-            segments: segments.into(),
+            layout: Arc::new(CanonicalRangeLayout {
+                segments: segments.into(),
+                pages: pages.into(),
+                stores,
+            }),
             size,
         })
     }
@@ -613,7 +655,7 @@ impl CanonicalBackingRange {
     /// Returns the ordered canonical segments.
     #[must_use]
     pub fn segments(&self) -> &[CanonicalBackingSegment] {
-        &self.segments
+        &self.layout.segments
     }
 
     /// Retains a checked logical subrange with the same canonical page identity.
@@ -643,7 +685,7 @@ impl CanonicalBackingRange {
         let original_len = output.len();
         let mut logical_start = 0_u64;
         let result = (|| {
-            for segment in self.segments.iter() {
+            for segment in self.layout.segments.iter() {
                 let logical_end = logical_start
                     .checked_add(segment.size)
                     .ok_or(CanonicalRangeError::RangeOverflow)?;
@@ -697,11 +739,10 @@ impl CanonicalBackingRange {
         if output.is_empty() {
             return Ok(());
         }
-        let stores = self.execution_stores();
         loop {
             let mut logical_start = 0_u64;
             let mut visited = BTreeSet::new();
-            for segment in self.segments.iter() {
+            for segment in self.layout.segments.iter() {
                 let logical_end = logical_start
                     .checked_add(segment.size)
                     .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
@@ -719,13 +760,13 @@ impl CanonicalBackingRange {
                 }
             }
 
-            let _transitions = stores
-                .iter()
+            let _transitions = self
+                .execution_stores()
                 .map(|store| store.execution_gate().acquire_exclusive())
                 .collect::<Vec<_>>();
             let mut logical_start = 0_u64;
             let mut cpu_visible = true;
-            for segment in self.segments.iter() {
+            for segment in self.layout.segments.iter() {
                 let logical_end = logical_start
                     .checked_add(segment.size)
                     .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
@@ -771,7 +812,7 @@ impl CanonicalBackingRange {
         }
         let mut logical_start = 0_u64;
         let mut copied = 0_usize;
-        for segment in self.segments.iter() {
+        for segment in self.layout.segments.iter() {
             let logical_end = logical_start
                 .checked_add(segment.size)
                 .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
@@ -817,18 +858,12 @@ impl CanonicalBackingRange {
         declaration: DeviceAccessDeclaration,
         coordinator: Arc<dyn VisibilityCoordinator>,
     ) -> Result<(), VisibilityError> {
-        let stores = self.execution_stores();
-        let mut transitions = self.begin_device_transition(&stores)?;
+        let mut transitions = self.begin_device_transition()?;
         for transition in &mut transitions {
             transition.commit();
         }
-        let mut visited = BTreeSet::new();
-        for segment in self.segments.iter() {
-            if visited.insert(segment.page()) {
-                segment
-                    .backing
-                    .prepare_device_access(declaration, Arc::clone(&coordinator))?;
-            }
+        for page in self.pages() {
+            page.prepare_device_access(declaration, Arc::clone(&coordinator))?;
         }
         Ok(())
     }
@@ -844,35 +879,43 @@ impl CanonicalBackingRange {
         declaration: DeviceAccessDeclaration,
         coordinator: Arc<dyn VisibilityCoordinator>,
     ) -> Result<(), VisibilityError> {
-        let stores = self.execution_stores();
-        let mut transitions = self.begin_device_transition(&stores)?;
+        // These accesses change no visibility, tracking, permissions or bytes.
+        // A later CPU store is observed by the resident resource's dirty
+        // dependency; taking its upload snapshot still closes execution.
+        // Only actual ownership transitions need the mutation handshake.
+        if self.pages().all(|page| match page.visibility_state() {
+            VisibilityState::Clean => !declaration.kind().writes(),
+            VisibilityState::GpuNewer { device, visible_at } => {
+                device == declaration.device() && visible_at <= declaration.device_visible_at()
+            }
+            _ => false,
+        }) {
+            return Ok(());
+        }
+        let mut transitions = self.begin_device_transition()?;
         for transition in &mut transitions {
             transition.commit();
         }
-        let mut visited = BTreeSet::new();
-        for segment in self.segments.iter() {
-            if !visited.insert(segment.page()) {
-                continue;
-            }
-            match segment.backing.visibility_state() {
+        for page in self.pages() {
+            match page.visibility_state() {
                 VisibilityState::Clean if !declaration.kind().writes() => {}
-                VisibilityState::Clean => segment
-                    .backing
-                    .prepare_device_access(declaration, Arc::clone(&coordinator))?,
-                VisibilityState::CpuNewer if !declaration.kind().writes() => {
-                    segment.backing.prepare_resident_device_read(declaration)?
+                VisibilityState::Clean => {
+                    page.prepare_device_access(declaration, Arc::clone(&coordinator))?
                 }
-                VisibilityState::CpuNewer => segment
-                    .backing
-                    .prepare_device_access(declaration, Arc::clone(&coordinator))?,
+                VisibilityState::CpuNewer if !declaration.kind().writes() => {
+                    page.prepare_resident_device_read(declaration)?
+                }
+                VisibilityState::CpuNewer => {
+                    page.prepare_device_access(declaration, Arc::clone(&coordinator))?
+                }
                 VisibilityState::GpuNewer { device, visible_at }
                     if device == declaration.device()
                         && visible_at <= declaration.device_visible_at() => {}
                 VisibilityState::GpuNewer { .. }
                 | VisibilityState::Conflicting
-                | VisibilityState::Invalid => segment
-                    .backing
-                    .prepare_device_access(declaration, Arc::clone(&coordinator))?,
+                | VisibilityState::Invalid => {
+                    page.prepare_device_access(declaration, Arc::clone(&coordinator))?
+                }
             }
         }
         Ok(())
@@ -891,18 +934,23 @@ impl CanonicalBackingRange {
         if !declaration.kind().writes() {
             return Err(VisibilityError::DeclarationDoesNotWrite);
         }
-        let stores = self.execution_stores();
-        let mut transitions = self.begin_device_transition(&stores)?;
-        for transition in &mut transitions {
-            transition.commit();
-        }
-        let mut visited = BTreeSet::new();
-        for segment in self.segments.iter() {
-            if visited.insert(segment.page()) {
-                segment
-                    .backing
-                    .publish_device_write(declaration, Arc::clone(&coordinator))?;
+        let mut pages = self.pages();
+        while let Some(page) = pages.next() {
+            if page.advance_resident_device_write(declaration, &coordinator)? {
+                continue;
             }
+            // Actual CPU-to-device ownership changes still close execution.
+            // Earlier pages have already published this operation's point;
+            // CPU consumers can materialize them only from that newer point.
+            let mut transitions = self.begin_device_transition()?;
+            for transition in &mut transitions {
+                transition.commit();
+            }
+            page.publish_device_write(declaration, Arc::clone(&coordinator))?;
+            for page in pages {
+                page.publish_device_write(declaration, Arc::clone(&coordinator))?;
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -910,16 +958,12 @@ impl CanonicalBackingRange {
     /// Marks every retained page invalid after an unrecoverable residency or
     /// visibility failure.
     pub fn invalidate_visibility(&self) -> Result<(), VisibilityError> {
-        let stores = self.execution_stores();
-        let mut transitions = self.begin_device_transition(&stores)?;
+        let mut transitions = self.begin_device_transition()?;
         for transition in &mut transitions {
             transition.commit();
         }
-        let mut visited = BTreeSet::new();
-        for segment in self.segments.iter() {
-            if visited.insert(segment.page()) {
-                segment.backing.invalidate_visibility()?;
-            }
+        for page in self.pages() {
+            page.invalidate_visibility()?;
         }
         Ok(())
     }
@@ -1257,8 +1301,90 @@ mod tests {
 
         let cloned = range.clone();
 
-        assert!(Arc::ptr_eq(&range.segments, &cloned.segments));
+        assert!(Arc::ptr_eq(&range.layout, &cloned.layout));
         assert_eq!(range, cloned);
+    }
+
+    #[test]
+    fn range_layout_deduplicates_physical_aliases_and_orders_store_transitions() {
+        let first = CanonicalBackingStore::allocate().unwrap();
+        let second = CanonicalBackingStore::allocate().unwrap();
+        let a = CanonicalBackingPage::zeroed(
+            &first,
+            GuestPhysicalPageId::new(3),
+            0x1000,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let b = CanonicalBackingPage::zeroed(
+            &second,
+            GuestPhysicalPageId::new(3),
+            0x1000,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let c = CanonicalBackingPage::zeroed(
+            &first,
+            GuestPhysicalPageId::new(1),
+            0x1000,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let segment = |page| {
+            CanonicalBackingSegment::new(
+                page,
+                0,
+                0x100,
+                MemoryPermissions::READ_WRITE,
+                MappingGeneration::INITIAL,
+            )
+            .unwrap()
+        };
+        let range = CanonicalBackingRange::new(vec![
+            segment(b.clone()),
+            segment(a.clone()),
+            segment(b.clone()),
+            segment(c.clone()),
+            segment(a.clone()),
+        ])
+        .unwrap();
+        assert_eq!(range.size(), 0x500);
+        assert_eq!(
+            range
+                .pages()
+                .map(CanonicalBackingPage::identity)
+                .collect::<Vec<_>>(),
+            [b.identity(), a.identity(), c.identity()]
+        );
+        assert_eq!(
+            range
+                .execution_stores()
+                .map(CanonicalBackingStore::identity)
+                .collect::<Vec<_>>(),
+            [first.identity(), second.identity()]
+        );
+        assert_eq!(
+            &*range.layout.stores[0].changes,
+            &[
+                crate::MemoryInvalidationKind::ExecutableContent {
+                    first: GuestPhysicalPageId::new(1),
+                    second: None
+                },
+                crate::MemoryInvalidationKind::ExecutableContent {
+                    first: GuestPhysicalPageId::new(3),
+                    second: None
+                },
+            ]
+        );
+        let subrange = range.snapshot_subrange(0x100, 0x100).unwrap();
+        assert_eq!(
+            subrange
+                .pages()
+                .map(CanonicalBackingPage::identity)
+                .collect::<Vec<_>>(),
+            [a.identity()]
+        );
+        assert_eq!(subrange.execution_stores().count(), 1);
     }
 
     #[test]
@@ -1530,6 +1656,176 @@ mod tests {
                 visible_at: DeviceVisibilityPoint::new(2),
             }
         );
+    }
+
+    #[test]
+    fn resident_reads_keep_clean_and_device_owned_pages_without_mutation() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let device = NonCpuDeviceId::new(1);
+        let write = DeviceAccessDeclaration::write(
+            device,
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(write, Arc::clone(&coordinator))
+            .unwrap();
+        let gate = range.segments()[0].backing().store().execution_gate();
+        let epoch = gate.epoch();
+        range
+            .prepare_resident_device_access(
+                DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(2)),
+                Arc::clone(&coordinator),
+            )
+            .unwrap();
+        assert_eq!(gate.epoch(), epoch);
+        range
+            .publish_device_write(write, Arc::clone(&coordinator))
+            .unwrap();
+        let epoch = gate.epoch();
+        range
+            .prepare_resident_device_access(
+                DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(2)),
+                Arc::clone(&coordinator),
+            )
+            .unwrap();
+        assert_eq!(gate.epoch(), epoch);
+        assert_eq!(
+            range.prepare_resident_device_access(
+                DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(1)),
+                coordinator
+            ),
+            Err(VisibilityError::ConflictingAccess)
+        );
+        assert_eq!(
+            range.segments()[0].visibility_state(),
+            VisibilityState::Conflicting
+        );
+    }
+
+    #[test]
+    fn resident_device_writes_advance_points_without_closing_cpu_execution() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let device = NonCpuDeviceId::new(1);
+        let first = DeviceAccessDeclaration::write(
+            device,
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(first, coordinator.clone())
+            .unwrap();
+        range
+            .publish_device_write(first, coordinator.clone())
+            .unwrap();
+        let gate = range.segments()[0].backing().store().execution_gate();
+        let epoch = gate.epoch();
+        let active = gate.acquire_shared();
+        let next = DeviceAccessDeclaration::write(
+            device,
+            DeviceVisibilityPoint::new(2),
+            DeviceVisibilityPoint::new(4),
+        )
+        .unwrap();
+        range
+            .prepare_resident_device_access(next, coordinator.clone())
+            .unwrap();
+        range.publish_device_write(next, coordinator).unwrap();
+        assert_eq!(gate.epoch(), epoch);
+        assert!(!gate.transition_pending());
+        for page in range.pages() {
+            assert_eq!(page.content_generation(), ContentGeneration::INITIAL);
+            assert_eq!(
+                page.visibility_state(),
+                VisibilityState::GpuNewer {
+                    device,
+                    visible_at: DeviceVisibilityPoint::new(4),
+                }
+            );
+        }
+        drop(active);
+    }
+
+    #[test]
+    fn cpu_writeback_retries_a_concurrent_resident_device_write() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let device = NonCpuDeviceId::new(1);
+        let first = DeviceAccessDeclaration::write(
+            device,
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(first, coordinator.clone())
+            .unwrap();
+        range
+            .publish_device_write(first, coordinator.clone())
+            .unwrap();
+        let mut requests = Vec::new();
+        let snapshot = dependency
+            .snapshot_with_resolver(
+                &range,
+                CpuWriteSnapshotSelection::All,
+                1,
+                &mut |_, request| {
+                    requests.push(request.visible_at);
+                    if requests.len() == 1 {
+                        let next = DeviceAccessDeclaration::write(
+                            device,
+                            DeviceVisibilityPoint::new(2),
+                            DeviceVisibilityPoint::new(4),
+                        )
+                        .unwrap();
+                        range
+                            .publish_device_write(next, coordinator.clone())
+                            .unwrap();
+                        Ok(vec![0x11; request.size].into_boxed_slice())
+                    } else {
+                        Ok(vec![0x44; request.size].into_boxed_slice())
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            requests,
+            [DeviceVisibilityPoint::new(2), DeviceVisibilityPoint::new(4)]
+        );
+        assert_eq!(snapshot[0].1.as_ref(), &[0x44; 0x1000]);
+        assert_eq!(
+            range.pages().next().unwrap().visibility_state(),
+            VisibilityState::Clean
+        );
+        // Materialization restores CPU authority. The next actual handoff
+        // must close execution again, rather than using the resident update.
+        let gate = range.segments()[0].backing().store().execution_gate();
+        let epoch = gate.epoch();
+        let next = DeviceAccessDeclaration::write(
+            device,
+            DeviceVisibilityPoint::new(4),
+            DeviceVisibilityPoint::new(6),
+        )
+        .unwrap();
+        range
+            .prepare_resident_device_access(next, coordinator.clone())
+            .unwrap();
+        range.publish_device_write(next, coordinator).unwrap();
+        assert!(gate.epoch() > epoch);
     }
 
     #[test]

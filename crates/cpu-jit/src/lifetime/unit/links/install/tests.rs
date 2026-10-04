@@ -9,6 +9,81 @@ use nixe_cpu::state::a64::A64State;
 mod batching;
 mod maintenance;
 
+#[test]
+fn optional_static_bridges_preserve_the_fallback_at_both_cache_limits() {
+    use crate::executable::{HARD_BYTES, SOFT_BYTES};
+    use crate::lifetime::unit::links::tests::source_input_for_tier;
+
+    for (tier, limit) in [(Tier::Lcq, HARD_BYTES), (Tier::Hcq, SOFT_BYTES)] {
+        let process = process();
+        let cursor = AtomicU64::new(0);
+        let target = nonempty_target(&process, &cursor);
+        if tier == Tier::Hcq {
+            source(&process, &cursor, 0, 4);
+            assert!(process.try_service_links().unwrap());
+        }
+        let input = source_input_for_tier(&process, 0, 4, tier);
+        let source = process
+            .prepare_unit(&[process.reserve(key(0)).unwrap()], input, &cursor)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let mut reader = process.register().unwrap();
+        let mut transition = stop(&process);
+        let pending = *pending(&process).first().unwrap();
+        let usage = process.cache.usage().unwrap();
+        let charge = process
+            .cache
+            .charge_metadata(limit - usage.total(), Tier::Lcq)
+            .unwrap();
+        assert!(!transition.install_link(pending).unwrap());
+        assert!(process.lock().units.links.records.get(pending.0).is_none());
+        let state = process.lock();
+        let record = state.units.records.get(source.0).unwrap();
+        assert!(record.static_sites[0].link.is_none());
+        assert!(record.static_sites[0].callable.is_none());
+        assert_eq!(record.lifecycle, Lifecycle::Published);
+        assert!(state.units.records.get(target.0).is_some());
+        drop(state);
+        assert_eq!(process.cache.usage().unwrap().total(), limit);
+        assert!(transition.drain_links().unwrap());
+        transition.batch().unwrap().complete().unwrap();
+        assert!(transition.try_reopen().unwrap());
+        drop(transition);
+        // The synthetic fallback executes under a real reader epoch even
+        // though no transfer storage could be installed at the cache limit.
+        let mut cpu = A64State::default();
+        let mut frame = frame(&mut cpu);
+        let invocation = unsafe { reader.admit(&mut frame, key(0)) }
+            .unwrap()
+            .unwrap();
+        let address = invocation.payload().preferred().unwrap().canonical.get();
+        let call: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(address) };
+        assert_eq!(unsafe { call() }, 42);
+        drop(invocation);
+        drop(reader);
+        drop(charge);
+        let mut transition = stop(&process);
+        let link = transition.refresh_static_link(source, 0).unwrap().unwrap();
+        assert!(transition.install_link(link).unwrap());
+        assert!(
+            process
+                .lock()
+                .units
+                .links
+                .records
+                .get(link.0)
+                .unwrap()
+                .bridge
+                .is_some()
+        );
+        transition.batch().unwrap().complete().unwrap();
+        assert!(transition.try_reopen().unwrap());
+        drop(transition);
+        assert!(process.try_shutdown().unwrap());
+    }
+}
+
 fn target_binding(input: &mut Input) {
     use crate::abi::{GuestValue, RegisterClass, ValueBinding};
     input.entries[0].contract.live_in.integer.x.insert(0);

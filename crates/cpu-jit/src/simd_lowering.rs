@@ -46,6 +46,7 @@ pub(crate) fn is_register_simd(instruction: Instruction) -> bool {
             | Instruction::VectorUnsignedShiftRegister(_)
             | Instruction::CountBits(_)
             | Instruction::Reverse64(_)
+            | Instruction::Reverse32(_)
             | Instruction::AddAcrossVector(_)
             | Instruction::UnsignedAddLongAcrossVector(_)
             | Instruction::ScalarFloatImmediate(_)
@@ -216,14 +217,22 @@ impl Translator<'_> {
             | Instruction::VectorUnsignedShiftRegister(_) => {
                 self.emit_register_shift(instruction, fields)
             }
-            Instruction::Reverse64(_) => {
-                // Arm REV64 permutes whole elements within 64-bit containers.
+            Instruction::Reverse64(_) | Instruction::Reverse32(_) => {
+                // Arm REV32/REV64 permute whole elements inside 32/64-bit containers.
                 // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
                 let source = self.read_vector(fields.rn)?;
                 let element_bytes = 1_usize << fields.opc;
+                let container_bytes = if matches!(instruction, Instruction::Reverse32(_)) {
+                    4
+                } else {
+                    8
+                };
                 let mask = std::array::from_fn(|index| {
-                    (index / 8 * 8
-                        + (8 / element_bytes - 1 - index % 8 / element_bytes) * element_bytes
+                    (index / container_bytes * container_bytes
+                        + (container_bytes / element_bytes
+                            - 1
+                            - index % container_bytes / element_bytes)
+                            * element_bytes
                         + index % element_bytes) as u8
                 });
                 let value = self.shuffle_bytes(source, source, mask);

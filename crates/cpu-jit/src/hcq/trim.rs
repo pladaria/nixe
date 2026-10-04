@@ -10,6 +10,7 @@ impl Graph {
         blocked: &[bool],
         successors: &[Option<Successor>; 4],
         observed_source: Option<crate::abi::InstructionKey>,
+        entries: &[BlockKey],
     ) -> Result<Self, Error> {
         if blocked.len() != self.instructions.len() {
             return Err(Error::InvalidInput("collision mask does not match graph"));
@@ -45,6 +46,11 @@ impl Graph {
             .collect();
         let mut reachable = vec![false; self.blocks.len()];
         let mut pending = vec![0];
+        pending.extend(
+            entries
+                .iter()
+                .filter_map(|entry| indexes.get(entry).copied()),
+        );
         while let Some(index) = pending.pop() {
             let block = &self.blocks[index];
             if reachable[index] || ends[index] == block.instructions.start {

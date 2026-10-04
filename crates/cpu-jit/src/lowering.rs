@@ -569,7 +569,7 @@ impl Translator<'_> {
             .builder
             .ins()
             .iconst(value_type(fields), immediate as i64);
-        self.emit_logical(fields, rhs)
+        self.emit_logical(fields, rhs, true)
     }
 
     pub(crate) fn emit_logical_shifted(
@@ -583,13 +583,14 @@ impl Translator<'_> {
         } else {
             rhs
         };
-        self.emit_logical(fields, rhs)
+        self.emit_logical(fields, rhs, false)
     }
 
     pub(crate) fn emit_logical(
         &mut self,
         fields: Operands,
         rhs: ir::Value,
+        immediate: bool,
     ) -> Result<Option<LazyFlags>, Error> {
         let lhs = self.read_integer(fields.rn, false, fields.width_64)?;
         let opcode = u8::from(fields.subtract) * 2 + u8::from(fields.set_flags);
@@ -599,7 +600,9 @@ impl Translator<'_> {
             2 => self.builder.ins().bxor(lhs, rhs),
             _ => unreachable!(),
         };
-        self.write_integer(fields.rd, false, result);
+        // Immediate AND/ORR/EOR may write SP; ANDS and register forms use ZR.
+        // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (AND immediate, p. 38)
+        self.write_integer(fields.rd, immediate && opcode != 3, result);
         Ok((opcode == 3).then_some(LazyFlags::Logical {
             result,
             width: value_width(fields),

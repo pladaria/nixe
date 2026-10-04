@@ -327,6 +327,7 @@ impl Lifetime {
             state
                 .units
                 .remove_static_source(UnitHandle(handle, self.identity));
+            state.units.remove_eviction(handle);
             let record = state.units.records.get_mut(handle).unwrap();
             record.lifecycle = Lifecycle::Unlinked;
             record.lifecycle = Lifecycle::Retired(retired);
@@ -472,35 +473,80 @@ impl Lifetime {
 const EVICTION_BATCH: usize = 64;
 
 impl Units {
-    /// A fixed-size oldest-first batch, selected without allocating while the
-    /// cache may already be at its hard limit. Reused registry slots and compiler
-    /// publication order need not follow CodeUnitId order.
+    pub(super) fn insert_eviction(&mut self, handle: Handle<UnitRecord>) {
+        let tier = usize::from(self.records.get(handle).unwrap().code.tier == Tier::Hcq);
+        let previous = self.eviction_tails[tier];
+        let record = self.records.get_mut(handle).unwrap();
+        record.eviction_previous = previous;
+        record.eviction_next = None;
+        if let Some(previous) = previous {
+            self.records.get_mut(previous).unwrap().eviction_next = Some(handle);
+        } else {
+            self.eviction_heads[tier] = Some(handle);
+        }
+        self.eviction_tails[tier] = Some(handle);
+    }
+
+    /// Reuse the existing cold sample to protect demonstrated native activity.
+    /// No atomics or list maintenance are added to individual guest instructions.
+    pub(super) fn sample_eviction(&mut self, handle: Handle<UnitRecord>) {
+        let record = self.records.get(handle).unwrap();
+        let tier = usize::from(record.code.tier == Tier::Hcq);
+        if record.lifecycle != Lifecycle::Published
+            || record.retirement.is_some()
+            || self.eviction_tails[tier] == Some(handle)
+        {
+            return;
+        }
+        self.remove_eviction(handle);
+        self.insert_eviction(handle);
+    }
+
+    fn remove_eviction(&mut self, handle: Handle<UnitRecord>) {
+        let record = self.records.get_mut(handle).unwrap();
+        let tier = usize::from(record.code.tier == Tier::Hcq);
+        let previous = record.eviction_previous.take();
+        let next = record.eviction_next.take();
+        if let Some(previous) = previous {
+            self.records.get_mut(previous).unwrap().eviction_next = next;
+        } else {
+            self.eviction_heads[tier] = next;
+        }
+        if let Some(next) = next {
+            self.records.get_mut(next).unwrap().eviction_previous = previous;
+        } else {
+            self.eviction_tails[tier] = previous;
+        }
+    }
+
+    /// No allocation under pressure. Retired records leave the list at unlink;
+    /// pinned LCQ and concurrently invalidating records cannot be selected.
     fn eviction_candidates(&self) -> [Option<Handle<UnitRecord>>; EVICTION_BATCH] {
-        for tier in [Tier::Hcq, Tier::Lcq] {
-            let mut oldest: [Option<(CodeUnitId, Handle<UnitRecord>)>; EVICTION_BATCH] =
-                [None; EVICTION_BATCH];
+        // Prefer sampled recency within each tier. Optimized regions represent
+        // demonstrated execution heat; preserve them and pinned baselines while LCQ can be
+        // reclaimed; evicting HCQ first immediately promotes hot code again.
+        for tier in [Tier::Lcq, Tier::Hcq] {
+            let mut candidates = [None; EVICTION_BATCH];
             let mut len = 0;
-            for (handle, record) in self.records.iter() {
-                if record.code.tier != tier
-                    || !matches!(
-                        record.lifecycle,
-                        Lifecycle::Published | Lifecycle::Superseded
-                    )
-                    || record.code.baseline_pins.load(Ordering::Relaxed) != 0
+            let mut current = self.eviction_heads[usize::from(tier == Tier::Hcq)];
+            while let Some(handle) = current {
+                let record = self.records.get(handle).unwrap();
+                current = record.eviction_next;
+                if !matches!(
+                    record.lifecycle,
+                    Lifecycle::Published | Lifecycle::Superseded
+                ) || record.code.baseline_pins.load(Ordering::Relaxed) != 0
                 {
                     continue;
                 }
-                let index = oldest[..len]
-                    .partition_point(|entry| entry.as_ref().unwrap().0 < record.code.id);
-                if index == EVICTION_BATCH {
-                    continue;
+                candidates[len] = Some(handle);
+                len += 1;
+                if len == EVICTION_BATCH {
+                    break;
                 }
-                len = (len + 1).min(EVICTION_BATCH);
-                oldest[index..len].rotate_right(1);
-                oldest[index] = Some((record.code.id, handle));
             }
             if len != 0 {
-                return oldest.map(|entry| entry.map(|(_, handle)| handle));
+                return candidates;
             }
         }
         [None; EVICTION_BATCH]
@@ -848,6 +894,7 @@ impl Transition<'_> {
                     }
                 }
             }
+            state.units.remove_eviction(handle);
             let record = state.units.records.get_mut(handle).unwrap();
             record.lifecycle = Lifecycle::Unlinked;
             record.lifecycle = Lifecycle::Retired(retired);

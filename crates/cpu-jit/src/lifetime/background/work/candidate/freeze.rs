@@ -48,7 +48,7 @@ impl<'w, 'p> Candidate<'w, 'p> {
         };
         // Storage is prepared outside state and outlives every guard below,
         // including partial-capture errors which release strong snapshots.
-        let mut replacement = Replacement::new(predecessors);
+        let replacement = Replacement::new(predecessors);
         {
             let state = self.work.process.lock();
             self.validate_locked(&state)?;
@@ -81,11 +81,6 @@ impl<'w, 'p> Candidate<'w, 'p> {
                     selected_blocks[index] = true;
                 }
             }
-            replacement.capture_fallbacks(&state, |key| {
-                blocks
-                    .get(&key)
-                    .is_some_and(|&index| selected_blocks[index])
-            })?;
         }
         entries.extend(
             selected_blocks
@@ -277,8 +272,7 @@ impl Frozen<'_, '_> {
     pub(in crate::lifetime) fn validate_locked(&self, state: &State) -> Result<(), Error> {
         // Selected entries are captured graph inputs, already revalidated here.
         // Do not repeat selection: new incoming links cannot invent native labels.
-        self.candidate.validate_locked(state)?;
-        self.replacement.validate(state)
+        self.candidate.validate_locked(state)
     }
 }
 

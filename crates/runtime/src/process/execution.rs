@@ -445,6 +445,12 @@ impl ProcessExecutionControl {
         self.process_id
     }
 
+    pub(crate) fn request_vcpu_safepoint(&self, vcpu: nixe_scheduler::VirtualCpuId) {
+        if let Some(control) = self.controls.get(&vcpu) {
+            control.request(ControlRequest::Preempt);
+        }
+    }
+
     pub(crate) fn request_safepoint(&self) {
         if self.controls.is_empty() {
             self.pending_safepoint.store(true, Ordering::Release);

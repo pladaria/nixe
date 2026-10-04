@@ -538,8 +538,13 @@ impl VideoSystem {
                     Some(source) => source.clone(),
                     None => presentable_image_request(&request.buffer, &object)?,
                 };
+                // queueBuffer transfers ownership to the consumer; it does not
+                // wait for that consumer to prepare or present the image.
+                // Retain the asynchronous reply with the slot until VSync and
+                // the backend has established the ordered image dependency.
+                // https://source.android.com/docs/core/graphics/arch-bq-gralloc
                 let image = nvdrv
-                    .acquire_presentable_image(source.clone())
+                    .request_presentable_image(source.clone())
                     .map_err(FramebufferError::Backend)?;
                 presentation_source = Some(source);
                 Some(PendingPresentation {
@@ -608,7 +613,7 @@ impl VideoSystem {
             state.vsync_event.signal();
         }
         for _ in 0..ticks.crossed {
-            let Some(pending) = state.pending_frames.front().cloned() else {
+            let Some(pending) = state.pending_frames.front() else {
                 break;
             };
             if pending.presentation.is_none()
@@ -621,12 +626,24 @@ impl VideoSystem {
             {
                 break;
             }
-            state.pending_frames.pop_front();
+            let image = match &pending.presentation {
+                Some(presentation) => match presentation.image.try_recv() {
+                    Ok(result) => Some(result.map_err(FramebufferError::Backend)?),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Err(FramebufferError::Backend(
+                            "GPU resident-image reply was lost".into(),
+                        ));
+                    }
+                },
+                None => None,
+            };
+            let pending = state.pending_frames.pop_front().unwrap();
             if let Some(presentation) = pending.presentation {
                 let sequence = state.next_frame_sequence;
                 state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
                 let frame = Arc::new(PresentationFrame::new(
-                    presentation.image,
+                    image.expect("a ready presentation owns its resident image"),
                     presentation.crop,
                     presentation.transform,
                     sequence,
@@ -785,7 +802,7 @@ pub(crate) struct BinderTransaction {
     pub(crate) queued: Option<QueuedBufferRequest>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PendingFrame {
     binder_id: i32,
     slot: i32,
@@ -793,9 +810,9 @@ struct PendingFrame {
     presentation: Option<PendingPresentation>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PendingPresentation {
-    image: ResidentImage,
+    image: std::sync::mpsc::Receiver<Result<ResidentImage, Box<str>>>,
     crop: FrameCrop,
     transform: FrameTransform,
 }
@@ -1637,12 +1654,14 @@ mod tests {
 
     #[derive(Debug)]
     struct ResidentTestRuntime {
+        preparation_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
         capabilities: BackendCapabilities,
     }
 
     impl ResidentTestRuntime {
         fn new() -> Self {
             Self {
+                preparation_gate: None,
                 capabilities: BackendCapabilities::new(
                     BackendFeatures::empty(),
                     [ImageFormat::Rgba8Unorm],
@@ -1703,6 +1722,10 @@ mod tests {
             &mut self,
             request: PresentationImageRequest,
         ) -> Result<ResidentImage, BackendRuntimeError> {
+            if let Some((entered, release)) = &self.preparation_gate {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
             let instance = BackendInstanceId::new(7);
             let description = ImageDescription::new(
                 ImageDimension::Two,
@@ -1737,6 +1760,49 @@ mod tests {
 
     impl FrameNotifier for ResidentTestNotifier {
         fn frame_available(&self) {}
+    }
+
+    #[test]
+    fn failed_or_lost_resident_image_reply_stops_presentation() {
+        for failure in [Some("image preparation failed"), None] {
+            let video = VideoSystem::default();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            video
+                .state
+                .lock()
+                .unwrap()
+                .pending_frames
+                .push_back(PendingFrame {
+                    binder_id: 1,
+                    slot: 0,
+                    acquire_fences: Box::default(),
+                    presentation: Some(PendingPresentation {
+                        image: receiver,
+                        crop: frame_crop(CropRect {
+                            left: 0,
+                            top: 0,
+                            right: 4,
+                            bottom: 4,
+                        })
+                        .unwrap(),
+                        transform: frame_transform(0).unwrap(),
+                    }),
+                });
+            if let Some(message) = failure {
+                sender.send(Err(Box::<str>::from(message))).unwrap();
+            }
+            drop(sender);
+            let error = video.advance(Duration::from_millis(17)).unwrap_err();
+            assert_eq!(
+                error,
+                FramebufferError::Backend(
+                    failure
+                        .unwrap_or("GPU resident-image reply was lost")
+                        .into(),
+                )
+            );
+            assert_eq!(video.state.lock().unwrap().pending_frames.len(), 1);
+        }
     }
 
     #[test]
@@ -2219,9 +2285,13 @@ mod tests {
     #[test]
     fn resident_frame_skips_cpu_materialization_and_retains_its_buffer_slot() {
         let mailbox = FrameMailbox::with_notifier(Arc::new(ResidentTestNotifier));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut backend = ResidentTestRuntime::new();
+        backend.preparation_gate = Some((entered_tx, release_rx));
         let video = VideoSystem::with_gpu_backend(
             Some(mailbox.clone()),
-            Box::new(ResidentTestRuntime::new()),
+            Box::new(backend),
             GpuCacheConfiguration::default(),
         );
         let (video, binder_id, buffer) = configure_rgba_nvmap(video);
@@ -2240,8 +2310,10 @@ mod tests {
                 },
             );
         }
-        video
-            .queue_graphic_buffer(
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let producer = video.clone();
+        let worker = std::thread::spawn(move || {
+            let result = producer.queue_graphic_buffer(
                 binder_id,
                 QueuedBufferRequest {
                     slot: 0,
@@ -2266,11 +2338,36 @@ mod tests {
                         .into_boxed_slice(),
                     },
                 },
-            )
-            .unwrap();
-
+            );
+            queued_tx.send(result).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let queued = queued_rx.recv_timeout(Duration::from_secs(5));
+        if queued.is_err() {
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+            panic!("QueueBuffer waited for resident image preparation");
+        }
+        queued.unwrap().unwrap();
+        worker.join().unwrap();
         assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
-        let frame = mailbox.take_latest().unwrap();
+        assert!(mailbox.take_latest().is_none());
+        assert_eq!(
+            video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
+            SlotOwnership::Queued
+        );
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut elapsed = Duration::from_millis(34);
+        let frame = loop {
+            video.advance(elapsed).unwrap();
+            if let Some(frame) = mailbox.take_latest() {
+                break frame;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            elapsed += Duration::from_millis(17);
+            std::thread::yield_now();
+        };
         assert_eq!((frame.width(), frame.height()), (4, 4));
         {
             let state = video.state.lock().unwrap();

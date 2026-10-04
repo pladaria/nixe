@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use nixe_gpu::{
@@ -102,13 +102,50 @@ struct PendingSegment {
     token: BackendSubmissionToken,
 }
 
-#[derive(Default)]
+#[derive(Debug)]
 struct GpuWorkBudget {
     state: Mutex<GpuWorkBudgetState>,
-    available: Condvar,
+    writable: nixe_runtime::WritableEventObject,
+    readable: nixe_runtime::ReadableEventObject,
 }
 
-#[derive(Default)]
+impl Default for GpuWorkBudget {
+    fn default() -> Self {
+        let (writable, readable) = nixe_runtime::EventObject::create_pair_with_source(
+            nixe_runtime::ExternalEventSource::Device,
+        );
+        Self {
+            state: Mutex::default(),
+            writable,
+            readable,
+        }
+    }
+}
+
+pub(super) enum GpuSubmissionAdmission {
+    Ready(GpuFrontendPermit),
+    Pending(PendingGpuSubmission),
+}
+
+/// Queue backpressure suspends the submitting guest thread, never the
+/// coordinator that must continue scheduling its other CPU and device work.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingGpuSubmission(Arc<GpuWorkBudget>);
+
+impl PendingGpuSubmission {
+    pub(crate) fn wake_event(&self) -> nixe_runtime::ReadableEventObject {
+        self.0.readable.clone()
+    }
+}
+
+impl PartialEq for PendingGpuSubmission {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for PendingGpuSubmission {}
+
+#[derive(Debug, Default)]
 struct GpuWorkBudgetState {
     active: usize,
     preflight_blocked: bool,
@@ -117,29 +154,27 @@ struct GpuWorkBudgetState {
 }
 
 impl GpuWorkBudget {
-    fn reserve(self: &Arc<Self>) -> Option<GpuFrontendPermit> {
+    fn reserve(self: &Arc<Self>) -> Option<GpuSubmissionAdmission> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while (state.active == MAX_GPU_SUBMISSIONS_IN_FLIGHT || state.preflight_blocked)
-            && !state.stopped
-        {
-            state = self
-                .available
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
         if state.stopped {
             return None;
         }
+        self.readable.clear();
+        if state.active == MAX_GPU_SUBMISSIONS_IN_FLIGHT || state.preflight_blocked {
+            return Some(GpuSubmissionAdmission::Pending(PendingGpuSubmission(
+                Arc::clone(self),
+            )));
+        }
         state.active += 1;
         state.preflight_blocked = true;
-        Some(GpuFrontendPermit {
+        Some(GpuSubmissionAdmission::Ready(GpuFrontendPermit {
             budget: Arc::clone(self),
             release_preflight_after_submission: false,
             preflight_released: false,
-        })
+        }))
     }
 
     fn stop(&self) {
@@ -147,7 +182,7 @@ impl GpuWorkBudget {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stopped = true;
-        self.available.notify_all();
+        self.writable.signal();
     }
 
     fn request_progress(&self) -> Option<bool> {
@@ -209,7 +244,9 @@ impl GpuFrontendPermit {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.preflight_blocked = false;
         self.preflight_released = true;
-        self.budget.available.notify_all();
+        if state.active < MAX_GPU_SUBMISSIONS_IN_FLIGHT {
+            self.budget.writable.signal();
+        }
     }
 
     fn allows_following(&self) -> bool {
@@ -226,7 +263,9 @@ impl Drop for GpuFrontendPermit {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active -= 1;
-        self.budget.available.notify_one();
+        if !state.preflight_blocked {
+            self.budget.writable.signal();
+        }
     }
 }
 
@@ -405,7 +444,7 @@ impl NvDrvGpuExecutor {
 
     /// Reserves bounded queue capacity and the ordered frontend boundary
     /// before channel state is dispatched and lowered.
-    pub(super) fn reserve_submission(&self) -> Result<GpuFrontendPermit, GpuExecutorFailure> {
+    pub(super) fn reserve_submission(&self) -> Result<GpuSubmissionAdmission, GpuExecutorFailure> {
         self.require_healthy()?;
         self.budget.reserve().ok_or_else(|| {
             self.failure().unwrap_or(GpuExecutorFailure {
@@ -452,10 +491,10 @@ impl NvDrvGpuExecutor {
         }
     }
 
-    pub(super) fn acquire_presentable_image(
+    pub(super) fn request_presentable_image(
         &self,
         request: PresentationImageRequest,
-    ) -> Result<ResidentImage, GpuExecutorFailure> {
+    ) -> Result<mpsc::Receiver<Result<ResidentImage, Box<str>>>, GpuExecutorFailure> {
         self.require_healthy()?;
         let sender = self
             .sender
@@ -475,18 +514,7 @@ impl NvDrvGpuExecutor {
                     detail: "GPU backend owner stopped before exporting a resident image".into(),
                 })
             })?;
-        result
-            .recv()
-            .map_err(|_| {
-                self.failure().unwrap_or(GpuExecutorFailure {
-                    frontend: FrontendSubmissionId::new(0),
-                    detail: "GPU resident-image reply was lost".into(),
-                })
-            })?
-            .map_err(|detail| GpuExecutorFailure {
-                frontend: FrontendSubmissionId::new(0),
-                detail,
-            })
+        Ok(result)
     }
 
     fn failure(&self) -> Option<GpuExecutorFailure> {
@@ -868,7 +896,6 @@ mod tests {
         ResourceDependency, SampleCount, ShaderStage,
     };
     use nixe_memory::{CanonicalPageId, DeviceVisibilityPoint, NonCpuDeviceId};
-    use std::time::Duration;
 
     struct VisibilityRuntime {
         capabilities: BackendCapabilities,
@@ -1003,59 +1030,86 @@ mod tests {
     }
 
     #[test]
-    fn frontend_preflight_waits_for_the_prior_memory_boundary() {
+    fn frontend_preflight_suspends_without_blocking_the_coordinator() {
         let budget = Arc::new(GpuWorkBudget::default());
-        let permit = budget.reserve().unwrap();
-        let waiting_budget = Arc::clone(&budget);
-        let (ready_sender, ready) = mpsc::sync_channel(1);
-        let (observed_sender, observed) = mpsc::sync_channel(1);
-        let waiter = thread::spawn(move || {
-            ready_sender.send(()).unwrap();
-            let permit = waiting_budget.reserve();
-            observed_sender.send(permit.is_some()).unwrap();
-            drop(permit);
-        });
-        ready.recv().unwrap();
-        assert_eq!(
-            observed.recv_timeout(Duration::from_millis(10)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
-
+        let Some(GpuSubmissionAdmission::Ready(permit)) = budget.reserve() else {
+            panic!()
+        };
+        let Some(GpuSubmissionAdmission::Pending(wait)) = budget.reserve() else {
+            panic!()
+        };
+        assert!(!wait.wake_event().is_signalled());
         drop(permit);
-        assert!(observed.recv().unwrap());
-        waiter.join().unwrap();
+        assert!(wait.wake_event().is_signalled());
+        assert!(matches!(
+            budget.reserve(),
+            Some(GpuSubmissionAdmission::Ready(_))
+        ));
     }
 
     #[test]
     fn backend_submission_releases_preflight_without_waiting_for_completion() {
         let budget = Arc::new(GpuWorkBudget::default());
-        let mut permit = budget.reserve().unwrap();
+        let Some(GpuSubmissionAdmission::Ready(mut permit)) = budget.reserve() else {
+            panic!()
+        };
         permit.set_release_after_submission(true);
-        let waiting_budget = Arc::clone(&budget);
-        let (observed_sender, observed) = mpsc::sync_channel(1);
-        let waiter = thread::spawn(move || {
-            let permit = waiting_budget.reserve();
-            observed_sender.send(permit.is_some()).unwrap();
-            drop(permit);
-        });
-        assert_eq!(
-            observed.recv_timeout(Duration::from_millis(10)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
+        let Some(GpuSubmissionAdmission::Pending(wait)) = budget.reserve() else {
+            panic!()
+        };
+        assert!(!wait.wake_event().is_signalled());
         permit.release_after_submission();
         assert!(permit.allows_following());
-        assert!(observed.recv().unwrap());
+        assert!(wait.wake_event().is_signalled());
+        assert!(matches!(
+            budget.reserve(),
+            Some(GpuSubmissionAdmission::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn capacity_and_shutdown_wake_suspended_submissions() {
+        let budget = Arc::new(GpuWorkBudget::default());
+        let mut permits = Vec::new();
+        for _ in 0..MAX_GPU_SUBMISSIONS_IN_FLIGHT {
+            let Some(GpuSubmissionAdmission::Ready(mut permit)) = budget.reserve() else {
+                panic!()
+            };
+            permit.set_release_after_submission(true);
+            permit.release_after_submission();
+            permits.push(permit);
+        }
+        let Some(GpuSubmissionAdmission::Pending(wait)) = budget.reserve() else {
+            panic!()
+        };
+        assert!(!wait.wake_event().is_signalled());
+        permits.pop();
+        assert!(wait.wake_event().is_signalled());
+        let Some(GpuSubmissionAdmission::Ready(permit)) = budget.reserve() else {
+            panic!()
+        };
+        let Some(GpuSubmissionAdmission::Pending(wait)) = budget.reserve() else {
+            panic!()
+        };
+        assert!(!wait.wake_event().is_signalled());
+        budget.stop();
+        assert!(wait.wake_event().is_signalled());
+        assert!(budget.reserve().is_none());
         drop(permit);
-        waiter.join().unwrap();
     }
 
     #[test]
     fn deferred_canonical_writes_keep_completion_demanded() {
         let budget = Arc::new(GpuWorkBudget::default());
-        let mut permit = budget.reserve().unwrap();
+        let Some(GpuSubmissionAdmission::Ready(mut permit)) = budget.reserve() else {
+            panic!()
+        };
         permit.set_release_after_submission(false);
         permit.release_after_submission();
-
         assert!(!permit.allows_following());
+        assert!(matches!(
+            budget.reserve(),
+            Some(GpuSubmissionAdmission::Pending(_))
+        ));
     }
 }

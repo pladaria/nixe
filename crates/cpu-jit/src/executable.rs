@@ -2,6 +2,7 @@
 //! mutex, never JIT state. A lease owns an exact span; published CodeUnit owners
 //! must retain it through unlink, reader quiescence and all strong references.
 
+mod free_spans;
 mod linux;
 pub(crate) mod output;
 mod patch;
@@ -11,6 +12,7 @@ mod tests;
 
 use crate::abi::{CheckedCounter, SegmentGeneration};
 use cranelift_codegen::binemit::Reloc;
+use free_spans::FreeSpans;
 use linux::Backing;
 use output::{Metadata, Output, Target};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -123,46 +125,23 @@ struct Segment {
     tier: Option<Tier>,
     bump: usize,
     live: usize,
-    // Sorted, coalesced ranges. Capacity is charged, including replacement
-    // overlap; fixed boxed storage makes that extent exact. No release allocates.
-    free: Box<[Span]>,
-    free_len: usize,
+    free: FreeSpans,
 }
 impl Segment {
     fn remove_free(&mut self, index: usize) -> Span {
-        let span = self.free[index];
-        self.free.copy_within(index + 1..self.free_len, index);
-        self.free_len -= 1;
-        span
+        self.free.remove(index)
     }
     fn insert_free(&mut self, span: Span) {
-        if span.len == 0 {
-            return;
-        }
-        let mut index = self.free[..self.free_len].partition_point(|free| free.start < span.start);
-        assert!(
-            self.free_len < self.free.len(),
-            "allocation reserved release metadata"
-        );
-        self.free.copy_within(index..self.free_len, index + 1);
-        self.free[index] = span;
-        self.free_len += 1;
-        if index > 0 && self.free[index - 1].end() == self.free[index].start {
-            let right = self.remove_free(index);
-            index -= 1;
-            self.free[index].len += right.len;
-        }
-        if index + 1 < self.free_len && self.free[index].end() == self.free[index + 1].start {
-            let right = self.remove_free(index + 1);
-            self.free[index].len += right.len;
-        }
+        self.free.insert(span);
     }
     fn release(&mut self, span: Span) {
         self.insert_free(span);
         self.live -= 1;
-        if self.free_len != 0 && self.free[self.free_len - 1].end() == self.bump {
-            self.bump = self.free[self.free_len - 1].start;
-            self.free_len -= 1;
+        if let Some((index, tail)) = self.free.last()
+            && tail.end() == self.bump
+        {
+            self.free.remove(index);
+            self.bump = tail.start;
         }
     }
 }
@@ -177,19 +156,18 @@ struct State {
 impl State {
     fn ensure_free_storage(&mut self, index: usize, tier: Tier) -> Result<(), Error> {
         let segment = &mut self.segments[index];
-        let needed = (segment.live + 2).max(segment.free_len + 2);
-        if segment.free.len() >= needed {
+        let needed = (segment.live + 2).max(segment.free.len() + 2);
+        if segment.free.capacity() >= needed {
             return Ok(());
         }
-        let count = needed.max(segment.free.len() * 2).max(8);
+        let count = needed.max(segment.free.capacity() * 2).max(8);
         let bytes = count
-            .checked_mul(std::mem::size_of::<Span>())
+            .checked_mul(std::mem::size_of::<free_spans::Node>())
             .ok_or(Error::Capacity("free span metadata overflow"))?;
         self.usage.check(bytes, tier)?; // Includes old/new allocation overlap.
-        let mut replacement = vec![Span::default(); count].into_boxed_slice();
-        replacement[..segment.free_len].copy_from_slice(&segment.free[..segment.free_len]);
+        let replacement = vec![free_spans::Node::default(); count].into_boxed_slice();
         self.usage.metadata += bytes;
-        let old = std::mem::replace(&mut segment.free, replacement);
+        let old = segment.free.grow(replacement);
         let old_bytes = std::mem::size_of_val(&*old);
         drop(old);
         self.usage.metadata -= old_bytes;
@@ -311,56 +289,73 @@ impl Cache {
                 .ok_or(Error::Capacity("code and islands exceed one segment"))?;
             (size, alignment.max(ISLAND_SLOT_BYTES))
         };
+        // Own trailing alignment padding with the allocation. Otherwise each
+        // append creates a tiny free span, making best-fit searches and release
+        // coalescing quadratic in the number of compiled units. Code/fault
+        // bounds remain the original code_len, excluding padding and islands.
+        let size = align(size, alignment)?;
         let mut state = self.lock()?;
         if state.backing.is_none() {
             return Err(Error::Closed);
         }
-        // Free-span policy is best fit, then lowest RX address. A tier can
-        // borrow an unused segment, never another tier's live active segment.
+        // Reuse best fit first, breaking ties by lowest RX address. The two
+        // indexes avoid scanning and shifting every hole in fragmented segments.
         let mut best: Option<(usize, usize, usize, usize)> = None;
         for (index, segment) in state.segments.iter().enumerate() {
             if segment.live != 0 && segment.tier != Some(tier) {
                 continue;
             }
-            for (free_index, free) in segment.free[..segment.free_len].iter().enumerate() {
-                let start = align(self.base + index * SEGMENT_BYTES + free.start, alignment)?
-                    - self.base
-                    - index * SEGMENT_BYTES;
-                if start + size <= free.end() {
-                    let candidate = (free.len, index, start, free_index);
-                    if best.is_none_or(|old| candidate < old) {
-                        best = Some(candidate);
-                    }
+            if let Some((free_index, start, free)) =
+                segment
+                    .free
+                    .best_fit(self.base + index * SEGMENT_BYTES, size, alignment)?
+            {
+                let candidate = (free.len, index, start, free_index);
+                if best.is_none_or(|old| candidate < old) {
+                    best = Some(candidate);
                 }
             }
         }
         let (index, start, free_index) = if let Some((_, index, start, free_index)) = best {
             (index, start, Some(free_index))
         } else {
-            let mut candidate = None;
-            // Prefer already committed tier/unused segments to new backing.
-            for committed in [true, false] {
-                for (index, segment) in state.segments.iter().enumerate() {
-                    if segment.generation.is_some() != committed
+            let append = state
+                .segments
+                .iter()
+                .enumerate()
+                .find_map(|(index, segment)| {
+                    if segment.generation.is_none()
                         || (segment.live != 0 && segment.tier != Some(tier))
                     {
-                        continue;
+                        return None;
                     }
-                    let start = align(self.base + index * SEGMENT_BYTES + segment.bump, alignment)?
-                        - self.base
-                        - index * SEGMENT_BYTES;
-                    if start + size <= segment_size(index) {
-                        candidate = Some((index, start, None));
-                        break;
-                    }
-                }
-                if candidate.is_some() {
-                    break;
-                }
+                    let start = (self.base + index * SEGMENT_BYTES + segment.bump)
+                        .checked_add(alignment - 1)?
+                        & !(alignment - 1);
+                    let start = start - self.base - index * SEGMENT_BYTES;
+                    (start + size <= segment_size(index)).then_some((index, start, None))
+                });
+            if let Some(append) = append {
+                append
+            } else {
+                state
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, segment)| {
+                        if segment.generation.is_some() {
+                            return None;
+                        }
+                        let start = (self.base + index * SEGMENT_BYTES + segment.bump)
+                            .checked_add(alignment - 1)?
+                            & !(alignment - 1);
+                        let start = start - self.base - index * SEGMENT_BYTES;
+                        (start + size <= segment_size(index)).then_some((index, start, None))
+                    })
+                    .ok_or(Error::Capacity(
+                        "2047 MiB executable window has no fitting code/island reservation",
+                    ))?
             }
-            candidate.ok_or(Error::Capacity(
-                "2047 MiB executable window has no fitting code/island reservation",
-            ))?
         };
         state.ensure_free_storage(index, tier)?;
         if state.segments[index].generation.is_none() {
@@ -635,7 +630,7 @@ impl Cache {
             state.usage.committed -= segment_size(index);
         }
         let old = std::mem::take(&mut state.segments[index]);
-        let metadata = std::mem::size_of_val(&*old.free);
+        let metadata = old.free.storage_bytes();
         drop(old);
         state.usage.metadata -= metadata;
         Ok(true)
@@ -653,7 +648,7 @@ impl Cache {
         state.usage.committed = 0;
         for index in 0..SEGMENTS {
             let old = std::mem::take(&mut state.segments[index]);
-            let bytes = std::mem::size_of_val(&*old.free);
+            let bytes = old.free.storage_bytes();
             drop(old);
             state.usage.metadata -= bytes;
         }

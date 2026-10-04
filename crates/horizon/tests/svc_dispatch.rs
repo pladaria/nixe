@@ -2515,6 +2515,97 @@ fn hid_activation_and_style_event_wire_contracts() {
 }
 
 #[test]
+fn hid_supported_style_set_round_trips_and_validates_get_requests() {
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 32));
+    let (_directory, mut process) = fixture_process(&instructions);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..35].copy_from_slice(b"hid");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let hid_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+
+    let mut get = register;
+    put_u32(&mut get, 40, 101);
+    put_u64(&mut get, 48, 0x1234);
+    // Nonzero alignment slack is not part of the ARUID payload.
+    put_u64(&mut get, 56, u64::MAX);
+    let mut send = |request: &[u8; 0x100]| {
+        write_guest_bytes(&process, tls, request);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(state(&mut process).read_w(x(0)), 0);
+        (
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            read_guest_u32(&process, tls.checked_add(32).unwrap()),
+        )
+    };
+    assert_eq!(send(&get), (0, 0));
+    let mut set = get;
+    put_u32(&mut set, 4, 12 | (1 << 31));
+    put_u32(&mut set, 40, 100);
+    put_u64(&mut set, 56, 0x1234);
+    for mask in [1u32, 0x1f, 0x8000_0021, 0] {
+        put_u32(&mut set, 48, mask);
+        assert_eq!(send(&set).0, 0);
+        assert_eq!(send(&get), (0, mask));
+    }
+    let mut truncated = get;
+    put_u32(&mut truncated, 4, 7 | (1 << 31));
+    let mut no_pid = [0u8; 0x100];
+    put_u32(&mut no_pid, 0, 4);
+    put_u32(&mut no_pid, 4, 10);
+    put_u32(&mut no_pid, 16, 0x4943_4653);
+    put_u32(&mut no_pid, 24, 101);
+    put_u64(&mut no_pid, 32, 0x1234);
+    let mut unexpected_descriptor = get;
+    put_u32(&mut unexpected_descriptor, 0, 4 | (1 << 16));
+    put_send_static(&mut unexpected_descriptor, 20, 0, 0);
+    for invalid in [truncated, no_pid, unexpected_descriptor] {
+        assert_eq!(
+            send(&invalid).0,
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+        );
+        assert_eq!(send(&get), (0, 0));
+    }
+}
+
+#[test]
 fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation() {
     let mut instructions = vec![svc(0x1f)];
     instructions.extend(std::iter::repeat_n(svc(0x21), 32));
@@ -6243,3 +6334,6 @@ mod access_log_index;
 
 #[path = "svc_dispatch/account_metadata.rs"]
 mod account_metadata;
+
+#[path = "svc_dispatch/mutex.rs"]
+mod mutex;

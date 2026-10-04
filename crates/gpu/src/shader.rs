@@ -385,6 +385,8 @@ impl ShaderInterfaceElement {
 /// Minimal operation vocabulary shared by frontend translation and backends.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShaderOperation {
+    /// Retains an instruction location with no per-invocation data effect.
+    Nop,
     LoadComputeBuiltin32 {
         destination: ShaderRegister,
         builtin: ShaderComputeBuiltin,
@@ -923,6 +925,7 @@ pub fn evaluate_shader_ir(
             continue;
         }
         match instruction.operation() {
+            ShaderOperation::Nop => {}
             ShaderOperation::LoadComputeBuiltin32 { .. }
             | ShaderOperation::LoadStorageBuffer32 { .. }
             | ShaderOperation::StoreStorageBuffer32 { .. } => {
@@ -1572,8 +1575,16 @@ fn finish_float(mut bits: u32, control: ShaderFloatControl) -> Result<u32, Shade
     if control.flush_denormals_to_zero {
         bits = flush_denormal_bits(bits);
     }
-    if control.saturate && !f32::from_bits(bits).is_nan() {
-        bits = f32::from_bits(bits).clamp(0.0, 1.0).to_bits();
+    if control.saturate {
+        // Ordered positive float encodings are also ordered unsigned integers.
+        // SAT maps negative results and NaNs to +0; classify bits so subnormals
+        // survive hosts that flush floating-point comparisons.
+        // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul
+        bits = if bits & 0x8000_0000 != 0 || bits > 0x7f80_0000 {
+            0
+        } else {
+            bits.min(1.0_f32.to_bits())
+        };
     }
     Ok(bits)
 }
@@ -1799,6 +1810,22 @@ fn lower_shader_ir_to_wgsl_impl(
             let zero = (a & 0x7fffffffu) == 0u || (b & 0x7fffffffu) == 0u;\n\
             return bitcast<u32>(bitcast<f32>(select(a, 0u, zero)) * bitcast<f32>(select(b, 0u, zero)));\n\
         }\n");
+    }
+    if ir.instructions.iter().any(|i| {
+        matches!(i.operation,
+        ShaderOperation::Multiply32 { float_control, .. }
+        | ShaderOperation::FloatMultiplyZero32 { float_control, .. }
+        | ShaderOperation::Add32 { float_control, .. }
+        | ShaderOperation::FloatMinMax32 { float_control, .. }
+        | ShaderOperation::FusedMultiplyAdd32 { float_control, .. }
+        if float_control.saturate())
+    }) {
+        source.push_str(
+            "fn nixe_saturate(bits: u32) -> u32 {\n\
+            if ((bits & 0x80000000u) != 0u || bits > 0x7f800000u) { return 0u; }\n\
+            return min(bits, 0x3f800000u);\n\
+        }\n",
+        );
     }
     if let Some((layouts, bind_group)) = vertex_pulling {
         emit_wgsl_vertex_pull_resources(&mut source, layouts, bind_group, quad_flat);
@@ -2537,6 +2564,7 @@ fn emit_wgsl_operation(
     return_statement: &str,
 ) -> Result<(), ShaderBackendLoweringError> {
     match instruction.operation() {
+        ShaderOperation::Nop => {}
         ShaderOperation::LoadComputeBuiltin32 {
             destination,
             builtin,
@@ -3237,15 +3265,16 @@ fn wgsl_float_multiply_expression(
         && control.denormals_are_zero()
         && control.flush_denormals_to_zero()
         && control.nan_mode() == ShaderNanMode::Propagate
-        && !control.saturate()
     {
-        return Ok(format!(
-            "nixe_multiply_rz_ftz(registers[{left}], registers[{right}], {zero_is_absorbing})"
+        return Ok(wgsl_saturate(
+            format!(
+                "nixe_multiply_rz_ftz(registers[{left}], registers[{right}], {zero_is_absorbing})"
+            ),
+            control,
         ));
     }
     if control.rounding() != ShaderRoundingMode::NearestEven
         || control.nan_mode() != ShaderNanMode::Propagate
-        || control.saturate()
     {
         return Err(ShaderBackendLoweringError::NumericControl(source));
     }
@@ -3265,15 +3294,18 @@ fn wgsl_float_multiply_expression(
             operand(right)
         )
     };
-    Ok(if control.flush_denormals_to_zero() {
-        format!(
-            "nixe_flush_product({result}, {}, {})",
-            operand(left),
-            operand(right)
-        )
-    } else {
-        result
-    })
+    Ok(wgsl_saturate(
+        if control.flush_denormals_to_zero() {
+            format!(
+                "nixe_flush_product({result}, {}, {})",
+                operand(left),
+                operand(right)
+            )
+        } else {
+            result
+        },
+        control,
+    ))
 }
 
 fn wgsl_float_add_expression(
@@ -3284,7 +3316,6 @@ fn wgsl_float_add_expression(
 ) -> Result<String, ShaderBackendLoweringError> {
     if control.rounding() != ShaderRoundingMode::NearestEven
         || control.nan_mode() != ShaderNanMode::Propagate
-        || control.saturate()
     {
         return Err(ShaderBackendLoweringError::NumericControl(source));
     }
@@ -3300,11 +3331,14 @@ fn wgsl_float_add_expression(
         operand(left),
         operand(right)
     );
-    Ok(if control.flush_denormals_to_zero() {
-        format!("nixe_flush_denormal({result})")
-    } else {
-        result
-    })
+    Ok(wgsl_saturate(
+        if control.flush_denormals_to_zero() {
+            format!("nixe_flush_denormal({result})")
+        } else {
+            result
+        },
+        control,
+    ))
 }
 
 fn wgsl_float_min_max_expression(
@@ -3316,7 +3350,6 @@ fn wgsl_float_min_max_expression(
 ) -> Result<String, ShaderBackendLoweringError> {
     if control.rounding() != ShaderRoundingMode::NearestEven
         || control.nan_mode() != ShaderNanMode::Propagate
-        || control.saturate()
     {
         return Err(ShaderBackendLoweringError::NumericControl(source));
     }
@@ -3334,11 +3367,14 @@ fn wgsl_float_min_max_expression(
         wgsl_predicate_expression(minimum)
     );
     let result = format!("bitcast<u32>({selected})");
-    Ok(if control.flush_denormals_to_zero() {
-        format!("nixe_flush_denormal({result})")
-    } else {
-        result
-    })
+    Ok(wgsl_saturate(
+        if control.flush_denormals_to_zero() {
+            format!("nixe_flush_denormal({result})")
+        } else {
+            result
+        },
+        control,
+    ))
 }
 
 fn wgsl_float_fma_expression(
@@ -3350,7 +3386,6 @@ fn wgsl_float_fma_expression(
 ) -> Result<String, ShaderBackendLoweringError> {
     if control.rounding() != ShaderRoundingMode::NearestEven
         || control.nan_mode() != ShaderNanMode::Propagate
-        || control.saturate()
     {
         return Err(ShaderBackendLoweringError::NumericControl(source));
     }
@@ -3367,11 +3402,22 @@ fn wgsl_float_fma_expression(
         operand(right),
         operand(addend)
     );
-    Ok(if control.flush_denormals_to_zero() {
-        format!("nixe_flush_denormal({result})")
+    Ok(wgsl_saturate(
+        if control.flush_denormals_to_zero() {
+            format!("nixe_flush_denormal({result})")
+        } else {
+            result
+        },
+        control,
+    ))
+}
+
+fn wgsl_saturate(result: String, control: ShaderFloatControl) -> String {
+    if control.saturate() {
+        format!("nixe_saturate({result})")
     } else {
         result
-    })
+    }
 }
 
 fn require_precise_float(
@@ -3668,6 +3714,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             ShaderPredicate::Always => {}
         }
         match &instruction.operation {
+            ShaderOperation::Nop => {}
             ShaderOperation::LoadControlPoint { destination, .. }
             | ShaderOperation::LoadPatchOutput { destination, .. } => {
                 tessellation::verify_operation(ir, instruction, index)?;

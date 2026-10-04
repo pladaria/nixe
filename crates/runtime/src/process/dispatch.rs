@@ -42,7 +42,6 @@ impl RunnableProcess {
             .complete_cpu_thread_retirement(self.memory.invalidation_cursor())
     }
 
-    #[cfg(test)]
     pub(crate) fn request_safepoint(&mut self) {
         self.execution.request_safepoint();
     }

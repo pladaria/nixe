@@ -13,18 +13,21 @@ impl RuntimeCoordinator {
         Ok(execution)
     }
 
-    /// Executes one parallel wave using the runtime-owned adaptive quantum.
-    pub fn run_parallel_wave_adaptive(
+    /// Reconciles one completed parallel slice without waiting for other cores.
+    pub fn run_parallel_adaptive(
         &mut self,
-    ) -> Result<Vec<CoordinatorExecution>, CoordinatorError> {
-        let executions = self.run_parallel_wave(self.adaptive_budget.current)?;
-        self.adaptive_budget.observe(
-            !executions.is_empty()
-                && executions.iter().all(|execution| {
-                    matches!(execution.report.stop, ExecutionStop::BudgetExhausted)
-                }),
-        );
-        Ok(executions)
+    ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
+        let execution = self.run_parallel_with_budget(None)?;
+        if let Some(execution) = &execution {
+            self.parallel_budgets
+                .get_mut(&execution.lease.vcpu)
+                .unwrap()
+                .observe(matches!(
+                    execution.report.stop,
+                    ExecutionStop::BudgetExhausted
+                ));
+        }
+        Ok(execution)
     }
 
     /// Executes at most one deterministic slice and returns its scheduler lease.
@@ -34,6 +37,9 @@ impl RuntimeCoordinator {
     ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
         if let Some(lease) = self.scheduler.active_leases().next() {
             return Err(CoordinatorError::InFlightLease(lease));
+        }
+        if let Some(execution) = self.completed_executions.pop_front() {
+            return Ok(Some(execution));
         }
         self.wake_due_deadlines()?;
         let replay_dispatch = self.replay_dispatches.front().copied();
@@ -64,22 +70,26 @@ impl RuntimeCoordinator {
         self.receive_worker(lease).map(Some)
     }
 
-    /// Dispatches one bounded wave across every currently idle emulated vCPU.
-    /// The method is available only in explicitly selected parallel mode and
-    /// does not return until every dispatched lease has been reconciled.
-    pub fn run_parallel_wave(
+    /// Dispatches idle cores and returns the first completed slice. Other
+    /// leases remain in flight and are reconciled by subsequent calls.
+    pub fn run_parallel(
         &mut self,
         instruction_budget: u64,
-    ) -> Result<Vec<CoordinatorExecution>, CoordinatorError> {
+    ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
+        self.run_parallel_with_budget(Some(instruction_budget))
+    }
+
+    fn run_parallel_with_budget(
+        &mut self,
+        instruction_budget: Option<u64>,
+    ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
         if self.execution_mode != VcpuExecutionMode::Parallel {
             return Err(CoordinatorError::ParallelModeRequired);
         }
-        if let Some(lease) = self.scheduler.active_leases().next() {
-            return Err(CoordinatorError::InFlightLease(lease));
+        if let Some(execution) = self.completed_executions.pop_front() {
+            return Ok(Some(execution));
         }
         self.wake_due_deadlines()?;
-        let mut dispatched = Vec::new();
-        let mut first_error = None;
         loop {
             let idle: Vec<_> = self.scheduler.idle_vcpus().collect();
             for vcpu in idle {
@@ -88,34 +98,59 @@ impl RuntimeCoordinator {
                 else {
                     unreachable!("select commands always produce a selected decision")
                 };
-                let Some(lease) = lease else {
-                    continue;
-                };
-                match self.dispatch_worker(lease, instruction_budget) {
-                    Ok(()) => dispatched.push(lease),
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
+                if let Some(lease) = lease {
+                    let budget =
+                        instruction_budget.unwrap_or_else(|| self.parallel_budgets[&vcpu].current);
+                    self.dispatch_worker(lease, budget)?;
                 }
             }
-            if !dispatched.is_empty()
-                || first_error.is_some()
-                || !self.fast_forward_to_next_deadline()?
-            {
+            if self.scheduler.active_leases().next().is_some() {
                 break;
             }
+            if !self.fast_forward_to_next_deadline()? {
+                return Ok(None);
+            }
         }
+        let result = self
+            .workers
+            .receive_any()
+            .map_err(CoordinatorError::Worker)?;
+        let lease = self
+            .scheduler
+            .active_leases()
+            .find(|lease| lease.vcpu == result.lease.vcpu)
+            .ok_or(CoordinatorError::InFlightLease(result.lease))?;
+        self.complete_worker(lease, result).map(Some)
+    }
 
-        let mut executions = Vec::with_capacity(dispatched.len());
-        for lease in dispatched {
+    /// Returns every CPU state to the coordinator before state transfer,
+    /// process termination or teardown. Preemption is requested before waiting.
+    pub fn quiesce(&mut self) -> Result<(), CoordinatorError> {
+        let leases: Vec<_> = self.scheduler.active_leases().collect();
+        for process in leases
+            .iter()
+            .map(|lease| lease.process)
+            .collect::<BTreeSet<_>>()
+        {
+            self.processes
+                .get_mut(&process)
+                .unwrap()
+                .request_safepoint();
+        }
+        let mut first_error = None;
+        for lease in leases {
             match self.receive_worker(lease) {
-                Ok(execution) => executions.push(execution),
+                Ok(execution) => self.completed_executions.push_back(execution),
+                Err(CoordinatorError::Execution {
+                    error: ProcessExecutionError::ConcurrentProcessStop { .. },
+                    ..
+                }) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
             }
         }
-        first_error.map_or(Ok(executions), Err)
+        first_error.map_or(Ok(()), Err)
     }
 
     fn select_with_deadline(
@@ -189,7 +224,7 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
-    fn receive_worker(
+    pub(super) fn receive_worker(
         &mut self,
         expected: Lease,
     ) -> Result<CoordinatorExecution, CoordinatorError> {
@@ -204,6 +239,14 @@ impl RuntimeCoordinator {
                 return Err(CoordinatorError::Worker(failure));
             }
         };
+        self.complete_worker(expected, worker_result)
+    }
+
+    fn complete_worker(
+        &mut self,
+        expected: Lease,
+        worker_result: worker::WorkerResult,
+    ) -> Result<CoordinatorExecution, CoordinatorError> {
         if worker_result.lease != expected {
             self.processes
                 .get_mut(&expected.process)
@@ -243,6 +286,7 @@ impl RuntimeCoordinator {
             );
         let completion = match &result {
             Ok(report) => self.completion_for_stop(expected, &report.stop)?,
+            Err(ProcessExecutionError::ConcurrentProcessStop { .. }) => Completion::Ready,
             Err(_) => Completion::Faulted,
         };
         if let Ok(report) = &result {

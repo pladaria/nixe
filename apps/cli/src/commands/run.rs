@@ -588,7 +588,13 @@ fn execute_worker(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
     );
-    // No scheduler lease survives execute(). Stop and join GPU work while its
+    if let Err(error) = coordinator.quiesce() {
+        execution = Err(match execution {
+            Ok(_) => error.to_string(),
+            Err(original) => format!("{original}; cannot quiesce CPU workers: {error}"),
+        });
+    }
+    // Stop and join GPU work while its
     // canonical memory transitions can still use the JIT coordinator. Removing
     // the process closes native admission and would reject those transitions.
     let graphics_teardown = video_system.teardown();
@@ -770,11 +776,13 @@ fn execute(
                 .map_err(|error| format!("cannot publish Horizon touch-screen state: {error}"))?;
             last_input_sample = Some(sample.captured_at);
         }
-        let executions = match coordinator.execution_mode() {
+        let executions: Vec<_> = match coordinator.execution_mode() {
             VcpuExecutionMode::Deterministic => coordinator
                 .run_next_adaptive()
                 .map(|execution| execution.into_iter().collect()),
-            VcpuExecutionMode::Parallel => coordinator.run_parallel_wave_adaptive(),
+            VcpuExecutionMode::Parallel => coordinator
+                .run_parallel_adaptive()
+                .map(|execution| execution.into_iter().collect()),
         }
         .map_err(|error| error.to_string())?;
         if executions.is_empty() {

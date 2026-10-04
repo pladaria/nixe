@@ -182,6 +182,66 @@ fn truncating_fp_to_integer_matches_widths_boundaries_modes_and_traps() {
     }
 }
 
+#[test]
+fn fixed_point_truncation_matches_exact_results_status_and_traps() {
+    for source_64 in [false, true] {
+        let encode = |value: f64| {
+            if source_64 {
+                value.to_bits()
+            } else {
+                u64::from((value as f32).to_bits())
+            }
+        };
+        let sign = if source_64 { 1 << 63 } else { 1 << 31 };
+        for destination_64 in [false, true] {
+            let integer_bits = if destination_64 { 64 } else { 32 };
+            for signed in [false, true] {
+                for fractional_bits in [1, 14, 15, integer_bits] {
+                    let word = 0x1e18_0020
+                        | (u32::from(source_64) << 22)
+                        | (u32::from(destination_64) << 31)
+                        | (u32::from(!signed) << 16)
+                        | ((64 - fractional_bits) << 10);
+                    let limit = encode(
+                        2.0f64
+                            .powi(integer_bits as i32 - i32::from(signed) - fractional_bits as i32),
+                    );
+                    for bits in [
+                        0,
+                        sign,
+                        encode(0.125),
+                        encode(-0.125),
+                        encode(0.100001),
+                        encode(-0.100001),
+                        1,
+                        limit - 1,
+                        limit,
+                        limit + 1,
+                        sign | (limit - 1),
+                        sign | limit,
+                        sign | (limit + 1),
+                        encode(f64::INFINITY),
+                        encode(f64::NEG_INFINITY),
+                        encode(f64::NAN),
+                        encode(f64::INFINITY) | 1,
+                    ] {
+                        for fpcr in [0, 1 << 24, 3 << 22, 1 << 8, 1 << 12, (1 << 24) | (1 << 15)] {
+                            check(word, bits, fpcr);
+                        }
+                    }
+                    for bits in [0, sign, limit - 1] {
+                        assert_eq!(check(word, bits, 0), EdgeKind::Breakpoint(0));
+                        assert_eq!(check(word | 31, bits, 0), EdgeKind::Breakpoint(0));
+                    }
+                    if signed {
+                        assert_eq!(check(word, sign | limit, 0), EdgeKind::Breakpoint(0));
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Compare the shared exact provider with actual Arm instructions as well, so
 // agreement between two users of that provider is not our only oracle.
 #[cfg(target_arch = "aarch64")]

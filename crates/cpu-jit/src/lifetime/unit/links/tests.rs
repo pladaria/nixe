@@ -619,7 +619,11 @@ pub(in crate::lifetime) fn source(
 }
 
 pub(in crate::lifetime) fn source_input(process: &Lifetime, pc: u64, target: u64) -> Input {
-    let mut input = input(process, &[pc], Tier::Lcq);
+    source_input_for_tier(process, pc, target, Tier::Lcq)
+}
+
+pub(super) fn source_input_for_tier(process: &Lifetime, pc: u64, target: u64, tier: Tier) -> Input {
+    let mut input = input(process, &[pc], tier);
     let abi = input.code.metadata.abi;
     let width = if abi == HostAbi::X86_64 { 8 } else { 4 };
     // Real aligned patch at +8, initially reaching a source-local return-42
@@ -669,7 +673,7 @@ pub(in crate::lifetime) fn source_input(process: &Lifetime, pc: u64, target: u64
                     relocations: Box::new([]),
                 },
             },
-            Tier::Lcq,
+            tier,
             1,
             |_| None,
         )

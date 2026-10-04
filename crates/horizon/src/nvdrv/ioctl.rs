@@ -50,4 +50,5 @@ pub(crate) struct NvDrvIoctlResponse {
 pub(crate) enum NvDrvIoctlOutcome {
     Complete(NvDrvIoctlResponse),
     PendingSyncpointWait(PendingNvHostCtrlWait),
+    PendingSubmission(super::PendingGpuSubmission),
 }

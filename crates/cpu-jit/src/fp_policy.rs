@@ -31,8 +31,7 @@ impl FpLoweringDisposition {
 /// `GuardedNative` admits only inputs whose result and host exception flags
 /// match Arm, then uses the lazy host accumulator. `GuardedExact` has a direct
 /// result-only domain but sends exceptional values to the typed edge. `Exact`
-/// is used when stock CLIF cannot express the complete operation: fixed and
-/// directional conversions, conditional comparison, all x86 FRINT forms
+/// is used when stock CLIF cannot express the complete operation: directional conversions, all x86 FRINT forms
 /// (whose lowering can leak MXCSR.PE), and Arm FRINTA/X/I forms not represented
 /// by the selected CLIF operation. No runtime policy object repeats this table.
 /// Every normalized variant is named so extending the decoder requires a
@@ -74,15 +73,16 @@ pub(crate) fn fp_lowering_for_host(
             FpLoweringDisposition::GuardedNative
         }
         Instruction::FloatToSignedInt(_) | Instruction::FloatToUnsignedInt(_)
-            if fields.fixed_point_fraction_bits.is_none()
-                && matches!(
-                    fields.float_to_integer_rounding,
-                    Some(FloatToIntegerRounding::TowardZero)
-                ) =>
+            if matches!(
+                fields.float_to_integer_rounding,
+                Some(FloatToIntegerRounding::TowardZero)
+            ) =>
         {
             FpLoweringDisposition::GuardedNative
         }
-        Instruction::ScalarVectorFloatToSignedInt(_)
+        Instruction::VectorFloatToSignedInt(_)
+        | Instruction::VectorFloatToUnsignedInt(_)
+        | Instruction::ScalarVectorFloatToSignedInt(_)
         | Instruction::ScalarVectorFloatToUnsignedInt(_)
         | Instruction::VectorSignedIntToFloat(_)
         | Instruction::VectorUnsignedIntToFloat(_)
@@ -105,7 +105,8 @@ pub(crate) fn fp_lowering_for_host(
         Instruction::ScalarFloatMaxNumber(_)
         | Instruction::ScalarFloatMinNumber(_)
         | Instruction::CompareRegister(_)
-        | Instruction::CompareZero(_) => FpLoweringDisposition::GuardedExact,
+        | Instruction::CompareZero(_)
+        | Instruction::ConditionalCompare(_) => FpLoweringDisposition::GuardedExact,
         Instruction::ScalarFloatRound(_)
             if host == crate::abi::HostAbi::Aarch64
                 && !matches!(
@@ -121,7 +122,6 @@ pub(crate) fn fp_lowering_for_host(
         }
         Instruction::FloatToSignedInt(_)
         | Instruction::FloatToUnsignedInt(_)
-        | Instruction::ConditionalCompare(_)
         | Instruction::ScalarFloatRound(_) => FpLoweringDisposition::Exact,
         Instruction::DuplicateGeneral(_)
         | Instruction::DuplicateElement(_)
@@ -164,6 +164,7 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::VectorUnsignedShiftRegister(_)
         | Instruction::CountBits(_)
         | Instruction::Reverse64(_)
+        | Instruction::Reverse32(_)
         | Instruction::AddAcrossVector(_)
         | Instruction::UnsignedAddLongAcrossVector(_)
         | Instruction::ExtractNarrow(_)

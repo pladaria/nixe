@@ -39,7 +39,6 @@ fn native_fp_comparisons_and_exact_edges_match_interpreter() {
                         first,
                         second,
                         0,
-                        false,
                     );
                 }
             }
@@ -51,13 +50,12 @@ fn native_fp_comparisons_and_exact_edges_match_interpreter() {
                 first,
                 0,
                 1 << 24,
-                false,
             );
         }
     }
 }
 
-fn check(words: &[u32], first: u64, second: u64, fpcr: u32, conditional: bool) {
+fn check(words: &[u32], first: u64, second: u64, fpcr: u32) -> EdgeKind {
     let memory = memory(words);
     let mut actual = A64State::default();
     actual.set_pc(PC);
@@ -70,11 +68,7 @@ fn check(words: &[u32], first: u64, second: u64, fpcr: u32, conditional: bool) {
     execute_one(&TargetPlatform::Switch1, &mut expected, words[0]).unwrap();
     let before_compare = expected.clone();
     let reference = execute_one(&TargetPlatform::Switch1, &mut expected, words[1]).unwrap();
-    let (_, exit) = execute_memory(
-        &memory,
-        if conditional { 2 } else { words.len() },
-        &mut actual,
-    );
+    let (_, exit) = execute_memory(&memory, words.len(), &mut actual);
     if let EdgeKind::FpCompare(operation) = exit.kind {
         assert_eq!(exit.pc.get(), PC + 4);
         assert_eq!(actual, before_compare);
@@ -97,7 +91,7 @@ fn check(words: &[u32], first: u64, second: u64, fpcr: u32, conditional: bool) {
                 ));
                 assert_eq!(actual, before_compare);
                 assert_eq!(actual, expected);
-                return;
+                return exit.kind;
             }
             Err(error) => panic!("{error:?}"),
         }
@@ -111,6 +105,7 @@ fn check(words: &[u32], first: u64, second: u64, fpcr: u32, conditional: bool) {
         "{:08x?}: {first:x}, {second:x}, FPCR {fpcr:x}",
         words
     );
+    exit.kind
 }
 
 #[test]
@@ -122,7 +117,6 @@ fn exact_comparison_traps_preserve_prestate_and_conditional_false_does_not_trap(
                 first,
                 0,
                 fpcr,
-                false,
             );
         }
     }
@@ -137,7 +131,6 @@ fn exact_comparison_traps_preserve_prestate_and_conditional_false_does_not_trap(
                     0x7ff0_0000_0000_0001,
                     0,
                     fpcr,
-                    true,
                 );
             }
         }
@@ -209,4 +202,71 @@ fn comparison_final_maps_retain_prestate_and_normal_path_has_no_helper() {
     state.set_vector(2, u128::from(2.0f64.to_bits()));
     let (_, exit) = execute(&words, &mut state);
     assert_eq!(exit.kind, EdgeKind::Breakpoint(0));
+}
+
+#[test]
+fn conditional_fp_comparison_keeps_lazy_flags_and_never_observes_false_inputs() {
+    use nixe_cpu::semantics::conditions::evaluate_a64;
+    for wide in [false, true] {
+        for condition in 0..16 {
+            for nzcv in 0..16 {
+                for signaling in [false, true] {
+                    let first = if wide {
+                        1.5f64.to_bits()
+                    } else {
+                        u64::from(1.5f32.to_bits())
+                    };
+                    let snan = if wide {
+                        0x7ff0_0000_0000_0001
+                    } else {
+                        0x7f80_0001
+                    };
+                    let compare = 0x1e22_042a
+                        | (u32::from(wide) << 22)
+                        | (condition << 12)
+                        | (u32::from(signaling) << 4);
+                    for input in [first, snan] {
+                        let words = [compare, 0xd420_0000];
+                        let memory = memory(&words);
+                        let mut actual = A64State::default();
+                        actual.set_pc(PC);
+                        actual.set_nzcv(nixe_cpu::state::a64::Nzcv::from_bits(nzcv << 28));
+                        actual.set_fpcr(1 << 8);
+                        actual.set_fpsr(1 << 27);
+                        actual.set_vector(1, u128::from(input));
+                        actual.set_vector(2, 0);
+                        let mut expected = actual.clone();
+                        let reference =
+                            execute_one(&TargetPlatform::Switch1, &mut expected, compare).unwrap();
+                        let (_, exit) = execute_memory(&memory, words.len(), &mut actual);
+                        if input == first
+                            || !evaluate_a64(
+                                nixe_cpu::semantics::conditions::Condition::from_encoding(
+                                    condition as u8,
+                                ),
+                                nzcv << 28,
+                            )
+                        {
+                            assert_eq!(
+                                exit.kind,
+                                EdgeKind::Breakpoint(0),
+                                "condition={condition} NZCV={nzcv:x}"
+                            );
+                            assert_eq!(reference, InstructionStep::Continue);
+                            assert_eq!(actual, expected);
+                        } else {
+                            let EdgeKind::FpCompare(operation) = exit.kind else {
+                                panic!("{exit:?}")
+                            };
+                            assert!(matches!(
+                                complete_compare(operation, &mut actual),
+                                Err(CompletionError::Trap(_))
+                            ));
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

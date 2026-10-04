@@ -57,11 +57,13 @@ impl Lifetime {
         let mut state = self.lock();
         let sequence = self.request_locked(&mut state, Reason::MappingChange)?;
         let units = &mut state.units;
+        let mut targeted_units = false;
         for change in changes {
             match *change {
                 MemoryInvalidationKind::ExecutableContent { first, second } => {
                     for page in [Some(first), second].into_iter().flatten() {
                         for dependency in units.dependencies.for_page(page) {
+                            targeted_units = true;
                             units
                                 .records
                                 .get_mut(dependency.unit.0)
@@ -86,11 +88,12 @@ impl Lifetime {
                         continue;
                     }
                     for (handle, record) in units.records.iter_mut() {
-                        if record.code.instructions.iter().any(|instruction| {
-                            let key = instruction.key.block_key();
-                            let pc = u128::from(key.pc.get());
-                            key.address_space == address_space && pc < end && start < pc + 4
-                        }) {
+                        if record
+                            .code
+                            .instructions
+                            .overlaps_mapping(address_space, start, end)
+                        {
+                            targeted_units = true;
                             record.invalidate(
                                 handle,
                                 &mut units.retirements,
@@ -103,6 +106,7 @@ impl Lifetime {
                 MemoryInvalidationKind::InstructionCache { address_space } => {
                     for (handle, record) in units.records.iter_mut() {
                         if record.code.entries[0].key.address_space == address_space {
+                            targeted_units = true;
                             record.invalidate(
                                 handle,
                                 &mut units.retirements,
@@ -120,28 +124,34 @@ impl Lifetime {
         // Both owners already carry their exact generational registry handles.
         // Resolve each in O(1), not a full unit scan for every pinned baseline
         // under the JIT mutex. Family pins keep those records resident.
-        for family in units.families.values() {
-            for baseline in &family.baselines {
-                let baseline_handle = baseline.registered_handle().ok_or(Error::StaleUnit)?;
-                let baseline_record = units
-                    .records
-                    .get(baseline_handle.0)
-                    .ok_or(Error::StaleUnit)?;
-                if baseline_record.invalidation.is_none() {
-                    continue;
+        // GPU visibility transitions also report physical data pages. An
+        // empty target lookup still closes admission, but cannot newly invalidate
+        // a pinned baseline. Previous batches propagated their baseline targets
+        // under this same lock, so no family scan is needed for unrelated pages.
+        if targeted_units {
+            for family in units.families.values() {
+                for baseline in &family.baselines {
+                    let baseline_handle = baseline.registered_handle().ok_or(Error::StaleUnit)?;
+                    let baseline_record = units
+                        .records
+                        .get(baseline_handle.0)
+                        .ok_or(Error::StaleUnit)?;
+                    if baseline_record.invalidation.is_none() {
+                        continue;
+                    }
+                    let handle = family.unit.registered_handle().ok_or(Error::StaleUnit)?;
+                    units
+                        .records
+                        .get_mut(handle.0)
+                        .ok_or(Error::StaleUnit)?
+                        .invalidate(
+                            handle.0,
+                            &mut units.retirements,
+                            &mut units.negatives,
+                            sequence,
+                        );
+                    break;
                 }
-                let handle = family.unit.registered_handle().ok_or(Error::StaleUnit)?;
-                units
-                    .records
-                    .get_mut(handle.0)
-                    .ok_or(Error::StaleUnit)?
-                    .invalidate(
-                        handle.0,
-                        &mut units.retirements,
-                        &mut units.negatives,
-                        sequence,
-                    );
-                break;
             }
         }
         let removed = state.units.negatives.take_removed();

@@ -147,14 +147,26 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
             let response = match response {
                 NvDrvIoctlOutcome::Complete(response) => response,
+                NvDrvIoctlOutcome::PendingSubmission(wait) => {
+                    return Err(IpcWireError::PendingGpuSubmission(wait));
+                }
                 NvDrvIoctlOutcome::PendingSyncpointWait(wait) => {
                     return Err(IpcWireError::PendingNvDrv(wait));
                 }
             };
             if response.driver_result != crate::nvdrv::NV_SUCCESS {
+                // A driver status is guest-visible ABI, not an unsupported
+                // emulator operation. In particular, asynchronous syncpoint
+                // waits return Timeout while arming their completion event.
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/fence.c
                 log::debug!(
-                    "nvdrv ioctl returned an error: fd={fd:#010x} request={ioctl:#010x} result={:#x} input-size={} input-prefix={:02x?}",
+                    "nvdrv ioctl returned a non-success driver status: fd={fd:#010x} request={ioctl:#010x} result={:#x}{} input-size={} input-prefix={:02x?}",
                     response.driver_result,
+                    if response.driver_result == crate::nvdrv::NV_TIMEOUT {
+                        " (Timeout)"
+                    } else {
+                        ""
+                    },
                     input.len(),
                     &input[..input.len().min(64)],
                 );

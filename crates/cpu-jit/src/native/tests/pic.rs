@@ -4,6 +4,31 @@ use nixe_cpu::{platform::TargetPlatform, profile::CpuProfileId, state::a64::Nzcv
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 #[test]
+fn aarch64_pic_selector_covers_the_full_table() {
+    let (source, _) = canonical::complete(HostAbi::Aarch64);
+    let target = BlockKey {
+        address_space: AddressSpaceId::new(1),
+        pc: GuestVirtualAddress::new(0xfffc),
+        profile: CpuProfileId::new(1),
+        platform: TargetPlatform::Switch1,
+        fp: FpSpecialization::Dynamic,
+    };
+    assert!(set_index(source.site, target) >= 2048);
+    let code = probe::emit(
+        &source,
+        target,
+        ValueLocation::constant(target.pc.get().into()),
+    )
+    .unwrap();
+    // Architectural encoding of UBFX x16,x16,#0,#14 (UBFM immr=0,
+    // imms=13), independently assembled for the current 16,384 sets.
+    assert!(
+        code.chunks_exact(4)
+            .any(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == 0xd3403610)
+    );
+}
+
+#[test]
 fn native_pic_rejects_targets_in_reserved_registers_or_transfer_storage() {
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         let (source, _) = canonical::complete(abi);

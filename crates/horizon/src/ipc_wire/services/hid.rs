@@ -7,6 +7,7 @@ enum HidCommand {
     StartSixAxisSensor,
     StopSixAxisSensor,
     SetSupportedNpadStyleSet,
+    GetSupportedNpadStyleSet,
     SetSupportedNpadIdType,
     ActivateNpad,
     AcquireNpadStyleSetUpdateEventHandle,
@@ -25,6 +26,7 @@ impl HidCommand {
             66 => Some(Self::StartSixAxisSensor),
             67 => Some(Self::StopSixAxisSensor),
             100 => Some(Self::SetSupportedNpadStyleSet),
+            101 => Some(Self::GetSupportedNpadStyleSet),
             102 => Some(Self::SetSupportedNpadIdType),
             103 => Some(Self::ActivateNpad),
             106 => Some(Self::AcquireNpadStyleSetUpdateEventHandle),
@@ -162,6 +164,25 @@ pub(in crate::ipc_wire) fn dispatch_hid(
             let style_set = request_u32(request.data, 0).expect("validated HID style payload");
             hid_system.set_supported_npad_style_set(style_set);
             semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        // Get carries the ARUID and caller PID and returns the configured
+        // u32 style mask, independently of currently connected controllers.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
+        HidCommand::GetSupportedNpadStyleSet => {
+            if hipc.pid.is_none()
+                || request_u64(request.data, 0).is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            semantic_success(
+                request.token,
+                false,
+                &hid_system.supported_npad_style_set().to_le_bytes(),
+                &[],
+                &[],
+                None,
+            )
         }
         HidCommand::SetSupportedNpadIdType => {
             if hipc.pid.is_none() || request.data.len() < 8 {

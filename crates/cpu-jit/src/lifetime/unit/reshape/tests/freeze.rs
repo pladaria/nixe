@@ -13,15 +13,6 @@ fn entries(frozen: &Frozen<'_, '_>) -> Vec<u64> {
         .collect()
 }
 
-fn fallbacks(frozen: &Frozen<'_, '_>) -> Vec<u64> {
-    frozen
-        .replacement()
-        .fallbacks
-        .iter()
-        .map(|entry| entry.key.pc.get())
-        .collect()
-}
-
 #[test]
 fn reshape_freeze_exports_root_and_required_target_without_exporting_coverage() {
     for owners in 0..=2 {
@@ -183,75 +174,6 @@ fn reshape_freeze_does_not_change_entries_for_a_later_pic_root() {
     frozen.check().unwrap();
     assert_eq!(entries(&frozen), [0, 16]);
     // The newly observed PIC root stays on LCQ: labels are frozen before analysis.
-    assert!(fallbacks(&frozen).is_empty());
-}
-
-#[test]
-fn reshape_freeze_captures_covered_and_dropped_predecessor_entries() {
-    let process = process();
-    publish_words(&process, 0, &[0x14000004]);
-    publish_words(&process, 16, &[NOP, RET]);
-    publish_words(&process, 20, &[RET]);
-    let outside = publish_words(&process, 32, &[RET]);
-    let old = owned_entries(
-        &process,
-        &[(0, 0x14000004), (16, NOP), (20, RET), (32, RET)],
-        4,
-    );
-    let work = reshape(&process, 0, 0, 16);
-    let frozen = work
-        .reserve_candidate(Graph::discover(&work).unwrap())
-        .unwrap()
-        .freeze()
-        .unwrap();
-    assert_eq!(entries(&frozen), [0, 16, 20]);
-    assert_eq!(fallbacks(&frozen), [32]);
-    assert!(frozen.graph().contains(instruction(20)));
-    assert!(!frozen.graph().contains(instruction(32)));
-    let replacement = frozen.replacement();
-    assert_eq!(replacement.predecessors.iter().flatten().count(), 1);
-    for (fallback, baseline) in replacement.fallbacks.iter().zip([outside]) {
-        assert_eq!(fallback.previous.unit, old);
-        assert_eq!(fallback.baseline.registered_handle(), Some(baseline));
-        let state = process.lock();
-        let payload = state.dispatch.get(fallback.slot).unwrap().snapshot();
-        // Freeze has not changed any live entry or active membership.
-        assert!(payload.hcq().is_some());
-        assert_eq!(payload.lcq().unwrap().unit, fallback.baseline.id);
-    }
-    assert!(!frozen.unchanged());
-    frozen.analyze().unwrap();
-}
-
-#[test]
-fn reshape_freeze_merges_two_families_and_captures_both_fallback_sets() {
-    let process = process();
-    publish_words(&process, 0, &[0x14000004]);
-    for pc in [8, 16, 24] {
-        publish_words(&process, pc, &[RET]);
-    }
-    let first = owned_entries(&process, &[(0, 0x14000004), (8, RET)], 2);
-    let second = owned_entries(&process, &[(16, RET), (24, RET)], 2);
-    let work = reshape(&process, 0, 0, 16);
-    let frozen = work
-        .reserve_candidate(Graph::discover(&work).unwrap())
-        .unwrap()
-        .freeze()
-        .unwrap();
-    assert_eq!(entries(&frozen), [0, 16]);
-    assert_eq!(fallbacks(&frozen), [8, 24]);
-    assert_eq!(
-        frozen
-            .replacement()
-            .predecessors
-            .iter()
-            .flatten()
-            .map(|p| p.registered_handle().unwrap())
-            .collect::<Vec<_>>(),
-        [first, second]
-    );
-    assert!(!frozen.unchanged());
-    frozen.analyze().unwrap();
 }
 
 #[test]
@@ -268,7 +190,6 @@ fn reshape_freeze_identifies_unchanged_sets_independent_of_root_order() {
             .freeze()
             .unwrap();
         assert_eq!(entries(&frozen), [0, 16]);
-        assert!(fallbacks(&frozen).is_empty());
         assert!(frozen.unchanged());
         frozen.validate_unchanged_locked(&process.lock()).unwrap();
         assert!(matches!(frozen.analyze(), Err(CompileError::Deferred)));
@@ -387,101 +308,19 @@ fn no_op_evidence_detects_new_demand_and_root_at_a_previously_uncaptured_interio
 }
 
 #[test]
-fn reshape_freeze_does_not_confuse_equal_sizes_with_equal_membership() {
+fn reshape_discovery_rejects_equal_size_replacement_that_loses_membership() {
+    use crate::hcq::{DiscoveryError, StructuralReason};
     let process = process();
-    publish_words(&process, 0, &[0x14000004]); // B 16.
-    publish_words(&process, 16, &[0x14000008]); // B 48.
+    publish_words(&process, 0, &[0x14000004]);
+    publish_words(&process, 16, &[0x14000008]);
     publish_words(&process, 32, &[RET]);
     publish_words(&process, 48, &[RET]);
     owned_entries(&process, &[(0, 0x14000004), (16, 0x14000008), (32, RET)], 2);
     let work = reshape(&process, 0, 0, 16);
-    let frozen = work
-        .reserve_candidate(Graph::discover(&work).unwrap())
-        .unwrap()
-        .freeze()
-        .unwrap();
-    assert_eq!(entries(&frozen), [0, 16]);
-    assert!(fallbacks(&frozen).is_empty());
-    assert_eq!(frozen.graph().instructions.len(), 3);
-    assert!(!frozen.unchanged());
-    frozen.analyze().unwrap();
-}
-
-#[test]
-fn reshape_freeze_revalidates_fallbacks_outside_the_candidate() {
-    let process = process();
-    publish_words(&process, 0, &[0x14000004]);
-    publish_words(&process, 16, &[RET]);
-    publish_words(&process, 32, &[RET]);
-    owned_entries(&process, &[(0, 0x14000004), (16, RET), (32, RET)], 3);
-    let work = reshape(&process, 0, 0, 16);
-    let frozen = work
-        .reserve_candidate(Graph::discover(&work).unwrap())
-        .unwrap()
-        .freeze()
-        .unwrap();
-    assert_eq!(fallbacks(&frozen), [32]);
-    // Isolate the fallback guard from endpoint/participant cancellation: make
-    // only the saved LCQ owner unavailable while leaving the family untouched.
-    let slot = frozen.replacement().fallbacks[0].slot;
-    let owner = process.lock().dispatch.get_mut(slot).unwrap().owners[0].take();
-    work.check().unwrap();
-    assert_eq!(frozen.check(), Err(Error::StalePublication));
-    assert!(matches!(frozen.analyze(), Err(CompileError::Cancelled)));
-    process.lock().dispatch.get_mut(slot).unwrap().owners[0] = owner;
-    frozen.check().unwrap();
-    let baseline = frozen.replacement().fallbacks[0]
-        .baseline
-        .registered_handle()
-        .unwrap();
-    process
-        .lock()
-        .units
-        .records
-        .get_mut(baseline.0)
-        .unwrap()
-        .lifecycle = Lifecycle::Invalidating;
-    work.check().unwrap();
-    assert_eq!(frozen.check(), Err(Error::StalePublication));
-    process
-        .lock()
-        .units
-        .records
-        .get_mut(baseline.0)
-        .unwrap()
-        .lifecycle = Lifecycle::Published;
-    frozen.check().unwrap();
-}
-
-#[test]
-fn reshape_freeze_rejects_partial_fallback_capture_and_releases_claims() {
-    let process = process();
-    publish_words(&process, 0, &[0x14000004]);
-    for pc in [16, 32, 48] {
-        publish_words(&process, pc, &[RET]);
-    }
-    owned_entries(
-        &process,
-        &[(0, 0x14000004), (16, RET), (32, RET), (48, RET)],
-        4,
-    );
-    let work = reshape(&process, 0, 0, 16);
-    let candidate = work
-        .reserve_candidate(Graph::discover(&work).unwrap())
-        .unwrap();
-    let slot = *process.lock().keys.get(&key(48)).unwrap();
-    let owner = process.lock().dispatch.get_mut(slot).unwrap().owners[0].take();
-    // Capture retains 32 first, then fails at 48. Snapshot/claim destruction
-    // must happen outside the state guard and leave this job reusable.
-    assert!(matches!(candidate.freeze(), Err(CompileError::Cancelled)));
-    process.lock().dispatch.get_mut(slot).unwrap().owners[0] = owner;
-    let frozen = work
-        .reserve_candidate(Graph::discover(&work).unwrap())
-        .unwrap()
-        .freeze()
-        .unwrap();
-    assert_eq!(fallbacks(&frozen), [32, 48]);
-    frozen.check().unwrap();
+    let Err(DiscoveryError::Structural(rejected)) = Graph::discover(&work) else {
+        panic!("membership loss must be rejected");
+    };
+    assert_eq!(rejected.reason(), StructuralReason::PartitionLoss);
 }
 
 #[test]
@@ -499,7 +338,6 @@ fn reshape_freeze_preserves_public_entries_without_recompiling_unchanged_body() 
         .unwrap();
     assert_eq!(frozen.graph().instructions.len(), 3);
     assert_eq!(entries(&frozen), [0, 16, 20]);
-    assert!(fallbacks(&frozen).is_empty());
     assert!(frozen.unchanged());
     assert!(matches!(frozen.analyze(), Err(CompileError::Deferred)));
 }

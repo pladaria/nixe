@@ -90,7 +90,9 @@ impl<'w, 'p> Frozen<'w, 'p> {
             .discovery
             .as_ref()
             .ok_or(Error::StalePublication)?;
-        let mut owners = Vec::with_capacity(evidence.owner_capacity() + 2);
+        let mut owners =
+            Vec::with_capacity(evidence.owner_capacity() + evidence.selection_capacity() + 2);
+        evidence.append_missing(&mut owners);
         {
             let state = work.process.lock();
             self.validate_unchanged_locked(&state)?;

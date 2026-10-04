@@ -9,7 +9,11 @@ use std::sync::Arc;
 
 pub(crate) mod probe;
 
-pub(crate) const SETS: usize = 2048;
+// Large managed runtimes revisit more indirect source/target pairs than a
+// 4,096-way table can retain. 32,768 ways avoid repeated bridge emission while
+// preserving the two-way, constant-cost native probe. All private tables,
+// weak shards and executable owners remain charged to the existing budget.
+pub(crate) const SETS: usize = 16_384;
 pub(crate) const WAYS: usize = SETS * 2;
 
 /// Explicit scalar encoding: generated code must not depend on Rust enum or
@@ -137,7 +141,7 @@ mod tests {
         assert_eq!(offset_of!(Record, profile), 32);
         assert_eq!(offset_of!(Record, fp), 40);
         assert_eq!(offset_of!(Record, address), 48);
-        assert_eq!(Table::BYTES, 32768 + 16);
+        assert_eq!(Table::BYTES, 262_144 + 16);
         let table = Table::new();
         for slot in 0..WAYS {
             assert!(unsafe { (*table.as_ptr().add(slot)).is_null() });
@@ -162,7 +166,7 @@ mod tests {
         }
         for other in [
             BlockKey {
-                pc: GuestVirtualAddress::new(0x3000),
+                pc: GuestVirtualAddress::new(target.pc.get() + 4 * SETS as u64),
                 ..target
             },
             BlockKey {

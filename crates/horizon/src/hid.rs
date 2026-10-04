@@ -201,6 +201,13 @@ impl HidSystem {
             .supported_style_set = style_set;
     }
 
+    pub(crate) fn supported_npad_style_set(&self) -> u32 {
+        self.configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .supported_style_set
+    }
+
     pub(crate) fn set_supported_npad_ids(&self, ids: impl IntoIterator<Item = u32>) -> bool {
         let ids = ids.into_iter().collect::<BTreeSet<_>>();
         if ids.iter().any(|id| !matches!(*id, 0..=7 | 0x10 | 0x20)) {

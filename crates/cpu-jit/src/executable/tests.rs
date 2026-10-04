@@ -537,7 +537,7 @@ fn best_fit_then_lowest_address_and_coalescing_match_policy() {
     assert_eq!(
         (
             state.segments[0].bump,
-            state.segments[0].free_len,
+            state.segments[0].free.len(),
             state.segments[0].live
         ),
         (0, 0, 0)
@@ -955,7 +955,7 @@ fn span_churn_never_overlaps_live_allocations_and_returns_to_empty() {
         state
             .segments
             .iter()
-            .all(|segment| segment.live == 0 && segment.bump == 0 && segment.free_len == 0)
+            .all(|segment| segment.live == 0 && segment.bump == 0 && segment.free.len() == 0)
     );
 }
 
@@ -1000,4 +1000,48 @@ fn code_is_coherent_when_published_and_reused_on_another_thread() {
             acknowledged.recv().unwrap();
         }
     });
+}
+
+#[test]
+fn free_span_indexes_track_splits_coalescing_and_tail_release() {
+    let cache = Cache::new().unwrap();
+    let mut allocations = Vec::new();
+    for i in 0..256 {
+        allocations.push(
+            cache
+                .allocate_with_islands(33 + i % 31, 16, Tier::Lcq, 0)
+                .unwrap(),
+        );
+    }
+    let verify = || {
+        let state = cache.lock().unwrap();
+        for segment in &state.segments {
+            segment.free.validate();
+        }
+    };
+    verify();
+    for i in (0..allocations.len()).step_by(3).rev() {
+        drop(allocations.remove(i));
+        verify();
+    }
+    let reused = cache.allocate_with_islands(40, 16, Tier::Lcq, 0).unwrap();
+    verify();
+    drop(reused);
+    verify();
+    while let Some(allocation) = allocations.pop() {
+        drop(allocation);
+        verify();
+    }
+}
+
+#[test]
+fn aligned_append_owns_padding_without_accumulating_free_fragments() {
+    let cache = Cache::new().unwrap();
+    let allocations: Vec<_> = (0..4096)
+        .map(|_| cache.allocate_with_islands(33, 16, Tier::Lcq, 0).unwrap())
+        .collect();
+    assert!(allocations.iter().all(|allocation| allocation.len() == 33));
+    assert_eq!(cache.lock().unwrap().segments[0].free.len(), 0);
+    drop(allocations);
+    assert_eq!(cache.lock().unwrap().segments[0].bump, 0);
 }

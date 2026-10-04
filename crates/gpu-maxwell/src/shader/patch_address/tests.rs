@@ -63,7 +63,8 @@ const VERTEX: &[[u64; 3]] = &[
 const FRAGMENT: &[[u64; 3]] = &[
     [0xe003ff87cff7ff00, 0x5080000000470002, 0x0103f8000007f003],
     [0xe043ff880027ff00, 0xe043ff884027ff01, 0xe043ff888027ff02],
-    [0xe30000000007000f, 0, 0],
+    // Preserve UAM's actual padding: a trap loop and NOP after the live EXIT.
+    [0xe30000000007000f, 0xe2400fffff87000f, 0x50b0000000070f00],
 ];
 
 fn binary(control: bool, code: &[[u64; 3]]) -> MaxwellShaderBinary {

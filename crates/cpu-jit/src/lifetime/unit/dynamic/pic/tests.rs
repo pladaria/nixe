@@ -76,7 +76,12 @@ fn pic_native_view_survives_registry_growth_and_other_vcpu_backlink_writes() {
 
     let process = process();
     let cursor = AtomicU64::new(0);
-    publish(&process, &cursor, &[4, 8196, 16388], Tier::Lcq);
+    publish(
+        &process,
+        &cursor,
+        &[4, 4 + SETS as u64 * 4, 4 + SETS as u64 * 8],
+        Tier::Lcq,
+    );
     let source = source(&process, &cursor, 0, EdgeKind::Indirect);
     let mut reader = process.register().unwrap();
     let handle = install(&mut reader, &process, source, 0, 4);
@@ -114,7 +119,11 @@ fn pic_native_view_survives_registry_growth_and_other_vcpu_backlink_writes() {
         });
         start.wait();
         let mut others: Vec<_> = (0..32).map(|_| process.register().unwrap()).collect();
-        for pc in [4, 8196, 16388].into_iter().cycle().take(128) {
+        for pc in [4, 4 + SETS as u64 * 4, 4 + SETS as u64 * 8]
+            .into_iter()
+            .cycle()
+            .take(128)
+        {
             // Shared source/target lists update backlinks in our active reader;
             // those ownership writes must not touch its native-readable cells.
             install(&mut others[0], &process, source, 0, pc);
@@ -164,13 +173,22 @@ fn pic_retirement_waits_for_the_existing_invocation_epoch() {
 fn pic_target_churn_keeps_two_roots_and_a_fixed_metadata_charge() {
     let process = process();
     let cursor = AtomicU64::new(0);
-    publish(&process, &cursor, &[4, 8196, 16388], Tier::Lcq);
+    publish(
+        &process,
+        &cursor,
+        &[4, 4 + SETS as u64 * 4, 4 + SETS as u64 * 8],
+        Tier::Lcq,
+    );
     let source = source(&process, &cursor, 0, EdgeKind::Indirect);
     let mut reader = process.register().unwrap();
     install(&mut reader, &process, source, 0, 4);
-    install(&mut reader, &process, source, 0, 8196);
+    install(&mut reader, &process, source, 0, 4 + SETS as u64 * 4);
     let before = process.cache.usage().unwrap();
-    for pc in [16388, 4, 8196].into_iter().cycle().take(1000) {
+    for pc in [4 + SETS as u64 * 8, 4, 4 + SETS as u64 * 4]
+        .into_iter()
+        .cycle()
+        .take(1000)
+    {
         install(&mut reader, &process, source, 0, pc);
         assert_eq!(process.cache.usage().unwrap(), before);
         let state = process.lock();
@@ -196,7 +214,12 @@ fn pic_suspended_installation_keeps_the_invocation_epoch_and_private_table() {
     use nixe_cpu::state::a64::A64State;
     let process = process();
     let cursor = AtomicU64::new(0);
-    publish(&process, &cursor, &[4, 8196, 16388], Tier::Lcq);
+    publish(
+        &process,
+        &cursor,
+        &[4, 4 + SETS as u64 * 4, 4 + SETS as u64 * 8],
+        Tier::Lcq,
+    );
     let source = source(&process, &cursor, 0, EdgeKind::Indirect);
     let mut reader = process.register().unwrap();
     let handle = reader.handle;
@@ -222,7 +245,11 @@ fn pic_suspended_installation_keeps_the_invocation_epoch_and_private_table() {
         // No native execution occurs while this exclusive dispatcher borrow
         // installs/replaces ways. The existing epoch remains announced.
         let mut suspended = unsafe { lookup.suspend_native() };
-        for pc in [4, 8196, 16388].into_iter().cycle().take(100) {
+        for pc in [4, 4 + SETS as u64 * 4, 4 + SETS as u64 * 8]
+            .into_iter()
+            .cycle()
+            .take(100)
+        {
             let prepared = process
                 .prepare_dynamic_bridge(source, 0, key(pc))
                 .unwrap()
@@ -250,12 +277,12 @@ fn pic_suspended_installation_rejects_closure_without_cutting_the_existing_way()
     use nixe_cpu::state::a64::A64State;
     let process = process();
     let cursor = AtomicU64::new(0);
-    let target = publish(&process, &cursor, &[4, 8196], Tier::Lcq);
+    let target = publish(&process, &cursor, &[4, 4 + SETS as u64 * 4], Tier::Lcq);
     let source = source(&process, &cursor, 0, EdgeKind::Return);
     let mut reader = process.register().unwrap();
     let existing = install(&mut reader, &process, source, 0, 4);
     let prepared = process
-        .prepare_dynamic_bridge(source, 0, key(8196))
+        .prepare_dynamic_bridge(source, 0, key(4 + SETS as u64 * 4))
         .unwrap()
         .unwrap();
     let mut cpu = A64State::default();
@@ -336,11 +363,16 @@ fn pic_suspended_installation_cannot_publish_a_different_process_bridge() {
 fn pic_full_keys_two_way_replacement_and_generations() {
     let process = process();
     let cursor = AtomicU64::new(0);
-    publish(&process, &cursor, &[4, 8196, 16388], Tier::Lcq);
+    publish(
+        &process,
+        &cursor,
+        &[4, 4 + SETS as u64 * 4, 4 + SETS as u64 * 8],
+        Tier::Lcq,
+    );
     let source = source(&process, &cursor, 0, EdgeKind::Indirect);
     let mut reader = process.register().unwrap();
     let a = install(&mut reader, &process, source, 0, 4);
-    let b = install(&mut reader, &process, source, 0, 8196);
+    let b = install(&mut reader, &process, source, 0, 4 + SETS as u64 * 4);
     assert_eq!(a.site.slot / 2, b.site.slot / 2);
     assert_ne!(a.site.slot, b.site.slot);
     assert!(cached(&process, a).is_some());
@@ -348,7 +380,7 @@ fn pic_full_keys_two_way_replacement_and_generations() {
     let before = process.cache.usage().unwrap();
     assert_eq!(install(&mut reader, &process, source, 0, 4), a);
     assert_eq!(process.cache.usage().unwrap(), before);
-    let c = install(&mut reader, &process, source, 0, 16388);
+    let c = install(&mut reader, &process, source, 0, 4 + SETS as u64 * 8);
     assert_eq!(c.site.slot, a.site.slot); // A hit did not write recency.
     assert_ne!(c.generation, a.generation);
     assert!(cached(&process, a).is_none());
@@ -461,12 +493,12 @@ fn pic_self_edge_and_stale_installation_release_both_adjacencies() {
 fn pic_replacement_generation_exhaustion_preserves_existing_root() {
     let process = process();
     let cursor = AtomicU64::new(0);
-    publish(&process, &cursor, &[4, 8196], Tier::Lcq);
+    publish(&process, &cursor, &[4, 4 + SETS as u64 * 4], Tier::Lcq);
     let source = source(&process, &cursor, 0, EdgeKind::Indirect);
     let mut reader = process.register().unwrap();
     let existing = install(&mut reader, &process, source, 0, 4);
     let transfer = process
-        .prepare_dynamic_bridge(source, 0, key(8196))
+        .prepare_dynamic_bridge(source, 0, key(4 + SETS as u64 * 4))
         .unwrap()
         .unwrap();
     process.lock().bridge_generations = CheckedCounter::exhausted();

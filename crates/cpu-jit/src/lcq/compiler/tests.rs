@@ -38,6 +38,7 @@ mod vector_fp_add;
 mod vector_fp_divide;
 mod vector_fp_fused;
 mod vector_fp_multiply;
+mod vector_fp_to_integer;
 mod vector_integer_to_fp;
 
 const PC: u64 = 0x1000;

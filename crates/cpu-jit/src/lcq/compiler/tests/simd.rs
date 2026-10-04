@@ -43,6 +43,28 @@ fn rev64_native_lowering_matches_all_arrangements_and_register_aliases() {
 }
 
 #[test]
+fn rev32_native_lowering_matches_all_arrangements_and_register_aliases() {
+    for size in 0..2 {
+        for full in [false, true] {
+            for (rd, rn) in [(0, 0), (31, 31), (2, 31), (31, 2)] {
+                let mut initial = initial_state();
+                initial.set_vector(rd, u128::MAX);
+                initial.set_vector(rn, 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+                initial.set_fpsr(0x0800_009f);
+                compare(
+                    0x2e20_0800
+                        | (size << 22)
+                        | (u32::from(full) << 30)
+                        | (u32::from(rn) << 5)
+                        | u32::from(rd),
+                    initial,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn uaddlv_native_lowering_matches_all_unsigned_arrangements_and_aliases() {
     for word in [
         0x2e30_3800_u32,
@@ -182,5 +204,43 @@ fn compact_simd_emitters_match_the_interpreter_across_shapes_and_operations() {
             assert!(initial.set_vector(register, u128::from(low) | (u128::from(high) << 64)));
         }
         compare(encoding, initial);
+    }
+}
+
+#[test]
+fn rev32_reverses_elements_within_each_word_and_clears_inactive_bytes() {
+    let input = u128::from_le_bytes(std::array::from_fn(|byte| byte as u8));
+    for wide in [false, true] {
+        for halfwords in [false, true] {
+            for register in [7_u8, 31] {
+                let word = 0x2e20_0800
+                    | (u32::from(wide) << 30)
+                    | (u32::from(halfwords) << 22)
+                    | (u32::from(register) << 5)
+                    | u32::from(register);
+                let mut initial = initial_state();
+                initial.set_vector(register, input);
+                let mut expected = if halfwords {
+                    [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13]
+                } else {
+                    [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12]
+                };
+                if !wide {
+                    expected[8..].fill(0);
+                }
+                let mut reference = initial.clone();
+                nixe_cpu_interpreter::execute_one(
+                    &nixe_cpu::platform::TargetPlatform::Switch1,
+                    &mut reference,
+                    word,
+                )
+                .unwrap();
+                assert_eq!(
+                    reference.vector(register),
+                    Some(u128::from_le_bytes(expected))
+                );
+                compare(word, initial);
+            }
+        }
     }
 }

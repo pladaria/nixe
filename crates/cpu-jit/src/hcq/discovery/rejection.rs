@@ -8,6 +8,7 @@ use crate::lifetime::{self, background::DiscoveryEvidence};
 pub(crate) enum StructuralReason {
     Disconnected,
     InstructionLimit,
+    PartitionLoss,
 }
 
 pub(crate) enum DiscoveryError<'w, 'p> {
@@ -83,13 +84,29 @@ impl From<Error> for DiscoveryError<'_, '_> {
 
 pub(super) fn finish<'w, 'p>(
     work: &'w Work<'p>,
-    mut graph: Graph,
-    missing: bool,
+    graph: Graph,
     limited: bool,
 ) -> DiscoveryError<'w, 'p> {
-    if missing {
-        return CompileError::Deferred.into();
-    }
+    reject(
+        work,
+        graph,
+        if limited {
+            StructuralReason::InstructionLimit
+        } else {
+            StructuralReason::Disconnected
+        },
+    )
+}
+
+pub(super) fn partition_loss<'w, 'p>(work: &'w Work<'p>, graph: Graph) -> DiscoveryError<'w, 'p> {
+    reject(work, graph, StructuralReason::PartitionLoss)
+}
+
+fn reject<'w, 'p>(
+    work: &'w Work<'p>,
+    mut graph: Graph,
+    reason: StructuralReason,
+) -> DiscoveryError<'w, 'p> {
     let Some(evidence) = graph.discovery.take() else {
         return CompileError::Failed(crate::jit_error::Error::internal(
             "reshape rejection lacks discovery evidence",
@@ -98,11 +115,7 @@ pub(super) fn finish<'w, 'p>(
     };
     let result = Structural {
         work,
-        reason: if limited {
-            StructuralReason::InstructionLimit
-        } else {
-            StructuralReason::Disconnected
-        },
+        reason,
         evidence,
     };
     match result.check() {

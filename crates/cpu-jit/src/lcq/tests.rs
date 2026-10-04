@@ -59,12 +59,10 @@ fn every_control_boundary_stops_without_fetching_its_successor() {
         (0xd503_3f5f, End::Architectural), // CLREX
         (0xd508_751f, End::Architectural), // IC IALLU
         (0xd50b_7520, End::Architectural), // IC IVAU
-        (0x1e62_0420, End::Architectural), // FCCMP
         (0x1e67_4020, End::Architectural), // FRINTX
         (0x1e67_c020, End::Architectural), // FRINTI
         (0x1e66_4020, End::Architectural), // FRINTA
         (0x1e20_0020, End::Architectural), // FCVTNS
-        (0x9e59_c020, End::Architectural), // FCVTZU X0,D1,#16
         (0xd53b_0000, End::Unsupported),
     ] {
         let mut memory = memory(1);
@@ -74,6 +72,29 @@ fn every_control_boundary_stops_without_fetching_its_successor() {
         assert_eq!(fragment.instructions.len(), 1);
         assert!(fragment.image.fault().is_none()); // Next page does not exist.
         assert_eq!(fragment.image.words()[0].bits, bits);
+    }
+}
+
+#[test]
+fn guarded_fp_operations_capture_native_successors_and_preserve_fetch_faults() {
+    for bits in [0x1e62_0420u32, 0x9e59_c020] {
+        // FCCMP; FCVTZU X0,D1,#16
+        let mut memory = memory(1);
+        assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 4092, &bits.to_le_bytes()));
+        let fragment = Fragment::capture(&memory, key(4092)).unwrap();
+        assert_eq!(fragment.end, End::FetchFault);
+        assert_eq!(fragment.instructions.len(), 1);
+        assert!(fragment.image.fault().is_some());
+        assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 4088, &bits.to_le_bytes()));
+        assert!(memory.initialize_ram(
+            GuestPhysicalPageId::new(1),
+            4092,
+            &0xd65f_03c0u32.to_le_bytes()
+        ));
+        let fragment = Fragment::capture(&memory, key(4088)).unwrap();
+        assert_eq!(fragment.end, End::Control);
+        assert_eq!(fragment.instructions.len(), 2);
+        assert!(fragment.image.fault().is_none());
     }
 }
 

@@ -140,7 +140,7 @@ fn reshape_discovery_accepts_a_retained_interior_entry_of_the_same_family() {
 }
 
 #[test]
-fn reshape_uses_the_previous_root_but_repartitions_if_it_cannot_reach_the_boundary() {
+fn reshape_rediscovers_every_previous_public_entry_across_indirect_boundaries() {
     for dynamic in [false, true] {
         let process = process();
         let root = if dynamic { 0xd61f0000 } else { 0x14000004 };
@@ -150,10 +150,9 @@ fn reshape_uses_the_previous_root_but_repartitions_if_it_cannot_reach_the_bounda
         owned_entries(&process, &[(0, root), (16, 0x14000004), (32, RET)], 2);
         let work = reshape(&process, 16, 16, 32);
         let graph = Graph::discover(&work).unwrap();
-        assert_eq!(graph.blocks[0].key, key(if dynamic { 16 } else { 0 }));
-        assert_eq!(graph.instructions.len(), if dynamic { 2 } else { 3 });
+        assert_eq!(graph.blocks[0].key, key(0));
+        assert_eq!(graph.instructions.len(), 3);
         let frozen = work.reserve_candidate(graph).unwrap().freeze().unwrap();
-        assert_eq!(frozen.replacement().fallbacks.len(), usize::from(dynamic));
         frozen.check().unwrap();
     }
 }
@@ -332,16 +331,9 @@ fn reshape_discovery_does_not_connect_calls_returns_or_unobserved_edges() {
         publish_words(&process, 16, &[RET]);
         let work = reshape(&process, 0, 0, 16);
         let result = Graph::discover(&work);
-        if bits == 0x14000008 {
-            // Its actual successor has no LCQ input; that remains retryable.
-            assert!(matches!(
-                result,
-                Err(DiscoveryError::Interrupted(CompileError::Deferred))
-            ));
-        } else {
-            assert!(matches!(result, Err(DiscoveryError::Structural(result))
-                if result.reason() == StructuralReason::Disconnected));
-        }
+        // Missing successors are watched absence evidence, never invented edges.
+        assert!(matches!(result, Err(DiscoveryError::Structural(result))
+            if result.reason() == StructuralReason::Disconnected));
     }
 }
 

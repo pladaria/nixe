@@ -1,5 +1,5 @@
 //! Lossy process-wide weak bridge index. Each active vCPU contributes exactly
-//! 4096 slots; a compact reader-handle vector selects a shard in O(1). Changing
+//! one fixed-size shard; a compact reader-handle vector selects it in O(1). Changing
 //! membership may lose hits, but never makes an invalid handle valid. No
 //! rebuild, executable owner or retained Arc allocation belongs to this index.
 

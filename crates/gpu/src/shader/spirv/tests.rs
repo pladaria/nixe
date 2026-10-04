@@ -820,3 +820,45 @@ fn validate_native_graphics_modules_with_spirv_tools() {
         );
     }
 }
+
+#[test]
+fn saturation_is_lowered_after_arithmetic_using_integer_classification() {
+    let control = ShaderFloatControl::new(
+        ShaderRoundingMode::NearestEven,
+        ShaderNanMode::Propagate,
+        true,
+        true,
+        true,
+    );
+    for operation in [
+        ShaderOperation::Multiply32 {
+            destination: ShaderRegister(3),
+            left: ShaderRegister(0),
+            right: ShaderRegister(1),
+            scalar_type: ShaderScalarType::Float32,
+            float_control: control,
+        },
+        ShaderOperation::Add32 {
+            destination: ShaderRegister(3),
+            left: ShaderRegister(0),
+            right: ShaderRegister(1),
+            scalar_type: ShaderScalarType::Float32,
+            float_control: control,
+        },
+        ShaderOperation::FusedMultiplyAdd32 {
+            destination: ShaderRegister(3),
+            left: ShaderRegister(0),
+            right: ShaderRegister(1),
+            addend: ShaderRegister(2),
+            float_control: control,
+        },
+    ] {
+        let shader = control_shader_arithmetic(operation);
+        let module = lower_shader_ir_to_spirv(&shader, options()).unwrap();
+        let module = rspirv::dr::load_words(module.words()).unwrap();
+        assert!(!ops(&module, spv::Op::UGreaterThanEqual).is_empty());
+        assert!(!ops(&module, spv::Op::UGreaterThan).is_empty());
+        assert!(!ops(&module, spv::Op::LogicalOr).is_empty());
+        assert!(ops(&module, spv::Op::Select).len() >= 2);
+    }
+}

@@ -723,6 +723,9 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::ShiftLeftLong(_)
         | fp_simd::Instruction::CountBits(_)
         | fp_simd::Instruction::Reverse64(_)
+        | fp_simd::Instruction::Reverse32(_)
+        | fp_simd::Instruction::VectorFloatToSignedInt(_)
+        | fp_simd::Instruction::VectorFloatToUnsignedInt(_)
         | fp_simd::Instruction::ScalarVectorFloatToSignedInt(_)
         | fp_simd::Instruction::ScalarVectorFloatToUnsignedInt(_)
         | fp_simd::Instruction::AddAcrossVector(_)
@@ -773,7 +776,12 @@ fn register_access_integer(
         }
         integer::Instruction::LogicalImmediate(_) => {
             mark_read(accessed, fields.rn, false);
-            mark_write(accessed, dirty, fields.rd, false);
+            mark_write(
+                accessed,
+                dirty,
+                fields.rd,
+                !(fields.subtract && fields.set_flags),
+            );
         }
         integer::Instruction::LogicalShifted(_)
         | integer::Instruction::Extract(_)

@@ -55,9 +55,9 @@ pub(crate) struct DiscoveryEvidence {
     blocked: Vec<Blocked>,
     // One packed worker-only vector, not an allocation per inspected input.
     leaders: Vec<u16>,
-    // Cap-excluded inputs are known evidence; unavailable frontier inputs are
-    // not. A no-op additionally requires all eligible words inside its graph.
-    complete_inputs: bool,
+    // Unexecuted frontiers are weak absence evidence. Publishing an LCQ entry
+    // or changing family membership on these pages invalidates the result.
+    missing: Vec<BlockKey>,
     // Actual vector capacity; storage is destroyed before returning the charge.
     _charge: MetadataLease,
 }
@@ -131,7 +131,7 @@ impl Work<'_> {
         inspected: Vec<Inspection>,
         blocked: Vec<Blocked>,
         leaders: Vec<u16>,
-        complete_inputs: bool,
+        missing: Vec<BlockKey>,
     ) -> Result<DiscoveryEvidence, Error> {
         let bytes = inspected
             .capacity()
@@ -149,12 +149,17 @@ impl Work<'_> {
                     .and_then(|leaders| bytes.checked_add(leaders))
             })
             .ok_or(Error::Capacity("discovery evidence size overflow"))?;
+        let bytes = missing
+            .capacity()
+            .checked_mul(size_of::<BlockKey>())
+            .and_then(|frontiers| bytes.checked_add(frontiers))
+            .ok_or(Error::Capacity("missing frontier evidence size overflow"))?;
         let charge = self.process.cache.charge_metadata(bytes, Tier::Hcq)?;
         Ok(DiscoveryEvidence {
             inspected,
             blocked,
             leaders,
-            complete_inputs,
+            missing,
             _charge: charge,
         })
     }
@@ -174,10 +179,20 @@ impl DiscoveryEvidence {
         self.inspected
             .iter()
             .map(|input| SelectionPage::span(input.key, input.instructions).len())
-            .sum()
+            .sum::<usize>()
+            + self.missing.len()
+    }
+
+    pub(super) fn append_missing(&self, owners: &mut Vec<Owner>) {
+        owners.extend(
+            self.missing
+                .iter()
+                .map(|&key| Owner::SelectionPage(SelectionPage::of(key))),
+        );
     }
 
     pub(super) fn append_selection(&self, owners: &mut Vec<Owner>) {
+        self.append_missing(owners);
         for input in &self.inspected {
             owners.extend(
                 SelectionPage::span(input.key, input.instructions).map(Owner::SelectionPage),
@@ -196,9 +211,6 @@ impl DiscoveryEvidence {
         state: &State,
         allowed: [Option<crate::sampling::FamilyIdentity>; 2],
     ) -> Result<(), Error> {
-        if !self.complete_inputs {
-            return Err(Error::StalePublication);
-        }
         self.validate_inputs(state, true, |key| {
             state.units.instruction_available(key, allowed)
         })
@@ -212,9 +224,6 @@ impl DiscoveryEvidence {
         state: &State,
         graph: &Graph,
     ) -> Result<(), Error> {
-        if !self.complete_inputs {
-            return Err(Error::StalePublication);
-        }
         self.validate_inputs(state, false, |key| graph.contains(key))
     }
 
@@ -224,6 +233,23 @@ impl DiscoveryEvidence {
         selection: bool,
         mut eligible: impl FnMut(crate::abi::InstructionKey) -> bool,
     ) -> Result<(), Error> {
+        for key in &self.missing {
+            // An unavailable withdrawing entry is transient, not absence proof.
+            // Any demanded entry or new family owner requires rediscovery.
+            let demanded = state
+                .keys
+                .get(key)
+                .and_then(|handle| state.dispatch.get(*handle))
+                .is_some_and(|slot| slot.snapshot().lcq().is_some());
+            if demanded
+                || state
+                    .units
+                    .active_family_owner(crate::abi::InstructionKey::new(*key).unwrap())
+                    .is_some()
+            {
+                return Err(Error::StalePublication);
+            }
+        }
         for blocked in &self.blocked {
             if state.units.active_family_owner(blocked.key) != Some(blocked.unit) {
                 return Err(Error::StalePublication);

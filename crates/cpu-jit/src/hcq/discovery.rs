@@ -27,6 +27,10 @@ impl From<Error> for CompileError {
 }
 
 impl Graph {
+    #[expect(
+        clippy::result_large_err,
+        reason = "keep bounded worker evidence inline instead of allocating each rejected result"
+    )]
     pub fn discover<'w, 'p>(work: &'w Work<'p>) -> Result<Self, DiscoveryError<'w, 'p>> {
         if let Some(anchor) = work.reshape_anchor() {
             match Self::discover_from(work, anchor) {
@@ -40,6 +44,10 @@ impl Graph {
         Self::discover_from(work, work.observation().root())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "keep bounded worker evidence inline instead of allocating each rejected result"
+    )]
     fn discover_from<'w, 'p>(
         work: &'w Work<'p>,
         (root, version): (BlockKey, crate::abi::ReachabilityVersion),
@@ -52,6 +60,18 @@ impl Graph {
         };
         let mut pending = Worklist::new(root);
         let mut builder = Builder::new(root);
+        let predecessors = work.reshape_predecessors()?;
+        let retained_entries: Vec<_> = predecessors
+            .iter()
+            .flatten()
+            .flat_map(|previous| previous.entries.iter().map(|entry| entry.key))
+            .collect();
+        // Regions have multiple public entries. Rediscover all of them: one
+        // caller's indirect edge must not discard another caller's native body.
+        for &entry in &retained_entries {
+            builder.leader(entry)?;
+            pending.push(entry, 0, 0, 0);
+        }
         if let Some(boundary) = boundary {
             let source = observation.root().0;
             builder.leader(source)?;
@@ -68,7 +88,7 @@ impl Graph {
         let mut inspected = boundary.map(|_| Vec::new());
         let mut blocked = Vec::new();
         let mut leaders = Vec::new();
-        let mut missing = false;
+        let mut missing = Vec::new();
         let mut limited = false;
         while let Some(key) = pending.pop() {
             // Seeds can skip exterior queries at the ceiling. Reshape must
@@ -89,7 +109,9 @@ impl Graph {
                 }
                 // An undemanded interior label already covered by captured
                 // words adds no unknown input. An exterior miss does.
-                missing |= !builder.words.contains_key(&key.pc.get());
+                if boundary.is_some() && !builder.words.contains_key(&key.pc.get()) {
+                    missing.push(key);
+                }
                 continue;
             };
             if (key == root && input.version != version)
@@ -189,7 +211,7 @@ impl Graph {
         work.check()?;
         let mut graph = Self::finish(builder, inputs)?;
         if let Some(inspected) = inspected {
-            graph.discovery = Some(work.discovery_evidence(inspected, blocked, leaders, !missing)?);
+            graph.discovery = Some(work.discovery_evidence(inspected, blocked, leaders, missing)?);
         }
         if let Some(boundary) = boundary {
             let source = graph
@@ -201,7 +223,7 @@ impl Graph {
                 .and_then(|index| graph.instructions.get(index))
                 .filter(|word| word.instruction.key == boundary.source);
             let Some(source) = source else {
-                return Err(rejection::finish(work, graph, missing, limited));
+                return Err(rejection::finish(work, graph, limited));
             };
             let key = boundary.source.block_key();
             let exit = terminal(key, &source.decoded).unwrap_or_else(|| {
@@ -213,19 +235,32 @@ impl Graph {
             if !permits_sample(&exit, boundary.target.block_key()) {
                 // Calls/returns/runtime boundaries never become region edges,
                 // even if a queued observation names a demanded destination.
-                return Err(rejection::finish(work, graph, missing, limited));
+                return Err(rejection::finish(work, graph, limited));
             }
             // A mandatory queue item is not proof of root connectivity. Use
             // the same captured-graph traversal as collision trimming; no live
             // lookup, extra body or speculative indirect edge is introduced.
             let blocked = vec![false; graph.instructions.len()];
-            graph = graph.trim(&blocked, &observed, Some(boundary.source))?;
+            graph = graph.trim(
+                &blocked,
+                &observed,
+                Some(boundary.source),
+                &retained_entries,
+            )?;
             if !graph.contains(boundary.source) || !graph.contains(boundary.target) {
                 // Preserve the reason and complete acquired-input ledger,
                 // without passing a disconnected graph into reservations.
-                return Err(rejection::finish(work, graph, missing, limited));
+                return Err(rejection::finish(work, graph, limited));
             }
             work.check()?;
+            if !predecessors.iter().flatten().all(|previous| {
+                previous
+                    .instructions
+                    .iter()
+                    .all(|word| graph.contains(word.key))
+            }) {
+                return Err(rejection::partition_loss(work, graph));
+            }
         }
         Ok(graph)
     }

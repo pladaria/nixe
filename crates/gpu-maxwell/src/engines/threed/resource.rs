@@ -879,7 +879,25 @@ struct MaxwellThreeDResolvedResourceCacheEntry {
     resources: Arc<MaxwellThreeDResolvedResources>,
     descriptor_reads: Box<[MaxwellThreeDDescriptorRead]>,
     mapping_generation: Cell<u64>,
-    last_used: Cell<u64>,
+    previous: Option<usize>,
+    next: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ResourceResolveKey {
+    address_space: crate::MaxwellAddressSpaceId,
+    state: MaxwellThreeDResourceStateIdentity,
+    inspect_complete_state: bool,
+}
+
+impl MaxwellThreeDResolvedResourceCacheEntry {
+    fn key(&self) -> ResourceResolveKey {
+        ResourceResolveKey {
+            address_space: self.address_space,
+            state: self.state.clone(),
+            inspect_complete_state: self.inspect_complete_state,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -900,6 +918,11 @@ struct ColorResolveCacheEntry {
 pub(crate) struct MaxwellThreeDResolvedResourceCache {
     resolves: HashMap<ColorResolveKey, ColorResolveCacheEntry>,
     entries: Vec<MaxwellThreeDResolvedResourceCacheEntry>,
+    // Only role lists with the same state domains share a bucket. Contents,
+    // descriptor writes and mapping generations are still checked on a hit.
+    index: HashMap<ResourceResolveKey, Vec<usize>>,
+    oldest: Option<usize>,
+    newest: Option<usize>,
     current: Option<usize>,
     retained_backings: MaxwellThreeDRetainedBackingCache,
     next_use: Cell<u64>,
@@ -1011,28 +1034,33 @@ impl MaxwellThreeDResolvedResourceCache {
                 inspect_complete_state,
             )?
         {
-            let entry = &self.entries[index];
-            entry.last_used.set(self.take_use());
-            return Ok(Arc::clone(&entry.resources));
+            self.touch_entry(index);
+            return Ok(Arc::clone(&self.entries[index].resources));
         }
-        for index in 0..self.entries.len() {
-            if Some(index) == self.current
-                || !self.entry_matches(
-                    index,
-                    state,
-                    address_space,
-                    required_roles,
-                    staged_writes,
-                    inspect_complete_state,
-                )?
-            {
-                continue;
+        let key = ResourceResolveKey {
+            address_space: address_space.id(),
+            state: state.resource_state_identity(required_roles, inspect_complete_state),
+            inspect_complete_state,
+        };
+        if let Some(indices) = self.index.get(&key) {
+            for &index in indices {
+                if Some(index) == self.current
+                    || !self.entry_matches(
+                        index,
+                        state,
+                        address_space,
+                        required_roles,
+                        staged_writes,
+                        inspect_complete_state,
+                    )?
+                {
+                    continue;
+                }
+                self.touch_entry(index);
+                let resources = Arc::clone(&self.entries[index].resources);
+                self.current = Some(index);
+                return Ok(resources);
             }
-            let entry = &self.entries[index];
-            entry.last_used.set(self.take_use());
-            let resources = Arc::clone(&entry.resources);
-            self.current = Some(index);
-            return Ok(resources);
         }
 
         let (resources, descriptor_reads) = resolve_maxwell_three_d_resources_inner(
@@ -1044,17 +1072,12 @@ impl MaxwellThreeDResolvedResourceCache {
             Some(&mut self.retained_backings),
         )?;
         let resources = Arc::new(resources);
-        let last_used = self.take_use();
         if self.entries.len() >= limit {
             let oldest = self
-                .entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.last_used.get())
-                .map(|(index, _)| index)
+                .oldest
                 .expect("a full resolved-resource cache is non-empty");
             let last = self.entries.len() - 1;
-            self.entries.swap_remove(oldest);
+            self.remove_entry(oldest);
             self.current = match self.current {
                 Some(current) if current == oldest => None,
                 Some(current) if current == last => Some(oldest),
@@ -1063,16 +1086,82 @@ impl MaxwellThreeDResolvedResourceCache {
         }
         self.entries.push(MaxwellThreeDResolvedResourceCacheEntry {
             address_space: address_space.id(),
-            state: state.resource_state_identity(required_roles, inspect_complete_state),
+            state: key.state.clone(),
             roles: required_roles.into(),
             inspect_complete_state,
             resources: Arc::clone(&resources),
             descriptor_reads,
             mapping_generation: Cell::new(address_space.mapping_generation().get()),
-            last_used: Cell::new(last_used),
+            previous: None,
+            next: None,
         });
-        self.current = Some(self.entries.len() - 1);
+        let index = self.entries.len() - 1;
+        self.index.entry(key).or_default().push(index);
+        self.append_entry(index);
+        self.current = Some(index);
         Ok(resources)
+    }
+
+    fn remove_entry(&mut self, index: usize) {
+        self.detach_entry(index);
+        let key = self.entries[index].key();
+        let bucket = self.index.get_mut(&key).unwrap();
+        let position = bucket.iter().position(|&entry| entry == index).unwrap();
+        bucket.swap_remove(position);
+        if bucket.is_empty() {
+            self.index.remove(&key);
+        }
+        let last = self.entries.len() - 1;
+        self.entries.swap_remove(index);
+        if index != last {
+            let key = self.entries[index].key();
+            let bucket = self.index.get_mut(&key).unwrap();
+            *bucket.iter_mut().find(|entry| **entry == last).unwrap() = index;
+            let entry = &self.entries[index];
+            let (previous, next) = (entry.previous, entry.next);
+            if let Some(previous) = previous {
+                self.entries[previous].next = Some(index);
+            } else {
+                self.oldest = Some(index);
+            }
+            if let Some(next) = next {
+                self.entries[next].previous = Some(index);
+            } else {
+                self.newest = Some(index);
+            }
+        }
+    }
+
+    fn detach_entry(&mut self, index: usize) {
+        let entry = &mut self.entries[index];
+        let (previous, next) = (entry.previous.take(), entry.next.take());
+        if let Some(previous) = previous {
+            self.entries[previous].next = next;
+        } else {
+            self.oldest = next;
+        }
+        if let Some(next) = next {
+            self.entries[next].previous = previous;
+        } else {
+            self.newest = previous;
+        }
+    }
+
+    fn append_entry(&mut self, index: usize) {
+        self.entries[index].previous = self.newest;
+        if let Some(newest) = self.newest {
+            self.entries[newest].next = Some(index);
+        } else {
+            self.oldest = Some(index);
+        }
+        self.newest = Some(index);
+    }
+
+    fn touch_entry(&mut self, index: usize) {
+        if self.newest != Some(index) {
+            self.detach_entry(index);
+            self.append_entry(index);
+        }
     }
 
     fn entry_matches(
@@ -2808,6 +2897,57 @@ mod tests {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         bytes
+    }
+
+    #[test]
+    fn resource_index_preserves_scope_identity_hits_and_moved_eviction_slots() {
+        let states: [_; 4] = std::array::from_fn(|_| super::MaxwellThreeDState::default());
+        let mut address_space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        address_space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let mut cache = MaxwellThreeDResolvedResourceCache::default();
+        let first = cache
+            .resolve(&states[0], &address_space, &[], None, false, 3)
+            .unwrap();
+        let second = cache
+            .resolve(&states[1], &address_space, &[], None, false, 3)
+            .unwrap();
+        let third = cache
+            .resolve(&states[2], &address_space, &[], None, false, 3)
+            .unwrap();
+        // Equal revision numbers in independently owned states are distinct.
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&second, &third));
+        let repeated = cache
+            .resolve(&states[0], &address_space, &[], None, false, 3)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        cache
+            .resolve(&states[3], &address_space, &[], None, false, 3)
+            .unwrap();
+        // Eviction removed the middle entry and moved the last into its slot.
+        let moved = cache
+            .resolve(&states[2], &address_space, &[], None, false, 3)
+            .unwrap();
+        assert!(Arc::ptr_eq(&third, &moved));
+        let replaced = cache
+            .resolve(&states[1], &address_space, &[], None, false, 3)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&second, &replaced));
+        for state in &states {
+            cache
+                .resolve(state, &address_space, &[], None, true, 3)
+                .unwrap();
+            assert_eq!(cache.entries.len(), 3);
+            assert_eq!(cache.index.values().map(Vec::len).sum::<usize>(), 3);
+            for (key, bucket) in &cache.index {
+                for &index in bucket {
+                    assert_eq!(&cache.entries[index].key(), key);
+                }
+            }
+        }
     }
 
     #[test]

@@ -1,14 +1,14 @@
 //! Maxwell stage interfaces, attribute transfers, and interpolation.
 
 use super::binary::MaxwellShaderProgramHeader;
-use super::decode::validate_register_range;
+use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use super::tessellation;
 use crate::MaxwellShaderStage;
 use nixe_gpu::{
-    ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation,
-    ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType, ShaderSourceLocation,
-    ShaderStage,
+    ShaderFloatControl, ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation,
+    ShaderIoLocation, ShaderNanMode, ShaderOperation, ShaderPredicate, ShaderRegister,
+    ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderStage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -451,8 +451,10 @@ pub(super) fn decode_interpolate(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    inputs: &[ShaderInterfaceElement],
-) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+    inputs: &mut Vec<ShaderInterfaceElement>,
+    next_temporary: &mut u16,
+    normalized_multiplier: bool,
+) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     if stage != MaxwellShaderStage::Pixel {
         return Err(malformed(
             stage,
@@ -496,12 +498,25 @@ pub(super) fn decode_interpolate(
         .find(|input| input.location() == location && input.component() == component)
         .and_then(|input| input.interpolation());
     match interpolation_mode {
-        0 => Ok(ShaderOperation::LoadInput {
+        0 if interpolation == Some(ShaderInterpolation::Perspective) => {
+            interpolate_perspective_numerator(
+                stage,
+                offset,
+                encoding,
+                destination,
+                location,
+                component,
+                None,
+                inputs,
+                next_temporary,
+            )
+        }
+        0 => Ok(vec![ShaderOperation::LoadInput {
             destinations: vec![ShaderRegister::new(u16::from(destination))].into_boxed_slice(),
             location,
             first_component: component,
             scalar_type: ShaderScalarType::Float32,
-        }),
+        }]),
         1 => {
             let interpolation = interpolation.ok_or_else(|| {
                 malformed(
@@ -521,21 +536,29 @@ pub(super) fn decode_interpolate(
             }
             let reciprocal = ((encoding >> 20) & 0xff) as u8;
             validate_register_range(stage, offset, encoding, reciprocal, 1, register_count)?;
-            // Maxwell PASS_MUL_W names the register carrying the hardware
-            // interpolation factor. The neutral shader interface is logical:
-            // a perspective input has already received that interpolation by
-            // the time WGSL exposes it, so retaining this as an arithmetic
-            // source would apply perspective correction twice.
-            //
-            // Mesa NAK likewise models PASS_MUL_W's inv_w operand as part of
-            // interpolation rather than as a separate floating-point multiply:
-            // https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/a3fcccb47bfbaf49a5d1ffa56547973462e70ab0/src/nouveau/compiler/nak/from_nir.rs
-            Ok(ShaderOperation::InterpolateInput {
-                destination: ShaderRegister::new(u16::from(destination)),
+            // When the producer is the canonical reciprocal of FragCoord.w,
+            // the host interpolator already performs precisely this operation.
+            // The caller proves that producer from register definitions; never
+            // infer it just from the operand register number.
+            if normalized_multiplier {
+                return Ok(vec![ShaderOperation::InterpolateInput {
+                    destination: ShaderRegister::new(u16::from(destination)),
+                    location,
+                    component,
+                    interpolation,
+                }]);
+            }
+            interpolate_perspective_numerator(
+                stage,
+                offset,
+                encoding,
+                destination,
                 location,
                 component,
-                interpolation,
-            })
+                Some(ShaderRegister::new(u16::from(reciprocal))),
+                inputs,
+                next_temporary,
+            )
         }
         2 => {
             if interpolation != Some(ShaderInterpolation::Constant) {
@@ -546,12 +569,12 @@ pub(super) fn decode_interpolate(
                     "IPA.CONSTANT requires a flat input declared by the shader header",
                 ));
             }
-            Ok(ShaderOperation::InterpolateInput {
+            Ok(vec![ShaderOperation::InterpolateInput {
                 destination: ShaderRegister::new(u16::from(destination)),
                 location,
                 component,
                 interpolation: ShaderInterpolation::Constant,
-            })
+            }])
         }
         3 => {
             let interpolation = interpolation.ok_or_else(|| {
@@ -562,15 +585,134 @@ pub(super) fn decode_interpolate(
                     "IPA.SC references a non-interpolated input",
                 )
             })?;
-            Ok(ShaderOperation::InterpolateInput {
+            Ok(vec![ShaderOperation::InterpolateInput {
                 destination: ShaderRegister::new(u16::from(destination)),
                 location,
                 component,
                 interpolation,
-            })
+            }])
         }
         _ => unreachable!("two-bit IPA interpolation mode"),
     }
+}
+
+pub(super) fn is_reciprocal_fragment_w(
+    instructions: &[ShaderInstruction],
+    register: ShaderRegister,
+) -> bool {
+    fn definition(instructions: &[ShaderInstruction], register: ShaderRegister) -> Option<usize> {
+        instructions.iter().rposition(|instruction| {
+            let mut writes = false;
+            instruction
+                .operation()
+                .visit_destination_registers(|destination| writes |= destination == register);
+            writes
+        })
+    }
+    let Some(index) = definition(instructions, register) else {
+        return false;
+    };
+    let instruction = &instructions[index];
+    if instruction.predicate() != ShaderPredicate::Always {
+        return false;
+    }
+    let ShaderOperation::Reciprocal32 {
+        source,
+        float_control: ShaderFloatControl::PRECISE,
+        ..
+    } = instruction.operation()
+    else {
+        return false;
+    };
+    let preceding = &instructions[..index];
+    let Some(index) = definition(preceding, *source) else {
+        return false;
+    };
+    let instruction = &preceding[index];
+    if instruction.predicate() != ShaderPredicate::Always {
+        return false;
+    }
+    matches!(instruction.operation(), ShaderOperation::LoadInput { destinations, location: ShaderIoLocation::Position, first_component, scalar_type: ShaderScalarType::Float32 } if destinations.iter().enumerate().any(|(index, destination)| destination == source && usize::from(*first_component) + index == 3))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interpolate_perspective_numerator(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    destination: u8,
+    location: ShaderIoLocation,
+    component: u8,
+    multiplier: Option<ShaderRegister>,
+    inputs: &mut Vec<ShaderInterfaceElement>,
+    next_temporary: &mut u16,
+) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+    // IPA.PASS exposes sum(lambda_i * attribute_i / clip_w_i), whereas
+    // host perspective inputs expose that numerator divided by FragCoord.w.
+    // Undo host normalization before PASS's explicit shader multiply or
+    // PASS_MUL_W's register operand. The operand need not be exactly 1/w.
+    // https://github.com/kotx/Ryujinx/blob/master/src/Ryujinx.Graphics.Shader/Instructions/InstEmitAttribute.cs#L146-L213
+    let mut temporary = || {
+        allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "IPA temporary-register space exhausted",
+            next_temporary,
+        )
+    };
+    let attribute = temporary()?;
+    let reciprocal_w = temporary()?;
+    let destination = ShaderRegister::new(u16::from(destination));
+    let numerator = if multiplier.is_some() {
+        temporary()?
+    } else {
+        destination
+    };
+    if !inputs
+        .iter()
+        .any(|input| input.location() == ShaderIoLocation::Position && input.component() == 3)
+    {
+        inputs.push(interface_element(ShaderIoLocation::Position, 3, None));
+    }
+    let float_control = ShaderFloatControl::new(
+        ShaderRoundingMode::NearestEven,
+        ShaderNanMode::Propagate,
+        true,
+        true,
+        false,
+    );
+    let mut operations = vec![
+        ShaderOperation::LoadInput {
+            destinations: vec![attribute].into_boxed_slice(),
+            location,
+            first_component: component,
+            scalar_type: ShaderScalarType::Float32,
+        },
+        ShaderOperation::LoadInput {
+            destinations: vec![reciprocal_w].into_boxed_slice(),
+            location: ShaderIoLocation::Position,
+            first_component: 3,
+            scalar_type: ShaderScalarType::Float32,
+        },
+        ShaderOperation::Multiply32 {
+            destination: numerator,
+            left: attribute,
+            right: reciprocal_w,
+            scalar_type: ShaderScalarType::Float32,
+            float_control,
+        },
+    ];
+    if let Some(multiplier) = multiplier {
+        operations.push(ShaderOperation::Multiply32 {
+            destination,
+            left: numerator,
+            right: multiplier,
+            scalar_type: ShaderScalarType::Float32,
+            float_control,
+        });
+    }
+    Ok(operations)
 }
 
 pub(super) fn attribute_location(

@@ -44,10 +44,11 @@ impl Lifetime {
             // supply its actual logical block/instruction to sample_transfer.
             return self.sample_transfer(unit, root, instruction, samples, edge);
         }
-        let Some(state) = self.sample_state()? else {
+        let Some(mut state) = self.sample_state()? else {
             return Ok(());
         };
         if let Some(source) = self.lcq_sample_identity(&state, unit)? {
+            state.units.sample_eviction(source.unit.0);
             let queue = state.background_queue.upgrade();
             drop(state);
             self.sample_seed(queue, samples, source.key, source.version, edge)?;
@@ -70,7 +71,7 @@ impl Lifetime {
         source: CompletionSample,
         samples: &mut Samples,
     ) -> Result<(), Error> {
-        let Some(state) = self.sample_state()? else {
+        let Some(mut state) = self.sample_state()? else {
             return Ok(());
         };
         if source.unit.1 != self.identity {
@@ -82,6 +83,7 @@ impl Lifetime {
             return Ok(());
         };
         if self.lcq_sample_identity(&state, &record.code)? == Some(source) {
+            state.units.sample_eviction(source.unit.0);
             let queue = state.background_queue.upgrade();
             drop(state);
             self.sample_seed(queue, samples, source.key, source.version, None)?;

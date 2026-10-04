@@ -548,6 +548,10 @@ impl RunnableProcess {
         Ok(report)
     }
 
+    pub(crate) fn request_vcpu_safepoint(&self, vcpu: nixe_scheduler::VirtualCpuId) {
+        self.execution.request_vcpu_safepoint(vcpu);
+    }
+
     pub(crate) fn request_execution_safepoint(&self) {
         self.execution.request_safepoint();
     }

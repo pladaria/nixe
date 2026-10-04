@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::direct::DirectArenaWeak;
@@ -136,6 +136,10 @@ struct CanonicalPageInner {
     generation: AtomicU64,
     cpu_dirty_epoch: AtomicU64,
     executable_invalidations: OnceLock<Arc<MemoryInvalidationLog>>,
+    // Read-only resident resources query clean authority on every submission.
+    // Publish this common state without taking one mutex per physical page;
+    // all transitions still serialize through `state`.
+    visibility_clean: AtomicBool,
     state: Mutex<CanonicalPageState>,
 }
 
@@ -243,6 +247,7 @@ impl CanonicalBackingPage {
                 generation: AtomicU64::new(generation.get()),
                 cpu_dirty_epoch: AtomicU64::new(0),
                 executable_invalidations: OnceLock::new(),
+                visibility_clean: AtomicBool::new(true),
                 state: Mutex::new(CanonicalPageState {
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
@@ -277,6 +282,7 @@ impl CanonicalBackingPage {
                 generation: AtomicU64::new(generation.get()),
                 cpu_dirty_epoch: AtomicU64::new(0),
                 executable_invalidations: OnceLock::new(),
+                visibility_clean: AtomicBool::new(true),
                 state: Mutex::new(CanonicalPageState {
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
@@ -475,7 +481,11 @@ impl CanonicalBackingPage {
     /// Returns the conservative authority state shared by every page alias.
     #[must_use]
     pub fn visibility_state(&self) -> VisibilityState {
-        Self::visibility_snapshot(&self.lock_state().visibility)
+        if self.inner.visibility_clean.load(Ordering::Acquire) {
+            VisibilityState::Clean
+        } else {
+            Self::visibility_snapshot(&self.lock_state().visibility)
+        }
     }
 
     /// Copies a checked byte range out of canonical storage.
@@ -846,6 +856,37 @@ impl CanonicalBackingPage {
         }
     }
 
+    /// Advances an existing device owner's completion point without changing
+    /// CPU permissions or executable bytes. The first handoff already revoked
+    /// every alias and invalidated compiled code. A concurrent CPU writeback
+    /// observes the visibility epoch and retries against the newer point.
+    pub(crate) fn advance_resident_device_write(
+        &self,
+        declaration: DeviceAccessDeclaration,
+        coordinator: &Arc<dyn VisibilityCoordinator>,
+    ) -> Result<bool, VisibilityError> {
+        let Some(visible_at) = declaration.cpu_visible_at() else {
+            return Err(VisibilityError::DeclarationDoesNotWrite);
+        };
+        let mut state = self.lock_state();
+        if !matches!(
+            state.visibility,
+            PageVisibility::GpuNewer { device, visible_at: previous, .. }
+                if device == declaration.device() && previous <= visible_at
+        ) {
+            return Ok(false);
+        }
+        self.publish_visibility(
+            &mut state,
+            PageVisibility::GpuNewer {
+                device: declaration.device(),
+                visible_at,
+                coordinator: Arc::clone(coordinator),
+            },
+        )?;
+        Ok(true)
+    }
+
     pub(crate) fn publish_device_write(
         &self,
         declaration: DeviceAccessDeclaration,
@@ -1034,19 +1075,33 @@ impl CanonicalBackingPage {
         state: &mut CanonicalPageState,
         visibility: PageVisibility,
     ) -> Result<(), VisibilityError> {
+        self.inner.visibility_clean.store(false, Ordering::Release);
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
             state.visibility = PageVisibility::Invalid;
             return Err(VisibilityError::VisibilityEpochExhausted);
         };
         let cpu_visible = matches!(visibility, PageVisibility::Clean | PageVisibility::CpuNewer);
         let cpu_writable = matches!(visibility, PageVisibility::CpuNewer);
-        self.publish_direct_alias_protection_for(state, cpu_visible, cpu_writable)
-            .map_err(|error| {
-                state.visibility = PageVisibility::Invalid;
-                VisibilityError::HostMemory(error.to_string().into_boxed_str())
-            })?;
+        // GPU-owned pages already have every CPU alias revoked. Moving their
+        // completion point or making them conflicting/invalid cannot change
+        // those protections. Clean pages may have temporary revocations, so
+        // their protections still need publication even for Clean -> Clean.
+        let already_revoked = matches!(state.visibility, PageVisibility::GpuNewer { .. });
+        let protection = if already_revoked && !cpu_visible {
+            Ok(())
+        } else {
+            self.publish_direct_alias_protection_for(state, cpu_visible, cpu_writable)
+        };
+        protection.map_err(|error| {
+            state.visibility = PageVisibility::Invalid;
+            VisibilityError::HostMemory(error.to_string().into_boxed_str())
+        })?;
         state.visibility = visibility;
         state.visibility_epoch = next_epoch;
+        self.inner.visibility_clean.store(
+            matches!(state.visibility, PageVisibility::Clean),
+            Ordering::Release,
+        );
         Ok(())
     }
 
@@ -1057,6 +1112,7 @@ impl CanonicalBackingPage {
         let Some(next) = self.cpu_dirty_epoch().checked_add(1) else {
             self.revoke_direct_access(state)
                 .map_err(CanonicalPageError::Visibility)?;
+            self.inner.visibility_clean.store(false, Ordering::Release);
             state.visibility = PageVisibility::Invalid;
             return Err(CanonicalPageError::CpuDirtyEpochExhausted);
         };
@@ -1072,12 +1128,19 @@ impl CanonicalBackingPage {
     }
 
     fn revoke_direct_access(&self, state: &mut CanonicalPageState) -> Result<(), VisibilityError> {
-        self.publish_direct_aliases_as(state, DirectProtection::None)
-            .map_err(|error| {
-                state.visibility = PageVisibility::Invalid;
-                VisibilityError::HostMemory(error.to_string().into_boxed_str())
-            })?;
+        let protection = if matches!(state.visibility, PageVisibility::GpuNewer { .. }) {
+            Ok(())
+        } else {
+            self.publish_direct_aliases_as(state, DirectProtection::None)
+        };
+        protection.map_err(|error| {
+            self.inner.visibility_clean.store(false, Ordering::Release);
+            state.visibility = PageVisibility::Invalid;
+            VisibilityError::HostMemory(error.to_string().into_boxed_str())
+        })?;
+        self.inner.visibility_clean.store(false, Ordering::Release);
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
+            self.inner.visibility_clean.store(false, Ordering::Release);
             state.visibility = PageVisibility::Invalid;
             return Err(VisibilityError::VisibilityEpochExhausted);
         };
@@ -1721,6 +1784,10 @@ impl CanonicalWriteBatch {
                 .bytes
                 .take()
                 .expect("prepared canonical batch write retains its bytes");
+            backing
+                .inner
+                .visibility_clean
+                .store(false, Ordering::Release);
             state.visibility = PageVisibility::CpuNewer;
             backing
                 .publish_cpu_dirty(state)

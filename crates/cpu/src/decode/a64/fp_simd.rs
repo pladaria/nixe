@@ -611,6 +611,17 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
     )
     .fixture32(0x0ea0_0800),
+    // Arm REV32 (vector), byte/halfword reversal within 32-bit containers.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1685-1686)
+    pattern(
+        "simd-reverse-32",
+        0xbf3f_fc00,
+        0x2e20_0800,
+        0x0000_00b1,
+        204,
+        &[],
+    )
+    .fixture32(0x2e20_08e7),
     // Arm A64 ADDV adds every active vector element and writes the modular
     // scalar result while clearing the remaining destination bits. Arm ARM
     // DDI 0602 (2025-12):
@@ -690,6 +701,26 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
     )
     .fixture32(0x0ddf_1e30),
+    // Arm FCVTZS/FCVTZU (vector, integer), single/double precision.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1330-1332, 1344-1346)
+    pattern(
+        "simd-vector-float-to-signed-int",
+        0xbfbf_fc00,
+        0x0ea1_b800,
+        0x0000_00af,
+        195,
+        &[],
+    )
+    .fixture32(0x4ea1_b841),
+    pattern(
+        "simd-vector-float-to-unsigned-int",
+        0xbfbf_fc00,
+        0x2ea1_b800,
+        0x0000_00b0,
+        195,
+        &[],
+    )
+    .fixture32(0x6ee1_b820),
     // Arm A64 Advanced SIMD integer-to-floating-point vector conversions,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--vector---Signed-integer-Convert-to-Floating-point--vector--
@@ -1489,6 +1520,8 @@ instructions!(
     SignedIntToFloat,
     UnsignedIntToFloat,
     FloatToSignedInt,
+    VectorFloatToSignedInt,
+    VectorFloatToUnsignedInt,
     ScalarVectorFloatToSignedInt,
     ScalarVectorFloatToUnsignedInt,
     FloatToUnsignedInt,
@@ -1518,6 +1551,7 @@ instructions!(
     VectorUnsignedShiftRegister,
     CountBits,
     Reverse64,
+    Reverse32,
     AddAcrossVector,
     UnsignedAddLongAcrossVector,
     ExtractNarrow,
@@ -1548,145 +1582,147 @@ instructions!(
 );
 
 pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
-    let operands =
-        Operands {
-            rd: (bits & 0x1f) as u8,
-            rn: ((bits >> 5) & 0x1f) as u8,
-            rm: ((bits >> 16) & 0x1f) as u8,
-            ra: if instruction_id == 0x0000_00ae {
-                (bits & 0x1f) as u8
+    let operands = Operands {
+        rd: (bits & 0x1f) as u8,
+        rn: ((bits >> 5) & 0x1f) as u8,
+        rm: ((bits >> 16) & 0x1f) as u8,
+        ra: if instruction_id == 0x0000_00ae {
+            (bits & 0x1f) as u8
+        } else {
+            ((bits >> 10) & 0x1f) as u8
+        },
+        size: (bits >> 30) as u8,
+        opc: if matches!(
+            instruction_id,
+            0x0000_00a1
+                | 0x0000_00a2
+                | 0x0000_00a4
+                | 0x0000_00a5
+                | 0x0000_00aa
+                | 0x0000_00ab
+                | 0x0000_00ad
+                | 0x0000_00ae
+                | 0x0000_00af
+                | 0x0000_00b0
+        ) {
+            ((bits >> 22) & 1) as u8
+        } else {
+            ((bits >> 22) & 3) as u8
+        },
+        option: ((bits >> 13) & 7) as u8,
+        immediate_9: ((bits >> 12) & 0x1ff) as u16,
+        immediate_12: ((bits >> 10) & 0xfff) as u16,
+        immediate_19: (bits >> 5) & 0x7ffff,
+        load: bits & (1 << 22) != 0,
+        quad: bits & (1 << 23) != 0,
+        vector_128: bits & (1 << 30) != 0,
+        subtract: bits
+            & (1 << match instruction_id {
+                0x0000_00a2 | 0x0000_00ae => 14,
+                0x0000_00a4 => 23,
+                _ => 29,
+            })
+            != 0,
+        scaled: bits & (1 << 12) != 0,
+        immediate_5: ((bits >> 16) & 0x1f) as u8,
+        rt2: ((bits >> 10) & 0x1f) as u8,
+        immediate_7: ((bits >> 15) & 0x7f) as u8,
+        shift_immediate: ((bits >> 16) & 0x7f) as u8,
+        mode: ((bits >> 23) & 3) as u8,
+        immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
+        cmode: ((bits >> 12) & 0xf) as u8,
+        structure_opcode: ((bits >> 12) & 0xf) as u8,
+        structure_r: bits & (1 << 21) != 0,
+        bitwise_operation: (instruction_id == 0x0000_0030).then(|| {
+            bitwise_operation(bits)
+                .expect("the SIMD bitwise pattern only contains allocated operations")
+        }),
+        integer_comparison: integer_comparison(instruction_id),
+        pairwise_operation: pairwise_operation(instruction_id),
+        permute_operation: (instruction_id == 0x0000_0064).then(|| {
+            permute_operation(bits)
+                .expect("allocation validation rejects invalid SIMD two-source permutes")
+        }),
+        compare_with_zero: matches!(instruction_id, 0x0000_0054..=0x0000_0058),
+        signaling_compare: bits & (1 << 4) != 0,
+        operation_bit: bits & (1 << 29) != 0,
+        immediate_4: ((bits >> 11) & 0xf) as u8,
+        nzcv_immediate: (bits & 0xf) as u8,
+        condition: ((bits >> 12) & 0xf) as u8,
+        element_size: ((bits >> 10) & 3) as u8,
+        fp_immediate_8: ((bits >> 13) & 0xff) as u8,
+        fp_element_lane: if matches!(
+            instruction_id,
+            0x0000_00a1 | 0x0000_00a2 | 0x0000_00ad | 0x0000_00ae
+        ) {
+            if bits & (1 << 22) == 0 {
+                (((bits >> 21) & 1) | (((bits >> 11) & 1) << 1)) as u8
             } else {
-                ((bits >> 10) & 0x1f) as u8
-            },
-            size: (bits >> 30) as u8,
-            opc: if matches!(
-                instruction_id,
-                0x0000_00a1
-                    | 0x0000_00a2
-                    | 0x0000_00a4
-                    | 0x0000_00a5
-                    | 0x0000_00aa
-                    | 0x0000_00ab
-                    | 0x0000_00ad
-                    | 0x0000_00ae
-            ) {
-                ((bits >> 22) & 1) as u8
+                ((bits >> 11) & 1) as u8
+            }
+        } else {
+            0
+        },
+        float_conversion: match instruction_id {
+            0x0000_006f => Some(FloatConversion::SingleToDouble),
+            0x0000_0070 => Some(FloatConversion::DoubleToSingle),
+            _ => None,
+        },
+        float_to_integer_rounding: match instruction_id {
+            0x0000_007d | 0x0000_007e => Some(FloatToIntegerRounding::NearestEven),
+            0x0000_007f | 0x0000_0080 => Some(FloatToIntegerRounding::NearestAway),
+            0x0000_0081 | 0x0000_0082 => Some(FloatToIntegerRounding::TowardPositive),
+            0x0000_0083 | 0x0000_0084 => Some(FloatToIntegerRounding::TowardNegative),
+            0x0000_003c | 0x0000_003d | 0x0000_009e | 0x0000_009f | 0x0000_00aa | 0x0000_00ab
+            | 0x0000_00af | 0x0000_00b0 => Some(FloatToIntegerRounding::TowardZero),
+            _ => None,
+        },
+        fixed_point_fraction_bits: matches!(instruction_id, 0x0000_009e | 0x0000_009f)
+            .then(|| 64 - ((bits >> 10) & 0x3f) as u8),
+        float_round_operation: match instruction_id {
+            0x0000_0072 => Some(FloatRoundOperation::NearestEven),
+            0x0000_0073 => Some(FloatRoundOperation::TowardPositive),
+            0x0000_0074 => Some(FloatRoundOperation::TowardNegative),
+            0x0000_0075 => Some(FloatRoundOperation::TowardZero),
+            0x0000_0076 => Some(FloatRoundOperation::NearestAway),
+            0x0000_0077 => Some(FloatRoundOperation::Exact),
+            0x0000_0078 => Some(FloatRoundOperation::CurrentMode),
+            _ => None,
+        },
+        float_add_operation: match instruction_id {
+            0x0000_00a5 => Some(if bits & (1 << 23) == 0 {
+                FloatAddOperation::Add
             } else {
-                ((bits >> 22) & 3) as u8
-            },
-            option: ((bits >> 13) & 7) as u8,
-            immediate_9: ((bits >> 12) & 0x1ff) as u16,
-            immediate_12: ((bits >> 10) & 0xfff) as u16,
-            immediate_19: (bits >> 5) & 0x7ffff,
-            load: bits & (1 << 22) != 0,
-            quad: bits & (1 << 23) != 0,
-            vector_128: bits & (1 << 30) != 0,
-            subtract: bits
-                & (1 << match instruction_id {
-                    0x0000_00a2 | 0x0000_00ae => 14,
-                    0x0000_00a4 => 23,
-                    _ => 29,
-                })
-                != 0,
-            scaled: bits & (1 << 12) != 0,
-            immediate_5: ((bits >> 16) & 0x1f) as u8,
-            rt2: ((bits >> 10) & 0x1f) as u8,
-            immediate_7: ((bits >> 15) & 0x7f) as u8,
-            shift_immediate: ((bits >> 16) & 0x7f) as u8,
-            mode: ((bits >> 23) & 3) as u8,
-            immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
-            cmode: ((bits >> 12) & 0xf) as u8,
-            structure_opcode: ((bits >> 12) & 0xf) as u8,
-            structure_r: bits & (1 << 21) != 0,
-            bitwise_operation: (instruction_id == 0x0000_0030).then(|| {
-                bitwise_operation(bits)
-                    .expect("the SIMD bitwise pattern only contains allocated operations")
+                FloatAddOperation::Subtract
             }),
-            integer_comparison: integer_comparison(instruction_id),
-            pairwise_operation: pairwise_operation(instruction_id),
-            permute_operation: (instruction_id == 0x0000_0064).then(|| {
-                permute_operation(bits)
-                    .expect("allocation validation rejects invalid SIMD two-source permutes")
-            }),
-            compare_with_zero: matches!(instruction_id, 0x0000_0054..=0x0000_0058),
-            signaling_compare: bits & (1 << 4) != 0,
-            operation_bit: bits & (1 << 29) != 0,
-            immediate_4: ((bits >> 11) & 0xf) as u8,
-            nzcv_immediate: (bits & 0xf) as u8,
-            condition: ((bits >> 12) & 0xf) as u8,
-            element_size: ((bits >> 10) & 3) as u8,
-            fp_immediate_8: ((bits >> 13) & 0xff) as u8,
-            fp_element_lane: if matches!(
-                instruction_id,
-                0x0000_00a1 | 0x0000_00a2 | 0x0000_00ad | 0x0000_00ae
-            ) {
-                if bits & (1 << 22) == 0 {
-                    (((bits >> 21) & 1) | (((bits >> 11) & 1) << 1)) as u8
-                } else {
-                    ((bits >> 11) & 1) as u8
+            0x0000_0079 => Some(FloatAddOperation::Add),
+            0x0000_007a => Some(FloatAddOperation::Subtract),
+            _ => None,
+        },
+        float_multiply_operation: match instruction_id {
+            0x0000_007b | 0x0000_00ad => Some(FloatMultiplyOperation::Multiply),
+            0x0000_007c => Some(FloatMultiplyOperation::NegatedMultiply),
+            _ => None,
+        },
+        float_fused_multiply_operation: matches!(instruction_id, 0x0000_0097 | 0x0000_00ae).then(
+            || {
+                if instruction_id == 0x0000_00ae {
+                    return if bits & (1 << 14) != 0 {
+                        FloatFusedMultiplyOperation::MultiplySubtract
+                    } else {
+                        FloatFusedMultiplyOperation::MultiplyAdd
+                    };
                 }
-            } else {
-                0
+                match ((bits >> 20) & 2) | ((bits >> 15) & 1) {
+                    0 => FloatFusedMultiplyOperation::MultiplyAdd,
+                    1 => FloatFusedMultiplyOperation::MultiplySubtract,
+                    2 => FloatFusedMultiplyOperation::NegatedMultiplyAdd,
+                    3 => FloatFusedMultiplyOperation::NegatedMultiplySubtract,
+                    _ => unreachable!(),
+                }
             },
-            float_conversion: match instruction_id {
-                0x0000_006f => Some(FloatConversion::SingleToDouble),
-                0x0000_0070 => Some(FloatConversion::DoubleToSingle),
-                _ => None,
-            },
-            float_to_integer_rounding: match instruction_id {
-                0x0000_007d | 0x0000_007e => Some(FloatToIntegerRounding::NearestEven),
-                0x0000_007f | 0x0000_0080 => Some(FloatToIntegerRounding::NearestAway),
-                0x0000_0081 | 0x0000_0082 => Some(FloatToIntegerRounding::TowardPositive),
-                0x0000_0083 | 0x0000_0084 => Some(FloatToIntegerRounding::TowardNegative),
-                0x0000_003c | 0x0000_003d | 0x0000_009e | 0x0000_009f | 0x0000_00aa
-                | 0x0000_00ab => Some(FloatToIntegerRounding::TowardZero),
-                _ => None,
-            },
-            fixed_point_fraction_bits: matches!(instruction_id, 0x0000_009e | 0x0000_009f)
-                .then(|| 64 - ((bits >> 10) & 0x3f) as u8),
-            float_round_operation: match instruction_id {
-                0x0000_0072 => Some(FloatRoundOperation::NearestEven),
-                0x0000_0073 => Some(FloatRoundOperation::TowardPositive),
-                0x0000_0074 => Some(FloatRoundOperation::TowardNegative),
-                0x0000_0075 => Some(FloatRoundOperation::TowardZero),
-                0x0000_0076 => Some(FloatRoundOperation::NearestAway),
-                0x0000_0077 => Some(FloatRoundOperation::Exact),
-                0x0000_0078 => Some(FloatRoundOperation::CurrentMode),
-                _ => None,
-            },
-            float_add_operation: match instruction_id {
-                0x0000_00a5 => Some(if bits & (1 << 23) == 0 {
-                    FloatAddOperation::Add
-                } else {
-                    FloatAddOperation::Subtract
-                }),
-                0x0000_0079 => Some(FloatAddOperation::Add),
-                0x0000_007a => Some(FloatAddOperation::Subtract),
-                _ => None,
-            },
-            float_multiply_operation: match instruction_id {
-                0x0000_007b | 0x0000_00ad => Some(FloatMultiplyOperation::Multiply),
-                0x0000_007c => Some(FloatMultiplyOperation::NegatedMultiply),
-                _ => None,
-            },
-            float_fused_multiply_operation: matches!(instruction_id, 0x0000_0097 | 0x0000_00ae)
-                .then(|| {
-                    if instruction_id == 0x0000_00ae {
-                        return if bits & (1 << 14) != 0 {
-                            FloatFusedMultiplyOperation::MultiplySubtract
-                        } else {
-                            FloatFusedMultiplyOperation::MultiplyAdd
-                        };
-                    }
-                    match ((bits >> 20) & 2) | ((bits >> 15) & 1) {
-                        0 => FloatFusedMultiplyOperation::MultiplyAdd,
-                        1 => FloatFusedMultiplyOperation::MultiplySubtract,
-                        2 => FloatFusedMultiplyOperation::NegatedMultiplyAdd,
-                        3 => FloatFusedMultiplyOperation::NegatedMultiplySubtract,
-                        _ => unreachable!(),
-                    }
-                }),
-        };
+        ),
+    };
     match instruction_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
         0x0000_008c => Instruction::DuplicateElement(operands),
@@ -1739,6 +1775,9 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_0096 => Instruction::VectorUnsignedShiftRegister(operands),
         0x0000_0093 => Instruction::CountBits(operands),
         0x0000_00a9 => Instruction::Reverse64(operands),
+        0x0000_00b1 => Instruction::Reverse32(operands),
+        0x0000_00af => Instruction::VectorFloatToSignedInt(operands),
+        0x0000_00b0 => Instruction::VectorFloatToUnsignedInt(operands),
         0x0000_00aa => Instruction::ScalarVectorFloatToSignedInt(operands),
         0x0000_00ab => Instruction::ScalarVectorFloatToUnsignedInt(operands),
         0x0000_0094 => Instruction::AddAcrossVector(operands),

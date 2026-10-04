@@ -18,6 +18,7 @@ pub(crate) enum IpcWireError {
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
     /// A decoded direct nvdrv wait which must suspend at the SVC boundary.
     PendingNvDrv(crate::nvdrv::PendingNvHostCtrlWait),
+    PendingGpuSubmission(crate::nvdrv::PendingGpuSubmission),
 }
 
 /// Fatal diagnostic retained when a checked HIPC/CMIF operation cannot finish.
@@ -91,7 +92,7 @@ impl std::fmt::Display for HorizonIpcFault {
                     "reached unsupported emulator semantics: {operation}"
                 )
             }
-            IpcWireError::PendingNvDrv(_) => {
+            IpcWireError::PendingNvDrv(_) | IpcWireError::PendingGpuSubmission(_) => {
                 formatter.write_str("pending nvdrv wait escaped the scheduler boundary")
             }
         }

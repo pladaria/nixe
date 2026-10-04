@@ -100,18 +100,20 @@ fn foreign_membership_is_evidence_even_without_a_dispatch_entry() {
     drop(work);
     retire(&process, foreign);
     assert!(process.lock().units.negatives.get(result_key).is_none());
-    // Removing ownership does not invent the missing LCQ entry; now this is
-    // unavailable input, not another persistent structural/no-op rejection.
+    // Removing ownership does not invent an LCQ entry. Its absence is now
+    // watched independently of the retired foreign family's membership.
     let work = reshape(&process, 0, 0, 16);
     let frozen = work
         .reserve_candidate(Graph::discover(&work).unwrap())
         .unwrap()
         .freeze()
         .unwrap();
-    assert!(matches!(
-        frozen.prepare_unchanged(),
-        Err(Error::StalePublication)
-    ));
+    assert!(frozen.prepare_unchanged().unwrap().install().unwrap());
+    assert!(!process.lock().keys.contains_key(&key(36)));
+    drop(frozen);
+    drop(work);
+    publish_words(&process, 36, &[RET]);
+    assert!(process.lock().units.negatives.get(result_key).is_none());
 }
 
 #[test]
@@ -124,7 +126,7 @@ fn frontier_storage_is_charged_and_pressure_does_not_leave_a_negative() {
     let bytes = blocked.capacity() * size_of_val(&blocked[0]);
     let before = process.cache.usage().unwrap();
     let evidence = work
-        .discovery_evidence(Vec::new(), blocked, Vec::new(), true)
+        .discovery_evidence(Vec::new(), blocked, Vec::new(), Vec::new())
         .unwrap();
     let charged = process.cache.usage().unwrap().metadata - before.metadata;
     assert_eq!(charged, bytes);
@@ -143,11 +145,53 @@ fn frontier_storage_is_charged_and_pressure_does_not_leave_a_negative() {
             Vec::new(),
             vec![work.blocker(super::key(20)).unwrap().unwrap()],
             Vec::new(),
-            true
+            Vec::new()
         ),
         Err(Error::Capacity(_))
     ));
     assert!(process.lock().units.negatives.get(key).is_none());
     drop(pressure);
     assert_eq!(process.cache.usage().unwrap().metadata, before.metadata);
+}
+
+#[test]
+fn missing_frontier_revalidates_publication_and_membership_without_fabricating_entries() {
+    for change in 0..3 {
+        let process = process();
+        publish_words(&process, 0, &[0x14000004]); // B 16.
+        publish_words(&process, 16, &[0x14003ffc]); // B 0x10000.
+        publish_words(&process, 0xfffc, &[NOP, RET]);
+        owned_entries(&process, &[(0, 0x14000004), (16, 0x14003ffc)], 2);
+        let result_key = result_key(&process);
+        let work = reshape(&process, 0, 0, 16);
+        let frozen = work
+            .reserve_candidate(Graph::discover(&work).unwrap())
+            .unwrap()
+            .freeze()
+            .unwrap();
+        assert!(frozen.unchanged());
+        let prepared = frozen.prepare_unchanged().unwrap();
+        assert!(!process.lock().keys.contains_key(&key(0x10000)));
+        match change {
+            0 => {
+                publish_words(&process, 0x11000, &[RET]);
+            }
+            1 => {
+                publish_words(&process, 0x10000, &[RET]);
+            }
+            _ => {
+                owned_entries(&process, &[(0xfffc, NOP), (0x10000, RET)], 1);
+            }
+        }
+        if change == 0 {
+            assert!(prepared.install().unwrap());
+            assert!(process.lock().units.negatives.get(result_key).is_some());
+            // The watched frontier is on a different page from all acquired inputs.
+            publish_words(&process, 0x10000, &[RET]);
+            assert!(process.lock().units.negatives.get(result_key).is_none());
+        } else {
+            assert!(matches!(prepared.install(), Err(Error::StalePublication)));
+            assert!(process.lock().units.negatives.get(result_key).is_none());
+        }
+    }
 }

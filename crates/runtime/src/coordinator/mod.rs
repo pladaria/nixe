@@ -124,6 +124,8 @@ pub struct RuntimeCoordinator {
     vcpu_events: BTreeMap<VirtualCpuId, VcpuEventState>,
     cpu_waits: BTreeMap<GuestThreadId, CpuWait>,
     adaptive_budget: AdaptiveExecutionBudget,
+    parallel_budgets: BTreeMap<VirtualCpuId, AdaptiveExecutionBudget>,
+    completed_executions: VecDeque<CoordinatorExecution>,
 }
 
 impl RuntimeCoordinator {
@@ -156,6 +158,11 @@ impl RuntimeCoordinator {
             .collect();
         let adaptive_budget =
             AdaptiveExecutionBudget::new(profile.default_timeslice_instructions());
+        let parallel_budgets = profile
+            .vcpus()
+            .iter()
+            .map(|descriptor| (descriptor.id(), adaptive_budget))
+            .collect();
         let workers = VcpuWorkerPool::start(
             profile.vcpus().iter().map(|descriptor| descriptor.id()),
             execution_mode == VcpuExecutionMode::Deterministic,
@@ -183,6 +190,8 @@ impl RuntimeCoordinator {
             vcpu_events,
             cpu_waits: BTreeMap::new(),
             adaptive_budget,
+            parallel_budgets,
+            completed_executions: VecDeque::new(),
         })
     }
 
@@ -259,12 +268,7 @@ impl RuntimeCoordinator {
     /// Quiesces workers and releases every process, CPU backend, wait, and
     /// canonical address-space resource. Repeated shutdown calls are harmless.
     pub fn shutdown(&mut self) -> Result<(), CoordinatorError> {
-        if self.host_stop_requested {
-            return self.workers.shutdown().map_err(CoordinatorError::Worker);
-        }
-        if let Some(lease) = self.scheduler.active_leases().next() {
-            return Err(CoordinatorError::ShutdownWithOutstandingLease(lease));
-        }
+        self.quiesce()?;
         let processes: Vec<_> = self.processes.keys().copied().collect();
         for process_id in processes {
             let process = self.remove_process(process_id)?;
@@ -392,6 +396,9 @@ impl RuntimeCoordinator {
     /// CPU thread, then transfers the process solely for final resource teardown.
     /// A removed process is terminal and cannot be registered again.
     pub fn remove_process(&mut self, id: ProcessId) -> Result<RunnableProcess, CoordinatorError> {
+        self.quiesce()?;
+        self.completed_executions
+            .retain(|execution| execution.lease.process != id);
         let threads: Vec<_> = self
             .processes
             .get(&id)
@@ -431,13 +438,9 @@ impl RuntimeCoordinator {
     /// Terminates every thread in a registered process through the scheduler
     /// and records a host-requested process exit without releasing resources.
     pub fn terminate_process(&mut self, id: ProcessId) -> Result<bool, CoordinatorError> {
-        if let Some(lease) = self
-            .scheduler
-            .active_leases()
-            .find(|lease| lease.process == id)
-        {
-            return Err(CoordinatorError::InFlightLease(lease));
-        }
+        self.quiesce()?;
+        self.completed_executions
+            .retain(|execution| execution.lease.process != id);
         let threads: Vec<_> = self
             .processes
             .get(&id)
@@ -454,6 +457,15 @@ impl RuntimeCoordinator {
         if terminated {
             for thread in threads {
                 self.cpu_waits.remove(&thread);
+                if self.scheduler.thread(thread).is_some_and(|view| {
+                    matches!(
+                        view.lifecycle,
+                        nixe_scheduler::ThreadLifecycle::Exited
+                            | nixe_scheduler::ThreadLifecycle::Faulted
+                    )
+                }) {
+                    continue;
+                }
                 self.scheduler.apply(SchedulerCommand::Terminate {
                     thread,
                     faulted: false,
@@ -789,7 +801,6 @@ pub enum CoordinatorError {
         process: ProcessId,
         failure: crate::ProcessTeardownFailure,
     },
-    ShutdownWithOutstandingLease(Lease),
     ReplayRequiresDeterministicMode,
     ReplayIncomplete {
         remaining_dispatches: usize,
@@ -844,8 +855,9 @@ impl Drop for RuntimeCoordinator {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoordinatorRouteError {
+    Coordinator(Box<CoordinatorError>),
     UnknownProcess(ProcessId),
     Route(ExceptionRouteError),
     Scheduler(SchedulerError),

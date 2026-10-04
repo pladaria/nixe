@@ -98,12 +98,15 @@ pub(in crate::native) fn lookup(
             );
         }
         HostAbi::Aarch64 => {
-            // UBFM/LSR, EOR, UBFM low 11 bits, then ADD shifted register.
+            // UBFM/LSR, EOR, UBFM of the selector bits, then ADD shifted register.
             // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions
             e.word(0xd342fe10); // LSR x16,x16,#2
             e.constant(17, u64::from(salt), 8);
             e.word(0xca110210); // EOR x16,x16,x17
-            e.word(0xd3402a10); // UBFX x16,x16,#0,#11
+            // UBFX's width is imms + 1 when immr is zero. Keep the native
+            // mask identical to Rust's set_index when table geometry changes.
+            // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+            e.word(0xd3400210 | ((SETS.ilog2() - 1) << 10));
             e.memory(
                 true,
                 Integer,

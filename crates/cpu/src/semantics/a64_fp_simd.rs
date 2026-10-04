@@ -173,8 +173,16 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             );
             Ok(())
         }
-        Instruction::Reverse64(_) => {
-            reverse_64(state, fields);
+        Instruction::Reverse64(_) | Instruction::Reverse32(_) => {
+            reverse_elements(
+                state,
+                fields,
+                if matches!(instruction, Instruction::Reverse32(_)) {
+                    4
+                } else {
+                    8
+                },
+            );
             Ok(())
         }
         Instruction::CountBits(_) => {
@@ -234,6 +242,21 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             if inexact {
                 state.set_fpsr(state.fpsr() | (1 << 4));
             }
+            Ok(())
+        }
+        Instruction::VectorFloatToSignedInt(_) | Instruction::VectorFloatToUnsignedInt(_) => {
+            let outcome = exact_vector_float_to_integer(
+                state.vector(fields.rn).unwrap(),
+                if fields.opc == 0 { 32 } else { 64 },
+                if fields.vector_128 { 128 } else { 64 },
+                matches!(instruction, Instruction::VectorFloatToSignedInt(_)),
+                state.fpcr(),
+            );
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(A64FpSimdError::Trap);
+            }
+            assert!(state.set_vector(fields.rd, outcome.bits));
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
             Ok(())
         }
         Instruction::ScalarVectorFloatToSignedInt(_)
@@ -2373,6 +2396,39 @@ fn scalar_float_add(
     }
 }
 
+/// FCVTZS/FCVTZU converts each active lane toward zero. Aggregate exceptions
+/// before committing so a trap in any lane leaves the entire instruction intact.
+/// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1330-1332, 1344-1346)
+pub fn exact_vector_float_to_integer(
+    source: u128,
+    lane_bits: u8,
+    vector_bits: u8,
+    signed: bool,
+    fpcr: u32,
+) -> ExactFpOutcome {
+    let mask = if lane_bits == 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    let mut bits = 0;
+    let mut status = FpStatus::default();
+    for shift in (0..u32::from(vector_bits)).step_by(usize::from(lane_bits)) {
+        let outcome = exact_float_to_integer(
+            (source >> shift) as u64 & mask,
+            lane_bits,
+            lane_bits,
+            signed,
+            FloatToIntegerRounding::TowardZero,
+            0,
+            fpcr,
+        );
+        bits |= u128::from(outcome.value & mask) << shift;
+        merge_fp_status(&mut status, outcome.status);
+    }
+    ExactFpOutcome { bits, status }
+}
+
 /// Apply the scalar operation to active lanes and merge status before committing.
 /// https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.35, D6.100)
 pub fn exact_vector_float_add(
@@ -3742,19 +3798,25 @@ fn shift_lane(value: u128, distance: i8, lane_bits: u32, signed: bool) -> u128 {
 // within an element. The 64-bit vector form clears the upper destination half.
 // Arm A64 ISA (2025), REV64:
 // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
-fn reverse_64(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (REV32/REV64)
+fn reverse_elements(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    container_bytes: usize,
+) {
     let element_bytes = 1_usize << fields.opc;
     let active_bytes = if fields.vector_128 { 16 } else { 8 };
     let source = state
         .vector(fields.rn)
-        .expect("normalized REV64 source")
+        .expect("normalized vector reversal source")
         .to_le_bytes();
     let mut result = [0_u8; 16];
     for (index, byte) in result[..active_bytes].iter_mut().enumerate() {
-        let container = index / 8 * 8;
-        let element = index % 8 / element_bytes;
-        *byte = source
-            [container + (8 / element_bytes - 1 - element) * element_bytes + index % element_bytes];
+        let container = index / container_bytes * container_bytes;
+        let element = index % container_bytes / element_bytes;
+        *byte = source[container
+            + (container_bytes / element_bytes - 1 - element) * element_bytes
+            + index % element_bytes];
     }
     assert!(state.set_vector(fields.rd, u128::from_le_bytes(result)));
 }

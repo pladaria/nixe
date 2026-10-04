@@ -117,14 +117,9 @@ pub(super) fn decode_float_multiply(
             detail: "FMUL source negation",
         });
     }
-    if encoding & (1 << if full_immediate { 55 } else { 50 }) != 0 {
-        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-            stage,
-            instruction_offset: offset,
-            encoding,
-            detail: "FMUL saturation",
-        });
-    }
+    // SAT clamps the rounded result to [0, 1], including NaN -> +0.
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul
+    let saturate = encoding & (1 << if full_immediate { 55 } else { 50 }) != 0;
     let rounding = match if full_immediate {
         0
     } else {
@@ -141,7 +136,7 @@ pub(super) fn decode_float_multiply(
         ShaderNanMode::Propagate,
         ftz || dnz,
         ftz || dnz,
-        false,
+        saturate,
     );
     let opcode = (encoding >> 48) as u16;
     let (right, preparation, constant_buffer_binding) = if opcode & 0xfffa == 0x5c68 {
@@ -349,14 +344,7 @@ pub(super) fn decode_float_add(
     }
     let destination = (encoding & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-    if encoding & (1 << 50) != 0 {
-        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-            stage,
-            instruction_offset: offset,
-            encoding,
-            detail: "FADD saturation",
-        });
-    }
+    let saturate = encoding & (1 << 50) != 0;
     let rounding = match (encoding >> 39) & 0x3 {
         0 => ShaderRoundingMode::NearestEven,
         1 => ShaderRoundingMode::TowardNegative,
@@ -371,7 +359,7 @@ pub(super) fn decode_float_add(
         // FADD.FTZ also flushes subnormal inputs, not only the rounded sum.
         // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add
         encoding & (1 << 44) != 0,
-        false,
+        saturate,
     );
     let opcode = (encoding >> 48) as u16;
     let mut operations = Vec::with_capacity(5);
@@ -722,14 +710,7 @@ pub(super) fn decode_float_fused_multiply_add(
     }
     let destination = (encoding & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-    if encoding & (1 << 50) != 0 {
-        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-            stage,
-            instruction_offset: offset,
-            encoding,
-            detail: "FFMA saturation",
-        });
-    }
+    let saturate = encoding & (1 << 50) != 0;
     let rounding = match (encoding >> 51) & 0x3 {
         0 => ShaderRoundingMode::NearestEven,
         1 => ShaderRoundingMode::TowardNegative,
@@ -742,7 +723,7 @@ pub(super) fn decode_float_fused_multiply_add(
         ShaderNanMode::Propagate,
         encoding & (1 << 53) != 0,
         encoding & (1 << 53) != 0,
-        false,
+        saturate,
     );
     let opcode_class = ((encoding >> 48) as u16) & 0xff80;
     let mut operations = Vec::with_capacity(6);

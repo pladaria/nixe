@@ -51,6 +51,9 @@ impl Translator<'_> {
             Instruction::ScalarFloatSquareRoot(_) | Instruction::ScalarFloatConvert(_) => {
                 self.fp_unary(pc, instruction, flags)
             }
+            Instruction::VectorFloatToSignedInt(_) | Instruction::VectorFloatToUnsignedInt(_) => {
+                self.vector_fp_to_integer(pc, instruction, flags)
+            }
             Instruction::FloatToSignedInt(_)
             | Instruction::FloatToUnsignedInt(_)
             | Instruction::ScalarVectorFloatToSignedInt(_)
@@ -59,6 +62,90 @@ impl Translator<'_> {
             }
             _ => unreachable!("unported FP lowering rejected before builder creation"),
         }
+    }
+
+    // Normal, in-range lanes lower natively; exceptional values use the exact
+    // typed completion, including saturation, cumulative status and traps.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1330-1332, 1344-1346)
+    fn vector_fp_to_integer(
+        &mut self,
+        pc: GuestVirtualAddress,
+        instruction: Instruction,
+        flags: &mut LazyFlags<ir::Value>,
+    ) -> Result<bool, Error> {
+        let f = instruction.operands();
+        let width = scalar_width(f.opc)?;
+        let vector_bits = if f.vector_128 { 128 } else { 64 };
+        let operation = crate::abi::VectorFpToIntegerOperation {
+            rn: f.rn,
+            rd: f.rd,
+            lane_64: width == 64,
+            vector_bits: vector_bits as u8,
+            signed: matches!(instruction, Instruction::VectorFloatToSignedInt(_)),
+        };
+        let source = self.read_vector(f.rn)?;
+        let lanes = self.vector_as(
+            source,
+            if width == 64 {
+                types::I64X2
+            } else {
+                types::I32X4
+            },
+        );
+        let mut direct = self.builder.ins().iconst(types::I8, 1);
+        for lane in 0..vector_bits / width {
+            let bits = self.builder.ins().extractlane(lanes, lane as u8);
+            let eligible =
+                self.fp_to_integer_domain(bits, width, operation.lane_64, operation.signed, 0);
+            direct = self.builder.ins().band(direct, eligible);
+        }
+        self.native_fp_path(pc, EdgeKind::VectorFpToInteger(operation), direct, flags)?;
+        let source = self.read_vector(f.rn)?;
+        let source = self.mask_vector(source, vector_bits);
+        let result = if width == 32 {
+            let value = self.vector_as(source, types::F32X4);
+            if operation.signed {
+                self.builder.ins().fcvt_to_sint_sat(types::I32X4, value)
+            } else {
+                // Stock x86 packed unsigned saturation subtracts 2^31 in
+                // every lane, including lanes that never use that result,
+                // leaking host inexact flags. Subtract only in upper-half
+                // lanes; Sterbenz guarantees that subtraction is exact.
+                let bits = self.vector_as(value, types::I32X4);
+                let magnitude = self.builder.ins().iconst(types::I32, 0x7fff_ffff);
+                let magnitude = self.builder.ins().splat(types::I32X4, magnitude);
+                let bits = self.builder.ins().band(bits, magnitude); // unsigned -0 is also zero
+                let bound = self.builder.ins().iconst(types::I32, 0x4f00_0000); // 2^31
+                let bound = self.builder.ins().splat(types::I32X4, bound);
+                let high = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, bits, bound);
+                let subtract = self.builder.ins().band(high, bound);
+                let subtract = self.vector_as(subtract, types::F32X4);
+                let adjusted = self.builder.ins().fsub(value, subtract);
+                let converted = self.builder.ins().fcvt_to_sint_sat(types::I32X4, adjusted);
+                let sign = self.builder.ins().iconst(types::I32, i64::from(i32::MIN));
+                let sign = self.builder.ins().splat(types::I32X4, sign);
+                let sign = self.builder.ins().band(high, sign);
+                self.builder.ins().bor(converted, sign)
+            }
+        } else {
+            // Baseline x86 has no packed double-to-i64 conversion.
+            let lanes = self.vector_as(source, types::I64X2);
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            let mut result = self.builder.ins().splat(types::I64X2, zero);
+            for lane in 0..2 {
+                let bits = self.builder.ins().extractlane(lanes, lane);
+                let value = self.fp_to_integer_value(bits, true, true, operation.signed);
+                result = self.builder.ins().insertlane(result, value, lane);
+            }
+            result
+        };
+        let result = self.vector_as(result, types::I8X16);
+        let result = self.mask_vector(result, vector_bits);
+        self.write_vector(f.rd, result);
+        Ok(false)
     }
 
     fn fp_to_integer(
@@ -99,11 +186,17 @@ impl Translator<'_> {
         }
         let width = scalar_width(f.opc)?;
         let bits = self.scalar_fp_bits(f.rn, width)?;
-        let direct =
-            self.fp_to_integer_domain(bits, width, operation.destination_64, operation.signed);
+        let direct = self.fp_to_integer_domain(
+            bits,
+            width,
+            operation.destination_64,
+            operation.signed,
+            operation.fractional_bits,
+        );
         self.native_fp_path(pc, kind, direct, flags)?;
         // The activation continuation defines fresh SSA inputs.
         let bits = self.scalar_fp_bits(f.rn, width)?;
+        let bits = self.scale_fp_to_integer_bits(bits, width, operation.fractional_bits);
         let result = self.fp_to_integer_value(
             bits,
             operation.source_64,
@@ -214,17 +307,8 @@ impl Translator<'_> {
         let direct = self.builder.ins().band(direct, compatible);
         self.native_fp_path(pc, EdgeKind::FpAdd(operation), direct, flags)?;
         // Activation defines new SSA inputs; reload through the continuation.
-        let first = self.scalar_fp_bits(f.rn, width)?;
-        let second = self.scalar_fp_bits(f.rm, width)?;
-        let ty = if width == 32 { types::F32 } else { types::F64 };
-        let first = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), first);
-        let second = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), second);
+        let first = self.fp_element_value(f.rn, width, None)?;
+        let second = self.fp_element_value(f.rm, width, None)?;
         let result = self.float_add_values(first, second, operation.operation);
         self.write_fp_scalar(f.rd, result);
         Ok(false)
@@ -313,17 +397,8 @@ impl Translator<'_> {
             flags,
         )?;
         // The activation continuation owns fresh SSA bindings.
-        let first = self.scalar_fp_bits(f.rn, width)?;
-        let second = self.scalar_fp_bits(f.rm, width)?;
-        let ty = if width == 32 { types::F32 } else { types::F64 };
-        let first = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), first);
-        let second = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), second);
+        let first = self.fp_element_value(f.rn, width, None)?;
+        let second = self.fp_element_value(f.rm, width, None)?;
         let result = self.fp_divide_value(first, second);
         self.write_fp_scalar(f.rd, result);
         Ok(false)
@@ -468,6 +543,24 @@ impl Translator<'_> {
         Ok(false)
     }
 
+    // Extract arithmetic operands as FP values directly. Extracting integer
+    // bits and bitcasting afterward crosses register files on baseline x86;
+    // the integer extraction remains separate for exception-domain guards.
+    fn fp_element_value(
+        &mut self,
+        register: u8,
+        width: u32,
+        lane: Option<u8>,
+    ) -> Result<ir::Value, Error> {
+        let ty = if width == 32 {
+            types::F32X4
+        } else {
+            types::F64X2
+        };
+        let vector = self.read_vector_as(register, ty)?;
+        Ok(self.builder.ins().extractlane(vector, lane.unwrap_or(0)))
+    }
+
     fn fp_element_bits(
         &mut self,
         register: u8,
@@ -524,17 +617,8 @@ impl Translator<'_> {
             flags,
         )?;
         // The activation continuation owns fresh SSA bindings.
-        let first = self.scalar_fp_bits(f.rn, width)?;
-        let second = self.fp_element_bits(f.rm, width, lane)?;
-        let ty = if width == 32 { types::F32 } else { types::F64 };
-        let first = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), first);
-        let second = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), second);
+        let first = self.fp_element_value(f.rn, width, None)?;
+        let second = self.fp_element_value(f.rm, width, lane)?;
         let result = self.fp_multiply_value(
             first,
             second,
@@ -591,22 +675,9 @@ impl Translator<'_> {
             direct = self.builder.ins().band(direct, compatible);
         }
         self.native_fp_path(pc, EdgeKind::FpFused(operation), direct, flags)?;
-        let first = self.scalar_fp_bits(f.rn, width)?;
-        let second = self.fp_element_bits(f.rm, width, lane)?;
-        let third = self.scalar_fp_bits(f.ra, width)?;
-        let ty = if width == 32 { types::F32 } else { types::F64 };
-        let first = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), first);
-        let second = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), second);
-        let third = self
-            .builder
-            .ins()
-            .bitcast(ty, crate::simd_lowering::bitcast_flags(), third);
+        let first = self.fp_element_value(f.rn, width, None)?;
+        let second = self.fp_element_value(f.rm, width, lane)?;
+        let third = self.fp_element_value(f.ra, width, None)?;
         let result = self.fp_fused_value(first, second, third, operation.operation);
         self.write_fp_scalar(f.rd, result);
         Ok(false)
@@ -707,12 +778,19 @@ impl Translator<'_> {
 
     fn write_fp_scalar(&mut self, rd: u8, result: ir::Value) {
         let width = self.builder.func.dfg.value_type(result).bits();
-        let result = self.builder.ins().bitcast(
-            if width == 32 { types::I32 } else { types::I64 },
-            crate::simd_lowering::bitcast_flags(),
+        // Scalar Arm FP writes clear the remaining vector bits. Keep the
+        // value in the SIMD register file instead of splitting an I128 value
+        // into GPR halves and reconstructing it after every arithmetic result.
+        // Switch 1 has no FEAT_AFP merging mode; see FADD's 128-bit result:
+        // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (p. 1188)
+        let result = self.builder.ins().scalar_to_vector(
+            if width == 32 {
+                types::F32X4
+            } else {
+                types::F64X2
+            },
             result,
         );
-        let result = self.builder.ins().uextend(types::I128, result);
         let result = self.vector_as(result, types::I8X16);
         self.write_vector(rd, result);
     }
@@ -769,12 +847,7 @@ impl Translator<'_> {
             direct,
             flags,
         )?;
-        let bits = self.scalar_fp_bits(f.rn, width)?;
-        let value = self.builder.ins().bitcast(
-            if width == 32 { types::F32 } else { types::F64 },
-            crate::simd_lowering::bitcast_flags(),
-            bits,
-        );
+        let value = self.fp_element_value(f.rn, width, None)?;
         let result = self.fp_unary_value(value, kind);
         self.write_fp_scalar(f.rd, result);
         Ok(false)
@@ -843,18 +916,14 @@ impl Translator<'_> {
             condition: matches!(instruction, Instruction::ConditionalCompare(_))
                 .then_some((Condition::from_encoding(f.condition), f.nzcv_immediate)),
         };
-        if operation.condition.is_some() {
-            // Matches the shared Exact policy for FCCMP/FCCMPE. No successor
-            // has been captured; success demands PC+4, failure retains PC.
-            self.constant_exit(
-                pc,
-                pc,
-                EdgeKind::FpCompare(operation),
-                NativeExitReason::Architectural,
-                flags,
-            )?;
-            return Ok(true);
-        }
+        // The false condition must not observe FP inputs or raise exceptions.
+        // Select harmless zeros before the ordered comparison, including when
+        // the unused inputs are signaling NaNs and invalid traps are enabled.
+        // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCCMP--Floating-point-Conditional-Compare--scalar--
+        // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCCMPE--Floating-point-Conditional-Compare--scalar--
+        let condition = operation
+            .condition
+            .map(|(condition, _)| self.emit_condition(condition, flags));
         let width = scalar_width(f.opc)?;
         let first = self.scalar_fp_bits(f.rn, width)?;
         let second = if let Some(rm) = operation.rm {
@@ -863,6 +932,18 @@ impl Translator<'_> {
             self.builder
                 .ins()
                 .iconst(if width == 32 { types::I32 } else { types::I64 }, 0)
+        };
+        let (first, second) = if let Some(condition) = condition {
+            let zero = self
+                .builder
+                .ins()
+                .iconst(if width == 32 { types::I32 } else { types::I64 }, 0);
+            (
+                self.builder.ins().select(condition, first, zero),
+                self.builder.ins().select(condition, second, zero),
+            )
+        } else {
+            (first, second)
         };
         let first_direct = self.fp_finite_or_zero(first, width);
         let second_direct = self.fp_finite_or_zero(second, width);
@@ -880,7 +961,18 @@ impl Translator<'_> {
             flags,
         )?;
         self.builder.switch_to_block(native);
-        *flags = LazyFlags::Packed(self.ordered_fp_compare(first, second, width));
+        let ordered = self.ordered_fp_compare(first, second, width);
+        let result = if let Some(condition) = condition {
+            let (_, literal) = operation.condition.unwrap();
+            let literal = self
+                .builder
+                .ins()
+                .iconst(types::I32, i64::from(literal) << 28);
+            self.builder.ins().select(condition, ordered, literal)
+        } else {
+            ordered
+        };
+        *flags = LazyFlags::Packed(result);
         self.dirty.nzcv = crate::analysis::NZCV;
         Ok(false)
     }

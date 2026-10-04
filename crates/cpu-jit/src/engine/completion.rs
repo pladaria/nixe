@@ -127,7 +127,8 @@ impl JitThread {
                     | EdgeKind::FpUnary(_)
                     | EdgeKind::FpToInteger(_)
                     | EdgeKind::IntegerToFp(_)
-                    | EdgeKind::VectorIntegerToFp(_)) => {
+                    | EdgeKind::VectorIntegerToFp(_)
+                    | EdgeKind::VectorFpToInteger(_)) => {
                         let result = match kind {
                             EdgeKind::FpCompare(op) => fp::complete_compare(op, state),
                             EdgeKind::FpRound(op) => fp::complete_round(op, state),
@@ -144,6 +145,9 @@ impl JitThread {
                             EdgeKind::FpFused(op) => fp::complete_fused(op, state),
                             EdgeKind::FpUnary(op) => fp::complete_unary(op, state),
                             EdgeKind::FpToInteger(op) => fp::complete_to_integer(op, state),
+                            EdgeKind::VectorFpToInteger(op) => {
+                                fp::complete_vector_to_integer(op, state)
+                            }
                             EdgeKind::IntegerToFp(op) => fp::complete_from_integer(op, state),
                             EdgeKind::VectorIntegerToFp(op) => {
                                 fp::complete_from_vector_integer(op, state)

@@ -236,7 +236,11 @@ fn logical_immediate(state: &mut A64State, fields: Operands) -> bool {
     };
     let opcode = u8::from(fields.subtract) * 2 + u8::from(fields.set_flags);
     let result = logical(opcode, read(state, fields.rn, bits, false), immediate) & mask(fields);
-    write(state, fields.rd, bits, false, result);
+    // AND/ORR/EOR immediate use SP as destination 31; ANDS uses ZR.
+    // The source register 31 is always ZR, including MOV's ORR alias.
+    // Arm A64 ISA, AND (immediate), p. 38:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    write(state, fields.rd, bits, opcode != 3, result);
     if opcode == 3 {
         set_logical_flags(state, result, bits);
     }

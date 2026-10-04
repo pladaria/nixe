@@ -33,7 +33,8 @@ pub use device::{
 };
 use diagnostics::NvDrvCallError;
 pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrvOperation};
-use gpu_executor::NvDrvGpuExecutor;
+pub(crate) use gpu_executor::PendingGpuSubmission;
+use gpu_executor::{GpuSubmissionAdmission, NvDrvGpuExecutor};
 use ioctl::NvDrvIoctlResponse;
 pub(crate) use ioctl::{NvDrvInlineBuffer, NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use nvhost_as_gpu::{decode_bind_channel, ioctl_nvhost_as_gpu};
@@ -169,10 +170,10 @@ impl NvDrvSession {
         }
     }
 
-    pub(crate) fn acquire_presentable_image(
+    pub(crate) fn request_presentable_image(
         &self,
         request: PresentationImageRequest,
-    ) -> Result<ResidentImage, Box<str>> {
+    ) -> Result<std::sync::mpsc::Receiver<Result<ResidentImage, Box<str>>>, Box<str>> {
         let backend = self
             .state
             .lock()
@@ -184,7 +185,7 @@ impl NvDrvSession {
             || Err("GPU backend is unavailable for resident presentation".into()),
             |backend| {
                 backend
-                    .acquire_presentable_image(request)
+                    .request_presentable_image(request)
                     .map_err(|error| error.to_string().into_boxed_str())
             },
         )
@@ -363,7 +364,8 @@ impl NvDrvSession {
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
         match self.ioctl_inner(fd, request, input, NvDrvInlineBuffer::None, None, 1)? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
-            NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
+            NvDrvIoctlOutcome::PendingSyncpointWait(_)
+            | NvDrvIoctlOutcome::PendingSubmission(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
             }
         }
@@ -397,7 +399,8 @@ impl NvDrvSession {
             1,
         )? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
-            NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
+            NvDrvIoctlOutcome::PendingSyncpointWait(_)
+            | NvDrvIoctlOutcome::PendingSubmission(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
             }
         }
@@ -424,7 +427,8 @@ impl NvDrvSession {
             thread_id: 1,
         })? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
-            NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
+            NvDrvIoctlOutcome::PendingSyncpointWait(_)
+            | NvDrvIoctlOutcome::PendingSubmission(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
             }
         }
@@ -692,35 +696,45 @@ impl NvDrvSession {
                 backend,
             }) => {
                 let descriptor = descriptor.expect("deferred GPU ioctl has a descriptor");
+                let permit = backend.reserve_submission().map_err(|error| {
+                    nvhost_gpu::queued_execution_error(descriptor, request, error)
+                })?;
+                let permit = match permit {
+                    GpuSubmissionAdmission::Ready(permit) => permit,
+                    GpuSubmissionAdmission::Pending(wait) => {
+                        return Ok(NvDrvIoctlOutcome::PendingSubmission(wait));
+                    }
+                };
                 let address_space_id = gpu
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .bound_address_space(descriptor.fd());
-                let address_space = address_space_id.and_then(|id| {
-                    address_spaces
+                let result = {
+                    // Frontend lowering only borrows the mapping table. Keep
+                    // it stable through lowering instead of cloning every
+                    // mapping and reservation for each submission/retry.
+                    let address_spaces = address_spaces
                         .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let address_space = address_space_id.and_then(|id| {
+                        address_spaces
+                            .values()
+                            .find(|address_space| address_space.id() == id)
+                    });
+                    gpu.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .values()
-                        .find(|address_space| address_space.id() == id)
-                        .cloned()
-                });
-                let permit = backend.reserve_submission().map_err(|error| {
-                    nvhost_gpu::queued_execution_error(descriptor, request, error)
-                })?;
-                let result = gpu
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .submit_ioctl(
-                        permit,
-                        NvHostGpuSubmitResources {
-                            control: &control,
-                            address_space: address_space.as_ref(),
-                        },
-                        descriptor,
-                        request,
-                        input,
-                        inline.input(),
-                    );
+                        .submit_ioctl(
+                            permit,
+                            NvHostGpuSubmitResources {
+                                control: &control,
+                                address_space,
+                            },
+                            descriptor,
+                            request,
+                            input,
+                            inline.input(),
+                        )
+                };
                 let result = match result {
                     Ok(result) => result,
                     Err(NvDrvCallError::GuestResult(error)) => {

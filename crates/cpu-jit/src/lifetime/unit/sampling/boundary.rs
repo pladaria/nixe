@@ -23,7 +23,7 @@ impl Lifetime {
         samples: &mut Samples,
         edge: ObservedEdge,
     ) -> Result<(), Error> {
-        let Some(state) = self.sample_state()? else {
+        let Some(mut state) = self.sample_state()? else {
             return Ok(());
         };
         let handle = unit
@@ -90,6 +90,7 @@ impl Lifetime {
                 }
             }
         }
+        state.units.sample_eviction(handle.0);
         let target = block
             .at(edge.destination)
             .and_then(|key| endpoint(&state, key).map(|entry| (key, entry)));

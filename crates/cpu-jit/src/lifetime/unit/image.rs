@@ -14,6 +14,7 @@ struct Word {
 pub(crate) struct InstructionImage {
     context: BlockKey,
     words: Box<[Word]>,
+    pc_bounds: [u64; 2],
 }
 
 impl InstructionImage {
@@ -31,6 +32,23 @@ impl InstructionImage {
     }
     pub(super) fn bytes(&self) -> usize {
         std::mem::size_of_val(&*self.words)
+    }
+    /// Reject unrelated mappings before visiting instructions or reconstructing
+    /// their execution keys. Regions may contain holes and multiple entries;
+    /// bounds only select candidates, never establish an invalidation hit.
+    pub(super) fn overlaps_mapping(
+        &self,
+        address_space: nixe_memory::AddressSpaceId,
+        start: u128,
+        end: u128,
+    ) -> bool {
+        self.context.address_space == address_space
+            && u128::from(self.pc_bounds[0]) < end
+            && start < u128::from(self.pc_bounds[1]) + 4
+            && self.words.iter().any(|word| {
+                let pc = u128::from(word.pc.get());
+                pc < end && start < pc + 4
+            })
     }
     fn expand(&self, word: Word) -> Instruction {
         Instruction {
@@ -51,6 +69,13 @@ impl Input {
             .collect();
         let instructions = InstructionImage {
             context: self.instructions[0].key.block_key(),
+            pc_bounds: self
+                .instructions
+                .iter()
+                .fold([u64::MAX, 0], |bounds, word| {
+                    let pc = word.key.block_key().pc.get();
+                    [bounds[0].min(pc), bounds[1].max(pc)]
+                }),
             words: self
                 .instructions
                 .iter()

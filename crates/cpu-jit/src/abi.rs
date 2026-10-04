@@ -1003,6 +1003,16 @@ pub struct VectorIntegerToFpOperation {
     pub signed: bool,
 }
 
+/// Advanced SIMD FCVTZS/FCVTZU over equally sized FP and integer lanes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VectorFpToIntegerOperation {
+    pub rn: u8,
+    pub rd: u8,
+    pub lane_64: bool,
+    pub vector_bits: u8,
+    pub signed: bool,
+}
+
 /// Exact scalar FCVT operands. XZR/WZR discards only the integer result, not
 /// status or exceptions; the source is always a scalar vector register.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

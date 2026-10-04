@@ -5,7 +5,8 @@ use super::binary::{
     MaxwellShaderBinary, MaxwellShaderMetadata,
 };
 use super::control_flow::{
-    decode_shader_control_target, is_branch, is_exit, is_set_sync_point, is_synchronize,
+    decode_shader_control_target, is_branch, is_dependency_barrier, is_exit, is_set_sync_point,
+    is_synchronize, validate_dependency_barrier,
 };
 use super::conversion::{
     decode_float_to_float, decode_float_to_integer, decode_integer_to_float, is_float_to_float,
@@ -66,6 +67,20 @@ pub(super) fn translate_shader_binary(
 ) -> Result<TranslatedShaderIr, MaxwellShaderTranslationError> {
     let stage = binary.stage();
     let neutral_stage = neutral_stage(stage);
+    // The reciprocal/IPA fusion below uses straight-line register definitions.
+    // Branching programs retain the explicit arithmetic rather than assuming
+    // a definition dominates every path into the interpolation instruction.
+    // Stop at the first unconditional EXIT: UAM places an unreachable trap
+    // branch in the remaining slots of that same scheduling bundle.
+    let straight_line_fragment = stage == MaxwellShaderStage::Pixel
+        && !binary
+            .bundles()
+            .iter()
+            .flat_map(|bundle| bundle.instructions)
+            .take_while(|&encoding| {
+                !(is_exit(encoding) && decode_predicate(encoding) == ShaderPredicate::Always)
+            })
+            .any(|encoding| is_branch(encoding) || is_synchronize(encoding));
     let (mut inputs, outputs) = match binary.metadata {
         MaxwellShaderMetadata::Graphics(header) => (
             decode_header_inputs(header, vertex_input_types)?,
@@ -183,6 +198,16 @@ pub(super) fn translate_shader_binary(
                     ));
                 }
                 patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
+                continue;
+            }
+
+            if is_dependency_barrier(encoding) {
+                validate_dependency_barrier(stage, offset, encoding)?;
+                instructions.push(ShaderInstruction::new(
+                    source,
+                    predicate,
+                    ShaderOperation::Nop,
+                ));
                 continue;
             }
 
@@ -425,7 +450,22 @@ pub(super) fn translate_shader_binary(
                         &mut texture_bindings,
                     )?
                 } else if is_interpolate(encoding) {
-                    decode_interpolate(stage, offset, encoding, register_count, &inputs)?
+                    let operations = decode_interpolate(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut inputs,
+                        &mut next_temporary,
+                        straight_line_fragment
+                            && ((encoding >> 54) & 3) == 1
+                            && super::interface::is_reciprocal_fragment_w(
+                                &instructions,
+                                nixe_gpu::ShaderRegister::new(((encoding >> 20) & 0xff) as u16),
+                            ),
+                    )?;
+                    append_expanded_operations(&mut instructions, source, predicate, operations);
+                    break 'instruction;
                 } else if is_mufu(encoding) {
                     if let Some(range_reduction) = pending_range_reduction.take() {
                         if let Some(binding) = range_reduction.constant_buffer_binding {
@@ -684,6 +724,7 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_branch(encoding)
         || is_set_sync_point(encoding)
         || is_synchronize(encoding)
+        || is_dependency_barrier(encoding)
         || is_attribute_load(encoding)
         || is_attribute_store(encoding)
         || is_move_immediate(encoding)

@@ -120,7 +120,9 @@ fn handle(process: &ScheduledProcess) -> u32 {
 
 #[test]
 fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
-    for auto in [false, true] {
+    'variants: for (auto, invalid_release) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let (_dir, mut process) =
             fixture_process_with_svcs(&[&[0x1f][..], &[0x21; 100][..]].concat());
         let backend = Arc::new(Backend::default());
@@ -309,6 +311,63 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             feed.render(&mut pcm);
             assert_eq!(pcm, [2, -2]);
             assert!(event.is_signalled());
+            if invalid_release {
+                // A release list starts in writable RAM but crosses into a
+                // read-only page. Validate EVERY destination page before
+                // draining tags or clearing the release event.
+                let crossing = base.checked_add(4092).unwrap();
+                process
+                    .memory()
+                    .set_permissions(
+                        process.cpu_context().address_space_id(),
+                        base.checked_add(4096).unwrap(),
+                        4096,
+                        MemoryPermissions::READ,
+                    )
+                    .unwrap();
+                let release = command(
+                    if auto { 8 } else { 5 },
+                    &[],
+                    None,
+                    Some((crossing.get(), 16)),
+                    auto,
+                    false,
+                );
+                write_guest_bytes(&process, process.main_thread().tls_base, &release);
+                state(&mut process).write_w(x(0), audio);
+                let ExceptionHandlingResult::Rejected(fault) =
+                    dispatch_next(&mut process, &mut dispatcher)
+                else {
+                    panic!("read-only release destination must reject the IPC request");
+                };
+                assert!(matches!(fault, HorizonSvcFault::GuestMemory { fault, .. }
+                    if fault.reason == nixe_cpu::memory::DataAccessFaultReason::WritePermissionDenied));
+                assert_eq!(
+                    state(&mut process).read_w(x(0)),
+                    HorizonKernelResult::INVALID_POINTER.raw()
+                );
+                assert!(
+                    event.is_signalled(),
+                    "failed validation must retain released tags"
+                );
+                process
+                    .memory()
+                    .set_permissions(
+                        process.cpu_context().address_space_id(),
+                        base.checked_add(4096).unwrap(),
+                        4096,
+                        MemoryPermissions::READ_WRITE,
+                    )
+                    .unwrap();
+                assert_eq!(call(&mut process, &mut dispatcher, audio, &release), 0);
+                assert_eq!(data32(&process), 1);
+                assert_eq!(
+                    read_guest_bytes(&process, crossing, 8),
+                    123_u64.to_le_bytes()
+                );
+                assert!(!event.is_signalled());
+                continue 'variants;
+            }
             assert_eq!(
                 call(
                     &mut process,

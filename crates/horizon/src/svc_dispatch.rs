@@ -427,14 +427,8 @@ enum PendingRuntimeRequest {
         object_id: u64,
         address: GuestVirtualAddress,
     },
-    InheritPriority {
-        owner_object_id: u64,
-        waiter_object_id: u64,
-        donation_key: u64,
-    },
-    RestorePriority {
-        object_id: u64,
-        donation_key: u64,
+    SynchronizeMutexWaits {
+        addresses: Vec<u64>,
     },
     ReapThread {
         object_id: u64,
@@ -1028,23 +1022,10 @@ impl HorizonSvcDispatcher {
                     |_| {},
                 )?;
             }
-            PendingRuntimeRequest::InheritPriority {
-                owner_object_id,
-                waiter_object_id,
-                donation_key,
-            } => {
+            PendingRuntimeRequest::SynchronizeMutexWaits { addresses } => {
                 coordinator
-                    .inherit_thread_priority(owner_object_id, waiter_object_id, donation_key)
-                    .map_err(|_| runtime_fault("ArbitrateLock priority inheritance"))?;
-                fully_handled = false;
-            }
-            PendingRuntimeRequest::RestorePriority {
-                object_id,
-                donation_key,
-            } => {
-                coordinator
-                    .restore_thread_priority(object_id, donation_key)
-                    .map_err(|_| runtime_fault("ArbitrateUnlock priority restoration"))?;
+                    .synchronize_mutex_waits(process_id, &addresses)
+                    .map_err(|_| runtime_fault("mutex priority handoff"))?;
                 fully_handled = false;
             }
             PendingRuntimeRequest::ReapThread { object_id } => {

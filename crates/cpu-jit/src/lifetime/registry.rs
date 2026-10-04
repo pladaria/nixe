@@ -223,20 +223,6 @@ impl<T> Registry<T> {
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.slots.iter().filter_map(|slot| slot.value.as_ref())
     }
-    pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
-        self.slots.iter().enumerate().filter_map(|(index, slot)| {
-            slot.value.as_ref().map(|value| {
-                (
-                    Handle {
-                        index,
-                        generation: NonZeroU64::new(slot.generation).unwrap(),
-                        marker: PhantomData,
-                    },
-                    value,
-                )
-            })
-        })
-    }
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
         self.slots
             .iter_mut()

@@ -191,11 +191,12 @@ fn indirect_pic_resolves_br_blr_ret_then_hits_without_a_rust_resolver() {
 #[test]
 fn indirect_pic_native_collisions_alternate_without_hit_recency() {
     let mut memory = ExecutionMemory::new();
-    let targets = [0x1010, 0x3010, 0x5010];
+    let stride = crate::native::pic::SETS as u64 * 4;
+    let targets = [0x1010, 0x1010 + stride, 0x1010 + stride * 2];
     for (index, target) in targets.into_iter().enumerate() {
         let page = GuestPhysicalPageId::new(index as u64 + 1);
         assert!(memory.add_ram_page(page));
-        // ADD X0,X0,#(index+1); SVC #7. PCs differ by 8192, so all
+        // ADD X0,X0,#(index+1); SVC #7. PCs differ by one selector period, so all
         // destinations select the same set for this BR's ExitSiteKey.
         let words = [0x91000000 | ((index as u32 + 1) << 10), 0xd40000e1];
         memory
@@ -221,7 +222,11 @@ fn indirect_pic_native_collisions_alternate_without_hit_recency() {
         ));
     }
     memory
-        .bind_cpu_memory_backend(SPACE, 0x10000, DirectBackendPolicy::Required)
+        .bind_cpu_memory_backend(
+            SPACE,
+            (targets[2] & !0xfff) + 0x1000,
+            DirectBackendPolicy::Required,
+        )
         .unwrap();
     let process = Arc::new(JitProcess::new(cpu(), Arc::new(memory)).unwrap());
     let mut thread = JitThread::new(process.clone()).unwrap();

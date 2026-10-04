@@ -535,7 +535,7 @@ fn closed_reclamation_makes_progress_with_no_free_metadata_budget() {
 }
 
 #[test]
-fn pressure_evicts_oldest_hcq_before_any_lcq_without_waiting_on_snapshots() {
+fn pressure_reclaims_unpinned_units_without_waiting_on_snapshots() {
     let process = process();
     let cursor = AtomicU64::new(0);
     let lcq = publish(&process, &cursor, &[0, 4], Tier::Lcq);
@@ -599,7 +599,7 @@ fn pressure_leaves_headroom_for_the_next_segment_without_another_eviction() {
 }
 
 #[test]
-fn eviction_batches_keep_creation_order_after_slot_reuse_and_prioritize_hcq() {
+fn eviction_batches_preserve_optimized_code_while_unpinned_baselines_remain() {
     let process = process();
     let cursor = AtomicU64::new(0);
     let units: Vec<_> = (0..EVICTION_BATCH + 8)
@@ -639,7 +639,10 @@ fn eviction_batches_keep_creation_order_after_slot_reuse_and_prioritize_hcq() {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>(),
-        vec![hcq.0]
+        units[4..4 + EVICTION_BATCH]
+            .iter()
+            .map(|unit| unit.0)
+            .collect::<Vec<_>>()
     );
     process.retire_unit(hcq).unwrap();
     drain(&process);
@@ -851,7 +854,7 @@ fn compiler_table_snapshot_blocks_in_place_mutation_not_unlink() {
 }
 
 #[test]
-fn pressure_uses_creation_order_and_lcq_reports_hard_capacity_precisely() {
+fn pressure_uses_cold_publication_order_and_lcq_reports_hard_capacity_precisely() {
     let process = process();
     let cursor = AtomicU64::new(0);
     let lcq = publish(&process, &cursor, &[0, 4], Tier::Lcq);
@@ -898,4 +901,81 @@ fn pressure_uses_creation_order_and_lcq_reports_hard_capacity_precisely() {
     transition.batch().unwrap().complete().unwrap();
     assert!(transition.try_reopen().unwrap());
     drop(charge);
+}
+
+#[test]
+fn eviction_uses_publication_recency_when_compilers_finish_in_reverse_order() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let inputs: Vec<_> = (0..20)
+        .map(|i| input(&process, &[i * 4], Tier::Lcq))
+        .collect();
+    for input in inputs.into_iter().rev() {
+        let pc = input.entries[0].key.pc.get();
+        let publication = process.reserve(key(pc)).unwrap();
+        process
+            .prepare_unit(&[publication], input, &cursor)
+            .unwrap()
+            .publish()
+            .unwrap();
+    }
+    let state = process.lock();
+    let ids: Vec<_> = state
+        .units
+        .eviction_candidates()
+        .into_iter()
+        .flatten()
+        .map(|handle| state.units.records.get(handle).unwrap().code.id)
+        .collect();
+    assert_eq!(ids.len(), 20);
+    assert!(ids.windows(2).all(|pair| pair[0] > pair[1]));
+    drop(state);
+    assert!(process.try_shutdown().unwrap());
+    assert_eq!(process.lock().units.eviction_heads, [None; 2]);
+    assert_eq!(process.lock().units.eviction_tails, [None; 2]);
+}
+
+#[test]
+fn cold_native_samples_refresh_eviction_order_and_keep_retired_units_unselected() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let units: Vec<_> = (0..4)
+        .map(|i| publish(&process, &cursor, &[i * 4], Tier::Lcq))
+        .collect();
+    let mut samples = crate::sampling::Samples::new();
+    for index in [0, 2, 0] {
+        let snapshot = process.snapshot(units[index]).unwrap();
+        process.sample_lcq(&snapshot, &mut samples, None).unwrap();
+    }
+    let ordered = || {
+        let state = process.lock();
+        state
+            .units
+            .eviction_candidates()
+            .into_iter()
+            .flatten()
+            .map(|handle| {
+                state
+                    .units
+                    .records
+                    .get(handle)
+                    .unwrap()
+                    .code
+                    .registered_handle()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ordered(), [units[1], units[3], units[2], units[0]]);
+    let old = process.snapshot(units[1]).unwrap();
+    process.retire_unit(units[1]).unwrap();
+    process.sample_lcq(&old, &mut samples, None).unwrap();
+    assert!(!ordered().contains(&units[1]));
+    drop(old);
+    drain(&process);
+    assert_eq!(process.reclaim_units().unwrap(), 1);
+    assert_eq!(ordered(), [units[3], units[2], units[0]]);
+    assert!(process.try_shutdown().unwrap());
+    assert_eq!(process.lock().units.eviction_heads, [None; 2]);
+    assert_eq!(process.lock().units.eviction_tails, [None; 2]);
 }

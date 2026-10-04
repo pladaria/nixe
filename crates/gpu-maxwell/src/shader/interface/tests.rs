@@ -173,6 +173,144 @@ fn captured_fragment_ipa_reciprocal_and_color_output_translate() {
 }
 
 #[test]
+fn perspective_pass_exposes_the_unnormalized_barycentric_numerator() {
+    let mut header = [0_u32; 20];
+    header[0] = 0x0002_5462;
+    header[6] = 2; // Perspective generic 0.x, without an explicit Position.w load.
+    header[18] = 1;
+    let shader = translated_fixture(
+        MaxwellShaderStage::Pixel,
+        header,
+        &[0, 0xe003_ff88_0ff7_ff00, 0xe300_0000_0007_000f, 0],
+    );
+    // Vertex values [0, 1, 1], clip W [1, 2, 4], barycentrics [1/4, 1/4, 1/2]:
+    // numerator = 1/4; interpolated 1/w = 1/2; logical host attribute = 1/2.
+    let inputs = nixe_gpu::ShaderEvaluationInputs::default()
+        .with_interface_bits(ShaderIoLocation::Generic(0), 0, 0.5_f32.to_bits())
+        .with_interface_bits(ShaderIoLocation::Position, 3, 0.5_f32.to_bits());
+    let result = nixe_gpu::evaluate_shader_ir(&shader, &inputs, 64).unwrap();
+    assert_eq!(
+        result.output_bits(ShaderIoLocation::Color(0), 0),
+        Some(0.25_f32.to_bits())
+    );
+    validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+    nixe_gpu::lower_shader_ir_to_spirv(
+        &shader,
+        nixe_gpu::SpirvShaderOptions {
+            input_control_points: 0,
+            tessellation_mode: None,
+            float32: nixe_gpu::SpirvFloat32Capabilities {
+                denorm_preserve: false,
+                rounding_mode_rte: true,
+                signed_zero_inf_nan_preserve: true,
+                fused_multiply_add: true,
+            },
+            float64: nixe_gpu::SpirvFloat64Capabilities {
+                enabled: true,
+                rounding_mode_rte: true,
+                signed_zero_inf_nan_preserve: true,
+            },
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn perspective_pass_mul_w_uses_its_register_even_when_it_aliases_destination() {
+    let mut header = [0_u32; 20];
+    header[0] = 0x0002_5462;
+    header[6] = 2;
+    header[18] = 1;
+    for factor in [2.0_f32, 3.0] {
+        let shader = translated_fixture(
+            MaxwellShaderStage::Pixel,
+            header,
+            &[
+                0,
+                0x0100_0000_0007_f000 | (u64::from(factor.to_bits()) << 20),
+                0xe043_ff88_0007_ff00,
+                0xe300_0000_0007_000f,
+            ],
+        );
+        let inputs = nixe_gpu::ShaderEvaluationInputs::default()
+            .with_interface_bits(ShaderIoLocation::Generic(0), 0, 0.5_f32.to_bits())
+            .with_interface_bits(ShaderIoLocation::Position, 3, 0.5_f32.to_bits());
+        let result = nixe_gpu::evaluate_shader_ir(&shader, &inputs, 64).unwrap();
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Color(0), 0),
+            Some((0.25 * factor).to_bits())
+        );
+        validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+    }
+}
+
+#[test]
+fn perspective_normalization_proof_tracks_register_overwrites_and_predication() {
+    let make = |operation| {
+        ShaderInstruction::new(
+            ShaderSourceLocation::new(8),
+            ShaderPredicate::Always,
+            operation,
+        )
+    };
+    let mut instructions = vec![
+        make(ShaderOperation::LoadInput {
+            destinations: vec![ShaderRegister::new(0)].into_boxed_slice(),
+            location: ShaderIoLocation::Position,
+            first_component: 3,
+            scalar_type: ShaderScalarType::Float32,
+        }),
+        make(ShaderOperation::Reciprocal32 {
+            destination: ShaderRegister::new(2),
+            source: ShaderRegister::new(0),
+            accuracy: nixe_gpu::ShaderMathAccuracy::Approximate,
+            float_control: ShaderFloatControl::PRECISE,
+        }),
+    ];
+    assert!(is_reciprocal_fragment_w(
+        &instructions,
+        ShaderRegister::new(2)
+    ));
+    // The reciprocal retains its value after its source register is reused.
+    instructions.push(make(ShaderOperation::MoveImmediate32 {
+        destination: ShaderRegister::new(0),
+        bits: 3_f32.to_bits(),
+        scalar_type: ShaderScalarType::Float32,
+    }));
+    assert!(is_reciprocal_fragment_w(
+        &instructions,
+        ShaderRegister::new(2)
+    ));
+    instructions.push(make(ShaderOperation::MoveImmediate32 {
+        destination: ShaderRegister::new(2),
+        bits: 3_f32.to_bits(),
+        scalar_type: ShaderScalarType::Float32,
+    }));
+    assert!(!is_reciprocal_fragment_w(
+        &instructions,
+        ShaderRegister::new(2)
+    ));
+    instructions.truncate(1);
+    instructions.push(ShaderInstruction::new(
+        ShaderSourceLocation::new(16),
+        ShaderPredicate::Register {
+            register: 0,
+            inverted: false,
+        },
+        ShaderOperation::Reciprocal32 {
+            destination: ShaderRegister::new(2),
+            source: ShaderRegister::new(0),
+            accuracy: nixe_gpu::ShaderMathAccuracy::Approximate,
+            float_control: ShaderFloatControl::PRECISE,
+        },
+    ));
+    assert!(!is_reciprocal_fragment_w(
+        &instructions,
+        ShaderRegister::new(2)
+    ));
+}
+
+#[test]
 fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodeled_bits() {
     let captured = 0xe083_ff89_0ff7_ff00;
     let constant_input = ShaderInterfaceElement::new(
@@ -188,15 +326,17 @@ fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodele
             0x38,
             captured,
             1,
-            &[constant_input],
+            &mut vec![constant_input],
+            &mut 8,
+            false,
         )
         .unwrap(),
-        ShaderOperation::InterpolateInput {
+        vec![ShaderOperation::InterpolateInput {
             destination: ShaderRegister::new(0),
             location: ShaderIoLocation::Generic(1),
             component: 0,
             interpolation: ShaderInterpolation::Constant,
-        }
+        }]
     );
 
     let screen_input = ShaderInterfaceElement::new(
@@ -208,11 +348,8 @@ fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodele
     .unwrap();
     let sc = (captured & !(3_u64 << 54)) | (3_u64 << 54);
     assert!(matches!(
-        decode_interpolate(MaxwellShaderStage::Pixel, 0x38, sc, 1, &[screen_input],),
-        Ok(ShaderOperation::InterpolateInput {
-            interpolation: ShaderInterpolation::ScreenLinear,
-            ..
-        })
+        decode_interpolate(MaxwellShaderStage::Pixel, 0x38, sc, 1, &mut vec![screen_input], &mut 8, false),
+        Ok(operations) if matches!(operations.as_slice(), [ShaderOperation::InterpolateInput { interpolation: ShaderInterpolation::ScreenLinear, .. }])
     ));
 
     for unsupported in [
@@ -226,7 +363,9 @@ fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodele
                 0x38,
                 unsupported,
                 1,
-                &[constant_input],
+                &mut vec![constant_input],
+                &mut 8,
+                false,
             ),
             Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { .. })
         ));

@@ -56,6 +56,7 @@ pub(super) fn live_instructions(
         // Exhaustive classification: adding a new store/atomic operation must
         // not silently classify it as removable. There is no shader FP status.
         let observable = match instruction.operation {
+            ShaderOperation::Nop => false,
             ShaderOperation::StoreOutput { .. }
             | ShaderOperation::StoreStorageBuffer32 { .. }
             | ShaderOperation::StoreControlPoint { .. }

@@ -149,7 +149,7 @@ fn backend_entry_page_watch_catches_lcq_only_pic_changes_but_not_hits_or_other_p
 }
 
 #[test]
-fn backend_negative_missing_input_and_pressure_defer_without_consuming_family_state() {
+fn backend_negative_watches_missing_inputs_and_pressure_defers_without_consuming_family_state() {
     let process = process();
     publish_words(&process, 0, &[0x14000004]);
     publish_words(&process, 16, &[0x14000004]); // B 32, not yet demanded.
@@ -161,13 +161,17 @@ fn backend_negative_missing_input_and_pressure_defer_without_consuming_family_st
             .unwrap()
             .freeze()
             .unwrap();
-        assert!(matches!(
-            frozen.prepare_backend_negative(),
-            Err(Error::StalePublication)
-        ));
-        assert!(process.lock().units.negatives.get(key).is_none());
+        assert!(
+            frozen
+                .prepare_backend_negative()
+                .unwrap()
+                .install()
+                .unwrap()
+        );
+        assert!(process.lock().units.negatives.get(key).is_some());
     }
     publish_words(&process, 32, &[0xd65f03c0]);
+    assert!(process.lock().units.negatives.get(key).is_none());
     {
         let work = reshape(&process, 0, 0, 16);
         let frozen = work

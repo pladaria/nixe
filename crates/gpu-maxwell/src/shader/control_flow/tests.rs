@@ -140,3 +140,52 @@ fn ssy_is_consumed_as_control_metadata_before_neutral_translation() {
             && matches!(instruction.operation(), ShaderOperation::Exit)
     }));
 }
+
+#[test]
+fn dependency_scoreboard_wait_retains_its_branch_location_without_backend_synchronization() {
+    let encoding = 0xf0f0_0000_3417_0000;
+    assert!(is_dependency_barrier(encoding));
+    validate_dependency_barrier(MaxwellShaderStage::Pixel, 16, encoding).unwrap();
+    for invalid in [
+        encoding | (1 << 8),
+        encoding | (1 << 30),
+        (encoding & !(7 << 26)) | (6 << 26),
+    ] {
+        assert!(validate_dependency_barrier(MaxwellShaderStage::Pixel, 16, invalid).is_err());
+    }
+    let mut header = [0_u32; 20];
+    header[0] = 0x0002_0461;
+    header[4] = 0x000f_f000;
+    header[6] = 0x0000_0077;
+    header[13] = 0x0007_f000;
+    let mov = |destination: u8| {
+        0x0100_0000_0000_0000_u64
+            | (u64::from(1.0_f32.to_bits()) << 20)
+            | (7 << 16)
+            | (0xf << 12)
+            | u64::from(destination)
+    };
+    let shader = translated_fixture(
+        MaxwellShaderStage::Vertex,
+        header,
+        &[
+            0,
+            0xe240_0000_0007_000f,
+            encoding,
+            mov(0),
+            0,
+            mov(1),
+            0xe300_0000_0007_000f,
+            0,
+        ],
+    );
+    assert!(
+        shader
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| instruction.source().byte_offset() == 16
+                && matches!(instruction.operation(), ShaderOperation::Nop))
+    );
+    validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+}

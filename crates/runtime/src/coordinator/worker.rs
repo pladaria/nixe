@@ -87,7 +87,6 @@ enum WorkerCommand {
 
 struct WorkerHandle {
     commands: SyncSender<WorkerCommand>,
-    results: Receiver<WorkerResult>,
     thread: Option<JoinHandle<Result<(), nixe_cpu_direct_memory::FaultRuntimeError>>>,
     shutdown_sent: bool,
 }
@@ -95,6 +94,8 @@ struct WorkerHandle {
 pub(super) struct VcpuWorkerPool {
     workers: BTreeMap<VirtualCpuId, WorkerHandle>,
     stop_requested: bool,
+    results: Receiver<WorkerResult>,
+    pending_results: BTreeMap<VirtualCpuId, WorkerResult>,
 }
 
 impl VcpuWorkerPool {
@@ -102,11 +103,13 @@ impl VcpuWorkerPool {
         vcpus: impl IntoIterator<Item = VirtualCpuId>,
         serialize_execution: bool,
     ) -> Result<Self, std::io::Error> {
+        let vcpus: Vec<_> = vcpus.into_iter().collect();
+        let (completion, results) = sync_channel(vcpus.len().max(1));
         let global_permit = serialize_execution.then(|| Arc::new(Mutex::new(())));
         let mut workers: BTreeMap<VirtualCpuId, WorkerHandle> = BTreeMap::new();
         for vcpu in vcpus {
             let (commands, receiver) = sync_channel(1);
-            let (completion, results) = sync_channel(1);
+            let completion = completion.clone();
             let permit = global_permit.clone();
             let thread = match std::thread::Builder::new()
                 .name(format!("nixe-vcpu-{}", vcpu.get()))
@@ -127,7 +130,6 @@ impl VcpuWorkerPool {
                 vcpu,
                 WorkerHandle {
                     commands,
-                    results,
                     thread: Some(thread),
                     shutdown_sent: false,
                 },
@@ -136,6 +138,8 @@ impl VcpuWorkerPool {
         Ok(Self {
             workers,
             stop_requested: false,
+            results,
+            pending_results: BTreeMap::new(),
         })
     }
 
@@ -254,13 +258,27 @@ impl VcpuWorkerPool {
             })
     }
 
-    pub(super) fn receive(&self, vcpu: VirtualCpuId) -> Result<WorkerResult, WorkerFailure> {
-        self.workers
-            .get(&vcpu)
-            .ok_or(WorkerFailure::Lost(vcpu))?
-            .results
-            .recv()
-            .map_err(|_| WorkerFailure::Lost(vcpu))
+    pub(super) fn receive(&mut self, vcpu: VirtualCpuId) -> Result<WorkerResult, WorkerFailure> {
+        if !self.workers.contains_key(&vcpu) {
+            return Err(WorkerFailure::Lost(vcpu));
+        }
+        if let Some(result) = self.pending_results.remove(&vcpu) {
+            return Ok(result);
+        }
+        loop {
+            let result = self.results.recv().map_err(|_| WorkerFailure::Lost(vcpu))?;
+            if result.lease.vcpu == vcpu {
+                return Ok(result);
+            }
+            self.pending_results.insert(result.lease.vcpu, result);
+        }
+    }
+
+    pub(super) fn receive_any(&mut self) -> Result<WorkerResult, WorkerFailure> {
+        if let Some((_, result)) = self.pending_results.pop_first() {
+            return Ok(result);
+        }
+        self.results.recv().map_err(|_| WorkerFailure::Stopped)
     }
 
     pub(super) fn shutdown(&mut self) -> Result<(), WorkerFailure> {

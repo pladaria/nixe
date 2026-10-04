@@ -186,3 +186,52 @@ fn real_worker_keeps_its_running_reshape_reservation_across_unrelated_stop() {
     assert!(process.background_failure().is_none());
     assert!(process.try_shutdown().unwrap());
 }
+
+#[test]
+fn shared_target_merges_retain_all_callers_and_stop_recompiling() {
+    let (process, memory, mut reader) = setup();
+    promote_at(&process, &memory, &mut reader, 0x1000);
+    let memory = Arc::new(memory);
+    let consumer = crate::hcq::worker::consumer(host(), 0x10000, Arc::clone(&memory)).unwrap();
+    let (done, received) = mpsc::channel();
+    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
+        let result = consumer(resources, work);
+        done.send(result.is_ok()).unwrap();
+        result
+    })
+    .unwrap()
+    .unwrap();
+    for (root, target) in [(0x3000, 0x1000), (0x4000, 0x2000)] {
+        assert_eq!(
+            admit_to(&process, workers.queue(), &mut reader, root, root, target),
+            Outcome::Queued
+        );
+        assert!(received.recv_timeout(Duration::from_secs(10)).unwrap());
+        process.try_service_links().unwrap();
+    }
+    let before = [0x1000, 0x2000, 0x3000, 0x4000].map(|pc| payload(&mut reader, pc).unwrap());
+    let family = before[0].hcq().unwrap().family;
+    assert!(
+        before
+            .iter()
+            .all(|entry| entry.hcq().unwrap().family == family)
+    );
+    for (root, target) in [(0x3000, 0x1000), (0x4000, 0x2000)] {
+        assert_eq!(
+            admit_to(&process, workers.queue(), &mut reader, root, root, target),
+            Outcome::Queued
+        );
+        assert!(received.recv_timeout(Duration::from_secs(10)).unwrap());
+        assert_eq!(
+            admit_to(&process, workers.queue(), &mut reader, root, root, target),
+            Outcome::Suppressed
+        );
+    }
+    for (pc, expected) in [0x1000, 0x2000, 0x3000, 0x4000].into_iter().zip(before) {
+        assert_eq!(payload(&mut reader, pc).unwrap(), expected);
+    }
+    run(&process, &memory, &mut reader, 0x3000, 3);
+    run(&process, &memory, &mut reader, 0x4000, 2);
+    workers.shutdown().unwrap();
+    assert!(process.try_shutdown().unwrap());
+}

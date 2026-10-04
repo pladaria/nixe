@@ -960,6 +960,30 @@ impl MaxwellThreeDResourceStateIdentity {
     }
 }
 
+impl PartialEq for MaxwellThreeDResourceStateIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.scope, &other.scope)
+            && self.render_targets == other.render_targets
+            && self.vertex_resources == other.vertex_resources
+            && self.constant_buffers == other.constant_buffers
+            && self.textures == other.textures
+            && self.sample_mode == other.sample_mode
+    }
+}
+
+impl Eq for MaxwellThreeDResourceStateIdentity {}
+
+impl std::hash::Hash for MaxwellThreeDResourceStateIdentity {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        Arc::as_ptr(&self.scope).hash(hasher);
+        self.render_targets.hash(hasher);
+        self.vertex_resources.hash(hasher);
+        self.constant_buffers.hash(hasher);
+        self.textures.hash(hasher);
+        self.sample_mode.hash(hasher);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MaxwellThreeDResourceSemanticWrites {
     draw_state: bool,

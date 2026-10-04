@@ -59,10 +59,12 @@ impl Translator<'_> {
         width: u32,
         destination_64: bool,
         signed: bool,
+        fractional_bits: u8,
     ) -> Value {
         let (fraction, bias) = if width == 32 { (23, 127) } else { (52, 1023) };
         let integer_bits = if destination_64 { 64 } else { 32 };
-        let limit = (bias + integer_bits - u64::from(signed)) << fraction;
+        let limit =
+            (bias + integer_bits - u64::from(signed) - u64::from(fractional_bits)) << fraction;
         let sign = 1u64 << (width - 1);
         let magnitude = self.builder.ins().band_imm_u(bits, (sign - 1) as i64);
         let ordered = if signed { magnitude } else { bits };
@@ -86,6 +88,35 @@ impl Translator<'_> {
             direct = self.builder.ins().bor(direct, minimum);
         }
         direct
+    }
+
+    /// Within the guarded normal/in-range domain, multiplying by 2^fbits is
+    /// an exact exponent adjustment. It cannot overflow or produce a subnormal;
+    /// only the final truncating conversion contributes inexact status. Keep
+    /// signed zeros unchanged. NaNs, subnormals and out-of-range values take
+    /// the typed FCVT exit before reaching this helper.
+    /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTZS--scalar--fixed-point---Floating-point-Convert-to-Signed-fixed-point--rounding-toward-Zero--scalar--
+    /// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTZU--scalar--fixed-point---Floating-point-Convert-to-Unsigned-fixed-point--rounding-toward-Zero--scalar--
+    pub(crate) fn scale_fp_to_integer_bits(
+        &mut self,
+        bits: Value,
+        width: u32,
+        fractional_bits: u8,
+    ) -> Value {
+        if fractional_bits == 0 {
+            return bits;
+        }
+        let magnitude = self
+            .builder
+            .ins()
+            .band_imm_u(bits, ((1u64 << (width - 1)) - 1) as i64);
+        let nonzero = self.builder.ins().icmp_imm_s(IntCC::NotEqual, magnitude, 0);
+        let shift = if width == 32 { 23 } else { 52 };
+        let scaled = self
+            .builder
+            .ins()
+            .iadd_imm_u(bits, i64::from(fractional_bits) << shift);
+        self.builder.ins().select(nonzero, scaled, bits)
     }
 
     /// Convert only after the domain/FPCR guard and guest FP activation. The
@@ -468,30 +499,43 @@ impl Translator<'_> {
     }
 
     pub(crate) fn scalar_fp_bits(&mut self, register: u8, width: u32) -> Result<Value, Error> {
-        let value = self.read_vector_as(register, types::I128)?;
-        Ok(self
-            .builder
-            .ins()
-            .ireduce(if width == 32 { types::I32 } else { types::I64 }, value))
+        let lanes = self.read_vector_as(
+            register,
+            if width == 32 {
+                types::I32X4
+            } else {
+                types::I64X2
+            },
+        )?;
+        Ok(self.builder.ins().extractlane(lanes, 0))
     }
 
     /// True for zero and finite normal values. NaNs, infinities and denormal
     /// inputs use the exact edge because their payload/status contracts differ
     /// between Arm and the host FP ISA.
     pub(crate) fn fp_finite_or_zero(&mut self, bits: Value, width: u32) -> Value {
-        let (exponent_mask, magnitude_mask) = if width == 32 {
-            (0x7f80_0000_u64, 0x7fff_ffff_u64)
+        let (minimum_normal, infinity, magnitude_mask) = if width == 32 {
+            (0x0080_0000_u64, 0x7f80_0000_u64, 0x7fff_ffff_u64)
         } else {
-            (0x7ff0_0000_0000_0000, 0x7fff_ffff_ffff_ffff)
+            (
+                0x0010_0000_0000_0000,
+                0x7ff0_0000_0000_0000,
+                0x7fff_ffff_ffff_ffff,
+            )
         };
-        let exponent = self.builder.ins().band_imm_u(bits, exponent_mask as i64);
-        let exponent_nonzero = self.builder.ins().icmp_imm_s(IntCC::NotEqual, exponent, 0);
-        let exponent_finite =
-            self.builder
-                .ins()
-                .icmp_imm_s(IntCC::NotEqual, exponent, exponent_mask as i64);
-        let normal = self.builder.ins().band(exponent_nonzero, exponent_finite);
         let magnitude = self.builder.ins().band_imm_u(bits, magnitude_mask as i64);
+        // Normal finite magnitudes form one unsigned interval. Subtraction
+        // folds its two bounds into one comparison; smaller magnitudes wrap
+        // outside it. Admit signed zero separately, without inspecting FP state.
+        let relative = self
+            .builder
+            .ins()
+            .iadd_imm_s(magnitude, -(minimum_normal as i64));
+        let normal = self.builder.ins().icmp_imm_u(
+            IntCC::UnsignedLessThan,
+            relative,
+            (infinity - minimum_normal) as i64,
+        );
         let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, magnitude, 0);
         self.builder.ins().bor(zero, normal)
     }

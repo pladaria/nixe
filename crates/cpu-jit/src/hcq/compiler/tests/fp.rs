@@ -122,14 +122,20 @@ fn hcq_fp_comparison_does_not_activate_and_its_cold_exit_keeps_old_flags() {
 }
 
 #[test]
-fn hcq_fp_exact_and_status_boundaries_keep_pending_state_without_new_activation() {
-    // FCCMP completes outside native execution, as do reads of accumulated FPSR.
+fn hcq_fp_comparison_and_status_boundaries_keep_pending_state_without_new_activation() {
+    // Exceptional FCCMP inputs complete outside native execution. Ordinary
+    // comparisons continue; reads of accumulated FPSR always take a boundary.
     for word in [0x1e62042a, 0xd53b4420] {
-        let graph = graph(&[(0, &[FADD, ADDS, 0x1400000e]), (64, &[word])]);
+        let tail = if word == 0x1e62042a {
+            vec![word, RET]
+        } else {
+            vec![word]
+        };
+        let graph = graph(&[(0, &[FADD, ADDS, 0x1400000e]), (64, &tail)]);
         for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
             let (_, body) = emitted(&graph, &[0, block(&graph, 64)], abi);
             assert_eq!(activation_pcs(&body), vec![0]);
-            assert_eq!(body.exits.len(), 2);
+            assert_eq!(body.exits.len(), if word == 0x1e62042a { 3 } else { 2 });
             let exit = &body.exits[1];
             assert_eq!(exit.guest.pc.get(), 64);
             assert_eq!(exit.reason, NativeExitReason::Architectural);

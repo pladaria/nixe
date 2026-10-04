@@ -358,6 +358,11 @@ pub(crate) fn send_sync_request_from_buffer(
             host_systems.caller_thread_id,
         ) {
             Ok(response) => response,
+            Err(IpcWireError::PendingGpuSubmission(wait)) => {
+                return Ok(trace_completion(SyncRequestResult::PendingGpuSubmission(
+                    wait,
+                )));
+            }
             Err(IpcWireError::PendingNvDrv(wait)) => {
                 return Ok(trace_completion(SyncRequestResult::PendingNvDrv(wait)));
             }
@@ -423,6 +428,7 @@ pub(crate) enum SyncRequestResult {
     InvalidHandle,
     AppletExitRequested,
     PendingNvDrv(crate::nvdrv::PendingNvHostCtrlWait),
+    PendingGpuSubmission(crate::nvdrv::PendingGpuSubmission),
 }
 
 #[cfg(test)]

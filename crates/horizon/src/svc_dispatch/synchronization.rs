@@ -511,122 +511,95 @@ impl HorizonSvcDispatcher {
 // https://github.com/switchbrew/libnx/blob/master/nx/include/switch/kernel/svc.h
 // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_condition_variable.cpp
 impl HorizonSvcDispatcher {
+    // Kernel mutex ownership must be published before waking a waiter, and the
+    // wait bit remains set until the final queued waiter has acquired the lock.
+    // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_condition_variable.cpp
     pub(super) fn wait_process_wide_key_atomic(
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let mutex_address = read_register(context.thread().state(), 0);
-        let key_address = read_register(context.thread().state(), 1) & !3;
+        let mutex = read_register(context.thread().state(), 0);
+        let key = read_register(context.thread().state(), 1) & !3;
         let tag = read_register(context.thread().state(), 2) as u32;
         let timeout = read_register(context.thread().state(), 3) as i64;
-        if !mutex_address.is_multiple_of(4) {
+        if !mutex.is_multiple_of(4) {
             result(context, HorizonKernelResult::INVALID_ADDRESS);
             return resume();
         }
         let thread = context.thread().id();
-        let thread_id = thread.get();
-        if context
-            .process()
-            .address_waits()
-            .is_signalled(key_address, thread)
-        {
-            let tag = context
+        for address in [key, mutex] {
+            if context
                 .process()
                 .address_waits()
-                .value(key_address, thread)
-                .unwrap_or(tag);
-            context
-                .process_mut()
-                .address_waits_mut()
-                .remove(key_address, thread);
-            self.finish_wait(thread_id, 0x1c);
-            if write_process_wide_key_word(context, mutex_address, tag).is_err() {
-                result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-            } else {
+                .is_signalled(address, thread)
+            {
+                let completion = context
+                    .process()
+                    .address_waits()
+                    .completion(address, thread)
+                    .unwrap();
                 context
                     .process_mut()
                     .address_waits_mut()
-                    .set_owner(mutex_address, thread);
-                result(context, HorizonKernelResult::SUCCESS);
-            }
-            return resume();
-        }
-        if context
-            .process()
-            .address_waits()
-            .contains(key_address, thread)
-            && self.wait_expired(thread_id, 0x1c, timeout)
-        {
-            context
-                .process_mut()
-                .address_waits_mut()
-                .remove(key_address, thread);
-            self.finish_wait(thread_id, 0x1c);
-            result(context, HorizonKernelResult::TIMED_OUT);
-            return resume();
-        }
-        if !context
-            .process()
-            .address_waits()
-            .contains(key_address, thread)
-        {
-            let old_key = match read_process_wide_key_word(context, key_address) {
-                Ok(value) => value,
-                Err(_) => {
-                    result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-                    return resume();
-                }
-            };
-            let old_mutex = match read_process_wide_key_word(context, mutex_address) {
-                Ok(value) => value,
-                Err(_) => {
-                    result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-                    return resume();
-                }
-            };
-            if write_process_wide_key_word(context, key_address, 1).is_err()
-                || write_process_wide_key_word(context, mutex_address, 0).is_err()
-            {
-                let _ = write_process_wide_key_word(context, key_address, old_key);
-                let _ = write_process_wide_key_word(context, mutex_address, old_mutex);
-                result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+                    .remove(address, thread);
+                self.finish_wait(thread.get(), 0x1c);
+                result(context, address_wait_result(completion));
                 return resume();
             }
-            if let Some(owner) = context
-                .process_mut()
-                .address_waits_mut()
-                .remove_owner(mutex_address)
-                && let Err(fault) = self.queue_runtime_request(
-                    context.thread().id(),
-                    PendingRuntimeRequest::RestorePriority {
-                        object_id: owner.get(),
-                        donation_key: mutex_address,
-                    },
-                    "WaitProcessWideKeyAtomic mutex release",
-                )
-            {
-                return ExceptionDispatchOutcome::Fault(fault);
-            }
-            context.process().address_waits().signal_one(mutex_address);
-            if timeout == 0 {
+        }
+        let waiting = context.process().address_waits().contains(key, thread)
+            || context.process().address_waits().contains(mutex, thread);
+        if waiting {
+            if self.wait_expired(thread.get(), 0x1c, timeout) {
+                context
+                    .process_mut()
+                    .address_waits_mut()
+                    .remove(key, thread);
+                context
+                    .process_mut()
+                    .address_waits_mut()
+                    .remove(mutex, thread);
+                self.finish_wait(thread.get(), 0x1c);
+                if let Err(fault) = self.synchronize_mutex_waits(context, vec![mutex]) {
+                    return ExceptionDispatchOutcome::Fault(fault);
+                }
                 result(context, HorizonKernelResult::TIMED_OUT);
                 return resume();
             }
-            let readable =
-                context
-                    .process_mut()
-                    .address_waits_mut()
-                    .enqueue(key_address, thread, tag);
-            self.wait_expired(thread_id, 0x1c, timeout);
-            let deadline = self.wait_deadlines.get(&(thread_id, 0x1c)).copied();
-            self.pending_wakes.insert(
-                thread_id,
-                PendingThreadWake {
-                    events: vec![readable],
-                    deadline,
-                },
-            );
+            return ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry);
         }
+        if let Err(fault) = write_process_wide_key_word(context, key, 1)
+            && process_wide_key_fault_is_internal(&fault)
+        {
+            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
+                immediate: 0x1c,
+                fault,
+            });
+        }
+        let released = handoff_mutex(context, mutex, false);
+        if let Err(fault) = self.synchronize_mutex_waits(context, vec![mutex]) {
+            return ExceptionDispatchOutcome::Fault(fault);
+        }
+        if let Err(fault) = released {
+            return mutex_memory_fault(context, 0x1c, fault);
+        }
+        if timeout == 0 {
+            result(context, HorizonKernelResult::TIMED_OUT);
+            return resume();
+        }
+        let event = context
+            .process_mut()
+            .address_waits_mut()
+            .enqueue_condition(key, thread, tag, mutex);
+        self.wait_expired(thread.get(), 0x1c, timeout);
+        let deadline = self.wait_deadlines.get(&(thread.get(), 0x1c)).copied();
+        self.pending_wakes.insert(
+            thread.get(),
+            PendingThreadWake {
+                events: vec![event],
+                deadline,
+            },
+        );
         ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
     }
 
@@ -634,21 +607,88 @@ impl HorizonSvcDispatcher {
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let key_address = read_register(context.thread().state(), 0) & !3;
+        use nixe_runtime::AddressWaitCompletion;
+        let key = read_register(context.thread().state(), 0) & !3;
         let count = read_register(context.thread().state(), 1) as u32 as i32;
         let limit = if count <= 0 {
             usize::MAX
         } else {
             count as usize
         };
-        context.process().address_waits().signal(key_address, limit);
-        if let Err(fault) = write_process_wide_key_word(context, key_address, 0)
+        let mut changed = Vec::new();
+        for _ in 0..limit {
+            let Some((thread, tag, mutex)) = context.process().address_waits().next_condition(key)
+            else {
+                break;
+            };
+            // Signal reacquires each mutex now, rather than letting resumed
+            // waiters overwrite a mutex that another thread may still own.
+            match update_condition_mutex(context, mutex, tag) {
+                Ok(0) => {
+                    context
+                        .process_mut()
+                        .address_waits_mut()
+                        .set_owner(mutex, thread);
+                    context.process_mut().address_waits_mut().signal_result(
+                        key,
+                        thread,
+                        AddressWaitCompletion::Success,
+                    );
+                    changed.push(mutex);
+                }
+                Ok(previous) => {
+                    let owner = context
+                        .process()
+                        .handles()
+                        .get_as::<ThreadObject>(previous & !MUTEX_WAITERS)
+                        .map(ThreadObject::thread_id);
+                    if let Some(owner) = owner {
+                        let waits = context.process_mut().address_waits_mut();
+                        waits.set_owner(mutex, GuestThreadId::new(owner));
+                        waits.move_waiter(key, mutex, thread);
+                        changed.push(mutex);
+                    } else {
+                        context.process_mut().address_waits_mut().signal_result(
+                            key,
+                            thread,
+                            AddressWaitCompletion::InvalidOwner,
+                        );
+                    }
+                }
+                Err(fault) => {
+                    if process_wide_key_fault_is_internal(&fault) {
+                        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
+                            immediate: 0x1d,
+                            fault,
+                        });
+                    }
+                    context.process_mut().address_waits_mut().signal_result(
+                        key,
+                        thread,
+                        AddressWaitCompletion::InvalidMemory,
+                    );
+                }
+            }
+        }
+        if context
+            .process()
+            .address_waits()
+            .next_condition(key)
+            .is_none()
+            && let Err(fault) = write_process_wide_key_word(context, key, 0)
             && process_wide_key_fault_is_internal(&fault)
         {
             return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
                 immediate: 0x1d,
                 fault,
             });
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        if !changed.is_empty()
+            && let Err(fault) = self.synchronize_mutex_waits(context, changed)
+        {
+            return ExceptionDispatchOutcome::Fault(fault);
         }
         resume()
     }
@@ -658,132 +698,179 @@ impl HorizonSvcDispatcher {
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let owner_handle = read_register(context.thread().state(), 0) as u32;
-        let mutex_address = read_register(context.thread().state(), 1);
+        let mutex = read_register(context.thread().state(), 1);
         let tag = read_register(context.thread().state(), 2) as u32;
-        if !mutex_address.is_multiple_of(4) {
+        if !mutex.is_multiple_of(4) {
             result(context, HorizonKernelResult::INVALID_ADDRESS);
             return resume();
         }
         let thread = context.thread().id();
-        let thread_id = thread.get();
         if context
             .process()
             .address_waits()
-            .is_signalled(mutex_address, thread)
+            .is_signalled(mutex, thread)
         {
-            let tag = context
+            let completion = context
                 .process()
                 .address_waits()
-                .value(mutex_address, thread)
-                .unwrap_or(tag);
+                .completion(mutex, thread)
+                .unwrap();
             context
                 .process_mut()
                 .address_waits_mut()
-                .remove(mutex_address, thread);
-            self.pending_wakes.remove(&thread_id);
-            if write_process_wide_key_word(context, mutex_address, tag).is_err() {
-                result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-            } else {
-                context
-                    .process_mut()
-                    .address_waits_mut()
-                    .set_owner(mutex_address, thread);
-                result(context, HorizonKernelResult::SUCCESS);
-            }
+                .remove(mutex, thread);
+            self.pending_wakes.remove(&thread.get());
+            result(context, address_wait_result(completion));
             return resume();
         }
-        match read_process_wide_key_word(context, mutex_address) {
-            Ok(0) => {
-                if write_process_wide_key_word(context, mutex_address, tag).is_err() {
-                    result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-                } else {
-                    context
-                        .process_mut()
-                        .address_waits_mut()
-                        .set_owner(mutex_address, thread);
-                    result(context, HorizonKernelResult::SUCCESS);
-                }
-                resume()
-            }
-            Ok(_) => {
-                if !context
-                    .process()
-                    .address_waits()
-                    .contains(mutex_address, thread)
-                {
-                    let Some(owner_object_id) = context
-                        .process()
-                        .handles()
-                        .get_as::<ThreadObject>(owner_handle)
-                        .map(ThreadObject::thread_id)
-                    else {
-                        result(context, HorizonKernelResult::INVALID_HANDLE);
-                        return resume();
-                    };
-                    let waiter_object_id = context.thread().object().thread_id();
-                    if let Err(fault) = self.queue_runtime_request(
-                        context.thread().id(),
-                        PendingRuntimeRequest::InheritPriority {
-                            owner_object_id,
-                            waiter_object_id,
-                            donation_key: mutex_address,
-                        },
-                        "ArbitrateLock",
-                    ) {
-                        return ExceptionDispatchOutcome::Fault(fault);
-                    }
-                    let readable = context.process_mut().address_waits_mut().enqueue(
-                        mutex_address,
-                        thread,
-                        tag,
-                    );
-                    self.pending_wakes.insert(
-                        thread_id,
-                        PendingThreadWake {
-                            events: vec![readable],
-                            deadline: None,
-                        },
-                    );
-                }
-                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-            }
-            Err(_) => {
-                result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-                resume()
-            }
+        if context.process().address_waits().contains(mutex, thread) {
+            return ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry);
         }
+        let observed = match read_process_wide_key_word(context, mutex) {
+            Ok(value) => value,
+            Err(fault) => return mutex_memory_fault(context, 0x1a, fault),
+        };
+        // Userspace retries acquisition when the observed owner has changed.
+        // The kernel must neither enqueue against the old owner nor steal it.
+        if observed != (owner_handle | MUTEX_WAITERS) {
+            result(context, HorizonKernelResult::SUCCESS);
+            return resume();
+        }
+        let Some(owner) = context
+            .process()
+            .handles()
+            .get_as::<ThreadObject>(owner_handle)
+            .map(ThreadObject::thread_id)
+        else {
+            result(context, HorizonKernelResult::INVALID_HANDLE);
+            return resume();
+        };
+        let waits = context.process_mut().address_waits_mut();
+        waits.set_owner(mutex, GuestThreadId::new(owner));
+        let event = waits.enqueue(mutex, thread, tag);
+        self.pending_wakes.insert(
+            thread.get(),
+            PendingThreadWake {
+                events: vec![event],
+                deadline: None,
+            },
+        );
+        if let Err(fault) = self.synchronize_mutex_waits(context, vec![mutex]) {
+            return ExceptionDispatchOutcome::Fault(fault);
+        }
+        ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
     }
 
     pub(super) fn arbitrate_unlock(
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let mutex_address = read_register(context.thread().state(), 0);
-        if !mutex_address.is_multiple_of(4) {
+        let mutex = read_register(context.thread().state(), 0);
+        if !mutex.is_multiple_of(4) {
             result(context, HorizonKernelResult::INVALID_ADDRESS);
             return resume();
         }
-        if write_process_wide_key_word(context, mutex_address, 0).is_err() {
-            result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-            return resume();
-        }
-        if let Some(owner) = context
-            .process_mut()
-            .address_waits_mut()
-            .remove_owner(mutex_address)
-            && let Err(fault) = self.queue_runtime_request(
-                context.thread().id(),
-                PendingRuntimeRequest::RestorePriority {
-                    object_id: owner.get(),
-                    donation_key: mutex_address,
-                },
-                "ArbitrateUnlock",
-            )
-        {
+        let released = handoff_mutex(context, mutex, true);
+        if let Err(fault) = self.synchronize_mutex_waits(context, vec![mutex]) {
             return ExceptionDispatchOutcome::Fault(fault);
         }
-        context.process().address_waits().signal_one(mutex_address);
+        if let Err(fault) = released {
+            return mutex_memory_fault(context, 0x1b, fault);
+        }
         result(context, HorizonKernelResult::SUCCESS);
+        resume()
+    }
+
+    fn synchronize_mutex_waits(
+        &mut self,
+        context: &ExceptionDispatchContext<'_>,
+        addresses: Vec<u64>,
+    ) -> Result<(), HorizonSvcFault> {
+        self.queue_runtime_request(
+            context.thread().id(),
+            PendingRuntimeRequest::SynchronizeMutexWaits { addresses },
+            "mutex priority handoff",
+        )
+    }
+}
+
+const MUTEX_WAITERS: u32 = 1 << 30;
+
+fn address_wait_result(result: nixe_runtime::AddressWaitCompletion) -> HorizonKernelResult {
+    match result {
+        nixe_runtime::AddressWaitCompletion::Success => HorizonKernelResult::SUCCESS,
+        nixe_runtime::AddressWaitCompletion::InvalidOwner => HorizonKernelResult::INVALID_STATE,
+        nixe_runtime::AddressWaitCompletion::TimedOut => HorizonKernelResult::TIMED_OUT,
+        nixe_runtime::AddressWaitCompletion::InvalidMemory => {
+            HorizonKernelResult::INVALID_CURRENT_MEMORY
+        }
+    }
+}
+
+fn handoff_mutex(
+    context: &mut ExceptionDispatchContext<'_>,
+    mutex: u64,
+    report_write_failure_to_waiter: bool,
+) -> Result<(), DataAccessFault> {
+    let owns_waiters =
+        context.process().address_waits().owner(mutex) == Some(context.thread().id());
+    let next = owns_waiters
+        .then(|| context.process().address_waits().next_waiter(mutex))
+        .flatten();
+    let value = next.map_or(0, |(_, tag)| {
+        tag | if context.process().address_waits().unsignalled_count(mutex) > 1 {
+            MUTEX_WAITERS
+        } else {
+            0
+        }
+    });
+    let written = write_process_wide_key_word(context, mutex, value);
+    let waits = context.process_mut().address_waits_mut();
+    if owns_waiters {
+        waits.remove_owner(mutex);
+    }
+    if let Some((thread, _)) = next {
+        waits.set_owner(mutex, thread);
+        let completion = if report_write_failure_to_waiter && written.is_err() {
+            nixe_runtime::AddressWaitCompletion::InvalidMemory
+        } else {
+            nixe_runtime::AddressWaitCompletion::Success
+        };
+        waits.signal_result(mutex, thread, completion);
+    }
+    written
+}
+
+fn update_condition_mutex(
+    context: &ExceptionDispatchContext<'_>,
+    mutex: u64,
+    tag: u32,
+) -> Result<u32, DataAccessFault> {
+    let mut previous = read_process_wide_key_word(context, mutex)?;
+    loop {
+        let value = if previous == 0 {
+            tag
+        } else {
+            previous | MUTEX_WAITERS
+        };
+        let observed =
+            super::address_arbitration::compare_exchange(context, mutex, previous, value)?;
+        if observed == previous {
+            return Ok(previous);
+        }
+        previous = observed;
+    }
+}
+
+fn mutex_memory_fault(
+    context: &mut ExceptionDispatchContext<'_>,
+    immediate: u32,
+    fault: DataAccessFault,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    if process_wide_key_fault_is_internal(&fault) {
+        ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory { immediate, fault })
+    } else {
+        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
         resume()
     }
 }

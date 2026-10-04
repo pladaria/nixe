@@ -214,6 +214,25 @@ fn mapping_uses_all_instruction_bytes_including_overlapping_non_root_words() {
 }
 
 #[test]
+fn mapping_bounds_do_not_invalidate_holes_or_assume_instruction_address_order() {
+    let process = process();
+    let cursor = AtomicU64::new(0);
+    let sparse = publish_image(&process, &cursor, &[0x2000, 0x40, 0x1000], 1, 7);
+    for (start, size) in [(0x44, 0xfbc), (0x1004, 0xffc), (0x2004, 4)] {
+        process
+            .invalidate_memory(&[mapping(1, start, size)])
+            .unwrap();
+        assert_eq!(drain(&process), 0);
+        assert!(process.snapshot(sparse).is_ok());
+    }
+    // The lowest word is neither the public root nor the final word. A byte
+    // within it must still revoke the complete native unit.
+    process.invalidate_memory(&[mapping(1, 0x43, 1)]).unwrap();
+    assert_eq!(drain(&process), 1);
+    assert!(matches!(process.snapshot(sparse), Err(Error::StaleUnit)));
+}
+
+#[test]
 fn final_address_byte_does_not_wrap_the_affected_range() {
     let process = process();
     let cursor = AtomicU64::new(0);
@@ -398,6 +417,14 @@ fn invalidating_a_baseline_also_removes_a_family_using_only_its_unchanged_words(
         .unwrap()
         .publish()
         .unwrap();
+    // Data-only device transitions and unrelated mappings still complete their
+    // maintenance handshake without invalidating this family or its baseline.
+    for changes in [vec![], vec![content(99)], vec![mapping(2, 0, 8)]] {
+        process.invalidate_memory(&changes).unwrap();
+        assert_eq!(drain(&process), 0);
+        assert!(process.snapshot(baseline).is_ok());
+        assert!(process.snapshot(hcq).is_ok());
+    }
     process.invalidate_memory(&[mapping(1, 4, 4)]).unwrap();
     assert_eq!(drain(&process), 2);
     assert!(matches!(process.snapshot(baseline), Err(Error::StaleUnit)));

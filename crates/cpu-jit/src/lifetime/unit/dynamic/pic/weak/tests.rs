@@ -167,7 +167,12 @@ fn weak_bridge_hit_shares_nonempty_code_without_allocating_or_emitting() {
 fn weak_bridge_stale_way_does_not_resurrect_reused_slot_or_retain_metadata() {
     let process = process();
     let cursor = AtomicU64::new(0);
-    publish(&process, &cursor, &[4, 8196, 16388], Tier::Lcq);
+    publish(
+        &process,
+        &cursor,
+        &[4, 4 + SETS as u64 * 4, 4 + SETS as u64 * 8],
+        Tier::Lcq,
+    );
     let source = source(&process, &cursor, 0, EdgeKind::Indirect);
     let mut reader = process.register().unwrap();
     let a = install(&mut reader, &process, source, 0, 4);
@@ -176,9 +181,9 @@ fn weak_bridge_stale_way_does_not_resurrect_reused_slot_or_retain_metadata() {
         .unwrap()
         .unwrap()
         .key();
-    install(&mut reader, &process, source, 0, 8196);
+    install(&mut reader, &process, source, 0, 4 + SETS as u64 * 4);
     let before = process.cache.usage().unwrap();
-    let c = install(&mut reader, &process, source, 0, 16388);
+    let c = install(&mut reader, &process, source, 0, 4 + SETS as u64 * 8);
     assert_eq!(a.site.slot, c.site.slot);
     assert_ne!(a.generation, c.generation);
     assert_eq!(process.cache.usage().unwrap(), before);

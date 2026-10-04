@@ -1444,6 +1444,20 @@ impl CpuMemory for SyntheticMemory {
         ))
     }
 
+    fn query_page(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Option<(MemoryRegionKind, MemoryMappingProperties)> {
+        let inner = self.lock_inner();
+        let (region, permissions, purpose, attributes) =
+            synthetic_mapping_state(&inner, address_space, virtual_page(address))?;
+        Some((
+            region,
+            MemoryMappingProperties::new(permissions, purpose, attributes),
+        ))
+    }
+
     fn query_memory(
         &self,
         address_space: AddressSpaceId,
@@ -2481,6 +2495,95 @@ mod tests {
         assert_eq!(hole.size, 0xd000);
         assert_eq!(hole.region, None);
         assert_eq!(hole.permissions, MemoryPermissions::NONE);
+    }
+
+    #[test]
+    fn production_queries_cross_leaves_and_preserve_holes_after_mapping_changes() {
+        let mut synthetic = SyntheticMemory::new();
+        let mut execution = ExecutionMemory::new();
+        let base = GuestVirtualAddress::new(0x1fe000);
+        let end = GuestVirtualAddress::new(0x900000);
+        for memory in [
+            &synthetic as &dyn ProcessMemory,
+            &execution as &dyn ProcessMemory,
+        ] {
+            for (space, start, size) in [
+                (SPACE, base, 0x7000),
+                (SPACE, GuestVirtualAddress::new(0x600000), 0x1000),
+                (
+                    AddressSpaceId::new(2),
+                    GuestVirtualAddress::new(0x300000),
+                    0x1000,
+                ),
+            ] {
+                memory
+                    .resize_zeroed_mapping(
+                        space,
+                        start,
+                        0,
+                        size,
+                        MemoryPermissions::READ_WRITE,
+                        MemoryMappingPurpose::Heap,
+                    )
+                    .unwrap();
+            }
+        }
+        let mapped = execution.query_memory(SPACE, base, end).unwrap();
+        assert_eq!(mapped.base, base);
+        assert_eq!(mapped.size, 0x7000);
+        let hole = execution
+            .query_memory(SPACE, GuestVirtualAddress::new(0x300000), end)
+            .unwrap();
+        assert_eq!(hole.base.get(), 0x205000);
+        assert_eq!(hole.size, 0x600000 - 0x205000);
+        for changed in [false, true] {
+            if changed {
+                for memory in [
+                    &synthetic as &dyn ProcessMemory,
+                    &execution as &dyn ProcessMemory,
+                ] {
+                    memory
+                        .resize_zeroed_mapping(
+                            SPACE,
+                            base,
+                            0x7000,
+                            0x3000,
+                            MemoryPermissions::READ_WRITE,
+                            MemoryMappingPurpose::Heap,
+                        )
+                        .unwrap();
+                }
+                let page = GuestVirtualAddress::new(0x200000);
+                assert!(synthetic.set_mapping_purpose(
+                    SPACE,
+                    page,
+                    0x1000,
+                    MemoryMappingPurpose::Stack
+                ));
+                assert!(execution.set_mapping_purpose(
+                    SPACE,
+                    page,
+                    0x1000,
+                    MemoryMappingPurpose::Stack
+                ));
+            }
+            for space in [SPACE, AddressSpaceId::new(2), AddressSpaceId::new(3)] {
+                for address in [
+                    0, 0x1fdfff, 0x1fe000, 0x1fffff, 0x200000, 0x201000, 0x202000, 0x204fff,
+                    0x205000, 0x300000, 0x5fffff, 0x600000, 0x601000, 0x8fffff,
+                ] {
+                    let address = GuestVirtualAddress::new(address);
+                    assert_eq!(
+                        execution.query_memory(space, address, end),
+                        synthetic.query_memory(space, address, end)
+                    );
+                    assert_eq!(
+                        execution.query_page(space, address),
+                        synthetic.query_page(space, address)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

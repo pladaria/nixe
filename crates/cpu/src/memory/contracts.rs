@@ -967,6 +967,15 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         address: Option<GuestVirtualAddress>,
     ) -> Result<(), DataAccessFault>;
 
+    /// Inspect only the page containing `address`, without reading backing or
+    /// coalescing adjacent pages. Single-word access checks must not scan an
+    /// entire heap to discover boundaries they do not consume.
+    fn query_page(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Option<(MemoryRegionKind, MemoryMappingProperties)>;
+
     /// Queries the maximal contiguous mapping state containing `address`.
     ///
     /// `end_exclusive` is supplied by the process address-space policy and

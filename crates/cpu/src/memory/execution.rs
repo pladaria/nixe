@@ -74,6 +74,18 @@ type PageTableLeaf = [Option<ExecutionMapping>; LEAF_ENTRY_COUNT];
 #[derive(Default)]
 struct ExecutionPageTable {
     leaves: BTreeMap<(AddressSpaceId, u64), Box<PageTableLeaf>>,
+    // QueryMemory repeatedly asks about the same large heap. Retain its last
+    // maximal extent, with the exact query limit, until ANY mapping mutation.
+    // Keeping this beside the leaves makes invalidation unavoidable at every
+    // mutable page-table access; backing content/visibility does not affect it.
+    query: Option<CachedMemoryQuery>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedMemoryQuery {
+    space: AddressSpaceId,
+    limit: GuestVirtualAddress,
+    result: MemoryQueryResult,
 }
 
 impl ExecutionPageTable {
@@ -94,6 +106,7 @@ impl ExecutionPageTable {
         address_space: AddressSpaceId,
         virtual_page: u64,
     ) -> Option<&mut ExecutionMapping> {
+        self.query = None;
         let (leaf, index) = Self::coordinates(virtual_page);
         self.leaves.get_mut(&(address_space, leaf))?[index].as_mut()
     }
@@ -104,6 +117,7 @@ impl ExecutionPageTable {
         virtual_page: u64,
         mapping: ExecutionMapping,
     ) -> Option<ExecutionMapping> {
+        self.query = None;
         let (leaf, index) = Self::coordinates(virtual_page);
         let entries = self
             .leaves
@@ -117,6 +131,7 @@ impl ExecutionPageTable {
         address_space: AddressSpaceId,
         virtual_page: u64,
     ) -> Option<ExecutionMapping> {
+        self.query = None;
         let (leaf, index) = Self::coordinates(virtual_page);
         let key = (address_space, leaf);
         let entries = self.leaves.get_mut(&key)?;
@@ -620,7 +635,10 @@ impl ExecutionMemoryInner {
         address_space: AddressSpaceId,
         virtual_page: u64,
     ) -> Option<MappingState> {
-        let mapping = self.mappings.get(address_space, virtual_page)?;
+        self.mapping_properties(self.mappings.get(address_space, virtual_page)?)
+    }
+
+    fn mapping_properties(&self, mapping: ExecutionMapping) -> Option<MappingState> {
         let region = match self.page(mapping.physical_slot)? {
             ExecutionPhysicalPage::Ram(_) => MemoryRegionKind::Ram,
             ExecutionPhysicalPage::Mmio(_) => MemoryRegionKind::Device,
@@ -631,6 +649,70 @@ impl ExecutionMemoryInner {
             mapping.purpose,
             mapping.attributes,
         ))
+    }
+
+    fn coalesce_mapping(
+        &self,
+        address_space: AddressSpaceId,
+        page: u64,
+        end_page: u64,
+        state: MappingState,
+    ) -> (u64, u64) {
+        // Traverse each leaf's array directly. Adjacent pages share one ordered
+        // leaf lookup, rather than repeating that lookup for every heap page.
+        // The memory lock keeps both mappings and backing identities stable.
+        let mut cached_leaf = u64::MAX;
+        let mut entries = None;
+        coalesce_mapped_pages(page, end_page, state, |page| {
+            let (leaf, index) = ExecutionPageTable::coordinates(page);
+            if cached_leaf != leaf {
+                cached_leaf = leaf;
+                entries = self.mappings.leaves.get(&(address_space, leaf));
+            }
+            self.mapping_properties(entries?[index]?)
+        })
+    }
+
+    fn unmapped_boundaries(
+        &self,
+        address_space: AddressSpaceId,
+        page: u64,
+        end_page: u64,
+    ) -> (u64, u64) {
+        let (leaf, index) = ExecutionPageTable::coordinates(page);
+        let previous = self
+            .mappings
+            .leaves
+            .range(..=(address_space, leaf))
+            .rev()
+            .take_while(|((space, _), _)| *space == address_space)
+            .find_map(|((_, candidate), entries)| {
+                let end = if *candidate == leaf {
+                    index
+                } else {
+                    LEAF_ENTRY_COUNT
+                };
+                entries[..end]
+                    .iter()
+                    .rposition(Option::is_some)
+                    .map(|offset| (*candidate << LEAF_BITS) + offset as u64 + 1)
+            })
+            .unwrap_or(0);
+        let next = self
+            .mappings
+            .leaves
+            .range((address_space, leaf)..)
+            .take_while(|((space, _), _)| *space == address_space)
+            .find_map(|((_, candidate), entries)| {
+                let start = if *candidate == leaf { index + 1 } else { 0 };
+                entries[start..]
+                    .iter()
+                    .position(Option::is_some)
+                    .map(|offset| (*candidate << LEAF_BITS) + (start + offset) as u64)
+            })
+            .unwrap_or(end_page)
+            .min(end_page);
+        (previous.min(page), next.max(page + 1))
     }
 }
 
@@ -3170,6 +3252,20 @@ impl CpuMemory for ExecutionMemory {
         }
     }
 
+    fn query_page(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Option<(MemoryRegionKind, MemoryMappingProperties)> {
+        let inner = self.lock_inner();
+        let (region, permissions, purpose, attributes) =
+            inner.mapping_state(address_space, virtual_page(address))?;
+        Some((
+            region,
+            MemoryMappingProperties::new(permissions, purpose, attributes),
+        ))
+    }
+
     fn query_memory(
         &self,
         address_space: AddressSpaceId,
@@ -3179,31 +3275,31 @@ impl CpuMemory for ExecutionMemory {
         if address.get() >= end_exclusive.get() {
             return None;
         }
-        let inner = self.lock_inner();
+        let mut inner = self.lock_inner();
+        if let Some(query) = inner.mappings.query
+            && query.space == address_space
+            && query.limit == end_exclusive
+            && address.get() >= query.result.base.get()
+            && address.get() - query.result.base.get() < query.result.size
+        {
+            return Some(query.result);
+        }
         let page = virtual_page(address);
         let end_page = virtual_page(end_exclusive);
         let state = inner.mapping_state(address_space, page);
 
         let (first_page, last_page_exclusive) = if let Some(state) = state {
-            coalesce_mapped_pages(page, end_page, state, |page| {
-                inner.mapping_state(address_space, page)
-            })
+            inner.coalesce_mapping(address_space, page, end_page, state)
         } else {
-            let mut previous = 0;
-            let mut next = end_page;
-            for (space, mapped_page, _) in inner.mappings.mappings() {
-                if space != address_space {
-                    continue;
-                }
-                if mapped_page < page {
-                    previous = previous.max(mapped_page.saturating_add(1));
-                } else if mapped_page > page {
-                    next = next.min(mapped_page);
-                }
-            }
-            (previous.min(page), next.max(page + 1))
+            inner.unmapped_boundaries(address_space, page, end_page)
         };
-        memory_query_result(first_page, last_page_exclusive, state)
+        let result = memory_query_result(first_page, last_page_exclusive, state)?;
+        inner.mappings.query = Some(CachedMemoryQuery {
+            space: address_space,
+            limit: end_exclusive,
+            result,
+        });
+        Some(result)
     }
 
     fn resolve_exclusive_load(
@@ -4041,6 +4137,110 @@ impl ProcessMemory for ExecutionMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_query_extents_follow_mapping_changes_spaces_and_limits() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(1);
+        let other = AddressSpaceId::new(2);
+        let limit = GuestVirtualAddress::new(0x10000);
+        for page in 1..=3 {
+            let id = GuestPhysicalPageId::new(page);
+            assert!(memory.add_ram_page(id));
+            assert!(memory.map_page(space, page_address(page), id, MemoryPermissions::READ_WRITE));
+        }
+        let query = |memory: &ExecutionMemory, address| {
+            memory
+                .query_memory(space, page_address(address), limit)
+                .unwrap()
+        };
+        let heap = query(&memory, 1);
+        assert_eq!((heap.base.get(), heap.size), (0x1000, 0x3000));
+        assert_eq!(query(&memory, 3), heap);
+        assert_eq!(query(&memory, 2), heap);
+        memory
+            .set_permissions(space, page_address(2), PAGE_SIZE, MemoryPermissions::READ)
+            .unwrap();
+        assert_eq!(query(&memory, 1).size, PAGE_SIZE);
+        assert_eq!(query(&memory, 2).permissions, MemoryPermissions::READ);
+        memory
+            .set_permissions(
+                space,
+                page_address(2),
+                PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+        assert_eq!(query(&memory, 3), heap);
+        memory
+            .set_attributes(
+                space,
+                page_address(2),
+                PAGE_SIZE,
+                MemoryAttributes::UNCACHED,
+                MemoryAttributes::UNCACHED,
+            )
+            .unwrap();
+        assert_eq!(query(&memory, 2).attributes, MemoryAttributes::UNCACHED);
+        assert_eq!(query(&memory, 1).size, PAGE_SIZE);
+        memory
+            .set_attributes(
+                space,
+                page_address(2),
+                PAGE_SIZE,
+                MemoryAttributes::UNCACHED,
+                MemoryAttributes::NONE,
+            )
+            .unwrap();
+        assert_eq!(query(&memory, 1), heap);
+        let bounded = memory
+            .query_memory(space, page_address(1), page_address(3))
+            .unwrap();
+        assert_eq!(bounded.size, 2 * PAGE_SIZE);
+        assert_eq!(query(&memory, 1), heap); // A smaller query limit cannot truncate the cache.
+        let hole = memory.query_memory(other, page_address(2), limit).unwrap();
+        assert_eq!(hole.region, None);
+        assert_eq!(query(&memory, 2), heap);
+        // A cached hole must disappear when an alias is inserted into it.
+        assert!(memory.map_page(
+            other,
+            page_address(2),
+            GuestPhysicalPageId::new(2),
+            MemoryPermissions::READ
+        ));
+        assert_eq!(
+            memory
+                .query_memory(other, page_address(2), limit)
+                .unwrap()
+                .region,
+            Some(MemoryRegionKind::Ram)
+        );
+        let hole = query(&memory, 4);
+        assert_eq!(hole.region, None);
+        memory
+            .resize_zeroed_mapping(
+                space,
+                page_address(1),
+                3 * PAGE_SIZE,
+                4 * PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        assert_eq!(query(&memory, 4).size, 4 * PAGE_SIZE);
+        memory
+            .resize_zeroed_mapping(
+                space,
+                page_address(1),
+                4 * PAGE_SIZE,
+                PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        assert_eq!(query(&memory, 1).size, PAGE_SIZE);
+        assert_eq!(query(&memory, 2).region, None);
+    }
     mod checked;
     mod mmio;
 

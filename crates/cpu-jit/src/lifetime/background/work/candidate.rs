@@ -116,7 +116,24 @@ impl<'p> Work<'p> {
                 Observation::Seed(_) => None,
                 Observation::Reshape { snapshot, .. } => Some(snapshot.key.source),
             };
-            graph.trim(&blocked, &observation.successors(), source)?
+            let predecessors = self.reshape_predecessors()?;
+            let entries: Vec<_> = predecessors
+                .iter()
+                .flatten()
+                .flat_map(|previous| previous.entries.iter().map(|entry| entry.key))
+                .collect();
+            let graph = graph.trim(&blocked, &observation.successors(), source, &entries)?;
+            // A competing claim is transient. Defer the whole reshape rather
+            // than dropping an existing entry's body or installing a negative.
+            if !predecessors.iter().flatten().all(|previous| {
+                previous
+                    .instructions
+                    .iter()
+                    .all(|word| graph.contains(word.key))
+            }) {
+                return Err(CompileError::Deferred);
+            }
+            graph
         } else {
             graph
         };

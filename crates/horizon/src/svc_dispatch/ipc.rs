@@ -162,6 +162,16 @@ impl HorizonSvcDispatcher {
                 log::debug!("application applet requested process exit");
                 terminate(ExceptionTerminationScope::Process)
             }
+            Ok(SyncRequestResult::PendingGpuSubmission(wait)) => {
+                self.pending_wakes.insert(
+                    context.thread().object().thread_id(),
+                    PendingThreadWake {
+                        events: vec![wait.wake_event()],
+                        deadline: None,
+                    },
+                );
+                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
+            }
             Ok(SyncRequestResult::PendingNvDrv(wait)) => {
                 log::debug!(
                     "suspending thread {} for nvdrv {} wait request={:#010x} target={} timeout-us={} event-slot={:?}",
@@ -253,6 +263,16 @@ impl HorizonSvcDispatcher {
                     .remove(&context.thread().object().thread_id());
                 log::debug!("application applet requested process exit");
                 terminate(ExceptionTerminationScope::Process)
+            }
+            Ok(SyncRequestResult::PendingGpuSubmission(wait)) => {
+                self.pending_wakes.insert(
+                    context.thread().object().thread_id(),
+                    PendingThreadWake {
+                        events: vec![wait.wake_event()],
+                        deadline: None,
+                    },
+                );
+                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
             }
             Ok(SyncRequestResult::PendingNvDrv(wait)) => {
                 self.pending_wakes.insert(

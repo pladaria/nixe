@@ -121,72 +121,12 @@ fn replacement_publishes_zero_one_or_two_participants_and_survives_their_cleanup
 }
 
 #[test]
-fn replacement_restores_discarded_entries_and_withdraws_unselected_membership() {
-    let process = process();
-    let cursor = AtomicU64::new(0);
-    publish_words(&process, 0, &[0x14000004]);
-    publish_words(&process, 16, &[NOP, RET]);
-    let baseline = publish_words(&process, 20, &[RET]);
-    let outside = publish_words(&process, 64, &[RET]);
-    let old = owned_entries(&process, &[(16, NOP), (20, RET), (64, RET)], 3);
-    let work = reshape(&process, 0, 0, 16);
-    let frozen = work
-        .reserve_candidate(Graph::discover(&work).unwrap())
-        .unwrap()
-        .freeze()
-        .unwrap();
-    assert_eq!(frozen.replacement().fallbacks.len(), 1);
-    let successor = frozen
-        .prepare(output(&process, &frozen), &cursor)
-        .unwrap()
-        .publish()
-        .unwrap();
-    {
-        let state = process.lock();
-        let retained = state
-            .dispatch
-            .get(*state.keys.get(&key(20)).unwrap())
-            .unwrap();
-        assert_eq!(retained.owners[1].unwrap().unit, successor);
-        assert_eq!(retained.owners[0].unwrap().unit, baseline);
-        let slot = state
-            .dispatch
-            .get(*state.keys.get(&key(64)).unwrap())
-            .unwrap();
-        assert!(slot.snapshot().hcq().is_none());
-        assert!(slot.owners[1].is_none());
-        assert_eq!(slot.owners[0].unwrap().unit, outside);
-        assert_eq!(slot.snapshot().preferred(), slot.snapshot().lcq());
-        assert!(state.units.family_owners.get(instruction(64)).is_none());
-        assert_eq!(
-            state.units.family_owners.get(instruction(20)),
-            state.units.records.get(successor.0).unwrap().family
-        );
-        assert_eq!(
-            state.units.records.get(old.0).unwrap().lifecycle,
-            Lifecycle::Superseded
-        );
-    }
-    assert!(process.try_service_links().unwrap());
-    {
-        let state = process.lock();
-        assert_eq!(
-            state.units.family_owners.get(instruction(20)),
-            state.units.records.get(successor.0).unwrap().family
-        );
-    }
-    drop(frozen);
-    drop(work);
-    assert!(process.try_shutdown().unwrap());
-}
-
-#[test]
 fn replacement_cuts_installed_static_and_pic_roots_before_retiring_predecessor() {
     let process = process();
     let cursor = AtomicU64::new(0);
     publish_words(&process, 0, &[0x14000004]);
     publish_words(&process, 16, &[RET]);
-    let baseline = publish_words(&process, 64, &[RET]);
+    publish_words(&process, 64, &[RET]);
     let old = owned_entries(&process, &[(16, RET), (64, RET)], 2);
     let selected = links::tests::source(&process, &cursor, 128, 16);
     let dropped = links::tests::source(&process, &cursor, 132, 64);
@@ -257,7 +197,7 @@ fn replacement_cuts_installed_static_and_pic_roots_before_retiring_predecessor()
         assert!(record.incoming.is_none());
         assert!(record.pic_incoming.is_none());
     }
-    for (source, target) in [(selected, successor), (dropped, baseline)] {
+    for (source, target) in [(selected, successor), (dropped, successor)] {
         links::tests::assert_callable_target(&process, source, target);
     }
     drop(frozen);

@@ -173,6 +173,15 @@ impl Work<'_> {
         }
     }
 
+    pub(crate) fn reshape_predecessors(&self) -> Result<[Option<unit::Snapshot>; 2], Error> {
+        let state = self.process.lock();
+        self.validate(&state)?;
+        Ok(match &self.job {
+            Job::Reshape(job) => job.predecessors(&state),
+            Job::Seed(_) => [None, None],
+        })
+    }
+
     pub(super) fn root_version(&self, key: BlockKey) -> Option<ReachabilityVersion> {
         [Some(self.observation().root()), self.reshape_anchor()]
             .into_iter()

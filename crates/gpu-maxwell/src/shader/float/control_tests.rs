@@ -75,7 +75,7 @@ fn fmul32i_preserves_all_immediate_bits_and_uses_its_own_modifier_fields() {
             assert!(f32::from_bits(result).is_nan());
         }
     }
-    for flags in [1 << 52, 1 << 55, 3 << 53] {
+    for flags in [1 << 52, 3 << 53] {
         assert!(
             decode_float_multiply(
                 MaxwellShaderStage::Compute,
@@ -316,5 +316,58 @@ fn fmul_dnz_constant_buffer_encoding_and_immediate_form() {
     assert_eq!(
         evaluate_operations(decoded.operations, [0x7f80_0000, 0, 0]),
         0
+    );
+}
+
+#[test]
+fn multiply_saturation_handles_every_operand_form_and_special_results() {
+    for (encoding, immediate) in [
+        (0x5c6c_0000_0017_0003, false),
+        (0x4c6c_0000_0007_0003, true),
+        (
+            0x386c_0000_0007_0003 | (u64::from(1.0_f32.to_bits() >> 12) << 20),
+            true,
+        ),
+        (
+            0x1e80_0000_0007_0003 | (u64::from(1.0_f32.to_bits()) << 20),
+            true,
+        ),
+    ] {
+        let decoded =
+            decode_float_multiply(MaxwellShaderStage::Compute, 8, encoding, 4, &mut 4).unwrap();
+        assert_eq!(decoded.operations.len(), if immediate { 2 } else { 1 });
+        assert!(
+            matches!(decoded.operations.last().unwrap(), ShaderOperation::Multiply32 { float_control, .. } if float_control.saturate())
+        );
+        if decoded.constant_buffer_binding.is_some() {
+            continue;
+        }
+        for (bits, expected) in [
+            (0xbf80_0000, 0),
+            (0x4000_0000, 0x3f80_0000),
+            (0x3f00_0000, 0x3f00_0000),
+            (0x7f80_0000, 0x3f80_0000),
+            (0xff80_0000, 0),
+            (0x7fc1_2345, 0),
+            (0xffc1_2345, 0),
+            (1, 1),
+            (0x8000_0000, 0),
+        ] {
+            assert_eq!(
+                evaluate_operations(decoded.operations.clone(), [bits, 1.0_f32.to_bits(), 0]),
+                expected
+            );
+        }
+    }
+    let decoded = decode_float_multiply(
+        MaxwellShaderStage::Pixel,
+        0x90,
+        0x1ea3_faaa_aab7_0308,
+        9,
+        &mut 9,
+    )
+    .unwrap();
+    assert!(
+        matches!(decoded.operations.last().unwrap(), ShaderOperation::Multiply32 { float_control, .. } if float_control.saturate() && float_control.flush_denormals_to_zero())
     );
 }

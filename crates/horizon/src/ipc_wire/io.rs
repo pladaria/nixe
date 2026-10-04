@@ -3,6 +3,7 @@
 use nixe_cpu::memory::{
     CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess,
     MemoryAccessSize, MemoryPermissions, MemoryRegionKind, MemoryValue, ProcessMemory,
+    SYNTHETIC_PAGE_SIZE,
 };
 use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::ExceptionProcessContext;
@@ -164,10 +165,18 @@ pub(crate) fn validate_writable_ram_range(
             DataAccessFaultReason::AddressOverflow,
         ))
     })?;
-    let limit = GuestVirtualAddress::new(process.address_space_limit());
+    let limit = process.address_space_limit();
     let mut cursor = start;
     while cursor.get() < end {
-        let Some(mapping) = process.memory().query_memory(address_space, cursor, limit) else {
+        // Only the destination's pages matter. QueryMemory finds maximal
+        // mapping boundaries and can scan the entire heap for an eight-byte
+        // audio release list. Both CPU memory backends use 4 KiB pages.
+        let mapping = if cursor.get() < limit {
+            process.memory().query_page(address_space, cursor)
+        } else {
+            None
+        };
+        let Some((region, mapping)) = mapping else {
             return Err(IpcWireError::GuestMemory(DataAccessFault::new(
                 address_space,
                 cursor,
@@ -175,7 +184,7 @@ pub(crate) fn validate_writable_ram_range(
                 DataAccessFaultReason::Unmapped,
             )));
         };
-        if mapping.region != Some(MemoryRegionKind::Ram) {
+        if region != MemoryRegionKind::Ram {
             return Err(IpcWireError::GuestMemory(DataAccessFault::new(
                 address_space,
                 cursor,
@@ -193,17 +202,8 @@ pub(crate) fn validate_writable_ram_range(
                 DataAccessFaultReason::WritePermissionDenied,
             )));
         }
-        let mapping_end = mapping
-            .base
-            .get()
-            .checked_add(mapping.size)
-            .ok_or(IpcWireError::Internal("guest memory query range overflows"))?;
-        if mapping_end <= cursor.get() {
-            return Err(IpcWireError::Internal(
-                "guest memory query did not advance while validating an IPC response",
-            ));
-        }
-        cursor = GuestVirtualAddress::new(mapping_end.min(end));
+        let page_end = (cursor.get() | (SYNTHETIC_PAGE_SIZE as u64 - 1)).saturating_add(1);
+        cursor = GuestVirtualAddress::new(page_end.min(end));
     }
     Ok(())
 }

@@ -587,9 +587,6 @@ impl SchedulerState {
             .threads
             .get(&id)
             .ok_or(SchedulerError::UnknownThread(id))?;
-        if thread.active_lease.is_some() {
-            return Err(SchedulerError::ThreadLeased(id));
-        }
         let old_key = thread.ready_key;
         if let Some(key) = old_key {
             self.ready.remove(&key);
@@ -621,9 +618,6 @@ impl SchedulerState {
             .threads
             .get(&id)
             .ok_or(SchedulerError::UnknownThread(id))?;
-        if thread.active_lease.is_some() {
-            return Err(SchedulerError::ThreadLeased(id));
-        }
         let old_key = thread.ready_key;
         if let Some(key) = old_key {
             self.ready.remove(&key);
@@ -861,6 +855,55 @@ mod tests {
             ideal_vcpu: Some(VirtualCpuId::new(0)),
             affinity: scheduler.profile().all_cores(),
         }
+    }
+
+    #[test]
+    fn priority_changes_preserve_the_running_lease_and_reorder_the_next_dispatch() {
+        let mut scheduler = SchedulerState::new(profile());
+        for (id, priority) in [(1, 10), (2, 20)] {
+            scheduler
+                .apply(SchedulerCommand::Register(config(&scheduler, id, priority)))
+                .unwrap();
+            scheduler
+                .apply(SchedulerCommand::MakeReady(GuestThreadId::new(id)))
+                .unwrap();
+        }
+        let SchedulerDecision::Selected(Some(lease)) = scheduler
+            .apply(SchedulerCommand::Select(VirtualCpuId::new(0)))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        scheduler
+            .apply(SchedulerCommand::SetPriority {
+                thread: lease.thread,
+                priority: 30,
+            })
+            .unwrap();
+        scheduler
+            .apply(SchedulerCommand::SetEffectivePriority {
+                thread: lease.thread,
+                priority: 25,
+            })
+            .unwrap();
+        assert_eq!(scheduler.lease_for_vcpu(lease.vcpu), Some(lease));
+        let view = scheduler.thread(lease.thread).unwrap();
+        assert_eq!(view.lifecycle, ThreadLifecycle::Running);
+        assert_eq!(view.base_priority, 30);
+        assert_eq!(view.effective_priority, 25);
+        scheduler
+            .apply(SchedulerCommand::Complete {
+                lease,
+                outcome: Completion::Preempted,
+            })
+            .unwrap();
+        let SchedulerDecision::Selected(Some(next)) = scheduler
+            .apply(SchedulerCommand::Select(VirtualCpuId::new(0)))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(next.thread, GuestThreadId::new(2));
     }
 
     #[test]

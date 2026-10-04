@@ -133,6 +133,7 @@ pub(crate) enum EdgeKind {
     FpToInteger(crate::abi::FpToIntegerOperation),
     IntegerToFp(crate::abi::IntegerToFpOperation),
     VectorIntegerToFp(crate::abi::VectorIntegerToFpOperation),
+    VectorFpToInteger(crate::abi::VectorFpToIntegerOperation),
     RuntimeSystem(crate::abi::RuntimeSystemOperation),
     ExclusiveStore(crate::abi::ExclusiveStoreOperation),
     Unsupported,
@@ -263,6 +264,8 @@ struct UnitRecord {
     reshape: Option<super::background::Owner<FamilyVersion>>,
     retirement: Option<(Reason, MaintenanceSequence)>,
     retirement_next: Option<Handle<UnitRecord>>,
+    eviction_previous: Option<Handle<UnitRecord>>,
+    eviction_next: Option<Handle<UnitRecord>>,
     // Memory safety work may join an already queued eviction/tier cutover.
     // Keep both acknowledgements tied to this exact unit until unlink.
     invalidation: Option<MaintenanceSequence>,
@@ -389,6 +392,10 @@ struct RetiredTable {
 
 pub(super) struct Units {
     records: Registry<UnitRecord>,
+    // Sample-recency intrusive lists avoid a full registry scan or sort for
+    // each eviction batch. Native sampling refreshes activity in constant time.
+    eviction_heads: [Option<Handle<UnitRecord>>; 2],
+    eviction_tails: [Option<Handle<UnitRecord>>; 2],
     // Includes retired/detached records until their last reference and epoch
     // permit removal. Directory-table presence alone is not sufficient.
     segment_records: [usize; SEGMENTS],
@@ -425,6 +432,8 @@ impl Default for Units {
     fn default() -> Self {
         Self {
             records: Registry::default(),
+            eviction_heads: [None; 2],
+            eviction_tails: [None; 2],
             segment_records: [0; SEGMENTS],
             segment_retired: [0; SEGMENTS],
             links: links::Links::default(),
@@ -1281,10 +1290,6 @@ impl Lifetime {
         let reshape = (tier == Tier::Hcq)
             .then(|| super::background::Owner::new(&self.cache, Tier::Hcq))
             .transpose()?;
-        let fallbacks = candidate
-            .map(|candidate| candidate.replacement().prepare_payloads(self))
-            .transpose()?
-            .flatten();
         Ok(PreparedUnit {
             process: self,
             candidate,
@@ -1298,7 +1303,6 @@ impl Lifetime {
             payloads: payload_boxes,
             slots: Some(slots),
             static_sites: Some(static_sites),
-            fallbacks,
         })
     }
 
@@ -1547,7 +1551,6 @@ pub(crate) struct PreparedUnit<'a> {
     payloads: StagedPayloads,
     slots: Option<Accounted<Box<[Handle<DispatchSlot>]>>>,
     static_sites: Option<Accounted<Box<[links::SourceSite]>>>,
-    fallbacks: Option<StagedPayloads>,
 }
 type OwnedPayload = Box<Accounted<DispatchPayload>>;
 type StagedPayloads = Accounted<Box<[Option<OwnedPayload>]>>;
@@ -1757,6 +1760,8 @@ impl PreparedUnit<'_> {
             reshape: self.reshape.take(),
             retirement: None,
             retirement_next: None,
+            eviction_previous: None,
+            eviction_next: None,
             invalidation: None,
             detached_epoch: None,
             detached_table: None,
@@ -1771,6 +1776,7 @@ impl PreparedUnit<'_> {
             .insert(&mut Some(record))
             .expect("validated unit insertion");
         debug_assert_eq!(inserted, handle);
+        state.units.insert_eviction(handle);
         state.units.segment_records[segment] += 1;
         unit.registration
             .set(source)
@@ -1789,9 +1795,7 @@ impl PreparedUnit<'_> {
             // transfer selected words in place below, under the same guard.
             // Old native roots stay callable until the TierCutover at Closed.
             if let Some(candidate) = self.candidate {
-                candidate
-                    .replacement()
-                    .retire(&mut state, cutover, candidate.graph());
+                candidate.replacement().retire(&mut state, cutover);
             }
             let family = state
                 .units
@@ -1868,9 +1872,6 @@ impl PreparedUnit<'_> {
                 );
             }
             *payload = Some(old);
-        }
-        if let Some(replacement) = predecessors {
-            replacement.publish_fallbacks(&mut state, self.fallbacks.as_mut());
         }
         process.changed.notify_all();
         // No publication can fail here. Old payload owners drop only
