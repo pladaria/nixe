@@ -149,6 +149,113 @@ fn current_process_content_does_not_require_general_mount_permission() {
 }
 
 #[test]
+fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions() {
+    for permissions in [0, 1_u64 << 62] {
+        let directory = tempfile::tempdir().unwrap();
+        let base = Package {
+            title_id: APPLICATION_ID,
+            version: 0,
+            kind: MetaKind::Application,
+            contents: vec![program_content_with_fs_permissions(
+                content_id(1),
+                &[("main", 1)],
+                permissions,
+            )],
+        };
+        let addon = Package {
+            title_id: FIRST_DLC_ID,
+            version: 0,
+            kind: MetaKind::AddOnContent {
+                required_application_version: 0,
+            },
+            contents: vec![public_data_content(
+                content_id(2),
+                FIRST_DLC_ID,
+                0,
+                build_romfs(&[("addon_key", b"public-content")]),
+            )],
+        };
+        fs::write(directory.path().join("base.nsp"), build_nsp(&base)).unwrap();
+        fs::write(directory.path().join("addon.nsp"), build_nsp(&addon)).unwrap();
+        let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
+        let policy = process.mounts().effective_policy().unwrap().filesystem();
+        assert!(policy.content_owner_ids().is_empty());
+        assert_eq!(policy.permissions().raw(), permissions);
+        assert_eq!(process.mounts().add_ons().len(), 1);
+
+        let service = process
+            .connect_ipc_service(IpcService::AddOnContent)
+            .unwrap();
+        assert_eq!(
+            process
+                .dispatch_ipc(service, IpcRequest::GetAddOnContentCount)
+                .unwrap(),
+            IpcResponse::Size(1)
+        );
+        let IpcResponse::AddOnContentEntries(entries) = process
+            .dispatch_ipc(
+                service,
+                IpcRequest::ListAddOnContent {
+                    offset: 0,
+                    max_entries: 1,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("add-on metadata must remain visible")
+        };
+        assert_eq!(entries[0].title_id.get(), FIRST_DLC_ID);
+        let IpcResponse::Handle(filesystem) = process
+            .dispatch_ipc(
+                service,
+                IpcRequest::OpenAddOnContent {
+                    title_id: entries[0].title_id,
+                    mount_index: 0,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("PublicData must not require content-owner permission")
+        };
+        let IpcResponse::Handle(file) = process
+            .dispatch_ipc(
+                filesystem,
+                IpcRequest::OpenFile {
+                    path: "/addon_key".into(),
+                    mode: 1,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("PublicData must be readable")
+        };
+        assert_eq!(
+            process
+                .dispatch_ipc(
+                    file,
+                    IpcRequest::ReadFile {
+                        offset: 0,
+                        size: 14
+                    }
+                )
+                .unwrap(),
+            IpcResponse::Data(b"public-content".to_vec())
+        );
+        assert_eq!(
+            process.dispatch_ipc(
+                service,
+                IpcRequest::OpenAddOnContent {
+                    title_id: nixe_loader_title::TitleId::new(SECOND_DLC_ID),
+                    mount_index: 0
+                }
+            ),
+            Err(IpcResultCode::PATH_NOT_FOUND)
+        );
+    }
+}
+
+#[test]
 fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
     let directory = tempfile::tempdir().unwrap();
     let base_romfs = build_romfs(&[("keep", b"same"), ("replace", b"old!")]);

@@ -20,13 +20,12 @@ pub struct ProcessMountNamespace {
 impl ProcessMountNamespace {
     pub(crate) fn from_launch_plan(plan: &LaunchPlan, sd_card_root: Option<PathBuf>) -> Self {
         let policy = plan.effective_policy().cloned();
-        let add_ons = plan
-            .add_ons()
-            .iter()
-            .filter(|add_on| content_owner_allowed(policy.as_ref(), add_on.title_id()))
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        // The title resolver selects only this application's add-ons, and the
+        // package loader verifies that their payload NCAs are PublicData.
+        // PublicData is exempt from FS content permissions; NPDM owner lists
+        // must not hide installed add-ons from aoc:u or prevent their access.
+        // https://switchbrew.org/wiki/Filesystem_services#OpenDataStorageByDataId
+        let add_ons = plan.add_ons().to_vec().into_boxed_slice();
         Self {
             primary: plan.primary_file_system().cloned(),
             add_ons,
@@ -41,7 +40,7 @@ impl ProcessMountNamespace {
         self.primary.as_ref()
     }
 
-    /// Returns only add-on views authorized by the effective NPDM policy.
+    /// Returns the installed PublicData add-ons resolved for this application.
     pub fn add_ons(&self) -> &[AddOnContent] {
         &self.add_ons
     }
@@ -61,7 +60,7 @@ impl ProcessMountNamespace {
         self.policy.as_ref()
     }
 
-    /// Looks up one authorized add-on without exposing unrelated installed content.
+    /// Looks up one application add-on without exposing unrelated installed content.
     pub fn add_on(&self, title_id: TitleId) -> Option<&AddOnContent> {
         self.add_ons
             .iter()
@@ -97,22 +96,4 @@ impl ProcessMountNamespace {
                 .map(|add_on| add_on.mounts().len())
                 .sum::<usize>()
     }
-}
-
-fn content_owner_allowed(policy: Option<&EffectiveNpdmPolicy>, title_id: TitleId) -> bool {
-    let Some(policy) = policy else {
-        return true;
-    };
-    let filesystem = policy.filesystem();
-    if filesystem
-        .permissions()
-        .contains(FileSystemPermissions::FULL_PERMISSION)
-    {
-        return true;
-    }
-    let owner = title_id.get();
-    filesystem.content_owner_ids().contains(&owner)
-        || filesystem
-            .content_owner_range()
-            .is_some_and(|(start, end)| (start..=end).contains(&owner))
 }
