@@ -13,6 +13,7 @@ mod indexed;
 mod multisample;
 mod raster;
 mod resolve;
+mod sampled_alias;
 
 use std::{
     cell::Cell,
@@ -70,6 +71,7 @@ use super::threed::{
     MaxwellThreeDTextureDimension, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
     MaxwellThreeDVertexNumericalType, MaxwellThreeDViewportCoordinateSwizzle,
     MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportScaleOffsetEnable,
+    MaxwellThreeDViewportSwizzleComponent,
 };
 
 #[derive(Clone, Debug)]
@@ -586,6 +588,7 @@ struct ViewRecord {
     dependency: ResourceDependency,
     materialization: ViewMaterialization,
     cpu_writes: Option<CanonicalCpuWriteDependency>,
+    write_revision: u64,
 }
 
 impl ViewRecord {
@@ -602,6 +605,7 @@ impl ViewRecord {
 enum ViewMaterialization {
     Direct,
     CompressedColor,
+    CopiedColor { source: ImageId, revision: u64 },
     CompressedDepthStencil { depth: bool, stencil: bool },
 }
 
@@ -613,7 +617,7 @@ impl ViewMaterialization {
                 depth: materialized_depth,
                 stencil: materialized_stencil,
             } => (!depth || materialized_depth) && (!stencil || materialized_stencil),
-            Self::CompressedColor => false,
+            Self::CompressedColor | Self::CopiedColor { .. } => false,
         }
     }
 }
@@ -640,6 +644,7 @@ struct PreparedDrawRecord {
     shaders: Arc<()>,
     operations: [GpuOperation; 3],
     dirty_images: Arc<[usize]>,
+    sampled_aliases: Box<[ResourceDependency]>,
 }
 
 impl PreparedDrawRecord {
@@ -818,6 +823,7 @@ pub struct MaxwellLoweringCache {
     )>,
     views: Vec<ViewRecord>,
     color_materializations: Vec<ColorRepresentationRecord>,
+    image_alias_copies: Vec<GpuOperation>,
     graphics_pipeline: Option<PipelineId>,
     compute_pipeline: Option<PipelineId>,
     compute_shaders: FingerprintCache<compute::ComputeShaderRecord>,
@@ -853,6 +859,7 @@ impl MaxwellLoweringCache {
             allocations: Vec::new(),
             views: Vec::new(),
             color_materializations: Vec::new(),
+            image_alias_copies: Vec::new(),
             graphics_pipeline: None,
             compute_pipeline: None,
             compute_shaders: FingerprintCache::default(),
@@ -1357,7 +1364,16 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         let prepared = cache
             .prepared_draw
             .as_ref()
-            .filter(|prepared| prepared.matches(state, resources, shaders, trigger.is_indexed()))
+            .filter(|prepared| {
+                prepared.matches(state, resources, shaders, trigger.is_indexed())
+                    && prepared.sampled_aliases.iter().all(|dependency| {
+                        cache
+                            .views
+                            .iter()
+                            .find(|record| record.dependency == *dependency)
+                            .is_some_and(|record| sampled_alias::copy_is_current(record, cache))
+                    })
+            })
             .map(|prepared| {
                 Ok::<_, MaxwellLoweringError>((
                     prepared.operations(arguments)?,
@@ -1366,6 +1382,10 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             })
             .transpose()?;
         if let Some((commands, dirty_images)) = prepared {
+            for index in dirty_images.iter() {
+                let image = resolved_image(resources, *index)?;
+                record_image_write(image, cache);
+            }
             let invalidations = std::mem::take(&mut cache.retired_resources);
             return finish_lowered_work(
                 cache,
@@ -1626,28 +1646,6 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         draw_viewport_transform(state)?;
     }
     if trigger.is_draw()
-        && let Some((viewport, swizzle)) = state
-            .fixed_function()
-            .viewport()
-            .iter()
-            .enumerate()
-            .find_map(|(viewport, state)| {
-                state
-                    .coordinate_swizzle()
-                    .value()
-                    .copied()
-                    .filter(|swizzle| !swizzle.is_identity())
-                    .map(|swizzle| (viewport as u8, swizzle))
-            })
-    {
-        return Err(
-            MaxwellLoweringError::UnsupportedViewportCoordinateSwizzleSemantics {
-                viewport,
-                swizzle,
-            },
-        );
-    }
-    if trigger.is_draw()
         && state
             .fixed_function()
             .register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable)
@@ -1757,7 +1755,6 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         let attachments = draw_attachments
             .as_mut()
             .ok_or(MaxwellLoweringError::IncompleteDraw("SET_CT_SELECT"))?;
-        validate_draw_surface_clip(state, resources, attachments)?;
         if attachments.colors.len() > 1
             && state.render_targets().separate_fragment_data().value()
                 == Some(&MaxwellThreeDSeparateFragmentData::Disabled)
@@ -1890,7 +1887,8 @@ fn finish_lowered_work(
     commands: impl IntoIterator<Item = GpuOperation>,
     dirty_images: Arc<[usize]>,
 ) -> Result<MaxwellLoweredWork, MaxwellLoweringError> {
-    let operations = sequence_with_transitions(commands, cache)?;
+    let copies = std::mem::take(&mut cache.image_alias_copies);
+    let operations = sequence_with_transitions(copies.into_iter().chain(commands), cache)?;
     let submission = OperationSubmission::new(submission, predecessors, operations)
         .map_err(MaxwellLoweringError::Command)?;
     cache.revision = cache
@@ -2239,6 +2237,7 @@ fn record_clear_materialization(
             MaxwellThreeDResourceRole::ColorTarget(surface.color_target()),
         )?;
         let image = resolved_image(resources, index)?;
+        record_image_write(image, cache);
         // Track the same storage requirement consumed by validation and
         // resource creation. MSAA sample storage needs a resident image even
         // when compression of subsequent writes is disabled or unspecified.
@@ -2280,11 +2279,26 @@ fn record_draw_color_materializations(
     for target in attachments.color_targets() {
         let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
         let image = resolved_image(resources, index)?;
+        record_image_write(image, cache);
         if image.guest_layout().requires_materialization() {
             record_color_materialization(image, cache);
         }
     }
     Ok(())
+}
+
+fn record_image_write(
+    image: &super::threed::MaxwellThreeDResolvedImage,
+    cache: &mut MaxwellLoweringCache,
+) {
+    let revision = cache.revision.saturating_add(1);
+    if let Some(record) = cache
+        .views
+        .iter_mut()
+        .find(|record| record.key.same_domain_as_image(image))
+    {
+        record.write_revision = revision;
+    }
 }
 
 fn record_color_materialization(
@@ -2639,35 +2653,74 @@ const fn depth_stencil_attachment_required(
     )
 }
 
-fn validate_draw_surface_clip(
+fn draw_scissor(
     state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
     attachments: &DrawAttachmentSelection,
-) -> Result<(), MaxwellLoweringError> {
+) -> Result<nixe_gpu::ScissorRect, MaxwellLoweringError> {
+    let (mut width, mut height) = (u32::MAX, u32::MAX);
+    for index in attachments.attachment_indices() {
+        let extent = resolved_image(resources, index)?.description().extent();
+        width = width.min(extent.width);
+        height = height.min(extent.height);
+    }
+    draw_scissor_region(state, width, height)
+}
+
+fn draw_scissor_region(
+    state: &MaxwellThreeDState,
+    width: u32,
+    height: u32,
+) -> Result<nixe_gpu::ScissorRect, MaxwellLoweringError> {
+    // Surface clip uses origin + extent; scissor uses half-open min/max.
+    // Both restrict window-space fragments, preserving vertex execution and
+    // shader-visible coordinates even when their intersection is empty.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1386-L1392
+    // https://docs.rs/wgpu/30.0.1/wgpu/struct.RenderPass.html#method.set_scissor_rect
+    let mut region = MaxwellThreeDRasterRegion::attachment(width, height);
     let horizontal = state.fixed_function().surface_clip_horizontal().value();
     let vertical = state.fixed_function().surface_clip_vertical().value();
-    let (Some(horizontal), Some(vertical)) = (horizontal, vertical) else {
-        return if horizontal.is_none() && vertical.is_none() {
-            Ok(())
-        } else {
-            Err(MaxwellLoweringError::IncompleteDraw(
+    match (horizontal, vertical) {
+        (Some(horizontal), Some(vertical)) => {
+            region.min_x = u32::from(horizontal.origin()).min(width);
+            region.max_x =
+                (u32::from(horizontal.origin()) + u32::from(horizontal.extent())).min(width);
+            region.min_y = u32::from(vertical.origin()).min(height);
+            region.max_y =
+                (u32::from(vertical.origin()) + u32::from(vertical.extent())).min(height);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(MaxwellLoweringError::IncompleteDraw(
                 "SET_SURFACE_CLIP_HORIZONTAL/VERTICAL",
-            ))
-        };
-    };
-
-    for index in attachments.attachment_indices() {
-        let image = resolved_image(resources, index)?;
-        let extent = image.description().extent();
-        if horizontal.origin() != 0
-            || vertical.origin() != 0
-            || u32::from(horizontal.extent()) < extent.width
-            || u32::from(vertical.extent()) < extent.height
-        {
-            return Err(MaxwellLoweringError::UnsupportedSurfaceClipSemantics);
+            ));
         }
     }
-    Ok(())
+    let scissor = &state.fixed_function().scissor()[0];
+    if scissor.enable().value() == Some(&true) {
+        region.intersect(
+            scissor
+                .horizontal()
+                .value()
+                .copied()
+                .ok_or(MaxwellLoweringError::IncompleteDraw(
+                    "SET_SCISSOR_HORIZONTAL(0)",
+                ))?,
+            scissor
+                .vertical()
+                .value()
+                .copied()
+                .ok_or(MaxwellLoweringError::IncompleteDraw(
+                    "SET_SCISSOR_VERTICAL(0)",
+                ))?,
+        );
+    }
+    Ok(nixe_gpu::ScissorRect {
+        x: region.min_x.min(width),
+        y: region.min_y.min(height),
+        width: region.max_x.saturating_sub(region.min_x),
+        height: region.max_y.saturating_sub(region.min_y),
+    })
 }
 
 fn draw_viewport_transform(
@@ -2680,13 +2733,30 @@ fn draw_viewport_transform(
         == Some(&MaxwellThreeDFixedFunctionValue::ViewportScaleOffsetEnable(
             MaxwellThreeDViewportScaleOffsetEnable::Enabled,
         ));
+    // The current draw contract selects viewport zero. Shader-selected or
+    // replicated viewports require a distinct draw contract.
+    let viewport = &state.fixed_function().viewport()[0];
+    let swizzle = viewport.coordinate_swizzle().value().copied();
+    let reflect_y = if let Some(swizzle) = swizzle {
+        use MaxwellThreeDViewportSwizzleComponent::{NegativeY, PositiveW, PositiveX, PositiveZ};
+        if swizzle.is_identity() {
+            false
+        } else if enabled && swizzle.components() == [PositiveX, NegativeY, PositiveZ, PositiveW] {
+            true
+        } else {
+            return Err(
+                MaxwellLoweringError::UnsupportedViewportCoordinateSwizzleSemantics {
+                    viewport: 0,
+                    swizzle,
+                },
+            );
+        }
+    } else {
+        false
+    };
     if !enabled {
         return Ok(None);
     }
-
-    // The current draw contract selects viewport zero. T10 must provide
-    // explicit viewport-index output evidence before another slot can be used.
-    let viewport = &state.fixed_function().viewport()[0];
     let scale = viewport
         .scale()
         .each_ref()
@@ -2727,8 +2797,14 @@ fn draw_viewport_transform(
             "SET_VIEWPORT_CLIP_MAX_Z(0)",
         ));
     };
+    // NV_viewport_swizzle acts before clipping and perspective division.
+    // A Y-only reflection preserves the symmetric -w..w clip volume and w;
+    // its exact window transform is therefore (y/w)*(-scale_y)+offset_y.
+    // Fold the sign into the existing neutral transform; the backend applies
+    // it at vertex output, preserving varyings, depth, and polygon facing.
+    // https://registry.khronos.org/OpenGL/extensions/NV/NV_viewport_swizzle.txt
     ViewportTransform::new(
-        [scale_x, scale_y, scale_z],
+        [scale_x, if reflect_y { -scale_y } else { scale_y }, scale_z],
         [offset_x, offset_y, offset_z],
         [clip_min_z, clip_max_z],
     )
@@ -2774,7 +2850,8 @@ fn prepare_resources(
                 .iter()
                 .find(|record| record.remains_current_for_image(image));
             if let Some(record) = resident
-                && (record.materialization == ViewMaterialization::Direct
+                && (sampled_alias::copy_is_current(record, cache)
+                    || record.materialization == ViewMaterialization::Direct
                     || (record.materialization == ViewMaterialization::CompressedColor
                         && cache
                             .color_materializations
@@ -2784,6 +2861,10 @@ fn prepare_resources(
                 // Direct residents have canonical initialization from their
                 // producer; opaque residents require the recorded clear.
                 result[*index] = Some(record.dependency);
+                continue;
+            }
+            if let Some(dependency) = sampled_alias::prepare(image, cache, creations)? {
+                result[*index] = Some(dependency);
                 continue;
             }
             return Err(MaxwellLoweringError::CompressedSampledImageImportRequired {
@@ -2879,6 +2960,7 @@ fn prepare_resources(
             dependency,
             materialization,
             cpu_writes,
+            write_revision: 0,
         });
         result[*index] = Some(dependency);
     }
@@ -3032,14 +3114,14 @@ fn shader_resource_dependency(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MaxwellThreeDClearRegion {
+struct MaxwellThreeDRasterRegion {
     min_x: u32,
     max_x: u32,
     min_y: u32,
     max_y: u32,
 }
 
-impl MaxwellThreeDClearRegion {
+impl MaxwellThreeDRasterRegion {
     const fn attachment(width: u32, height: u32) -> Self {
         Self {
             min_x: 0,
@@ -3139,8 +3221,8 @@ impl MaxwellThreeDClearRegions {
         })
     }
 
-    fn for_attachment(self, width: u32, height: u32) -> MaxwellThreeDClearRegion {
-        let mut region = MaxwellThreeDClearRegion::attachment(width, height);
+    fn for_attachment(self, width: u32, height: u32) -> MaxwellThreeDRasterRegion {
+        let mut region = MaxwellThreeDRasterRegion::attachment(width, height);
         for (horizontal, vertical) in [self.clear, self.scissor, self.viewport_clip]
             .into_iter()
             .flatten()
@@ -3627,6 +3709,7 @@ fn lower_draw(
     }
     draw.front_face = raster.front_face;
     draw.cull_mode = raster.cull_mode;
+    draw.scissor = Some(draw_scissor(state, resources, attachment_selection)?);
     draw.tessellation = tessellation;
     draw.color_outputs = attachment_selection.color_outputs;
     if let Some(alpha_test) = draw_alpha_test_state(state)? {
@@ -3677,6 +3760,20 @@ fn lower_draw(
         shaders: shaders.identity(),
         operations,
         dirty_images: attachment_selection.attachment_indices().into(),
+        sampled_aliases: bindings
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|dependency| {
+                cache.views.iter().any(|record| {
+                    record.dependency == *dependency
+                        && matches!(
+                            record.materialization,
+                            ViewMaterialization::CopiedColor { .. }
+                        )
+                })
+            })
+            .collect(),
     };
     let operations = record.operations(arguments)?;
     let dirty = Arc::clone(&record.dirty_images);
@@ -4217,7 +4314,6 @@ pub enum MaxwellLoweringError {
         viewport: u8,
         swizzle: MaxwellThreeDViewportCoordinateSwizzle,
     },
-    UnsupportedSurfaceClipSemantics,
     UnsupportedWindowClipSemantics,
     UnsupportedClipIdTestSemantics,
     UnsupportedStencilTestSemantics {
@@ -4488,9 +4584,6 @@ impl Display for MaxwellLoweringError {
                 formatter,
                 "MAXWELL_B viewport coordinate swizzle is not represented by the neutral pipeline contract: viewport={viewport} components={:?}",
                 swizzle.components()
-            ),
-            Self::UnsupportedSurfaceClipSemantics => formatter.write_str(
-                "MAXWELL_B programmed surface clip has no verified neutral draw-time region-composition semantics",
             ),
             Self::UnsupportedWindowClipSemantics => formatter.write_str(
                 "MAXWELL_B enabled window clipping has no neutral pipeline or backend rasterization semantics",
@@ -4763,6 +4856,136 @@ impl std::error::Error for MaxwellLoweringError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draw_fragment_bounds_compose_surface_origin_extent_and_scissor() {
+        use crate::engines::tests::{program_three_d, three_d_channel};
+        use nixe_gpu::ScissorRect;
+        let mut channel = three_d_channel();
+        assert_eq!(
+            super::draw_scissor_region(channel.three_d(), 64, 32).unwrap(),
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 32
+            }
+        );
+        program_three_d(&mut channel, 0x0ff4, (40 << 16) | 5);
+        assert!(matches!(
+            super::draw_scissor_region(channel.three_d(), 64, 32),
+            Err(MaxwellLoweringError::IncompleteDraw(_))
+        ));
+        program_three_d(&mut channel, 0x0ff8, (20 << 16) | 7);
+        assert_eq!(
+            super::draw_scissor_region(channel.three_d(), 64, 32).unwrap(),
+            ScissorRect {
+                x: 5,
+                y: 7,
+                width: 40,
+                height: 20
+            }
+        );
+        program_three_d(&mut channel, 0x0e00, 1);
+        assert!(matches!(
+            super::draw_scissor_region(channel.three_d(), 64, 32),
+            Err(MaxwellLoweringError::IncompleteDraw(_))
+        ));
+        program_three_d(&mut channel, 0x0e04, (50 << 16) | 12);
+        program_three_d(&mut channel, 0x0e08, (23 << 16) | 2);
+        assert_eq!(
+            super::draw_scissor_region(channel.three_d(), 64, 32).unwrap(),
+            ScissorRect {
+                x: 12,
+                y: 7,
+                width: 33,
+                height: 16
+            }
+        );
+        program_three_d(&mut channel, 0x0e04, (80 << 16) | 70);
+        assert_eq!(
+            super::draw_scissor_region(channel.three_d(), 64, 32).unwrap(),
+            ScissorRect {
+                x: 64,
+                y: 7,
+                width: 0,
+                height: 16
+            }
+        );
+        program_three_d(&mut channel, 0x0e00, 0);
+        assert_eq!(
+            super::draw_scissor_region(channel.three_d(), 16, 12).unwrap(),
+            ScissorRect {
+                x: 5,
+                y: 7,
+                width: 11,
+                height: 5
+            }
+        );
+        program_three_d(&mut channel, 0x0ff4, 100);
+        assert_eq!(
+            super::draw_scissor_region(channel.three_d(), 64, 32).unwrap(),
+            ScissorRect {
+                x: 64,
+                y: 7,
+                width: 0,
+                height: 20
+            }
+        );
+    }
+
+    #[test]
+    fn viewport_y_swizzle_composes_with_both_scale_signs_and_preserves_offsets() {
+        use crate::engines::tests::{program_three_d, three_d_channel};
+        let mut channel = three_d_channel();
+        for (method, argument) in [
+            (0x0a00, 32.0_f32.to_bits()),
+            (0x0a08, 0.5_f32.to_bits()),
+            (0x0a0c, 37.0_f32.to_bits()),
+            (0x0a10, 19.0_f32.to_bits()),
+            (0x0a14, 0.5_f32.to_bits()),
+            (0x0c08, 0.0_f32.to_bits()),
+            (0x0c0c, 1.0_f32.to_bits()),
+            (0x192c, 1),
+        ] {
+            program_three_d(&mut channel, method, argument);
+        }
+        for scale in [-16.0_f32, 16.0] {
+            program_three_d(&mut channel, 0x0a04, scale.to_bits());
+            for (swizzle, expected_y) in [(0x6420, scale), (0x6430, -scale)] {
+                program_three_d(&mut channel, 0x0a18, swizzle);
+                // Unconsumed viewport state must not reject viewport zero.
+                program_three_d(&mut channel, 0x0a38, 0x7654);
+                let transform = super::draw_viewport_transform(channel.three_d())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(transform.scale(), [32.0, expected_y, 0.5]);
+                assert_eq!(transform.offset(), [37.0, 19.0, 0.5]);
+                assert_eq!(transform.depth_range(), [0.0, 1.0]);
+            }
+        }
+        program_three_d(&mut channel, 0x0a18, 0x6421);
+        assert!(matches!(
+            super::draw_viewport_transform(channel.three_d()),
+            Err(
+                MaxwellLoweringError::UnsupportedViewportCoordinateSwizzleSemantics {
+                    viewport: 0,
+                    ..
+                }
+            )
+        ));
+        program_three_d(&mut channel, 0x0a18, 0x6430);
+        program_three_d(&mut channel, 0x192c, 0);
+        assert!(matches!(
+            super::draw_viewport_transform(channel.three_d()),
+            Err(
+                MaxwellLoweringError::UnsupportedViewportCoordinateSwizzleSemantics {
+                    viewport: 0,
+                    ..
+                }
+            )
+        ));
+    }
+
     use nixe_gpu::{
         DepthCompareOperation, GpuCacheConfiguration, PrimitiveTopology, ResourceDependency,
         ShaderId, ShaderInstruction, ShaderIr, ShaderOperation, ShaderPredicate,

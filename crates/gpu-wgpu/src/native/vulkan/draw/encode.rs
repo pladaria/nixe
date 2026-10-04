@@ -85,9 +85,11 @@ unsafe fn encode_segment(cmd: vk::CommandBuffer, draws: &[RetainedDraw]) {
                 .render_area(area),
             vk::SubpassContents::INLINE,
         );
-        raw.cmd_set_scissor(cmd, 0, &[area]);
         let mut previous: Option<&RetainedDraw> = None;
         for draw in draws {
+            if previous.is_none_or(|p| p.scissor != draw.scissor) {
+                raw.cmd_set_scissor(cmd, 0, &[draw.scissor]);
+            }
             let pipeline = &draw.frame.pipeline;
             if previous.is_none_or(|p| !Arc::ptr_eq(&p.frame.pipeline, pipeline)) {
                 raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);

@@ -47,9 +47,52 @@ impl LoggerCommand {
 
 pub(in crate::ipc_wire) fn dispatch_log_manager(
     process: &mut ExceptionProcessContext<'_>,
+    manager: &LogManagerSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    guest_logs_level: GuestLogLevel,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    // Domain objects stay in this session instead of becoming kernel handles.
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L242-L293
+    let is_domain = manager.is_domain();
+    match &request.domain {
+        Some(DomainRequest::Close { object_id }) => {
+            let result = if manager.close_object(*object_id) {
+                HorizonIpcResult::SUCCESS
+            } else {
+                HorizonIpcResult::CMIF_TARGET_NOT_FOUND
+            };
+            return logger_response(request.token, is_domain, result);
+        }
+        Some(DomainRequest::SendMessage {
+            object_id,
+            input_objects,
+        }) => {
+            if !input_objects.is_empty() {
+                return logger_response(
+                    request.token,
+                    is_domain,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            }
+            if *object_id != 1 {
+                let Some(logger) = manager.logger(*object_id) else {
+                    return logger_response(
+                        request.token,
+                        is_domain,
+                        HorizonIpcResult::CMIF_TARGET_NOT_FOUND,
+                    );
+                };
+                return dispatch_logger(process, &logger, request, hipc, guest_logs_level);
+            }
+        }
+        None if is_domain => {
+            return Err(IpcWireError::Malformed(
+                "domain lm request omitted its domain header",
+            ));
+        }
+        None => {}
+    }
     let Some(command) = LogManagerCommand::decode(request.command_id) else {
         return unsupported_service_command("lm", request.command_id);
     };
@@ -68,12 +111,29 @@ pub(in crate::ipc_wire) fn dispatch_log_manager(
                 || !hipc.exchange_buffers.is_empty()
                 || !matches!(hipc.receive_statics, ReceiveStatics::None)
             {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                return logger_response(
+                    request.token,
+                    request.domain.is_some(),
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
             }
             let process_id = process.process_id();
+            let logger = LoggerSession::new(process_id);
+            if is_domain {
+                let object_id =
+                    manager
+                        .insert_logger(logger)
+                        .ok_or(IpcWireError::HostResourceExhausted(
+                            "installing an lm logger domain object",
+                        ))?;
+                log::debug!(
+                    "lm opened ILogger domain object {object_id:#x} for process {process_id}"
+                );
+                return semantic_success(request.token, true, &[], &[], &[object_id], None);
+            }
             let handle = process
                 .handles_mut()
-                .insert(HorizonIpcObject::Logger(LoggerSession::new(process_id)))
+                .insert(HorizonIpcObject::Logger(logger))
                 .map_err(|_| {
                     IpcWireError::HostResourceExhausted("installing an lm logger handle")
                 })?;
@@ -110,7 +170,11 @@ pub(in crate::ipc_wire) fn dispatch_logger(
                 || !hipc.exchange_buffers.is_empty()
                 || !matches!(hipc.receive_statics, ReceiveStatics::None)
             {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                return logger_response(
+                    request.token,
+                    request.domain.is_some(),
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
             }
             let (address, size) = one_auto_select_input(hipc)?;
             if size > MAX_LOG_PACKET_BYTES {
@@ -146,9 +210,22 @@ pub(in crate::ipc_wire) fn dispatch_logger(
                     logger.process_id()
                 ),
             }
-            semantic_success(request.token, false, &[], &[], &[], None)
+            semantic_success(request.token, request.domain.is_some(), &[], &[], &[], None)
         }
     }
+}
+
+fn logger_response(
+    token: u32,
+    is_domain: bool,
+    result: HorizonIpcResult,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let response = if is_domain {
+        encode_domain_response(token, result, &[], &[], &[])?
+    } else {
+        encode_response(token, result, &[], None)?
+    };
+    Ok((response, None))
 }
 
 fn validate_log_packet_frame(bytes: &[u8]) -> Result<(), &'static str> {

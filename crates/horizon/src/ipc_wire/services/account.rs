@@ -7,16 +7,22 @@ enum AccountTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AccountCommand {
+    GetUserExistence,
     InitializeApplicationInfo,
     GetBaasAccountManagerForApplication,
+    IsUserAccountSwitchLocked,
 }
 
 impl AccountCommand {
     const fn decode(command_id: u32) -> Option<Self> {
         match command_id {
-            // InitializeApplicationInfo moved from command 100 to 140 in
-            // Horizon 6.0.0.
-            100 | 140 => Some(Self::InitializeApplicationInfo),
+            1 => Some(Self::GetUserExistence),
+            // Application-info initialization versions share the caller-PID
+            // association. V2 also carries only the PID placeholder, with no
+            // scalar output; this session stores the authenticated process ID.
+            // https://switchbrew.org/wiki/Account_services#acc:u0
+            100 | 140 | 160 => Some(Self::InitializeApplicationInfo),
+            150 => Some(Self::IsUserAccountSwitchLocked),
             101 => Some(Self::GetBaasAccountManagerForApplication),
             _ => None,
         }
@@ -28,6 +34,7 @@ pub(in crate::ipc_wire) fn dispatch_account(
     session: &AccountSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    user_account_switch_locked: Option<bool>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let target = match &request.domain {
         Some(DomainRequest::Close { object_id }) => {
@@ -75,7 +82,9 @@ pub(in crate::ipc_wire) fn dispatch_account(
     };
 
     match target {
-        AccountTarget::Root => dispatch_account_root(process, session, request, hipc),
+        AccountTarget::Root => {
+            dispatch_account_root(process, session, request, hipc, user_account_switch_locked)
+        }
         AccountTarget::BaasManagerForApplication(manager) => {
             dispatch_account_manager_for_application(&manager, request)
         }
@@ -87,18 +96,40 @@ fn dispatch_account_root(
     session: &AccountSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    user_account_switch_locked: Option<bool>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = AccountCommand::decode(request.command_id) else {
         return unsupported_service_command("acc:u0", request.command_id);
     };
 
     match command {
+        // A well-formed UID absent from the local account database produces
+        // false, rather than an unsupported account-manager operation.
+        // https://switchbrew.org/wiki/Account_services#acc:u0
+        AccountCommand::GetUserExistence => {
+            if !request.has_payload_size(16) || has_ipc_descriptors(hipc) {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            }
+            let exists = is_configured_user(session, &request.data[..16]);
+            semantic_success(
+                request.token,
+                session.is_domain(),
+                &[u8::from(exists)],
+                &[],
+                &[],
+                None,
+            )
+        }
         // libnx sends the caller PID descriptor and a zero u64 placeholder:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L61-L67
         AccountCommand::InitializeApplicationInfo => {
             if hipc.pid.is_none()
                 || request_u64(request.data, 0) != Some(0)
-                || !has_only_transport_padding(request.data, 8)
+                || !request.has_payload_size(8)
                 || has_ipc_descriptors_other_than_pid(hipc)
             {
                 return account_response(
@@ -110,12 +141,40 @@ fn dispatch_account_root(
             session.initialize_application_info(process.process_id());
             account_response(session, request.token, HorizonIpcResult::SUCCESS)
         }
+        // This is the application's NACP UserAccountSwitchLock bit, not a
+        // consequence of how many local users happen to be configured.
+        // https://switchbrew.org/wiki/Account_services#acc:u0
+        // https://switchbrew.org/wiki/NACP
+        AccountCommand::IsUserAccountSwitchLocked => {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            }
+            let locked = user_account_switch_locked.ok_or_else(|| {
+                IpcWireError::UnsupportedService(UnsupportedServiceOperation::CommandVariant {
+                    service: "acc:u0",
+                    command_id: request.command_id,
+                    detail: "application account-switch policy is unavailable",
+                })
+            })?;
+            semantic_success(
+                request.token,
+                session.is_domain(),
+                &[u8::from(locked)],
+                &[],
+                &[],
+                None,
+            )
+        }
         // GetBaasAccountManagerForApplication associates the local AccountUid
         // with the Nintendo-account manager returned to this application. The
         // manager's existence does not mean that an online account is linked.
         // https://switchbrew.org/w/index.php?title=Account_services&oldid=14813#acc:u0
         AccountCommand::GetBaasAccountManagerForApplication => {
-            if !has_only_transport_padding(request.data, 16) || has_ipc_descriptors(hipc) {
+            if !request.has_payload_size(16) || has_ipc_descriptors(hipc) {
                 return account_response(
                     session,
                     request.token,

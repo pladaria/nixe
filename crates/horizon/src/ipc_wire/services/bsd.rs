@@ -78,7 +78,7 @@ pub(in crate::ipc_wire) fn dispatch_bsd(
             };
             if hipc.pid.is_none()
                 || request_u64(request.data, 0x20) != Some(0)
-                || !has_only_transport_padding(request.data, REGISTER_CLIENT_PAYLOAD_SIZE)
+                || !request.has_payload_size(REGISTER_CLIENT_PAYLOAD_SIZE)
                 || hipc.copy_handles.len() != 1
                 || !hipc.move_handles.is_empty()
                 || !hipc.send_statics.is_empty()
@@ -122,7 +122,7 @@ pub(in crate::ipc_wire) fn dispatch_bsd(
         BsdCommand::StartMonitoring => {
             if request_u64(request.data, 0) != Some(0)
                 || hipc.pid.is_none()
-                || !has_only_transport_padding(request.data, START_MONITORING_PAYLOAD_SIZE)
+                || !request.has_payload_size(START_MONITORING_PAYLOAD_SIZE)
                 || has_ipc_descriptors_other_than_pid(hipc)
             {
                 return invalid_header(session, request.token);

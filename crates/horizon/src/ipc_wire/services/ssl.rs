@@ -49,7 +49,7 @@ pub(in crate::ipc_wire) fn dispatch_ssl(
             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
         );
     };
-    if !has_only_transport_padding(request.data, 4) || has_ipc_descriptors(hipc) {
+    if !request.has_payload_size(4) || has_ipc_descriptors(hipc) {
         return ssl_response(
             session,
             request.token,
@@ -104,7 +104,7 @@ mod tests {
         session.set_interface_version(1);
         let buffer = [0_u8; 8];
         let hipc = HipcRequest::decode(&buffer).unwrap();
-        for data in [&[][..], &[2, 0, 0][..], &[2, 0, 0, 0, 1][..]] {
+        for data in [&[][..], &[2, 0, 0][..]] {
             let (response, handle) = dispatch_ssl(&session, request(data), &hipc).unwrap();
             assert_eq!(
                 request_u32(&response, 24),
@@ -137,7 +137,7 @@ mod tests {
         let buffer = [0_u8; 8];
         let hipc = HipcRequest::decode(&buffer).unwrap();
         for version in 1_u32..=3 {
-            let mut data = [0_u8; 16];
+            let mut data = [0xa5_u8; 16];
             data[..4].copy_from_slice(&version.to_le_bytes());
             let (response, _) = dispatch_ssl(&session, request(&data), &hipc).unwrap();
             assert_eq!(request_u32(&response, 24), Some(0));

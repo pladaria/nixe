@@ -41,13 +41,6 @@ pub(super) fn has_ipc_descriptors_other_than_pid(hipc: &HipcRequest<'_>) -> bool
         || !matches!(hipc.receive_statics, ReceiveStatics::None)
 }
 
-/// Plain CMIF rounds its data-word region up, while domain CMIF reports the
-/// semantic payload length. Accept only zeroes in either transport's tail.
-pub(super) fn has_only_transport_padding(data: &[u8], payload_size: usize) -> bool {
-    data.get(payload_size..)
-        .is_some_and(|padding| padding.iter().all(|byte| *byte == 0))
-}
-
 pub(super) fn cmif_error(
     token: u32,
     result: HorizonIpcResult,

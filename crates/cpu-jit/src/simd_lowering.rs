@@ -16,6 +16,7 @@ pub(crate) fn is_register_simd(instruction: Instruction) -> bool {
         instruction,
         Instruction::DuplicateGeneral(_)
             | Instruction::DuplicateElement(_)
+            | Instruction::DuplicateScalarElement(_)
             | Instruction::ModifiedImmediate(_)
             | Instruction::UnsignedMoveToGeneral(_)
             | Instruction::InsertElement(_)
@@ -44,6 +45,7 @@ pub(crate) fn is_register_simd(instruction: Instruction) -> bool {
             | Instruction::VectorSignedShiftRegister(_)
             | Instruction::VectorUnsignedShiftRegister(_)
             | Instruction::CountBits(_)
+            | Instruction::Reverse64(_)
             | Instruction::AddAcrossVector(_)
             | Instruction::UnsignedAddLongAcrossVector(_)
             | Instruction::ScalarFloatImmediate(_)
@@ -73,15 +75,20 @@ impl Translator<'_> {
                 self.write_vector(fields.rd, value);
                 Ok(())
             }
-            Instruction::DuplicateElement(_) => {
+            Instruction::DuplicateElement(_) | Instruction::DuplicateScalarElement(_) => {
                 let shift = fields.immediate_5.trailing_zeros();
                 let lane_bits = 8_u32 << shift;
                 let lane_index = fields.immediate_5 >> (shift + 1);
                 let vector_ty = vector_type(integer_lane_type(lane_bits)?, lane_bits)?;
                 let source = self.read_vector_as(fields.rn, vector_ty)?;
                 let lane = self.builder.ins().extractlane(source, lane_index);
-                let value = self.builder.ins().splat(vector_ty, lane);
-                let value = self.finish_vector(value, fields.vector_128);
+                let value = if matches!(instruction, Instruction::DuplicateScalarElement(_)) {
+                    let scalar = self.builder.ins().uextend(types::I128, lane);
+                    self.vector_as(scalar, types::I8X16)
+                } else {
+                    let value = self.builder.ins().splat(vector_ty, lane);
+                    self.finish_vector(value, fields.vector_128)
+                };
                 self.write_vector(fields.rd, value);
                 Ok(())
             }
@@ -208,6 +215,21 @@ impl Translator<'_> {
             Instruction::VectorSignedShiftRegister(_)
             | Instruction::VectorUnsignedShiftRegister(_) => {
                 self.emit_register_shift(instruction, fields)
+            }
+            Instruction::Reverse64(_) => {
+                // Arm REV64 permutes whole elements within 64-bit containers.
+                // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+                let source = self.read_vector(fields.rn)?;
+                let element_bytes = 1_usize << fields.opc;
+                let mask = std::array::from_fn(|index| {
+                    (index / 8 * 8
+                        + (8 / element_bytes - 1 - index % 8 / element_bytes) * element_bytes
+                        + index % element_bytes) as u8
+                });
+                let value = self.shuffle_bytes(source, source, mask);
+                let value = self.mask_vector(value, if fields.vector_128 { 128 } else { 64 });
+                self.write_vector(fields.rd, value);
+                Ok(())
             }
             Instruction::CountBits(_) => {
                 let source = self.read_vector(fields.rn)?;

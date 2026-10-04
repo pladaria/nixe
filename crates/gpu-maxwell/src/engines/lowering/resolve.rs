@@ -50,6 +50,7 @@ impl MaxwellLoweringCache {
             source.description().samples(),
         )
         .map_err(MaxwellLoweringError::Command)?;
+        record_image_write(destination, self);
         record_color_materialization(destination, self);
         finish_lowered_work(
             self,

@@ -26,6 +26,17 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
     )
     .fixture32(0x0e04_07ff),
+    // Arm DUP (element), scalar class: extract one lane and zero upper bits.
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/DUP--element---Duplicate-vector-element-to-vector-or-scalar-
+    pattern(
+        "simd-duplicate-scalar-element",
+        0xffe0_fc00,
+        0x5e00_0400,
+        0x0000_00ac,
+        190,
+        &[],
+    )
+    .fixture32(0x5e0c_0402),
     pattern(
         "fp-simd-load-store-pair",
         0x3e00_0000,
@@ -588,6 +599,18 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         204,
         &[],
     ),
+    // REV64 reverses 8-, 16-, or 32-bit elements inside each 64-bit container.
+    // Arm A64 ISA (2025), REV64:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-reverse-64",
+        0xbf3f_fc00,
+        0x0e20_0800,
+        0x0000_00a9,
+        204,
+        &[],
+    )
+    .fixture32(0x0ea0_0800),
     // Arm A64 ADDV adds every active vector element and writes the modular
     // scalar result while clearing the remaining destination bits. Arm ARM
     // DDI 0602 (2025-12):
@@ -740,6 +763,30 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
     )
     .fixture32(0x4f96_93fb),
+    // Arm FMUL (by element), scalar single/double precision. The second
+    // operand uses H:L (S) or H (D); size=11 is unallocated.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (FMUL by element)
+    pattern(
+        "scalar-floating-point-multiply-by-element",
+        0xff80_f400,
+        0x5f80_9000,
+        0x0000_00ad,
+        215,
+        &[],
+    )
+    .fixture32(0x5f80_9003),
+    // Scalar FMLA/FMLS (by element), S/D: accumulator is Rd, o2 selects
+    // subtraction, and H:L/H selects the multiplier lane.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (FMLA/FMLS by element)
+    pattern(
+        "scalar-floating-point-fused-multiply-by-element",
+        0xff80_b400,
+        0x5f80_1000,
+        0x0000_00ae,
+        215,
+        &[],
+    )
+    .fixture32(0x5fa0_1043),
     // Arm FMLA/FMLS (vector, by element), single/double precision.
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMLA--by-element---Floating-point-fused-Multiply-Add-to-accumulator--by-element--
     // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab (D6.75)
@@ -1060,6 +1107,27 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
     )
     .fixture32(0x1e19_e027),
+    // FCVTZS/FCVTZU scalar Advanced SIMD forms write S/D, unlike GPR forms.
+    // Arm A64 ISA (2025), FCVTZS/FCVTZU (vector, integer), scalar encoding:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-scalar-float-to-signed-int",
+        0xffbf_fc00,
+        0x5ea1_b800,
+        0x0000_00aa,
+        210,
+        &[],
+    )
+    .fixture32(0x5ea1_b823),
+    pattern(
+        "simd-scalar-float-to-unsigned-int",
+        0xffbf_fc00,
+        0x7ea1_b800,
+        0x0000_00ab,
+        210,
+        &[],
+    )
+    .fixture32(0x7ee1_b83f),
     // Arm A64 scalar floating-point to integer conversions with an explicit
     // rounding direction. These cover the base S/D-to-W/X forms; optional
     // FP16 forms remain classified by the feature-gated unsupported classification. Arm ARM
@@ -1402,6 +1470,7 @@ macro_rules! instructions {
 instructions!(
     DuplicateGeneral,
     DuplicateElement,
+    DuplicateScalarElement,
     MemoryPair,
     Bitwise,
     Integer,
@@ -1420,6 +1489,8 @@ instructions!(
     SignedIntToFloat,
     UnsignedIntToFloat,
     FloatToSignedInt,
+    ScalarVectorFloatToSignedInt,
+    ScalarVectorFloatToUnsignedInt,
     FloatToUnsignedInt,
     MoveToGeneral,
     MoveFromGeneral,
@@ -1446,6 +1517,7 @@ instructions!(
     VectorSignedShiftRegister,
     VectorUnsignedShiftRegister,
     CountBits,
+    Reverse64,
     AddAcrossVector,
     UnsignedAddLongAcrossVector,
     ExtractNarrow,
@@ -1468,132 +1540,157 @@ instructions!(
     ScalarFloatMaxNumber,
     ScalarFloatMinNumber,
     ScalarFloatMultiply,
+    ScalarFloatMultiplyElement,
     ScalarFloatFusedMultiplyAdd,
+    ScalarFloatFusedElement,
     ScalarFloatSquareRoot,
     ScalarFloatConditionalSelect,
 );
 
 pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
-    let operands = Operands {
-        rd: (bits & 0x1f) as u8,
-        rn: ((bits >> 5) & 0x1f) as u8,
-        rm: ((bits >> 16) & 0x1f) as u8,
-        ra: ((bits >> 10) & 0x1f) as u8,
-        size: (bits >> 30) as u8,
-        opc: if matches!(
-            instruction_id,
-            0x0000_00a1 | 0x0000_00a2 | 0x0000_00a4 | 0x0000_00a5
-        ) {
-            ((bits >> 22) & 1) as u8
-        } else {
-            ((bits >> 22) & 3) as u8
-        },
-        option: ((bits >> 13) & 7) as u8,
-        immediate_9: ((bits >> 12) & 0x1ff) as u16,
-        immediate_12: ((bits >> 10) & 0xfff) as u16,
-        immediate_19: (bits >> 5) & 0x7ffff,
-        load: bits & (1 << 22) != 0,
-        quad: bits & (1 << 23) != 0,
-        vector_128: bits & (1 << 30) != 0,
-        subtract: bits
-            & (1 << match instruction_id {
-                0x0000_00a2 => 14,
-                0x0000_00a4 => 23,
-                _ => 29,
-            })
-            != 0,
-        scaled: bits & (1 << 12) != 0,
-        immediate_5: ((bits >> 16) & 0x1f) as u8,
-        rt2: ((bits >> 10) & 0x1f) as u8,
-        immediate_7: ((bits >> 15) & 0x7f) as u8,
-        shift_immediate: ((bits >> 16) & 0x7f) as u8,
-        mode: ((bits >> 23) & 3) as u8,
-        immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
-        cmode: ((bits >> 12) & 0xf) as u8,
-        structure_opcode: ((bits >> 12) & 0xf) as u8,
-        structure_r: bits & (1 << 21) != 0,
-        bitwise_operation: (instruction_id == 0x0000_0030).then(|| {
-            bitwise_operation(bits)
-                .expect("the SIMD bitwise pattern only contains allocated operations")
-        }),
-        integer_comparison: integer_comparison(instruction_id),
-        pairwise_operation: pairwise_operation(instruction_id),
-        permute_operation: (instruction_id == 0x0000_0064).then(|| {
-            permute_operation(bits)
-                .expect("allocation validation rejects invalid SIMD two-source permutes")
-        }),
-        compare_with_zero: matches!(instruction_id, 0x0000_0054..=0x0000_0058),
-        signaling_compare: bits & (1 << 4) != 0,
-        operation_bit: bits & (1 << 29) != 0,
-        immediate_4: ((bits >> 11) & 0xf) as u8,
-        nzcv_immediate: (bits & 0xf) as u8,
-        condition: ((bits >> 12) & 0xf) as u8,
-        element_size: ((bits >> 10) & 3) as u8,
-        fp_immediate_8: ((bits >> 13) & 0xff) as u8,
-        fp_element_lane: if matches!(instruction_id, 0x0000_00a1 | 0x0000_00a2) {
-            if bits & (1 << 22) == 0 {
-                (((bits >> 21) & 1) | (((bits >> 11) & 1) << 1)) as u8
+    let operands =
+        Operands {
+            rd: (bits & 0x1f) as u8,
+            rn: ((bits >> 5) & 0x1f) as u8,
+            rm: ((bits >> 16) & 0x1f) as u8,
+            ra: if instruction_id == 0x0000_00ae {
+                (bits & 0x1f) as u8
             } else {
-                ((bits >> 11) & 1) as u8
-            }
-        } else {
-            0
-        },
-        float_conversion: match instruction_id {
-            0x0000_006f => Some(FloatConversion::SingleToDouble),
-            0x0000_0070 => Some(FloatConversion::DoubleToSingle),
-            _ => None,
-        },
-        float_to_integer_rounding: match instruction_id {
-            0x0000_007d | 0x0000_007e => Some(FloatToIntegerRounding::NearestEven),
-            0x0000_007f | 0x0000_0080 => Some(FloatToIntegerRounding::NearestAway),
-            0x0000_0081 | 0x0000_0082 => Some(FloatToIntegerRounding::TowardPositive),
-            0x0000_0083 | 0x0000_0084 => Some(FloatToIntegerRounding::TowardNegative),
-            0x0000_003c | 0x0000_003d | 0x0000_009e | 0x0000_009f => {
-                Some(FloatToIntegerRounding::TowardZero)
-            }
-            _ => None,
-        },
-        fixed_point_fraction_bits: matches!(instruction_id, 0x0000_009e | 0x0000_009f)
-            .then(|| 64 - ((bits >> 10) & 0x3f) as u8),
-        float_round_operation: match instruction_id {
-            0x0000_0072 => Some(FloatRoundOperation::NearestEven),
-            0x0000_0073 => Some(FloatRoundOperation::TowardPositive),
-            0x0000_0074 => Some(FloatRoundOperation::TowardNegative),
-            0x0000_0075 => Some(FloatRoundOperation::TowardZero),
-            0x0000_0076 => Some(FloatRoundOperation::NearestAway),
-            0x0000_0077 => Some(FloatRoundOperation::Exact),
-            0x0000_0078 => Some(FloatRoundOperation::CurrentMode),
-            _ => None,
-        },
-        float_add_operation: match instruction_id {
-            0x0000_00a5 => Some(if bits & (1 << 23) == 0 {
-                FloatAddOperation::Add
+                ((bits >> 10) & 0x1f) as u8
+            },
+            size: (bits >> 30) as u8,
+            opc: if matches!(
+                instruction_id,
+                0x0000_00a1
+                    | 0x0000_00a2
+                    | 0x0000_00a4
+                    | 0x0000_00a5
+                    | 0x0000_00aa
+                    | 0x0000_00ab
+                    | 0x0000_00ad
+                    | 0x0000_00ae
+            ) {
+                ((bits >> 22) & 1) as u8
             } else {
-                FloatAddOperation::Subtract
+                ((bits >> 22) & 3) as u8
+            },
+            option: ((bits >> 13) & 7) as u8,
+            immediate_9: ((bits >> 12) & 0x1ff) as u16,
+            immediate_12: ((bits >> 10) & 0xfff) as u16,
+            immediate_19: (bits >> 5) & 0x7ffff,
+            load: bits & (1 << 22) != 0,
+            quad: bits & (1 << 23) != 0,
+            vector_128: bits & (1 << 30) != 0,
+            subtract: bits
+                & (1 << match instruction_id {
+                    0x0000_00a2 | 0x0000_00ae => 14,
+                    0x0000_00a4 => 23,
+                    _ => 29,
+                })
+                != 0,
+            scaled: bits & (1 << 12) != 0,
+            immediate_5: ((bits >> 16) & 0x1f) as u8,
+            rt2: ((bits >> 10) & 0x1f) as u8,
+            immediate_7: ((bits >> 15) & 0x7f) as u8,
+            shift_immediate: ((bits >> 16) & 0x7f) as u8,
+            mode: ((bits >> 23) & 3) as u8,
+            immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
+            cmode: ((bits >> 12) & 0xf) as u8,
+            structure_opcode: ((bits >> 12) & 0xf) as u8,
+            structure_r: bits & (1 << 21) != 0,
+            bitwise_operation: (instruction_id == 0x0000_0030).then(|| {
+                bitwise_operation(bits)
+                    .expect("the SIMD bitwise pattern only contains allocated operations")
             }),
-            0x0000_0079 => Some(FloatAddOperation::Add),
-            0x0000_007a => Some(FloatAddOperation::Subtract),
-            _ => None,
-        },
-        float_multiply_operation: match instruction_id {
-            0x0000_007b => Some(FloatMultiplyOperation::Multiply),
-            0x0000_007c => Some(FloatMultiplyOperation::NegatedMultiply),
-            _ => None,
-        },
-        float_fused_multiply_operation: (instruction_id == 0x0000_0097).then(|| {
-            match ((bits >> 20) & 2) | ((bits >> 15) & 1) {
-                0 => FloatFusedMultiplyOperation::MultiplyAdd,
-                1 => FloatFusedMultiplyOperation::MultiplySubtract,
-                2 => FloatFusedMultiplyOperation::NegatedMultiplyAdd,
-                3 => FloatFusedMultiplyOperation::NegatedMultiplySubtract,
-                _ => unreachable!(),
-            }
-        }),
-    };
+            integer_comparison: integer_comparison(instruction_id),
+            pairwise_operation: pairwise_operation(instruction_id),
+            permute_operation: (instruction_id == 0x0000_0064).then(|| {
+                permute_operation(bits)
+                    .expect("allocation validation rejects invalid SIMD two-source permutes")
+            }),
+            compare_with_zero: matches!(instruction_id, 0x0000_0054..=0x0000_0058),
+            signaling_compare: bits & (1 << 4) != 0,
+            operation_bit: bits & (1 << 29) != 0,
+            immediate_4: ((bits >> 11) & 0xf) as u8,
+            nzcv_immediate: (bits & 0xf) as u8,
+            condition: ((bits >> 12) & 0xf) as u8,
+            element_size: ((bits >> 10) & 3) as u8,
+            fp_immediate_8: ((bits >> 13) & 0xff) as u8,
+            fp_element_lane: if matches!(
+                instruction_id,
+                0x0000_00a1 | 0x0000_00a2 | 0x0000_00ad | 0x0000_00ae
+            ) {
+                if bits & (1 << 22) == 0 {
+                    (((bits >> 21) & 1) | (((bits >> 11) & 1) << 1)) as u8
+                } else {
+                    ((bits >> 11) & 1) as u8
+                }
+            } else {
+                0
+            },
+            float_conversion: match instruction_id {
+                0x0000_006f => Some(FloatConversion::SingleToDouble),
+                0x0000_0070 => Some(FloatConversion::DoubleToSingle),
+                _ => None,
+            },
+            float_to_integer_rounding: match instruction_id {
+                0x0000_007d | 0x0000_007e => Some(FloatToIntegerRounding::NearestEven),
+                0x0000_007f | 0x0000_0080 => Some(FloatToIntegerRounding::NearestAway),
+                0x0000_0081 | 0x0000_0082 => Some(FloatToIntegerRounding::TowardPositive),
+                0x0000_0083 | 0x0000_0084 => Some(FloatToIntegerRounding::TowardNegative),
+                0x0000_003c | 0x0000_003d | 0x0000_009e | 0x0000_009f | 0x0000_00aa
+                | 0x0000_00ab => Some(FloatToIntegerRounding::TowardZero),
+                _ => None,
+            },
+            fixed_point_fraction_bits: matches!(instruction_id, 0x0000_009e | 0x0000_009f)
+                .then(|| 64 - ((bits >> 10) & 0x3f) as u8),
+            float_round_operation: match instruction_id {
+                0x0000_0072 => Some(FloatRoundOperation::NearestEven),
+                0x0000_0073 => Some(FloatRoundOperation::TowardPositive),
+                0x0000_0074 => Some(FloatRoundOperation::TowardNegative),
+                0x0000_0075 => Some(FloatRoundOperation::TowardZero),
+                0x0000_0076 => Some(FloatRoundOperation::NearestAway),
+                0x0000_0077 => Some(FloatRoundOperation::Exact),
+                0x0000_0078 => Some(FloatRoundOperation::CurrentMode),
+                _ => None,
+            },
+            float_add_operation: match instruction_id {
+                0x0000_00a5 => Some(if bits & (1 << 23) == 0 {
+                    FloatAddOperation::Add
+                } else {
+                    FloatAddOperation::Subtract
+                }),
+                0x0000_0079 => Some(FloatAddOperation::Add),
+                0x0000_007a => Some(FloatAddOperation::Subtract),
+                _ => None,
+            },
+            float_multiply_operation: match instruction_id {
+                0x0000_007b | 0x0000_00ad => Some(FloatMultiplyOperation::Multiply),
+                0x0000_007c => Some(FloatMultiplyOperation::NegatedMultiply),
+                _ => None,
+            },
+            float_fused_multiply_operation: matches!(instruction_id, 0x0000_0097 | 0x0000_00ae)
+                .then(|| {
+                    if instruction_id == 0x0000_00ae {
+                        return if bits & (1 << 14) != 0 {
+                            FloatFusedMultiplyOperation::MultiplySubtract
+                        } else {
+                            FloatFusedMultiplyOperation::MultiplyAdd
+                        };
+                    }
+                    match ((bits >> 20) & 2) | ((bits >> 15) & 1) {
+                        0 => FloatFusedMultiplyOperation::MultiplyAdd,
+                        1 => FloatFusedMultiplyOperation::MultiplySubtract,
+                        2 => FloatFusedMultiplyOperation::NegatedMultiplyAdd,
+                        3 => FloatFusedMultiplyOperation::NegatedMultiplySubtract,
+                        _ => unreachable!(),
+                    }
+                }),
+        };
     match instruction_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
         0x0000_008c => Instruction::DuplicateElement(operands),
+        0x0000_00ac => Instruction::DuplicateScalarElement(operands),
         0x0000_0049 => Instruction::MemoryPair(operands),
         0x0000_0030 => Instruction::Bitwise(operands),
         0x0000_0031 => Instruction::Integer(operands),
@@ -1641,6 +1738,9 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_0095 => Instruction::VectorSignedShiftRegister(operands),
         0x0000_0096 => Instruction::VectorUnsignedShiftRegister(operands),
         0x0000_0093 => Instruction::CountBits(operands),
+        0x0000_00a9 => Instruction::Reverse64(operands),
+        0x0000_00aa => Instruction::ScalarVectorFloatToSignedInt(operands),
+        0x0000_00ab => Instruction::ScalarVectorFloatToUnsignedInt(operands),
         0x0000_0094 => Instruction::AddAcrossVector(operands),
         0x0000_00a6 => Instruction::UnsignedAddLongAcrossVector(operands),
         0x0000_0088 => Instruction::ExtractNarrow(operands),
@@ -1664,7 +1764,9 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_00a7 => Instruction::ScalarFloatMaxNumber(operands),
         0x0000_0079..=0x0000_007a => Instruction::ScalarFloatAdd(operands),
         0x0000_007b..=0x0000_007c => Instruction::ScalarFloatMultiply(operands),
+        0x0000_00ad => Instruction::ScalarFloatMultiplyElement(operands),
         0x0000_0097 => Instruction::ScalarFloatFusedMultiplyAdd(operands),
+        0x0000_00ae => Instruction::ScalarFloatFusedElement(operands),
         0x0000_0098 => Instruction::ScalarFloatSquareRoot(operands),
         0x0000_0087 => Instruction::ScalarFloatConditionalSelect(operands),
         _ => unreachable!("FP/SIMD semantic ID was routed to the wrong family"),

@@ -47,6 +47,12 @@ pub(super) fn execute(
     decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
 ) -> Result<InstructionStep, InterpreterError> {
+    // Prefetch hints have implementation-defined cache effects. As in the JIT,
+    // they produce no memory access or fault. See Instruction::is_prefetch.
+    if instruction.is_prefetch() {
+        advance(state);
+        return Ok(InstructionStep::Continue);
+    }
     let memory = context.memory();
     let address_space = context.process().address_space_id();
     let fields = instruction.operands();

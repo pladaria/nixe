@@ -31,8 +31,11 @@ impl Translator<'_> {
             Instruction::VectorFloatMultiply(_) | Instruction::VectorFloatMultiplyElement(_) => {
                 self.vector_fp_multiply(pc, instruction, flags)
             }
-            Instruction::ScalarFloatMultiply(_) => self.fp_multiply(pc, instruction, flags),
-            Instruction::ScalarFloatFusedMultiplyAdd(_) => self.fp_fused(pc, instruction, flags),
+            Instruction::ScalarFloatMultiply(_) | Instruction::ScalarFloatMultiplyElement(_) => {
+                self.fp_multiply(pc, instruction, flags)
+            }
+            Instruction::ScalarFloatFusedMultiplyAdd(_)
+            | Instruction::ScalarFloatFusedElement(_) => self.fp_fused(pc, instruction, flags),
             Instruction::VectorFloatFusedElement(_) | Instruction::VectorFloatFused(_) => {
                 self.vector_fp_fused(pc, instruction, flags)
             }
@@ -48,7 +51,10 @@ impl Translator<'_> {
             Instruction::ScalarFloatSquareRoot(_) | Instruction::ScalarFloatConvert(_) => {
                 self.fp_unary(pc, instruction, flags)
             }
-            Instruction::FloatToSignedInt(_) | Instruction::FloatToUnsignedInt(_) => {
+            Instruction::FloatToSignedInt(_)
+            | Instruction::FloatToUnsignedInt(_)
+            | Instruction::ScalarVectorFloatToSignedInt(_)
+            | Instruction::ScalarVectorFloatToUnsignedInt(_) => {
                 self.fp_to_integer(pc, instruction, flags)
             }
             _ => unreachable!("unported FP lowering rejected before builder creation"),
@@ -62,12 +68,25 @@ impl Translator<'_> {
         flags: &mut LazyFlags<ir::Value>,
     ) -> Result<bool, Error> {
         let f = instruction.operands();
+        let vector_destination = matches!(
+            instruction,
+            Instruction::ScalarVectorFloatToSignedInt(_)
+                | Instruction::ScalarVectorFloatToUnsignedInt(_)
+        );
         let operation = FpToIntegerOperation {
+            vector_destination,
             rn: f.rn,
             rd: f.rd,
             source_64: f.opc == 1,
-            destination_64: f.size & 2 != 0,
-            signed: matches!(instruction, Instruction::FloatToSignedInt(_)),
+            destination_64: if vector_destination {
+                f.opc == 1
+            } else {
+                f.size & 2 != 0
+            },
+            signed: matches!(
+                instruction,
+                Instruction::FloatToSignedInt(_) | Instruction::ScalarVectorFloatToSignedInt(_)
+            ),
             rounding: f
                 .float_to_integer_rounding
                 .expect("normalized FCVT rounding"),
@@ -91,7 +110,13 @@ impl Translator<'_> {
             operation.destination_64,
             operation.signed,
         );
-        self.write_register(f.rd, result);
+        if vector_destination {
+            let result = self.builder.ins().uextend(types::I128, result);
+            let result = self.vector_as(result, types::I8X16);
+            self.write_vector(f.rd, result);
+        } else {
+            self.write_register(f.rd, result);
+        }
         Ok(false)
     }
 
@@ -443,6 +468,27 @@ impl Translator<'_> {
         Ok(false)
     }
 
+    fn fp_element_bits(
+        &mut self,
+        register: u8,
+        width: u32,
+        lane: Option<u8>,
+    ) -> Result<ir::Value, Error> {
+        if lane.unwrap_or(0) == 0 {
+            return self.scalar_fp_bits(register, width);
+        }
+        let ty = if width == 32 {
+            types::I32X4
+        } else {
+            types::I64X2
+        };
+        let vector = self.read_vector_as(register, ty)?;
+        Ok(self
+            .builder
+            .ins()
+            .extractlane(vector, lane.expect("nonzero lane")))
+    }
+
     fn fp_multiply(
         &mut self,
         pc: GuestVirtualAddress,
@@ -451,8 +497,10 @@ impl Translator<'_> {
     ) -> Result<bool, Error> {
         let f = instruction.operands();
         let width = scalar_width(f.opc)?;
+        let lane = matches!(instruction, Instruction::ScalarFloatMultiplyElement(_))
+            .then_some(f.fp_element_lane);
         let first = self.scalar_fp_bits(f.rn, width)?;
-        let second = self.scalar_fp_bits(f.rm, width)?;
+        let second = self.fp_element_bits(f.rm, width, lane)?;
         let first_ok = self.fp_finite_or_zero(first, width);
         let second_ok = self.fp_finite_or_zero(second, width);
         let mut direct = self.builder.ins().band(first_ok, second_ok);
@@ -463,6 +511,7 @@ impl Translator<'_> {
         self.native_fp_path(
             pc,
             EdgeKind::FpMultiply(FpMultiplyOperation {
+                lane,
                 rn: f.rn,
                 rm: f.rm,
                 rd: f.rd,
@@ -476,7 +525,7 @@ impl Translator<'_> {
         )?;
         // The activation continuation owns fresh SSA bindings.
         let first = self.scalar_fp_bits(f.rn, width)?;
-        let second = self.scalar_fp_bits(f.rm, width)?;
+        let second = self.fp_element_bits(f.rm, width, lane)?;
         let ty = if width == 32 { types::F32 } else { types::F64 };
         let first = self
             .builder
@@ -504,7 +553,10 @@ impl Translator<'_> {
     ) -> Result<bool, Error> {
         let f = instruction.operands();
         let width = scalar_width(f.opc)?;
+        let lane = matches!(instruction, Instruction::ScalarFloatFusedElement(_))
+            .then_some(f.fp_element_lane);
         let operation = FpFusedOperation {
+            lane,
             rn: f.rn,
             rm: f.rm,
             ra: f.ra,
@@ -527,7 +579,7 @@ impl Translator<'_> {
             return Ok(true);
         }
         let first = self.scalar_fp_bits(f.rn, width)?;
-        let second = self.scalar_fp_bits(f.rm, width)?;
+        let second = self.fp_element_bits(f.rm, width, lane)?;
         let third = self.scalar_fp_bits(f.ra, width)?;
         let first_ok = self.fp_finite_or_zero(first, width);
         let second_ok = self.fp_finite_or_zero(second, width);
@@ -540,7 +592,7 @@ impl Translator<'_> {
         }
         self.native_fp_path(pc, EdgeKind::FpFused(operation), direct, flags)?;
         let first = self.scalar_fp_bits(f.rn, width)?;
-        let second = self.scalar_fp_bits(f.rm, width)?;
+        let second = self.fp_element_bits(f.rm, width, lane)?;
         let third = self.scalar_fp_bits(f.ra, width)?;
         let ty = if width == 32 { types::F32 } else { types::F64 };
         let first = self

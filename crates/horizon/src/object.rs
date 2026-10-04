@@ -52,6 +52,9 @@ pub enum HorizonIpcObject {
     NvDrv(NvDrvSession),
     LogManager(LogManagerSession),
     Logger(LoggerSession),
+    /// Application writer for error contexts. Command semantics are dispatched
+    /// separately from establishing the service connection.
+    ErrorContextWriter(ErrorContextWriterSession),
     ParentalControl(ParentalControlFactorySession),
     ParentalControlService(ParentalControlSession),
     NetworkInterface(NetworkInterfaceManagerSession),
@@ -104,12 +107,51 @@ impl ServiceManagerSession {
 /// return the real session boundary while unimplemented methods remain fatal.
 /// Interface reference:
 /// https://github.com/Atmosphere-NX/Atmosphere/blob/cb4b882e3b176480ac57a1161a85ff175c3f162c/libraries/libstratosphere/source/lm/sf/lm_i_log_service.hpp
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct LogManagerSession;
+#[derive(Clone, Debug)]
+pub struct LogManagerSession {
+    domain: DomainSession<LoggerSession>,
+}
+
+impl Default for LogManagerSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LogManagerSession {
-    pub(crate) const fn new() -> Self {
-        Self
+    pub(crate) fn new() -> Self {
+        Self {
+            domain: DomainSession::new(),
+        }
+    }
+    pub(crate) fn is_domain(&self) -> bool {
+        self.domain.is_domain()
+    }
+    pub(crate) fn convert_to_domain(&self) -> u32 {
+        self.domain.convert()
+    }
+    pub(crate) fn logger(&self, id: u32) -> Option<LoggerSession> {
+        self.domain.object(id)
+    }
+    pub(crate) fn insert_logger(&self, logger: LoggerSession) -> Option<u32> {
+        self.domain.insert_object(logger)
+    }
+    pub(crate) fn close_object(&self, id: u32) -> bool {
+        self.domain.close_object(id)
+    }
+}
+
+/// Domain session for `nn::err::context::IWriterForApplication`.
+#[derive(Clone, Debug)]
+pub struct ErrorContextWriterSession {
+    pub(crate) domain: DomainSession<()>,
+}
+
+impl Default for ErrorContextWriterSession {
+    fn default() -> Self {
+        Self {
+            domain: DomainSession::new(),
+        }
     }
 }
 
@@ -281,12 +323,12 @@ struct IpcDomain<T> {
 }
 
 #[derive(Clone, Debug)]
-struct DomainSession<T> {
+pub(crate) struct DomainSession<T> {
     state: Arc<Mutex<IpcDomain<T>>>,
 }
 
 impl<T: Clone> DomainSession<T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(IpcDomain {
                 converted: false,
@@ -296,14 +338,14 @@ impl<T: Clone> DomainSession<T> {
         }
     }
 
-    fn is_domain(&self) -> bool {
+    pub(crate) fn is_domain(&self) -> bool {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .converted
     }
 
-    fn convert(&self) -> u32 {
+    pub(crate) fn convert(&self) -> u32 {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -311,7 +353,7 @@ impl<T: Clone> DomainSession<T> {
         IPC_ROOT_OBJECT_ID
     }
 
-    fn object(&self, object_id: u32) -> Option<T> {
+    pub(crate) fn object(&self, object_id: u32) -> Option<T> {
         if object_id == IPC_ROOT_OBJECT_ID {
             return None;
         }
@@ -323,7 +365,7 @@ impl<T: Clone> DomainSession<T> {
             .cloned()
     }
 
-    fn insert_object(&self, object: T) -> Option<u32> {
+    pub(crate) fn insert_object(&self, object: T) -> Option<u32> {
         let mut state = self
             .state
             .lock()
@@ -337,7 +379,7 @@ impl<T: Clone> DomainSession<T> {
         Some(object_id)
     }
 
-    fn close_object(&self, object_id: u32) -> bool {
+    pub(crate) fn close_object(&self, object_id: u32) -> bool {
         if object_id == IPC_ROOT_OBJECT_ID {
             return false;
         }
@@ -1582,6 +1624,7 @@ struct AppletDomain {
     operation_mode_changed_notification: bool,
     performance_mode_changed_notification: bool,
     restart_message_enabled: bool,
+    request_exit_to_library_applet_at_execute_next_program_enabled: bool,
     focus_policy: AppletFocusPolicy,
     foreground_rights_acquired: bool,
     exit_locked: bool,
@@ -1591,6 +1634,9 @@ struct AppletDomain {
     message_queue: AppletMessageQueue,
     library_applet_launchable_event: WritableEventObject,
     library_applet_launchable_event_reader: ReadableEventObject,
+    accumulated_suspended_tick_changed_event: ReadableEventObject,
+    accumulated_suspended_ticks: u64,
+    gpu_error_detected_event: ReadableEventObject,
     active_library_applet: Option<ActiveLibraryApplet>,
     next_storage_id: u64,
     storages: BTreeMap<u64, Vec<u8>>,
@@ -1622,6 +1668,12 @@ impl AppletSession {
             VecDeque::from([encode_preselected_user_launch_parameter(user)]),
         );
         let (launchable_event, launchable_event_reader) = nixe_runtime::EventObject::create_pair();
+        // Applications currently remain in the foreground throughout their
+        // lifetime; no suspension interval has elapsed and this event is idle.
+        let (_, suspended_tick_event_reader) = nixe_runtime::EventObject::create_pair();
+        // Unsupported GPU behavior stops execution before it can be reported
+        // as a hardware fault. No emulated GPU error is initially present.
+        let (_, gpu_error_event_reader) = nixe_runtime::EventObject::create_pair();
         let session = Self {
             domain: Arc::new(Mutex::new(AppletDomain {
                 converted: false,
@@ -1631,6 +1683,7 @@ impl AppletSession {
                 operation_mode_changed_notification: false,
                 performance_mode_changed_notification: false,
                 restart_message_enabled: false,
+                request_exit_to_library_applet_at_execute_next_program_enabled: false,
                 focus_policy: AppletFocusPolicy::default(),
                 foreground_rights_acquired: false,
                 exit_locked: false,
@@ -1640,6 +1693,9 @@ impl AppletSession {
                 message_queue,
                 library_applet_launchable_event: launchable_event,
                 library_applet_launchable_event_reader: launchable_event_reader,
+                accumulated_suspended_tick_changed_event: suspended_tick_event_reader,
+                accumulated_suspended_ticks: 0,
+                gpu_error_detected_event: gpu_error_event_reader,
                 active_library_applet: None,
                 next_storage_id: 1,
                 storages: BTreeMap::new(),
@@ -2105,6 +2161,36 @@ impl AppletSession {
         domain.restart_message_enabled = enabled;
     }
 
+    pub(crate) fn accumulated_suspended_ticks(&self) -> u64 {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accumulated_suspended_ticks
+    }
+
+    pub(crate) fn gpu_error_detected_event(&self) -> ReadableEventObject {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .gpu_error_detected_event
+            .clone()
+    }
+
+    pub(crate) fn accumulated_suspended_tick_changed_event(&self) -> ReadableEventObject {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accumulated_suspended_tick_changed_event
+            .clone()
+    }
+
+    pub(crate) fn enable_request_exit_to_library_applet_at_execute_next_program(&self) {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_exit_to_library_applet_at_execute_next_program_enabled = true;
+    }
+
     pub(crate) fn set_focus_handling_mode(&self, mode: [bool; 3]) {
         let mut domain = self
             .domain
@@ -2217,6 +2303,53 @@ fn encode_preselected_user_launch_parameter(user: UserIdentity) -> Vec<u8> {
 #[cfg(test)]
 mod applet_tests {
     use super::*;
+
+    #[test]
+    fn execute_next_program_exit_policy_is_shared_and_does_not_request_exit_immediately() {
+        let session = AppletSession::new(OperationMode::Console);
+        assert!(
+            !session
+                .domain
+                .lock()
+                .unwrap()
+                .request_exit_to_library_applet_at_execute_next_program_enabled
+        );
+        assert_eq!(session.receive_message(), Some(15));
+        let cloned = session.clone();
+        for _ in 0..2 {
+            cloned.enable_request_exit_to_library_applet_at_execute_next_program();
+            assert!(
+                session
+                    .domain
+                    .lock()
+                    .unwrap()
+                    .request_exit_to_library_applet_at_execute_next_program_enabled
+            );
+            assert_eq!(session.receive_message(), None);
+            assert!(!session.message_event().is_signalled());
+        }
+    }
+
+    #[test]
+    fn foreground_applet_has_no_suspended_ticks_or_counter_change_notification() {
+        let session = AppletSession::new(OperationMode::Console);
+        let cloned = session.clone();
+        assert_eq!(cloned.accumulated_suspended_ticks(), 0);
+        assert!(
+            !cloned
+                .accumulated_suspended_tick_changed_event()
+                .is_signalled()
+        );
+        assert_eq!(session.receive_message(), Some(15));
+        session.set_out_of_focus_suspending_enabled(true);
+        session.acquire_foreground_rights();
+        assert_eq!(session.accumulated_suspended_ticks(), 0);
+        assert!(
+            !session
+                .accumulated_suspended_tick_changed_event()
+                .is_signalled()
+        );
+    }
 
     #[test]
     fn restart_message_policy_is_shared_without_generating_notifications() {
@@ -2756,7 +2889,7 @@ impl Debug for ReadOnlyStorage {
     }
 }
 
-/// Process-local SD-card filesystem with an optional host-directory backing.
+/// Process-local host filesystem, optionally backed by a save-data generation.
 ///
 /// Guest paths are normalized by the semantic IPC layer. Resolution rejects
 /// every symbolic-link component so a guest cannot escape the configured root
@@ -2765,13 +2898,31 @@ impl Debug for ReadOnlyStorage {
 #[derive(Clone, Debug)]
 pub struct HostDirectoryFileSystem {
     root: Option<Arc<PathBuf>>,
+    save: Option<Arc<Mutex<nixe_runtime::TransactionalDirectory>>>,
 }
 
 impl HostDirectoryFileSystem {
     pub(crate) fn new(root: Option<PathBuf>) -> Self {
         Self {
             root: root.map(Arc::new),
+            save: None,
         }
+    }
+
+    pub(crate) fn from_save(volume: Arc<Mutex<nixe_runtime::TransactionalDirectory>>) -> Self {
+        let root = volume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .working_directory()
+            .to_owned();
+        Self {
+            root: Some(Arc::new(root)),
+            save: Some(volume),
+        }
+    }
+
+    pub(crate) fn save_volume(&self) -> Option<&Arc<Mutex<nixe_runtime::TransactionalDirectory>>> {
+        self.save.as_ref()
     }
 
     pub(crate) const fn has_host_root(&self) -> bool {
@@ -2783,7 +2934,9 @@ impl HostDirectoryFileSystem {
             .root
             .as_ref()
             .map(|root| root.as_ref().clone())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SD card is not backed"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "filesystem has no host backing")
+            })?;
         for component in guest_path.trim_start_matches('/').split('/') {
             if component.is_empty() {
                 continue;
@@ -2793,7 +2946,7 @@ impl HostDirectoryFileSystem {
             if metadata.file_type().is_symlink() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "symbolic links are not exposed through sdmc:",
+                    "symbolic links are not exposed through host filesystems",
                 ));
             }
         }
@@ -2827,7 +2980,7 @@ impl HostDirectoryFileSystem {
     }
 }
 
-/// Writable host file opened through the configured SD-card root.
+/// Host file opened through a confined filesystem root.
 #[derive(Clone, Debug)]
 pub struct HostFile {
     path: Arc<str>,
@@ -2835,6 +2988,8 @@ pub struct HostFile {
     readable: bool,
     writable: bool,
     allow_append: bool,
+    save: Option<Arc<Mutex<nixe_runtime::TransactionalDirectory>>>,
+    _writer: Option<nixe_runtime::DirectoryWriteLease>,
 }
 
 impl HostFile {
@@ -2851,7 +3006,23 @@ impl HostFile {
             readable,
             writable,
             allow_append,
+            save: None,
+            _writer: None,
         }
+    }
+
+    pub(crate) fn with_save(
+        mut self,
+        save: Option<Arc<Mutex<nixe_runtime::TransactionalDirectory>>>,
+        writer: Option<nixe_runtime::DirectoryWriteLease>,
+    ) -> Self {
+        self.save = save;
+        self._writer = writer;
+        self
+    }
+
+    pub(crate) fn save_volume(&self) -> Option<&Arc<Mutex<nixe_runtime::TransactionalDirectory>>> {
+        self.save.as_ref()
     }
 
     pub fn path(&self) -> &str {

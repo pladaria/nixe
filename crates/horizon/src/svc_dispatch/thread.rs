@@ -1,6 +1,17 @@
 use super::*;
 
 impl HorizonSvcDispatcher {
+    pub(super) fn cancel_synchronization(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        // Pending cancellation and cancellable-wait semantics:
+        // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_thread.cpp#L832-L846
+        let handle = read_register(context.thread().state(), 0) as u32;
+        self.stage_thread_object_request(context, handle, "CancelSynchronization", |object_id| {
+            PendingRuntimeRequest::CancelSynchronization { object_id }
+        })
+    }
     pub(super) fn create_thread(
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,

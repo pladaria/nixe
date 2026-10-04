@@ -202,6 +202,22 @@ instructions!(
     CompareAndSwapPair,
 );
 
+impl Instruction {
+    /// PRFM/PRFUM are cache hints, not loads into the register named by Rt.
+    /// https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/PRFM--immediate---Prefetch-memory--immediate--
+    /// https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/PRFM--literal---Prefetch-memory--literal--
+    /// https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/PRFM--register---Prefetch-memory--register--
+    /// https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/PRFUM--Prefetch-memory--unscaled-offset--
+    #[must_use]
+    pub const fn is_prefetch(self) -> bool {
+        match self {
+            Self::Literal(f) => f.size == 3,
+            Self::Unsigned(f) | Self::Unscaled(f) | Self::Register(f) => f.size == 3 && f.opc == 2,
+            _ => false,
+        }
+    }
+}
+
 pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
     let (acquire, release) = match instruction_id {
         0x0000_002d => (bits & (1 << 23) != 0, bits & (1 << 22) != 0),

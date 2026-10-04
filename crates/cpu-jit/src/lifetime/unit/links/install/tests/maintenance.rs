@@ -110,3 +110,47 @@ fn link_service_completes_replacement_retirement_without_an_external_owner() {
     assert!(process.try_service_links().unwrap());
     assert!(process.try_shutdown().unwrap());
 }
+
+#[test]
+fn capacity_recovery_drains_or_defers_joined_link_work_before_reopening() {
+    use std::{sync::mpsc, time::Duration};
+    for count in [1, INSTALL_LIMIT + 1] {
+        let process = process();
+        let cursor = AtomicU64::new(0);
+        publish(&process, &cursor, &[4], Tier::Lcq);
+        let sources: Vec<_> = (0..count)
+            .map(|index| source(&process, &cursor, 8 + index as u64 * 4, 4))
+            .collect();
+        let mut transition = stop(&process);
+        for src in sources {
+            let prepared = transition.prepare_static_link(src, 0).unwrap().unwrap();
+            transition.register_link(prepared).unwrap();
+        }
+        let ticket = process.request(Reason::LinkPatch).unwrap();
+        drop(transition);
+        let worker_process = process.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(worker_process.recover_capacity()).unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            process.request_shutdown().unwrap();
+        }
+        worker.join().unwrap();
+        result
+            .expect("capacity recovery did not resolve pending links")
+            .unwrap();
+        assert_eq!(process.lock().phase, crate::lifetime::Phase::Open);
+        assert_eq!(pending(&process).len(), count.saturating_sub(INSTALL_LIMIT));
+        assert_eq!(
+            process
+                .maintenance_complete(Reason::LinkPatch, ticket)
+                .unwrap(),
+            count <= INSTALL_LIMIT
+        );
+        assert!(process.try_service_links().unwrap());
+        assert!(pending(&process).is_empty());
+        assert!(process.try_shutdown().unwrap());
+    }
+}

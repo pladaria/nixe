@@ -23,6 +23,20 @@ pub(super) fn decode(
         return Ok(None);
     };
     match command {
+        FileSystemCommand::GetEntryType => {
+            if !matches!(object, SemanticIpcObject::HostDirectoryFileSystem(_)) {
+                return Ok(None);
+            }
+            Ok(Some(IpcRequest::GetEntryType {
+                path: read_path(process, hipc)?,
+            }))
+        }
+        FileSystemCommand::Commit => {
+            if !request.has_payload_size(0) || crate::ipc_wire::io::has_ipc_descriptors(hipc) {
+                return Ok(None);
+            }
+            Ok(Some(IpcRequest::CommitFileSystem))
+        }
         // IFileSystem::CreateFile/CreateDirectory use the same bounded
         // input-pointer path as open operations:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L816-L840

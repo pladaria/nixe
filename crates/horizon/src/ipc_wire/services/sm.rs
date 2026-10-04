@@ -1,4 +1,52 @@
 use super::prelude::*;
+use crate::ipc_wire::message::{TipcRequest, encode_tipc_response};
+
+pub(in crate::ipc_wire) enum ServiceManagerRequest<'a> {
+    Cmif(CmifRequest<'a>),
+    Tipc(TipcRequest<'a>),
+}
+
+impl ServiceManagerRequest<'_> {
+    fn command_id(&self) -> u32 {
+        match self {
+            Self::Cmif(request) => request.command_id,
+            Self::Tipc(request) => request.command_id,
+        }
+    }
+
+    fn data(&self) -> &[u8] {
+        match self {
+            Self::Cmif(request) => request.data,
+            Self::Tipc(request) => request.data,
+        }
+    }
+
+    fn encode_response(
+        &self,
+        result: HorizonIpcResult,
+        handle: Option<u32>,
+    ) -> Result<Vec<u8>, IpcWireError> {
+        match self {
+            Self::Cmif(request) => encode_response(request.token, result, &[], handle),
+            Self::Tipc(request) => {
+                // TIPC response layout comes from the command signature even
+                // on failure: GetService always reserves one moved handle.
+                // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libstratosphere/include/stratosphere/tipc/impl/tipc_impl_command_serialization.hpp
+                let handles = [handle.unwrap_or(0)];
+                encode_tipc_response(
+                    result.raw(),
+                    &[],
+                    if request.command_id == 1 {
+                        &handles
+                    } else {
+                        &[]
+                    },
+                )
+                .map_err(|error| IpcWireError::Malformed(error.0))
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServiceKind {
@@ -15,6 +63,7 @@ enum ServiceKind {
     Vi(ViServiceKind),
     NvDrv,
     LogManager,
+    ErrorContextWriter,
     ParentalControl,
     NetworkInterface,
     Semantic(IpcService),
@@ -35,6 +84,9 @@ impl ServiceKind {
             b"audout:u" => Some(Self::AudioOut),
             b"nvdrv" | b"nvdrv:a" | b"nvdrv:s" => Some(Self::NvDrv),
             b"lm" => Some(Self::LogManager),
+            // Public ECTX application-writer service registration:
+            // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/glue/ectx.cpp
+            b"ectx:aw" => Some(Self::ErrorContextWriter),
             b"pctl" | b"pctl:a" | b"pctl:r" | b"pctl:s" => Some(Self::ParentalControl),
             b"nifm:u" => Some(Self::NetworkInterface),
             _ => ViServiceKind::from_name(name)
@@ -63,25 +115,24 @@ impl ServiceManagerCommand {
 pub(in crate::ipc_wire) fn dispatch_service_manager(
     process: &mut ExceptionProcessContext<'_>,
     manager: &ServiceManagerSession,
-    request: CmifRequest<'_>,
+    request: ServiceManagerRequest<'_>,
     sent_pid: bool,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
     host_systems: HostSystems<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    let Some(command) = ServiceManagerCommand::decode(request.command_id) else {
-        return unsupported_service_command("sm:", request.command_id);
+    let Some(command) = ServiceManagerCommand::decode(request.command_id()) else {
+        return unsupported_service_command("sm:", request.command_id());
     };
     match command {
         ServiceManagerCommand::RegisterClient => {
-            if !sent_pid || request.data.len() < 8 {
+            let valid_payload = match &request {
+                ServiceManagerRequest::Cmif(request) => request.data.len() >= 8,
+                ServiceManagerRequest::Tipc(request) => request.data.is_empty(),
+            };
+            if !sent_pid || !valid_payload {
                 return Ok((
-                    encode_response(
-                        request.token,
-                        HorizonIpcResult::SM_INVALID_CLIENT,
-                        &[],
-                        None,
-                    )?,
+                    request.encode_response(HorizonIpcResult::SM_INVALID_CLIENT, None)?,
                     None,
                 ));
             }
@@ -91,41 +142,26 @@ pub(in crate::ipc_wire) fn dispatch_service_manager(
                 process.process_id()
             );
             Ok((
-                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                request.encode_response(HorizonIpcResult::SUCCESS, None)?,
                 None,
             ))
         }
         ServiceManagerCommand::GetServiceHandle => {
             if !manager.is_registered() {
                 return Ok((
-                    encode_response(
-                        request.token,
-                        HorizonIpcResult::SM_INVALID_CLIENT,
-                        &[],
-                        None,
-                    )?,
+                    request.encode_response(HorizonIpcResult::SM_INVALID_CLIENT, None)?,
                     None,
                 ));
             }
-            let Some(encoded_name) = request.data.get(..8) else {
+            let Some(encoded_name) = request.data().get(..8) else {
                 return Ok((
-                    encode_response(
-                        request.token,
-                        HorizonIpcResult::SM_INVALID_SERVICE_NAME,
-                        &[],
-                        None,
-                    )?,
+                    request.encode_response(HorizonIpcResult::SM_INVALID_SERVICE_NAME, None)?,
                     None,
                 ));
             };
             let Some(name) = decode_service_name(encoded_name) else {
                 return Ok((
-                    encode_response(
-                        request.token,
-                        HorizonIpcResult::SM_INVALID_SERVICE_NAME,
-                        &[],
-                        None,
-                    )?,
+                    request.encode_response(HorizonIpcResult::SM_INVALID_SERVICE_NAME, None)?,
                     None,
                 ));
             };
@@ -134,7 +170,7 @@ pub(in crate::ipc_wire) fn dispatch_service_manager(
                 String::from_utf8_lossy(name)
             );
             if !process.mounts().allows_service(name) {
-                return service_response(request.token, HorizonIpcResult::SM_NOT_ALLOWED, None);
+                return service_response(&request, HorizonIpcResult::SM_NOT_ALLOWED, None);
             }
             let Some(service) = ServiceKind::from_name(name) else {
                 return Err(IpcWireError::UnsupportedService(
@@ -144,7 +180,7 @@ pub(in crate::ipc_wire) fn dispatch_service_manager(
             connect_service(
                 process,
                 manager,
-                request.token,
+                &request,
                 service,
                 initial_operation_mode,
                 time_environment,
@@ -157,7 +193,7 @@ pub(in crate::ipc_wire) fn dispatch_service_manager(
 fn connect_service(
     process: &mut ExceptionProcessContext<'_>,
     manager: &ServiceManagerSession,
-    token: u32,
+    request: &ServiceManagerRequest<'_>,
     service: ServiceKind,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
@@ -243,6 +279,9 @@ fn connect_service(
         ServiceKind::LogManager => process
             .handles_mut()
             .insert(HorizonIpcObject::LogManager(LogManagerSession::new())),
+        ServiceKind::ErrorContextWriter => process
+            .handles_mut()
+            .insert(HorizonIpcObject::ErrorContextWriter(Default::default())),
         ServiceKind::ParentalControl => {
             process
                 .handles_mut()
@@ -264,19 +303,19 @@ fn connect_service(
     match handle {
         Ok(handle) => {
             log::debug!("sm:GetService returned session handle {handle:#x}");
-            service_response(token, HorizonIpcResult::SUCCESS, Some(handle))
+            service_response(request, HorizonIpcResult::SUCCESS, Some(handle))
         }
         Err(_) if host_resource_failure => Err(IpcWireError::HostResourceExhausted(
             "installing a service handle",
         )),
-        Err(_) => service_response(token, HorizonIpcResult::SM_OUT_OF_SESSIONS, None),
+        Err(_) => service_response(request, HorizonIpcResult::SM_OUT_OF_SESSIONS, None),
     }
 }
 
 fn service_response(
-    token: u32,
+    request: &ServiceManagerRequest<'_>,
     result: HorizonIpcResult,
     handle: Option<u32>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    Ok((encode_response(token, result, &[], handle)?, handle))
+    Ok((request.encode_response(result, handle)?, handle))
 }

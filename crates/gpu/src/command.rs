@@ -315,6 +315,32 @@ pub enum DrawArguments {
     },
 }
 
+/// Window-space fragment bounds. Empty rectangles still execute vertex shaders.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ScissorRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ScissorRect {
+    /// Intersects with framebuffer bounds without changing viewport coordinates.
+    #[must_use]
+    pub fn clipped(self, width: u32, height: u32) -> Self {
+        let x = self.x.min(width);
+        let y = self.y.min(height);
+        let end_x = self.x.saturating_add(self.width).min(width);
+        let end_y = self.y.saturating_add(self.height).min(height);
+        Self {
+            x,
+            y,
+            width: end_x.saturating_sub(x),
+            height: end_y.saturating_sub(y),
+        }
+    }
+}
+
 /// Backend-independent affine transform from normalized device coordinates to
 /// framebuffer coordinates: `window = ndc * scale + offset`.
 ///
@@ -672,6 +698,7 @@ pub struct PreparedDraw {
     pub vertex_buffers: Box<[VertexBufferLayout]>,
     pub index_buffer: Option<(BufferRegion, IndexType)>,
     pub viewport_transform: Option<ViewportTransform>,
+    pub scissor: Option<ScissorRect>,
     pub depth_state: DepthState,
     accesses: Box<[ResourceAccess]>,
     dependencies: Box<[ResourceDependency]>,
@@ -753,6 +780,7 @@ impl PreparedDraw {
             vertex_buffers: vertex_buffers.into_boxed_slice(),
             index_buffer,
             viewport_transform: None,
+            scissor: None,
             depth_state: DepthState::DISABLED,
             accesses: accesses.into_boxed_slice(),
             dependencies: dependencies.into_boxed_slice(),

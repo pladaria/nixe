@@ -48,7 +48,9 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
                 | Instruction::VectorFloatFusedElement(_)
                 | Instruction::VectorFloatFused(_)
                 | Instruction::ScalarFloatMultiply(_)
+                | Instruction::ScalarFloatMultiplyElement(_)
                 | Instruction::ScalarFloatFusedMultiplyAdd(_)
+                | Instruction::ScalarFloatFusedElement(_)
                 | Instruction::ScalarFloatSquareRoot(_)
                 | Instruction::ScalarFloatConvert(_)
                 | Instruction::SignedIntToFloat(_)
@@ -59,6 +61,8 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
                 | Instruction::ScalarVectorUnsignedIntToFloat(_)
                 | Instruction::FloatToSignedInt(_)
                 | Instruction::FloatToUnsignedInt(_)
+                | Instruction::ScalarVectorFloatToSignedInt(_)
+                | Instruction::ScalarVectorFloatToUnsignedInt(_)
         )
 }
 
@@ -247,7 +251,14 @@ pub(crate) fn complete_to_integer(
     if fp_status_traps(result.status, state.fpcr()) {
         return Err(CompletionError::Trap(result.status));
     }
-    if operation.rd != 31 {
+    if operation.vector_destination {
+        let value = if operation.destination_64 {
+            result.value
+        } else {
+            u64::from(result.value as u32)
+        };
+        state.set_vector(operation.rd, u128::from(value));
+    } else if operation.rd != 31 {
         state.general_register_storage_mut()[usize::from(operation.rd)] =
             if operation.destination_64 {
                 result.value
@@ -517,9 +528,25 @@ pub(crate) fn complete_multiply(
             "invalid exact FP multiply operands",
         )));
     }
+    let width = if operation.width_64 { 64 } else { 32 };
+    let lane = operation.lane.unwrap_or(0);
+    if u32::from(lane) >= 128 / width {
+        return Err(CompletionError::Invalid(Error::internal(
+            "invalid exact FP multiply lane",
+        )));
+    }
+    let second = (state
+        .vector(operation.rm)
+        .expect("validated vector register")
+        >> (u32::from(lane) * width)) as u64;
+    let second = if operation.width_64 {
+        second
+    } else {
+        u64::from(second as u32)
+    };
     let result = exact_scalar_float_multiply(
         scalar_bits(state, operation.rn, operation.width_64),
-        scalar_bits(state, operation.rm, operation.width_64),
+        second,
         if operation.width_64 { 64 } else { 32 },
         operation.operation,
         state.fpcr(),
@@ -548,9 +575,25 @@ pub(crate) fn complete_fused(
             "invalid exact FP fused operands",
         )));
     }
+    let width = if operation.width_64 { 64 } else { 32 };
+    let lane = operation.lane.unwrap_or(0);
+    if u32::from(lane) >= 128 / width {
+        return Err(CompletionError::Invalid(Error::internal(
+            "invalid exact FP fused lane",
+        )));
+    }
+    let second = (state
+        .vector(operation.rm)
+        .expect("validated vector register")
+        >> (u32::from(lane) * width)) as u64;
+    let second = if operation.width_64 {
+        second
+    } else {
+        u64::from(second as u32)
+    };
     let result = exact_scalar_float_fused_multiply_add(
         scalar_bits(state, operation.rn, operation.width_64),
-        scalar_bits(state, operation.rm, operation.width_64),
+        second,
         scalar_bits(state, operation.ra, operation.width_64),
         if operation.width_64 { 64 } else { 32 },
         operation.operation,

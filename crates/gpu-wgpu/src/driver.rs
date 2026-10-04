@@ -1962,10 +1962,69 @@ impl WgpuBackendDriver {
                 );
                 Ok(())
             }
-            CopyOperation::BufferToImage { .. }
-            | CopyOperation::ImageToBuffer { .. }
-            | CopyOperation::ImageToImage { .. } => {
-                Err(unsupported("non-buffer neutral copy layout"))
+            CopyOperation::ImageToImage {
+                source,
+                destination,
+            } => {
+                let source_handle =
+                    dependency_handle(dependencies, ResourceDependency::Image(source.image))?;
+                let destination_handle =
+                    dependency_handle(dependencies, ResourceDependency::Image(destination.image))?;
+                let Resource::Image {
+                    texture: source_texture,
+                    description: source_description,
+                    ..
+                } = self.resource(source_handle)?
+                else {
+                    return Err(kind_mismatch(source_handle));
+                };
+                let Resource::Image {
+                    texture: destination_texture,
+                    description: destination_description,
+                    ..
+                } = self.resource(destination_handle)?
+                else {
+                    return Err(kind_mismatch(destination_handle));
+                };
+                if source.image == destination.image
+                    || source.extent != destination.extent
+                    || source_description.kind() != nixe_gpu::ImageKind::Color
+                    || destination_description.kind() != nixe_gpu::ImageKind::Color
+                    || source_description.dimension() != ImageDimension::Two
+                    || destination_description.dimension() != ImageDimension::Two
+                    || source_description.format() != destination_description.format()
+                    || source_description.samples() != SampleCount::One
+                    || destination_description.samples() != SampleCount::One
+                {
+                    return Err(unsupported(
+                        "image copy requires distinct single-sample 2D color images of the same format",
+                    ));
+                }
+                image_region_is_full(*source_description, *source)?;
+                image_region_is_full(*destination_description, *destination)?;
+                let info = |texture, region: &ImageRegion| TexelCopyTextureInfo {
+                    texture,
+                    mip_level: u32::from(region.subresources.mip_level),
+                    origin: Origin3d {
+                        x: region.origin.x,
+                        y: region.origin.y,
+                        z: u32::from(region.subresources.base_layer),
+                    },
+                    aspect: TextureAspect::All,
+                };
+                encoder.copy_texture_to_texture(
+                    info(source_texture, source),
+                    info(destination_texture, destination),
+                    Extent3d {
+                        width: source.extent.width,
+                        height: source.extent.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                Ok(())
+            }
+            CopyOperation::BufferToImage { .. } | CopyOperation::ImageToBuffer { .. } => {
+                Err(unsupported("buffer/image neutral copy layout"))
             }
         }
     }
@@ -2409,9 +2468,26 @@ impl WgpuBackendDriver {
 
         let mut views = std::mem::take(&mut self.render_attachment_views);
         views.clear();
+        let (mut render_width, mut render_height) = (u32::MAX, u32::MAX);
         for attachment in attachments.iter() {
+            let handle =
+                dependency_handle(dependencies, ResourceDependency::Image(attachment.image))?;
+            let Resource::Image { description, .. } = self.resource(handle)? else {
+                return Err(kind_mismatch(handle));
+            };
+            let extent = description
+                .mip_extent(attachment.subresources.mip_level)
+                .ok_or_else(|| unsupported("invalid render attachment mip"))?;
+            render_width = render_width.min(extent.width);
+            render_height = render_height.min(extent.height);
             views.push(self.attachment_view(dependencies, *attachment)?);
         }
+        let full_scissor = nixe_gpu::ScissorRect {
+            x: 0,
+            y: 0,
+            width: render_width,
+            height: render_height,
+        };
         let mut draw_bind_groups = std::mem::take(&mut self.draw_bind_groups);
         {
             let mut color_attachments: [Option<RenderPassColorAttachment<'_>>;
@@ -2462,10 +2538,20 @@ impl WgpuBackendDriver {
                 ..Default::default()
             });
             let mut draw_index = 0;
+            let mut previous_scissor = full_scissor;
             for operation in &operations[begin + 1..end] {
                 let GpuCommand::Draw(draw) = operation.command() else {
                     continue;
                 };
+                let scissor = draw
+                    .prepared
+                    .scissor
+                    .unwrap_or(full_scissor)
+                    .clipped(render_width, render_height);
+                if scissor != previous_scissor {
+                    pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+                    previous_scissor = scissor;
+                }
                 pass.set_pipeline(&draw_pipelines[draw_index].pipeline);
                 for (slot, layout) in draw.prepared.vertex_buffers.iter().enumerate() {
                     if draw_pipelines[draw_index].vertex_fetch.quad_flat
@@ -3297,7 +3383,18 @@ impl WgpuBackendDriver {
             return Ok((module.clone(), neutral));
         }
         let wgsl = nixe_gpu::lower_shader_ir_to_wgsl(neutral.ir()).map_err(|error| {
-            BackendDriverError::failure(format!("WGSL shader lowering failed: {error}"))
+            let instruction = match error {
+                nixe_gpu::ShaderBackendLoweringError::NumericControl(location) => neutral
+                    .ir()
+                    .ir()
+                    .instructions()
+                    .iter()
+                    .find(|instruction| instruction.source() == location),
+                _ => None,
+            };
+            BackendDriverError::failure(format!(
+                "WGSL shader lowering failed: {error}; instruction={instruction:?}"
+            ))
         })?;
         let scope = self.device.push_error_scope(ErrorFilter::Validation);
         let compiled = self.device.create_shader_module(ShaderModuleDescriptor {

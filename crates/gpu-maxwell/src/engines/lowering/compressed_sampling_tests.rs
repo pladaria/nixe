@@ -207,6 +207,67 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
             .unwrap()[texture_index],
             target_binding
         );
+        // A width inside the producer's last GOB uses the same storage but
+        // requires different sampling coordinates. Retain both host images.
+        tic(&metadata, alias, 63, texture_format);
+        let cropped = resolve(&space, sampled);
+        let cropped_binding = prepare(
+            &cropped,
+            texture_index,
+            &mut cache,
+            &mut creations,
+            &mut invalidations,
+        )
+        .unwrap()[texture_index];
+        assert_ne!(cropped_binding, target_binding);
+        assert_eq!(creations.len(), 1);
+        assert!(matches!(
+            creations[0],
+            BackendResourceCreateInfo::Image { view: None, .. }
+        ));
+        assert_eq!(cache.image_alias_copies.len(), 1);
+        let GpuCommand::Copy(nixe_gpu::CopyOperation::ImageToImage {
+            source,
+            destination,
+        }) = cache.image_alias_copies[0].command()
+        else {
+            panic!("expected resident image copy");
+        };
+        assert_eq!(source.extent.width, 63);
+        assert_eq!(destination.extent, source.extent);
+        assert_ne!(source.image, destination.image);
+        creations.clear();
+        cache.image_alias_copies.clear();
+        assert_eq!(
+            prepare(
+                &cropped,
+                texture_index,
+                &mut cache,
+                &mut creations,
+                &mut invalidations
+            )
+            .unwrap()[texture_index],
+            cropped_binding
+        );
+        assert!(cache.image_alias_copies.is_empty());
+        assert!(creations.is_empty());
+        cache.revision += 1;
+        record_image_write(image, &mut cache);
+        assert_eq!(
+            prepare(
+                &cropped,
+                texture_index,
+                &mut cache,
+                &mut creations,
+                &mut invalidations
+            )
+            .unwrap()[texture_index],
+            cropped_binding
+        );
+        assert_eq!(cache.image_alias_copies.len(), 1);
+        assert!(creations.is_empty());
+        assert!(invalidations.is_empty());
+        cache.image_alias_copies.clear();
         // Layout/extent changes and new physical pages cannot inherit contents.
         tic(&metadata, alias, 32, texture_format);
         assert!(
@@ -234,7 +295,12 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         );
         tic(&metadata, address, 64, texture_format);
         // A historical materialization record without its resident image is not enough.
-        let resident = cache.views.pop().unwrap();
+        let position = cache
+            .views
+            .iter()
+            .position(|record| Some(record.dependency) == target_binding)
+            .unwrap();
+        let resident = cache.views.remove(position);
         assert!(
             prepare(
                 &textures,

@@ -52,7 +52,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0022..=0x0000_002f | 0x0000_005e..=0x0000_005f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a8 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00ae => {
             A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -212,6 +212,38 @@ mod tests {
                     ),
                     DecodeResult::Decoded(_)
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn rev64_decodes_all_arrangements_and_rejects_64_bit_elements() {
+        for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+            let location =
+                LocationDescriptor::new(GuestVirtualAddress::new(0), platform.profile_id());
+            for size in 0..4 {
+                for full in [false, true] {
+                    let word =
+                        0x0e20_0800 | (size << 22) | (u32::from(full) << 30) | (31 << 5) | 31;
+                    let encoding = InstructionEncoding::from_u32(word);
+                    let decoded = decode(platform, location, encoding);
+                    if size == 3 {
+                        assert!(!matches!(decoded, DecodeResult::Decoded(_)));
+                        continue;
+                    }
+                    let DecodeResult::Decoded(decoded) = decoded else {
+                        panic!("REV64 {word:08x}");
+                    };
+                    let A64Instruction::FpSimd(fp_simd::Instruction::Reverse64(fields)) =
+                        normalize(&decoded.instruction, encoding)
+                    else {
+                        panic!("{decoded:?}");
+                    };
+                    assert_eq!(
+                        (fields.rd, fields.rn, fields.opc, fields.vector_128),
+                        (31, 31, size as u8, full)
+                    );
+                }
             }
         }
     }

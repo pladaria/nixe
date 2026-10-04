@@ -382,11 +382,43 @@ struct ProcessMetadata {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ThreadPolicy {
+pub(crate) struct ThreadPolicy {
     pub(super) highest_priority: i32,
     pub(super) lowest_priority: i32,
     pub(super) min_core: u32,
     pub(super) max_core: u32,
+}
+
+impl ThreadPolicy {
+    /// Core permissions loaded from the executable's effective NPDM policy.
+    #[must_use]
+    pub fn allowed_core_mask(&self) -> Option<u64> {
+        let policy = self;
+        let low = 1_u64.checked_shl(policy.min_core)?.wrapping_sub(1);
+        let high = if policy.max_core == 63 {
+            u64::MAX
+        } else {
+            1_u64.checked_shl(policy.max_core + 1)?.wrapping_sub(1)
+        };
+        Some(high & !low)
+    }
+
+    /// Priority permissions shared with thread creation and policy validation.
+    #[must_use]
+    pub fn allowed_priority_mask(&self) -> Option<u64> {
+        let policy = self;
+        let low = 1_u64
+            .checked_shl(policy.highest_priority as u32)?
+            .wrapping_sub(1);
+        let high = if policy.lowest_priority == 63 {
+            u64::MAX
+        } else {
+            1_u64
+                .checked_shl(policy.lowest_priority as u32 + 1)?
+                .wrapping_sub(1)
+        };
+        Some(high & !low)
+    }
 }
 
 fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
@@ -677,4 +709,31 @@ pub(super) fn a64_register(index: u8) -> nixe_cpu::state::a64::A64GeneralRegiste
 
 pub(super) fn error(stage: ProcessBuildStage, cause: impl Display) -> ProcessBuildError {
     ProcessBuildError::new(stage, cause)
+}
+
+#[cfg(test)]
+mod thread_policy_tests {
+    use super::ThreadPolicy;
+
+    #[test]
+    fn permission_masks_cover_inclusive_ranges_and_bit_63() {
+        for (min, max, expected) in [(0, 2, 7), (1, 1, 2), (63, 63, 1 << 63), (0, 63, u64::MAX)] {
+            let policy = ThreadPolicy {
+                highest_priority: min as i32,
+                lowest_priority: max as i32,
+                min_core: min,
+                max_core: max,
+            };
+            assert_eq!(policy.allowed_core_mask(), Some(expected));
+            assert_eq!(policy.allowed_priority_mask(), Some(expected));
+        }
+        let unrepresentable = ThreadPolicy {
+            highest_priority: 0,
+            lowest_priority: 64,
+            min_core: 0,
+            max_core: 64,
+        };
+        assert_eq!(unrepresentable.allowed_core_mask(), None);
+        assert_eq!(unrepresentable.allowed_priority_mask(), None);
+    }
 }

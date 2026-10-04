@@ -5,7 +5,9 @@ mod commands;
 mod directory;
 mod file;
 mod filesystem;
+mod save;
 mod storage;
+pub(super) use save::open_save_data;
 
 use nixe_runtime::ExceptionProcessContext;
 
@@ -20,9 +22,21 @@ pub(in crate::ipc_wire) fn object_name(object: &SemanticIpcObject) -> &'static s
     match object {
         SemanticIpcObject::ReadOnlyFileSystem(_) => "IFileSystem(read-only)",
         SemanticIpcObject::ReadOnlyStorage(_) => "IStorage(read-only)",
-        SemanticIpcObject::HostDirectoryFileSystem(_) => "IFileSystem(sd-card)",
+        SemanticIpcObject::HostDirectoryFileSystem(fs) => {
+            if fs.save_volume().is_some() {
+                "IFileSystem(save-data)"
+            } else {
+                "IFileSystem(sd-card)"
+            }
+        }
         SemanticIpcObject::ReadOnlyFile(_) => "IFile(read-only)",
-        SemanticIpcObject::HostFile(_) => "IFile(sd-card)",
+        SemanticIpcObject::HostFile(file) => {
+            if file.save_volume().is_some() {
+                "IFile(save-data)"
+            } else {
+                "IFile(sd-card)"
+            }
+        }
         SemanticIpcObject::ReadOnlyDirectory(_) => "IDirectory",
     }
 }
@@ -63,6 +77,12 @@ pub(super) fn decode_root_request(
                 return Ok(None);
             }
             Ok(Some(IpcRequest::GetGlobalAccessLogMode))
+        }
+        FileSystemProxyCommand::GetProgramIndexForAccessLog => {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+                return Ok(None);
+            }
+            Ok(Some(IpcRequest::GetProgramIndexForAccessLog))
         }
     }
 }

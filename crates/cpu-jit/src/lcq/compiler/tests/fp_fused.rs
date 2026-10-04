@@ -317,3 +317,84 @@ fn fused_capabilities_and_pending_status_use_real_boundaries() {
         assert_eq!(actual, expected);
     }
 }
+
+#[test]
+fn scalar_fused_element_matches_lanes_aliases_rounding_and_exact_traps() {
+    for wide in [false, true] {
+        let width = if wide { 64 } else { 32 };
+        let bits = |v: f64| {
+            if wide {
+                v.to_bits()
+            } else {
+                u64::from((v as f32).to_bits())
+            }
+        };
+        for index in 0..128 / width {
+            for (rd, rn, rm) in [
+                (0, 1, 2),
+                (1, 1, 2),
+                (2, 1, 2),
+                (31, 31, 2),
+                (31, 1, 31),
+                (31, 31, 31),
+            ] {
+                for fpcr in [0, 3 << 22, 1 << 24, 1 << 8] {
+                    for subtract in [false, true] {
+                        for selected in [bits(1.5), bits(f64::INFINITY), bits(f64::NAN), 1] {
+                            let mut actual = A64State::default();
+                            actual.set_pc(PC);
+                            actual.set_fpcr(fpcr);
+                            actual.set_fpsr(1 << 27);
+                            actual.set_vector(rd, u128::MAX << width | u128::from(bits(-1.0)));
+                            actual.set_vector(rn, u128::from(bits(1.0) + 1));
+                            actual.set_vector(rm, u128::from(selected) << (index * width));
+                            let index_bits = if wide {
+                                index << 11
+                            } else {
+                                (index & 1) << 21 | (index >> 1) << 11
+                            };
+                            let word = 0x5f80_1000
+                                | (u32::from(wide) << 22)
+                                | (u32::from(subtract) << 14)
+                                | index_bits
+                                | (u32::from(rm) << 16)
+                                | (u32::from(rn) << 5)
+                                | u32::from(rd);
+                            let prestate = actual.clone();
+                            let mut expected = actual.clone();
+                            let reference =
+                                execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap();
+                            let (_, exit) = execute(&[word, 0xd420_0000], &mut actual);
+                            match exit.kind {
+                                EdgeKind::FpFused(operation) => {
+                                    assert_eq!(actual, prestate);
+                                    match complete_fused(operation, &mut actual) {
+                                        Ok(()) => assert_eq!(reference, InstructionStep::Continue),
+                                        Err(CompletionError::Trap(_)) => {
+                                            assert!(matches!(
+                                                reference,
+                                                InstructionStep::Exit(
+                                                    CpuExit::ArchitecturalException {
+                                                        kind: ExceptionKind::FloatingPoint,
+                                                        ..
+                                                    }
+                                                )
+                                            ));
+                                            assert_eq!(actual, prestate);
+                                        }
+                                        Err(error) => panic!("{error:?}"),
+                                    }
+                                }
+                                EdgeKind::Breakpoint(0) => {
+                                    assert_eq!(reference, InstructionStep::Continue)
+                                }
+                                other => panic!("{other:?}"),
+                            }
+                            assert_eq!(actual, expected, "word={word:08x} FPCR={fpcr:08x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

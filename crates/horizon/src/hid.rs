@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use nixe_cpu::memory::ExecutionMemory;
 use nixe_input::{EmulatedControllerState, EmulatedTouchScreenState};
-use nixe_runtime::{HandleError, SharedMemoryObject};
+use nixe_runtime::{
+    EventObject, ExternalEventSource, HandleError, ReadableEventObject, SharedMemoryObject,
+    WritableEventObject,
+};
 
 const HID_SHARED_MEMORY_SIZE: usize = 0x40000;
 const TOUCH_SCREEN_OFFSET: usize = 0x400;
@@ -55,6 +58,7 @@ pub(crate) fn vibration_device_position(handle: u32) -> Option<u32> {
 #[derive(Debug)]
 pub struct HidSystem {
     shared_memory: OnceLock<SharedMemoryObject>,
+    style_events: [OnceLock<(WritableEventObject, ReadableEventObject)>; 10],
     sampling_number: u64,
     touch_screen_sampling_number: u64,
     touch_screen: Lifo,
@@ -120,6 +124,7 @@ impl HidSystem {
     pub fn new() -> Self {
         Self {
             shared_memory: OnceLock::new(),
+            style_events: std::array::from_fn(|_| OnceLock::new()),
             sampling_number: 0,
             touch_screen_sampling_number: 0,
             touch_screen: Lifo::default(),
@@ -150,6 +155,28 @@ impl HidSystem {
             .get()
             .expect("HID allocation initialized")
             .clone())
+    }
+
+    pub(crate) fn acquire_style_event(&self, id: u32) -> Option<ReadableEventObject> {
+        let index = match id {
+            0..=7 => id as usize,
+            0x10 => 8,
+            0x20 => 9,
+            _ => return None,
+        };
+        let (writable, readable) = self.style_events[index]
+            .get_or_init(|| EventObject::create_pair_with_source(ExternalEventSource::Input));
+        // Acquiring also signals the event so a client can inspect the initial
+        // style. Later signals follow publication of a changed style tag.
+        // https://github.com/eden-emulator/mirror/blob/master/src/hid_core/resources/npad/npad_resource.cpp
+        writable.signal();
+        Some(readable.clone())
+    }
+
+    fn signal_player_one_style_change(&self) {
+        if let Some((event, _)) = self.style_events[0].get() {
+            event.signal();
+        }
     }
 
     pub(crate) fn activate_npad(&self) {
@@ -302,12 +329,14 @@ impl HidSystem {
                 self.publish_system_button(HOME_BUTTON_LIFO_OFFSET, false, true)?;
                 self.publish_system_button(CAPTURE_BUTTON_LIFO_OFFSET, false, false)?;
                 self.connected = false;
+                self.signal_player_one_style_change();
             }
             return Ok(());
         };
 
         self.sampling_number = self.sampling_number.saturating_add(1);
-        if !self.connected {
+        let style_changed = !self.connected;
+        if style_changed {
             self.write_u32(NPAD_OFFSET, NPAD_STYLE_FULL_KEY)?;
             self.write_u32(NPAD_OFFSET + 4, 0)?;
             self.write_u32(NPAD_OFFSET + 8, 0)?;
@@ -379,7 +408,11 @@ impl HidSystem {
         }
 
         self.publish_system_button(HOME_BUTTON_LIFO_OFFSET, state.buttons.home, true)?;
-        self.publish_system_button(CAPTURE_BUTTON_LIFO_OFFSET, state.buttons.capture, false)
+        self.publish_system_button(CAPTURE_BUTTON_LIFO_OFFSET, state.buttons.capture, false)?;
+        if style_changed {
+            self.signal_player_one_style_change();
+        }
+        Ok(())
     }
 
     fn publish_system_button(
@@ -519,6 +552,39 @@ mod tests {
         assert!(hid.set_supported_npad_ids([0]));
         if six_axis {
             hid.set_six_axis_sensor_active(0x0002_0003, true);
+        }
+    }
+
+    #[test]
+    fn style_event_copies_track_published_connection_changes() {
+        let mut hid = HidSystem::new();
+        let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let event = hid.acquire_style_event(0).unwrap();
+        assert!(event.is_signalled());
+        let copy = hid.acquire_style_event(0).unwrap();
+        copy.clear();
+        assert!(!event.is_signalled());
+        configure_player_one(&hid, false);
+        let state = EmulatedControllerState::default();
+        hid.publish(Some(&state), Duration::ZERO).unwrap();
+        assert!(event.is_signalled());
+        assert_eq!(read_u32(&memory, NPAD_OFFSET), NPAD_STYLE_FULL_KEY);
+        event.clear();
+        hid.publish(Some(&state), Duration::ZERO).unwrap();
+        assert!(!event.is_signalled());
+        hid.publish(None, Duration::ZERO).unwrap();
+        assert!(copy.is_signalled());
+        assert_eq!(read_u32(&memory, NPAD_OFFSET), 0);
+        copy.clear();
+        hid.publish(None, Duration::ZERO).unwrap();
+        assert!(!event.is_signalled());
+        let other = hid.acquire_style_event(1).unwrap();
+        assert!(other.is_signalled());
+        other.clear();
+        hid.publish(Some(&state), Duration::ZERO).unwrap();
+        assert!(!other.is_signalled());
+        for id in [8, 9, 0x11, 0x21, u32::MAX] {
+            assert!(hid.acquire_style_event(id).is_none());
         }
     }
 

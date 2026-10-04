@@ -375,6 +375,38 @@ fn a64_architectural_timer_provider_is_only_sampled_by_timer_reads() {
 }
 
 #[test]
+fn a64_prefetch_does_not_access_unmapped_memory_or_modify_registers() {
+    let memory = SyntheticMemory::new();
+    let services = TestServices::default();
+    let context = services.context(
+        ProcessCpuContext::new(TargetPlatform::Switch1, AddressSpaceId::new(0)),
+        &memory,
+    );
+    for word in [
+        0xf980_0021,
+        0xf99f_ffe0,
+        0xf89f_f023,
+        0xf8a2_6824,
+        0xd81f_ffe1,
+    ] {
+        let mut state = A64State::default();
+        state.set_pc(0x1000);
+        state.set_nzcv(nixe_cpu::state::a64::Nzcv::from_bits(0xa000_0000));
+        for (i, value) in state.general_register_storage_mut().iter_mut().enumerate() {
+            *value = u64::MAX - i as u64;
+        }
+        *state.stack_pointer_storage_mut() = u64::MAX;
+        let mut expected = state.clone();
+        expected.set_pc(0x1004);
+        assert_eq!(
+            execute_one_with_context(context, &mut state, word).unwrap(),
+            InstructionStep::Continue
+        );
+        assert_eq!(state, expected);
+    }
+}
+
+#[test]
 fn a64_cache_maintenance_uses_the_canonical_memory_contract() {
     let profile = TargetPlatform::Switch1;
     let space = AddressSpaceId::new(0);

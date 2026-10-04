@@ -103,6 +103,12 @@ impl HorizonSvcDispatcher {
         }
 
         let thread_id = context.thread().object().thread_id();
+        if self.cancelled_waits.remove(&thread_id) {
+            self.finish_reply_wait(thread_id, immediate);
+            result(context, HorizonKernelResult::CANCELLED);
+            write_register(context.thread_mut().state_mut(), 1, u32::MAX as u64);
+            return resume();
+        }
         if reply_target != 0 && !self.reply_sent.contains(&thread_id) {
             let Some(session) = context
                 .process()
@@ -215,6 +221,13 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::TIMED_OUT);
             resume()
         } else {
+            if self.pending_wait_cancellations.remove(&thread_id) {
+                self.finish_reply_wait(thread_id, immediate);
+                result(context, HorizonKernelResult::CANCELLED);
+                write_register(context.thread_mut().state_mut(), 1, u32::MAX as u64);
+                return resume();
+            }
+            self.cancellable_waits.insert(thread_id);
             let mut events: Vec<_> = targets
                 .iter()
                 .map(|target| match target {
@@ -262,6 +275,9 @@ impl HorizonSvcDispatcher {
     }
 
     pub(super) fn finish_wait(&mut self, thread_id: u64, immediate: u32) {
+        if matches!(immediate, 0x18 | 0x43 | 0x44) {
+            self.cancellable_waits.remove(&thread_id);
+        }
         self.wait_deadlines.remove(&(thread_id, immediate));
         self.pending_wakes.remove(&thread_id);
     }
@@ -401,6 +417,13 @@ impl HorizonSvcDispatcher {
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let thread_id = context.thread().object().thread_id();
+        if self.cancelled_waits.remove(&thread_id) {
+            self.finish_wait(thread_id, 0x18);
+            result(context, HorizonKernelResult::CANCELLED);
+            write_register(context.thread_mut().state_mut(), 1, u32::MAX as u64);
+            return resume();
+        }
         let pointer = read_register(context.thread().state(), 1);
         let count = read_register(context.thread().state(), 2) as u32;
         let timeout = read_wait_timeout(context.thread().state());
@@ -465,6 +488,15 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::TIMED_OUT);
             resume()
         } else {
+            // Readiness and zero-timeout polling precede a latched cancellation.
+            // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_synchronization_object.cpp#L98-L117
+            if self.pending_wait_cancellations.remove(&thread_id) {
+                self.finish_wait(thread_id, 0x18);
+                result(context, HorizonKernelResult::CANCELLED);
+                write_register(context.thread_mut().state_mut(), 1, u32::MAX as u64);
+                return resume();
+            }
+            self.cancellable_waits.insert(thread_id);
             if !events.is_empty() {
                 let deadline = self.wait_deadlines.get(&(thread_id, 0x18)).copied();
                 self.pending_wakes

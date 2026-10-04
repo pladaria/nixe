@@ -40,7 +40,11 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             Ok(())
         }
         Instruction::DuplicateElement(_) => {
-            duplicate_element(state, fields);
+            duplicate_element(state, fields, false);
+            Ok(())
+        }
+        Instruction::DuplicateScalarElement(_) => {
+            duplicate_element(state, fields, true);
             Ok(())
         }
         Instruction::ModifiedImmediate(_) => {
@@ -169,6 +173,10 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             );
             Ok(())
         }
+        Instruction::Reverse64(_) => {
+            reverse_64(state, fields);
+            Ok(())
+        }
         Instruction::CountBits(_) => {
             count_bits(state, fields);
             Ok(())
@@ -226,6 +234,33 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             if inexact {
                 state.set_fpsr(state.fpsr() | (1 << 4));
             }
+            Ok(())
+        }
+        Instruction::ScalarVectorFloatToSignedInt(_)
+        | Instruction::ScalarVectorFloatToUnsignedInt(_) => {
+            // Scalar SIMD FCVTZS/ZU has equal source/destination widths and
+            // clears all inactive destination bits, including for V31.
+            // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+            let width = if fields.opc == 0 { 32 } else { 64 };
+            let outcome = exact_float_to_integer(
+                state.vector(fields.rn).unwrap() as u64,
+                width,
+                width,
+                matches!(instruction, Instruction::ScalarVectorFloatToSignedInt(_)),
+                FloatToIntegerRounding::TowardZero,
+                0,
+                state.fpcr(),
+            );
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(A64FpSimdError::Trap);
+            }
+            let value = if width == 32 {
+                u64::from(outcome.value as u32)
+            } else {
+                outcome.value
+            };
+            assert!(state.set_vector(fields.rd, u128::from(value)));
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
             Ok(())
         }
         Instruction::FloatToSignedInt(_) | Instruction::FloatToUnsignedInt(_) => {
@@ -401,13 +436,15 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
             Ok(())
         }
-        Instruction::ScalarFloatMultiply(_) => {
+        Instruction::ScalarFloatMultiply(_) | Instruction::ScalarFloatMultiplyElement(_) => {
             let outcome = scalar_float_multiply(
                 state,
                 fields,
                 fields
                     .float_multiply_operation
                     .expect("normalized scalar floating-point multiply operation"),
+                matches!(instruction, Instruction::ScalarFloatMultiplyElement(_))
+                    .then_some(fields.fp_element_lane),
             );
             if fp_status_traps(outcome.status, state.fpcr()) {
                 return Err(A64FpSimdError::Trap);
@@ -416,13 +453,15 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
             Ok(())
         }
-        Instruction::ScalarFloatFusedMultiplyAdd(_) => {
+        Instruction::ScalarFloatFusedMultiplyAdd(_) | Instruction::ScalarFloatFusedElement(_) => {
             let outcome = scalar_float_fused_multiply_add(
                 state,
                 fields,
                 fields
                     .float_fused_multiply_operation
                     .expect("normalized scalar fused multiply-add operation"),
+                matches!(instruction, Instruction::ScalarFloatFusedElement(_))
+                    .then_some(fields.fp_element_lane),
             );
             if fp_status_traps(outcome.status, state.fpcr()) {
                 return Err(A64FpSimdError::Trap);
@@ -616,7 +655,11 @@ fn duplicate_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::
 // source before writing so aliases are exact, and clears inactive upper bits
 // for 64-bit destinations. Arm ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/DUP--element---Duplicate-vector-element-to-vector-or-scalar-
-fn duplicate_element(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+fn duplicate_element(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    scalar: bool,
+) {
     let size_shift = fields.immediate_5.trailing_zeros();
     let lane_bits = 8_u32 << size_shift;
     let lane = fields.immediate_5 >> (size_shift + 1);
@@ -625,12 +668,16 @@ fn duplicate_element(state: &mut A64State, fields: crate::decode::a64::fp_simd::
         .vector(fields.rn)
         .expect("normalized DUP element source register");
     let element = (source >> (u32::from(lane) * lane_bits)) & ((1_u128 << lane_bits) - 1);
-    let value = replicate(
-        element,
-        BitWidth::new(lane_bits as u8).expect("allocated DUP element width"),
-        BitWidth::new(vector_bits).expect("allocated DUP destination width"),
-    )
-    .expect("allocated DUP destination arrangement");
+    let value = if scalar {
+        element
+    } else {
+        replicate(
+            element,
+            BitWidth::new(lane_bits as u8).expect("allocated DUP element width"),
+            BitWidth::new(vector_bits).expect("allocated DUP destination width"),
+        )
+        .expect("allocated DUP destination arrangement")
+    };
     assert!(state.set_vector(fields.rd, value));
 }
 
@@ -1756,10 +1803,13 @@ pub fn exact_scalar_float_divide(lhs: u64, rhs: u64, precision: u8, fpcr: u32) -
 // Arm ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMUL--scalar---Floating-point-Multiply--scalar--
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNMUL--Floating-point-Negated-Multiply--scalar--
+// FMUL (by element), scalar S/D has the same FP operation on one selected lane:
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (FMUL by element)
 fn scalar_float_multiply(
     state: &A64State,
     fields: crate::decode::a64::fp_simd::Operands,
     operation: FloatMultiplyOperation,
+    lane: Option<u8>,
 ) -> FpLaneOutcome {
     let fp_format = if fields.opc == 0 {
         FpFormat::Binary32
@@ -1776,9 +1826,10 @@ fn scalar_float_multiply(
         .vector(fields.rn)
         .expect("normalized scalar multiplication first operand") as u64
         & mask;
-    let rhs = state
+    let rhs = (state
         .vector(fields.rm)
-        .expect("normalized scalar multiplication second operand") as u64
+        .expect("normalized scalar multiplication second operand")
+        >> (u32::from(lane.unwrap_or(0)) * u32::from(fp_format.bits()))) as u64
         & mask;
     let outcome = exact_scalar_float_multiply(lhs, rhs, fp_format.bits(), operation, state.fpcr());
     FpLaneOutcome {
@@ -1815,6 +1866,7 @@ fn scalar_float_fused_multiply_add(
     state: &A64State,
     fields: crate::decode::a64::fp_simd::Operands,
     operation: FloatFusedMultiplyOperation,
+    lane: Option<u8>,
 ) -> FpLaneOutcome {
     let fp_format = if fields.opc == 0 {
         FpFormat::Binary32
@@ -1831,9 +1883,11 @@ fn scalar_float_fused_multiply_add(
         .vector(fields.rn)
         .expect("normalized scalar FMA multiplicand") as u64
         & mask;
-    let multiplier = state
+    let multiplier = (state
         .vector(fields.rm)
-        .expect("normalized scalar FMA multiplier") as u64
+        .expect("normalized scalar FMA multiplier")
+        >> (u32::from(lane.unwrap_or(0)) * u32::from(fp_format.bits())))
+        as u64
         & mask;
     let addend = state
         .vector(fields.ra)
@@ -3684,6 +3738,27 @@ fn shift_lane(value: u128, distance: i8, lane_bits: u32, signed: bool) -> u128 {
     }
 }
 
+// Reverse elements independently in each 64-bit container, preserving bytes
+// within an element. The 64-bit vector form clears the upper destination half.
+// Arm A64 ISA (2025), REV64:
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+fn reverse_64(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let element_bytes = 1_usize << fields.opc;
+    let active_bytes = if fields.vector_128 { 16 } else { 8 };
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized REV64 source")
+        .to_le_bytes();
+    let mut result = [0_u8; 16];
+    for (index, byte) in result[..active_bytes].iter_mut().enumerate() {
+        let container = index / 8 * 8;
+        let element = index % 8 / element_bytes;
+        *byte = source
+            [container + (8 / element_bytes - 1 - element) * element_bytes + index % element_bytes];
+    }
+    assert!(state.set_vector(fields.rd, u128::from_le_bytes(result)));
+}
+
 // CNT writes the population count of each source byte into the corresponding
 // destination byte. The 8B form clears the inactive upper 64 bits.
 // Arm A64 ISA (2025):
@@ -3866,6 +3941,173 @@ mod tests {
         align_fused_operands, exact_float_convert, exact_scalar_float_divide, fp_status_bits,
         integer_square_root, shift_lane,
     };
+
+    #[test]
+    fn scalar_fused_element_uses_accumulator_and_one_rounding() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for wide in [false, true] {
+            let width = if wide { 64 } else { 32 };
+            let bits = |v: f64| {
+                if wide {
+                    v.to_bits()
+                } else {
+                    u64::from((v as f32).to_bits())
+                }
+            };
+            let one = bits(1.0);
+            let epsilon_squared = bits(if wide {
+                (2.0f64).powi(-104)
+            } else {
+                (2.0f64).powi(-46)
+            });
+            for index in 0..128 / width {
+                for subtract in [false, true] {
+                    let mut state = A64State::default();
+                    state.set_vector(1, u128::from(one + 1));
+                    state.set_vector(2, u128::from(one - 2) << (index * width));
+                    state.set_vector(
+                        31,
+                        u128::MAX << width | u128::from(bits(if subtract { 1.0 } else { -1.0 })),
+                    );
+                    let index_bits = if wide {
+                        index << 11
+                    } else {
+                        (index & 1) << 21 | (index >> 1) << 11
+                    };
+                    let word = 0x5f82_103f
+                        | (u32::from(wide) << 22)
+                        | (u32::from(subtract) << 14)
+                        | index_bits;
+                    super::execute(&mut state, fp_simd::normalize(0xae, word)).unwrap();
+                    let expected = epsilon_squared | if subtract { 0 } else { 1 << (width - 1) };
+                    assert_eq!(state.vector(31), Some(u128::from(expected)));
+                    assert_eq!(state.fpsr(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_by_element_multiply_selects_each_lane_and_clears_upper_bits() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for wide in [false, true] {
+            let width = if wide { 64 } else { 32 };
+            let bits = |v: f64| {
+                if wide {
+                    v.to_bits()
+                } else {
+                    u64::from((v as f32).to_bits())
+                }
+            };
+            let source = (0..128 / width).fold(0_u128, |v, i| {
+                v | (u128::from(bits(f64::from(i + 2))) << (i * width))
+            });
+            for index in 0..128 / width {
+                for (rd, rn, rm) in [(0, 1, 2), (1, 1, 2), (2, 1, 2), (31, 31, 2), (31, 1, 31)] {
+                    let mut state = A64State::default();
+                    state.set_vector(rd, u128::MAX);
+                    state.set_vector(rn, u128::from(bits(3.0)));
+                    state.set_vector(rm, source);
+                    state.set_fpsr(1 << 27);
+                    let index_bits = if wide {
+                        index << 11
+                    } else {
+                        (index & 1) << 21 | (index >> 1) << 11
+                    };
+                    let word = 0x5f80_9000
+                        | (u32::from(wide) << 22)
+                        | index_bits
+                        | (u32::from(rm) << 16)
+                        | (u32::from(rn) << 5)
+                        | u32::from(rd);
+                    super::execute(&mut state, fp_simd::normalize(0xad, word)).unwrap();
+                    assert_eq!(
+                        state.vector(rd),
+                        Some(u128::from(bits(3.0 * f64::from(index + 2))))
+                    );
+                    assert_eq!(state.fpsr(), 1 << 27);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_dup_extracts_all_lane_sizes_and_indices_without_changing_status() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        let bytes: [u8; 16] = std::array::from_fn(|i| 0x80 + i as u8);
+        let source = u128::from_le_bytes(bytes);
+        for size in 0..4_u32 {
+            let lane_bytes = 1 << size;
+            for index in 0..16 / lane_bytes {
+                for (rd, rn) in [(0, 0), (31, 31), (2, 31), (31, 2)] {
+                    let mut state = A64State::default();
+                    state.set_vector(rd, u128::MAX);
+                    state.set_vector(rn, source);
+                    state.set_fpsr(0x0800_009f);
+                    state.set_fpcr(0x07c0_0000);
+                    let imm5 = (index << (size + 1)) | (1 << size);
+                    let word = 0x5e00_0400 | (imm5 << 16) | (u32::from(rn) << 5) | u32::from(rd);
+                    super::execute(&mut state, fp_simd::normalize(0xac, word)).unwrap();
+                    let mut expected = [0; 16];
+                    let offset = (index * lane_bytes) as usize;
+                    expected[..lane_bytes as usize]
+                        .copy_from_slice(&bytes[offset..offset + lane_bytes as usize]);
+                    assert_eq!(state.vector(rd), Some(u128::from_le_bytes(expected)));
+                    assert_eq!(state.fpsr(), 0x0800_009f);
+                    assert_eq!(state.fpcr(), 0x07c0_0000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_simd_fcvtzs_writes_integer_bits_clears_upper_bits_and_sets_status() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for (value, expected, status) in [
+            (1.75f32, 1u32, 16),
+            (-1.75, u32::MAX, 16),
+            (f32::INFINITY, i32::MAX as u32, 1),
+            (f32::NAN, 0, 1),
+        ] {
+            let mut state = A64State::default();
+            state.set_vector(31, u128::MAX << 32 | u128::from(value.to_bits()));
+            super::execute(&mut state, fp_simd::normalize(0x0000_00aa, 0x5ea1_bbff)).unwrap();
+            assert_eq!(state.vector(31), Some(u128::from(expected)));
+            assert_eq!(state.fpsr(), status);
+        }
+    }
+
+    #[test]
+    fn rev64_reverses_elements_within_each_container_and_clears_inactive_bits() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for (size, expected) in [
+            (0, [7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8]),
+            (1, [6, 7, 4, 5, 2, 3, 0, 1, 14, 15, 12, 13, 10, 11, 8, 9]),
+            (2, [4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11]),
+        ] {
+            for full in [false, true] {
+                let mut state = A64State::default();
+                state.set_vector(0, u128::from_le_bytes(std::array::from_fn(|i| i as u8)));
+                state.set_fpsr(0x0800_009f);
+                let instruction = fp_simd::normalize(
+                    0x0000_00a9,
+                    0x0e20_0800 | (size << 22) | (u32::from(full) << 30),
+                );
+                super::execute(&mut state, instruction).unwrap();
+                let mut expected = expected;
+                if !full {
+                    expected[8..].fill(0);
+                }
+                assert_eq!(state.vector(0), Some(u128::from_le_bytes(expected)));
+                assert_eq!(state.fpsr(), 0x0800_009f);
+            }
+        }
+    }
 
     #[test]
     fn fused_nan_priority_sign_changes_and_invalid_product_are_architectural() {

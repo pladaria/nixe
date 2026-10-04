@@ -119,11 +119,24 @@ pub(in crate::ipc_wire) fn dispatch_vi(
     let video = session.video();
     match session.kind() {
         ViObjectKind::Root(kind) => {
-            if request.command_id != kind.required_root_command() {
+            // Application command 1 (9.0.0+) has the same u32 policy and
+            // display-interface output. Binder relay objects are returned
+            // directly by this in-process server, with no named proxy hop.
+            // https://switchbrew.org/wiki/Display_services#GetDisplayServiceWithProxyNameExchange
+            let proxy_exchange = kind == ViServiceKind::Application && request.command_id == 1;
+            if request.command_id != kind.required_root_command() && !proxy_exchange {
                 return unsupported_service_command(
                     vi_object_name(session.kind()),
                     request.command_id,
                 );
+            }
+            if proxy_exchange {
+                if !request.has_payload_size(4) || has_ipc_descriptors(hipc) {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                if request_u32(request.data, 0) != Some(0) {
+                    return cmif_error(request.token, HorizonIpcResult::from_raw(0xa72));
+                }
             }
             vi_child(
                 process,

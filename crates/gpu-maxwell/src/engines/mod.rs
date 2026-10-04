@@ -786,6 +786,16 @@ fn flush_mme_methods<E>(
 
 fn preflight_host_method(method: MaxwellMethodDispatch, host: MaxwellHostMethod) -> AppliedMethod {
     match host {
+        MaxwellHostMethod::Nop => AppliedMethod::new(
+            method,
+            MaxwellEngineMethodMetadata::new(
+                method.class(),
+                "MAXWELL_CHANNEL_GPFIFO_A",
+                method.source().method(),
+                "NOP",
+            ),
+            None,
+        ),
         MaxwellHostMethod::LegacyMemOpA { .. } => AppliedMethod::new(
             method,
             MaxwellEngineMethodMetadata::new(

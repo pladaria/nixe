@@ -82,6 +82,8 @@ impl IpcResultCode {
     pub const RESOURCE_LIMIT: Self = Self(9);
     pub const STORAGE_FAILURE: Self = Self(10);
     pub const INTERNAL_STATE: Self = Self(11);
+    pub const NO_SPACE: Self = Self(12);
+    pub const WRITE_FILE_NOT_CLOSED: Self = Self(13);
 
     pub(crate) const fn semantic_id(self) -> u32 {
         self.0
@@ -112,6 +114,7 @@ pub enum IpcRequest {
     OpenPrimaryStorage,
     OpenSdCardFileSystem,
     GetGlobalAccessLogMode,
+    GetProgramIndexForAccessLog,
     CreateFile {
         path: String,
         size: u64,
@@ -128,6 +131,10 @@ pub enum IpcRequest {
         path: String,
         mode: u32,
     },
+    GetEntryType {
+        path: String,
+    },
+    CommitFileSystem,
     GetFileSize,
     ReadFile {
         offset: u64,
@@ -165,6 +172,7 @@ pub enum IpcRequest {
         horizon_index: u32,
     },
     GetAddOnContentListChangedEvent,
+    CheckAddOnContentMountStatus,
     OpenAddOnContent {
         title_id: TitleId,
         mount_index: usize,
@@ -179,7 +187,9 @@ pub enum IpcResponse {
     Handle(u32),
     Event(u32),
     Size(u64),
+    EntryType(DirectoryEntryKind),
     FileSystemAccessLogMode(FileSystemAccessLogMode),
+    AccessLogProgramIndex { version: u32, program_index: u32 },
     Data(Vec<u8>),
     StorageRead { offset: u64, size: usize },
     DirectoryEntries(Vec<DirectoryEntry>),
@@ -292,6 +302,19 @@ fn dispatch_session(
         (IpcService::FileSystem, IpcRequest::GetGlobalAccessLogMode) => Ok(
             IpcResponse::FileSystemAccessLogMode(file_system_access_log_mode),
         ),
+        (IpcService::FileSystem, IpcRequest::GetProgramIndexForAccessLog) => {
+            // The current launcher requires exactly one Program content and
+            // verifies NPDM's program ID against the base application ID.
+            // Multi-program launches and RegisterProgramIndexMapInfo are not
+            // supported; the registered application is therefore program zero.
+            // The wire ABI is two u32 values: access-log version, program index.
+            // https://switchbrew.org/wiki/Filesystem_services#GetProgramIndexForAccessLog
+            // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/filesystem/fsp/fsp_srv.h
+            Ok(IpcResponse::AccessLogProgramIndex {
+                version: 2,
+                program_index: 0,
+            })
+        }
         // The `ByCurrentProcess` commands resolve content from the process
         // registration established by SetCurrentProcess. `CanMountContentData`
         // applies to the generic content mount commands, not to these commands:
@@ -393,6 +416,15 @@ fn dispatch_session(
             } else {
                 Err(IpcResultCode::PATH_NOT_FOUND)
             }
+        }
+        (IpcService::AddOnContent, IpcRequest::CheckAddOnContentMountStatus) => {
+            // This checks for loss of content mounted by the caller, rather
+            // than requiring any DLC to be installed. The process namespace
+            // owns immutable, resolved backing views for its entire lifetime;
+            // it cannot lose a mount. Mount/unmount notifications and live
+            // removal remain separate, unsupported commands.
+            // https://github.com/alula/Ryujinx/blob/master/src/Ryujinx.HLE/HOS/Services/Ns/Aoc/IAddOnContentManager.cs
+            Ok(IpcResponse::None)
         }
         (IpcService::AddOnContent, IpcRequest::GetAddOnContentListChangedEvent) => {
             let (_writable, readable) = EventObject::create_pair();
@@ -548,8 +580,41 @@ fn dispatch_host_filesystem(
     filesystem: &HostDirectoryFileSystem,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
-    require_sd_card_access(mounts)?;
+    let mut save = filesystem
+        .save_volume()
+        .map(|volume| volume.lock().map_err(|_| IpcResultCode::INTERNAL_STATE))
+        .transpose()?;
+    if save.is_none() {
+        require_sd_card_access(mounts)?;
+    }
     match request {
+        IpcRequest::GetEntryType { path } => {
+            let path = normalize_path(&path)?;
+            if save.is_none()
+                && let Some(identity) = mounts.homebrew_executable()
+            {
+                if path == identity.guest_path() {
+                    return Ok(IpcResponse::EntryType(DirectoryEntryKind::File));
+                }
+                if is_homebrew_virtual_directory(identity.guest_path(), &path) {
+                    return Ok(IpcResponse::EntryType(DirectoryEntryKind::Directory));
+                }
+            }
+            let metadata = std::fs::metadata(
+                filesystem
+                    .resolve_existing(&path)
+                    .map_err(map_host_io_error)?,
+            )
+            .map_err(map_host_io_error)?;
+            let kind = if metadata.is_dir() {
+                DirectoryEntryKind::Directory
+            } else if metadata.is_file() {
+                DirectoryEntryKind::File
+            } else {
+                return Err(IpcResultCode::PATH_NOT_FOUND);
+            };
+            Ok(IpcResponse::EntryType(kind))
+        }
         IpcRequest::CreateFile { path, size, option } => {
             if option != 0 {
                 return Err(IpcResultCode::INVALID_ARGUMENT);
@@ -559,6 +624,12 @@ fn dispatch_host_filesystem(
                 return Err(IpcResultCode::ACCESS_DENIED);
             }
             let host_path = filesystem.resolve_new(&path).map_err(map_host_io_error)?;
+            if save
+                .as_ref()
+                .is_some_and(|volume| !volume.can_resize(0, size))
+            {
+                return Err(IpcResultCode::NO_SPACE);
+            }
             let file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -569,6 +640,9 @@ fn dispatch_host_filesystem(
                 let _ = std::fs::remove_file(host_path);
                 return Err(map_host_io_error(error));
             }
+            if let Some(volume) = save.as_mut() {
+                volume.record_resize(&path, 0, size);
+            }
             Ok(IpcResponse::None)
         }
         IpcRequest::CreateDirectory { path } => {
@@ -578,6 +652,9 @@ fn dispatch_host_filesystem(
             }
             let host_path = filesystem.resolve_new(&path).map_err(map_host_io_error)?;
             std::fs::create_dir(host_path).map_err(map_host_io_error)?;
+            if let Some(volume) = save.as_mut() {
+                volume.mark_changed(&path);
+            }
             Ok(IpcResponse::None)
         }
         IpcRequest::OpenFile { path, mode } => {
@@ -625,13 +702,17 @@ fn dispatch_host_filesystem(
                 .map_err(map_host_io_error)?;
             insert_handle(
                 handles,
-                SemanticIpcObject::HostFile(HostFile::new(
-                    Arc::from(path),
-                    file,
-                    readable,
-                    writable,
-                    allow_append,
-                )),
+                SemanticIpcObject::HostFile(
+                    HostFile::new(Arc::from(path), file, readable, writable, allow_append)
+                        .with_save(
+                            filesystem.save_volume().cloned(),
+                            if writable {
+                                save.as_ref().map(|volume| volume.open_writer())
+                            } else {
+                                None
+                            },
+                        ),
+                ),
             )
         }
         IpcRequest::OpenDirectory { path, mode } => {
@@ -654,6 +735,15 @@ fn dispatch_host_filesystem(
                 )),
             )
         }
+        IpcRequest::CommitFileSystem => {
+            if let Some(volume) = save.as_mut() {
+                if volume.has_open_writers() {
+                    return Err(IpcResultCode::WRITE_FILE_NOT_CLOSED);
+                }
+                volume.commit().map_err(map_host_io_error)?;
+            }
+            Ok(IpcResponse::None)
+        }
         _ => Err(IpcResultCode::INVALID_COMMAND),
     }
 }
@@ -663,7 +753,13 @@ fn dispatch_host_file(
     file: &HostFile,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
-    require_sd_card_access(mounts)?;
+    let mut save = file
+        .save_volume()
+        .map(|volume| volume.lock().map_err(|_| IpcResultCode::INTERNAL_STATE))
+        .transpose()?;
+    if save.is_none() {
+        require_sd_card_access(mounts)?;
+    }
     match request {
         IpcRequest::GetFileSize => {
             let file = file
@@ -709,6 +805,7 @@ fn dispatch_host_file(
                 return Err(IpcResultCode::RESOURCE_LIMIT);
             }
             let allow_append = file.allows_append();
+            let path = file.path();
             let mut file = file
                 .file()
                 .lock()
@@ -716,12 +813,27 @@ fn dispatch_host_file(
             let end = offset
                 .checked_add(u64::try_from(data.len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?)
                 .ok_or(IpcResultCode::OUT_OF_RANGE)?;
-            if end > file.metadata().map_err(map_host_io_error)?.len() && !allow_append {
+            let old_size = file.metadata().map_err(map_host_io_error)?.len();
+            if end > old_size && !allow_append {
                 return Err(IpcResultCode::OUT_OF_RANGE);
             }
             file.seek(SeekFrom::Start(offset))
                 .map_err(map_host_io_error)?;
-            file.write_all(&data).map_err(map_host_io_error)?;
+            if save
+                .as_ref()
+                .is_some_and(|volume| !volume.can_resize(old_size, old_size.max(end)))
+            {
+                return Err(IpcResultCode::NO_SPACE);
+            }
+            let result = file.write_all(&data);
+            if let Some(volume) = save.as_mut() {
+                volume.record_resize(
+                    path,
+                    old_size,
+                    file.metadata().map_err(map_host_io_error)?.len(),
+                );
+            }
+            result.map_err(map_host_io_error)?;
             if flush {
                 file.sync_data().map_err(map_host_io_error)?;
             }
@@ -742,11 +854,26 @@ fn dispatch_host_file(
             if !file.writable() {
                 return Err(IpcResultCode::ACCESS_DENIED);
             }
-            file.file()
+            let handle = file
+                .file()
                 .lock()
-                .map_err(|_| IpcResultCode::INTERNAL_STATE)?
-                .set_len(size)
-                .map_err(map_host_io_error)?;
+                .map_err(|_| IpcResultCode::INTERNAL_STATE)?;
+            let old_size = handle.metadata().map_err(map_host_io_error)?.len();
+            if save
+                .as_ref()
+                .is_some_and(|volume| !volume.can_resize(old_size, size))
+            {
+                return Err(IpcResultCode::NO_SPACE);
+            }
+            let result = handle.set_len(size);
+            if let Some(volume) = save.as_mut() {
+                volume.record_resize(
+                    file.path(),
+                    old_size,
+                    handle.metadata().map_err(map_host_io_error)?.len(),
+                );
+            }
+            result.map_err(map_host_io_error)?;
             Ok(IpcResponse::None)
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
@@ -1038,6 +1165,116 @@ mod tests {
     use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
+
+    #[test]
+    fn save_files_enforce_quota_and_publish_only_after_writers_close() {
+        use nixe_runtime::{Launcher, LauncherInput, ProcessBuilder, TransactionalDirectory};
+        let directory = tempfile::tempdir().unwrap();
+        let mut nro = vec![0; 0x2800];
+        nro[0x10..0x14].copy_from_slice(b"NRO0");
+        for (offset, value) in [
+            (0x18, 0x2800_u32),
+            (0x24, 0x1000),
+            (0x28, 0x1000),
+            (0x2c, 0x1000),
+            (0x30, 0x2000),
+            (0x34, 0x800),
+            (0x38, 0x800),
+        ] {
+            nro[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let path = directory.path().join("test.nro");
+        std::fs::write(&path, nro).unwrap();
+        let plan = Launcher::build(LauncherInput::new(path)).unwrap();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let base = directory.path().join("volume");
+        std::fs::create_dir_all(base.join("data")).unwrap();
+        let volume = Arc::new(std::sync::Mutex::new(
+            TransactionalDirectory::open(base.clone(), 4).unwrap(),
+        ));
+        let filesystem = HostDirectoryFileSystem::from_save(volume.clone());
+        let (mounts, handles) = process.mounts_and_handles_mut();
+        assert_eq!(
+            dispatch_host_filesystem(
+                mounts,
+                handles,
+                &filesystem,
+                IpcRequest::GetEntryType {
+                    path: "/progress".into()
+                }
+            ),
+            Err(IpcResultCode::PATH_NOT_FOUND)
+        );
+        dispatch_host_filesystem(
+            mounts,
+            handles,
+            &filesystem,
+            IpcRequest::CreateFile {
+                path: "/progress".into(),
+                size: 4,
+                option: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_host_filesystem(
+                mounts,
+                handles,
+                &filesystem,
+                IpcRequest::CreateFile {
+                    path: "/extra".into(),
+                    size: 1,
+                    option: 0
+                }
+            ),
+            Err(IpcResultCode::NO_SPACE)
+        );
+        let IpcResponse::Handle(handle) = dispatch_host_filesystem(
+            mounts,
+            handles,
+            &filesystem,
+            IpcRequest::OpenFile {
+                path: "/progress".into(),
+                mode: FILE_OPEN_WRITE | FILE_OPEN_APPEND,
+            },
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let object = handles.get_as::<HorizonIpcObject>(handle).unwrap().clone();
+        let HorizonIpcObject::SemanticObject(SemanticIpcObject::HostFile(file)) = object else {
+            panic!()
+        };
+        assert_eq!(
+            dispatch_host_file(mounts, &file, IpcRequest::SetFileSize { size: 5 }),
+            Err(IpcResultCode::NO_SPACE)
+        );
+        dispatch_host_file(
+            mounts,
+            &file,
+            IpcRequest::WriteFile {
+                offset: 0,
+                data: b"save".to_vec(),
+                flush: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_host_filesystem(mounts, handles, &filesystem, IpcRequest::CommitFileSystem),
+            Err(IpcResultCode::WRITE_FILE_NOT_CLOSED)
+        );
+        handles.close(handle).unwrap();
+        drop(file);
+        dispatch_host_filesystem(mounts, handles, &filesystem, IpcRequest::CommitFileSystem)
+            .unwrap();
+        drop(filesystem);
+        drop(volume);
+        let reopened = TransactionalDirectory::open(base, 4).unwrap();
+        assert_eq!(
+            std::fs::read(reopened.working_directory().join("progress")).unwrap(),
+            b"save"
+        );
+    }
 
     struct SizedStorage(u64);
 

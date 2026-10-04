@@ -82,7 +82,17 @@ impl Lifetime {
             };
             transition.wait_closed()?;
             transition.relieve_pressure(0, Tier::Lcq)?;
-            match transition.batch()?.complete() {
+            // Eviction may share a stop with deferred link installation. Drain
+            // that work before acknowledging its ticket, or completion would
+            // retry forever while no execution worker can service the links.
+            let links_finished = transition.drain_links()?;
+            let batch = transition.batch()?;
+            let completed = if links_finished {
+                batch.complete()
+            } else {
+                batch.complete_with_links_deferred()
+            };
+            match completed {
                 Ok(()) => {}
                 // A concurrent mutation/retirement joined this stop. Drop the
                 // transition and let its owner finish before the next pass.

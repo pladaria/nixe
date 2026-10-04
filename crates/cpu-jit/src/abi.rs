@@ -950,9 +950,10 @@ pub struct VectorFpFusedOperation {
     pub subtract: bool,
 }
 
-/// Typed exact scalar FMUL/FNMUL over canonical PRE-state operands.
+/// Typed exact scalar FMUL/FNMUL, including indexed FMUL, over PRE-state operands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FpMultiplyOperation {
+    pub lane: Option<u8>,
     pub rn: u8,
     pub rm: u8,
     pub rd: u8,
@@ -963,6 +964,7 @@ pub struct FpMultiplyOperation {
 /// Exact fused scalar operation over three canonical PRE-state operands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FpFusedOperation {
+    pub lane: Option<u8>,
     pub rn: u8,
     pub rm: u8,
     pub ra: u8,
@@ -1001,10 +1003,11 @@ pub struct VectorIntegerToFpOperation {
     pub signed: bool,
 }
 
-/// Exact FCVT-to-GPR operands. XZR/WZR discards only the integer result, not
+/// Exact scalar FCVT operands. XZR/WZR discards only the integer result, not
 /// status or exceptions; the source is always a scalar vector register.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FpToIntegerOperation {
+    pub vector_destination: bool,
     pub rn: u8,
     pub rd: u8,
     pub source_64: bool,

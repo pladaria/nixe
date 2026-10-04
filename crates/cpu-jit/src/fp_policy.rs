@@ -45,6 +45,7 @@ pub(crate) fn fp_lowering_disposition(instruction: Instruction) -> FpLoweringDis
     if matches!(
         instruction,
         Instruction::ScalarFloatFusedMultiplyAdd(_)
+            | Instruction::ScalarFloatFusedElement(_)
             | Instruction::VectorFloatFusedElement(_)
             | Instruction::VectorFloatFused(_)
     ) && !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma"))
@@ -81,7 +82,9 @@ pub(crate) fn fp_lowering_for_host(
         {
             FpLoweringDisposition::GuardedNative
         }
-        Instruction::VectorSignedIntToFloat(_)
+        Instruction::ScalarVectorFloatToSignedInt(_)
+        | Instruction::ScalarVectorFloatToUnsignedInt(_)
+        | Instruction::VectorSignedIntToFloat(_)
         | Instruction::VectorUnsignedIntToFloat(_)
         | Instruction::ScalarVectorSignedIntToFloat(_)
         | Instruction::ScalarVectorUnsignedIntToFloat(_)
@@ -95,7 +98,9 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::ScalarFloatDivide(_)
         | Instruction::ScalarFloatAdd(_)
         | Instruction::ScalarFloatMultiply(_)
+        | Instruction::ScalarFloatMultiplyElement(_)
         | Instruction::ScalarFloatFusedMultiplyAdd(_)
+        | Instruction::ScalarFloatFusedElement(_)
         | Instruction::ScalarFloatSquareRoot(_) => FpLoweringDisposition::GuardedNative,
         Instruction::ScalarFloatMaxNumber(_)
         | Instruction::ScalarFloatMinNumber(_)
@@ -120,6 +125,7 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::ScalarFloatRound(_) => FpLoweringDisposition::Exact,
         Instruction::DuplicateGeneral(_)
         | Instruction::DuplicateElement(_)
+        | Instruction::DuplicateScalarElement(_)
         | Instruction::MemoryPair(_)
         | Instruction::Bitwise(_)
         | Instruction::Integer(_)
@@ -157,6 +163,7 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::VectorSignedShiftRegister(_)
         | Instruction::VectorUnsignedShiftRegister(_)
         | Instruction::CountBits(_)
+        | Instruction::Reverse64(_)
         | Instruction::AddAcrossVector(_)
         | Instruction::UnsignedAddLongAcrossVector(_)
         | Instruction::ExtractNarrow(_)

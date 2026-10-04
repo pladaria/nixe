@@ -58,7 +58,7 @@ pub use command::{
     CopyOperation, CullMode, DepthCompareOperation, DepthState, DispatchOperation, DrawArguments,
     DrawOperation, FrontFace, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
     LineRasterization, OperationSubmission, PreparedDraw, PrimitiveTopology, QueryOperation,
-    RenderAttachment, RenderPassOperation, ResolveOperation, TriangleRasterization,
+    RenderAttachment, RenderPassOperation, ResolveOperation, ScissorRect, TriangleRasterization,
     VertexAttribute, VertexBufferLayout, VertexComponentCount, VertexComponentWidth, VertexFormat,
     VertexStepMode, ViewportTransform,
 };

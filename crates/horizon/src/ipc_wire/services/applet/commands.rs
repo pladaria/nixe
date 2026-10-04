@@ -108,6 +108,7 @@ command_enum!(CommonStateGetterCommand {
     5 => GetOperationMode,
     6 => GetPerformanceMode,
     9 => GetCurrentFocusState,
+    900 => SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled,
 });
 
 command_enum!(SelfControllerCommand {
@@ -121,6 +122,9 @@ command_enum!(SelfControllerCommand {
     14 => SetRestartMessageEnabled,
     16 => SetOutOfFocusSuspendingEnabled,
     40 => CreateManagedDisplayLayer,
+    44 => CreateManagedDisplaySeparableLayer,
+    90 => GetAccumulatedSuspendedTickValue,
+    91 => GetAccumulatedSuspendedTickChangedEvent,
 });
 
 command_enum!(WindowControllerCommand {
@@ -129,10 +133,12 @@ command_enum!(WindowControllerCommand {
 });
 
 command_enum!(ApplicationFunctionsCommand {
+    20 => EnsureSaveData,
     1 => PopLaunchParameter,
     21 => GetDesiredLanguage,
     22 => SetTerminateResult,
     40 => NotifyRunning,
+    130 => GetGpuErrorDetectedSystemEvent,
 });
 
 command_enum!(LibraryAppletCreatorCommand {

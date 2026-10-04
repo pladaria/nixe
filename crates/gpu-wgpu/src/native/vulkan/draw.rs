@@ -219,6 +219,7 @@ pub(super) struct RetainedDraw {
     offsets: Vec<u64>,
     arguments: DrawArguments,
     viewport: vk::Viewport,
+    scissor: vk::Rect2D,
     line_width_bits: Option<u32>,
     parameters: Option<[u32; 6]>,
     bindings: Option<Arc<NativeBindings>>,
@@ -392,6 +393,26 @@ impl WgpuBackendDriver {
                 .shaders
                 .parameters(draw.prepared.tessellation.map(|t| t.control))?;
             let viewport = native_viewport(draw.prepared.viewport_transform, extent)?;
+            let scissor = draw
+                .prepared
+                .scissor
+                .unwrap_or(nixe_gpu::ScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: extent.width,
+                    height: extent.height,
+                })
+                .clipped(extent.width, extent.height);
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: scissor.x as i32,
+                    y: scissor.y as i32,
+                },
+                extent: vk::Extent2D {
+                    width: scissor.width,
+                    height: scissor.height,
+                },
+            };
             use ash::vk::Handle;
             let key = FrameKey {
                 pipeline: pipeline.pipeline.as_raw(),
@@ -529,6 +550,7 @@ impl WgpuBackendDriver {
                 offsets,
                 arguments: draw.arguments,
                 viewport,
+                scissor,
                 parameters,
                 bindings,
                 index,

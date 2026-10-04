@@ -39,6 +39,22 @@ pub(super) fn get_info(
     // remain mutually consistent without scanning mappings here.
     // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_process.cpp
     let value = match info_type {
+        // Use the same effective NPDM permissions as runtime thread validation.
+        // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/svc/kern_svc_info.cpp
+        0 | 1 => {
+            let mask = if info_type == 0 {
+                context.process().allowed_core_mask()
+            } else {
+                context.process().allowed_priority_mask()
+            };
+            let Some(mask) = mask else {
+                return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
+                    immediate: 0x29,
+                    documented_name: "GetInfo (process thread policy unavailable)",
+                });
+            };
+            mask
+        }
         2 => layout.alias().base().get(),
         3 => layout.alias().size(),
         4 => layout.heap().base().get(),

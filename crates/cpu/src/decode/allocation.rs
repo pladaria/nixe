@@ -69,6 +69,17 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
                 AllocationStatus::Allocated
             }
         }
+        0x0000_0023..=0x0000_0027 => {
+            let size = bits >> 30;
+            let opc = (bits >> 22) & 3;
+            if (opc == 3 && size >= 2) || (size == 3 && opc == 2 && matches!(id, 0x25 | 0x26)) {
+                AllocationStatus::Unallocated("unallocated scalar load/store opcode")
+            } else if id == 0x27 && bits & (1 << 14) == 0 {
+                AllocationStatus::Unallocated("invalid scalar load/store register extension")
+            } else {
+                AllocationStatus::Allocated
+            }
+        }
         0x0000_002d if ((bits >> 12) & 0xf) > 8 => {
             AllocationStatus::Unallocated("unallocated LSE atomic read-modify-write opcode")
         }
@@ -83,7 +94,7 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
                 AllocationStatus::Allocated
             }
         }
-        0x0000_008c => validate_a64_simd_duplicate_element(bits),
+        0x0000_008c | 0x0000_00ac => validate_a64_simd_duplicate_element(bits),
         0x0000_0049 if bits >> 30 == 3 => {
             AllocationStatus::Reserved("invalid SIMD pair transfer size")
         }
@@ -182,12 +193,23 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
                 AllocationStatus::Allocated
             }
         }
-        0x0000_009c | 0x0000_009d | 0x0000_00a1 => validate_a64_simd_float_vector(bits),
-        0x0000_00a2 => {
+        0x0000_009c | 0x0000_009d => validate_a64_simd_float_vector(bits),
+        0x0000_00a1 | 0x0000_00ad => {
+            if bits & (1 << 22) != 0 && bits & (1 << 21) != 0 {
+                AllocationStatus::Reserved("double-precision by-element multiply requires L=0")
+            } else if id == 0x0000_00a1 {
+                validate_a64_simd_float_vector(bits)
+            } else {
+                AllocationStatus::Allocated
+            }
+        }
+        0x0000_00a2 | 0x0000_00ae => {
             if bits & (1 << 22) != 0 && bits & (1 << 21) != 0 {
                 AllocationStatus::Reserved("double-precision by-element FMA requires L=0")
-            } else {
+            } else if id == 0x0000_00a2 {
                 validate_a64_simd_float_vector(bits)
+            } else {
+                AllocationStatus::Allocated
             }
         }
         0x0000_009e | 0x0000_009f => {
@@ -196,6 +218,13 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
                 AllocationStatus::Reserved(
                     "32-bit fixed-point floating conversion exceeds 32 fractional bits",
                 )
+            } else {
+                AllocationStatus::Allocated
+            }
+        }
+        0x0000_00a9 => {
+            if (bits >> 22) & 3 == 3 {
+                AllocationStatus::Reserved("REV64 element width must be below 64 bits")
             } else {
                 AllocationStatus::Allocated
             }
@@ -338,7 +367,7 @@ fn validate_a64_simd_extract_narrow(bits: u32) -> AllocationStatus {
 fn validate_a64_simd_duplicate_element(bits: u32) -> AllocationStatus {
     let immediate = ((bits >> 16) & 0x1f) as u8;
     let quad = bits & (1 << 30) != 0;
-    if immediate == 0 {
+    if immediate & 0x0f == 0 {
         AllocationStatus::Reserved("SIMD duplicate element has no element size")
     } else if immediate.trailing_zeros() == 3 && !quad {
         AllocationStatus::Reserved("64-bit SIMD duplicate requires a 128-bit vector")
@@ -457,5 +486,50 @@ fn validate_a64_simd_permute_two_source(bits: u32) -> AllocationStatus {
         AllocationStatus::Reserved("64-bit SIMD vector cannot contain two 64-bit lanes")
     } else {
         AllocationStatus::Allocated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AllocationStatus, validate_a64_simd_duplicate_element};
+
+    #[test]
+    fn scalar_float_element_operations_reject_reserved_double_precision_lane() {
+        use crate::coverage::CoverageId;
+        for id in [0xa1, 0xad, 0xa2, 0xae] {
+            assert!(matches!(
+                super::validate_a64(CoverageId::new(id), 0x5fe0_9000),
+                AllocationStatus::Reserved(_)
+            ));
+            assert_eq!(
+                super::validate_a64(CoverageId::new(id), 0x5fc0_9800),
+                AllocationStatus::Allocated
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_element_rejects_reserved_size_encodings() {
+        for base in [0x0e00_0400, 0x4e00_0400, 0x5e00_0400] {
+            for imm5 in [0, 16] {
+                assert!(matches!(
+                    validate_a64_simd_duplicate_element(base | (imm5 << 16)),
+                    AllocationStatus::Reserved(_)
+                ));
+            }
+        }
+        for imm5 in 1..32 {
+            if imm5 == 16 {
+                continue;
+            }
+            assert_eq!(
+                validate_a64_simd_duplicate_element(0x5e00_0400 | (imm5 << 16)),
+                AllocationStatus::Allocated
+            );
+        }
+        assert!(matches!(
+            validate_a64_simd_duplicate_element(0x0e08_0400),
+            AllocationStatus::Reserved(_)
+        ));
     }
 }

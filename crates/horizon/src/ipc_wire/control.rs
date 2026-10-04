@@ -52,6 +52,53 @@ pub(super) fn dispatch_control(
     };
 
     match (control_command, target) {
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::ErrorContextWriter(session),
+        ) => {
+            write_domain_conversion(
+                process,
+                address,
+                size,
+                request.token,
+                session.domain.convert(),
+            )?;
+        }
+        (
+            CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
+            HorizonIpcObject::ErrorContextWriter(_),
+        ) => {
+            install_clone(
+                process,
+                address,
+                size,
+                request.token,
+                target.clone(),
+                "cloning an error-context writer session",
+            )?;
+        }
+
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::LogManager(manager),
+        ) => {
+            let object_id = manager.convert_to_domain();
+            write_domain_conversion(process, address, size, request.token, object_id)?;
+            log::debug!("lm converted to domain with root object {object_id:#x}");
+        }
+        (
+            CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
+            HorizonIpcObject::LogManager(manager),
+        ) => {
+            install_clone(
+                process,
+                address,
+                size,
+                request.token,
+                HorizonIpcObject::LogManager(manager.clone()),
+                "cloning an lm session handle",
+            )?;
+        }
         (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Applet(applet)) => {
             // libnx converts appletOE to a domain before opening the
             // application proxy. The control command and returned root object
@@ -225,10 +272,18 @@ pub(super) fn dispatch_control(
             // Npad ID array. A zero budget makes nn::sf reject these locally
             // before SendSyncRequest. Reserve 0x100 bytes for the emulated
             // HID server, enough for all ten IDs including 16-byte alignment.
-            // Other servers continue to select map-alias for auto-select IO.
+            // Filesystem commands likewise use pointer-only paths. Its 0x800
+            // byte budget accommodates two aligned FS_MAX_PATH inputs.
+            // https://github.com/Atmosphere-NX/Atmosphere/blob/master/stratosphere/ams_mitm/source/fs_mitm/fsmitm_module.cpp
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
             let pointer_buffer_size: u16 = match target {
                 HorizonIpcObject::Hid(_) => 0x100,
+                HorizonIpcObject::SemanticService(session)
+                    if session.service() == crate::IpcService::FileSystem =>
+                {
+                    0x800
+                }
+                HorizonIpcObject::SemanticObject(_) => 0x800,
                 _ => 0,
             };
             let response = encode_response(

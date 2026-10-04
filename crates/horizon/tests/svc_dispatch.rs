@@ -2177,8 +2177,15 @@ fn nvdrv_firmware_memory_margin_uses_a_u64_input_and_no_output() {
     put_u32(&mut missing_input, 4, 6);
     let mut truncated_input = request;
     put_u32(&mut truncated_input, 4, 7);
-    let mut invalid_padding = request;
-    invalid_padding[40] = 1;
+    let mut nonzero_padding = request;
+    nonzero_padding[40..48].fill(0xa5);
+    write_guest_bytes(&process, tls, &nonzero_padding);
+    state(&mut process).write_w(x(0), handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
     let mut unexpected_pid = [0_u8; 0x100];
     put_u32(&mut unexpected_pid, 0, 4);
     put_u32(&mut unexpected_pid, 4, 12 | (1 << 31));
@@ -2186,12 +2193,7 @@ fn nvdrv_firmware_memory_margin_uses_a_u64_input_and_no_output() {
     put_u32(&mut unexpected_pid, 32, 0x4943_4653);
     put_u32(&mut unexpected_pid, 40, 13);
     put_u64(&mut unexpected_pid, 48, 1);
-    for malformed in [
-        missing_input,
-        truncated_input,
-        invalid_padding,
-        unexpected_pid,
-    ] {
+    for malformed in [missing_input, truncated_input, unexpected_pid] {
         write_guest_bytes(&process, tls, &malformed);
         state(&mut process).write_w(x(0), handle);
         assert_eq!(
@@ -2412,6 +2414,104 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
         ExceptionHandlingResult::Resumed
     );
     assert!(process.handles().get(list_handle).is_none());
+}
+
+#[test]
+fn hid_activation_and_style_event_wire_contracts() {
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 32));
+    let (_directory, mut process) = fixture_process(&instructions);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..35].copy_from_slice(b"hid");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let hid_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+
+    let activate_npad = register;
+    for revision in 0..=3 {
+        let mut activate_with_revision = activate_npad;
+        put_u32(&mut activate_with_revision, 4, 12 | (1 << 31));
+        put_u32(&mut activate_with_revision, 40, 109);
+        put_u32(&mut activate_with_revision, 48, revision);
+        put_u64(&mut activate_with_revision, 56, 1);
+        write_guest_bytes(&process, tls, &activate_with_revision);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    }
+    let mut acquire = register;
+    put_u32(&mut acquire, 4, 14 | (1 << 31));
+    put_u32(&mut acquire, 40, 106);
+    put_u64(&mut acquire, 56, 1);
+    put_u64(&mut acquire, 64, 0x75dd_7790);
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        write_guest_bytes(&process, tls, &acquire);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(read_guest_u32(&process, tls.checked_add(8).unwrap()), 2);
+        let handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+        let event = process
+            .handles()
+            .get_as::<ReadableEventObject>(handle)
+            .unwrap()
+            .clone();
+        assert!(event.is_signalled());
+        events.push(event);
+    }
+    events[0].clear();
+    assert!(!events[1].is_signalled());
+    for id in [8, u32::MAX] {
+        put_u32(&mut acquire, 48, id);
+        write_guest_bytes(&process, tls, &acquire);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw()
+        );
+    }
 }
 
 #[test]
@@ -6128,3 +6228,18 @@ fn notification_only_break_reports_success_without_terminating() {
 
 #[path = "svc_dispatch/audout.rs"]
 mod audout;
+
+#[path = "svc_dispatch/tipc.rs"]
+mod tipc;
+
+#[path = "svc_dispatch/lm_domain.rs"]
+mod lm_domain;
+
+#[path = "svc_dispatch/cancellation.rs"]
+mod cancellation;
+
+#[path = "svc_dispatch/access_log_index.rs"]
+mod access_log_index;
+
+#[path = "svc_dispatch/account_metadata.rs"]
+mod account_metadata;

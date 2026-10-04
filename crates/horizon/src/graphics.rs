@@ -772,7 +772,7 @@ struct BufferSlot {
 
 #[derive(Debug)]
 struct BufferQueue {
-    connected: bool,
+    connected_api: Option<i32>,
     weak_references: i64,
     strong_references: i64,
     slots: BTreeMap<i32, BufferSlot>,
@@ -830,7 +830,7 @@ impl std::error::Error for FramebufferError {}
 impl BufferQueue {
     fn new(binder_id: i32) -> Self {
         Self {
-            connected: false,
+            connected_api: None,
             weak_references: 0,
             strong_references: 0,
             slots: BTreeMap::new(),
@@ -870,7 +870,7 @@ impl BufferQueue {
                     .slots
                     .get(&slot_index)
                     .filter(|slot| slot.ownership == SlotOwnership::Dequeued);
-                if !self.connected {
+                if self.connected_api.is_none() {
                     writer.write_i32(0);
                     writer.write_i32(-19);
                 } else if let Some(slot) = slot {
@@ -963,11 +963,24 @@ impl BufferQueue {
                 let listener_present = reader.read_i32()?;
                 let api = reader.read_i32()?;
                 let _controlled_by_app = reader.read_i32()?;
-                if listener_present != 0 || api != 2 || self.connected {
+                // BufferQueue accepts EGL, CPU, media and camera producer APIs.
+                // The connected API must match at Disconnect; it does not select
+                // the host rendering backend.
+                // https://android.googlesource.com/platform/frameworks/native/+/android-8.1.0_r1/libs/gui/BufferQueueProducer.cpp
+                log::trace!(
+                    "Binder Connect: listener={listener_present} api={api} connected-api={:?}",
+                    self.connected_api
+                );
+                if listener_present != 0 {
+                    return Err(ParcelError::Unsupported(
+                        "Binder producer listeners are not implemented",
+                    ));
+                }
+                if !(1..=4).contains(&api) || self.connected_api.is_some() {
                     write_buffer_output(&mut writer, self.pending_count());
                     writer.write_i32(-22);
                 } else {
-                    self.connected = true;
+                    self.connected_api = Some(api);
                     write_buffer_output(&mut writer, self.pending_count());
                     writer.write_i32(0);
                     self.update_availability();
@@ -975,9 +988,17 @@ impl BufferQueue {
             }
             11 => {
                 let api = reader.read_i32()?;
-                let status = if api == 2 && self.connected { 0 } else { -22 };
+                let status = if !(1..=4).contains(&api) {
+                    -22
+                } else {
+                    match self.connected_api {
+                        Some(connected) if connected == api => 0,
+                        Some(_) => -22,
+                        None => -19,
+                    }
+                };
                 if status == 0 {
-                    self.connected = false;
+                    self.connected_api = None;
                     self.slots.clear();
                     self.available_event.clear();
                 }
@@ -1937,6 +1958,62 @@ mod tests {
             writer.write_u32(u32::from_le_bytes(word.try_into().unwrap()));
         }
         writer
+    }
+
+    #[test]
+    fn producer_connection_tracks_api_and_rejects_mismatched_disconnects() {
+        let connect = |api| {
+            let mut request = producer_request();
+            for value in [0, api, 0] {
+                request.write_i32(value);
+            }
+            request.finish().unwrap()
+        };
+        let disconnect = |api| {
+            let mut request = producer_request();
+            request.write_i32(api);
+            request.finish().unwrap()
+        };
+        let status = |reply: BinderTransaction, connect: bool| {
+            let mut reader = ParcelReader::decode(&reply.reply).unwrap();
+            if connect {
+                for _ in 0..4 {
+                    reader.read_u32().unwrap();
+                }
+            }
+            reader.read_i32().unwrap()
+        };
+        for api in 1..=4 {
+            let mut queue = BufferQueue::new(4);
+            assert_eq!(status(queue.transact(10, &connect(api)).unwrap(), true), 0);
+            assert_eq!(queue.connected_api, Some(api));
+            assert_eq!(
+                status(queue.transact(10, &connect(api)).unwrap(), true),
+                -22
+            );
+            assert_eq!(
+                status(queue.transact(11, &disconnect(api % 4 + 1)).unwrap(), false),
+                -22
+            );
+            assert_eq!(queue.connected_api, Some(api));
+            assert_eq!(
+                status(queue.transact(11, &disconnect(api)).unwrap(), false),
+                0
+            );
+            assert_eq!(queue.connected_api, None);
+            assert_eq!(
+                status(queue.transact(11, &disconnect(api)).unwrap(), false),
+                -19
+            );
+        }
+        for api in [0, 5, -1] {
+            let mut queue = BufferQueue::new(4);
+            assert_eq!(
+                status(queue.transact(10, &connect(api)).unwrap(), true),
+                -22
+            );
+            assert_eq!(queue.connected_api, None);
+        }
     }
 
     #[test]

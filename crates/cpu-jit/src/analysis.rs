@@ -392,6 +392,9 @@ fn register_access_memory(
 ) {
     use nixe_cpu::semantics::a64::{ScalarTransfer, pair_transfer, scalar_transfer};
 
+    if instruction.is_prefetch() {
+        return;
+    }
     let fields = instruction.operands();
     if !matches!(instruction, memory::Instruction::Literal(_)) {
         mark_read(accessed, fields.rn, true);
@@ -686,12 +689,14 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::ScalarFloatMaxNumber(_)
         | fp_simd::Instruction::ScalarFloatMinNumber(_)
         | fp_simd::Instruction::ScalarFloatMultiply(_)
+        | fp_simd::Instruction::ScalarFloatMultiplyElement(_)
         | fp_simd::Instruction::ScalarFloatConditionalSelect(_) => {
             read(accessed, fields.rn);
             read(accessed, fields.rm);
             write(accessed, dirty, fields.rd);
         }
-        fp_simd::Instruction::ScalarFloatFusedMultiplyAdd(_) => {
+        fp_simd::Instruction::ScalarFloatFusedMultiplyAdd(_)
+        | fp_simd::Instruction::ScalarFloatFusedElement(_) => {
             read(accessed, fields.rn);
             read(accessed, fields.rm);
             read(accessed, fields.ra);
@@ -710,12 +715,16 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::VectorFloatAbsolute(_)
         | fp_simd::Instruction::VectorFloatNegate(_)
         | fp_simd::Instruction::DuplicateElement(_)
+        | fp_simd::Instruction::DuplicateScalarElement(_)
         | fp_simd::Instruction::ScalarShiftRightImmediate(_)
         | fp_simd::Instruction::VectorShiftRightImmediate(_)
         | fp_simd::Instruction::ScalarShiftLeftImmediate(_)
         | fp_simd::Instruction::VectorShiftLeftImmediate(_)
         | fp_simd::Instruction::ShiftLeftLong(_)
         | fp_simd::Instruction::CountBits(_)
+        | fp_simd::Instruction::Reverse64(_)
+        | fp_simd::Instruction::ScalarVectorFloatToSignedInt(_)
+        | fp_simd::Instruction::ScalarVectorFloatToUnsignedInt(_)
         | fp_simd::Instruction::AddAcrossVector(_)
         | fp_simd::Instruction::UnsignedAddLongAcrossVector(_)
         | fp_simd::Instruction::VectorSignedIntToFloat(_)

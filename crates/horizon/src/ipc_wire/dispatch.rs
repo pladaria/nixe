@@ -5,7 +5,10 @@
 //! decoded messages into the service manager and semantic service objects.
 
 use super::io::{read_bytes, validate_writable_ram_range, write_response};
-use super::message::{COMMAND_BUFFER_SIZE, CmifRequest, DomainRequest, HipcRequest};
+use super::message::{
+    COMMAND_BUFFER_SIZE, CmifRequest, DomainRequest, HipcRequest, TIPC_COMMAND_CLOSE,
+    TIPC_COMMAND_REQUEST_BASE, TipcRequest,
+};
 use super::services;
 use super::services::content::{dispatch_plain_object, dispatch_service};
 use super::services::fsp::object_name;
@@ -31,6 +34,8 @@ pub(crate) struct HostSystems<'a> {
     pub hid: &'a HidSystem,
     pub settings: &'a SettingsEnvironment,
     pub application_language: Option<crate::SystemLanguage>,
+    pub user_account_switch_locked: Option<bool>,
+    pub save_data: Option<&'a crate::SaveDataSystem>,
     pub diagnostics: &'a crate::HorizonDiagnostics,
     pub caller_thread_id: u64,
 }
@@ -46,6 +51,8 @@ impl HorizonIpcObject {
             Self::Account(session) => session.is_domain(),
             Self::Bsd(session) => session.is_domain(),
             Self::Ssl(session) => session.is_domain(),
+            Self::LogManager(session) => session.is_domain(),
+            Self::ErrorContextWriter(session) => session.domain.is_domain(),
             _ => false,
         }
     }
@@ -101,6 +108,7 @@ impl HorizonIpcObject {
             Self::NvDrv(_) => "nvdrv",
             Self::LogManager(_) => "lm",
             Self::Logger(_) => "ILogger",
+            Self::ErrorContextWriter(_) => "ectx:aw",
             Self::ParentalControl(session) => domain_object
                 .and_then(|object_id| session.object(object_id))
                 .map_or("pctl", |_| "IParentalControlService"),
@@ -165,6 +173,51 @@ pub(crate) fn send_sync_request_from_buffer(
     buffer.resize(size, 0);
     read_bytes(process, address, &mut buffer)?;
     let hipc = HipcRequest::decode(&buffer).map_err(|error| IpcWireError::Malformed(error.0))?;
+    if hipc.command_type >= TIPC_COMMAND_CLOSE {
+        let HorizonIpcObject::ServiceManager(manager) = &target else {
+            return Err(IpcWireError::UnsupportedService(
+                UnsupportedServiceOperation::CommandVariant {
+                    service: "TIPC transport",
+                    command_id: u32::from(hipc.command_type),
+                    detail: "TIPC is only implemented for sm:",
+                },
+            ));
+        };
+        if hipc.command_type == TIPC_COMMAND_CLOSE {
+            if hipc.data_word_bytes() != 0 || super::io::has_ipc_descriptors(&hipc) {
+                return Err(IpcWireError::Malformed(
+                    "TIPC session close contains payload or descriptors",
+                ));
+            }
+            return Ok(SyncRequestResult::Success);
+        }
+        debug_assert!(hipc.command_type >= TIPC_COMMAND_REQUEST_BASE);
+        let request =
+            TipcRequest::decode(&hipc).map_err(|error| IpcWireError::Malformed(error.0))?;
+        if super::io::has_ipc_descriptors_other_than_pid(&hipc) {
+            return Err(IpcWireError::Malformed(
+                "sm: TIPC request contains unexpected descriptors",
+            ));
+        }
+        log::trace!(
+            "SendSyncRequest service=sm: transport=TIPC type={} command={} send_pid={} data_len={}",
+            hipc.command_type,
+            request.command_id,
+            hipc.pid.is_some(),
+            request.data.len()
+        );
+        let (response, _) = services::dispatch_service_manager(
+            process,
+            manager,
+            services::ServiceManagerRequest::Tipc(request),
+            hipc.pid.is_some(),
+            initial_operation_mode,
+            time_environment,
+            host_systems,
+        )?;
+        write_response(process, address, size, &response)?;
+        return Ok(SyncRequestResult::Success);
+    }
     let request = CmifRequest::decode(&hipc, target.is_domain()).map_err(|error| {
         if error.0 == "unsupported HIPC command type for CMIF" {
             IpcWireError::UnsupportedService(UnsupportedServiceOperation::CommandVariant {
@@ -226,7 +279,7 @@ pub(crate) fn send_sync_request_from_buffer(
         HorizonIpcObject::ServiceManager(manager) => services::dispatch_service_manager(
             process,
             &manager,
-            request,
+            services::ServiceManagerRequest::Cmif(request),
             hipc.pid.is_some(),
             initial_operation_mode,
             time_environment,
@@ -238,6 +291,7 @@ pub(crate) fn send_sync_request_from_buffer(
             request,
             &hipc,
             host_systems.diagnostics.file_system_access_log_mode(),
+            host_systems.save_data,
         )?,
         HorizonIpcObject::SystemSettings(_) => {
             services::dispatch_system_settings(process, request, &hipc.receive_statics)?
@@ -258,10 +312,15 @@ pub(crate) fn send_sync_request_from_buffer(
             &hipc,
             host_systems.video,
             host_systems.application_language,
+            host_systems.save_data,
         )?,
-        HorizonIpcObject::Account(account) => {
-            services::dispatch_account(process, &account, request, &hipc)?
-        }
+        HorizonIpcObject::Account(account) => services::dispatch_account(
+            process,
+            &account,
+            request,
+            &hipc,
+            host_systems.user_account_switch_locked,
+        )?,
         HorizonIpcObject::AccountManagerForApplication(manager) => {
             services::dispatch_account_manager_for_application(&manager, request)?
         }
@@ -304,7 +363,13 @@ pub(crate) fn send_sync_request_from_buffer(
             }
             Err(error) => return Err(error),
         },
-        HorizonIpcObject::LogManager(_) => services::dispatch_log_manager(process, request, &hipc)?,
+        HorizonIpcObject::LogManager(manager) => services::dispatch_log_manager(
+            process,
+            &manager,
+            request,
+            &hipc,
+            host_systems.diagnostics.guest_logs_level,
+        )?,
         HorizonIpcObject::Logger(logger) => services::dispatch_logger(
             process,
             &logger,
@@ -320,6 +385,9 @@ pub(crate) fn send_sync_request_from_buffer(
         }
         HorizonIpcObject::NetworkInterface(manager) => {
             services::dispatch_network_interface(process, &manager, request, &hipc)?
+        }
+        HorizonIpcObject::ErrorContextWriter(session) => {
+            services::dispatch_error_context_writer(&session, request, &hipc)?
         }
         HorizonIpcObject::NetworkGeneralService(service) => {
             services::dispatch_network_general_service(&service, request)?

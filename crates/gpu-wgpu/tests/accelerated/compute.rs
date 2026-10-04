@@ -793,3 +793,265 @@ fn compute_generated_vertices(line_width: Option<f32>, split: bool) -> Option<u6
     );
     Some(pixels.chunks_exact(4).map(|p| u64::from(p[3])).sum())
 }
+
+#[test]
+fn float32_multiply_rz_ftz_matches_exact_products_on_gpu() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(764),
+        NonCpuDeviceId::new(764),
+        WgpuBackendConfiguration {
+            pipeline_cache_directory: None,
+            ..Default::default()
+        },
+    ) else {
+        return;
+    };
+    let mut cases = Vec::new();
+    for a in [
+        0, 0x80000000, 1, 0x807fffff, 0x00800000, 0x3f800001, 0x3fc00000, 0x7f7fffff, 0xff7fffff,
+        0x7f800000, 0xff800000, 0x7fc01234, 0x7f801234,
+    ] {
+        for b in [
+            0, 0x80000000, 0x3f800001, 0x3f000000, 0xbf800001, 0x7f7fffff, 0x7f800000, 0x7fc05678,
+        ] {
+            cases.push((a, b));
+        }
+    }
+    let mut random = 0x5ac32d19_u32;
+    for _ in 0..8192 {
+        random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+        let a = random;
+        random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+        cases.push((a, random));
+    }
+    cases.resize(cases.len().div_ceil(64) * 64, (0, 0));
+    let size = cases.len() * 16;
+    let canonical = CanonicalAllocation::zeroed(size, 4096).unwrap();
+    let mut input = Vec::with_capacity(size);
+    for &(a, b) in &cases {
+        for word in [a, b, 0, 0] {
+            input.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    canonical.write(0, &input).unwrap();
+    let allocation = GpuAllocationId::new(1);
+    let allocation_description = GpuAllocationDescription::new(size as u64, 4).unwrap();
+    let backing = BackingView::new(
+        allocation,
+        allocation_description,
+        0,
+        canonical
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+    )
+    .unwrap();
+    let buffer = BufferId::new(1);
+    let description = BufferDescription::new(size as u64).unwrap();
+    let r = ShaderRegister::new;
+    let immediate = |destination, bits| ShaderOperation::MoveImmediate32 {
+        destination: r(destination),
+        bits,
+        scalar_type: ShaderScalarType::Unsigned32,
+    };
+    let control = ShaderFloatControl::new(
+        nixe_gpu::ShaderRoundingMode::TowardZero,
+        nixe_gpu::ShaderNanMode::Propagate,
+        true,
+        true,
+        false,
+    );
+    let ops = vec![
+        ShaderOperation::LoadComputeBuiltin32 {
+            destination: r(0),
+            builtin: ShaderComputeBuiltin::GlobalInvocationId,
+            component: 0,
+        },
+        immediate(1, 4),
+        ShaderOperation::Multiply32 {
+            destination: r(0),
+            left: r(0),
+            right: r(1),
+            scalar_type: ShaderScalarType::Unsigned32,
+            float_control: ShaderFloatControl::PRECISE,
+        },
+        ShaderOperation::LoadStorageBuffer32 {
+            destination: r(2),
+            binding: 0,
+            word_index: r(0),
+        },
+        immediate(1, 1),
+        ShaderOperation::Add32 {
+            destination: r(0),
+            left: r(0),
+            right: r(1),
+            scalar_type: ShaderScalarType::Unsigned32,
+            float_control: ShaderFloatControl::PRECISE,
+        },
+        ShaderOperation::LoadStorageBuffer32 {
+            destination: r(3),
+            binding: 0,
+            word_index: r(0),
+        },
+        ShaderOperation::Multiply32 {
+            destination: r(4),
+            left: r(2),
+            right: r(3),
+            scalar_type: ShaderScalarType::Float32,
+            float_control: control,
+        },
+        ShaderOperation::FloatMultiplyZero32 {
+            destination: r(2),
+            left: r(2),
+            right: r(3),
+            float_control: control,
+        },
+        ShaderOperation::Add32 {
+            destination: r(0),
+            left: r(0),
+            right: r(1),
+            scalar_type: ShaderScalarType::Unsigned32,
+            float_control: ShaderFloatControl::PRECISE,
+        },
+        ShaderOperation::StoreStorageBuffer32 {
+            source: r(4),
+            binding: 0,
+            word_index: r(0),
+        },
+        ShaderOperation::Add32 {
+            destination: r(0),
+            left: r(0),
+            right: r(1),
+            scalar_type: ShaderScalarType::Unsigned32,
+            float_control: ShaderFloatControl::PRECISE,
+        },
+        ShaderOperation::StoreStorageBuffer32 {
+            source: r(2),
+            binding: 0,
+            word_index: r(0),
+        },
+        ShaderOperation::Exit,
+    ];
+    let ir = ShaderIr::new(
+        ShaderStage::Compute,
+        vec![],
+        vec![],
+        vec![ShaderResourceAccess::new(0, ShaderResourceKind::StorageBuffer, true, true).unwrap()],
+        ops.into_iter()
+            .enumerate()
+            .map(|(i, op)| {
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(i as u32 * 8),
+                    ShaderPredicate::Always,
+                    op,
+                )
+            })
+            .collect(),
+    )
+    .with_workgroup_size([64, 1, 1]);
+    let creations = vec![
+        BackendResourceCreateInfo::Allocation {
+            id: allocation,
+            description: allocation_description,
+        },
+        BackendResourceCreateInfo::Buffer {
+            id: buffer,
+            description,
+            view: Some(BufferView::new(buffer, description, 0, backing.clone()).unwrap()),
+        },
+        BackendResourceCreateInfo::Pipeline {
+            id: PipelineId::new(1),
+            description: PipelineDescription {
+                kind: PipelineKind::Compute,
+            },
+        },
+        BackendResourceCreateInfo::DescriptorTable {
+            id: DescriptorTableId::new(1),
+            description: DescriptorTableDescription::new(vec![DescriptorKind::Buffer]).unwrap(),
+            bindings: vec![DescriptorTableBinding {
+                binding: 0,
+                resource: ResourceDependency::Buffer(buffer),
+            }]
+            .into_boxed_slice(),
+        },
+        BackendResourceCreateInfo::Shader {
+            id: ShaderId::new(1),
+            description: ShaderDescription {
+                stage: ShaderStage::Compute,
+            },
+            module: ShaderBackendModule::new(VerifiedShaderIr::verify(ir).unwrap()),
+        },
+    ];
+    let operation = GpuOperation::new(
+        GpuCommand::Dispatch(
+            DispatchOperation::new(
+                PipelineId::new(1),
+                ShaderId::new(1),
+                vec![DescriptorTableId::new(1)],
+                [cases.len() as u32 / 64, 1, 1],
+            )
+            .unwrap(),
+        ),
+        [ResourceAccess::new(
+            AccessTarget::Buffer {
+                buffer,
+                range: BufferRange::new(0, size as u64).unwrap(),
+            },
+            AccessScope::new(
+                PipelineStages::COMPUTE_SHADER,
+                AccessMode::ReadWrite,
+                ResourceUsage::StorageBuffer,
+            )
+            .unwrap(),
+        )],
+        [ResourceDependency::Buffer(buffer)],
+        CapabilityRequirements::none(),
+    );
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &OperationSubmission::new(FrontendSubmissionId::new(1), vec![], vec![operation])
+                .unwrap(),
+        )
+        .unwrap();
+    let mut bytes = vec![0; size];
+    backing.range().read(0, &mut bytes).unwrap();
+    for (index, &(a, b)) in cases.iter().enumerate() {
+        let flush = |bits: u32| {
+            if bits & 0x7f800000 == 0 {
+                bits & 0x80000000
+            } else {
+                bits
+            }
+        };
+        let a = flush(a);
+        let b = flush(b);
+        let exact = f64::from(f32::from_bits(a)) * f64::from(f32::from_bits(b));
+        let rounded = exact as f32;
+        let mut expected = rounded.to_bits();
+        if exact.is_finite() && f64::from(rounded).abs() > exact.abs() {
+            expected -= 1;
+        }
+        expected = flush(expected);
+        for (word, zero_absorbs) in [(2, false), (3, true)] {
+            let expected = if zero_absorbs && (a & 0x7fffffff == 0 || b & 0x7fffffff == 0) {
+                0
+            } else {
+                expected
+            };
+            let offset = index * 16 + word * 4;
+            let actual = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            if f32::from_bits(expected).is_nan() {
+                assert!(f32::from_bits(actual).is_nan());
+            } else {
+                assert_eq!(
+                    actual, expected,
+                    "case {index}: {a:08x} * {b:08x}, zero_absorbs={zero_absorbs}"
+                );
+            }
+        }
+    }
+}

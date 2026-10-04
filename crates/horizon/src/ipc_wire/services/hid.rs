@@ -9,7 +9,8 @@ enum HidCommand {
     SetSupportedNpadStyleSet,
     SetSupportedNpadIdType,
     ActivateNpad,
-    SetSupportedNpadStyleSetUpdateEventHandle,
+    AcquireNpadStyleSetUpdateEventHandle,
+    ActivateNpadWithRevision,
     SetNpadJoyHoldType,
     GetNpadJoyHoldType,
     GetVibrationDeviceInfo,
@@ -26,7 +27,8 @@ impl HidCommand {
             100 => Some(Self::SetSupportedNpadStyleSet),
             102 => Some(Self::SetSupportedNpadIdType),
             103 => Some(Self::ActivateNpad),
-            109 => Some(Self::SetSupportedNpadStyleSetUpdateEventHandle),
+            106 => Some(Self::AcquireNpadStyleSetUpdateEventHandle),
+            109 => Some(Self::ActivateNpadWithRevision),
             120 => Some(Self::SetNpadJoyHoldType),
             121 => Some(Self::GetNpadJoyHoldType),
             200 => Some(Self::GetVibrationDeviceInfo),
@@ -225,19 +227,48 @@ pub(in crate::ipc_wire) fn dispatch_hid(
             hid_system.activate_npad();
             semantic_success(request.token, false, &[], &[], &[], None)
         }
-        HidCommand::SetSupportedNpadStyleSetUpdateEventHandle => {
-            if hipc.pid.is_none() || request.data.len() < 16 {
+        HidCommand::AcquireNpadStyleSetUpdateEventHandle => {
+            // u32 Npad ID, alignment padding, u64 ARUID and an unused client
+            // pointer. The returned handle is a copy of a readable event.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
+            if hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+                || request.data.len() < 24
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let id = request_u32(request.data, 0).expect("validated Npad ID payload");
+            let Some(event) = hid_system.acquire_style_event(id) else {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            };
+            let handle = process.handles_mut().insert(event).map_err(|_| {
+                IpcWireError::HostResourceExhausted("copying a HID style update event")
+            })?;
+            semantic_success(request.token, false, &[], &[handle], &[], None)
+        }
+        HidCommand::ActivateNpadWithRevision => {
+            if hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+                || request.data.len() < 16
+            {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let revision = request_u32(request.data, 0).expect("validated HID revision payload");
+            // Revisions 0..=3 use the same FullKey LIFO representation that
+            // this producer publishes. Revision changes must not invent a
+            // different memory layout or enable unsupported controller styles.
+            // https://github.com/switchbrew/libnx/blob/v3.0.0/nx/include/switch/services/hid.h
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
+            if revision <= 3 {
+                hid_system.activate_npad();
+                return semantic_success(request.token, false, &[], &[], &[], None);
+            }
+
             Err(IpcWireError::UnsupportedService(
                 UnsupportedServiceOperation::CommandVariant {
                     service: "hid",
                     command_id: request.command_id,
                     detail: match revision {
-                        1 => "Npad shared-memory revision 1",
-                        2 => "Npad shared-memory revision 2",
-                        3 => "Npad shared-memory revision 3",
                         5 => "Npad shared-memory revision 5",
                         _ => "unknown Npad shared-memory revision",
                     },

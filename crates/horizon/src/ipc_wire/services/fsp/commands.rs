@@ -7,6 +7,7 @@ pub(super) enum FileSystemProxyCommand {
     OpenSdCardFileSystem,
     OpenDataStorageByCurrentProcess,
     GetGlobalAccessLogMode,
+    GetProgramIndexForAccessLog,
 }
 
 impl FileSystemProxyCommand {
@@ -17,6 +18,7 @@ impl FileSystemProxyCommand {
             18 => Some(Self::OpenSdCardFileSystem),
             200 => Some(Self::OpenDataStorageByCurrentProcess),
             1005 => Some(Self::GetGlobalAccessLogMode),
+            1011 => Some(Self::GetProgramIndexForAccessLog),
             _ => None,
         }
     }
@@ -26,6 +28,8 @@ impl FileSystemProxyCommand {
 pub(super) enum FileSystemCommand {
     CreateFile,
     CreateDirectory,
+    Commit,
+    GetEntryType,
     OpenFile,
     OpenDirectory,
 }
@@ -35,8 +39,10 @@ impl FileSystemCommand {
         match command_id {
             0 => Some(Self::CreateFile),
             2 => Some(Self::CreateDirectory),
+            7 => Some(Self::GetEntryType),
             8 => Some(Self::OpenFile),
             9 => Some(Self::OpenDirectory),
+            10 => Some(Self::Commit),
             _ => None,
         }
     }

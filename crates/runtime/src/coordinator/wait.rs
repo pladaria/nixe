@@ -27,6 +27,12 @@ impl RuntimeCoordinator {
         }
     }
 
+    /// Cancels exactly one current wait generation and releases its observers
+    /// and deadline. A readiness wake which already won cannot be cancelled.
+    pub fn cancel_wait(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
+        self.apply_wake(token, true)
+    }
+
     #[must_use]
     pub fn virtual_time_ns(&self) -> u64 {
         self.virtual_clock.scheduler_time_ns()

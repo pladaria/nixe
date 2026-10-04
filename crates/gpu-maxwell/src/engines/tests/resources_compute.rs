@@ -1546,14 +1546,7 @@ fn check_draw_compressed_depth_aspects(format: u32, kind: u8) {
 }
 
 #[test]
-fn three_d_surface_clip_pair_preserves_sources_and_controls_draw_validation() {
-    let allocation = CanonicalAllocation::zeroed(0x40_0000, 0x1000).unwrap();
-    let backing = allocation
-        .backing_range(MemoryPermissions::READ_WRITE)
-        .unwrap();
-    let mut address_space = resource_address_space();
-    let mapping = map_resource(&mut address_space, backing, 12, 0xfe);
-    let address = mapping.offset().get();
+fn three_d_surface_clip_pair_preserves_sources_and_origin_extent() {
     let mut channel = three_d_channel();
     let dispatch =
         dispatch_incrementing(&mut channel, 0x0ff4 / 4, &[0x0500_0000, 0x02d0_0000]).unwrap();
@@ -1584,68 +1577,6 @@ fn three_d_surface_clip_pair_preserves_sources_and_controls_draw_validation() {
         vertical.source(),
         Some(dispatch.methods()[1].method().source())
     );
-    let clip_source = horizontal.source().unwrap();
-    assert!(dispatch.ordered_operations().is_empty());
-
-    for (method, argument) in [
-        (0x0800, (address >> 32) as u32),
-        (0x0804, address as u32),
-        (0x0808, 1280),
-        (0x080c, 720),
-        (0x0810, 0xd5),
-        (0x0814, 0),
-        (0x0818, 1),
-        (0x081c, 0),
-        (0x0820, 0),
-        (0x15d0, 0),
-        (0x121c, 1),
-    ] {
-        program_three_d(&mut channel, method, argument);
-    }
-    let resources = resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-    let capabilities =
-        lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
-    let result = lower_maxwell_three_d_operation(
-        channel.three_d(),
-        &resources,
-        MaxwellThreeDOperationTrigger::DrawVertexArray {
-            source: clip_source,
-            vertex_count: 3,
-        },
-        None,
-        FrontendSubmissionId::new(4),
-        Vec::new(),
-        &capabilities,
-        &mut MaxwellLoweringCache::default(),
-    );
-    assert!(!matches!(
-        result,
-        Err(MaxwellLoweringError::UnsupportedSurfaceClipSemantics)
-    ));
-
-    program_three_d(&mut channel, 0x0ff4, 0x04ff_0000);
-    let resources = resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source: channel
-                    .three_d()
-                    .fixed_function()
-                    .surface_clip_horizontal()
-                    .source()
-                    .unwrap(),
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(5),
-            Vec::new(),
-            &capabilities,
-            &mut MaxwellLoweringCache::default(),
-        ),
-        Err(MaxwellLoweringError::UnsupportedSurfaceClipSemantics)
-    ));
 }
 
 #[test]

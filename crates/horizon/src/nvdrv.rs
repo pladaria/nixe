@@ -35,7 +35,7 @@ use diagnostics::NvDrvCallError;
 pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrvOperation};
 use gpu_executor::NvDrvGpuExecutor;
 use ioctl::NvDrvIoctlResponse;
-pub(crate) use ioctl::{NvDrvIoctlOutcome, NvDrvIoctlRequest};
+pub(crate) use ioctl::{NvDrvInlineBuffer, NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use nvhost_as_gpu::{decode_bind_channel, ioctl_nvhost_as_gpu};
 use nvhost_ctrl::{NvHostControl, NvHostCtrlIoctlOutcome};
 use nvhost_ctrl_gpu::NvHostControlGpuEvents;
@@ -361,7 +361,7 @@ impl NvDrvSession {
         request: u32,
         input: &[u8],
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
-        match self.ioctl_inner(fd, request, input, &[], None, 1)? {
+        match self.ioctl_inner(fd, request, input, NvDrvInlineBuffer::None, None, 1)? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
             NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
@@ -377,7 +377,7 @@ impl NvDrvSession {
         input: &[u8],
         thread_id: u64,
     ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
-        self.ioctl_inner(fd, request, input, &[], None, thread_id)
+        self.ioctl_inner(fd, request, input, NvDrvInlineBuffer::None, None, thread_id)
     }
 
     #[cfg(test)]
@@ -388,7 +388,14 @@ impl NvDrvSession {
         input: &[u8],
         additional_input: &[u8],
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
-        match self.ioctl_inner(fd, request, input, additional_input, None, 1)? {
+        match self.ioctl_inner(
+            fd,
+            request,
+            input,
+            NvDrvInlineBuffer::Input(additional_input),
+            None,
+            1,
+        )? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
             NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
@@ -410,7 +417,7 @@ impl NvDrvSession {
             fd,
             request,
             input,
-            additional_input: &[],
+            inline: NvDrvInlineBuffer::None,
             process_id,
             address_space,
             translator,
@@ -427,18 +434,62 @@ impl NvDrvSession {
         &self,
         request: NvDrvIoctlRequest<'_>,
     ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
-        self.ioctl_inner(
+        let inline = request.inline.output_size();
+        let mut inline_length = 0;
+        if let Some(size) = inline
+            && let Some(descriptor) = self.device_descriptor(request.fd)
+        {
+            let (element_size, count) = match (descriptor.kind(), request.request) {
+                (NvDrvDeviceKind::HostControlGpu, IOCTL_CTRL_GPU_GET_CHARACTERISTICS) => (0xa0, 1),
+                (NvDrvDeviceKind::HostControlGpu, IOCTL_CTRL_GPU_GET_TPC_MASKS) => (
+                    4,
+                    self.state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .gpu_profile
+                        .topology()
+                        .tpc_enable_masks()
+                        .len(),
+                ),
+                (
+                    NvDrvDeviceKind::HostAddressSpaceGpu,
+                    nvhost_as_gpu::IOCTL_AS_GPU_GET_VA_REGIONS,
+                ) => (24, 2),
+                _ => {
+                    return Err(UnsupportedNvDrvOperation::Ioctl {
+                        context: NvDrvErrorContext::new(
+                            descriptor.kind(),
+                            request.request,
+                            request.fd,
+                            None,
+                            NvDrvValidationReason::UnsupportedOperation,
+                        ),
+                    });
+                }
+            };
+            inline_length = (size / element_size).min(count) * element_size;
+        }
+        let mut outcome = self.ioctl_inner(
             request.fd,
             request.request,
             request.input,
-            request.additional_input,
+            request.inline,
             Some((
                 request.process_id,
                 request.address_space,
                 request.translator,
             )),
             request.thread_id,
-        )
+        )?;
+        // Ioctl3 publishes complete records from the same query to its inline output.
+        // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.cpp
+        if inline.is_some()
+            && let NvDrvIoctlOutcome::Complete(response) = &mut outcome
+            && response.driver_result == NV_SUCCESS
+        {
+            response.additional_output = response.output[0x10..0x10 + inline_length].to_vec();
+        }
+        Ok(outcome)
     }
 
     fn ioctl_inner(
@@ -446,7 +497,7 @@ impl NvDrvSession {
         fd: NvDrvFileDescriptor,
         request: u32,
         input: &[u8],
-        additional_input: &[u8],
+        inline: NvDrvInlineBuffer<'_>,
         canonical_memory: Option<(u64, AddressSpaceId, &dyn CanonicalRangeTranslator)>,
         thread_id: u64,
     ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
@@ -499,9 +550,15 @@ impl NvDrvSession {
                 )
                 .map(LockedIoctlOutcome::Standard),
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControlGpu => {
-                ioctl_nvhost_ctrl_gpu(state.gpu_profile, descriptor, request, input)
-                    .map(NvHostCtrlIoctlOutcome::Complete)
-                    .map(LockedIoctlOutcome::Standard)
+                ioctl_nvhost_ctrl_gpu(
+                    state.gpu_profile,
+                    descriptor,
+                    request,
+                    input,
+                    inline.output_size().is_some(),
+                )
+                .map(NvHostCtrlIoctlOutcome::Complete)
+                .map(LockedIoctlOutcome::Standard)
             }
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostGpu => {
                 match state.gpu_backend.as_ref().cloned() {
@@ -662,12 +719,13 @@ impl NvDrvSession {
                         descriptor,
                         request,
                         input,
-                        additional_input,
+                        inline.input(),
                     );
                 let result = match result {
                     Ok(result) => result,
                     Err(NvDrvCallError::GuestResult(error)) => {
                         return Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                            additional_output: Vec::new(),
                             output: input.to_vec(),
                             driver_result: error,
                         }));
@@ -679,12 +737,14 @@ impl NvDrvSession {
                     nvhost_gpu::queued_execution_error(descriptor, request, error)
                 })?;
                 Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                    additional_output: Vec::new(),
                     output,
                     driver_result: NV_SUCCESS,
                 }))
             }
             Ok(LockedIoctlOutcome::Standard(NvHostCtrlIoctlOutcome::Complete(output))) => {
                 Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                    additional_output: Vec::new(),
                     output,
                     driver_result: NV_SUCCESS,
                 }))
@@ -693,6 +753,7 @@ impl NvDrvSession {
                 output,
                 driver_result,
             })) => Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                additional_output: Vec::new(),
                 output,
                 driver_result,
             })),
@@ -701,6 +762,7 @@ impl NvDrvSession {
             }
             Err(NvDrvCallError::GuestResult(error)) => {
                 Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                    additional_output: Vec::new(),
                     output: input.to_vec(),
                     driver_result: error,
                 }))
@@ -907,6 +969,7 @@ fn ioctl_nvhost_ctrl_gpu(
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
     input: &[u8],
+    inline_output: bool,
 ) -> Result<Vec<u8>, NvDrvCallError> {
     debug_assert_eq!(profile.validate(), Ok(()));
     match request {
@@ -962,7 +1025,10 @@ fn ioctl_nvhost_ctrl_gpu(
             const CHARACTERISTICS_SIZE: usize = 0xa0;
             const REQUEST_SIZE: usize = 0x10 + CHARACTERISTICS_SIZE;
             require_input_size(input, REQUEST_SIZE)?;
-            if input_u64(input, 0)? == 0 || input_u64(input, 8)? == 0 {
+            // Ioctl3 uses its explicit output buffer, so the legacy user
+            // address is not consumed by that variant.
+            // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.cpp
+            if input_u64(input, 0)? == 0 || (!inline_output && input_u64(input, 8)? == 0) {
                 return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
             }
             let mut output = sized_output(input, REQUEST_SIZE);
@@ -1057,7 +1123,9 @@ fn ioctl_nvhost_ctrl_gpu(
                 .len()
                 .checked_mul(size_of::<u32>())
                 .ok_or(NV_BAD_PARAMETER)?;
-            if caller_address == 0 || caller_size < required_size || caller_size > INLINE_MASK_SIZE
+            if (!inline_output && caller_address == 0)
+                || caller_size < required_size
+                || caller_size > INLINE_MASK_SIZE
             {
                 return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
             }
@@ -1328,6 +1396,74 @@ mod tests {
         input[16] = kind;
         input[24..32].copy_from_slice(&address.get().to_le_bytes());
         input
+    }
+
+    #[test]
+    fn ioctl3_characteristics_match_ordinary_output_and_copy_complete_records() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
+        let mut input = vec![0; 0xb0];
+        input[..8].copy_from_slice(&0xa0_u64.to_le_bytes());
+        input[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        let (ordinary, result) = session
+            .ioctl(fd, IOCTL_CTRL_GPU_GET_CHARACTERISTICS, &input)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        input[8..16].fill(0);
+        let memory = ExecutionMemory::new();
+        for size in [0x9f, 0xa0] {
+            let outcome = session
+                .ioctl_outcome(NvDrvIoctlRequest {
+                    fd,
+                    request: IOCTL_CTRL_GPU_GET_CHARACTERISTICS,
+                    input: &input,
+                    inline: NvDrvInlineBuffer::Output(size),
+                    process_id: 1,
+                    address_space: AddressSpaceId::new(1),
+                    translator: &memory,
+                    thread_id: 1,
+                })
+                .unwrap();
+            let NvDrvIoctlOutcome::Complete(response) = outcome else {
+                panic!()
+            };
+            assert_eq!(response.driver_result, NV_SUCCESS);
+            assert_eq!(response.output[16..], ordinary[16..]);
+            if size == 0x9f {
+                assert!(response.additional_output.is_empty());
+            } else {
+                assert_eq!(response.additional_output, ordinary[16..]);
+            }
+        }
+    }
+
+    #[test]
+    fn ioctl3_tpc_masks_use_inline_output_without_a_legacy_user_pointer() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
+        let memory = ExecutionMemory::new();
+        let mut input = [0; 24];
+        input[..4].copy_from_slice(&4_u32.to_le_bytes());
+        let outcome = session
+            .ioctl_outcome(NvDrvIoctlRequest {
+                fd,
+                request: IOCTL_CTRL_GPU_GET_TPC_MASKS,
+                input: &input,
+                inline: NvDrvInlineBuffer::Output(4),
+                process_id: 1,
+                address_space: AddressSpaceId::new(1),
+                translator: &memory,
+                thread_id: 1,
+            })
+            .unwrap();
+        let NvDrvIoctlOutcome::Complete(response) = outcome else {
+            panic!()
+        };
+        assert_eq!(response.driver_result, NV_SUCCESS);
+        assert_eq!(response.additional_output, 3_u32.to_le_bytes());
+        assert_eq!(response.output[16..20], response.additional_output);
     }
 
     #[test]

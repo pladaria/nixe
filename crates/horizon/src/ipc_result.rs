@@ -95,6 +95,9 @@ impl HorizonIpcResult {
             8 => Self::FS_OUT_OF_RANGE,
             9 => Self::FS_ALLOCATION_MEMORY_FAILED,
             10 | 11 => Self::FS_UNEXPECTED,
+            // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libvapours/include/vapours/results/fs_results.hpp
+            12 => Self::new(MODULE_FS, 30),
+            13 => Self::new(MODULE_FS, 6457),
             _ => unreachable!(),
         }
     }

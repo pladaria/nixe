@@ -369,6 +369,8 @@ pub struct HorizonSvcDispatcher {
     time_environment: crate::TimeEnvironment,
     settings_environment: crate::SettingsEnvironment,
     application_language: Option<crate::SystemLanguage>,
+    user_account_switch_locked: Option<bool>,
+    save_data: Option<crate::SaveDataSystem>,
     diagnostics: crate::HorizonDiagnostics,
     video_system: crate::VideoSystem,
     hid_system: crate::HidSystem,
@@ -379,6 +381,9 @@ pub struct HorizonSvcDispatcher {
     virtual_clock: nixe_runtime::VirtualClock,
     pending_wakes: BTreeMap<u64, PendingThreadWake>,
     pending_runtime_requests: BTreeMap<GuestThreadId, PendingRuntimeRequest>,
+    cancellable_waits: BTreeSet<u64>,
+    cancelled_waits: BTreeSet<u64>,
+    pending_wait_cancellations: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +396,9 @@ enum PendingRuntimeRequest {
         core_id: i32,
     },
     StartThread {
+        object_id: u64,
+    },
+    CancelSynchronization {
         object_id: u64,
     },
     GetThreadPriority {
@@ -518,6 +526,8 @@ impl HorizonSvcDispatcher {
             time_environment,
             settings_environment,
             application_language: None,
+            user_account_switch_locked: None,
+            save_data: None,
             diagnostics: crate::HorizonDiagnostics::default(),
             video_system,
             hid_system: crate::HidSystem::new(),
@@ -528,6 +538,9 @@ impl HorizonSvcDispatcher {
             virtual_clock,
             pending_wakes: BTreeMap::new(),
             pending_runtime_requests: BTreeMap::new(),
+            cancellable_waits: BTreeSet::new(),
+            cancelled_waits: BTreeSet::new(),
+            pending_wait_cancellations: BTreeSet::new(),
         }
     }
 
@@ -536,6 +549,20 @@ impl HorizonSvcDispatcher {
     #[must_use]
     pub fn with_application_language(mut self, language: crate::SystemLanguage) -> Self {
         self.application_language = Some(language);
+        self
+    }
+
+    /// Installs the account-switch policy from the launched application's NACP.
+    #[must_use]
+    pub fn with_user_account_switch_lock(mut self, locked: bool) -> Self {
+        self.user_account_switch_locked = Some(locked);
+        self
+    }
+
+    /// Installs the launched application's persistent save-data namespace.
+    #[must_use]
+    pub fn with_save_data(mut self, save_data: crate::SaveDataSystem) -> Self {
+        self.save_data = Some(save_data);
         self
     }
 
@@ -784,6 +811,36 @@ impl HorizonSvcDispatcher {
                     |_| {},
                 )?;
             }
+            PendingRuntimeRequest::CancelSynchronization { object_id } => {
+                let info = coordinator
+                    .thread_scheduling_info(object_id)
+                    .map_err(|_| runtime_fault("CancelSynchronization target"))?;
+                let cancelled = if self.cancellable_waits.contains(&object_id) {
+                    if let Some(token) = info.active_wait {
+                        coordinator
+                            .cancel_wait(token)
+                            .map_err(|_| runtime_fault("CancelSynchronization wake"))?
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if cancelled {
+                    self.cancellable_waits.remove(&object_id);
+                    self.cancelled_waits.insert(object_id);
+                } else {
+                    self.pending_wait_cancellations.insert(object_id);
+                }
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "CancelSynchronization",
+                    HorizonKernelResult::SUCCESS,
+                    |_| {},
+                )?;
+            }
             PendingRuntimeRequest::GetThreadPriority { object_id } => {
                 let info = coordinator.thread_scheduling_info(object_id);
                 let (code, priority) = match info {
@@ -991,6 +1048,9 @@ impl HorizonSvcDispatcher {
                 fully_handled = false;
             }
             PendingRuntimeRequest::ReapThread { object_id } => {
+                self.cancellable_waits.remove(&object_id);
+                self.cancelled_waits.remove(&object_id);
+                self.pending_wait_cancellations.remove(&object_id);
                 coordinator
                     .reap_thread(object_id)
                     .map_err(|_| runtime_fault("CloseHandle thread reaping"))?;
@@ -1125,6 +1185,7 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x16 => close_handle(self, context),
             0x17 => reset_signal(context),
             0x18 => self.wait_synchronization(context),
+            0x19 => self.cancel_synchronization(context),
             0x1a => self.arbitrate_lock(context),
             0x1b => self.arbitrate_unlock(context),
             0x1c => self.wait_process_wide_key_atomic(context),
@@ -1176,8 +1237,8 @@ impl Default for HorizonSvcDispatcher {
 const fn svc_support(immediate: u32) -> HorizonSvcSupport {
     match immediate {
         0x04 | 0x05 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f | 0x10
-        | 0x13 | 0x14 | 0x15 | 0x16 | 0x25 | 0x27 | 0x32 | 0x34 | 0x35 | 0x40 | 0x41 | 0x45
-        | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
+        | 0x13 | 0x14 | 0x15 | 0x16 | 0x19 | 0x25 | 0x27 | 0x32 | 0x34 | 0x35 | 0x40 | 0x41
+        | 0x45 | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
         0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x1a | 0x1b | 0x1c | 0x1d
         | 0x20 | 0x21 | 0x22 | 0x24 | 0x26 | 0x29 | 0x33 | 0x42 | 0x43 | 0x44 => {
             HorizonSvcSupport::Partial

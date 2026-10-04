@@ -209,7 +209,7 @@ fn dispatch_time_root(
                     &[],
                 );
             };
-            if !has_only_transport_padding(request.data, 0x20) || has_ipc_descriptors(hipc) {
+            if !request.has_payload_size(0x20) || has_ipc_descriptors(hipc) {
                 return time_response(
                     session,
                     request.token,
@@ -308,7 +308,7 @@ fn dispatch_system_clock_target(
     };
     match command {
         SystemClockCommand::GetCurrentTime => {
-            if !has_only_transport_padding(request.data, 0) || has_ipc_descriptors(hipc) {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
                 return time_object_response(
                     parent,
                     request.token,
@@ -339,7 +339,7 @@ fn dispatch_system_clock_target(
                     &[],
                 );
             };
-            if !has_only_transport_padding(request.data, 8) || has_ipc_descriptors(hipc) {
+            if !request.has_payload_size(8) || has_ipc_descriptors(hipc) {
                 return time_object_response(
                     parent,
                     request.token,
@@ -367,7 +367,7 @@ fn dispatch_system_clock_target(
         // point and its source ID as one 0x20-byte SystemClockContext:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/time.h
         SystemClockCommand::GetSystemClockContext => {
-            if !has_only_transport_padding(request.data, 0) || has_ipc_descriptors(hipc) {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
                 return time_object_response(
                     parent,
                     request.token,

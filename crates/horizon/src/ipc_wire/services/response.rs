@@ -29,6 +29,22 @@ pub(super) fn encode_semantic_response(
     let is_domain = domain_session.is_some_and(IpcSession::is_domain);
     match response {
         IpcResponse::None => semantic_success(request.token, is_domain, &[], &[], &[], None),
+        IpcResponse::EntryType(kind) => {
+            // FsDirectoryEntryType: Directory=0, File=1.
+            // https://github.com/switchbrew/libnx/blob/master/nx/include/switch/services/fs.h
+            let value: u32 = match kind {
+                DirectoryEntryKind::Directory => 0,
+                DirectoryEntryKind::File => 1,
+            };
+            semantic_success(
+                request.token,
+                is_domain,
+                &value.to_le_bytes(),
+                &[],
+                &[],
+                None,
+            )
+        }
         IpcResponse::Size(size) => semantic_success(
             request.token,
             is_domain,
@@ -37,6 +53,15 @@ pub(super) fn encode_semantic_response(
             &[],
             None,
         ),
+        IpcResponse::AccessLogProgramIndex {
+            version,
+            program_index,
+        } => {
+            let mut data = [0; 8];
+            data[..4].copy_from_slice(&version.to_le_bytes());
+            data[4..].copy_from_slice(&program_index.to_le_bytes());
+            semantic_success(request.token, is_domain, &data, &[], &[], None)
+        }
         IpcResponse::FileSystemAccessLogMode(mode) => semantic_success(
             request.token,
             is_domain,

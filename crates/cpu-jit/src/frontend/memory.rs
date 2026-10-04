@@ -108,6 +108,12 @@ impl Translator<'_> {
         instruction: Instruction,
         flags: &LazyFlags<ir::Value>,
     ) -> Result<(), Error> {
+        // Arm permits implementation-defined prefetch effects. This backend
+        // issues no host hint: no guest access, register write, or fault occurs.
+        // See Instruction::is_prefetch for the architectural references.
+        if instruction.is_prefetch() {
+            return Ok(());
+        }
         if matches!(
             instruction,
             Instruction::StoreExclusive(_) | Instruction::StoreExclusivePair(_)

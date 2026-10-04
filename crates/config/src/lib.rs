@@ -94,6 +94,7 @@ impl NixeConfig {
             },
             filesystem: FileSystemConfig {
                 sd_card: resolve_path(base_directory, raw.filesystem.sd_card),
+                save_data: resolve_path(base_directory, raw.filesystem.save_data),
             },
             system: SystemConfig {
                 preferred_languages: raw.system.preferred_languages,
@@ -173,6 +174,8 @@ impl LibraryConfig {
 pub struct FileSystemConfig {
     /// Directory exposed to the guest as the removable `sdmc:` filesystem.
     pub sd_card: PathBuf,
+    /// Persistent application save-data volumes, isolated by application/user.
+    pub save_data: PathBuf,
 }
 
 /// System-wide preferences shared by applications.
@@ -438,12 +441,15 @@ struct RawLibraryConfig {
 struct RawFileSystemConfig {
     #[serde(default = "default_sd_card_path")]
     sd_card: PathBuf,
+    #[serde(default = "default_save_data_path")]
+    save_data: PathBuf,
 }
 
 impl Default for RawFileSystemConfig {
     fn default() -> Self {
         Self {
             sd_card: default_sd_card_path(),
+            save_data: default_save_data_path(),
         }
     }
 }
@@ -500,6 +506,10 @@ const fn default_recursive_scan() -> bool {
 
 fn default_timezone() -> String {
     "UTC".to_owned()
+}
+
+fn default_save_data_path() -> PathBuf {
+    PathBuf::from("./storage/save")
 }
 
 fn default_sd_card_path() -> PathBuf {
@@ -753,6 +763,7 @@ mod tests {
                 follow_symlinks = false
                 [filesystem]
                 sd_card = "./custom-sd"
+                save_data = "./custom-save"
                 [system]
                 preferred_languages = ["Spanish", "AmericanEnglish"]
                 keys = "./keys"
@@ -769,6 +780,7 @@ mod tests {
         assert!(!config.library.scan_options().recursive);
         assert!(!config.library.scan_options().follow_symlinks);
         assert_eq!(config.filesystem.sd_card, base.join("./custom-sd"));
+        assert_eq!(config.filesystem.save_data, base.join("./custom-save"));
         assert_eq!(
             config.system.preferred_languages,
             vec![NacpLanguage::Spanish, NacpLanguage::AmericanEnglish]

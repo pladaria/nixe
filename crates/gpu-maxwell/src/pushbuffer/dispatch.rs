@@ -123,6 +123,7 @@ pub enum MaxwellHostMemoryOperation {
 /// Source-preserving semantic kind of one implemented Maxwell host method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellHostMethod {
+    Nop,
     LegacyMemOpA { operand_low: u32 },
     LegacyMemOpB(MaxwellHostMemoryOperation),
 }
@@ -445,6 +446,16 @@ fn dispatch_method(
     validate_source_identity(channel, submission, source.location)?;
     if method.method() == MAXWELL_SET_OBJECT_METHOD {
         return preflight_set_object(profile, source, frontend);
+    }
+    // NVB06F_NOP accepts all 32 handle bits and is discarded by PBDMA.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/host/clb06f.h
+    // https://github.com/NVIDIA/open-gpu-doc/blob/master/manuals/turing/tu104/dev_pbdma.ref.txt
+    if method.method() == GpuMethodId(0x08) {
+        return Ok(MaxwellMethodDispatch {
+            source,
+            class: profile.classes().gpfifo(),
+            kind: MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::Nop),
+        });
     }
     if method.method() == MAXWELL_LEGACY_MEM_OP_A_METHOD {
         return preflight_legacy_mem_op_a(profile, source, frontend);
@@ -955,8 +966,29 @@ mod tests {
     }
 
     #[test]
+    fn host_nop_discards_all_argument_bits_without_a_class_binding() {
+        for argument in [0, 0x110e, u32::MAX] {
+            for subchannel in 0..8 {
+                let decoded = decode(&[word(header(1, 2, subchannel, 1), 0), word(argument, 1)]);
+                let mut channel = channel();
+                let packet = dispatch_maxwell_packet(
+                    &mut channel,
+                    FrontendSubmissionId::new(11),
+                    &decoded.packets()[0],
+                )
+                .unwrap();
+                assert_eq!(
+                    packet.methods()[0].kind(),
+                    MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::Nop)
+                );
+                assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_host_and_subdevice_controls_remain_fatal_boundaries() {
-        let host = decode(&[word(header(4, 2, 0, 7), 0)]);
+        let host = decode(&[word(header(4, 1, 0, 7), 0)]);
         let control = decode(&[word(1 << 16, 0)]);
         let mut channel = channel();
         assert!(matches!(
@@ -966,7 +998,7 @@ mod tests {
                 &host.packets()[0]
             ),
             Err(MaxwellMethodDispatchError::UnsupportedHostMethod { source })
-                if source.method() == GpuMethodId(8)
+                if source.method() == GpuMethodId(4)
         ));
         assert!(matches!(
             dispatch_maxwell_packet(

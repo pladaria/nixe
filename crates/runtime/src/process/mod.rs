@@ -9,9 +9,10 @@ mod memory_accounting;
 mod thread;
 
 pub use builder::ProcessBuilder;
+pub(crate) use builder::ThreadPolicy;
 #[cfg(test)]
 use builder::a64_register;
-use builder::{ThreadPolicy, align_up, error, initialize_created_thread};
+use builder::{align_up, error, initialize_created_thread};
 pub use execution::{
     CpuBackendConfig, ExecutionReport, ExecutionStop, GuestStackFrame, ProcessExecutionError,
     ProcessExit, ProcessExitCause, ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,

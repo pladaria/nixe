@@ -16,14 +16,14 @@ use nixe_gpu::BackendInstanceId;
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
     GuestLogLevel, HorizonDiagnostics, HorizonSvcDispatcher, HorizonSvcFault, OperationMode,
-    SettingsEnvironment, SystemLanguage, TimeEnvironment, UnsupportedNvDrvOperation, VideoSystem,
-    switch_1_machine_profile,
+    SaveDataSystem, SettingsEnvironment, SystemLanguage, TimeEnvironment,
+    UnsupportedNvDrvOperation, VideoSystem, switch_1_machine_profile,
 };
 use nixe_input::{
     ControllerId, EmulatedButtonState, GamepadProfiles, InputReader, InputWorker,
     ProfiledControllerState, TouchScreenReader,
 };
-use nixe_loader_title::{NacpLanguage, SupportedLanguages};
+use nixe_loader_title::{NacpLanguage, SupportedLanguages, UserAccountSwitchLock};
 use nixe_memory::NonCpuDeviceId;
 use nixe_runtime::{
     CpuBackendConfig, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
@@ -229,6 +229,22 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
                 &config.system.preferred_languages,
             )
         }),
+        user_account_switch_locked: plan.control_metadata().and_then(|control| {
+            match control.nacp.user_account_switch_lock {
+                UserAccountSwitchLock::Disable => Some(false),
+                UserAccountSwitchLock::Enable => Some(true),
+                UserAccountSwitchLock::Unknown(_) => None,
+            }
+        }),
+        save_data: plan.packaged_identity().zip(plan.control_metadata()).map(
+            |(identity, control)| {
+                SaveDataSystem::new(
+                    config.filesystem.save_data.clone(),
+                    identity.application_id().get(),
+                    &control.nacp,
+                )
+            },
+        ),
         diagnostics: horizon_diagnostics(diagnostics_configuration),
     };
     log::debug!(
@@ -527,6 +543,8 @@ struct HorizonEnvironment {
     time: TimeEnvironment,
     settings: SettingsEnvironment,
     application_language: Option<SystemLanguage>,
+    user_account_switch_locked: Option<bool>,
+    save_data: Option<SaveDataSystem>,
     diagnostics: HorizonDiagnostics,
 }
 
@@ -677,6 +695,12 @@ fn execute(
     )
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend);
+    if let Some(save_data) = horizon_environment.save_data {
+        dispatcher = dispatcher.with_save_data(save_data);
+    }
+    if let Some(locked) = horizon_environment.user_account_switch_locked {
+        dispatcher = dispatcher.with_user_account_switch_lock(locked);
+    }
     if let Some(language) = horizon_environment.application_language {
         dispatcher = dispatcher.with_application_language(language);
     }

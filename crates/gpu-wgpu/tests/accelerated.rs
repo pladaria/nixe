@@ -164,6 +164,93 @@ fn color_clear_submission(
 }
 
 #[test]
+fn resident_image_copy_preserves_a_smaller_logical_extent() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(701),
+        NonCpuDeviceId::new(701),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let page = initialized_page(&[0; 13 * 8 * 4]);
+    let (mut creations, backing, destination, subresources) =
+        backed_color_image(ImageFormat::Rgba8Unorm, 13, 8, &[page]);
+    let source = ImageId::new(702);
+    creations.push(BackendResourceCreateInfo::Image {
+        id: source,
+        description: ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent::new(16, 8, 1).unwrap(),
+            ImageFormat::Rgba8Unorm,
+            ImageKind::Color,
+            1,
+            1,
+            SampleCount::One,
+        )
+        .unwrap(),
+        view: None,
+    });
+    let mut operations = color_clear_submission(
+        source,
+        subresources,
+        ImageFormat::Rgba8Unorm,
+        16,
+        8,
+        [1.0, 0.0, 0.0, 1.0],
+        701,
+    )
+    .operations()
+    .to_vec();
+    operations.extend_from_slice(
+        color_clear_submission(
+            source,
+            subresources,
+            ImageFormat::Rgba8Unorm,
+            5,
+            8,
+            [0.0, 0.0, 1.0, 1.0],
+            701,
+        )
+        .operations(),
+    );
+    let region = |image| nixe_gpu::ImageRegion {
+        image,
+        subresources,
+        origin: nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 },
+        extent: ImageExtent::new(13, 8, 1).unwrap(),
+    };
+    operations.push(GpuOperation::new(
+        GpuCommand::Copy(CopyOperation::ImageToImage {
+            source: region(source),
+            destination: region(destination),
+        }),
+        [],
+        [],
+        CapabilityRequirements::none(),
+    ));
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &OperationSubmission::new(FrontendSubmissionId::new(701), vec![], operations).unwrap(),
+        )
+        .unwrap();
+    let mut pixels = [0; 13 * 8 * 4];
+    backing.range().read(0, &mut pixels).unwrap();
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let expected = if index % 13 < 5 {
+            [0, 0, 255, 255]
+        } else {
+            [255, 0, 0, 255]
+        };
+        assert_eq!(pixel, expected, "pixel {index}");
+    }
+}
+
+#[test]
 fn partial_float32_clear_writes_unblended_values() {
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
@@ -1400,6 +1487,7 @@ fn accelerated_polygon_draw(
         None,
         None,
         false,
+        None,
     );
 }
 
@@ -1461,6 +1549,7 @@ fn accelerated_blending_and_write_masks_preserve_destination_components() {
             Some((output, expected)),
             None,
             false,
+            None,
         );
     }
 }
@@ -1483,6 +1572,7 @@ fn accelerated_polygon_facing_preserves_winding_for_triangles_and_quads() {
                 None,
                 Some((front, cull, visible)),
                 false,
+                None,
             );
         }
     }
@@ -1503,6 +1593,34 @@ fn accelerated_positive_y_viewport_preserves_interpolation_and_polygon_facing() 
                 true,
             )),
             true,
+            None,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScissorScenario {
+    Partial,
+    Empty,
+    Reset,
+}
+
+#[test]
+fn accelerated_draw_scissor_clips_fragments_and_resets_between_draws() {
+    for scenario in [
+        ScissorScenario::Partial,
+        ScissorScenario::Empty,
+        ScissorScenario::Reset,
+    ] {
+        accelerated_polygon_color_draw(
+            PrimitiveTopology::Triangles,
+            ShaderInterpolation::Perspective,
+            false,
+            VertexFormat::Float32x3,
+            None,
+            None,
+            false,
+            Some(scenario),
         );
     }
 }
@@ -1516,6 +1634,7 @@ fn accelerated_polygon_color_draw(
     color_output: Option<(nixe_gpu::ColorOutputState, [u8; 4])>,
     facing: Option<(nixe_gpu::FrontFace, nixe_gpu::CullMode, bool)>,
     positive_y: bool,
+    scissor: Option<ScissorScenario>,
 ) {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x12);
@@ -1769,6 +1888,21 @@ fn accelerated_polygon_color_draw(
         .unwrap(),
     );
     let mut prepared = prepared;
+    prepared.scissor = match scissor {
+        Some(ScissorScenario::Partial) => Some(nixe_gpu::ScissorRect {
+            x: 8,
+            y: 8,
+            width: 16,
+            height: 16,
+        }),
+        Some(ScissorScenario::Empty) => Some(nixe_gpu::ScissorRect {
+            x: 8,
+            y: 8,
+            width: 0,
+            height: 16,
+        }),
+        _ => None,
+    };
     if let Some((front, cull, _)) = facing {
         prepared.front_face = if positive_y {
             match front {
@@ -1811,10 +1945,18 @@ fn accelerated_polygon_color_draw(
     } else {
         draw.clone()
     };
-    if color_output.is_some() || facing.is_some() {
+    if color_output.is_some() || facing.is_some() || scissor.is_some() {
         // Same neutral pipeline/shaders, one changed pipeline field. The first
         // draw is invisible; a cache hit must restore the second draw's state.
         let mut prepared = (*draw.prepared).clone();
+        if scissor.is_some() {
+            prepared.scissor = Some(nixe_gpu::ScissorRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+        }
         if color_output.is_some() {
             prepared.color_outputs[0].write_mask = nixe_gpu::ColorWriteMask::NONE;
         }
@@ -1901,6 +2043,27 @@ fn accelerated_polygon_color_draw(
     assert_eq!(clear[3], 255);
     assert_eq!(pixel(WIDTH - 1, HEIGHT - 1), clear);
 
+    match scissor {
+        Some(ScissorScenario::Partial) => {
+            let mut written = 0;
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    if (8..24).contains(&x) && (8..24).contains(&y) {
+                        written += usize::from(pixel(x, y) != clear);
+                    } else {
+                        assert_eq!(pixel(x, y), clear, "outside scissor ({x},{y})");
+                    }
+                }
+            }
+            assert!(written > 0);
+            return;
+        }
+        Some(ScissorScenario::Empty) => {
+            assert!(pixels.chunks_exact(4).all(|p| p == clear));
+            return;
+        }
+        _ => {}
+    }
     if let Some((_, _, false)) = facing {
         assert!(pixels.chunks_exact(4).all(|p| p == clear));
         return;

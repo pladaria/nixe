@@ -2,7 +2,7 @@
 
 use crate::ipc_wire::IpcWireError;
 use crate::ipc_wire::buffer::one_receive_buffer;
-use crate::ipc_wire::io::request_u32;
+use crate::ipc_wire::io::{has_ipc_descriptors_other_than_pid, request_u32, request_u64};
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
 use crate::{IpcRequest, MAX_IPC_LIST_ENTRIES};
 
@@ -15,6 +15,7 @@ enum AddOnContentCommand {
     PrepareLegacy,
     Prepare,
     GetListChangedEvent,
+    CheckMountStatus,
 }
 
 impl AddOnContentCommand {
@@ -27,6 +28,7 @@ impl AddOnContentCommand {
             6 => Some(Self::PrepareLegacy),
             7 => Some(Self::Prepare),
             8 => Some(Self::GetListChangedEvent),
+            50 => Some(Self::CheckMountStatus),
             _ => None,
         }
     }
@@ -42,6 +44,18 @@ pub(in crate::ipc_wire) fn decode_root_request(
     // Versioned command IDs follow the documented aoc:u ABI:
     // https://switchbrew.org/w/index.php?title=NS_services&oldid=14328#aoc:u
     match command {
+        AddOnContentCommand::CheckMountStatus => {
+            // PID descriptor plus zero u64 placeholder; no output data.
+            // https://github.com/alula/Ryujinx/blob/master/src/Ryujinx.HLE/HOS/Services/Ns/Aoc/IAddOnContentManager.cs
+            if hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+                || request_u64(request.data, 0) != Some(0)
+                || !request.has_payload_size(8)
+            {
+                return Ok(None);
+            }
+            Ok(Some(IpcRequest::CheckAddOnContentMountStatus))
+        }
         AddOnContentCommand::CountLegacy => Ok(Some(IpcRequest::GetIndexedAddOnContentCount)),
         AddOnContentCommand::Count => {
             if hipc.pid.is_none() {
@@ -114,6 +128,18 @@ mod tests {
             decode_root_request(&request, &hipc).unwrap(),
             Some(IpcRequest::GetIndexedAddOnContentCount)
         );
+
+        put_u32(&mut count, 40, 50);
+        let hipc = HipcRequest::decode(&count).unwrap();
+        let request = CmifRequest::decode(&hipc, false).unwrap();
+        assert_eq!(
+            decode_root_request(&request, &hipc).unwrap(),
+            Some(IpcRequest::CheckAddOnContentMountStatus)
+        );
+        put_u32(&mut count, 48, 1);
+        let hipc = HipcRequest::decode(&count).unwrap();
+        let request = CmifRequest::decode(&hipc, false).unwrap();
+        assert_eq!(decode_root_request(&request, &hipc).unwrap(), None);
 
         let mut list = [0_u8; COMMAND_BUFFER_SIZE];
         put_u32(&mut list, 0, 4 | (1 << 24));

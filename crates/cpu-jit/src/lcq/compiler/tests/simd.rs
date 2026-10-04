@@ -1,6 +1,48 @@
 use super::integer::{compare, initial_state};
 
 #[test]
+fn scalar_dup_native_lowering_matches_all_lanes_and_register_aliases() {
+    for size in 0..4_u32 {
+        for index in 0..16 >> size {
+            for (rd, rn) in [(0, 0), (31, 31), (2, 31), (31, 2)] {
+                let mut initial = initial_state();
+                initial.set_vector(rd, u128::MAX);
+                initial.set_vector(rn, 0x8f8e_8d8c_8b8a_8988_8786_8584_8382_8180);
+                initial.set_fpsr(0x0800_009f);
+                initial.set_fpcr(0x07c0_0000);
+                let imm5 = (index << (size + 1)) | (1 << size);
+                compare(
+                    0x5e00_0400 | (imm5 << 16) | (u32::from(rn) << 5) | u32::from(rd),
+                    initial,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rev64_native_lowering_matches_all_arrangements_and_register_aliases() {
+    for size in 0..3 {
+        for full in [false, true] {
+            for (rd, rn) in [(0, 0), (31, 31), (2, 31), (31, 2)] {
+                let mut initial = initial_state();
+                initial.set_vector(rd, u128::MAX);
+                initial.set_vector(rn, 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+                initial.set_fpsr(0x0800_009f);
+                compare(
+                    0x0e20_0800
+                        | (size << 22)
+                        | (u32::from(full) << 30)
+                        | (u32::from(rn) << 5)
+                        | u32::from(rd),
+                    initial,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn uaddlv_native_lowering_matches_all_unsigned_arrangements_and_aliases() {
     for word in [
         0x2e30_3800_u32,

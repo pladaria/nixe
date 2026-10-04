@@ -187,6 +187,7 @@ pub struct ExceptionProcessContext<'a> {
     address_space_limit: u64,
     memory_layout: ProcessMemoryLayout,
     random_entropy: [u64; 4],
+    thread_policy: Option<crate::process::ThreadPolicy>,
     memory_accounting: &'a mut ProcessMemoryAccounting,
     memory: &'a ExecutionMemory,
     mapping_control: &'a dyn MemoryMutationControl,
@@ -203,9 +204,20 @@ pub(crate) struct ExceptionProcessMetadata {
     pub address_space_limit: u64,
     pub memory_layout: ProcessMemoryLayout,
     pub random_entropy: [u64; 4],
+    pub thread_policy: Option<crate::process::ThreadPolicy>,
 }
 
 impl<'a> ExceptionProcessContext<'a> {
+    #[must_use]
+    pub fn allowed_core_mask(&self) -> Option<u64> {
+        self.thread_policy?.allowed_core_mask()
+    }
+
+    #[must_use]
+    pub fn allowed_priority_mask(&self) -> Option<u64> {
+        self.thread_policy?.allowed_priority_mask()
+    }
+
     pub(crate) const fn new(
         metadata: ExceptionProcessMetadata,
         memory_accounting: &'a mut ProcessMemoryAccounting,
@@ -217,6 +229,7 @@ impl<'a> ExceptionProcessContext<'a> {
             address_space_limit: metadata.address_space_limit,
             memory_layout: metadata.memory_layout,
             random_entropy: metadata.random_entropy,
+            thread_policy: metadata.thread_policy,
             memory_accounting,
             memory: resources.memory,
             mapping_control: resources.mapping_control,

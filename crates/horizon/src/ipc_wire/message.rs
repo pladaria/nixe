@@ -1,4 +1,4 @@
-//! Checked, bounded codecs for the HIPC transport and CMIF framing layers.
+//! Checked, bounded codecs for HIPC transport and CMIF/TIPC framing.
 
 use std::fmt::{Display, Formatter};
 
@@ -18,6 +18,8 @@ const CMIF_DOMAIN_SEND_MESSAGE: u8 = 1;
 const CMIF_DOMAIN_CLOSE: u8 = 2;
 const MAX_DESCRIPTOR_COUNT: usize = 15;
 const MAX_HANDLE_COUNT: usize = 15;
+pub(crate) const TIPC_COMMAND_CLOSE: u16 = 15;
+pub(crate) const TIPC_COMMAND_REQUEST_BASE: u16 = 16;
 
 /// A deterministic rejection reason for an invalid HIPC or CMIF message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +29,72 @@ impl Display for MessageError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.0)
     }
+}
+
+/// TIPC carries its request ID in the HIPC type and its payload without CMIF
+/// magic or 16-byte alignment. Responses start with one result word.
+/// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/tipc.h
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TipcRequest<'a> {
+    pub(crate) command_id: u32,
+    pub(crate) data: &'a [u8],
+}
+
+impl<'a> TipcRequest<'a> {
+    pub(crate) fn decode(hipc: &HipcRequest<'a>) -> Result<Self, MessageError> {
+        let command_id = hipc
+            .command_type
+            .checked_sub(TIPC_COMMAND_REQUEST_BASE)
+            .ok_or(MessageError("invalid TIPC request type"))?;
+        if !hipc.send_statics.is_empty() || hipc.receive_statics != ReceiveStatics::None {
+            return Err(MessageError("TIPC request contains pointer descriptors"));
+        }
+        Ok(Self {
+            command_id: u32::from(command_id),
+            data: &hipc.raw[hipc.data_offset..hipc.data_end],
+        })
+    }
+}
+
+pub(crate) fn encode_tipc_response(
+    result: u32,
+    data: &[u8],
+    move_handles: &[u32],
+) -> Result<Vec<u8>, MessageError> {
+    bounded_count(
+        move_handles.len(),
+        MAX_HANDLE_COUNT,
+        "too many moved handles",
+    )?;
+    let has_special = !move_handles.is_empty();
+    let data_offset = checked_add(
+        8,
+        if has_special {
+            checked_add(4, checked_mul(move_handles.len(), 4)?)?
+        } else {
+            0
+        },
+    )?;
+    let data_size = align_up(checked_add(4, data.len())?, 4)?;
+    let total = checked_add(data_offset, data_size)?;
+    if total > COMMAND_BUFFER_SIZE {
+        return Err(MessageError("TIPC response exceeds the TLS command buffer"));
+    }
+    let mut output = vec![0; total];
+    put_u32(
+        &mut output,
+        4,
+        (data_size as u32 / 4) | (u32::from(has_special) << 31),
+    )?;
+    if has_special {
+        put_u32(&mut output, 8, (move_handles.len() as u32) << 5)?;
+        for (index, handle) in move_handles.iter().enumerate() {
+            put_u32(&mut output, 12 + index * 4, *handle)?;
+        }
+    }
+    put_u32(&mut output, data_offset, result)?;
+    output[data_offset + 4..data_offset + 4 + data.len()].copy_from_slice(data);
+    Ok(output)
 }
 
 /// Kernel mapping mode carried by a HIPC buffer descriptor.
@@ -206,7 +274,7 @@ impl<'a> HipcRequest<'a> {
             .ok_or(MessageError("aligned CMIF data exceeds HIPC data words"))
     }
 
-    fn data_word_bytes(&self) -> usize {
+    pub(crate) fn data_word_bytes(&self) -> usize {
         self.data_end - self.data_offset
     }
 }
@@ -277,6 +345,14 @@ impl<'a> CmifRequest<'a> {
             return Self::decode_domain(command_type, data_words);
         }
         Self::decode_plain(command_type, data_words)
+    }
+
+    /// Validate the bytes consumed by the command, without interpreting its
+    /// alignment tail as fields. Client serializers can leave these bytes
+    /// uninitialized; domain payloads can also include argument-struct padding.
+    /// https://github.com/switchbrew/libnx/blob/master/nx/include/switch/sf/cmif.h
+    pub(crate) fn has_payload_size(&self, size: usize) -> bool {
+        self.data.len() >= size
     }
 
     fn decode_plain(command_type: u16, bytes: &'a [u8]) -> Result<Self, MessageError> {
@@ -691,6 +767,63 @@ mod tests {
 
     fn put_word(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn tipc_uses_unaligned_data_after_the_pid_and_no_cmif_header() {
+        let mut bytes = [0_u8; COMMAND_BUFFER_SIZE];
+        put_word(&mut bytes, 0, u32::from(TIPC_COMMAND_REQUEST_BASE) + 7);
+        put_word(&mut bytes, 4, 2 | (1 << 31));
+        put_word(&mut bytes, 8, 1);
+        bytes[12..20].copy_from_slice(&9_u64.to_le_bytes());
+        bytes[20..28].copy_from_slice(b"set:sys\0");
+        let hipc = HipcRequest::decode(&bytes).unwrap();
+        let request = TipcRequest::decode(&hipc).unwrap();
+        assert_eq!(hipc.pid, Some(9));
+        assert_eq!(request.command_id, 7);
+        assert_eq!(request.data, b"set:sys\0");
+        assert!(HipcRequest::decode(&bytes[..27]).is_err());
+    }
+
+    #[test]
+    fn tipc_rejects_other_protocols_and_pointer_descriptors() {
+        for command_type in [4, 15] {
+            let mut bytes = [0_u8; COMMAND_BUFFER_SIZE];
+            put_word(&mut bytes, 0, command_type);
+            let hipc = HipcRequest::decode(&bytes).unwrap();
+            assert!(TipcRequest::decode(&hipc).is_err());
+        }
+        for (word0, word1) in [(16 | (1 << 16), 0), (16, 2 << 10)] {
+            let mut bytes = [0_u8; COMMAND_BUFFER_SIZE];
+            put_word(&mut bytes, 0, word0);
+            put_word(&mut bytes, 4, word1);
+            let hipc = HipcRequest::decode(&bytes).unwrap();
+            assert_eq!(
+                TipcRequest::decode(&hipc),
+                Err(MessageError("TIPC request contains pointer descriptors"))
+            );
+        }
+    }
+
+    #[test]
+    fn tipc_response_places_result_directly_after_hipc_metadata() {
+        let response = encode_tipc_response(0x1234, &[1, 2, 3], &[]).unwrap();
+        assert_eq!(
+            response,
+            [0, 0, 0, 0, 2, 0, 0, 0, 0x34, 0x12, 0, 0, 1, 2, 3, 0]
+        );
+        let response = encode_tipc_response(0, &9_u32.to_le_bytes(), &[3, 4, 5]).unwrap();
+        assert_eq!(get_u32(&response, 4).unwrap(), 2 | (1 << 31));
+        assert_eq!(get_u32(&response, 8).unwrap(), 3 << 5);
+        assert_eq!(&response[12..24], &[3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0]);
+        assert_eq!(get_u32(&response, 24).unwrap(), 0);
+        assert_eq!(get_u32(&response, 28).unwrap(), 9);
+        assert_eq!(
+            encode_tipc_response(0, &[0; 244], &[]).unwrap().len(),
+            COMMAND_BUFFER_SIZE
+        );
+        assert!(encode_tipc_response(0, &[0; 245], &[]).is_err());
+        assert!(encode_tipc_response(0, &[], &[0; 16]).is_err());
     }
 
     #[test]

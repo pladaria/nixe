@@ -13,7 +13,9 @@ mod launcher;
 mod module_memory;
 mod process;
 mod process_mount;
+mod transactional_directory;
 mod virtual_time;
+pub use transactional_directory::{DirectoryWriteLease, TransactionalDirectory};
 
 pub use address_wait::{AddressWaitRegistry, AddressWaitResult, PriorityAddressWaitQueue};
 pub use coordinator::{

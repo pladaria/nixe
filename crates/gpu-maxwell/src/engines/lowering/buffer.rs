@@ -121,6 +121,7 @@ pub(super) fn prepare_buffer(
         dependency,
         materialization: ViewMaterialization::Direct,
         cpu_writes: None,
+        write_revision: 0,
     });
     Ok(dependency)
 }

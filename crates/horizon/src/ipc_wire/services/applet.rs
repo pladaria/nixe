@@ -26,6 +26,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
     hipc: &HipcRequest<'_>,
     video_system: &VideoSystem,
     application_language: Option<crate::SystemLanguage>,
+    save_data: Option<&crate::SaveDataSystem>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     // The startup order, command IDs, input PID/process handle, returned
     // objects, and scalar result layouts implemented below follow libnx:
@@ -155,6 +156,12 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 CommonStateGetterCommand::GetCurrentFocusState => {
                     applet_data(request.token, &[session.current_focus_state()])
                 }
+                CommonStateGetterCommand::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled => {
+                    // No input or output: this enables AM's next-program exit policy.
+                    // https://github.com/switchbrew/libnx/blob/master/nx/source/services/applet.c
+                    session.enable_request_exit_to_library_applet_at_execute_next_program();
+                    applet_data(request.token, &[])
+                }
             }
         }
         AppletObject::SelfController => {
@@ -195,27 +202,32 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 // copied, manual-clear event handle (`autoclear=false`).
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c
                 // https://switchbrew.org/w/index.php?title=Applet_Manager_services&oldid=14546#GetLibraryAppletLaunchableEvent
-                SelfControllerCommand::GetLibraryAppletLaunchableEvent => {
+                command @ (SelfControllerCommand::GetLibraryAppletLaunchableEvent
+                | SelfControllerCommand::GetAccumulatedSuspendedTickChangedEvent) => {
                     if !request.data.is_empty() || has_ipc_descriptors(hipc) {
                         return applet_error(
                             request.token,
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let handle = match process
-                        .handles_mut()
-                        .insert(session.library_applet_launchable_event())
-                    {
+                    // Command 91 returns a copied, auto-clear event for changes
+                    // to command 90's suspended-tick counter.
+                    // https://github.com/switchbrew/libnx/blob/master/nx/source/services/applet.c
+                    let event = match command {
+                        SelfControllerCommand::GetLibraryAppletLaunchableEvent => {
+                            session.library_applet_launchable_event()
+                        }
+                        _ => session.accumulated_suspended_tick_changed_event(),
+                    };
+                    let handle = match process.handles_mut().insert(event) {
                         Ok(handle) => handle,
                         Err(_) => {
                             return Err(IpcWireError::HostResourceExhausted(
-                                "installing the library-applet launchable event handle",
+                                "installing the self-controller event handle",
                             ));
                         }
                     };
-                    log::debug!(
-                        "ISelfController returned library-applet launchable event handle {handle:#x}"
-                    );
+                    log::debug!("ISelfController returned {command:?} handle {handle:#x}");
                     Ok((
                         encode_domain_response(
                             request.token,
@@ -227,7 +239,20 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                         Some(handle),
                     ))
                 }
-                SelfControllerCommand::CreateManagedDisplayLayer => {
+                SelfControllerCommand::GetAccumulatedSuspendedTickValue => {
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    applet_data(
+                        request.token,
+                        &session.accumulated_suspended_ticks().to_le_bytes(),
+                    )
+                }
+                SelfControllerCommand::CreateManagedDisplayLayer
+                | SelfControllerCommand::CreateManagedDisplaySeparableLayer => {
                     if !request.data.is_empty() || has_ipc_descriptors(hipc) {
                         return applet_error(
                             request.token,
@@ -240,7 +265,20 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             HorizonIpcResult::SF_PRECONDITION_VIOLATION,
                         );
                     };
-                    applet_data(request.token, &layer.id.to_le_bytes())
+                    // Both outputs identify real independently backed layers.
+                    // The second is opened by CreateRecordingLayer, whereas
+                    // ordinary rendering uses the first.
+                    // https://switchbrew.org/wiki/AM_services#CreateManagedDisplaySeparableLayer
+                    let mut data = layer.id.to_le_bytes().to_vec();
+                    if command == SelfControllerCommand::CreateManagedDisplaySeparableLayer {
+                        let recording = video_system.create_layer(1).ok_or(
+                            IpcWireError::HostResourceExhausted(
+                                "creating the recording display layer",
+                            ),
+                        )?;
+                        data.extend_from_slice(&recording.id.to_le_bytes());
+                    }
+                    applet_data(request.token, &data)
                 }
                 // These state-mutating command layouts follow pinned libnx:
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1113-L1125
@@ -358,7 +396,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     };
-                    if !has_only_transport_padding(request.data, 4) || has_ipc_descriptors(hipc) {
+                    if !request.has_payload_size(4) || has_ipc_descriptors(hipc) {
                         return applet_error(
                             request.token,
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
@@ -407,6 +445,41 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             ))
                         }
                     }
+                }
+                ApplicationFunctionsCommand::EnsureSaveData => {
+                    if !request.has_payload_size(16) || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let system = save_data.ok_or_else(|| {
+                        IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "IApplicationFunctions",
+                                command_id: 20,
+                                detail: "application save-data metadata/storage is unavailable",
+                            },
+                        )
+                    })?;
+                    let user = u128::from_le_bytes(request.data[..16].try_into().unwrap());
+                    let size = match system.ensure(user) {
+                        Ok(size) => size,
+                        Err(crate::save_data::SaveDataError::Unsupported(detail)) => {
+                            return Err(IpcWireError::UnsupportedService(
+                                UnsupportedServiceOperation::CommandVariant {
+                                    service: "IApplicationFunctions",
+                                    command_id: 20,
+                                    detail,
+                                },
+                            ));
+                        }
+                        Err(crate::save_data::SaveDataError::Io(error)) => {
+                            log::error!("save-data creation failed: {error}");
+                            return applet_error(request.token, HorizonIpcResult::FS_UNEXPECTED);
+                        }
+                    };
+                    semantic_success(request.token, true, &size.to_le_bytes(), &[], &[], None)
                 }
                 // No input; returns the application's selected language code as
                 // a null-padded, little-endian u64, not a SetLanguage enum value.
@@ -458,6 +531,34 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                         );
                     }
                     applet_data(request.token, &[1])
+                }
+                // Copied, manual-clear system event, with no input payload.
+                // https://github.com/switchbrew/libnx/blob/master/nx/source/services/applet.c
+                ApplicationFunctionsCommand::GetGpuErrorDetectedSystemEvent => {
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let handle = process
+                        .handles_mut()
+                        .insert(session.gpu_error_detected_event())
+                        .map_err(|_| {
+                            IpcWireError::HostResourceExhausted(
+                                "installing the applet GPU-error event handle",
+                            )
+                        })?;
+                    Ok((
+                        encode_domain_response(
+                            request.token,
+                            HorizonIpcResult::SUCCESS,
+                            &[],
+                            &[handle],
+                            &[],
+                        )?,
+                        Some(handle),
+                    ))
                 }
             }
         }

@@ -98,7 +98,7 @@ fn dispatch_network_interface_manager(
         NetworkInterfaceManagerCommand::CreateGeneralService => {
             if hipc.pid.is_none()
                 || request_u64(request.data, 0) != Some(0)
-                || !has_only_transport_padding(request.data, 8)
+                || !request.has_payload_size(8)
                 || has_ipc_descriptors_other_than_pid(hipc)
             {
                 return network_interface_response(

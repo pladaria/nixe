@@ -1111,7 +1111,7 @@ pub fn evaluate_shader_ir(
                 let right = register_bits(&registers, *right)?;
                 let value = match scalar_type {
                     ShaderScalarType::Float32 => {
-                        evaluate_float_binary(left, right, *float_control, |a, b| a * b)?
+                        evaluate_float_multiply(left, right, *float_control, false)?
                     }
                     ShaderScalarType::Unsigned32 | ShaderScalarType::Signed32 => {
                         left.wrapping_mul(right)
@@ -1126,11 +1126,11 @@ pub fn evaluate_shader_ir(
                 right,
                 float_control,
             } => {
-                let value = evaluate_float_binary(
+                let value = evaluate_float_multiply(
                     register_bits(&registers, *left)?,
                     register_bits(&registers, *right)?,
                     *float_control,
-                    |a, b| if a == 0.0 || b == 0.0 { 0.0 } else { a * b },
+                    true,
                 )?;
                 registers[destination.index() as usize] = Some(value);
             }
@@ -1464,6 +1464,43 @@ fn register_bits(
     registers[register.index() as usize].ok_or(ShaderEvaluationError::UndefinedRegister(register))
 }
 
+fn evaluate_float_multiply(
+    mut left: u32,
+    mut right: u32,
+    control: ShaderFloatControl,
+    zero_absorbs: bool,
+) -> Result<u32, ShaderEvaluationError> {
+    if control.rounding != ShaderRoundingMode::TowardZero {
+        return evaluate_float_binary(left, right, control, |a, b| {
+            if zero_absorbs && (a == 0.0 || b == 0.0) {
+                0.0
+            } else {
+                a * b
+            }
+        });
+    }
+    if !control.denormals_are_zero || !control.flush_denormals_to_zero {
+        return Err(ShaderEvaluationError::UnsupportedRoundingMode(
+            control.rounding,
+        ));
+    }
+    left = flush_denormal_bits(left);
+    right = flush_denormal_bits(right);
+    if zero_absorbs && (left & 0x7fff_ffff == 0 || right & 0x7fff_ffff == 0) {
+        return finish_float(0, control);
+    }
+    // Binary64 represents the product of two binary32 significands exactly.
+    // Repair an upward RNE conversion by one binary32 ULP to obtain RZ.
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul
+    let exact = f64::from(f32::from_bits(left)) * f64::from(f32::from_bits(right));
+    let rounded = exact as f32;
+    let mut bits = rounded.to_bits();
+    if exact.is_finite() && f64::from(rounded).abs() > exact.abs() {
+        bits -= 1;
+    }
+    finish_float(bits, control)
+}
+
 fn evaluate_float_binary(
     mut left: u32,
     mut right: u32,
@@ -1715,6 +1752,14 @@ fn lower_shader_ir_to_wgsl_impl(
     let output_groups = interface_groups(&ir.outputs)?;
     let mut source = String::new();
     emit_wgsl_resources(&mut source, ir)?;
+    if ir.instructions.iter().any(|i| {
+        matches!(i.operation,
+        ShaderOperation::Multiply32 { scalar_type: ShaderScalarType::Float32, float_control, .. }
+        | ShaderOperation::FloatMultiplyZero32 { float_control, .. }
+        if float_control.rounding() == ShaderRoundingMode::TowardZero)
+    }) {
+        source.push_str(include_str!("shader/multiply_rz.wgsl"));
+    }
     if ir.instructions.iter().any(|i| {
         matches!(i.operation,
         ShaderOperation::Multiply32 { scalar_type: ShaderScalarType::Float32, float_control, .. }
@@ -3188,6 +3233,16 @@ fn wgsl_float_multiply_expression(
     control: ShaderFloatControl,
     zero_is_absorbing: bool,
 ) -> Result<String, ShaderBackendLoweringError> {
+    if control.rounding() == ShaderRoundingMode::TowardZero
+        && control.denormals_are_zero()
+        && control.flush_denormals_to_zero()
+        && control.nan_mode() == ShaderNanMode::Propagate
+        && !control.saturate()
+    {
+        return Ok(format!(
+            "nixe_multiply_rz_ftz(registers[{left}], registers[{right}], {zero_is_absorbing})"
+        ));
+    }
     if control.rounding() != ShaderRoundingMode::NearestEven
         || control.nan_mode() != ShaderNanMode::Propagate
         || control.saturate()
@@ -4297,6 +4352,40 @@ fn verify_interface_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiply_rz_ftz_evaluation_preserves_signed_zero_and_truncates() {
+        let control = ShaderFloatControl::new(
+            ShaderRoundingMode::TowardZero,
+            ShaderNanMode::Propagate,
+            true,
+            true,
+            false,
+        );
+        for (a, b, expected) in [
+            (0x3fc00000, 0x3f800001, 0x3fc00001),
+            (0xbfc00000, 0x3f800001, 0xbfc00001),
+            (0x7f7fffff, 0x40000000, 0x7f7fffff),
+            (0xff7fffff, 0x40000000, 0xff7fffff),
+            (0x00800000, 0x3f7fffff, 0),
+            (0x80800000, 0x3f000000, 0x80000000),
+            (1, 0xbf800000, 0x80000000),
+            (0x7f800000, 0xbf800000, 0xff800000),
+        ] {
+            assert_eq!(
+                evaluate_float_multiply(a, b, control, false).unwrap(),
+                expected
+            );
+        }
+        assert!(
+            f32::from_bits(evaluate_float_multiply(0, 0x7f800000, control, false).unwrap())
+                .is_nan()
+        );
+        assert_eq!(
+            evaluate_float_multiply(0x80000001, 0x7fc01234, control, true).unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn wgsl_grouping_inherits_only_the_consumed_components_interpolation() {

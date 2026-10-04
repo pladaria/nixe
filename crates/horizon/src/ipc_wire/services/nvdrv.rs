@@ -9,6 +9,7 @@ enum NvDrvCommand {
     QueryEvent,
     SetAruid,
     Ioctl2,
+    Ioctl3,
     SetGraphicsFirmwareMemoryMarginEnabled,
 }
 
@@ -22,6 +23,7 @@ impl NvDrvCommand {
             4 => Some(Self::QueryEvent),
             8 => Some(Self::SetAruid),
             11 => Some(Self::Ioctl2),
+            12 => Some(Self::Ioctl3),
             13 => Some(Self::SetGraphicsFirmwareMemoryMarginEnabled),
             _ => None,
         }
@@ -72,7 +74,7 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                 None,
             ))
         }
-        command @ (NvDrvCommand::Ioctl | NvDrvCommand::Ioctl2) => {
+        command @ (NvDrvCommand::Ioctl | NvDrvCommand::Ioctl2 | NvDrvCommand::Ioctl3) => {
             let Some(fd) = request_u32(request.data, 0) else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
@@ -84,6 +86,8 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                 // descriptor array in a second input auto-select buffer:
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nv.c#L172-L208
                 nv_ioctl2_buffers(hipc, ioctl)?
+            } else if command == NvDrvCommand::Ioctl3 {
+                nv_ioctl3_buffers(hipc, ioctl)?
             } else {
                 nv_ioctl_buffers(hipc, ioctl)?
             };
@@ -124,7 +128,17 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                     fd: NvDrvFileDescriptor::new(fd),
                     request: ioctl,
                     input: &input,
-                    additional_input: &additional_input,
+                    inline: if let Some(buffer) = buffers.additional_output {
+                        crate::nvdrv::NvDrvInlineBuffer::Output(
+                            usize::try_from(buffer.size).map_err(|_| {
+                                IpcWireError::Malformed("nvdrv inline output is too large")
+                            })?,
+                        )
+                    } else if command == NvDrvCommand::Ioctl2 {
+                        crate::nvdrv::NvDrvInlineBuffer::Input(&additional_input)
+                    } else {
+                        crate::nvdrv::NvDrvInlineBuffer::None
+                    },
                     process_id: process.process_id(),
                     address_space: process.cpu().address_space_id(),
                     translator: process.canonical_memory(),
@@ -147,6 +161,9 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
             }
             if let Some(output_descriptor) = buffers.output {
                 write_descriptor_bytes(process, output_descriptor, &response.output)?;
+            }
+            if let Some(output) = buffers.additional_output {
+                write_descriptor_bytes(process, output, &response.additional_output)?;
             }
             Ok((
                 encode_response(
@@ -233,7 +250,7 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
             // is no per-client state to allocate or firmware memory to reserve.
             // https://switchbrew.org/w/index.php?title=NV_services#SetGraphicsFirmwareMemoryMarginEnabled
             if request_u64(request.data, 0).is_none()
-                || !has_only_transport_padding(request.data, 8)
+                || !request.has_payload_size(8)
                 || has_ipc_descriptors(hipc)
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
@@ -306,6 +323,7 @@ struct NvIoctlBuffers {
     input: Option<BufferDescriptor>,
     additional_input: Option<BufferDescriptor>,
     output: Option<BufferDescriptor>,
+    additional_output: Option<BufferDescriptor>,
 }
 
 fn nv_ioctl_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuffers, IpcWireError> {
@@ -385,6 +403,7 @@ fn nv_ioctl_buffer_descriptors(
     };
 
     Ok(NvIoctlBuffers {
+        additional_output: None,
         input: select(
             *input,
             request & NV_IOCTL_WRITE != 0,
@@ -468,10 +487,49 @@ fn nv_ioctl2_buffer_descriptors(
         request,
     )?;
     Ok(NvIoctlBuffers {
+        additional_output: None,
         input: ordinary.input,
         additional_input: Some(*additional_input),
         output: ordinary.output,
     })
+}
+
+// Ioctl3 adds a second output AutoSelect buffer to the ordinary ioctl ABI.
+// https://github.com/switchbrew/libnx/blob/master/nx/source/services/nv.c
+fn nv_ioctl3_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuffers, IpcWireError> {
+    let [output, inline] = hipc.receive_buffers.as_slice() else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl3 requires two output buffers",
+        ));
+    };
+    let ReceiveStatics::Entries(pointers) = &hipc.receive_statics else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl3 requires two output pointers",
+        ));
+    };
+    let [output_pointer, inline_pointer] = pointers.as_slice() else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl3 requires two output pointers",
+        ));
+    };
+    if inline_pointer.size != 0
+        || inline.mode == BufferMode::Invalid
+        || inline.size > 0x10000
+        || (inline.size != 0 && inline.address == 0)
+    {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl3 inline output buffer is invalid",
+        ));
+    }
+    let mut buffers = nv_ioctl_buffer_descriptors(
+        &hipc.send_statics,
+        &hipc.send_buffers,
+        &[*output],
+        &ReceiveStatics::Entries(vec![*output_pointer]),
+        request,
+    )?;
+    buffers.additional_output = Some(*inline);
+    Ok(buffers)
 }
 
 #[cfg(test)]
@@ -513,6 +571,7 @@ mod tests {
         assert_eq!(
             ioctl_descriptors(buffer(0x1000, 40), buffer(0, 0), 0x4028_4109),
             Ok(NvIoctlBuffers {
+                additional_output: None,
                 input: Some(buffer(0x1000, 40)),
                 additional_input: None,
                 output: None,
@@ -543,6 +602,7 @@ mod tests {
             assert_eq!(
                 decode(input_pointer, output_pointer),
                 Ok(NvIoctlBuffers {
+                    additional_output: None,
                     input: Some(input),
                     additional_input: None,
                     output: Some(output),
@@ -572,6 +632,7 @@ mod tests {
             assert_eq!(
                 ioctl_descriptors(unused, buffer(0x1000, 4), 0x8004_4701),
                 Ok(NvIoctlBuffers {
+                    additional_output: None,
                     input: None,
                     additional_input: None,
                     output: Some(buffer(0x1000, 4)),
@@ -580,6 +641,7 @@ mod tests {
             assert_eq!(
                 ioctl_descriptors(buffer(0x1000, 40), unused, 0x4028_4109),
                 Ok(NvIoctlBuffers {
+                    additional_output: None,
                     input: Some(buffer(0x1000, 40)),
                     additional_input: None,
                     output: None,
@@ -657,6 +719,7 @@ mod tests {
                 0x4028_4109,
             ),
             Ok(NvIoctlBuffers {
+                additional_output: None,
                 input: Some(input),
                 additional_input: Some(additional),
                 output: None,
@@ -697,6 +760,7 @@ mod tests {
         assert_eq!(
             decode(&pointers, output_pointer),
             Ok(NvIoctlBuffers {
+                additional_output: None,
                 input: Some(input),
                 additional_input: Some(additional),
                 output: Some(output),

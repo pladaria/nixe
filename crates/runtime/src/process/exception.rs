@@ -65,6 +65,7 @@ impl RunnableProcess {
                 address_space_limit: self.address_space.exclusive_limit(),
                 memory_layout: self.memory_layout,
                 random_entropy: self.random_entropy,
+                thread_policy: self.thread_policy,
             },
             &mut self.memory_accounting,
             ExceptionProcessResources {

@@ -854,6 +854,19 @@ fn scalar_ram_addressing_and_extensions_match_interpreter() {
     }
 }
 
+#[test]
+fn prefetch_hints_leave_state_and_memory_unchanged_at_unmapped_addresses() {
+    for word in [
+        0xf980_0021, // PRFM PLDL1STRM,[X1]
+        0xf99f_ffe0, // PRFM PLDL1KEEP,[SP,#32760]
+        0xf89f_f023, // PRFUM PLDL2STRM,[X1,#-1]
+        0xf8a2_6824, // PRFM PLDL3KEEP,[X1,X2]
+        0xd81f_ffe1, // PRFM PLDL1STRM,PC-relative unmapped target
+    ] {
+        check_transfer_at(word, &[ARENA * 100]);
+    }
+}
+
 fn check_transfer(word: u32) {
     check_transfer_at(word, &[0, 1, 7, 4060]);
 }

@@ -71,6 +71,40 @@ fn check(word: u32, bits: u64, fpcr: u32) -> EdgeKind {
 }
 
 #[test]
+fn scalar_simd_fcvtzs_fcvtzu_match_native_and_exact_paths_with_traps() {
+    for wide in [false, true] {
+        let encode = |v: f64| {
+            if wide {
+                v.to_bits()
+            } else {
+                (v as f32).to_bits() as u64
+            }
+        };
+        for unsigned in [false, true] {
+            for rd in [0, 1, 31] {
+                let word = 0x5ea1_b820 | (u32::from(wide) << 22) | (u32::from(unsigned) << 29) | rd;
+                for bits in [
+                    0,
+                    encode(-0.0),
+                    encode(1.75),
+                    encode(-1.75),
+                    1,
+                    encode(2.0f64.powi(if wide { 64 } else { 32 })),
+                    encode(f64::INFINITY),
+                    encode(f64::NEG_INFINITY),
+                    encode(f64::NAN),
+                    encode(f64::INFINITY) | 1,
+                ] {
+                    for fpcr in [0, 1 << 24, 1 << 8, 1 << 12, 1 << 15, 3 << 22] {
+                        check(word, bits, fpcr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn truncating_fp_to_integer_matches_widths_boundaries_modes_and_traps() {
     for source_64 in [false, true] {
         let encode = |v: f64| {
