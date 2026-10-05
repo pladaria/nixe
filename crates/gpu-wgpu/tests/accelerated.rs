@@ -446,6 +446,7 @@ fn cpu_authored_rgb565_is_converted_by_a_reusable_gpu_import() {
     let presentation = initialized.presentation_context();
     let runtime = RuntimeOwner::new(initialized.into_runtime());
     let request = PresentationImageRequest {
+        allow_canonical_import: true,
         cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(source.range()).unwrap(),
         backing: source,
         width: 4,
@@ -726,6 +727,106 @@ fn read_presented_rgba(
 }
 
 #[test]
+fn opaque_presentation_requires_a_current_device_producer() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(707),
+        NonCpuDeviceId::new(707),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let page = initialized_page(&[0; 256]);
+    let (creations, backing, image, subresources) =
+        backed_color_image(ImageFormat::Rgba8Unorm, 8, 8, std::slice::from_ref(&page));
+    let presentation = initialized.presentation_context();
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let request = PresentationImageRequest {
+        allow_canonical_import: false,
+        cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(backing.range()).unwrap(),
+        backing: backing.clone(),
+        width: 8,
+        height: 8,
+        format: PresentationImageFormat::Rgba8,
+        layout: ImageMemoryLayout::PitchLinear {
+            row_pitch: 32,
+            layer_stride: 256,
+        },
+        row_pitch: 32,
+    };
+    assert!(
+        runtime
+            .runtime()
+            .acquire_presentable_image(request.clone())
+            .is_err()
+    );
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                8,
+                8,
+                [1.0, 0.0, 0.0, 1.0],
+                707,
+            ),
+        )
+        .unwrap();
+    let destination = nixe_gpu::ImageRegion {
+        image,
+        subresources,
+        origin: nixe_gpu::ImageOrigin { x: 2, y: 3, z: 0 },
+        extent: ImageExtent::new(3, 1, 1).unwrap(),
+    };
+    runtime
+        .runtime()
+        .submit(
+            &[],
+            &[],
+            &OperationSubmission::new(
+                FrontendSubmissionId::new(708),
+                vec![],
+                vec![GpuOperation::new(
+                    GpuCommand::UploadImage {
+                        destination,
+                        bytes: [0, 0, 255, 255].repeat(3).into(),
+                    },
+                    [],
+                    [],
+                    CapabilityRequirements::none(),
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let resident = runtime
+        .runtime()
+        .acquire_presentable_image(request.clone())
+        .unwrap();
+    let mut expected = [255, 0, 0, 255].repeat(64);
+    expected[(3 * 8 + 2) * 4..(3 * 8 + 5) * 4].copy_from_slice(&[0, 0, 255, 255].repeat(3));
+    assert_eq!(read_presented_rgba(&presentation, &resident), expected);
+    page.prepare_write().unwrap();
+    let generation = page.content_generation();
+    page.write_preflighted(0, &[0, 255, 0, 255], generation, generation.next().unwrap())
+        .unwrap();
+    let request = PresentationImageRequest {
+        cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(backing.range()).unwrap(),
+        ..request
+    };
+    assert!(
+        runtime
+            .runtime()
+            .acquire_presentable_image(request)
+            .is_err()
+    );
+}
+
+#[test]
 fn presentation_reconciles_mixed_cpu_and_device_pages() {
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
@@ -766,6 +867,7 @@ fn presentation_reconciles_mixed_cpu_and_device_pages() {
         nixe_memory::VisibilityState::GpuNewer { .. }
     ));
     let request = PresentationImageRequest {
+        allow_canonical_import: true,
         cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(backing.range()).unwrap(),
         backing,
         width: 64,
@@ -1237,6 +1339,7 @@ fn partial_image_clear_preserves_texels_and_reuses_device_authored_presentation(
     }
 
     let presentation_request = |backing: BackingView, cpu_writes| PresentationImageRequest {
+        allow_canonical_import: true,
         backing,
         width: WIDTH,
         height: HEIGHT,
@@ -1625,6 +1728,26 @@ fn accelerated_draw_scissor_clips_fragments_and_resets_between_draws() {
     }
 }
 
+#[test]
+fn accelerated_triangle_fans_preserve_interpolation_and_last_provoking_vertex() {
+    for interpolation in [
+        ShaderInterpolation::Constant,
+        ShaderInterpolation::Perspective,
+        ShaderInterpolation::ScreenLinear,
+    ] {
+        accelerated_polygon_color_draw(
+            PrimitiveTopology::TriangleFan,
+            interpolation,
+            false,
+            VertexFormat::Float32x3,
+            None,
+            None,
+            false,
+            None,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn accelerated_polygon_color_draw(
     topology: PrimitiveTopology,
@@ -1695,6 +1818,10 @@ fn accelerated_polygon_color_draw(
         ),
     });
 
+    let square = matches!(
+        topology,
+        PrimitiveTopology::Quads | PrimitiveTopology::TriangleFan
+    );
     let mut vertex_bytes = Vec::new();
     let triangle_vertices = [
         -0.5_f32, -0.5, 0.0, 1.0, 0.0, 0.0, 0.5, -0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
@@ -1715,7 +1842,7 @@ fn accelerated_polygon_color_draw(
         &quad_vertices[6..],
     ]
     .concat();
-    let vertices: &[f32] = if topology == PrimitiveTopology::Quads {
+    let vertices: &[f32] = if square {
         &repeated_quads
     } else {
         &triangle_vertices
@@ -1723,7 +1850,7 @@ fn accelerated_polygon_color_draw(
     for (index, vertex) in vertices.chunks_exact(6).enumerate() {
         // Different clip W values distinguish perspective from screen-linear
         // interpolation while keeping the projected square at pixels 8..24.
-        let w = if topology == PrimitiveTopology::Quads && index % 5 != 0 && index < 10 {
+        let w = if square && index % 5 != 0 && index < 10 {
             [1.0_f32, 2.0, 4.0, 2.0][index % 5 - 1]
         } else {
             1.0
@@ -1920,8 +2047,10 @@ fn accelerated_polygon_color_draw(
     let mut draw = DrawOperation::new(
         Arc::new(prepared),
         DrawArguments::NonIndexed {
-            first_vertex: u32::from(topology == PrimitiveTopology::Quads),
-            vertex_count: if topology == PrimitiveTopology::Quads {
+            first_vertex: u32::from(square),
+            vertex_count: if topology == PrimitiveTopology::TriangleFan {
+                4
+            } else if square {
                 7
             } else {
                 3
@@ -1931,12 +2060,16 @@ fn accelerated_polygon_color_draw(
         },
     )
     .unwrap();
-    let second_draw = if topology == PrimitiveTopology::Quads {
+    let second_draw = if square {
         DrawOperation::new(
             Arc::clone(&draw.prepared),
             DrawArguments::NonIndexed {
                 first_vertex: 6,
-                vertex_count: 7,
+                vertex_count: if topology == PrimitiveTopology::TriangleFan {
+                    4
+                } else {
+                    7
+                },
                 first_instance: 2,
                 instance_count: 2,
             },
@@ -2015,6 +2148,7 @@ fn accelerated_polygon_color_draw(
     let resident = runtime
         .runtime()
         .acquire_presentable_image(PresentationImageRequest {
+            allow_canonical_import: true,
             cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(image_backing.range())
                 .unwrap(),
             backing: image_backing.clone(),
@@ -2069,14 +2203,18 @@ fn accelerated_polygon_color_draw(
         return;
     }
 
-    if topology == PrimitiveTopology::Quads {
+    if square {
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
                 let expected = if (8..24).contains(&x) && (8..24).contains(&y) {
                     if let Some((_, expected)) = color_output {
                         expected
                     } else if interpolation == ShaderInterpolation::Constant {
-                        [255, 255, 0, 255]
+                        if topology == PrimitiveTopology::TriangleFan && x + y >= 31 {
+                            [0, 0, 255, 255]
+                        } else {
+                            [255, 255, 0, 255]
+                        }
                     } else {
                         let u = (x as f32 + 0.5 - 8.0) / 16.0;
                         let v = (24.0 - y as f32 - 0.5) / 16.0;

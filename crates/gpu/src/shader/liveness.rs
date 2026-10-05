@@ -69,6 +69,8 @@ pub(super) fn live_instructions(
             | ShaderOperation::Move32 { .. }
             | ShaderOperation::FloatAbsolute32 { .. }
             | ShaderOperation::FloatNegate32 { .. }
+            | ShaderOperation::UnpackHalf32 { .. }
+            | ShaderOperation::PackHalf32 { .. }
             | ShaderOperation::ConvertIntegerToFloat32 { .. }
             | ShaderOperation::RoundFloat32ToIntegral { .. }
             | ShaderOperation::ConvertFloat32ToInteger { .. }

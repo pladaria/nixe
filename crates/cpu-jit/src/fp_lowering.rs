@@ -27,7 +27,7 @@ impl Translator<'_> {
             let bits = self.vector_as(value, types::I128);
             let integer_ty = if lane_64 { types::I64 } else { types::I32 };
             let bits = self.builder.ins().ireduce(types::I64, bits);
-            let result = self.integer_to_fp_value(bits, lane_64, lane_64, signed);
+            let result = self.integer_to_fp_value(bits, lane_64, lane_64, signed, 0);
             let bits = self
                 .builder
                 .ins()
@@ -160,6 +160,7 @@ impl Translator<'_> {
         source_64: bool,
         destination_64: bool,
         signed: bool,
+        fractional_bits: u8,
     ) -> Value {
         let value = if source_64 {
             value
@@ -171,11 +172,36 @@ impl Translator<'_> {
         } else {
             types::F32
         };
-        if signed {
+        let converted = if signed {
             self.builder.ins().fcvt_from_sint(ty, value)
         } else {
             self.builder.ins().fcvt_from_uint(ty, value)
+        };
+        if fractional_bits == 0 {
+            return converted;
         }
+        // Fixed W/X-to-S/D conversions cannot underflow. Scaling by 2^-fbits
+        // is an exact exponent adjustment after the FPCR-rounded conversion;
+        // it preserves zero and adds no host exceptions or second rounding.
+        // Arm A64 ISA, SCVTF/UCVTF (scalar, fixed-point):
+        // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+        let integer_ty = if destination_64 {
+            types::I64
+        } else {
+            types::I32
+        };
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(integer_ty, bitcast_flags(), converted);
+        let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, value, 0);
+        let shift = if destination_64 { 52 } else { 23 };
+        let scaled = self
+            .builder
+            .ins()
+            .iadd_imm_s(bits, -(i64::from(fractional_bits) << shift));
+        let scaled = self.builder.ins().select(zero, bits, scaled);
+        self.builder.ins().bitcast(ty, bitcast_flags(), scaled)
     }
 
     /// x86 FMA tininess guard, with normal/zero operands checked separately.
@@ -365,6 +391,8 @@ impl Translator<'_> {
         use crate::abi::FpUnaryKind;
         use nixe_cpu::decode::a64::fp_simd::FloatConversion;
         match kind {
+            FpUnaryKind::ConvertLong { .. } => self.builder.ins().fvpromote_low(input),
+            FpUnaryKind::ConvertNarrow { .. } => self.builder.ins().fvdemote(input),
             FpUnaryKind::SquareRoot { .. } => self.builder.ins().sqrt(input),
             FpUnaryKind::Convert(FloatConversion::SingleToDouble) => {
                 self.builder.ins().fpromote(types::F64, input)
@@ -465,6 +493,11 @@ impl Translator<'_> {
         match operation {
             FloatAddOperation::Add => self.builder.ins().fadd(first, second),
             FloatAddOperation::Subtract => self.builder.ins().fsub(first, second),
+            // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (FABD pp. 1174–1176)
+            FloatAddOperation::AbsoluteDifference => {
+                let difference = self.builder.ins().fsub(first, second);
+                self.builder.ins().fabs(difference)
+            }
         }
     }
     /// AArch64's FRINTN/P/M/Z do not set IXC. Call only on finite normal/zero

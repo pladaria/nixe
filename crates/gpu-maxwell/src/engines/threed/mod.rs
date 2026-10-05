@@ -113,16 +113,17 @@ pub use output::{
     MaxwellThreeDBlendControlState, MaxwellThreeDBlendEnableCommon, MaxwellThreeDBlendFactor,
     MaxwellThreeDBlendFloatPixelKillEnable, MaxwellThreeDBlendOp,
     MaxwellThreeDBlendPerFormatEnable, MaxwellThreeDBlendZeroTimesAnythingIsZero,
-    MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorMask, MaxwellThreeDCompareOp,
-    MaxwellThreeDCullFace, MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
-    MaxwellThreeDFixedFunctionValue, MaxwellThreeDFixedFunctionWrite, MaxwellThreeDFrontFace,
-    MaxwellThreeDIteratedBlend, MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDLogicOp,
-    MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPolygonMode,
-    MaxwellThreeDProvokingVertex, MaxwellThreeDSampleMode, MaxwellThreeDScissorState,
-    MaxwellThreeDShadeMode, MaxwellThreeDStencilOp, MaxwellThreeDSurfaceClipAxis,
-    MaxwellThreeDViewportClipControl, MaxwellThreeDViewportCoordinateSwizzle,
-    MaxwellThreeDViewportScaleOffsetEnable, MaxwellThreeDViewportSwizzleComponent,
-    MaxwellThreeDViewportTransformState, MaxwellThreeDWindowClipState, MaxwellThreeDWindowClipType,
+    MaxwellThreeDClipAxis, MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorMask,
+    MaxwellThreeDCompareOp, MaxwellThreeDCullFace, MaxwellThreeDFixedFunctionRegister,
+    MaxwellThreeDFixedFunctionState, MaxwellThreeDFixedFunctionValue,
+    MaxwellThreeDFixedFunctionWrite, MaxwellThreeDFrontFace, MaxwellThreeDIteratedBlend,
+    MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDLogicOp, MaxwellThreeDPixelShaderClampRange,
+    MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPolygonMode, MaxwellThreeDProvokingVertex,
+    MaxwellThreeDSampleMode, MaxwellThreeDScissorState, MaxwellThreeDShadeMode,
+    MaxwellThreeDStencilOp, MaxwellThreeDViewportClipControl,
+    MaxwellThreeDViewportCoordinateSwizzle, MaxwellThreeDViewportScaleOffsetEnable,
+    MaxwellThreeDViewportSwizzleComponent, MaxwellThreeDViewportTransformState,
+    MaxwellThreeDWindowClipState, MaxwellThreeDWindowClipType,
 };
 pub use render_enable::{
     MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDRenderEnableMode,
@@ -204,6 +205,7 @@ pub use zcull::{
     MaxwellThreeDZCullRegionFormat, MaxwellThreeDZCullRegionId, MaxwellThreeDZCullRegionLocation,
     MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
     MaxwellThreeDZCullStencilFunction, MaxwellThreeDZCullSubregion,
+    MaxwellThreeDZCullSubregionAlgorithm, MaxwellThreeDZCullSubregionAllocation,
 };
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
@@ -225,6 +227,10 @@ const CLASS_NAME: &str = "MAXWELL_B";
 
 #[derive(Clone, Copy)]
 enum PendingOperation {
+    Notification {
+        address: u64,
+        source: crate::MaxwellMethodSource,
+    },
     ThreeD(MaxwellThreeDOperationTrigger),
     Synchronization(MaxwellThreeDSynchronizationTrigger),
     InlineToMemory(MaxwellInlineToMemoryUpload),
@@ -294,7 +300,11 @@ const fn state_inline_constant_buffer(
 
 #[derive(Clone, Copy)]
 enum MethodAction {
+    NotifyAddress,
+    Notify,
     NoOperation,
+    Delay,
+    VpcPerfKnob,
     DecompressSurface,
     WaitForIdle,
     PixelShaderBarrier,
@@ -321,7 +331,9 @@ enum MethodAction {
     ColorReductionThresholdsUnorm16,
     ColorReductionThresholdsFp16,
     ColorReductionThresholdsSrgb8,
+    OpportunisticEarlyZHysteresis,
     ApiMandatedEarlyZ,
+    PostPsInitialCoverage,
     PostZPixelShaderImask,
     PixelShaderInterlockControl,
     ConstantColorRenderingEnable,
@@ -371,6 +383,11 @@ enum MethodAction {
     CsaaEnable,
     AliasedLineWidthEnable,
     ActiveZCullRegion,
+    ZCullStorage(usize),
+    ZCullSubregionAllocation,
+    ZCullSubregionAlgorithm,
+    ZCullReportSelection,
+    ZCullReportType,
     ZCullRegionLocation,
     ZCullRegionAliquots,
     ZCullRegionFormat,
@@ -379,6 +396,7 @@ enum MethodAction {
     ZCullSubregion,
     ZCullDirectionFormat,
     ZCullMaintenance,
+    ClearReportValue,
     ZCullStatsEnable,
     ZPassPixelCountEnable,
     ZCullCriterion,
@@ -386,7 +404,6 @@ enum MethodAction {
     ZCullBounds,
     DrawVertexArray,
     DrawIndexBuffer,
-    Unsupported,
     Missing(MaxwellEngineCapability),
 }
 
@@ -428,6 +445,8 @@ methods!(
         MethodAction::DecompressSurface
     ),
     PIPE_NOP => (0x1a2c, "PIPE_NOP", u32::MAX, MethodAction::NoOperation),
+    DELAY => (0x1a24, "DELAY", u32::MAX, MethodAction::Delay),
+    SET_VPC_PERF_KNOB => (0x0f14, "SET_VPC_PERF_KNOB", u32::MAX, MethodAction::VpcPerfKnob),
     SET_INSTRUMENTATION_METHOD_HEADER => (
         0x0150,
         "SET_INSTRUMENTATION_METHOD_HEADER",
@@ -482,12 +501,14 @@ methods!(
         u32::MAX,
         MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Alpha)
     ),
+    SET_OPPORTUNISTIC_EARLY_Z_HYSTERESIS => (0x0204, "SET_OPPORTUNISTIC_EARLY_Z_HYSTERESIS", 0x1f, MethodAction::OpportunisticEarlyZHysteresis),
     SET_API_MANDATED_EARLY_Z => (
         0x0210,
         "SET_API_MANDATED_EARLY_Z",
         0x0000_0001,
         MethodAction::ApiMandatedEarlyZ
     ),
+    SET_POST_PS_INITIAL_COVERAGE => (0x1138, "SET_POST_PS_INITIAL_COVERAGE", 1, MethodAction::PostPsInitialCoverage),
     SET_POST_Z_PS_IMASK => (
         0x0f1c,
         "SET_POST_Z_PS_IMASK",
@@ -895,8 +916,10 @@ methods!(
         0x0104,
         "SET_NOTIFY_A",
         0x0000_00ff,
-        MethodAction::Unsupported
+        MethodAction::NotifyAddress
     ),
+    SET_NOTIFY_B => (0x0108, "SET_NOTIFY_B", u32::MAX, MethodAction::NotifyAddress),
+    NOTIFY => (0x010c, "NOTIFY", u32::MAX, MethodAction::Notify),
     WAIT_FOR_IDLE => (
         0x0110,
         "WAIT_FOR_IDLE",
@@ -1013,6 +1036,12 @@ methods!(
     SET_ZCULL_REGION_LOCATION => (
         0x07e0, "SET_ZCULL_REGION_LOCATION", u32::MAX, MethodAction::ZCullRegionLocation
     ),
+    // Hierarchical depth cache backing, separate from the depth attachment.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L639-L649
+    SET_ZCULL_STORAGE_A => (0x07e8, "SET_ZCULL_STORAGE_A", 0xff, MethodAction::ZCullStorage(0)),
+    SET_ZCULL_STORAGE_B => (0x07ec, "SET_ZCULL_STORAGE_B", u32::MAX, MethodAction::ZCullStorage(1)),
+    SET_ZCULL_STORAGE_C => (0x07f0, "SET_ZCULL_STORAGE_C", 0xff, MethodAction::ZCullStorage(2)),
+    SET_ZCULL_STORAGE_D => (0x07f4, "SET_ZCULL_STORAGE_D", u32::MAX, MethodAction::ZCullStorage(3)),
     SET_ZCULL_REGION_ALIQUOTS => (
         0x07e4, "SET_ZCULL_REGION_ALIQUOTS", 0xffff, MethodAction::ZCullRegionAliquots
     ),
@@ -1043,15 +1072,30 @@ methods!(
         0x07cc, "SET_ZCULL_REGION_PIXEL_OFFSET_C", 0xffff,
         MethodAction::ZCullRegionPixelOffset(MaxwellThreeDZCullAxis::Depth)
     ),
+    // Allocation layout and policy are cache optimization state, not attachments.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L351-L378
+    SET_ZCULL_SUBREGION_TO_REPORT => (0x036c, "SET_ZCULL_SUBREGION_TO_REPORT", 0x0ff1, MethodAction::ZCullReportSelection),
+    SET_ZCULL_SUBREGION_REPORT_TYPE => (0x0370, "SET_ZCULL_SUBREGION_REPORT_TYPE", 0x71, MethodAction::ZCullReportType),
+    SET_ZCULL_SUBREGION_ALLOCATION => (0x02f8, "SET_ZCULL_SUBREGION_ALLOCATION", 0x0fff_ffff, MethodAction::ZCullSubregionAllocation),
+    ASSIGN_ZCULL_SUBREGIONS => (0x02fc, "ASSIGN_ZCULL_SUBREGIONS", 3, MethodAction::ZCullSubregionAlgorithm),
     SET_ZCULL_SUBREGION => (
         0x02e8, "SET_ZCULL_SUBREGION", 0x0fff_fff1, MethodAction::ZCullSubregion
     ),
     SET_ZCULL_DIR_FORMAT => (
         0x0dbc, "SET_ZCULL_DIR_FORMAT", u32::MAX, MethodAction::ZCullDirectionFormat
     ),
+    CLEAR_REPORT_VALUE => (0x1530, "CLEAR_REPORT_VALUE", 0x1f, MethodAction::ClearReportValue),
     CLEAR_ZCULL_REGION => (
         0x12c8, "CLEAR_ZCULL_REGION", 0x001f_ffff, MethodAction::ZCullMaintenance
     ),
+    // Save/restore only the optional hierarchical culling cache. The neutral
+    // renderer keeps ordinary depth testing authoritative and has no Maxwell
+    // Z-cull cache to serialize; do not fabricate a hardware cache encoding.
+    // Existing emulator semantics also leave these outside executable methods:
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_3d.cpp
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2647-L2659
+    STORE_ZCULL => (0x1464, "STORE_ZCULL", 1, MethodAction::ZCullMaintenance),
+    LOAD_ZCULL => (0x1500, "LOAD_ZCULL", 1, MethodAction::ZCullMaintenance),
     INVALIDATE_ZCULL => (
         0x1958, "INVALIDATE_ZCULL", 0, MethodAction::ZCullMaintenance
     ),
@@ -1224,6 +1268,7 @@ where
         self.candidate
             .raw_register(method)
             .and_then(MaxwellThreeDRegister::raw)
+            .or_else(|| state::verified_raw_register_reset(method))
             .ok_or_else(|| {
                 MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::MmeExecution {
                     source: self.source,
@@ -1275,6 +1320,9 @@ fn lower_pending_operation(
     _state: &MaxwellThreeDFrontendState,
 ) -> Option<PendingEngineOperation> {
     operation.map(|operation| match operation {
+        PendingOperation::Notification { address, source } => {
+            PendingEngineOperation::Notification { address, source }
+        }
         PendingOperation::ThreeD(trigger) => PendingEngineOperation::ThreeD(trigger),
         PendingOperation::Synchronization(trigger) => {
             PendingEngineOperation::ThreeDSynchronization(trigger)
@@ -1371,13 +1419,18 @@ fn preflight_register(
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let (operation, writes_state) = if matches!(
-            write,
-            MaxwellThreeDStateWrite::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::ClearSurface { .. }
-            )
-        ) {
-            state_operation(MaxwellThreeDOperationTrigger::ClearSurface { source })
+        let (operation, writes_state) = if let MaxwellThreeDStateWrite::RenderTarget(
+            MaxwellThreeDRenderTargetWrite::ClearSurface { value, .. },
+        ) = write
+        {
+            // A zero component mask writes no attachment. Retain the register
+            // for shadow replay without resolving or materializing resources.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+            if value.depth() || value.stencil() || value.color_mask() != 0 {
+                state_operation(MaxwellThreeDOperationTrigger::ClearSurface { source })
+            } else {
+                state_write()
+            }
         } else {
             state_write()
         };
@@ -1404,9 +1457,74 @@ fn preflight_register(
             defined_mask: declaration.defined_mask,
         });
     }
+    // The documented notification request completes after the following method.
+    // NO_OPERATION is the explicit way to request notification without other work.
+    // Other completion-producing methods and the interrupt variant stay unsupported.
+    // https://envytools.readthedocs.io/en/latest/hw/graph/intro.html#notify-method
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L33-L40
+    if candidate.pending_notification.is_some()
+        && !matches!(declaration.action, MethodAction::NoOperation)
+    {
+        return Err(invalid_encoding(
+            source,
+            declaration.metadata.method_name(),
+            "pending notification requires completion of a method other than NO_OPERATION",
+        ));
+    }
     let (operation, writes_state) =
         match declaration.action {
-            MethodAction::NoOperation => no_operation(),
+            MethodAction::NotifyAddress => state_write(),
+            MethodAction::Notify => {
+                if source.argument() != 0 {
+                    return Err(MaxwellEngineDispatchError::UnsupportedMethod {
+                        source,
+                        metadata: declaration.metadata,
+                    });
+                }
+                let high = candidate
+                    .raw_register(GpuMethodId(0x0104))
+                    .and_then(state::MaxwellThreeDRegister::raw);
+                let low = candidate
+                    .raw_register(GpuMethodId(0x0108))
+                    .and_then(state::MaxwellThreeDRegister::raw);
+                let (Some(high), Some(low)) = (high, low) else {
+                    return Err(invalid_encoding(
+                        source,
+                        declaration.metadata.method_name(),
+                        "notification address has not been programmed",
+                    ));
+                };
+                candidate.pending_notification =
+                    Some(((u64::from(high) << 32) | u64::from(low), source));
+                state_write()
+            }
+            MethodAction::NoOperation => {
+                if let Some((address, source)) = candidate.pending_notification.take() {
+                    (
+                        Some(PendingOperation::Notification { address, source }),
+                        false,
+                    )
+                } else {
+                    no_operation()
+                }
+            }
+            MethodAction::Delay => {
+                // Match the functional emulation contract of Eden and Ryujinx:
+                // retain the full register value for MME reads and shadow RAM,
+                // without a host sleep, GPU barrier, or pipeline-state change.
+                // Neither implementation models the hardware delay duration.
+                // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_3d.cpp#L301-L405
+                // https://git.axenov.dev/Museum/ryujinx/src/commit/ec3e848d7998038ce22c41acdbf81032bf47991f/Ryujinx.Graphics.Gpu/Engine/Threed/ThreedClassState.cs#L797
+                state_write()
+            }
+            MethodAction::VpcPerfKnob => {
+                // VPC work-distribution policy has four full-byte fields for
+                // culled small lines/triangles and nonculled lines/points/triangles.
+                // Preserve them for MME reads and replay; host work distribution
+                // is chosen by the host driver rather than Maxwell's VPC.
+                // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1215-L1219
+                state_write()
+            }
             MethodAction::DiscardRenderTarget => {
                 // A discard relinquishes preservation of the selected target's
                 // contents; it is not a clear, unbind, deallocation, or barrier.
@@ -1418,6 +1536,21 @@ fn preflight_register(
                 // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L514-L530
                 // Discard/invalidation permits retained contents, not a required
                 // replacement value: https://registry.khronos.org/OpenGL/specs/gl/glspec43.core.pdf section 17.4.4.
+                no_operation()
+            }
+            MethodAction::ClearReportValue => {
+                // Type 2 resets the hierarchical Z-cull statistics. We do not
+                // run that guest cache, so there is no accumulated cache work
+                // to reset. Counter reporting remains explicitly unsupported;
+                // resetting this cache must not clear depth or other counters.
+                // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2722-L2741
+                if source.argument() != 2 {
+                    return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                        source,
+                        method_name: "CLEAR_REPORT_VALUE",
+                        reason: "resetting non-Z-cull performance counters is not implemented",
+                    });
+                }
                 no_operation()
             }
             MethodAction::ZCullMaintenance => {
@@ -1741,6 +1874,23 @@ fn preflight_register(
                 candidate.apply(write);
                 state_write()
             }
+            MethodAction::OpportunisticEarlyZHysteresis => {
+                let raw = source.argument();
+                if raw > 19 && raw != 31 {
+                    return Err(invalid_encoding(
+                        source,
+                        "SET_OPPORTUNISTIC_EARLY_Z_HYSTERESIS",
+                        "undefined primitive-area threshold",
+                    ));
+                }
+                candidate.apply(MaxwellThreeDStateWrite::ShaderExecution(
+                    MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis {
+                        value: raw as u8,
+                        source,
+                    },
+                ));
+                state_write()
+            }
             MethodAction::ApiMandatedEarlyZ => {
                 let value = MaxwellThreeDApiMandatedEarlyZ::parse(source.argument()).ok_or(
                     MaxwellEngineDispatchError::InvalidMethodValue {
@@ -1753,6 +1903,15 @@ fn preflight_register(
                     MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source },
                 );
                 candidate.apply(write);
+                state_write()
+            }
+            MethodAction::PostPsInitialCoverage => {
+                candidate.apply(MaxwellThreeDStateWrite::Coverage(
+                    MaxwellThreeDCoverageStateWrite::PostPsInitialCoverage {
+                        value: source.argument() != 0,
+                        source,
+                    },
+                ));
                 state_write()
             }
             MethodAction::PostZPixelShaderImask => {
@@ -2384,6 +2543,71 @@ fn preflight_register(
                 candidate.apply(write);
                 state_write()
             }
+            MethodAction::ZCullReportSelection => {
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::ReportSelection {
+                        value: source.argument(),
+                        source,
+                    },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullReportType => {
+                if source.argument() >> 4 > 3 {
+                    return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                        source,
+                        method_name: "SET_ZCULL_SUBREGION_REPORT_TYPE",
+                        reason: "reserved Z-cull report type",
+                    });
+                }
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::ReportType {
+                        value: source.argument(),
+                        source,
+                    },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullSubregionAllocation => {
+                let value = MaxwellThreeDZCullSubregionAllocation::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodEncoding {
+                        source,
+                        method_name: "SET_ZCULL_SUBREGION_ALLOCATION",
+                        reason: "reserved Z-cull allocation format",
+                    },
+                )?;
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::SubregionAllocation { value, source },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullSubregionAlgorithm => {
+                let value = match source.argument() {
+                    0 => MaxwellThreeDZCullSubregionAlgorithm::Static,
+                    1 => MaxwellThreeDZCullSubregionAlgorithm::Adaptive,
+                    _ => {
+                        return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                            source,
+                            method_name: "ASSIGN_ZCULL_SUBREGIONS",
+                            reason: "reserved Z-cull assignment algorithm",
+                        });
+                    }
+                };
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::SubregionAlgorithm { value, source },
+                ));
+                state_write()
+            }
+            MethodAction::ZCullStorage(index) => {
+                candidate.apply(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::Storage {
+                        index,
+                        value: source.argument(),
+                        source,
+                    },
+                ));
+                state_write()
+            }
             MethodAction::ZCullRegionLocation => {
                 candidate.apply(MaxwellThreeDStateWrite::ZCull(
                     MaxwellThreeDZCullStateWrite::RegionLocation {
@@ -2563,12 +2787,6 @@ fn preflight_register(
                     source,
                     index_count: source.argument(),
                 })
-            }
-            MethodAction::Unsupported => {
-                return Err(MaxwellEngineDispatchError::UnsupportedMethod {
-                    source,
-                    metadata: declaration.metadata,
-                });
             }
             MethodAction::Missing(capability) => {
                 return Err(MaxwellEngineDispatchError::MissingCapability {
@@ -2807,7 +3025,20 @@ fn preflight_vertex_and_binding_state(
     let method = source.method().0;
     let raw = source.argument();
 
-    let vertex = if (0x1160..0x11e0).contains(&method) && method & 3 == 0 {
+    let vertex = if (0x1120..0x1130).contains(&method) && method & 3 == 0 {
+        Some((
+            V::AttributeSkipMask {
+                index: ((method - 0x1120) / 4) as u8,
+                value: raw,
+                source,
+            },
+            if method < 0x1128 {
+                "SET_DA_OUTPUT_ATTRIBUTE_SKIP_MASK_A"
+            } else {
+                "SET_DA_OUTPUT_ATTRIBUTE_SKIP_MASK_B"
+            },
+        ))
+    } else if (0x1160..0x11e0).contains(&method) && method & 3 == 0 {
         let attribute = ((method - 0x1160) / 4) as u8;
         let value = MaxwellThreeDVertexAttributeFormat::parse(raw).ok_or_else(|| {
             invalid_encoding(
@@ -3766,6 +3997,22 @@ fn preflight_output_state(
                 "reserved bits are set",
             ));
         }
+        // Disabling sRGB writes selects the linear attachment interpretation.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2883-L2886
+        0x15b8 if raw <= 1 => Some((
+            MaxwellThreeDRenderTargetWrite::SrgbWrite {
+                value: raw != 0,
+                source,
+            },
+            "SET_SRGB_WRITE",
+        )),
+        0x15b8 => {
+            return Err(invalid_encoding(
+                source,
+                "SET_SRGB_WRITE",
+                "reserved sRGB-write bits are set",
+            ));
+        }
         0x0fac => {
             let value = MaxwellThreeDSeparateFragmentData::parse(raw).ok_or_else(|| {
                 invalid_encoding(
@@ -3810,6 +4057,22 @@ fn preflight_output_state(
             MaxwellThreeDRenderTargetWrite::DepthAddressLower { value: raw, source },
             "SET_ZT_B",
         )),
+        // Sparse depth compare applies only when the attachment is consumed.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1922-L1928
+        0x1208 if raw & !3 == 0 => Some((
+            MaxwellThreeDRenderTargetWrite::DepthSparse {
+                value: raw as u8,
+                source,
+            },
+            "SET_ZT_SPARSE",
+        )),
+        0x1208 => {
+            return Err(invalid_encoding(
+                source,
+                "SET_ZT_SPARSE",
+                "reserved sparse-depth bits are set",
+            ));
+        }
         0x0fe8 => {
             let value = MaxwellThreeDDepthStencilFormat::parse(raw).ok_or_else(|| {
                 invalid_encoding(
@@ -4029,7 +4292,7 @@ fn preflight_output_state(
         let vertical = method == 0x0ff8;
         let write = MaxwellThreeDFixedFunctionWrite::SurfaceClip {
             vertical,
-            value: MaxwellThreeDSurfaceClipAxis::parse(raw),
+            value: MaxwellThreeDClipAxis::parse(raw),
             source,
         };
         return Ok(Some((
@@ -4057,6 +4320,25 @@ fn preflight_output_state(
                 "SET_VIEWPORT_SCALE_OR_OFFSET",
             )));
         }
+        if field == 7 {
+            if raw & !0x1f1f != 0 {
+                return Err(invalid_encoding(
+                    source,
+                    "SET_VIEWPORT_INCREASE_SNAP_GRID_PRECISION",
+                    "reserved precision bits are set",
+                ));
+            }
+            return Ok(Some((
+                MaxwellThreeDStateWrite::FixedFunction(
+                    MaxwellThreeDFixedFunctionWrite::ViewportSnapGridPrecision {
+                        viewport,
+                        value: [(raw & 31) as u8, ((raw >> 8) & 31) as u8],
+                        source,
+                    },
+                ),
+                "SET_VIEWPORT_INCREASE_SNAP_GRID_PRECISION",
+            )));
+        }
         if field == 6 {
             let value = MaxwellThreeDViewportCoordinateSwizzle::parse(raw).ok_or_else(|| {
                 invalid_encoding(
@@ -4082,14 +4364,8 @@ fn preflight_output_state(
         let field = (method - 0x0c00) % 0x10;
         let write = match field {
             0 | 4 => {
-                let value = rectangle(raw).ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_VIEWPORT_CLIP",
-                        "rectangle minimum exceeds maximum",
-                    )
-                })?;
-                MaxwellThreeDFixedFunctionWrite::ViewportRectangle {
+                let value = MaxwellThreeDClipAxis::parse(raw);
+                MaxwellThreeDFixedFunctionWrite::ViewportClip {
                     viewport,
                     vertical: field == 4,
                     value,
@@ -4323,6 +4599,27 @@ fn preflight_output_state(
             },
             V::Boolean(checked_bool(source, "SET_POLY_OFFSET")?),
             "SET_POLY_OFFSET",
+        ),
+        // These float parameters are inactive unless polygon offset is enabled
+        // for the consumed polygon mode. The raster lowering boundary rejects
+        // enabled depth bias explicitly until the host pipeline implements it.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2782-L2783
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2888-L2889
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3327-L3328
+        0x156c => (
+            R::SlopeScaleDepthBias,
+            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
+            "SET_SLOPE_SCALE_DEPTH_BIAS",
+        ),
+        0x15bc => (
+            R::DepthBias,
+            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
+            "SET_DEPTH_BIAS",
+        ),
+        0x187c => (
+            R::DepthBiasClamp,
+            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
+            "SET_DEPTH_BIAS_CLAMP",
         ),
         0x0df8 if raw <= 0x1ffff => (R::WindowOffsetX, V::Mask(raw), "SET_WINDOW_OFFSET_X"),
         0x0dfc if raw <= 0x3ffff => (R::WindowOffsetY, V::Mask(raw), "SET_WINDOW_OFFSET_Y"),

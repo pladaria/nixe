@@ -778,6 +778,9 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     PolygonOffsetPointEnable,
     PolygonOffsetLineEnable,
     PolygonOffsetFillEnable,
+    SlopeScaleDepthBias,
+    DepthBias,
+    DepthBiasClamp,
     FrontStencilFail,
     FrontStencilDepthFail,
     FrontStencilPass,
@@ -857,18 +860,19 @@ pub enum MaxwellThreeDFixedFunctionValue {
     },
 }
 
-/// One axis of the global surface clip, encoded as origin plus extent.
+/// One axis of a surface or viewport clip, encoded as origin plus extent.
 ///
-/// Unlike viewport, scissor, and window-clip rectangles, these registers use
+/// Unlike scissor and window-clip rectangles, these registers use
 /// an origin and size rather than minimum and maximum coordinates.
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1386-L1392>
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L841-L847>
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct MaxwellThreeDSurfaceClipAxis {
+pub struct MaxwellThreeDClipAxis {
     origin: u16,
     extent: u16,
 }
 
-impl MaxwellThreeDSurfaceClipAxis {
+impl MaxwellThreeDClipAxis {
     pub(super) const fn parse(raw: u32) -> Self {
         Self {
             origin: raw as u16,
@@ -891,11 +895,12 @@ impl MaxwellThreeDSurfaceClipAxis {
 pub struct MaxwellThreeDViewportTransformState {
     scale: [MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3],
     offset: [MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3],
-    clip_horizontal: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
-    clip_vertical: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
+    clip_horizontal: MaxwellThreeDRegister<MaxwellThreeDClipAxis>,
+    clip_vertical: MaxwellThreeDRegister<MaxwellThreeDClipAxis>,
     clip_min_z: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
     clip_max_z: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
     coordinate_swizzle: MaxwellThreeDRegister<MaxwellThreeDViewportCoordinateSwizzle>,
+    snap_grid_precision: MaxwellThreeDRegister<[u8; 2]>,
 }
 
 impl Default for MaxwellThreeDViewportTransformState {
@@ -914,6 +919,7 @@ impl Default for MaxwellThreeDViewportTransformState {
                 Some(MaxwellThreeDRawValue::new(VIEWPORT_CLIP_MAX_Z_RESET)),
             ),
             coordinate_swizzle: Default::default(),
+            snap_grid_precision: Default::default(),
         }
     }
 }
@@ -1009,11 +1015,11 @@ impl MaxwellThreeDViewportTransformState {
         &self.offset
     }
     #[must_use]
-    pub const fn clip_horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+    pub const fn clip_horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
         &self.clip_horizontal
     }
     #[must_use]
-    pub const fn clip_vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+    pub const fn clip_vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
         &self.clip_vertical
     }
     #[must_use]
@@ -1024,6 +1030,13 @@ impl MaxwellThreeDViewportTransformState {
     pub const fn clip_max_z(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRawValue> {
         &self.clip_max_z
     }
+    /// Additional X/Y snap-grid precision bits. Zero uses the ordinary grid.
+    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L837-L839
+    #[must_use]
+    pub const fn snap_grid_precision(&self) -> &MaxwellThreeDRegister<[u8; 2]> {
+        &self.snap_grid_precision
+    }
+
     #[must_use]
     pub const fn coordinate_swizzle(
         &self,
@@ -1078,8 +1091,8 @@ impl MaxwellThreeDScissorState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDFixedFunctionState {
-    surface_clip_horizontal: MaxwellThreeDRegister<MaxwellThreeDSurfaceClipAxis>,
-    surface_clip_vertical: MaxwellThreeDRegister<MaxwellThreeDSurfaceClipAxis>,
+    surface_clip_horizontal: MaxwellThreeDRegister<MaxwellThreeDClipAxis>,
+    surface_clip_vertical: MaxwellThreeDRegister<MaxwellThreeDClipAxis>,
     viewport: [MaxwellThreeDViewportTransformState; MAXWELL_VIEWPORT_COUNT],
     scissor: [MaxwellThreeDScissorState; MAXWELL_SCISSOR_COUNT],
     window_clip: [MaxwellThreeDWindowClipState; MAXWELL_WINDOW_CLIP_COUNT],
@@ -1171,16 +1184,12 @@ impl Default for MaxwellThreeDFixedFunctionState {
 }
 impl MaxwellThreeDFixedFunctionState {
     #[must_use]
-    pub const fn surface_clip_horizontal(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDSurfaceClipAxis> {
+    pub const fn surface_clip_horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
         &self.surface_clip_horizontal
     }
 
     #[must_use]
-    pub const fn surface_clip_vertical(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDSurfaceClipAxis> {
+    pub const fn surface_clip_vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
         &self.surface_clip_vertical
     }
 
@@ -1261,7 +1270,7 @@ impl MaxwellThreeDFixedFunctionState {
                     _ => unreachable!(),
                 }
             }
-            MaxwellThreeDFixedFunctionWrite::ViewportRectangle {
+            MaxwellThreeDFixedFunctionWrite::ViewportClip {
                 viewport,
                 vertical,
                 value,
@@ -1288,6 +1297,12 @@ impl MaxwellThreeDFixedFunctionState {
                     self.viewport[viewport as usize].clip_min_z =
                         MaxwellThreeDRegister::programmed(raw, value, source)
                 }
+            }
+            MaxwellThreeDFixedFunctionWrite::ViewportSnapGridPrecision {
+                viewport, value, ..
+            } => {
+                self.viewport[viewport as usize].snap_grid_precision =
+                    MaxwellThreeDRegister::programmed(raw, value, source);
             }
             MaxwellThreeDFixedFunctionWrite::ViewportCoordinateSwizzle {
                 viewport, value, ..
@@ -1381,7 +1396,7 @@ impl MaxwellThreeDFixedFunctionState {
 pub enum MaxwellThreeDFixedFunctionWrite {
     SurfaceClip {
         vertical: bool,
-        value: MaxwellThreeDSurfaceClipAxis,
+        value: MaxwellThreeDClipAxis,
         source: MaxwellMethodSource,
     },
     ViewportFloat {
@@ -1390,16 +1405,21 @@ pub enum MaxwellThreeDFixedFunctionWrite {
         value: MaxwellThreeDRawValue,
         source: MaxwellMethodSource,
     },
-    ViewportRectangle {
+    ViewportClip {
         viewport: u8,
         vertical: bool,
-        value: MaxwellThreeDRectangle,
+        value: MaxwellThreeDClipAxis,
         source: MaxwellMethodSource,
     },
     ViewportDepth {
         viewport: u8,
         maximum: bool,
         value: MaxwellThreeDRawValue,
+        source: MaxwellMethodSource,
+    },
+    ViewportSnapGridPrecision {
+        viewport: u8,
+        value: [u8; 2],
         source: MaxwellMethodSource,
     },
     ViewportCoordinateSwizzle {
@@ -1475,9 +1495,10 @@ impl MaxwellThreeDFixedFunctionWrite {
         match self {
             Self::SurfaceClip { source, .. }
             | Self::ViewportFloat { source, .. }
-            | Self::ViewportRectangle { source, .. }
+            | Self::ViewportClip { source, .. }
             | Self::ViewportDepth { source, .. }
             | Self::ViewportCoordinateSwizzle { source, .. }
+            | Self::ViewportSnapGridPrecision { source, .. }
             | Self::ScissorEnable { source, .. }
             | Self::ScissorRectangle { source, .. }
             | Self::WindowClipRectangle { source, .. }

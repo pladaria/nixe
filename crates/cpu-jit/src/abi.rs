@@ -866,9 +866,11 @@ pub struct FpCompareOperation {
 pub enum FpUnaryKind {
     SquareRoot { width_64: bool },
     Convert(nixe_cpu::decode::a64::fp_simd::FloatConversion),
+    ConvertLong { upper: bool },
+    ConvertNarrow { upper: bool },
 }
 
-/// Typed scalar FP unary completion over canonical PRE-state.
+/// Typed FP unary completion over canonical PRE-state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FpUnaryOperation {
     pub rn: u8,
@@ -906,10 +908,11 @@ pub struct FpDivideOperation {
     pub width_64: bool,
 }
 
-/// Typed exact scalar FMINNM/FMAXNM over canonical PRE-state operands.
+/// Typed exact scalar FMIN/FMAX/FMINNM/FMAXNM over canonical PRE-state operands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FpMinMaxNumberOperation {
+pub struct FpMinMaxOperation {
     pub minimum: bool,
+    pub number: bool,
     pub rn: u8,
     pub rm: u8,
     pub rd: u8,
@@ -990,6 +993,7 @@ pub struct IntegerToFpOperation {
     pub source_64: bool,
     pub destination_64: bool,
     pub signed: bool,
+    pub fractional_bits: u8,
 }
 
 /// Advanced SIMD SCVTF/UCVTF, including the one-element scalar encodings.

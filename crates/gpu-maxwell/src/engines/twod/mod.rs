@@ -2,12 +2,14 @@
 
 mod beta;
 pub(crate) mod blit;
-pub use blit::MaxwellTwoDResolveOperation;
+pub use blit::MaxwellTwoDBlitOperation;
 mod methods;
 mod notify;
 mod pixels_from_memory;
 mod render_enable;
+mod solid;
 mod state;
+pub use solid::MaxwellTwoDSolidOperation;
 
 pub use beta::{
     MaxwellTwoDBeta1, MaxwellTwoDBeta4, MaxwellTwoDBetaState, MaxwellTwoDBetaStateWrite,

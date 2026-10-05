@@ -13,7 +13,10 @@ use crate::{
 use nixe_gpu::{FrontendSubmissionId, ReservedTimelinePoint};
 
 /// Hard bound for a failure-only command dump.
-pub const MAXWELL_FRONTEND_DIAGNOSTIC_WORDS: usize = 4_096;
+// Retain up to 256 KiB of commands so ordinary multi-entry submissions
+// include the failing packet rather than only their initialization prefix.
+// This allocation occurs exclusively on the diagnostic failure path.
+pub const MAXWELL_FRONTEND_DIAGNOSTIC_WORDS: usize = 65_536;
 
 /// Raw command prefix reconstructed from retained sources after a failure.
 pub struct MaxwellFrontendDiagnostic {
@@ -80,15 +83,15 @@ pub fn lower_maxwell_frontend(
     if decoded.packets().is_empty() {
         return Err(MaxwellFrontendDispatchError::EmptySubmission);
     }
-    lower_maxwell_pushbuffer(
-        &decoded,
-        channel,
-        address_space,
-        frontend,
-        predecessors,
-        completion,
-        cache,
-    )
+    let mut planner =
+        MaxwellSubmissionPlanner::new(address_space, frontend, predecessors, completion, cache);
+    // FENCE_GET is fulfilled by the driver after all user commands, not by
+    // requiring the pushbuffer to contain its own syncpoint increments.
+    // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp#L338-L350
+    if submission.decoded().mode().fence_get() {
+        planner.set_driver_completion_increments(2);
+    }
+    lower_packets(&decoded, channel, planner)
 }
 
 /// Applies and lowers an already decoded pushbuffer through the current
@@ -105,8 +108,17 @@ pub fn lower_maxwell_pushbuffer(
     if decoded.packets().is_empty() {
         return Err(MaxwellFrontendDispatchError::EmptySubmission);
     }
-    let mut planner =
+    let planner =
         MaxwellSubmissionPlanner::new(address_space, frontend, predecessors, completion, cache);
+    lower_packets(decoded, channel, planner)
+}
+
+fn lower_packets(
+    decoded: &MaxwellDecodedPushbuffer,
+    channel: &mut MaxwellGpuChannel,
+    mut planner: MaxwellSubmissionPlanner<'_>,
+) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
+    let frontend = planner.frontend();
     let (mut mme_methods, mut mme_parameters) = planner.take_mme_scratch();
     for packet in decoded.packets() {
         stream_maxwell_engine_packet(

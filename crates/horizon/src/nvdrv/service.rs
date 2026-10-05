@@ -59,8 +59,8 @@ impl<'a> NvDrvService<'a> {
         self.session.query_event(fd, event_id, process_id)
     }
 
-    pub(crate) fn initialize(&self) {
-        self.session.initialize();
+    pub(crate) fn initialize(&self, transfer_memory_size: u32) {
+        self.session.initialize(transfer_memory_size);
     }
 
     pub(crate) fn set_aruid(&self, process_id: u64, applet_resource_user_id: u64) {

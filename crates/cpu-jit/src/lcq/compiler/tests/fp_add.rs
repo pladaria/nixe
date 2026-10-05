@@ -259,3 +259,100 @@ fn activation_keeps_an_already_active_segment_and_restores_the_caller() {
         (caller.saved_control, caller.saved_status)
     );
 }
+
+#[test]
+fn fabd_scalar_and_vector_rounding_special_values_aliases_and_traps() {
+    for vector in [false, true] {
+        for wide in [false, true] {
+            for full in [false, true] {
+                if !vector && !full || vector && wide && !full {
+                    continue;
+                }
+                for alias in [false, true] {
+                    for fpcr in [
+                        0,
+                        1 << 22,
+                        2 << 22,
+                        3 << 22,
+                        1 << 24,
+                        1 << 25,
+                        1 << 8,
+                        1 << 11,
+                        1 << 12,
+                        1 << 15,
+                    ] {
+                        let samples = if wide {
+                            [
+                                0,
+                                1 << 63,
+                                1,
+                                1.0_f64.to_bits(),
+                                f64::MAX.to_bits(),
+                                f64::INFINITY.to_bits(),
+                                0xfff8_0000_0000_0123,
+                                0xfff0_0000_0000_0123,
+                            ]
+                        } else {
+                            [
+                                0,
+                                1 << 31,
+                                1,
+                                u64::from(1.0_f32.to_bits()),
+                                u64::from(f32::MAX.to_bits()),
+                                u64::from(f32::INFINITY.to_bits()),
+                                0xffc0_0123,
+                                0xff80_0123,
+                            ]
+                        };
+                        for sample in samples {
+                            let rd = if alias { 1 } else { 0 };
+                            let width = if wide { 64 } else { 32 };
+                            let mut actual = A64State::default();
+                            actual.set_pc(PC);
+                            actual.set_fpcr(fpcr);
+                            actual.set_fpsr(1 << 27);
+                            actual.set_vector(rd as u8, u128::MAX);
+                            actual
+                                .set_vector(1, u128::from(sample) | (u128::from(sample) << width));
+                            actual.set_vector(
+                                2,
+                                u128::from(samples[3]) | (u128::from(samples[3]) << width),
+                            );
+                            let pre = actual.clone();
+                            let mut expected = actual.clone();
+                            let base = if vector { 0x2ea2_d420 } else { 0x7ea2_d420 };
+                            let word =
+                                base | (u32::from(wide) << 22) | (u32::from(full) << 30) | rd;
+                            let reference =
+                                execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap();
+                            let (_, exit) = execute(&[word, 0xd420_0000], &mut actual);
+                            let result = match exit.kind {
+                                EdgeKind::FpAdd(op) => {
+                                    assert_eq!(actual, pre);
+                                    complete_add(op, &mut actual)
+                                }
+                                EdgeKind::VectorFpAdd(op) => {
+                                    assert_eq!(actual, pre);
+                                    crate::lcq::fp::complete_vector_add(op, &mut actual)
+                                }
+                                EdgeKind::Breakpoint(0) => {
+                                    assert_eq!(reference, InstructionStep::Continue);
+                                    Ok(())
+                                }
+                                other => panic!("{other:?}"),
+                            };
+                            if let Err(error) = result {
+                                assert!(matches!(error, CompletionError::Trap(_)));
+                                assert!(matches!(reference, InstructionStep::Exit(_)));
+                            }
+                            assert_eq!(
+                                actual, expected,
+                                "FABD {word:x} sample={sample:x} FPCR={fpcr:x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

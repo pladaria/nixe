@@ -553,6 +553,10 @@ pub enum MaxwellThreeDShaderExecutionStateWrite {
         value: MaxwellThreeDPixelShaderInterlockControl,
         source: MaxwellMethodSource,
     },
+    OpportunisticEarlyZHysteresis {
+        value: u8,
+        source: MaxwellMethodSource,
+    },
     ApiMandatedEarlyZ {
         value: MaxwellThreeDApiMandatedEarlyZ,
         source: MaxwellMethodSource,
@@ -616,6 +620,7 @@ pub enum MaxwellThreeDShaderExecutionStateWrite {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderExecutionState {
     pixel_shader_interlock_control: MaxwellThreeDRegister<MaxwellThreeDPixelShaderInterlockControl>,
+    opportunistic_early_z_hysteresis: MaxwellThreeDRegister<u8>,
     api_mandated_early_z: MaxwellThreeDRegister<MaxwellThreeDApiMandatedEarlyZ>,
     shader_exceptions_enable: MaxwellThreeDRegister<MaxwellThreeDShaderExceptionsEnable>,
     subtiling_perf_knob_a: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobA>,
@@ -635,6 +640,16 @@ impl MaxwellThreeDShaderExecutionState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDPixelShaderInterlockControl> {
         &self.pixel_shader_interlock_control
+    }
+
+    /// Area threshold for opportunistic early-depth scheduling. This selects
+    /// a GM20B performance heuristic rather than API-mandated test ordering;
+    /// the host driver may choose early tests only when semantically safe.
+    /// The late-Z encoding likewise uses ordinary late depth/stencil semantics.
+    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L220-L242
+    #[must_use]
+    pub const fn opportunistic_early_z_hysteresis(&self) -> &MaxwellThreeDRegister<u8> {
+        &self.opportunistic_early_z_hysteresis
     }
 
     #[must_use]
@@ -720,6 +735,13 @@ impl MaxwellThreeDShaderExecutionState {
             } => {
                 self.pixel_shader_interlock_control =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis {
+                value,
+                source,
+            } => {
+                self.opportunistic_early_z_hysteresis =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source } => {
                 self.api_mandated_early_z =

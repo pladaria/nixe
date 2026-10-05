@@ -103,7 +103,15 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
         ),
         0x0000_0086 => validate_a64_simd_float_immediate(bits),
         0x0000_003e | 0x0000_003f => validate_a64_fp_move_general(bits),
-        0x0000_0031 => validate_a64_simd_add_sub(bits),
+        0x0000_00c6 => validate_a64_simd_float_vector(bits),
+        0x0000_0031 | 0x0000_00c2 => validate_a64_simd_add_sub(bits),
+        0x0000_00b6..=0x0000_00b9 => validate_a64_simd_add_across_vector(bits),
+        0x0000_00c1 if ((bits >> 22) & 3) == 3 => {
+            AllocationStatus::Reserved("SIMD add-wide has no 64-bit source lane encoding")
+        }
+        0x0000_00b5 if ((bits >> 22) & 3) == 3 => {
+            AllocationStatus::Reserved("SIMD integer multiply has no 64-bit lane encoding")
+        }
         0x0000_0038 if bits & 0x9f20_fc00 == 0x0e20_8400 => validate_a64_simd_add_sub(bits),
         0x0000_0038 if bits & 0xbf3f_fc00 == 0x0e31_b800 => {
             validate_a64_simd_add_across_vector(bits)
@@ -212,7 +220,7 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
                 AllocationStatus::Allocated
             }
         }
-        0x0000_009e | 0x0000_009f => {
+        0x0000_009e | 0x0000_009f | 0x0000_00c9 | 0x0000_00ca => {
             let scale = ((bits >> 10) & 0x3f) as u8;
             if !sf && scale < 32 {
                 AllocationStatus::Reserved(
@@ -304,10 +312,10 @@ fn validate_a64_simd_add_across_vector(bits: u32) -> AllocationStatus {
     let size = (bits >> 22) & 3;
     let vector_128 = bits & (1 << 30) != 0;
     if size == 3 {
-        AllocationStatus::Unallocated("across-vector sum has no 64-bit element form")
+        AllocationStatus::Unallocated("across-vector reduction has no 64-bit element form")
     } else if size == 2 && !vector_128 {
         AllocationStatus::Reserved(
-            "across-vector sum with 32-bit elements requires a 128-bit vector",
+            "across-vector reduction with 32-bit elements requires a 128-bit vector",
         )
     } else {
         AllocationStatus::Allocated

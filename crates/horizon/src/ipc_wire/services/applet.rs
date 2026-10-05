@@ -1,6 +1,8 @@
 use super::prelude::*;
 
 mod commands;
+mod controller;
+mod player_select;
 
 use commands::*;
 
@@ -24,10 +26,12 @@ pub(in crate::ipc_wire) fn dispatch_applet(
     session: &AppletSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
-    video_system: &VideoSystem,
-    application_language: Option<crate::SystemLanguage>,
-    save_data: Option<&crate::SaveDataSystem>,
+    host_systems: &HostSystems<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let video_system = host_systems.video;
+    let application_language = host_systems.application_language;
+    let save_data = host_systems.save_data;
+    let hid = host_systems.hid;
     // The startup order, command IDs, input PID/process handle, returned
     // objects, and scalar result layouts implemented below follow libnx:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L112-L333
@@ -115,13 +119,38 @@ pub(in crate::ipc_wire) fn dispatch_applet(
             applet_child(session, request.token, child, applet_object_name(child))
         }
         AppletObject::CommonStateGetter => {
-            if !request.data.is_empty() || has_ipc_descriptors(hipc) {
-                return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-            }
             let Some(command) = CommonStateGetterCommand::decode(request.command_id) else {
                 return unsupported_service_command("ICommonStateGetter", request.command_id);
             };
+            let payload_size = if command == CommonStateGetterCommand::SetCpuBoostMode {
+                4
+            } else {
+                0
+            };
+            if (payload_size == 0 && !request.data.is_empty())
+                || !request.has_payload_size(payload_size)
+                || has_ipc_descriptors(hipc)
+            {
+                return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
             match command {
+                // AM accepts Normal (0) and FastLoad (1), with one u32 input.
+                // Boost changes hardware clock policy, not the architectural
+                // timer frequency. Host CPU/GPU execution is already unthrottled.
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/apm.h
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c
+                CommonStateGetterCommand::SetCpuBoostMode => {
+                    let mode = request_u32(request.data, 0).expect("validated u32 payload");
+                    if mode > 1 {
+                        return applet_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                    }
+                    session.set_cpu_boost_enabled(mode == 1);
+                    applet_data(request.token, &[])
+                }
+                CommonStateGetterCommand::CancelCpuBoostMode => {
+                    session.set_cpu_boost_enabled(false);
+                    applet_data(request.token, &[])
+                }
                 CommonStateGetterCommand::GetEventHandle => {
                     let handle = match process.handles_mut().insert(session.message_event()) {
                         Ok(handle) => handle,
@@ -155,6 +184,15 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 }
                 CommonStateGetterCommand::GetCurrentFocusState => {
                     applet_data(request.token, &[session.current_focus_state()])
+                }
+                CommonStateGetterCommand::GetDefaultDisplayResolution => {
+                    // No input; the CMIF output is two signed 32-bit dimensions.
+                    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c
+                    let (width, height) = session.operation_mode().default_display_resolution();
+                    let mut data = [0; 8];
+                    data[..4].copy_from_slice(&width.to_le_bytes());
+                    data[4..].copy_from_slice(&height.to_le_bytes());
+                    applet_data(request.token, &data)
                 }
                 CommonStateGetterCommand::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled => {
                     // No input or output: this enables AM's next-program exit policy.
@@ -422,7 +460,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             ))
                         }
                         Err(PopAppletLaunchParameterError::NotAvailable) => {
-                            applet_error(request.token, HorizonIpcResult::AM_NO_MESSAGES)
+                            applet_error(request.token, HorizonIpcResult::AM_NO_DATA_IN_CHANNEL)
                         }
                         Err(PopAppletLaunchParameterError::DomainCapacityExhausted) => {
                             Err(IpcWireError::HostResourceExhausted(
@@ -718,6 +756,55 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                         Some(handle),
                     ))
                 }
+                LibraryAppletAccessorCommand::CheckFinished
+                | LibraryAppletAccessorCommand::GetResult
+                | LibraryAppletAccessorCommand::PopOutData => {
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    match command {
+                        LibraryAppletAccessorCommand::CheckFinished => applet_data(
+                            request.token,
+                            &[u8::from(session.library_applet_result(object_id).is_some())],
+                        ),
+                        LibraryAppletAccessorCommand::GetResult => {
+                            match session.library_applet_result(object_id) {
+                                Some(result) => {
+                                    applet_error(request.token, HorizonIpcResult::from_raw(result))
+                                }
+                                None => unsupported_service_command(
+                                    "ILibraryAppletAccessor unfinished result",
+                                    30,
+                                ),
+                            }
+                        }
+                        LibraryAppletAccessorCommand::PopOutData => {
+                            match session.pop_library_applet_output(object_id) {
+                                Ok(storage) => Ok((
+                                    encode_domain_response(
+                                        request.token,
+                                        HorizonIpcResult::SUCCESS,
+                                        &[],
+                                        &[],
+                                        &[storage],
+                                    )?,
+                                    None,
+                                )),
+                                Err(PopAppletLaunchParameterError::NotAvailable) => applet_error(
+                                    request.token,
+                                    HorizonIpcResult::AM_NO_DATA_IN_CHANNEL,
+                                ),
+                                Err(_) => Err(IpcWireError::HostResourceExhausted(
+                                    "opening library-applet output storage",
+                                )),
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 // Start freezes the queued inputs into one launch request. Until
                 // Nixe has a graphical system-applet host, Error applets become a
                 // typed fatal diagnostic rather than hanging on their state event
@@ -752,6 +839,24 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                                     )
                                 }
                             })?;
+                    if matches!(
+                        launch.applet_id,
+                        LibraryAppletId::Controller | LibraryAppletId::PlayerSelect
+                    ) {
+                        let output = match launch.applet_id {
+                            LibraryAppletId::Controller => controller::run(&launch, hid)?,
+                            LibraryAppletId::PlayerSelect => {
+                                player_select::run(&launch, session.user())?
+                            }
+                            _ => unreachable!(),
+                        };
+                        if !session.complete_library_applet(object_id, output) {
+                            return Err(IpcWireError::Internal(
+                                "library applet was already completed",
+                            ));
+                        }
+                        return applet_data(request.token, &[]);
+                    }
                     if launch.applet_id != LibraryAppletId::Error {
                         return Err(IpcWireError::UnsupportedService(
                             UnsupportedServiceOperation::CommandVariant {

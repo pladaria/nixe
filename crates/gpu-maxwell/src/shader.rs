@@ -12,6 +12,7 @@ mod decode;
 mod error;
 mod float;
 mod global_memory;
+mod half;
 mod integer;
 mod interface;
 mod link;

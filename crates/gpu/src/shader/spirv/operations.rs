@@ -51,6 +51,23 @@ impl Emitter {
                 };
                 self.write(*destination, result);
             }
+            UnpackHalf32 {
+                destination,
+                source,
+                high,
+            } => {
+                let packed = self.read(*source)?;
+                let value = self.unpack_half(packed, *high)?;
+                self.write(*destination, value);
+            }
+            PackHalf32 {
+                destination,
+                source,
+            } => {
+                let value = self.read(*source)?;
+                let packed = self.pack_half(value)?;
+                self.write(*destination, packed);
+            }
             ConvertIntegerToFloat32 {
                 destination,
                 source,

@@ -277,7 +277,10 @@ pub(super) fn dispatch_control(
             // https://github.com/Atmosphere-NX/Atmosphere/blob/master/stratosphere/ams_mitm/source/fs_mitm/fsmitm_module.cpp
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
             let pointer_buffer_size: u16 = match target {
-                HorizonIpcObject::Hid(_) => 0x100,
+                // Account's fixed pointer-only lists contain eight 16-byte UIDs.
+                // A zero budget rejects enumeration in nn::sf before dispatch.
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L77-L81
+                HorizonIpcObject::Hid(_) | HorizonIpcObject::Account(_) => 0x100,
                 HorizonIpcObject::SemanticService(session)
                     if session.service() == crate::IpcService::FileSystem =>
                 {

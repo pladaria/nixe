@@ -40,7 +40,7 @@ mod tests {
     #[test]
     fn control_gpu_events_preserve_identity_and_descriptor_lifetimes() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let other_fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let clone = session.clone_connection().unwrap();

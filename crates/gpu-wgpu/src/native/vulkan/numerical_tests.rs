@@ -1,4 +1,4 @@
-//! GPU numeric oracle for native SPIR-V and portable absorbing-zero multiply.
+//! GPU numeric oracle for native SPIR-V arithmetic and portable float conversions.
 //! Finite/Inf/zero results are bit-exact; propagated NaN payloads are unspecified.
 use super::*;
 use nixe_gpu::*;
@@ -87,6 +87,15 @@ fn shader(operator: u8) -> VerifiedShaderIr {
             left: R::new(2),
             right: R::new(3),
             float_control: control,
+        },
+        6 | 7 => Op::UnpackHalf32 {
+            destination: R::new(5),
+            source: R::new(2),
+            high: operator == 7,
+        },
+        8 => Op::PackHalf32 {
+            destination: R::new(5),
+            source: R::new(2),
         },
         _ => unreachable!(),
     });
@@ -252,7 +261,7 @@ fn validate(module: &SpirvShaderModule) {
 
 #[test]
 #[ignore = "requires Vulkan, float64 numerical guarantees and NIXE_SPIRV_VAL; FMA additionally needs VK_KHR_shader_fma"]
-fn native_float32_daz_ftz_matches_ir_bits() {
+fn native_float_conversions_and_daz_ftz_match_ir_bits() {
     let _guard = NATIVE_DEVICE_TEST_LOCK.lock().unwrap();
     if !crate::test_hardware::available(wgpu::Backends::VULKAN) {
         return;
@@ -347,7 +356,7 @@ fn run_numeric_oracle() {
     let input = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("float32 oracle inputs"),
         contents: &data,
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
@@ -421,7 +430,62 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
         contents: &vertices,
         usage: wgpu::BufferUsages::VERTEX,
     });
-    for (operator, wgsl) in (0..6).map(|op| (op, false)).chain([(5, true)]) {
+    for (operator, wgsl) in
+        (0..9)
+            .map(|op| (op, false))
+            .chain([(5, true), (6, true), (7, true), (8, true)])
+    {
+        let conversion_cases;
+        let cases = if operator >= 6 {
+            conversion_cases = if operator < 8 {
+                (0..65536_u32)
+                    .map(|i| [i | ((65535 - i) << 16), 0, 0])
+                    .collect::<Vec<_>>()
+            } else {
+                let mut values = cases
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| [(v[0] & 0x807f_ffff) | ((100 + i as u32 % 48) << 23), 0, 0])
+                    .collect::<Vec<_>>();
+                for (i, bits) in [
+                    0,
+                    0x8000_0000,
+                    0x7f80_0000,
+                    0xff80_0000,
+                    0x7f80_0001,
+                    0xffcf_ffff,
+                    0x32ff_ffff,
+                    0x3300_0000,
+                    0x3300_0001,
+                    0x337f_ffff,
+                    0x3380_0000,
+                    0x3380_0001,
+                    0x387f_ffff,
+                    0x3880_0000,
+                    0x477f_e000,
+                    0x477f_efff,
+                    0x477f_f000,
+                    0x477f_f001,
+                    0x3f80_1000,
+                    0x3f80_3000,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    values[i] = [bits, 0, 0];
+                }
+                values
+            };
+            &conversion_cases
+        } else {
+            &cases
+        };
+        let data: Vec<_> = cases
+            .iter()
+            .flatten()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        queue.write_buffer(&input, 0, &data);
         if operator == 2 && !caps.float32.fused_multiply_add {
             eprintln!(
                 "SKIP FMA GPU oracle: shaderFmaFloat32 unavailable (addition/multiplication still checked)"
@@ -435,6 +499,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
         let module = lower_shader_ir_to_spirv(
             &ir,
             SpirvShaderOptions {
+                depth_clip_negative_one_to_one: false,
                 input_control_points: 0,
                 tessellation_mode: None,
                 float32,

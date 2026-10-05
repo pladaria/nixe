@@ -82,16 +82,19 @@ impl HorizonIpcObject {
             Self::Account(session) => domain_object
                 .and_then(|object_id| session.object(object_id))
                 .map_or("acc:u0", |object| match object {
+                    crate::object::AccountObject::Profile(_) => "IProfile",
                     crate::object::AccountObject::BaasManagerForApplication(_) => {
                         "IManagerForApplication"
                     }
                 }),
+            Self::AccountProfile(_) => "IProfile",
             Self::AccountManagerForApplication(_) => "IManagerForApplication",
             Self::Bsd(_) => "bsd:u",
             Self::Ssl(_) => "ssl",
             Self::AudioOutManager(_) => "audout:u",
             Self::AudioOut(_) => "IAudioOut",
             Self::Hid(_) => "hid",
+            Self::Irs(_) => "irs",
             Self::HidAppletResource(_) => "IAppletResource",
             Self::HidActiveVibrationDeviceList(_) => "IActiveVibrationDeviceList",
             Self::Time(session) => domain_object
@@ -117,8 +120,10 @@ impl HorizonIpcObject {
                 .and_then(|object_id| session.object(object_id))
                 .map_or("nifm:u", |object| match object {
                     NetworkInterfaceObject::GeneralService(_) => "IGeneralService",
+                    NetworkInterfaceObject::Request(_) => "IRequest",
                 }),
             Self::NetworkGeneralService(_) => "IGeneralService",
+            Self::NetworkRequest(_) => "IRequest",
             Self::SemanticObject(object) => object_name(object),
         }
     }
@@ -305,15 +310,9 @@ pub(crate) fn send_sync_request_from_buffer(
         HorizonIpcObject::Performance(session) => {
             services::dispatch_performance_session(&session, request)?
         }
-        HorizonIpcObject::Applet(applet) => services::dispatch_applet(
-            process,
-            &applet,
-            request,
-            &hipc,
-            host_systems.video,
-            host_systems.application_language,
-            host_systems.save_data,
-        )?,
+        HorizonIpcObject::Applet(applet) => {
+            services::dispatch_applet(process, &applet, request, &hipc, &host_systems)?
+        }
         HorizonIpcObject::Account(account) => services::dispatch_account(
             process,
             &account,
@@ -321,6 +320,9 @@ pub(crate) fn send_sync_request_from_buffer(
             &hipc,
             host_systems.user_account_switch_locked,
         )?,
+        HorizonIpcObject::AccountProfile(profile) => {
+            services::dispatch_account_profile(profile, request, &hipc, false)?
+        }
         HorizonIpcObject::AccountManagerForApplication(manager) => {
             services::dispatch_account_manager_for_application(&manager, request)?
         }
@@ -336,6 +338,9 @@ pub(crate) fn send_sync_request_from_buffer(
         }
         HorizonIpcObject::Hid(hid) => {
             services::dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?
+        }
+        HorizonIpcObject::Irs(session) => {
+            services::dispatch_irs(process, &session, request, &hipc)?
         }
         HorizonIpcObject::HidAppletResource(resource) => {
             services::dispatch_hid_applet_resource(process, &resource, request)?
@@ -356,6 +361,7 @@ pub(crate) fn send_sync_request_from_buffer(
             request,
             &hipc,
             host_systems.caller_thread_id,
+            time_environment.clock(),
         ) {
             Ok(response) => response,
             Err(IpcWireError::PendingGpuSubmission(wait)) => {
@@ -395,7 +401,10 @@ pub(crate) fn send_sync_request_from_buffer(
             services::dispatch_error_context_writer(&session, request, &hipc)?
         }
         HorizonIpcObject::NetworkGeneralService(service) => {
-            services::dispatch_network_general_service(&service, request)?
+            services::dispatch_network_general_service(process, None, &service, request, &hipc)?
+        }
+        HorizonIpcObject::NetworkRequest(session) => {
+            services::dispatch_network_request(process, false, &session, request, &hipc)?
         }
         HorizonIpcObject::SemanticObject(object) => {
             dispatch_plain_object(process, &object, request, &hipc)?

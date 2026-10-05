@@ -40,6 +40,8 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
                 | Instruction::ScalarFloatAdd(_)
                 | Instruction::ScalarFloatMaxNumber(_)
                 | Instruction::ScalarFloatMinNumber(_)
+                | Instruction::ScalarFloatMax(_)
+                | Instruction::ScalarFloatMin(_)
                 | Instruction::ScalarFloatDivide(_)
                 | Instruction::VectorFloatDivide(_)
                 | Instruction::VectorFloatAdd(_)
@@ -53,6 +55,8 @@ pub(crate) fn is_lowered(instruction: Instruction) -> bool {
                 | Instruction::ScalarFloatFusedElement(_)
                 | Instruction::ScalarFloatSquareRoot(_)
                 | Instruction::ScalarFloatConvert(_)
+                | Instruction::VectorFloatConvertLong(_)
+                | Instruction::VectorFloatConvertNarrow(_)
                 | Instruction::SignedIntToFloat(_)
                 | Instruction::UnsignedIntToFloat(_)
                 | Instruction::VectorSignedIntToFloat(_)
@@ -175,6 +179,7 @@ pub(crate) fn complete_from_integer(
         if operation.destination_64 { 64 } else { 32 },
         operation.signed,
         state.fpcr(),
+        operation.fractional_bits,
     );
     let status = FpStatus {
         inexact,
@@ -330,6 +335,19 @@ pub(crate) fn complete_unary(
         )));
     }
     let result = match operation.kind {
+        FpUnaryKind::ConvertNarrow { .. } => {
+            nixe_cpu::semantics::a64_fp_simd::exact_vector_float_convert_narrow(
+                state.vector(operation.rn).expect("validated FCVTN source"),
+                state.fpcr(),
+            )
+        }
+        FpUnaryKind::ConvertLong { upper } => {
+            nixe_cpu::semantics::a64_fp_simd::exact_vector_float_convert_long(
+                state.vector(operation.rn).expect("validated FCVTL source"),
+                upper,
+                state.fpcr(),
+            )
+        }
         FpUnaryKind::SquareRoot { width_64 } => exact_scalar_float_square_root(
             scalar_bits(state, operation.rn, width_64),
             if width_64 { 64 } else { 32 },
@@ -348,7 +366,16 @@ pub(crate) fn complete_unary(
     if fp_status_traps(result.status, state.fpcr()) {
         return Err(CompletionError::Trap(result.status));
     }
-    state.set_vector(operation.rd, result.bits);
+    let bits = if matches!(operation.kind, FpUnaryKind::ConvertNarrow { upper: true }) {
+        (state
+            .vector(operation.rd)
+            .expect("validated FCVTN2 destination")
+            & u128::from(u64::MAX))
+            | (result.bits << 64)
+    } else {
+        result.bits
+    };
+    state.set_vector(operation.rd, bits);
     state.set_fpsr(state.fpsr() | fp_status_bits(result.status));
     state.set_pc(state.pc().wrapping_add(4));
     Ok(())
@@ -381,23 +408,24 @@ pub(crate) fn complete_divide(
     Ok(())
 }
 
-/// Exact FMINNM/FMAXNM cold completion after native FPSR merge and epoch release.
+/// Exact FMIN/FMAX/FMINNM/FMAXNM after native FPSR merge and epoch release.
 /// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
-pub(crate) fn complete_min_max_number(
-    operation: crate::abi::FpMinMaxNumberOperation,
+pub(crate) fn complete_min_max(
+    operation: crate::abi::FpMinMaxOperation,
     state: &mut A64State,
 ) -> Result<(), CompletionError> {
-    use nixe_cpu::semantics::a64_fp_simd::exact_scalar_float_min_max_number;
+    use nixe_cpu::semantics::a64_fp_simd::exact_scalar_float_min_max;
     if operation.rn >= 32 || operation.rm >= 32 || operation.rd >= 32 {
         return Err(CompletionError::Invalid(Error::internal(
             "invalid exact FP minimum/maximum-number operands",
         )));
     }
-    let result = exact_scalar_float_min_max_number(
+    let result = exact_scalar_float_min_max(
         scalar_bits(state, operation.rn, operation.width_64),
         scalar_bits(state, operation.rm, operation.width_64),
         if operation.width_64 { 64 } else { 32 },
         operation.minimum,
+        operation.number,
         state.fpcr(),
     );
     if fp_status_traps(result.status, state.fpcr()) {

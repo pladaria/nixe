@@ -19,6 +19,7 @@ pub(super) mod content;
 mod ectx;
 pub(super) mod fsp;
 mod hid;
+mod irs;
 mod lm;
 mod nifm;
 mod nvdrv;
@@ -31,7 +32,9 @@ mod ssl;
 mod time;
 mod vi;
 
-pub(super) use account::{dispatch_account, dispatch_account_manager_for_application};
+pub(super) use account::{
+    dispatch_account, dispatch_account_manager_for_application, dispatch_account_profile,
+};
 pub(super) use apm::{dispatch_performance_manager, dispatch_performance_session};
 pub(super) use applet::{applet_object_name, applet_requests_self_exit, dispatch_applet};
 pub(super) use audout::{dispatch_audio_out, dispatch_audio_out_manager};
@@ -40,8 +43,11 @@ pub(super) use ectx::dispatch_error_context_writer;
 pub(super) use hid::{
     dispatch_hid, dispatch_hid_active_vibration_device_list, dispatch_hid_applet_resource,
 };
+pub(super) use irs::dispatch_irs;
 pub(super) use lm::{dispatch_log_manager, dispatch_logger};
-pub(super) use nifm::{dispatch_network_general_service, dispatch_network_interface};
+pub(super) use nifm::{
+    dispatch_network_general_service, dispatch_network_interface, dispatch_network_request,
+};
 pub(super) use nvdrv::dispatch_nvdrv;
 pub(super) use pctl::{dispatch_parental_control, dispatch_parental_control_service};
 pub(super) use settings::{dispatch_system_settings, dispatch_user_settings};

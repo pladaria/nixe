@@ -816,6 +816,7 @@ impl MaxwellThreeDBegin {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDVertexInputState {
+    attribute_skip_masks: [MaxwellThreeDRegister<u32>; 4],
     streams: Arc<[MaxwellThreeDVertexStreamState; MAXWELL_VERTEX_STREAM_COUNT]>,
     attributes: Arc<
         [MaxwellThreeDRegister<MaxwellThreeDVertexAttributeFormat>; MAXWELL_VERTEX_ATTRIBUTE_COUNT],
@@ -829,6 +830,7 @@ pub struct MaxwellThreeDVertexInputState {
 impl Default for MaxwellThreeDVertexInputState {
     fn default() -> Self {
         Self {
+            attribute_skip_masks: std::array::from_fn(|_| MaxwellThreeDRegister::default()),
             streams: Arc::new(std::array::from_fn(|_| {
                 MaxwellThreeDVertexStreamState::default()
             })),
@@ -842,6 +844,23 @@ impl Default for MaxwellThreeDVertexInputState {
 }
 
 impl MaxwellThreeDVertexInputState {
+    /// DA output is the vertex fetcher's output, not the vertex shader's output.
+    /// A/B select scalar attributes 0..63/64..127, one bit per component.
+    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1605-L1800
+    /// https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/unix/nvidia-3d/src/nvidia-3d-vertex-arrays.c#L274-L297
+    #[must_use]
+    pub fn attribute_skip_masks(&self) -> &[MaxwellThreeDRegister<u32>; 4] {
+        &self.attribute_skip_masks
+    }
+
+    #[must_use]
+    pub fn attribute_skip_mask(&self, attribute: u8) -> u8 {
+        assert!(attribute < MAXWELL_VERTEX_ATTRIBUTE_COUNT as u8);
+        let word = &self.attribute_skip_masks[attribute as usize / 8];
+        word.value()
+            .map_or(0, |value| ((value >> ((attribute % 8) * 4)) & 15) as u8)
+    }
+
     #[must_use]
     pub fn streams(&self) -> &[MaxwellThreeDVertexStreamState; MAXWELL_VERTEX_STREAM_COUNT] {
         &self.streams
@@ -875,6 +894,10 @@ impl MaxwellThreeDVertexInputState {
         let raw = write.raw();
         let source = write.source();
         match write {
+            MaxwellThreeDVertexInputWrite::AttributeSkipMask { index, value, .. } => {
+                self.attribute_skip_masks[index as usize] =
+                    MaxwellThreeDRegister::programmed(raw, value, source);
+            }
             MaxwellThreeDVertexInputWrite::BalancedPrimitiveWorkload { value, .. } => {
                 self.primitive.balanced_workload =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -1014,6 +1037,11 @@ impl MaxwellThreeDVertexInputState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDVertexInputWrite {
+    AttributeSkipMask {
+        index: u8,
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     IndexCount {
         value: u32,
         source: MaxwellMethodSource,
@@ -1159,7 +1187,8 @@ pub enum MaxwellThreeDVertexInputWrite {
 impl MaxwellThreeDVertexInputWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::BalancedPrimitiveWorkload { source, .. }
+            Self::AttributeSkipMask { source, .. }
+            | Self::BalancedPrimitiveWorkload { source, .. }
             | Self::PrimitiveCircularBufferThrottle { source, .. }
             | Self::PatchSize { source, .. }
             | Self::StreamFormat { source, .. }

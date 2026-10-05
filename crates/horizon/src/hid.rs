@@ -13,6 +13,12 @@ const HID_SHARED_MEMORY_SIZE: usize = 0x40000;
 const TOUCH_SCREEN_OFFSET: usize = 0x400;
 const TOUCH_SCREEN_ENTRY_SIZE: usize = 0x298;
 const TOUCH_STATE_SIZE: usize = 0x28;
+// Public HID shared-memory ABI: mouse is 0x400 bytes, keyboard is 0x400.
+// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h#L647-L703
+const MOUSE_OFFSET: usize = 0x3400;
+const KEYBOARD_OFFSET: usize = 0x3800;
+const MOUSE_ENTRY_SIZE: usize = 0x30;
+const KEYBOARD_ENTRY_SIZE: usize = 0x38;
 const NPAD_OFFSET: usize = 0x9a00;
 const NPAD_ENTRY_SIZE: usize = 0x5000;
 const FULL_KEY_LIFO_OFFSET: usize = 0x28;
@@ -58,10 +64,14 @@ pub(crate) fn vibration_device_position(handle: u32) -> Option<u32> {
 #[derive(Debug)]
 pub struct HidSystem {
     shared_memory: OnceLock<SharedMemoryObject>,
+    infrared: OnceLock<crate::object::IrsSession>,
     style_events: [OnceLock<(WritableEventObject, ReadableEventObject)>; 10],
     sampling_number: u64,
     touch_screen_sampling_number: u64,
     touch_screen: Lifo,
+    mouse: Lifo,
+    keyboard: Lifo,
+    peripheral_sampling_number: u64,
     full_key: Lifo,
     six_axis: Lifo,
     home: Lifo,
@@ -73,6 +83,8 @@ pub struct HidSystem {
 #[derive(Debug, Default)]
 struct HidConfiguration {
     touch_screen_active: bool,
+    mouse_active: bool,
+    keyboard_active: bool,
     npad_active: bool,
     supported_style_set: u32,
     supported_ids: BTreeSet<u32>,
@@ -124,10 +136,14 @@ impl HidSystem {
     pub fn new() -> Self {
         Self {
             shared_memory: OnceLock::new(),
+            infrared: OnceLock::new(),
             style_events: std::array::from_fn(|_| OnceLock::new()),
             sampling_number: 0,
             touch_screen_sampling_number: 0,
             touch_screen: Lifo::default(),
+            mouse: Lifo::default(),
+            keyboard: Lifo::default(),
+            peripheral_sampling_number: 0,
             full_key: Lifo::default(),
             six_axis: Lifo::default(),
             home: Lifo::default(),
@@ -135,6 +151,23 @@ impl HidSystem {
             connected: false,
             configuration: Mutex::new(HidConfiguration::default()),
         }
+    }
+
+    /// Controller-support applets use the same connection state published to HID.
+    pub(crate) fn connected_full_key_id(&self) -> Option<u32> {
+        self.connected.then_some(0)
+    }
+
+    pub(crate) fn infrared_session(
+        &self,
+        memory: &ExecutionMemory,
+    ) -> Result<crate::object::IrsSession, HandleError> {
+        if let Some(session) = self.infrared.get() {
+            return Ok(session.clone());
+        }
+        let session = crate::object::IrsSession::new(memory)?;
+        let _ = self.infrared.set(session);
+        Ok(self.infrared.get().expect("IRS initialized").clone())
     }
 
     pub fn shared_memory(
@@ -192,6 +225,20 @@ impl HidSystem {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .touch_screen_active = true;
+    }
+
+    pub(crate) fn activate_mouse(&self) {
+        self.configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mouse_active = true;
+    }
+
+    pub(crate) fn activate_keyboard(&self) {
+        self.configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keyboard_active = true;
     }
 
     pub(crate) fn set_supported_npad_style_set(&self, style_set: u32) {
@@ -312,7 +359,7 @@ impl HidSystem {
         if self.shared_memory.get().is_none() {
             return Ok(());
         }
-        let (publish_player_one, publish_six_axis) = {
+        let (publish_player_one, publish_six_axis, mouse_active, keyboard_active) = {
             let configuration = self
                 .configuration
                 .lock()
@@ -325,8 +372,33 @@ impl HidSystem {
                 // is pinned in the public libnx HidSixAxisSensorHandle ABI:
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h#L1412-L1421
                 configuration.active_six_axis_handles.contains(&0x0002_0003),
+                configuration.mouse_active,
+                configuration.keyboard_active,
             )
         };
+        // Host keys are controller bindings and the mouse is a touch contact;
+        // neither is exposed as a guest USB peripheral. Activated rings still
+        // publish idle samples, with the mouse connection attribute cleared.
+        if mouse_active || keyboard_active {
+            self.peripheral_sampling_number = self.peripheral_sampling_number.wrapping_add(1);
+            if mouse_active {
+                let mut entry = [0; MOUSE_ENTRY_SIZE];
+                put_u64(&mut entry, 0, self.peripheral_sampling_number);
+                put_u64(&mut entry, 8, self.peripheral_sampling_number);
+                self.mouse
+                    .publish(self.shared_memory.get().unwrap(), MOUSE_OFFSET, &entry)?;
+            }
+            if keyboard_active {
+                let mut entry = [0; KEYBOARD_ENTRY_SIZE];
+                put_u64(&mut entry, 0, self.peripheral_sampling_number);
+                put_u64(&mut entry, 8, self.peripheral_sampling_number);
+                self.keyboard.publish(
+                    self.shared_memory.get().unwrap(),
+                    KEYBOARD_OFFSET,
+                    &entry,
+                )?;
+            }
+        }
         let Some(state) = state.filter(|_| publish_player_one) else {
             if self.connected {
                 self.sampling_number = self.sampling_number.saturating_add(1);
@@ -513,6 +585,36 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn peripheral_activation_publishes_idle_samples_only_after_activation() {
+        let mut hid = HidSystem::new();
+        let shared = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        hid.publish(None, Duration::ZERO).unwrap();
+        let mut before = [0; 0x800];
+        shared.read(MOUSE_OFFSET, &mut before).unwrap();
+        assert_eq!(before, [0; 0x800]);
+        hid.activate_mouse();
+        hid.activate_keyboard();
+        for _ in 0..20 {
+            hid.publish(None, Duration::ZERO).unwrap();
+        }
+        for (offset, size) in [
+            (MOUSE_OFFSET, MOUSE_ENTRY_SIZE),
+            (KEYBOARD_OFFSET, KEYBOARD_ENTRY_SIZE),
+        ] {
+            let mut header = [0; 32];
+            shared.read(offset, &mut header).unwrap();
+            assert_eq!(u64::from_le_bytes(header[8..16].try_into().unwrap()), 17);
+            assert_eq!(u64::from_le_bytes(header[16..24].try_into().unwrap()), 2);
+            assert_eq!(u64::from_le_bytes(header[24..32].try_into().unwrap()), 17);
+            let mut entry = vec![0; size];
+            shared.read(offset + 32 + 2 * size, &mut entry).unwrap();
+            assert_eq!(u64::from_le_bytes(entry[..8].try_into().unwrap()), 20);
+            assert_eq!(u64::from_le_bytes(entry[8..16].try_into().unwrap()), 20);
+            assert!(entry[16..].iter().all(|value| *value == 0));
+        }
+    }
 
     #[test]
     fn publication_updates_the_mapped_pages_without_synchronization() {

@@ -29,6 +29,9 @@ pub enum PresentationImageFormat {
 /// must not materialize a software-rendered host frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PresentationImageRequest {
+    /// Whether canonical bytes can be decoded as this image. Opaque storage
+    /// requires a current resident producer; importing it would corrupt pixels.
+    pub allow_canonical_import: bool,
     pub backing: BackingView,
     pub width: u32,
     pub height: u32,

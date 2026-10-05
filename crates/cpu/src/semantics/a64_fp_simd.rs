@@ -83,8 +83,24 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             );
             Ok(())
         }
-        Instruction::Integer(_) => {
-            integer_add_sub(state, fields);
+        Instruction::Integer(_) | Instruction::IntegerMultiply(_) => {
+            integer_arithmetic(
+                state,
+                fields,
+                matches!(instruction, Instruction::IntegerMultiply(_)),
+            );
+            Ok(())
+        }
+        Instruction::IntegerSign(_) | Instruction::ScalarIntegerSign(_) => {
+            integer_sign(
+                state,
+                fields,
+                matches!(instruction, Instruction::ScalarIntegerSign(_)),
+            );
+            Ok(())
+        }
+        Instruction::IntegerWideAdd(_) => {
+            integer_add_wide(state, fields);
             Ok(())
         }
         Instruction::Bitwise(_) => {
@@ -97,13 +113,14 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             );
             Ok(())
         }
-        Instruction::IntegerCompare(_) => {
+        Instruction::IntegerCompare(_) | Instruction::ScalarIntegerCompare(_) => {
             integer_compare(
                 state,
                 fields,
                 fields
                     .integer_comparison
                     .expect("normalized SIMD integer comparison"),
+                matches!(instruction, Instruction::ScalarIntegerCompare(_)),
             );
             Ok(())
         }
@@ -117,6 +134,10 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             );
             Ok(())
         }
+        Instruction::IntegerMinMaxAcross(_) => {
+            integer_min_max_across(state, fields);
+            Ok(())
+        }
         Instruction::IntegerMinMax(_) => {
             integer_min_max(
                 state,
@@ -124,6 +145,14 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
                 fields
                     .pairwise_operation
                     .expect("normalized SIMD minimum/maximum operation"),
+            );
+            Ok(())
+        }
+        Instruction::TableLookup(_) | Instruction::TableLookupExtension(_) => {
+            table_lookup(
+                state,
+                fields,
+                matches!(instruction, Instruction::TableLookupExtension(_)),
             );
             Ok(())
         }
@@ -378,6 +407,35 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             scalar_float_immediate(state, fields);
             Ok(())
         }
+        Instruction::VectorFloatConvertNarrow(_) => {
+            let source = state.vector(fields.rn).expect("normalized FCVTN source");
+            let outcome = exact_vector_float_convert_narrow(source, state.fpcr());
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(A64FpSimdError::Trap);
+            }
+            let result = if fields.vector_128 {
+                (state
+                    .vector(fields.rd)
+                    .expect("normalized FCVTN2 destination")
+                    & u128::from(u64::MAX))
+                    | (outcome.bits << 64)
+            } else {
+                outcome.bits
+            };
+            assert!(state.set_vector(fields.rd, result));
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+            Ok(())
+        }
+        Instruction::VectorFloatConvertLong(_) => {
+            let source = state.vector(fields.rn).expect("normalized FCVTL source");
+            let outcome = exact_vector_float_convert_long(source, fields.vector_128, state.fpcr());
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(A64FpSimdError::Trap);
+            }
+            assert!(state.set_vector(fields.rd, outcome.bits));
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+            Ok(())
+        }
         Instruction::ScalarFloatConvert(_) => {
             let outcome = scalar_float_convert(
                 state,
@@ -417,14 +475,17 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
             state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
             Ok(())
         }
-        Instruction::ScalarFloatMaxNumber(_) | Instruction::ScalarFloatMinNumber(_) => {
+        Instruction::ScalarFloatMaxNumber(_)
+        | Instruction::ScalarFloatMinNumber(_)
+        | Instruction::ScalarFloatMax(_)
+        | Instruction::ScalarFloatMin(_) => {
             let width = if fields.opc == 0 { 32 } else { 64 };
             let mask = if width == 32 {
                 u64::from(u32::MAX)
             } else {
                 u64::MAX
             };
-            let outcome = exact_scalar_float_min_max_number(
+            let outcome = exact_scalar_float_min_max(
                 state
                     .vector(fields.rn)
                     .expect("normalized FP min/max-number source") as u64
@@ -434,7 +495,14 @@ pub fn execute(state: &mut A64State, instruction: Instruction) -> Result<(), A64
                     .expect("normalized FP min/max-number source") as u64
                     & mask,
                 width,
-                matches!(instruction, Instruction::ScalarFloatMinNumber(_)),
+                matches!(
+                    instruction,
+                    Instruction::ScalarFloatMinNumber(_) | Instruction::ScalarFloatMin(_)
+                ),
+                matches!(
+                    instruction,
+                    Instruction::ScalarFloatMaxNumber(_) | Instruction::ScalarFloatMinNumber(_)
+                ),
                 state.fpcr(),
             );
             if fp_status_traps(outcome.status, state.fpcr()) {
@@ -925,7 +993,14 @@ fn expand_vfp_immediate(immediate: u8, exponent_bits: u32, fraction_bits: u32) -
         | (fraction_head << (fraction_bits - 4))
 }
 
-fn integer_add_sub(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+// MUL retains the low lane bits of unsigned products (identical to signed modular multiplication).
+// Arm A64 ISA, MUL (vector), pp. 1660–1661:
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+fn integer_arithmetic(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    multiply: bool,
+) {
     let vector_bits = if fields.vector_128 { 128 } else { 64 };
     let lane_bits = 8_u8 << fields.opc;
     let lane_mask = (1_u128 << lane_bits) - 1;
@@ -939,12 +1014,69 @@ fn integer_add_sub(state: &mut A64State, fields: crate::decode::a64::fp_simd::Op
     for shift in (0..vector_bits).step_by(usize::from(lane_bits)) {
         let lhs_lane = (lhs >> shift) & lane_mask;
         let rhs_lane = (rhs >> shift) & lane_mask;
-        let lane = if fields.subtract {
+        let lane = if multiply {
+            lhs_lane.wrapping_mul(rhs_lane)
+        } else if fields.subtract {
             lhs_lane.wrapping_sub(rhs_lane)
         } else {
             lhs_lane.wrapping_add(rhs_lane)
         } & lane_mask;
         result |= lane << shift;
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// Integer ABS/NEG wrap even for the most negative signed value and clear inactive bits.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (ABS/NEG pp. 1094–1095, 1665–1666)
+fn integer_sign(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands, scalar: bool) {
+    let width = 8_u32 << fields.opc;
+    let active = if !scalar && fields.vector_128 {
+        128
+    } else {
+        64
+    };
+    let mask = (1_u128 << width) - 1;
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized integer sign source");
+    let mut result = 0;
+    for lane in 0..active / width {
+        let value = (source >> (lane * width)) & mask;
+        let value = if fields.operation_bit || value & (1 << (width - 1)) != 0 {
+            value.wrapping_neg() & mask
+        } else {
+            value
+        };
+        result |= value << (lane * width);
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// SADDW/UADDW widen the selected 64-bit half of Rm, then add modulo
+// the destination lane width. Both source registers are read before writing.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1709–1710, 2022–2023)
+fn integer_add_wide(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let narrow = 8_u8 << fields.opc;
+    let wide = narrow * 2;
+    let narrow_mask = (1_u128 << narrow) - 1;
+    let wide_mask = (1_u128 << wide) - 1;
+    let lhs = state
+        .vector(fields.rn)
+        .expect("normalized add-wide first source");
+    let rhs = state
+        .vector(fields.rm)
+        .expect("normalized add-wide second source");
+    let first = if fields.vector_128 { 64 } else { 0 };
+    let mut result = 0;
+    for lane in 0..128 / wide {
+        let value = (rhs >> (first + lane * narrow)) & narrow_mask;
+        let value = if fields.operation_bit {
+            value
+        } else {
+            sign_extend(value as u64, narrow) as u128
+        };
+        let sum = ((lhs >> (lane * wide)) & wide_mask).wrapping_add(value) & wide_mask;
+        result |= sum << (lane * wide);
     }
     assert!(state.set_vector(fields.rd, result));
 }
@@ -996,7 +1128,7 @@ pub fn exact_vector_integer_to_float(
         let lane = ((source >> shift) & lane_mask) as u64;
         let (negative, magnitude) = integer_sign_and_magnitude(lane, lane_bits, signed);
         let (converted, inexact) =
-            integer_magnitude_to_ieee(magnitude, negative, lane_bits, rounding);
+            integer_magnitude_to_ieee(magnitude, negative, lane_bits, rounding, 0);
         result |= u128::from(converted) << shift;
         any_inexact |= inexact;
     }
@@ -1035,7 +1167,7 @@ pub fn exact_scalar_vector_integer_to_float(
 ) -> (u64, bool) {
     let lane_bits = u32::from(lane_bits);
     let (negative, magnitude) = integer_sign_and_magnitude(source, lane_bits, signed);
-    integer_magnitude_to_ieee(magnitude, negative, lane_bits, fpcr_rounding_mode(fpcr))
+    integer_magnitude_to_ieee(magnitude, negative, lane_bits, fpcr_rounding_mode(fpcr), 0)
 }
 
 // SCVTF and UCVTF scalar integer forms use FPCR.RMode, set FPSR.IXC for a
@@ -1062,6 +1194,7 @@ fn scalar_integer_to_float(
         destination_bits as u8,
         signed,
         state.fpcr(),
+        fields.fixed_point_fraction_bits.unwrap_or(0),
     )
 }
 
@@ -1071,6 +1204,7 @@ pub fn exact_scalar_integer_to_float(
     destination_bits: u8,
     signed: bool,
     fpcr: u32,
+    fractional_bits: u8,
 ) -> (u64, bool) {
     let source_bits = u32::from(source_bits);
     let destination_bits = u32::from(destination_bits);
@@ -1080,6 +1214,7 @@ pub fn exact_scalar_integer_to_float(
         negative,
         destination_bits,
         fpcr_rounding_mode(fpcr),
+        fractional_bits,
     )
 }
 
@@ -1315,6 +1450,7 @@ fn integer_magnitude_to_ieee(
     negative: bool,
     format_bits: u32,
     rounding: FpRoundingMode,
+    fractional_bits: u8,
 ) -> (u64, bool) {
     if magnitude == 0 {
         return (0, false);
@@ -1325,7 +1461,11 @@ fn integer_magnitude_to_ieee(
         (52_u32, 1023_u64)
     };
     let leading_bit = 63 - magnitude.leading_zeros();
-    let mut exponent = u64::from(leading_bit) + exponent_bias;
+    // FixedToFP divides the exact integer by 2^fbits before rounding. Every
+    // nonzero W/X-to-S/D result remains normal even for fbits=64, so scaling
+    // changes only the exponent and leaves the significand/IXC rounding intact.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 2026-2028)
+    let mut exponent = u64::from(leading_bit) + exponent_bias - u64::from(fractional_bits);
     let (mut significand, inexact) = if leading_bit <= fraction_bits {
         (magnitude << (fraction_bits - leading_bit), false)
     } else {
@@ -1389,6 +1529,44 @@ fn scalar_float_convert(
         bits: outcome.bits as u64,
         status: outcome.status,
     }
+}
+
+// FCVTL converts the selected pair of single-precision lanes to double
+// precision. Capture every source lane before writing, aggregate status, and
+// leave destination/status unchanged if any enabled exception traps.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1261–1262)
+pub fn exact_vector_float_convert_long(source: u128, upper: bool, fpcr: u32) -> ExactFpOutcome {
+    let first = if upper { 64 } else { 0 };
+    let mut bits = 0;
+    let mut status = FpStatus::default();
+    for lane in 0..2 {
+        let outcome = exact_float_convert(
+            ((source >> (first + lane * 32)) as u64) & u64::from(u32::MAX),
+            FloatConversion::SingleToDouble,
+            fpcr,
+        );
+        bits |= outcome.bits << (lane * 64);
+        merge_fp_status(&mut status, outcome.status);
+    }
+    ExactFpOutcome { bits, status }
+}
+
+// Both input lanes are converted before committing the destination, so traps
+// cannot expose partially written output. FCVTN2 merging belongs to the caller.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1281–1282)
+pub fn exact_vector_float_convert_narrow(source: u128, fpcr: u32) -> ExactFpOutcome {
+    let mut bits = 0;
+    let mut status = FpStatus::default();
+    for lane in 0..2 {
+        let outcome = exact_float_convert(
+            (source >> (lane * 64)) as u64,
+            FloatConversion::DoubleToSingle,
+            fpcr,
+        );
+        bits |= outcome.bits << (lane * 32);
+        merge_fp_status(&mut status, outcome.status);
+    }
+    ExactFpOutcome { bits, status }
 }
 
 pub fn exact_float_convert(source: u64, conversion: FloatConversion, fpcr: u32) -> ExactFpOutcome {
@@ -2467,23 +2645,30 @@ pub fn exact_scalar_float_add(
     operation: FloatAddOperation,
     fpcr: u32,
 ) -> ExactFpOutcome {
-    exact_value(add_ieee_lane(
+    let mut outcome = exact_value(add_ieee_lane(
         lhs,
         rhs,
         fp_format(precision),
         fpcr,
-        matches!(operation, FloatAddOperation::Subtract),
-    ))
+        !matches!(operation, FloatAddOperation::Add),
+    ));
+    // FABD applies FPAbs after subtraction, without changing subtraction status.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1174–1176)
+    if matches!(operation, FloatAddOperation::AbsoluteDifference) {
+        outcome.bits &= (1_u128 << (precision - 1)) - 1;
+    }
+    outcome
 }
 
-/// FMINNM/FMAXNM prefer a number to a quiet NaN, but propagate signaling NaNs.
+/// FMIN/FMAX propagate NaNs; FMINNM/FMAXNM prefer a number to a quiet NaN.
 /// FPUnpack applies FZ/IDC before selection; +0 is greater than -0.
 /// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
-pub fn exact_scalar_float_min_max_number(
+pub fn exact_scalar_float_min_max(
     lhs: u64,
     rhs: u64,
     precision: u8,
     minimum: bool,
+    number: bool,
     fpcr: u32,
 ) -> ExactFpOutcome {
     let format = BinaryFormat::new(fp_format(precision));
@@ -2498,7 +2683,10 @@ pub fn exact_scalar_float_min_max_number(
         }
     }
     status.invalid_operation = lhs.is_signaling_nan(format) || rhs.is_signaling_nan(format);
-    let bits = if status.invalid_operation || (lhs.is_nan(format) && rhs.is_nan(format)) {
+    let bits = if status.invalid_operation
+        || (lhs.is_nan(format) && rhs.is_nan(format))
+        || (!number && (lhs.is_nan(format) || rhs.is_nan(format)))
+    {
         propagate_nan(lhs, rhs, format, control.default_nan)
     } else if lhs.is_nan(format) {
         rhs.bits
@@ -2859,7 +3047,7 @@ pub fn exact_scalar_float_round(
     let bits = if magnitude == 0 {
         source.bits & format.sign_mask()
     } else {
-        integer_magnitude_to_ieee(magnitude, source.sign, format.total_bits, rounding).0
+        integer_magnitude_to_ieee(magnitude, source.sign, format.total_bits, rounding, 0).0
     };
     ExactFpOutcome {
         bits: u128::from(bits),
@@ -3463,6 +3651,41 @@ fn integer_pairwise(
     assert!(state.set_vector(fields.rd, result));
 }
 
+// SMAXV/SMINV/UMAXV/UMINV reduce active lanes and zero the scalar upper bits.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (UMAXV pp. 2050–2051, UMINV pp. 2056–2057)
+fn integer_min_max_across(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let width = 8_u8 << fields.opc;
+    let mask = (1_u128 << width) - 1;
+    let bits = if fields.vector_128 { 128 } else { 64 };
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized reduction source");
+    let operation = fields
+        .pairwise_operation
+        .expect("normalized reduction operation");
+    let signed = matches!(
+        operation,
+        PairwiseOperation::SignedMaximum | PairwiseOperation::SignedMinimum
+    );
+    let minimum = matches!(
+        operation,
+        PairwiseOperation::SignedMinimum | PairwiseOperation::UnsignedMinimum
+    );
+    let mut result = source & mask;
+    for shift in (usize::from(width)..bits).step_by(usize::from(width)) {
+        let value = (source >> shift) & mask;
+        let less = if signed {
+            sign_extend(value as u64, width) < sign_extend(result as u64, width)
+        } else {
+            value < result
+        };
+        if less == minimum {
+            result = value;
+        }
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
 fn integer_min_max(
     state: &mut A64State,
     fields: crate::decode::a64::fp_simd::Operands,
@@ -3519,6 +3742,28 @@ fn integer_min_max(
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/TRN2--Transpose-vectors--secondary--
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UZP1--Unzip-vectors--primary--
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UZP2--Unzip-vectors--secondary--
+// Arm TBL/TBX read all table/index bytes before updating the destination.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+fn table_lookup(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands, extend: bool) {
+    let indices = state.vector(fields.rm).unwrap().to_le_bytes();
+    let table: [u128; 4] =
+        std::array::from_fn(|i| state.vector((fields.rn + i as u8) & 31).unwrap());
+    let previous = state.vector(fields.rd).unwrap().to_le_bytes();
+    let mut result = [0_u8; 16];
+    let lanes = if fields.vector_128 { 16 } else { 8 };
+    for i in 0..lanes {
+        let index = usize::from(indices[i]);
+        result[i] = if index < usize::from(fields.table_register_count) * 16 {
+            (table[index / 16] >> (index % 16 * 8)) as u8
+        } else if extend {
+            previous[i]
+        } else {
+            0
+        };
+    }
+    state.set_vector(fields.rd, u128::from_le_bytes(result));
+}
+
 fn permute_two_source(
     state: &mut A64State,
     fields: crate::decode::a64::fp_simd::Operands,
@@ -3637,6 +3882,8 @@ fn shift_right_narrow(state: &mut A64State, fields: crate::decode::a64::fp_simd:
 // Arm ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHR--Signed-shift-right--immediate--
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/USHR--Unsigned-shift-right--immediate--
+// SSRA/USRA add the shifted lane to the original destination, modulo lane width.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1902–1903, 2124–2125)
 fn shift_right_immediate(
     state: &mut A64State,
     fields: crate::decode::a64::fp_simd::Operands,
@@ -3656,6 +3903,9 @@ fn shift_right_immediate(
     let source = state
         .vector(fields.rn)
         .expect("normalized SSHR/USHR source register");
+    let accumulator = state
+        .vector(fields.rd)
+        .expect("normalized shift destination register");
     let signed = !fields.operation_bit;
     let mut result = 0_u128;
     for lane in 0..lane_count {
@@ -3666,7 +3916,12 @@ fn shift_right_immediate(
         } else {
             value >> shift
         };
-        result |= (shifted & lane_mask) << (lane * lane_bits);
+        let value = if fields.shift_accumulate {
+            shifted.wrapping_add((accumulator >> (lane * lane_bits)) & lane_mask)
+        } else {
+            shifted
+        };
+        result |= (value & lane_mask) << (lane * lane_bits);
     }
     assert!(state.set_vector(fields.rd, result));
 }
@@ -3920,6 +4175,7 @@ fn bitwise(
         .vector(fields.rd)
         .expect("normalized SIMD destination register");
     let result = match operation {
+        BitwiseOperation::Not => !first,
         BitwiseOperation::And => first & second,
         BitwiseOperation::BitClear => first & !second,
         BitwiseOperation::Or => first | second,
@@ -3950,12 +4206,19 @@ fn bitwise(
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMEQ--zero---Compare-bitwise-equal-to-zero--vector--
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMLE--Compare-signed-less-than-or-equal-to-zero--vector--
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMLT--Compare-signed-less-than-zero--vector--
+// Integer SIMD scalar comparisons have one D lane; vector forms use every active lane.
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (CMEQ p. 1138)
 fn integer_compare(
     state: &mut A64State,
     fields: crate::decode::a64::fp_simd::Operands,
     comparison: IntegerComparison,
+    scalar: bool,
 ) {
-    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let vector_bits = if !scalar && fields.vector_128 {
+        128
+    } else {
+        64
+    };
     let lane_bits = 8_u8 << fields.opc;
     let lane_mask = (1_u128 << lane_bits) - 1;
     let lhs = state
@@ -3999,10 +4262,417 @@ fn integer_compare(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn table_lookup_handles_all_byte_indices_register_wrap_and_destination_aliases() {
+        use crate::{decode::a64::fp_simd::Operands, state::a64::A64State};
+        for count in 1..=4 {
+            for full in [false, true] {
+                for extend in [false, true] {
+                    for rd in [0, 1, 2, 4, 31] {
+                        for batch in 0..16_u8 {
+                            let mut state = A64State::default();
+                            for register in 0..32_u8 {
+                                state.set_vector(
+                                    register,
+                                    u128::from_le_bytes(std::array::from_fn(|i| {
+                                        register.wrapping_mul(17).wrapping_add(i as u8)
+                                    })),
+                                );
+                            }
+                            state.set_vector(
+                                4,
+                                u128::from_le_bytes(std::array::from_fn(|i| batch * 16 + i as u8)),
+                            );
+                            let previous = state.vector(rd).unwrap().to_le_bytes();
+                            let expected = std::array::from_fn(|i| {
+                                if !full && i >= 8 {
+                                    return 0;
+                                }
+                                let index = usize::from(batch) * 16 + i;
+                                if index < usize::from(count) * 16 {
+                                    state
+                                        .vector((31 + (index / 16) as u8) & 31)
+                                        .unwrap()
+                                        .to_le_bytes()[index % 16]
+                                } else if extend {
+                                    previous[i]
+                                } else {
+                                    0
+                                }
+                            });
+                            super::table_lookup(
+                                &mut state,
+                                Operands {
+                                    rd,
+                                    rn: 31,
+                                    rm: 4,
+                                    table_register_count: count,
+                                    vector_128: full,
+                                    ..Operands::empty()
+                                },
+                                extend,
+                            );
+                            assert_eq!(state.vector(rd).unwrap().to_le_bytes(), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use super::{
         align_fused_operands, exact_float_convert, exact_scalar_float_divide, fp_status_bits,
         integer_square_root, shift_lane,
     };
+
+    #[test]
+    fn scalar_minmax_distinguishes_nan_propagation_and_signed_zero() {
+        for precision in [32, 64] {
+            let (one, qnan, default_nan, sign) = if precision == 32 {
+                (
+                    0x3f80_0000_u64,
+                    0x7fc0_0123_u64,
+                    0x7fc0_0000_u64,
+                    1_u64 << 31,
+                )
+            } else {
+                (
+                    0x3ff0_0000_0000_0000,
+                    0x7ff8_0000_0000_0123,
+                    0x7ff8_0000_0000_0000,
+                    1 << 63,
+                )
+            };
+            for minimum in [false, true] {
+                for (lhs, rhs) in [(qnan, one), (one, qnan)] {
+                    let propagating =
+                        super::exact_scalar_float_min_max(lhs, rhs, precision, minimum, false, 0);
+                    assert_eq!(propagating.bits, u128::from(qnan));
+                    assert!(!propagating.status.invalid_operation);
+                    assert_eq!(
+                        super::exact_scalar_float_min_max(lhs, rhs, precision, minimum, true, 0)
+                            .bits,
+                        u128::from(one)
+                    );
+                    assert_eq!(
+                        super::exact_scalar_float_min_max(
+                            lhs,
+                            rhs,
+                            precision,
+                            minimum,
+                            false,
+                            1 << 25
+                        )
+                        .bits,
+                        u128::from(default_nan)
+                    );
+                }
+                for (lhs, rhs) in [(0, sign), (sign, 0)] {
+                    assert_eq!(
+                        super::exact_scalar_float_min_max(lhs, rhs, precision, minimum, false, 0)
+                            .bits,
+                        if minimum { u128::from(sign) } else { 0 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_sign_wraps_minimum_and_preserves_status() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::{A64State, Nzcv};
+        for size in 0..4 {
+            let width = 8_u32 << size;
+            let minimum = 1_u128 << (width - 1);
+            let mask = (1_u128 << width) - 1;
+            for full in [false, true] {
+                if size == 3 && !full {
+                    continue;
+                }
+                for negate in [false, true] {
+                    let mut state = A64State::default();
+                    let source = minimum | (mask << width);
+                    state.set_vector(0, source | (!0_u128 << 64));
+                    state.set_nzcv(Nzcv::from_bits(0xb000_0000));
+                    state.set_fpsr(0x0800_009f);
+                    let word = 0x0e20_b800
+                        | (size << 22)
+                        | (u32::from(full) << 30)
+                        | (u32::from(negate) << 29);
+                    super::execute(&mut state, fp_simd::normalize(0xc2, word)).unwrap();
+                    let active = if full { 128 } else { 64 };
+                    let mut expected = 0;
+                    for lane in 0..active / width {
+                        let value = ((source | (!0_u128 << 64)) >> (lane * width)) & mask;
+                        let signed = (value << (128 - width)) as i128 >> (128 - width);
+                        let value = if negate { -signed } else { signed.abs() };
+                        expected |= (value as u128 & mask) << (lane * width);
+                    }
+                    assert_eq!(state.vector(0), Some(expected));
+                    assert_eq!(state.fpsr(), 0x0800_009f);
+                    assert_eq!(state.nzcv(), Nzcv::from_bits(0xb000_0000));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_add_wide_extends_only_selected_rhs_half_and_wraps_destination() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for size in 0..3 {
+            let narrow = 8_u32 << size;
+            let wide = narrow * 2;
+            let value = (1_u128 << narrow) - 1;
+            for upper in [false, true] {
+                for unsigned in [false, true] {
+                    let mut state = A64State::default();
+                    let mut lhs = 0;
+                    let mut rhs = 0;
+                    let mut expected = 0;
+                    for lane in 0..128 / wide {
+                        lhs |= 1_u128 << (lane * wide);
+                        rhs |= value << (lane * narrow + if upper { 64 } else { 0 });
+                        if unsigned {
+                            expected |= (1_u128 << narrow) << (lane * wide);
+                        }
+                    }
+                    state.set_vector(0, lhs);
+                    state.set_vector(2, rhs);
+                    state.set_fpsr(0x0800_009f);
+                    let word = 0x0e22_1000
+                        | (size << 22)
+                        | (u32::from(unsigned) << 29)
+                        | (u32::from(upper) << 30);
+                    super::execute(&mut state, fp_simd::normalize(0xc1, word)).unwrap();
+                    assert_eq!(state.vector(0), Some(expected));
+                    assert_eq!(state.fpsr(), 0x0800_009f);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_integer_compare_writes_one_mask_without_touching_flags() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::{A64State, Nzcv};
+        for (id, expected) in [
+            (0xbb, 0),
+            (0xbc, u64::MAX),
+            (0xbd, 0),
+            (0xbe, u64::MAX),
+            (0xbf, u64::MAX),
+            (0xc0, 0),
+        ] {
+            let mut state = A64State::default();
+            state.set_vector(2, u128::MAX);
+            state.set_vector(1, 1);
+            state.set_nzcv(Nzcv::from_bits(0xb000_0000));
+            state.set_fpsr(0x0800_009f);
+            super::execute(&mut state, fp_simd::normalize(id, 0x7ee1_8c41)).unwrap();
+            assert_eq!(state.vector(1), Some(u128::from(expected)));
+            assert_eq!(state.nzcv(), Nzcv::from_bits(0xb000_0000));
+            assert_eq!(state.fpsr(), 0x0800_009f);
+        }
+    }
+
+    #[test]
+    fn fabd_clears_subtraction_sign_including_nan_and_negative_zero() {
+        use crate::decode::a64::fp_simd::FloatAddOperation::AbsoluteDifference;
+        for (width, sign, one, two, nan) in [
+            (
+                32,
+                1_u64 << 31,
+                u64::from(1.0_f32.to_bits()),
+                u64::from(2.0_f32.to_bits()),
+                0xffc0_1234,
+            ),
+            (
+                64,
+                1_u64 << 63,
+                1.0_f64.to_bits(),
+                2.0_f64.to_bits(),
+                0xfff8_0000_0000_1234,
+            ),
+        ] {
+            assert_eq!(
+                super::exact_scalar_float_add(one, two, width, AbsoluteDifference, 0).bits,
+                u128::from(one)
+            );
+            assert_eq!(
+                super::exact_scalar_float_add(sign, 0, width, AbsoluteDifference, 0).bits,
+                0
+            );
+            let result = super::exact_scalar_float_add(nan, one, width, AbsoluteDifference, 0);
+            assert_eq!(result.bits, u128::from(nan & !sign));
+            assert_eq!(super::fp_status_bits(result.status), 0);
+        }
+    }
+
+    #[test]
+    fn fcvtn_merges_selected_destination_half_and_honors_rounding() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        let source =
+            u128::from(0x3ff0_0000_1000_0000_u64) | (u128::from((-2.5_f64).to_bits()) << 64);
+        for upper in [false, true] {
+            for mode in 0..4 {
+                let mut state = A64State::default();
+                state.set_vector(1, source);
+                state.set_fpcr(mode << 22);
+                let word = 0x0e61_6821 | (u32::from(upper) << 30);
+                super::execute(&mut state, fp_simd::normalize(0xc4, word)).unwrap();
+                let low = if mode == 1 {
+                    0x3f80_0001_u64
+                } else {
+                    0x3f80_0000
+                };
+                let bits = u128::from(low | (u64::from((-2.5_f32).to_bits()) << 32));
+                let expected = if upper {
+                    (source & u128::from(u64::MAX)) | (bits << 64)
+                } else {
+                    bits
+                };
+                assert_eq!(state.vector(1), Some(expected));
+                assert_eq!(state.fpsr(), 1 << 4);
+            }
+        }
+    }
+
+    #[test]
+    fn fcvtl_widens_selected_half_exactly_and_aggregates_exception_status() {
+        let source = 0xc020_0000_3fc0_0000_8000_0000_0000_0000;
+        let low = super::exact_vector_float_convert_long(source, false, 0);
+        assert_eq!(low.bits, 1_u128 << 127);
+        let high = super::exact_vector_float_convert_long(source, true, 0);
+        assert_eq!(
+            high.bits,
+            u128::from(1.5_f64.to_bits()) | (u128::from((-2.5_f64).to_bits()) << 64)
+        );
+        assert_eq!(super::fp_status_bits(high.status), 0);
+        let exceptional = super::exact_vector_float_convert_long(
+            0x7f80_0123_0000_0001,
+            false,
+            (1 << 24) | (1 << 25),
+        );
+        assert_eq!(exceptional.bits, u128::from(f64::NAN.to_bits()) << 64);
+        assert_eq!(super::fp_status_bits(exceptional.status), 0x81);
+    }
+
+    #[test]
+    fn integer_min_max_across_ignores_inactive_lanes_and_clears_scalar_upper_bits() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for (id, expected) in [
+            (0xb6, 0x7fff),
+            (0xb7, 0x8000),
+            (0xb8, 0xffff),
+            (0xb9, 0x0001),
+        ] {
+            let mut state = A64State::default();
+            state.set_vector(0, 0x0000_0000_0000_0000_ffff_7fff_8000_0001);
+            state.set_fpsr(0x0800_009f);
+            super::execute(&mut state, fp_simd::normalize(id, 0x0e70_a800)).unwrap();
+            assert_eq!(state.vector(0), Some(expected));
+            assert_eq!(state.fpsr(), 0x0800_009f);
+        }
+    }
+
+    #[test]
+    fn shift_right_accumulate_wraps_and_distinguishes_signed_full_width_shifts() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for unsigned in [false, true] {
+            for shift in [1, 4, 32] {
+                let mut state = A64State::default();
+                state.set_vector(1, 0x8000_0000_0000_0010);
+                state.set_vector(2, u128::MAX);
+                state.set_fpsr(0x0800_009f);
+                let word = 0x0f00_1422 | (u32::from(unsigned) << 29) | ((64 - shift) << 16);
+                super::execute(&mut state, fp_simd::normalize(0x92, word)).unwrap();
+                let low = if shift == 32 { 0 } else { 16_u32 >> shift };
+                let high = if unsigned {
+                    if shift == 32 {
+                        0
+                    } else {
+                        0x8000_0000_u32 >> shift
+                    }
+                } else {
+                    (i32::MIN >> shift.min(31)) as u32
+                };
+                let expected =
+                    u128::from(low.wrapping_sub(1)) | (u128::from(high.wrapping_sub(1)) << 32);
+                assert_eq!(state.vector(2), Some(expected));
+                assert_eq!(state.fpsr(), 0x0800_009f);
+            }
+        }
+    }
+
+    #[test]
+    fn vector_integer_multiply_wraps_each_lane_and_preserves_status() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for size in 0..3 {
+            let width = 8_u32 << size;
+            let mask = (1_u128 << width) - 1;
+            for full in [false, true] {
+                let mut state = A64State::default();
+                let mut lhs = 0;
+                let mut rhs = 0;
+                let mut expected = 0;
+                for lane in 0..128 / width {
+                    let a = (mask - u128::from(lane)) & mask;
+                    let b = u128::from(lane + 2) & mask;
+                    lhs |= a << (lane * width);
+                    rhs |= b << (lane * width);
+                    if full || lane < 64 / width {
+                        // Independent signed arithmetic oracle, including overflow truncation.
+                        let signed = a as i128 - (1_i128 << width);
+                        expected |= ((signed * b as i128) as u128 & mask) << (lane * width);
+                    }
+                }
+                state.set_vector(0, rhs);
+                state.set_vector(2, lhs);
+                state.set_fpsr(0x0800_009f);
+                let word = 0x0e20_9c40 | (size << 22) | (u32::from(full) << 30);
+                super::execute(&mut state, fp_simd::normalize(0x0000_00b5, word)).unwrap();
+                assert_eq!(state.vector(0), Some(expected));
+                assert_eq!(state.fpsr(), 0x0800_009f);
+            }
+        }
+    }
+
+    #[test]
+    fn vector_not_inverts_active_bits_and_clears_upper_half() {
+        use crate::decode::a64::fp_simd;
+        use crate::state::a64::A64State;
+        for full in [false, true] {
+            for (rd, rn) in [(0, 0), (31, 31), (2, 31), (31, 2)] {
+                for source in [0, u128::MAX, 0x1234_5678_9abc_def0_0123_4567_89ab_cdef] {
+                    let mut state = A64State::default();
+                    state.set_vector(rd, u128::MAX);
+                    state.set_vector(rn, source);
+                    state.set_fpsr(0x0800_009f);
+                    let instruction = fp_simd::normalize(
+                        0x0000_00b2,
+                        0x2e20_5800
+                            | (u32::from(full) << 30)
+                            | (u32::from(rn) << 5)
+                            | u32::from(rd),
+                    );
+                    super::execute(&mut state, instruction).unwrap();
+                    let mask = if full {
+                        u128::MAX
+                    } else {
+                        u128::from(u64::MAX)
+                    };
+                    assert_eq!(state.vector(rd), Some(!source & mask));
+                    assert_eq!(state.fpsr(), 0x0800_009f);
+                }
+            }
+        }
+    }
 
     #[test]
     fn scalar_fused_element_uses_accumulator_and_one_rounding() {

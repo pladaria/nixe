@@ -657,9 +657,21 @@ fn register_access_fp_simd_vector(
             }
             write(accessed, dirty, fields.rd);
         }
+        fp_simd::Instruction::TableLookup(_) | fp_simd::Instruction::TableLookupExtension(_) => {
+            for index in 0..fields.table_register_count {
+                read(accessed, (fields.rn + index) & 31);
+            }
+            read(accessed, fields.rm);
+            if matches!(instruction, fp_simd::Instruction::TableLookupExtension(_)) {
+                read(accessed, fields.rd);
+            }
+            write(accessed, dirty, fields.rd);
+        }
         fp_simd::Instruction::Bitwise(_) => {
             read(accessed, fields.rn);
-            read(accessed, fields.rm);
+            if fields.bitwise_operation != Some(fp_simd::BitwiseOperation::Not) {
+                read(accessed, fields.rm);
+            }
             if matches!(
                 fields.bitwise_operation,
                 Some(
@@ -673,7 +685,10 @@ fn register_access_fp_simd_vector(
             write(accessed, dirty, fields.rd);
         }
         fp_simd::Instruction::Integer(_)
+        | fp_simd::Instruction::IntegerMultiply(_)
+        | fp_simd::Instruction::IntegerWideAdd(_)
         | fp_simd::Instruction::IntegerCompare(_)
+        | fp_simd::Instruction::ScalarIntegerCompare(_)
         | fp_simd::Instruction::IntegerPairwise(_)
         | fp_simd::Instruction::IntegerMinMax(_)
         | fp_simd::Instruction::PermuteTwoSource(_)
@@ -688,6 +703,8 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::ScalarFloatAdd(_)
         | fp_simd::Instruction::ScalarFloatMaxNumber(_)
         | fp_simd::Instruction::ScalarFloatMinNumber(_)
+        | fp_simd::Instruction::ScalarFloatMax(_)
+        | fp_simd::Instruction::ScalarFloatMin(_)
         | fp_simd::Instruction::ScalarFloatMultiply(_)
         | fp_simd::Instruction::ScalarFloatMultiplyElement(_)
         | fp_simd::Instruction::ScalarFloatConditionalSelect(_) => {
@@ -709,7 +726,9 @@ fn register_access_fp_simd_vector(
             read(accessed, fields.rd);
             write(accessed, dirty, fields.rd);
         }
-        fp_simd::Instruction::ScalarMove(_)
+        fp_simd::Instruction::IntegerSign(_)
+        | fp_simd::Instruction::ScalarIntegerSign(_)
+        | fp_simd::Instruction::ScalarMove(_)
         | fp_simd::Instruction::ScalarAbsolute(_)
         | fp_simd::Instruction::ScalarNegate(_)
         | fp_simd::Instruction::VectorFloatAbsolute(_)
@@ -728,6 +747,7 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::VectorFloatToUnsignedInt(_)
         | fp_simd::Instruction::ScalarVectorFloatToSignedInt(_)
         | fp_simd::Instruction::ScalarVectorFloatToUnsignedInt(_)
+        | fp_simd::Instruction::IntegerMinMaxAcross(_)
         | fp_simd::Instruction::AddAcrossVector(_)
         | fp_simd::Instruction::UnsignedAddLongAcrossVector(_)
         | fp_simd::Instruction::VectorSignedIntToFloat(_)
@@ -735,9 +755,21 @@ fn register_access_fp_simd_vector(
         | fp_simd::Instruction::ScalarVectorSignedIntToFloat(_)
         | fp_simd::Instruction::ScalarVectorUnsignedIntToFloat(_)
         | fp_simd::Instruction::ScalarFloatConvert(_)
+        | fp_simd::Instruction::VectorFloatConvertLong(_)
+        | fp_simd::Instruction::VectorFloatConvertNarrow(_)
         | fp_simd::Instruction::ScalarFloatRound(_)
         | fp_simd::Instruction::ScalarFloatSquareRoot(_) => {
             read(accessed, fields.rn);
+            if matches!(
+                instruction,
+                fp_simd::Instruction::VectorFloatConvertNarrow(_)
+            ) && fields.vector_128
+            {
+                read(accessed, fields.rd);
+            }
+            if fields.shift_accumulate {
+                read(accessed, fields.rd);
+            }
             write(accessed, dirty, fields.rd);
         }
         fp_simd::Instruction::SignedIntToFloat(_) | fp_simd::Instruction::UnsignedIntToFloat(_) => {

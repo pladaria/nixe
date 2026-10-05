@@ -36,12 +36,14 @@ pub enum HorizonIpcObject {
     Performance(PerformanceSession),
     Applet(AppletSession),
     Account(AccountSession),
+    AccountProfile(AccountProfileSession),
     AccountManagerForApplication(AccountManagerForApplicationSession),
     Bsd(BsdSession),
     Ssl(SslSession),
     AudioOutManager(crate::AudioOutManagerSession),
     AudioOut(crate::AudioOutSession),
     Hid(HidSession),
+    Irs(IrsSession),
     HidAppletResource(HidAppletResource),
     HidActiveVibrationDeviceList(HidActiveVibrationDeviceList),
     Time(TimeServiceSession),
@@ -59,6 +61,7 @@ pub enum HorizonIpcObject {
     ParentalControlService(ParentalControlSession),
     NetworkInterface(NetworkInterfaceManagerSession),
     NetworkGeneralService(NetworkGeneralServiceSession),
+    NetworkRequest(NetworkRequestSession),
     SemanticObject(SemanticIpcObject),
 }
 
@@ -259,7 +262,27 @@ impl AccountSession {
 /// Interface identities hosted by a domain-converted `acc:u0` session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AccountObject {
+    Profile(AccountProfileSession),
     BaasManagerForApplication(AccountManagerForApplicationSession),
+}
+
+/// Local account profile returned by IAccountServiceForApplication::GetProfile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountProfileSession {
+    pub(crate) user: UserIdentity,
+}
+
+impl AccountProfileSession {
+    pub(crate) fn base(self) -> [u8; 0x38] {
+        // AccountProfileBase: UID, POSIX last-edit time, UTF-8 nickname.
+        // The built-in profile has never been edited; its timestamp is epoch.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/acc.h#L42-L47
+        let mut base = [0; 0x38];
+        base[..16].copy_from_slice(&self.user.id().encode());
+        let name = self.user.name().as_bytes();
+        base[24..24 + name.len()].copy_from_slice(name);
+        base
+    }
 }
 
 /// Nintendo-account manager associated with one local application user.
@@ -584,9 +607,10 @@ impl NetworkInterfaceManagerSession {
 }
 
 /// Interface identity hosted by a domain-converted `nifm:u` session.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum NetworkInterfaceObject {
     GeneralService(NetworkGeneralServiceSession),
+    Request(NetworkRequestSession),
 }
 
 /// Per-process `nn::nifm::detail::IGeneralService` session.
@@ -609,8 +633,74 @@ impl NetworkGeneralServiceSession {
     }
 }
 
+/// An offline NIFM request and its two independently owned event endpoints.
+/// The request-state event is the first handle returned by command 2.
+/// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nifm.c
+#[derive(Clone, Debug)]
+pub struct NetworkRequestSession {
+    result: Arc<AtomicU32>,
+    state_event: WritableEventObject,
+    state_reader: ReadableEventObject,
+    completion_event: WritableEventObject,
+    completion_reader: ReadableEventObject,
+}
+
+impl NetworkRequestSession {
+    pub(crate) fn new() -> Self {
+        let (state_event, state_reader) = nixe_runtime::EventObject::create_pair();
+        let (completion_event, completion_reader) = nixe_runtime::EventObject::create_pair();
+        Self {
+            result: Arc::new(AtomicU32::new(
+                crate::HorizonIpcResult::NIFM_NOT_SUBMITTED.raw(),
+            )),
+            state_event,
+            state_reader,
+            completion_event,
+            completion_reader,
+        }
+    }
+
+    pub(crate) fn result(&self) -> crate::HorizonIpcResult {
+        crate::HorizonIpcResult::from_raw(self.result.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn submit(&self) {
+        // No network backend is configured. Complete with the hardware's
+        // communication-disabled error, never an available connection.
+        // State 1 means both not submitted and a failed request.
+        // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/nifm/nifm.cpp
+        self.result.store(
+            crate::HorizonIpcResult::NIFM_COMMUNICATION_DISABLED.raw(),
+            Ordering::Release,
+        );
+        self.state_event.signal();
+        self.completion_event.signal();
+    }
+
+    pub(crate) fn events(&self) -> [ReadableEventObject; 2] {
+        [self.state_reader.clone(), self.completion_reader.clone()]
+    }
+}
+
 #[cfg(test)]
 mod ipc_session_tests {
+    #[test]
+    fn offline_network_request_completes_with_a_shared_error_and_events() {
+        let request = super::NetworkRequestSession::new();
+        let [state, completion] = request.events();
+        assert!(!state.is_signalled());
+        assert!(!completion.is_signalled());
+        assert_eq!(request.result().raw(), 110 | (311 << 9));
+        let clone = request.clone();
+        clone.submit();
+        assert_eq!(request.result().raw(), 110 | (1111 << 9));
+        assert!(state.is_signalled());
+        assert!(completion.is_signalled());
+        drop(request);
+        drop(clone);
+        assert!(state.is_signalled());
+    }
+
     use super::*;
 
     #[test]
@@ -883,6 +973,117 @@ impl HidSession {
     }
 }
 
+/// Shared IRS status for a process with no emulated infrared cameras.
+#[derive(Clone, Debug)]
+pub struct IrsSession {
+    shared_memory: SharedMemoryObject,
+    activation_lock: Arc<Mutex<()>>,
+}
+
+impl IrsSession {
+    pub(crate) fn new(
+        memory: &nixe_cpu::memory::ExecutionMemory,
+    ) -> Result<Self, nixe_runtime::HandleError> {
+        // Nine 0xe30-byte device entries, followed by five ARUID entries.
+        // Camera status 2 means unconnected; mode and processor state stay stopped.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/irs.h#L350-L379
+        let shared_memory = SharedMemoryObject::for_process(
+            memory,
+            0x8000,
+            nixe_cpu::memory::MemoryPermissions::READ,
+        )?;
+        for camera in 0..9 {
+            shared_memory.write(camera * 0xe30, &2_u32.to_le_bytes())?;
+        }
+        Ok(Self {
+            shared_memory,
+            activation_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    pub(crate) fn shared_memory(&self) -> SharedMemoryObject {
+        self.shared_memory.clone()
+    }
+
+    pub(crate) fn set_active(
+        &self,
+        aruid: u64,
+        active: bool,
+    ) -> Result<bool, nixe_runtime::HandleError> {
+        let _lock = self
+            .activation_lock
+            .lock()
+            .expect("IRS activation lock poisoned");
+        let mut empty = None;
+        for index in 0..5 {
+            let offset = 9 * 0xe30 + index * 16;
+            let mut entry = [0; 16];
+            self.shared_memory.read(offset, &mut entry)?;
+            let id = u64::from_le_bytes(entry[..8].try_into().expect("ARUID field"));
+            if id == aruid {
+                if !active {
+                    self.shared_memory.write(offset, &[0; 16])?;
+                }
+                return Ok(true);
+            }
+            if id == 0 {
+                empty = Some(offset);
+            }
+        }
+        if !active {
+            return Ok(true);
+        }
+        let Some(offset) = empty else {
+            return Ok(false);
+        };
+        let mut entry = [0; 16];
+        entry[..8].copy_from_slice(&aruid.to_le_bytes());
+        entry[8..12].copy_from_slice(&1_u32.to_le_bytes()); // Foreground applet.
+        self.shared_memory.write(offset, &entry)?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod infrared_tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_cameras_and_registrations_share_read_only_backing() {
+        let session = IrsSession::new(&nixe_cpu::memory::ExecutionMemory::new()).unwrap();
+        let clone = session.clone();
+        let shared = session.shared_memory();
+        assert_eq!(shared.size(), 0x8000);
+        assert_eq!(
+            shared.remote_permissions(),
+            nixe_cpu::memory::MemoryPermissions::READ
+        );
+        for camera in 0..9 {
+            let mut entry = [0; 16];
+            shared.read(camera * 0xe30, &mut entry).unwrap();
+            assert_eq!(entry[0], 2);
+            assert!(entry[1..].iter().all(|byte| *byte == 0));
+        }
+        for aruid in 1..=5 {
+            assert!(session.set_active(aruid, true).unwrap());
+        }
+        assert!(clone.set_active(3, true).unwrap());
+        assert!(!session.set_active(6, true).unwrap());
+        assert!(clone.set_active(3, false).unwrap());
+        assert!(session.set_active(6, true).unwrap());
+        let mut entries = [0; 80];
+        clone.shared_memory().read(9 * 0xe30, &mut entries).unwrap();
+        let ids: BTreeSet<_> = entries
+            .chunks_exact(16)
+            .map(|entry| {
+                assert_eq!(&entry[8..12], &1_u32.to_le_bytes());
+                u64::from_le_bytes(entry[..8].try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(ids, BTreeSet::from([1, 2, 4, 5, 6]));
+    }
+}
+
 /// `IAppletResource` returned by the root HID service.
 #[derive(Clone, Debug)]
 pub struct HidAppletResource {
@@ -998,8 +1199,8 @@ impl TimeEnvironment {
         TimeServiceSession::new(self.clone(), memory)
     }
 
-    pub(crate) fn clock(&self) -> VirtualClock {
-        self.clock.clone()
+    pub(crate) fn clock(&self) -> &VirtualClock {
+        &self.clock
     }
 }
 
@@ -1346,6 +1547,17 @@ impl OperationMode {
     pub(crate) const fn as_raw(self) -> u8 {
         self as u8
     }
+
+    // AM's output resolution follows the selected operation mode. It is
+    // independent of the application's framebuffer or the host window size.
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/am/service/common_state_getter.cpp
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/vi/vi_types.h
+    pub(crate) const fn default_display_resolution(self) -> (i32, i32) {
+        match self {
+            Self::Handheld => (1280, 720),
+            Self::Console => (1920, 1080),
+        }
+    }
 }
 
 /// Kinds accepted by `IApplicationFunctions::PopLaunchParameter`.
@@ -1494,9 +1706,10 @@ pub(crate) enum AppletProxyKind {
 #[derive(Debug)]
 struct ActiveLibraryApplet {
     object_id: u32,
-    // Retained for the future accessor lifecycle commands which signal state
-    // transitions after Start, exit, or termination.
-    _state_changed_event: WritableEventObject,
+    // Manual-clear completion event paired with the accessor result and output.
+    state_changed_event: WritableEventObject,
+    result: Option<u32>,
+    output: Option<Vec<u8>>,
     state_changed_event_reader: ReadableEventObject,
     input_storage_ids: VecDeque<u64>,
 }
@@ -1623,6 +1836,7 @@ struct AppletDomain {
     operation_mode: OperationMode,
     operation_mode_changed_notification: bool,
     performance_mode_changed_notification: bool,
+    cpu_boost_enabled: bool,
     restart_message_enabled: bool,
     request_exit_to_library_applet_at_execute_next_program_enabled: bool,
     focus_policy: AppletFocusPolicy,
@@ -1682,6 +1896,7 @@ impl AppletSession {
                 operation_mode,
                 operation_mode_changed_notification: false,
                 performance_mode_changed_notification: false,
+                cpu_boost_enabled: false,
                 restart_message_enabled: false,
                 request_exit_to_library_applet_at_execute_next_program_enabled: false,
                 focus_policy: AppletFocusPolicy::default(),
@@ -2049,7 +2264,9 @@ impl AppletSession {
         domain.next_object_id = next_object_id;
         domain.active_library_applet = Some(ActiveLibraryApplet {
             object_id,
-            _state_changed_event: state_changed_event,
+            state_changed_event,
+            result: None,
+            output: None,
             state_changed_event_reader,
             input_storage_ids: VecDeque::new(),
         });
@@ -2066,6 +2283,79 @@ impl AppletSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active = domain.active_library_applet.as_ref()?;
         (active.object_id == object_id).then(|| active.state_changed_event_reader.clone())
+    }
+
+    pub(crate) fn library_applet_result(&self, object_id: u32) -> Option<u32> {
+        let domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        domain
+            .active_library_applet
+            .as_ref()
+            .filter(|a| a.object_id == object_id)?
+            .result
+    }
+
+    pub(crate) fn complete_library_applet(&self, object_id: u32, output: Vec<u8>) -> bool {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(active) = domain
+            .active_library_applet
+            .as_mut()
+            .filter(|a| a.object_id == object_id && a.result.is_none())
+        else {
+            return false;
+        };
+        active.output = Some(output);
+        active.result = Some(0);
+        active.state_changed_event.signal();
+        true
+    }
+
+    pub(crate) fn pop_library_applet_output(
+        &self,
+        object_id: u32,
+    ) -> Result<u32, PopAppletLaunchParameterError> {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if domain
+            .active_library_applet
+            .as_ref()
+            .filter(|a| a.object_id == object_id)
+            .is_none_or(|a| a.output.is_none())
+        {
+            return Err(PopAppletLaunchParameterError::NotAvailable);
+        }
+        if domain.objects.len() >= MAX_APPLET_DOMAIN_OBJECTS {
+            return Err(PopAppletLaunchParameterError::DomainCapacityExhausted);
+        }
+        let storage_object = domain.next_object_id;
+        let next_object = storage_object
+            .checked_add(1)
+            .ok_or(PopAppletLaunchParameterError::ObjectIdExhausted)?;
+        let storage_id = domain.next_storage_id;
+        let next_storage = storage_id
+            .checked_add(1)
+            .ok_or(PopAppletLaunchParameterError::StorageIdExhausted)?;
+        let output = domain
+            .active_library_applet
+            .as_mut()
+            .unwrap()
+            .output
+            .take()
+            .unwrap();
+        domain.storages.insert(storage_id, output);
+        domain
+            .objects
+            .insert(storage_object, AppletObject::Storage { storage_id });
+        domain.next_storage_id = next_storage;
+        domain.next_object_id = next_object;
+        Ok(storage_object)
     }
 
     pub(crate) fn push_library_applet_input_storage(
@@ -2159,6 +2449,13 @@ impl AppletSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         domain.restart_message_enabled = enabled;
+    }
+
+    pub(crate) fn set_cpu_boost_enabled(&self, enabled: bool) {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cpu_boost_enabled = enabled;
     }
 
     pub(crate) fn accumulated_suspended_ticks(&self) -> u64 {
@@ -2305,6 +2602,55 @@ mod applet_tests {
     use super::*;
 
     #[test]
+    fn completed_library_applet_signals_and_transfers_output_storage_once() {
+        let session = AppletSession::new(OperationMode::Console);
+        session.convert_to_domain();
+        let applet = session
+            .create_library_applet(
+                LibraryAppletId::Controller,
+                LibraryAppletMode::AllForeground,
+            )
+            .unwrap();
+        let event = session.library_applet_state_changed_event(applet).unwrap();
+        assert!(!event.is_signalled());
+        assert_eq!(session.library_applet_result(applet), None);
+        assert_eq!(
+            session.pop_library_applet_output(applet),
+            Err(PopAppletLaunchParameterError::NotAvailable)
+        );
+        assert!(session.complete_library_applet(applet, vec![1, 2, 3, 4]));
+        assert!(event.is_signalled());
+        assert!(!session.complete_library_applet(applet, vec![9]));
+        assert_eq!(session.library_applet_result(applet), Some(0));
+        let storage = session.pop_library_applet_output(applet).unwrap();
+        assert_eq!(
+            session.pop_library_applet_output(applet),
+            Err(PopAppletLaunchParameterError::NotAvailable)
+        );
+        let Some(AppletObject::Storage { storage_id }) = session.object(storage) else {
+            panic!("output storage missing")
+        };
+        assert!(session.close_object(applet));
+        assert_eq!(
+            session.read_storage(storage_id, 0, 4).unwrap(),
+            [1, 2, 3, 4]
+        );
+        assert!(session.close_object(storage));
+        assert_eq!(session.storage_size(storage_id), None);
+    }
+
+    #[test]
+    fn cpu_boost_policy_is_shared_between_session_clones() {
+        let session = AppletSession::new(OperationMode::Console);
+        let cloned = session.clone();
+        assert!(!session.domain.lock().unwrap().cpu_boost_enabled);
+        cloned.set_cpu_boost_enabled(true);
+        assert!(session.domain.lock().unwrap().cpu_boost_enabled);
+        session.set_cpu_boost_enabled(false);
+        assert!(!cloned.domain.lock().unwrap().cpu_boost_enabled);
+    }
+
+    #[test]
     fn execute_next_program_exit_policy_is_shared_and_does_not_request_exit_immediately() {
         let session = AppletSession::new(OperationMode::Console);
         assert!(
@@ -2406,6 +2752,14 @@ mod applet_tests {
 
     #[test]
     fn applet_runtime_policy_is_retained_in_the_shared_domain() {
+        assert_eq!(
+            OperationMode::Handheld.default_display_resolution(),
+            (1280, 720)
+        );
+        assert_eq!(
+            OperationMode::Console.default_display_resolution(),
+            (1920, 1080)
+        );
         let session = AppletSession::new(OperationMode::Console);
         let cloned = session.clone();
         cloned.set_operation_mode_changed_notification(true);

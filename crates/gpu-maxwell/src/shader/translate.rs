@@ -23,6 +23,7 @@ use super::float::{
     decode_float_set_predicate, is_float_add, is_float_fused_multiply_add, is_float_min_max,
     is_float_multiply, is_float_set_predicate,
 };
+use super::half::{decode_half_multiply, is_half_multiply};
 use super::integer::{decode_shift_left, is_shift_left};
 use super::interface::{
     append_implicit_outputs, decode_attribute_load, decode_attribute_store, decode_header_inputs,
@@ -442,13 +443,22 @@ pub(super) fn translate_shader_binary(
                             detail: "compute texture binding ABI is not implemented",
                         });
                     }
-                    decode_texture_access_simplified(
+                    let operations = decode_texture_access_simplified(
                         stage,
                         offset,
                         encoding,
                         register_count,
                         &mut texture_bindings,
-                    )?
+                        &mut next_temporary,
+                    )?;
+                    // One TEXS may write two packed architectural registers;
+                    // preserve its predicate on both writes and the sample.
+                    instructions.extend(
+                        operations
+                            .into_iter()
+                            .map(|operation| ShaderInstruction::new(source, predicate, operation)),
+                    );
+                    break 'instruction;
                 } else if is_interpolate(encoding) {
                     let operations = decode_interpolate(
                         stage,
@@ -508,6 +518,16 @@ pub(super) fn translate_shader_binary(
                         predicate,
                         decoded.operations,
                     );
+                    break 'instruction;
+                } else if is_half_multiply(encoding) {
+                    let operations = decode_half_multiply(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    append_expanded_operations(&mut instructions, source, predicate, operations);
                     break 'instruction;
                 } else if is_float_multiply(encoding) {
                     let decoded = decode_float_multiply(
@@ -739,6 +759,7 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_range_reduction(encoding)
         || is_mufu(encoding)
         || is_float_min_max(encoding)
+        || is_half_multiply(encoding)
         || is_float_multiply(encoding)
         || is_float_fused_multiply_add(encoding)
         || is_float_add(encoding)

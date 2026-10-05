@@ -29,11 +29,18 @@ pub(crate) fn is_register_simd(instruction: Instruction) -> bool {
             | Instruction::VectorFloatAbsolute(_)
             | Instruction::VectorFloatNegate(_)
             | Instruction::Integer(_)
+            | Instruction::IntegerMultiply(_)
+            | Instruction::IntegerWideAdd(_)
+            | Instruction::IntegerSign(_)
+            | Instruction::ScalarIntegerSign(_)
             | Instruction::Bitwise(_)
             | Instruction::IntegerCompare(_)
+            | Instruction::ScalarIntegerCompare(_)
             | Instruction::IntegerPairwise(_)
             | Instruction::IntegerMinMax(_)
             | Instruction::PermuteTwoSource(_)
+            | Instruction::TableLookup(_)
+            | Instruction::TableLookupExtension(_)
             | Instruction::Extract(_)
             | Instruction::ShiftRightNarrow(_)
             | Instruction::ExtractNarrow(_)
@@ -47,6 +54,7 @@ pub(crate) fn is_register_simd(instruction: Instruction) -> bool {
             | Instruction::CountBits(_)
             | Instruction::Reverse64(_)
             | Instruction::Reverse32(_)
+            | Instruction::IntegerMinMaxAcross(_)
             | Instruction::AddAcrossVector(_)
             | Instruction::UnsignedAddLongAcrossVector(_)
             | Instruction::ScalarFloatImmediate(_)
@@ -197,10 +205,55 @@ impl Translator<'_> {
                 Ok(())
             }
             Instruction::Integer(_) => self.emit_integer_vector(fields),
+            Instruction::IntegerMultiply(_) => self.emit_integer_multiply(fields),
+            Instruction::IntegerSign(_) => self.emit_integer_sign(fields, false),
+            Instruction::ScalarIntegerSign(_) => self.emit_integer_sign(fields, true),
+            Instruction::IntegerWideAdd(_) => self.emit_integer_add_wide(fields),
             Instruction::Bitwise(_) => self.emit_bitwise(fields),
-            Instruction::IntegerCompare(_) => self.emit_integer_compare(fields),
+            Instruction::IntegerCompare(_) => self.emit_integer_compare(fields, false),
+            Instruction::ScalarIntegerCompare(_) => self.emit_integer_compare(fields, true),
             Instruction::IntegerPairwise(_) => self.emit_integer_pairwise(fields),
             Instruction::IntegerMinMax(_) => self.emit_integer_min_max(fields),
+            Instruction::TableLookup(_) | Instruction::TableLookupExtension(_) => {
+                // Swizzle zeroes out-of-range byte indices. Adjusting each
+                // table's indices lets the host SIMD instructions handle all
+                // 1–4 tables without per-lane scalar code or helper calls.
+                // Arm TBL/TBX: https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+                let indices = self.read_vector_as(fields.rm, types::I8X16)?;
+                let mut result = None;
+                for index in 0..fields.table_register_count {
+                    let table = self.read_vector_as((fields.rn + index) & 31, types::I8X16)?;
+                    let adjusted = if index == 0 {
+                        indices
+                    } else {
+                        let offset = self.builder.ins().iconst(types::I8, i64::from(index) * 16);
+                        let offset = self.builder.ins().splat(types::I8X16, offset);
+                        self.builder.ins().isub(indices, offset)
+                    };
+                    let lookup = self.emit_byte_swizzle(table, adjusted);
+                    result = Some(match result {
+                        None => lookup,
+                        Some(previous) => self.builder.ins().bor(previous, lookup),
+                    });
+                }
+                let mut result = result.expect("normalized table register count");
+                if matches!(instruction, Instruction::TableLookupExtension(_)) {
+                    let limit = self
+                        .builder
+                        .ins()
+                        .iconst(types::I8, i64::from(fields.table_register_count) * 16);
+                    let limit = self.builder.ins().splat(types::I8X16, limit);
+                    let mask = self
+                        .builder
+                        .ins()
+                        .icmp(IntCC::UnsignedLessThan, indices, limit);
+                    let previous = self.read_vector_as(fields.rd, types::I8X16)?;
+                    result = self.builder.ins().bitselect(mask, result, previous);
+                }
+                let result = self.finish_vector(result, fields.vector_128);
+                self.write_vector(fields.rd, result);
+                Ok(())
+            }
             Instruction::PermuteTwoSource(_) => self.emit_permute(fields),
             Instruction::Extract(_) => self.emit_vector_extract(fields),
             Instruction::ShiftRightNarrow(_) | Instruction::ExtractNarrow(_) => {
@@ -247,8 +300,19 @@ impl Translator<'_> {
                 self.write_vector(fields.rd, value);
                 Ok(())
             }
-            Instruction::AddAcrossVector(_) => self.emit_add_across(fields, false),
-            Instruction::UnsignedAddLongAcrossVector(_) => self.emit_add_across(fields, true),
+            Instruction::IntegerMinMaxAcross(_) => self.emit_reduce_across(
+                fields,
+                false,
+                fields
+                    .pairwise_operation
+                    .expect("normalized reduction operation"),
+            ),
+            Instruction::AddAcrossVector(_) => {
+                self.emit_reduce_across(fields, false, PairwiseOperation::Add)
+            }
+            Instruction::UnsignedAddLongAcrossVector(_) => {
+                self.emit_reduce_across(fields, true, PairwiseOperation::Add)
+            }
             Instruction::ScalarFloatImmediate(_) | Instruction::VectorFloatImmediate(_) => {
                 self.emit_float_immediate(instruction, fields)
             }
@@ -351,13 +415,90 @@ impl Translator<'_> {
         Ok(())
     }
 
+    // MUL (vector) performs modular lane multiplication and leaves FP status unchanged.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (pp. 1660–1661)
+    pub(crate) fn emit_integer_multiply(&mut self, fields: Operands) -> Result<(), Error> {
+        let lane_bits = 8_u32 << fields.opc;
+        let vector_ty = vector_type(integer_lane_type(lane_bits)?, lane_bits)?;
+        let lhs = self.read_vector_as(fields.rn, vector_ty)?;
+        let rhs = self.read_vector_as(fields.rm, vector_ty)?;
+        let result = if lane_bits == 8 {
+            // Packed byte multiplication is not a portable Cranelift operation.
+            // Multiply even/odd bytes in halfword lanes and discard cross-lane carries.
+            let lhs = self.vector_as(lhs, types::I16X8);
+            let rhs = self.vector_as(rhs, types::I16X8);
+            let even = self.builder.ins().imul(lhs, rhs);
+            let mask = self.builder.ins().iconst(types::I16, 0xff);
+            let mask = self.builder.ins().splat(types::I16X8, mask);
+            let even = self.builder.ins().band(even, mask);
+            let odd_lhs = self.builder.ins().ushr_imm_u(lhs, 8);
+            let odd_rhs = self.builder.ins().ushr_imm_u(rhs, 8);
+            let odd = self.builder.ins().imul(odd_lhs, odd_rhs);
+            let odd = self.builder.ins().ishl_imm_u(odd, 8);
+            self.builder.ins().bor(even, odd)
+        } else {
+            self.builder.ins().imul(lhs, rhs)
+        };
+        let result = self.finish_vector(result, fields.vector_128);
+        self.write_vector(fields.rd, result);
+        Ok(())
+    }
+
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (ABS/NEG pp. 1094–1095, 1665–1666)
+    pub(crate) fn emit_integer_sign(
+        &mut self,
+        fields: Operands,
+        scalar: bool,
+    ) -> Result<(), Error> {
+        let lane_bits = 8_u32 << fields.opc;
+        let lane_ty = integer_lane_type(lane_bits)?;
+        let vector_ty = vector_type(lane_ty, lane_bits)?;
+        let source = self.read_vector_as(fields.rn, vector_ty)?;
+        let negated = self.builder.ins().ineg(source);
+        let result = if fields.operation_bit {
+            negated
+        } else {
+            let zero = self.builder.ins().iconst(lane_ty, 0);
+            let zero = self.builder.ins().splat(vector_ty, zero);
+            let negative = self.builder.ins().icmp(IntCC::SignedLessThan, source, zero);
+            self.builder.ins().bitselect(negative, negated, source)
+        };
+        let result = self.finish_vector(result, !scalar && fields.vector_128);
+        self.write_vector(fields.rd, result);
+        Ok(())
+    }
+
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (SADDW/UADDW pp. 1709–1710, 2022–2023)
+    pub(crate) fn emit_integer_add_wide(&mut self, fields: Operands) -> Result<(), Error> {
+        let narrow = 8_u32 << fields.opc;
+        let narrow_ty = vector_type(integer_lane_type(narrow)?, narrow)?;
+        let wide_ty = vector_type(integer_lane_type(narrow * 2)?, narrow * 2)?;
+        let lhs = self.read_vector_as(fields.rn, wide_ty)?;
+        let rhs = self.read_vector_as(fields.rm, narrow_ty)?;
+        let rhs = match (fields.operation_bit, fields.vector_128) {
+            (false, false) => self.builder.ins().swiden_low(rhs),
+            (false, true) => self.builder.ins().swiden_high(rhs),
+            (true, false) => self.builder.ins().uwiden_low(rhs),
+            (true, true) => self.builder.ins().uwiden_high(rhs),
+        };
+        let result = self.builder.ins().iadd(lhs, rhs);
+        let result = self.vector_as(result, types::I8X16);
+        self.write_vector(fields.rd, result);
+        Ok(())
+    }
+
     pub(crate) fn emit_bitwise(&mut self, fields: Operands) -> Result<(), Error> {
         let first = self.read_vector(fields.rn)?;
-        let second = self.read_vector(fields.rm)?;
-        let result = match fields
+        let operation = fields
             .bitwise_operation
-            .expect("normalized SIMD bitwise operation")
-        {
+            .expect("normalized SIMD bitwise operation");
+        let second = if operation == BitwiseOperation::Not {
+            first
+        } else {
+            self.read_vector(fields.rm)?
+        };
+        let result = match operation {
+            BitwiseOperation::Not => self.builder.ins().bnot(first),
             BitwiseOperation::And => self.builder.ins().band(first, second),
             BitwiseOperation::BitClear => {
                 let not_second = self.builder.ins().bnot(second);
@@ -387,7 +528,12 @@ impl Translator<'_> {
         Ok(())
     }
 
-    pub(crate) fn emit_integer_compare(&mut self, fields: Operands) -> Result<(), Error> {
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (CMEQ p. 1138)
+    pub(crate) fn emit_integer_compare(
+        &mut self,
+        fields: Operands,
+        scalar: bool,
+    ) -> Result<(), Error> {
         let lane_bits = 8_u32 << fields.opc;
         let lane = integer_lane_type(lane_bits)?;
         let vector_ty = vector_type(lane, lane_bits)?;
@@ -423,7 +569,7 @@ impl Translator<'_> {
                 self.builder.ins().icmp(condition, lhs, rhs)
             }
         };
-        let result = self.finish_vector(result, fields.vector_128);
+        let result = self.finish_vector(result, !scalar && fields.vector_128);
         self.write_vector(fields.rd, result);
         Ok(())
     }
@@ -496,6 +642,27 @@ impl Translator<'_> {
                 self.builder.ins().bitselect(mask, lhs, rhs)
             }
         }
+    }
+
+    fn emit_byte_swizzle(&mut self, table: Value, indices: Value) -> Value {
+        if self.use_clif_shuffle {
+            return self.builder.ins().swizzle(table, indices);
+        }
+        // SSE2-only x86 hosts cannot lower swizzle without a runtime call.
+        // Select each table byte with vector equality masks instead. Hosts
+        // with SSSE3 and AArch64 retain the direct SIMD swizzle above.
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        let mut result = self.builder.ins().splat(types::I8X16, zero);
+        for index in 0..16 {
+            let lane = self.builder.ins().extractlane(table, index);
+            let lane = self.builder.ins().splat(types::I8X16, lane);
+            let selector = self.builder.ins().iconst(types::I8, i64::from(index));
+            let selector = self.builder.ins().splat(types::I8X16, selector);
+            let mask = self.builder.ins().icmp(IntCC::Equal, indices, selector);
+            let selected = self.builder.ins().band(lane, mask);
+            result = self.builder.ins().bor(result, selected);
+        }
+        result
     }
 
     pub(crate) fn emit_permute(&mut self, fields: Operands) -> Result<(), Error> {
@@ -650,6 +817,12 @@ impl Translator<'_> {
         } else {
             self.builder.ins().ishl_imm_u(source, i64::from(shift))
         };
+        let result = if fields.shift_accumulate {
+            let accumulator = self.read_vector_as(fields.rd, vector_ty)?;
+            self.builder.ins().iadd(result, accumulator)
+        } else {
+            result
+        };
         let result = self.finish_vector(result, !scalar && fields.vector_128);
         self.write_vector(fields.rd, result);
         Ok(())
@@ -768,7 +941,12 @@ impl Translator<'_> {
 
     // UADDLV widens before adding, preserving carries across source lane widths.
     // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
-    pub(crate) fn emit_add_across(&mut self, fields: Operands, widen: bool) -> Result<(), Error> {
+    pub(crate) fn emit_reduce_across(
+        &mut self,
+        fields: Operands,
+        widen: bool,
+        operation: PairwiseOperation,
+    ) -> Result<(), Error> {
         let mut lane_bits = 8_u32 << fields.opc;
         let mut lane_count = (if fields.vector_128 { 128 } else { 64 }) / lane_bits;
         let lane = integer_lane_type(lane_bits)?;
@@ -804,7 +982,7 @@ impl Translator<'_> {
             }
             let paired = self.shuffle_bytes(bytes, bytes, mask);
             let paired = self.vector_as(paired, vector_ty);
-            value = self.builder.ins().iadd(value, paired);
+            value = self.select_pairwise_vector(value, paired, operation);
             distance /= 2;
         }
         let result = self.builder.ins().extractlane(value, 0);

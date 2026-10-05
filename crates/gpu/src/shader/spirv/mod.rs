@@ -22,6 +22,7 @@ pub use pipeline::{
     lower_raster_shaders_to_spirv, lower_tessellation_shaders_to_spirv,
 };
 mod float;
+mod half;
 pub use default_control::{
     SpirvDefaultControlOptions, SpirvDefaultControlShader,
     lower_default_tessellation_control_to_spirv,
@@ -55,6 +56,8 @@ pub struct SpirvFloat64Capabilities {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SpirvShaderOptions {
+    /// Convert only the final pre-raster position, after guest output reads.
+    pub depth_clip_negative_one_to_one: bool,
     /// Incoming patch cardinality: draw patch size for TCS, TCS output size for TES.
     /// Zero for stages without arrayed patch inputs.
     pub input_control_points: u32,
@@ -177,6 +180,22 @@ pub fn lower_shader_ir_to_spirv(
         } else {
             emitter.predicated(instruction)?;
         }
+    }
+    if options.depth_clip_negative_one_to_one {
+        let z = emitter.load_interface(false, ShaderIoLocation::Position, 2, None)?;
+        let w = emitter.load_interface(false, ShaderIoLocation::Position, 3, None)?;
+        let z = emitter.b.bitcast(emitter.float, None, z)?;
+        let w = emitter.b.bitcast(emitter.float, None, w)?;
+        let half = emitter.constant(0.5_f32.to_bits());
+        let half = emitter.b.bitcast(emitter.float, None, half)?;
+        let z = emitter.b.f_mul(emitter.float, None, z, half)?;
+        let w = emitter.b.f_mul(emitter.float, None, w, half)?;
+        emitter.b.decorate(z, spv::Decoration::NoContraction, []);
+        emitter.b.decorate(w, spv::Decoration::NoContraction, []);
+        let z = emitter.b.f_add(emitter.float, None, z, w)?;
+        emitter.b.decorate(z, spv::Decoration::NoContraction, []);
+        let z = emitter.b.bitcast(emitter.uint, None, z)?;
+        emitter.store_interface(ShaderIoLocation::Position, 2, None, z)?;
     }
     emitter.b.ret()?;
     emitter.b.end_function()?;

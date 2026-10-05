@@ -12,6 +12,7 @@ mod pipeline;
 
 fn options() -> SpirvShaderOptions {
     SpirvShaderOptions {
+        depth_clip_negative_one_to_one: false,
         input_control_points: 3,
         tessellation_mode: None,
         float64: SpirvFloat64Capabilities::default(),

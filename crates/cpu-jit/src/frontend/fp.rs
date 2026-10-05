@@ -22,9 +22,10 @@ impl Translator<'_> {
             | Instruction::ConditionalCompare(_) => self.fp_compare(pc, instruction, flags),
             Instruction::ScalarFloatRound(_) => self.fp_round(pc, instruction, flags),
             Instruction::ScalarFloatAdd(_) => self.fp_add(pc, instruction, flags),
-            Instruction::ScalarFloatMaxNumber(_) | Instruction::ScalarFloatMinNumber(_) => {
-                self.fp_min_max_number(pc, instruction, flags)
-            }
+            Instruction::ScalarFloatMaxNumber(_)
+            | Instruction::ScalarFloatMinNumber(_)
+            | Instruction::ScalarFloatMax(_)
+            | Instruction::ScalarFloatMin(_) => self.fp_min_max(pc, instruction, flags),
             Instruction::VectorFloatAdd(_) => self.vector_fp_add(pc, instruction, flags),
             Instruction::ScalarFloatDivide(_) => self.fp_divide(pc, instruction, flags),
             Instruction::VectorFloatDivide(_) => self.vector_fp_divide(pc, instruction, flags),
@@ -48,6 +49,10 @@ impl Translator<'_> {
             | Instruction::ScalarVectorUnsignedIntToFloat(_) => {
                 self.vector_integer_to_fp(pc, instruction, flags)
             }
+            Instruction::VectorFloatConvertNarrow(_) => {
+                self.fp_convert_narrow(pc, instruction, flags)
+            }
+            Instruction::VectorFloatConvertLong(_) => self.fp_convert_long(pc, instruction, flags),
             Instruction::ScalarFloatSquareRoot(_) | Instruction::ScalarFloatConvert(_) => {
                 self.fp_unary(pc, instruction, flags)
             }
@@ -213,10 +218,10 @@ impl Translator<'_> {
         Ok(false)
     }
 
-    // FMINNM/FMAXNM's normal/zero domain needs only integer ordering, so it cannot
+    // Scalar min/max's normal/zero domain needs only integer ordering, so it cannot
     // modify host FP status and does not need to activate a host FP epoch.
     // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
-    fn fp_min_max_number(
+    fn fp_min_max(
         &mut self,
         pc: GuestVirtualAddress,
         instruction: Instruction,
@@ -237,8 +242,15 @@ impl Translator<'_> {
         self.constant_exit(
             pc,
             pc,
-            EdgeKind::FpMinMaxNumber(crate::abi::FpMinMaxNumberOperation {
-                minimum: matches!(instruction, Instruction::ScalarFloatMinNumber(_)),
+            EdgeKind::FpMinMax(crate::abi::FpMinMaxOperation {
+                minimum: matches!(
+                    instruction,
+                    Instruction::ScalarFloatMinNumber(_) | Instruction::ScalarFloatMin(_)
+                ),
+                number: matches!(
+                    instruction,
+                    Instruction::ScalarFloatMaxNumber(_) | Instruction::ScalarFloatMinNumber(_)
+                ),
                 rn: f.rn,
                 rm: f.rm,
                 rd: f.rd,
@@ -262,7 +274,10 @@ impl Translator<'_> {
             let positive = self.builder.ins().bor(*key, sign);
             *key = self.builder.ins().select(negative, inverted, positive);
         }
-        let comparison = if matches!(instruction, Instruction::ScalarFloatMinNumber(_)) {
+        let comparison = if matches!(
+            instruction,
+            Instruction::ScalarFloatMinNumber(_) | Instruction::ScalarFloatMin(_)
+        ) {
             IntCC::UnsignedLessThan
         } else {
             IntCC::UnsignedGreaterThan
@@ -736,6 +751,7 @@ impl Translator<'_> {
             source_64: f.size & 2 != 0,
             destination_64: f.opc == 1,
             signed: matches!(instruction, Instruction::SignedIntToFloat(_)),
+            fractional_bits: f.fixed_point_fraction_bits.unwrap_or(0),
         };
         let eligible = self.builder.ins().iconst(types::I8, 1);
         self.native_fp_path(pc, EdgeKind::IntegerToFp(operation), eligible, flags)?;
@@ -746,6 +762,7 @@ impl Translator<'_> {
             operation.source_64,
             operation.destination_64,
             operation.signed,
+            operation.fractional_bits,
         );
         self.write_fp_scalar(f.rd, result);
         Ok(false)
@@ -793,6 +810,104 @@ impl Translator<'_> {
         );
         let result = self.vector_as(result, types::I8X16);
         self.write_vector(rd, result);
+    }
+
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (FCVTN pp. 1281–1282)
+    fn fp_convert_narrow(
+        &mut self,
+        pc: GuestVirtualAddress,
+        instruction: Instruction,
+        flags: &mut LazyFlags<ir::Value>,
+    ) -> Result<bool, Error> {
+        let f = instruction.operands();
+        let mut direct = None;
+        for lane in 0..2 {
+            let bits = self.fp_element_bits(f.rn, 64, Some(lane))?;
+            let mut eligible = self.fp_finite_or_zero(bits, 64);
+            if self.abi == HostAbi::X86_64 {
+                let normal = self.fp_demote_domain(bits);
+                eligible = self.builder.ins().band(eligible, normal);
+            }
+            direct = Some(if let Some(previous) = direct {
+                self.builder.ins().band(previous, eligible)
+            } else {
+                eligible
+            });
+        }
+        let kind = FpUnaryKind::ConvertNarrow {
+            upper: f.vector_128,
+        };
+        self.native_fp_path(
+            pc,
+            EdgeKind::FpUnary(FpUnaryOperation {
+                rn: f.rn,
+                rd: f.rd,
+                kind,
+            }),
+            direct.expect("two conversion lanes"),
+            flags,
+        )?;
+        let source = self.read_vector_as(f.rn, types::F64X2)?;
+        let result = self.fp_unary_value(source, kind);
+        let result = self.vector_as(result, types::I8X16);
+        let result = if f.vector_128 {
+            let old = self.read_vector(f.rd)?;
+            self.shuffle_bytes(
+                old,
+                result,
+                [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23],
+            )
+        } else {
+            result
+        };
+        self.write_vector(f.rd, result);
+        Ok(false)
+    }
+
+    // Native widening for normal/zero lanes, with the exact typed edge for
+    // NaNs and denormals. FP ownership/exception traps use the shared guard.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85 (FCVTL pp. 1261–1262)
+    fn fp_convert_long(
+        &mut self,
+        pc: GuestVirtualAddress,
+        instruction: Instruction,
+        flags: &mut LazyFlags<ir::Value>,
+    ) -> Result<bool, Error> {
+        let f = instruction.operands();
+        let first = if f.vector_128 { 2 } else { 0 };
+        let low = self.fp_element_bits(f.rn, 32, Some(first))?;
+        let high = self.fp_element_bits(f.rn, 32, Some(first + 1))?;
+        let low = self.fp_finite_or_zero(low, 32);
+        let high = self.fp_finite_or_zero(high, 32);
+        let direct = self.builder.ins().band(low, high);
+        let kind = FpUnaryKind::ConvertLong {
+            upper: f.vector_128,
+        };
+        self.native_fp_path(
+            pc,
+            EdgeKind::FpUnary(FpUnaryOperation {
+                rn: f.rn,
+                rd: f.rd,
+                kind,
+            }),
+            direct,
+            flags,
+        )?;
+        let source = self.read_vector(f.rn)?;
+        let source = if f.vector_128 {
+            self.shuffle_bytes(
+                source,
+                source,
+                [8, 9, 10, 11, 12, 13, 14, 15, 8, 9, 10, 11, 12, 13, 14, 15],
+            )
+        } else {
+            source
+        };
+        let source = self.vector_as(source, types::F32X4);
+        let result = self.fp_unary_value(source, kind);
+        let result = self.vector_as(result, types::I8X16);
+        self.write_vector(f.rd, result);
+        Ok(false)
     }
 
     fn fp_unary(

@@ -108,6 +108,7 @@ fn retired_images_preserve_contents_without_occupying_reused_logical_slots() {
         let resident = runtime
             .runtime()
             .acquire_presentable_image(PresentationImageRequest {
+                allow_canonical_import: true,
                 cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(
                     image_backing.range(),
                 )

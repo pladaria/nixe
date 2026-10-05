@@ -218,18 +218,12 @@ pub(in crate::ipc_wire) fn dispatch_audio_out(
             }
             let mut descriptor = [0; 40];
             read_bytes(process, GuestVirtualAddress::new(address), &mut descriptor)?;
-            let next = request_u64(&descriptor, 0).unwrap();
+            // The descriptor's next pointer and offset are unused by AudioOut;
+            // each submission supplies one buffer starting at samples.
+            // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/audio_core/out/audio_out_system.cpp#L132-L145
             let samples = request_u64(&descriptor, 8).unwrap();
             let capacity = request_u64(&descriptor, 16).unwrap();
             let length = request_u64(&descriptor, 24).unwrap();
-            let offset = request_u64(&descriptor, 32).unwrap();
-            if next != 0 || offset != 0 {
-                return unsupported(
-                    "IAudioOut",
-                    cmd,
-                    "linked audio buffers and nonzero buffer offsets are not implemented",
-                );
-            }
             if length > capacity || samples.checked_add(length).is_none() {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ADDRESS_INFO);
             }

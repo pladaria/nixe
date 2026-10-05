@@ -6,7 +6,9 @@ pub(super) fn validate_shader_mask(
     shaders: &MaxwellThreeDTranslatedShaders,
     cache: &MaxwellLoweringCache,
 ) -> Result<(), MaxwellLoweringError> {
-    if state.ps_output_sample_mask_effective() != Some(true) {
+    let pre_ps_initial_coverage =
+        state.coverage().post_ps_initial_coverage().value() == Some(&true);
+    if state.ps_output_sample_mask_effective() != Some(true) && !pre_ps_initial_coverage {
         return Ok(());
     }
     let fragment = shaders
@@ -32,8 +34,17 @@ pub(super) fn validate_shader_mask(
         .iter()
         .any(|output| output.location() == nixe_gpu::ShaderIoLocation::SampleMask)
     {
-        return Err(MaxwellLoweringError::UnsupportedPsOutputSampleMaskSemantics);
+        return Err(if pre_ps_initial_coverage {
+            MaxwellLoweringError::UnsupportedPostPsInitialCoverageSemantics
+        } else {
+            MaxwellLoweringError::UnsupportedPsOutputSampleMaskSemantics
+        });
     }
+    // Without a shader mask export or pixel-kill, pre/post-PS coverage is
+    // identical. Pixel-kill remains an explicit SPH translation boundary;
+    // alpha-test discard is validated separately before this call.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1817-L1820
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_3d.h#L2793
     Ok(())
 }
 
@@ -134,6 +145,9 @@ mod tests {
         program_three_d(&mut channel, 0x1534, 1);
         program_three_d(&mut channel, 0x0300, 3);
         validate_shader_mask(channel.three_d(), &shaders, &cache).unwrap();
+        program_three_d(&mut channel, 0x1138, 1);
+        validate_shader_mask(channel.three_d(), &shaders, &cache).unwrap();
+        program_three_d(&mut channel, 0x1138, 0);
 
         let scalar_type = ShaderScalarType::Unsigned32;
         let ir = ShaderIr::new(
@@ -176,6 +190,12 @@ mod tests {
         assert_eq!(
             validate_shader_mask(channel.three_d(), &shaders, &cache),
             Err(MaxwellLoweringError::UnsupportedPsOutputSampleMaskSemantics)
+        );
+        program_three_d(&mut channel, 0x0300, 0);
+        program_three_d(&mut channel, 0x1138, 1);
+        assert_eq!(
+            validate_shader_mask(channel.three_d(), &shaders, &cache),
+            Err(MaxwellLoweringError::UnsupportedPostPsInitialCoverageSemantics)
         );
     }
 

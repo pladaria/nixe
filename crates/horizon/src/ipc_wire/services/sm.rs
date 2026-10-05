@@ -55,6 +55,7 @@ enum ServiceKind {
     Performance,
     Applet,
     Hid,
+    Irs,
     Time,
     Account,
     Bsd,
@@ -77,6 +78,7 @@ impl ServiceKind {
             b"apm" => Some(Self::Performance),
             b"appletOE" => Some(Self::Applet),
             b"hid" => Some(Self::Hid),
+            b"irs" => Some(Self::Irs),
             b"time:u" => Some(Self::Time),
             b"acc:u0" => Some(Self::Account),
             b"bsd:u" => Some(Self::Bsd),
@@ -240,6 +242,10 @@ fn connect_service(
                     .handles_mut()
                     .insert(HorizonIpcObject::Hid(HidSession::new(memory)))
             }),
+        ServiceKind::Irs => host_systems
+            .hid
+            .infrared_session(process.memory())
+            .and_then(|session| process.handles_mut().insert(HorizonIpcObject::Irs(session))),
         ServiceKind::Time => {
             time_environment
                 .create_service(process.memory())

@@ -1,6 +1,117 @@
 use super::*;
 
 #[test]
+fn viewport_clips_preserve_origins_and_extents_independently() {
+    let mut channel = three_d_channel();
+    for (viewport, raw) in [(0, 0x00f0_01e0), (15, u32::MAX), (7, 0x0000_ffff)] {
+        for vertical in [false, true] {
+            program_three_d(
+                &mut channel,
+                0x0c00 + viewport * 16 + u32::from(vertical) * 4,
+                raw,
+            );
+            let clip = &channel.three_d().fixed_function().viewport()[viewport as usize];
+            let register = if vertical {
+                clip.clip_vertical()
+            } else {
+                clip.clip_horizontal()
+            };
+            assert_eq!(register.raw(), Some(raw));
+            assert_eq!(register.value().unwrap().origin(), raw as u16);
+            assert_eq!(register.value().unwrap().extent(), (raw >> 16) as u16);
+        }
+    }
+}
+
+#[test]
+fn snap_grid_precision_rejects_reserved_bits_without_modifying_the_viewport() {
+    let mut channel = three_d_channel();
+    program_three_d(&mut channel, 0x0a1c, 0x0302);
+    for raw in [0x20, 0x80, 0x2000, u32::MAX] {
+        assert!(dispatch_method(&mut channel, 0x0a1c / 4, raw).is_err());
+        assert_eq!(
+            channel.three_d().fixed_function().viewport()[0]
+                .snap_grid_precision()
+                .value(),
+            Some(&[2, 3])
+        );
+    }
+}
+
+#[test]
+fn vpc_performance_policy_preserves_all_four_bytes_without_pipeline_changes() {
+    let mut channel = three_d_channel();
+    let before = channel.three_d().clone();
+    for argument in [0, 0x1234_5678, u32::MAX] {
+        let dispatch = dispatch_method(&mut channel, 0x0f14 / 4, argument).unwrap();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_VPC_PERF_KNOB"
+        );
+        assert!(dispatch.operations().is_empty());
+        assert_eq!(channel.three_d(), &before);
+        let register = channel
+            .three_d_mut()
+            .raw_register(GpuMethodId(0x0f14))
+            .unwrap();
+        assert_eq!(register.raw(), Some(argument));
+        assert_eq!(
+            register.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+    }
+}
+
+#[test]
+fn delay_preserves_full_register_and_shadow_replay_without_execution_effects() {
+    let mut channel = three_d_channel();
+    let before = channel.three_d().clone();
+    for argument in [0, 1, 0x8000_0000, u32::MAX] {
+        let dispatch = dispatch_method(&mut channel, 0x1a24 / 4, argument).unwrap();
+        assert_eq!(dispatch.methods()[0].metadata().method_name(), "DELAY");
+        assert!(dispatch.operations().is_empty());
+        assert_eq!(channel.three_d(), &before);
+        let register = channel
+            .three_d_mut()
+            .raw_register(GpuMethodId(0x1a24))
+            .unwrap();
+        assert_eq!(register.raw(), Some(argument));
+        assert_eq!(
+            register.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+    }
+    program_three_d(&mut channel, 0x0124, 2);
+    program_three_d(&mut channel, 0x1a24, 0x1234_5678);
+    program_three_d(&mut channel, 0x0124, 3);
+    let replay = dispatch_method(&mut channel, 0x1a24 / 4, 0).unwrap();
+    assert_eq!(replay.methods()[0].method().source().argument(), u32::MAX);
+    assert!(replay.operations().is_empty());
+    program_three_d(&mut channel, 0x0124, 2);
+    // A synthetic macro reads the retained register and sends it to scratch.
+    load_mme_program(
+        &mut channel,
+        3,
+        &[
+            5 | (1 << 4) | (2 << 8) | ((0x1a24 / 4) << 14),
+            1 | (2 << 4) | ((0x3400 / 4) << 14),
+            1 | (4 << 4) | (1 << 7) | (2 << 11),
+            0x11,
+        ],
+    );
+    let dispatch = dispatch_method(&mut channel, 0x3818 / 4, 0).unwrap();
+    assert!(dispatch.operations().is_empty());
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register(GpuMethodId(0x3400))
+            .unwrap()
+            .raw(),
+        Some(u32::MAX)
+    );
+}
+
+#[test]
 fn three_d_no_operation_is_named_and_implemented() {
     let mut channel = three_d_channel();
     let dispatch = dispatch_method(&mut channel, 0x100 / 4, 0xfeed_beef).unwrap();

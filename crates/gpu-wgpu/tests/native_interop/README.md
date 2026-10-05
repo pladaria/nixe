@@ -483,7 +483,7 @@ not the whole guest demo or a Switch raster-equivalence test.
 
 ## Native arithmetic oracle
 
-The separate ignored unit test `native_float32_daz_ftz_matches_ir_bits` executes
+The separate ignored unit test `native_float_conversions_and_daz_ftz_match_ir_bits` executes
 the neutral emitter's addition, multiplication, FMA and signed/unsigned integer
 conversion to float32 against an `R32Uint` target,
 comparing 65,536 results per operation bit for bit with the IR evaluator. It uses
@@ -493,7 +493,7 @@ and readback only for its oracle. Run in a debug build with Khronos validation
 
 ```sh
 NIXE_SPIRV_VAL=/path/to/spirv-val \
-cargo test -p nixe-gpu-wgpu native_float32_daz_ftz_matches_ir_bits -- --ignored --nocapture
+cargo test -p nixe-gpu-wgpu native_float_conversions_and_daz_ftz_match_ir_bits -- --ignored --nocapture
 ```
 
 Select the ICD/layer paths as for the interop test. The numerical test requires
@@ -505,3 +505,8 @@ guest tessellation workload. No numerical feature is assumed from the vendor ID.
 Both integer conversion variants pass on NVIDIA, including signed
 limits and halfway rounding cases. Conversion cannot produce subnormals and uses
 native conversion instructions without the arithmetic underflow-repair path.
+
+The numerical oracle also checks binary16 packing and unpacking in native SPIR-V
+and WGSL. Unpacking covers all 65,536 half encodings in both lanes; packing
+covers signed zeros, infinities, NaNs, subnormal and overflow boundaries,
+nearest-even ties, and randomized float32 significands/exponents.

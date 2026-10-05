@@ -5,6 +5,84 @@ use crate::decode::table::InstructionPattern;
 use super::pattern;
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
+    // Arm A64 TBL/TBX, pp. 1998–2001: 1–4 full table registers, 8B/16B indices.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-table-lookup",
+        0xbfe0_9c00,
+        0x0e00_0000,
+        0x0000_00c7,
+        202,
+        &[],
+    )
+    .fixture32(0x0e02_0000),
+    pattern(
+        "simd-table-lookup-extension",
+        0xbfe0_9c00,
+        0x0e00_1000,
+        0x0000_00c8,
+        202,
+        &[],
+    )
+    .fixture32(0x4e02_7000),
+    // FABD subtracts using FPCR and then clears the result sign (including NaNs).
+    // Arm A64 ISA pp. 1174–1176:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "fp-scalar-absolute-difference",
+        0xffa0_fc00,
+        0x7ea0_d400,
+        0x0000_00c5,
+        201,
+        &[],
+    )
+    .fixture32(0x7ea2_d463),
+    pattern(
+        "fp-vector-absolute-difference",
+        0xbfa0_fc00,
+        0x2ea0_d400,
+        0x0000_00c6,
+        201,
+        &[],
+    )
+    .fixture32(0x6ea2_d463),
+    // FCVTN/FCVTN2 double to single; Q selects the destination half.
+    // Arm A64 ISA pp. 1281–1282:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-float-convert-narrow-double",
+        0xbfff_fc00,
+        0x0e61_6800,
+        0x0000_00c4,
+        200,
+        &[],
+    )
+    .fixture32(0x0e61_6802),
+    // NOT (MVN alias) inverts 8B/16B without touching FP status.
+    // Arm A64 ISA, NOT, p. 1667:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    // Integer ABS/NEG truncate each result to its lane width; no saturation or FP status.
+    // Arm A64 ISA, ABS pp. 1094–1095, NEG pp. 1665–1666:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-integer-sign",
+        0x9f3f_fc00,
+        0x0e20_b800,
+        0x0000_00c2,
+        199,
+        &[],
+    )
+    .fixture32(0x6ea0_b800),
+    pattern(
+        "simd-scalar-integer-sign",
+        0xdfff_fc00,
+        0x5ee0_b800,
+        0x0000_00c3,
+        199,
+        &[],
+    )
+    .fixture32(0x7ee0_b800),
+    pattern("simd-not", 0xbfff_fc00, 0x2e20_5800, 0x0000_00b2, 193, &[]).fixture32(0x6e20_5800),
     pattern(
         "simd-duplicate-general",
         0xbfe0_fc00,
@@ -74,6 +152,132 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         58,
         &[],
     ),
+    // MUL (vector), 8B/16B, 4H/8H and 2S/4S; each product wraps to its lane width.
+    // Arm A64 ISA, MUL (vector), pp. 1660–1661:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-integer-multiply",
+        0xbf20_fc00,
+        0x0e20_9c00,
+        0x0000_00b5,
+        194,
+        &[],
+    )
+    .fixture32(0x0ea0_9c40),
+    // Signed/unsigned min/max reductions; inactive source bits are ignored
+    // and only the scalar result is written. Arm A64 ISA, UMAXV pp. 2050–2051,
+    // UMINV pp. 2056–2057 (SMAXV/SMINV use the same allocation with U=0).
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-signed-max-across",
+        0xbf3f_fc00,
+        0x0e30_a800,
+        0x0000_00b6,
+        195,
+        &[],
+    ),
+    pattern(
+        "simd-signed-min-across",
+        0xbf3f_fc00,
+        0x0e31_a800,
+        0x0000_00b7,
+        195,
+        &[],
+    ),
+    pattern(
+        "simd-unsigned-max-across",
+        0xbf3f_fc00,
+        0x2e30_a800,
+        0x0000_00b8,
+        195,
+        &[],
+    ),
+    pattern(
+        "simd-unsigned-min-across",
+        0xbf3f_fc00,
+        0x2e31_a800,
+        0x0000_00b9,
+        195,
+        &[],
+    ),
+    // FCVTL/FCVTL2, single to double precision. Q chooses the source half;
+    // both forms write the full 128-bit destination. Half-to-single remains
+    // a separate unsupported precision, rather than borrowing FP32 semantics.
+    // Arm A64 ISA, FCVTL pp. 1261–1262:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-floating-point-convert-long-single",
+        0xbfff_fc00,
+        0x0e61_7800,
+        0x0000_00ba,
+        196,
+        &[],
+    )
+    .fixture32(0x0e61_7821),
+    // Scalar integer SIMD comparisons operate on one D lane and clear the
+    // upper 64 bits, with no NZCV/FPSR effects. Arm A64 ISA, CMEQ p. 1138,
+    // CMGE p. 1142, CMGT p. 1146, CMHI p. 1150, CMHS p. 1152, CMTST p. 1158:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-scalar-signed-greater",
+        0xffe0_fc00,
+        0x5ee0_3400,
+        0x0000_00bb,
+        197,
+        &[],
+    ),
+    pattern(
+        "simd-scalar-unsigned-greater",
+        0xffe0_fc00,
+        0x7ee0_3400,
+        0x0000_00bc,
+        197,
+        &[],
+    ),
+    pattern(
+        "simd-scalar-signed-greater-equal",
+        0xffe0_fc00,
+        0x5ee0_3c00,
+        0x0000_00bd,
+        197,
+        &[],
+    ),
+    pattern(
+        "simd-scalar-unsigned-greater-equal",
+        0xffe0_fc00,
+        0x7ee0_3c00,
+        0x0000_00be,
+        197,
+        &[],
+    ),
+    pattern(
+        "simd-scalar-bit-test",
+        0xffe0_fc00,
+        0x5ee0_8c00,
+        0x0000_00bf,
+        197,
+        &[],
+    ),
+    pattern(
+        "simd-scalar-equal",
+        0xffe0_fc00,
+        0x7ee0_8c00,
+        0x0000_00c0,
+        197,
+        &[],
+    ),
+    // SADDW/UADDW and their upper-half forms widen only Rm, then add to
+    // the already-wide Rn. Arm A64 ISA, SADDW pp. 1709–1710, UADDW pp. 2022–2023:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-integer-add-wide",
+        0x9f20_fc00,
+        0x0e20_1000,
+        0x0000_00c1,
+        198,
+        &[],
+    )
+    .fixture32(0x6e70_1063),
     // Arm A64 Advanced SIMD pairwise integer operations,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDP--vector---Add-Pairwise--vector--
@@ -270,7 +474,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         30,
         &[],
     )
-    .fixture32(0x1e20_4800)
+    .fixture32(0x1ee0_4800)
     .recognized_unimplemented(),
     pattern(
         "fp-simd-load-store-unsigned",
@@ -508,13 +712,16 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
     )
     .fixture32(0x0f0c_8400),
+    // SSRA/USRA additionally accumulate into Rd with lane-width wrapping.
+    // Arm A64 ISA, SSRA pp. 1902–1903, USRA pp. 2124–2125:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
     // Arm A64 SSHR/USHR shift each signed or unsigned lane right by an
     // immediate in the range 1..=element size. Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHR--Signed-shift-right--immediate--
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/USHR--Unsigned-shift-right--immediate--
     pattern(
         "simd-scalar-shift-right-immediate",
-        0xdf80_fc00,
+        0xdf80_ec00,
         0x5f00_0400,
         0x0000_0091,
         203,
@@ -523,7 +730,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     .fixture32(0x7f60_07fe),
     pattern(
         "simd-vector-shift-right-immediate",
-        0x9f80_fc00,
+        0x9f80_ec00,
         0x0f00_0400,
         0x0000_0092,
         202,
@@ -904,6 +1111,24 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
     ),
     // FMAXNM S/D, Arm ISA D4.27 (half precision retains its unsupported boundary).
+    // FMAX/FMIN propagate a lone quiet NaN, unlike the number variants.
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "fp-scalar-maximum",
+        0xffa0_fc00,
+        0x1e20_4800,
+        0x0000_00b3,
+        193,
+        &[],
+    ),
+    pattern(
+        "fp-scalar-minimum",
+        0xffa0_fc00,
+        0x1e20_5800,
+        0x0000_00b4,
+        193,
+        &[],
+    ),
     // https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab
     pattern(
         "fp-scalar-maximum-number",
@@ -1062,7 +1287,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         2,
         &[],
     )
-    .recognized_unimplemented(),
+    .recognized_unimplemented()
+    .fixture32(0x0e20_0c00), // SQADD remains outside the implemented subset.
     pattern(
         "floating-point-unsupported",
         0x1f00_0000,
@@ -1094,6 +1320,28 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         105,
         &[],
     ),
+    // SCVTF/UCVTF (scalar, fixed-point), W/X to S/D. The scale field
+    // encodes 64-fbits; W sources reserve scales below 32.
+    // Arm A64 ISA (2025), pp. 1713-1715 and 2026-2028:
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "fp-signed-fixed-int-to-float",
+        0x7fbf_0000,
+        0x1e02_0000,
+        0x0000_00c9,
+        176,
+        &[],
+    )
+    .fixture32(0x1e42_8000),
+    pattern(
+        "fp-unsigned-fixed-int-to-float",
+        0x7fbf_0000,
+        0x1e03_0000,
+        0x0000_00ca,
+        175,
+        &[],
+    )
+    .fixture32(0x1e43_8000),
     // Arm A64 FCVTZS/FCVTZU (scalar, integer), covering the base S/D-to-W/X
     // forms. Both operations round toward zero and return a saturated integer
     // for an out-of-range operand. Arm ARM DDI 0602 (2025-12):
@@ -1313,11 +1561,13 @@ pub struct Operands {
     pub immediate_7: u8,
     /// Normalized `immh:immb` field used by Advanced SIMD shifts.
     pub shift_immediate: u8,
+    pub shift_accumulate: bool,
     pub mode: u8,
     pub immediate_8: u8,
     pub cmode: u8,
     pub structure_opcode: u8,
     pub structure_r: bool,
+    pub table_register_count: u8,
     pub bitwise_operation: Option<BitwiseOperation>,
     pub integer_comparison: Option<IntegerComparison>,
     pub pairwise_operation: Option<PairwiseOperation>,
@@ -1366,11 +1616,13 @@ impl Operands {
             rt2: 0,
             immediate_7: 0,
             shift_immediate: 0,
+            shift_accumulate: false,
             mode: 0,
             immediate_8: 0,
             cmode: 0,
             structure_opcode: 0,
             structure_r: false,
+            table_register_count: 0,
             bitwise_operation: None,
             integer_comparison: None,
             pairwise_operation: None,
@@ -1397,6 +1649,7 @@ impl Operands {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BitwiseOperation {
+    Not,
     And,
     BitClear,
     Or,
@@ -1468,6 +1721,7 @@ pub enum FloatRoundOperation {
 pub enum FloatAddOperation {
     Add,
     Subtract,
+    AbsoluteDifference,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1505,6 +1759,10 @@ instructions!(
     MemoryPair,
     Bitwise,
     Integer,
+    IntegerMultiply,
+    IntegerWideAdd,
+    IntegerSign,
+    ScalarIntegerSign,
     ScalarMove,
     ScalarAbsolute,
     ScalarNegate,
@@ -1537,10 +1795,14 @@ instructions!(
     MemorySingleStructure,
     MemorySingleStructurePostIndex,
     PermuteTwoSource,
+    TableLookup,
+    TableLookupExtension,
     Extract,
     IntegerCompare,
+    ScalarIntegerCompare,
     IntegerPairwise,
     IntegerMinMax,
+    IntegerMinMaxAcross,
     ShiftRightNarrow,
     ScalarShiftRightImmediate,
     VectorShiftRightImmediate,
@@ -1568,11 +1830,15 @@ instructions!(
     VectorFloatImmediate,
     ScalarFloatImmediate,
     ScalarFloatConvert,
+    VectorFloatConvertLong,
+    VectorFloatConvertNarrow,
     ScalarFloatDivide,
     ScalarFloatRound,
     ScalarFloatAdd,
     ScalarFloatMaxNumber,
     ScalarFloatMinNumber,
+    ScalarFloatMax,
+    ScalarFloatMin,
     ScalarFloatMultiply,
     ScalarFloatMultiplyElement,
     ScalarFloatFusedMultiplyAdd,
@@ -1604,6 +1870,8 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
                 | 0x0000_00ae
                 | 0x0000_00af
                 | 0x0000_00b0
+                | 0x0000_00c5
+                | 0x0000_00c6
         ) {
             ((bits >> 22) & 1) as u8
         } else {
@@ -1628,15 +1896,18 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         rt2: ((bits >> 10) & 0x1f) as u8,
         immediate_7: ((bits >> 15) & 0x7f) as u8,
         shift_immediate: ((bits >> 16) & 0x7f) as u8,
+        shift_accumulate: matches!(instruction_id, 0x91 | 0x92) && bits & (1 << 12) != 0,
         mode: ((bits >> 23) & 3) as u8,
         immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
         cmode: ((bits >> 12) & 0xf) as u8,
         structure_opcode: ((bits >> 12) & 0xf) as u8,
         structure_r: bits & (1 << 21) != 0,
-        bitwise_operation: (instruction_id == 0x0000_0030).then(|| {
-            bitwise_operation(bits)
-                .expect("the SIMD bitwise pattern only contains allocated operations")
-        }),
+        table_register_count: ((bits >> 13) & 3) as u8 + 1,
+        bitwise_operation: match instruction_id {
+            0x0000_00b2 => Some(BitwiseOperation::Not),
+            0x0000_0030 => bitwise_operation(bits),
+            _ => None,
+        },
         integer_comparison: integer_comparison(instruction_id),
         pairwise_operation: pairwise_operation(instruction_id),
         permute_operation: (instruction_id == 0x0000_0064).then(|| {
@@ -1677,8 +1948,11 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
             | 0x0000_00af | 0x0000_00b0 => Some(FloatToIntegerRounding::TowardZero),
             _ => None,
         },
-        fixed_point_fraction_bits: matches!(instruction_id, 0x0000_009e | 0x0000_009f)
-            .then(|| 64 - ((bits >> 10) & 0x3f) as u8),
+        fixed_point_fraction_bits: matches!(
+            instruction_id,
+            0x0000_009e | 0x0000_009f | 0x0000_00c9 | 0x0000_00ca
+        )
+        .then(|| 64 - ((bits >> 10) & 0x3f) as u8),
         float_round_operation: match instruction_id {
             0x0000_0072 => Some(FloatRoundOperation::NearestEven),
             0x0000_0073 => Some(FloatRoundOperation::TowardPositive),
@@ -1695,6 +1969,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
             } else {
                 FloatAddOperation::Subtract
             }),
+            0x0000_00c5 | 0x0000_00c6 => Some(FloatAddOperation::AbsoluteDifference),
             0x0000_0079 => Some(FloatAddOperation::Add),
             0x0000_007a => Some(FloatAddOperation::Subtract),
             _ => None,
@@ -1728,8 +2003,12 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_008c => Instruction::DuplicateElement(operands),
         0x0000_00ac => Instruction::DuplicateScalarElement(operands),
         0x0000_0049 => Instruction::MemoryPair(operands),
-        0x0000_0030 => Instruction::Bitwise(operands),
+        0x0000_0030 | 0x0000_00b2 => Instruction::Bitwise(operands),
         0x0000_0031 => Instruction::Integer(operands),
+        0x0000_00b5 => Instruction::IntegerMultiply(operands),
+        0x0000_00c1 => Instruction::IntegerWideAdd(operands),
+        0x0000_00c2 => Instruction::IntegerSign(operands),
+        0x0000_00c3 => Instruction::ScalarIntegerSign(operands),
         0x0000_0035 | 0x0000_0089 => Instruction::ScalarMove(operands),
         0x0000_008d | 0x0000_008f => Instruction::ScalarAbsolute(operands),
         0x0000_008e | 0x0000_0090 => Instruction::ScalarNegate(operands),
@@ -1742,8 +2021,8 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_004b => Instruction::UnsignedMoveToGeneral(operands),
         0x0000_0060 => Instruction::InsertElement(operands),
         0x0000_0061 => Instruction::InsertGeneral(operands),
-        0x0000_003a => Instruction::SignedIntToFloat(operands),
-        0x0000_003b => Instruction::UnsignedIntToFloat(operands),
+        0x0000_003a | 0x0000_00c9 => Instruction::SignedIntToFloat(operands),
+        0x0000_003b | 0x0000_00ca => Instruction::UnsignedIntToFloat(operands),
         0x0000_003c | 0x0000_007d | 0x0000_007f | 0x0000_0081 | 0x0000_0083 | 0x0000_009e => {
             Instruction::FloatToSignedInt(operands)
         }
@@ -1762,8 +2041,11 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_0062 => Instruction::MemorySingleStructure(operands),
         0x0000_0063 => Instruction::MemorySingleStructurePostIndex(operands),
         0x0000_0064 => Instruction::PermuteTwoSource(operands),
+        0x0000_00c7 => Instruction::TableLookup(operands),
+        0x0000_00c8 => Instruction::TableLookupExtension(operands),
         0x0000_0085 => Instruction::Extract(operands),
         0x0000_004e..=0x0000_0058 => Instruction::IntegerCompare(operands),
+        0x0000_00bb..=0x0000_00c0 => Instruction::ScalarIntegerCompare(operands),
         0x0000_0059..=0x0000_005d => Instruction::IntegerPairwise(operands),
         0x0000_0065 => Instruction::ShiftRightNarrow(operands),
         0x0000_0091 => Instruction::ScalarShiftRightImmediate(operands),
@@ -1784,6 +2066,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_00a6 => Instruction::UnsignedAddLongAcrossVector(operands),
         0x0000_0088 => Instruction::ExtractNarrow(operands),
         0x0000_0066..=0x0000_0069 => Instruction::IntegerMinMax(operands),
+        0x0000_00b6..=0x0000_00b9 => Instruction::IntegerMinMaxAcross(operands),
         0x0000_006a => Instruction::VectorSignedIntToFloat(operands),
         0x0000_006b => Instruction::VectorUnsignedIntToFloat(operands),
         0x0000_008a => Instruction::ScalarVectorSignedIntToFloat(operands),
@@ -1797,11 +2080,16 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_0086 => Instruction::VectorFloatImmediate(operands),
         0x0000_006d..=0x0000_006e => Instruction::ScalarFloatImmediate(operands),
         0x0000_006f..=0x0000_0070 => Instruction::ScalarFloatConvert(operands),
+        0x0000_00ba => Instruction::VectorFloatConvertLong(operands),
+        0x0000_00c4 => Instruction::VectorFloatConvertNarrow(operands),
         0x0000_0071 => Instruction::ScalarFloatDivide(operands),
         0x0000_0072..=0x0000_0078 => Instruction::ScalarFloatRound(operands),
         0x0000_00a8 => Instruction::ScalarFloatMinNumber(operands),
+        0x0000_00b3 => Instruction::ScalarFloatMax(operands),
+        0x0000_00b4 => Instruction::ScalarFloatMin(operands),
         0x0000_00a7 => Instruction::ScalarFloatMaxNumber(operands),
-        0x0000_0079..=0x0000_007a => Instruction::ScalarFloatAdd(operands),
+        0x0000_0079..=0x0000_007a | 0x0000_00c5 => Instruction::ScalarFloatAdd(operands),
+        0x0000_00c6 => Instruction::VectorFloatAdd(operands),
         0x0000_007b..=0x0000_007c => Instruction::ScalarFloatMultiply(operands),
         0x0000_00ad => Instruction::ScalarFloatMultiplyElement(operands),
         0x0000_0097 => Instruction::ScalarFloatFusedMultiplyAdd(operands),
@@ -1842,12 +2130,12 @@ const fn bitwise_operation(bits: u32) -> Option<BitwiseOperation> {
 #[must_use]
 pub(super) const fn integer_comparison(instruction_id: u32) -> Option<IntegerComparison> {
     match instruction_id {
-        0x0000_004e => Some(IntegerComparison::SignedGreaterThan),
-        0x0000_004f => Some(IntegerComparison::UnsignedGreaterThan),
-        0x0000_0050 => Some(IntegerComparison::SignedGreaterThanOrEqual),
-        0x0000_0051 => Some(IntegerComparison::UnsignedGreaterThanOrEqual),
-        0x0000_0052 => Some(IntegerComparison::NonzeroBitTest),
-        0x0000_0053 => Some(IntegerComparison::Equal),
+        0x0000_004e | 0x0000_00bb => Some(IntegerComparison::SignedGreaterThan),
+        0x0000_004f | 0x0000_00bc => Some(IntegerComparison::UnsignedGreaterThan),
+        0x0000_0050 | 0x0000_00bd => Some(IntegerComparison::SignedGreaterThanOrEqual),
+        0x0000_0051 | 0x0000_00be => Some(IntegerComparison::UnsignedGreaterThanOrEqual),
+        0x0000_0052 | 0x0000_00bf => Some(IntegerComparison::NonzeroBitTest),
+        0x0000_0053 | 0x0000_00c0 => Some(IntegerComparison::Equal),
         0x0000_0054 => Some(IntegerComparison::SignedGreaterThan),
         0x0000_0055 => Some(IntegerComparison::SignedGreaterThanOrEqual),
         0x0000_0056 => Some(IntegerComparison::Equal),
@@ -1865,10 +2153,10 @@ const fn pairwise_operation(instruction_id: u32) -> Option<PairwiseOperation> {
         0x0000_005b => Some(PairwiseOperation::SignedMinimum),
         0x0000_005c => Some(PairwiseOperation::UnsignedMaximum),
         0x0000_005d => Some(PairwiseOperation::UnsignedMinimum),
-        0x0000_0066 => Some(PairwiseOperation::SignedMaximum),
-        0x0000_0067 => Some(PairwiseOperation::SignedMinimum),
-        0x0000_0068 => Some(PairwiseOperation::UnsignedMaximum),
-        0x0000_0069 => Some(PairwiseOperation::UnsignedMinimum),
+        0x0000_0066 | 0x0000_00b6 => Some(PairwiseOperation::SignedMaximum),
+        0x0000_0067 | 0x0000_00b7 => Some(PairwiseOperation::SignedMinimum),
+        0x0000_0068 | 0x0000_00b8 => Some(PairwiseOperation::UnsignedMaximum),
+        0x0000_0069 | 0x0000_00b9 => Some(PairwiseOperation::UnsignedMinimum),
         _ => None,
     }
 }

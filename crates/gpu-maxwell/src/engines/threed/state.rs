@@ -90,6 +90,16 @@ pub(super) const MAXWELL_THREE_D_WINDOW_ORIGIN_RESET: u32 = 0;
 /// unknown rather than being silently fabricated as zero.
 pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u32> {
     match method.0 {
+        // GM20B method initialization explicitly clears scratch words 0..127.
+        // Table SHA-256: 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24.
+        // Each entry encodes (method_dword << 16) | class, followed by value;
+        // B197 entries 0x0d00..0x0d7f are all zero. The upper half is not
+        // covered by this table and remains unknown until programmed.
+        // https://gitlab.com/kernel-firmware/linux-firmware/-/blob/main/WHENCE
+        // https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
+        // The same GM20B table disables sparse depth (B197 dword 0x482).
+        0x1208 | 0x15b8 => Some(0),
+        raw @ 0x3400..=0x35fc if raw.is_multiple_of(4) => Some(0),
         raw if raw >= 0x0c00 && raw < 0x0d00 && (raw - 0x0c00) % 0x10 == 8 => {
             Some(VIEWPORT_CLIP_MIN_Z_RESET)
         }
@@ -1009,6 +1019,7 @@ impl MaxwellThreeDResourceSemanticWrites {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellThreeDFrontendState {
     raw_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
+    pub(in crate::engines) pending_notification: Option<(u64, MaxwellMethodSource)>,
     operation: MaxwellThreeDState,
     mme: MaxwellThreeDMmeState,
     resource_semantic_writes: MaxwellThreeDResourceSemanticWrites,
@@ -1019,6 +1030,8 @@ impl Default for MaxwellThreeDFrontendState {
     fn default() -> Self {
         let mut raw_registers = BTreeMap::new();
         for method in [
+            0x1208,
+            0x15b8,
             0x0f8c,
             0x166c,
             0x1918,
@@ -1078,6 +1091,7 @@ impl Default for MaxwellThreeDFrontendState {
         }
         Self {
             raw_registers,
+            pending_notification: None,
             operation: MaxwellThreeDState::default(),
             mme: Default::default(),
             resource_semantic_writes: MaxwellThreeDResourceSemanticWrites::default(),
@@ -1794,11 +1808,11 @@ impl MaxwellThreeDStateWrite {
             | Self::ViewportPixelCenter { .. }
             | Self::FixedFunction(_)
             | Self::RenderEnable(_)
-            | Self::ShaderExecution(_)
             | Self::ColorReduction(_)
             | Self::ConstantColorRendering(_)
             | Self::Coverage(_)
             | Self::Line(_) => true,
+            Self::ShaderExecution(write) => !matches!(write, MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis { .. }),
             Self::RenderTarget(write) => !matches!(
                 write,
                 MaxwellThreeDRenderTargetWrite::ClearColor { .. }
@@ -1841,6 +1855,7 @@ impl MaxwellThreeDStateWrite {
                 | MaxwellThreeDRenderTargetWrite::ColorWidth { .. }
                 | MaxwellThreeDRenderTargetWrite::ColorHeight { .. }
                 | MaxwellThreeDRenderTargetWrite::ColorFormat { .. }
+                | MaxwellThreeDRenderTargetWrite::SrgbWrite { .. }
                 | MaxwellThreeDRenderTargetWrite::ColorLayout { .. }
                 | MaxwellThreeDRenderTargetWrite::ColorThirdDimension { .. }
                 | MaxwellThreeDRenderTargetWrite::ColorArrayPitch { .. }
@@ -1849,6 +1864,7 @@ impl MaxwellThreeDStateWrite {
                 | MaxwellThreeDRenderTargetWrite::DepthAddressUpper { .. }
                 | MaxwellThreeDRenderTargetWrite::DepthAddressLower { .. }
                 | MaxwellThreeDRenderTargetWrite::DepthFormat { .. }
+                | MaxwellThreeDRenderTargetWrite::DepthSparse { .. }
                 | MaxwellThreeDRenderTargetWrite::DepthLayout { .. }
                 | MaxwellThreeDRenderTargetWrite::DepthWidth { .. }
                 | MaxwellThreeDRenderTargetWrite::DepthHeight { .. }
@@ -1868,7 +1884,8 @@ impl MaxwellThreeDStateWrite {
                 ..MaxwellThreeDResourceSemanticWrites::default()
             },
             Self::VertexInput(
-                MaxwellThreeDVertexInputWrite::StreamFormat { .. }
+                MaxwellThreeDVertexInputWrite::AttributeSkipMask { .. }
+                | MaxwellThreeDVertexInputWrite::StreamFormat { .. }
                 | MaxwellThreeDVertexInputWrite::StreamAddressUpper { .. }
                 | MaxwellThreeDVertexInputWrite::StreamAddressLower { .. }
                 | MaxwellThreeDVertexInputWrite::StreamLimitUpper { .. }

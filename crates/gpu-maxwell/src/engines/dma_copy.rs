@@ -1,8 +1,11 @@
 //! GM20B `MAXWELL_DMA_COPY_A` state and virtual-memory copy semantics.
 
-use std::fmt::{Display, Formatter};
-
 use nixe_gpu::{GpuClassId, GpuMethodId};
+
+use super::memory_copy::{
+    MaxwellMemoryCopyComponentSource, MaxwellMemoryCopyLayout, MaxwellMemoryCopyOperation,
+    MaxwellMemoryCopyRemap, required_range_size,
+};
 
 use super::{
     AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
@@ -17,6 +20,14 @@ const GPU_ADDRESS_UPPER_MASK: u32 = 0xff;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum MaxwellDmaCopyRegisterName {
+    SemaphoreAddressUpper,
+    SemaphoreAddressLower,
+    SemaphorePayload,
+    RenderEnableAddressUpper,
+    RenderEnableAddressLower,
+    RenderEnableControl,
+    SourcePhysicalTarget,
+    DestinationPhysicalTarget,
     SourceAddressUpper,
     SourceAddressLower,
     DestinationAddressUpper,
@@ -79,9 +90,21 @@ pub struct MaxwellDmaCopyState {
 
 impl Default for MaxwellDmaCopyState {
     fn default() -> Self {
-        Self {
-            registers: [MaxwellDmaCopyRegister::default(); DMA_REGISTER_COUNT],
+        let mut registers = [MaxwellDmaCopyRegister::default(); DMA_REGISTER_COUNT];
+        // Slice selectors start at zero in the copy engine. A 2D transfer need
+        // not program SET_SRC_LAYER/SET_DST_LAYER before its first launch.
+        // Keep reset state distinct from a guest write (no source location).
+        // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_dma.h
+        for name in [
+            MaxwellDmaCopyRegisterName::SourcePositionZ,
+            MaxwellDmaCopyRegisterName::DestinationPositionZ,
+        ] {
+            registers[name as usize] = MaxwellDmaCopyRegister {
+                raw: Some(0),
+                source: None,
+            };
         }
+        Self { registers }
     }
 }
 
@@ -109,173 +132,6 @@ pub struct MaxwellDmaCopyStateWrite {
     value: u32,
     source: MaxwellMethodSource,
 }
-
-/// Memory organization selected for one side of a DMA copy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellDmaCopyMemoryLayout {
-    Pitch {
-        pitch: u32,
-    },
-    BlockLinear {
-        surface_width: u32,
-        surface_height: u32,
-        x: u32,
-        y: u32,
-        block_height_log2: u8,
-    },
-}
-
-/// Source selected for one remapped destination component.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellDmaCopyComponentSource {
-    Source(u8),
-    ConstantA,
-    ConstantB,
-    NoWrite,
-}
-
-/// Component mapping applied independently to every copied element.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxwellDmaCopyRemap {
-    components: [MaxwellDmaCopyComponentSource; 4],
-    component_bytes: u8,
-    source_components: u8,
-    destination_components: u8,
-    constant_a: u32,
-    constant_b: u32,
-}
-
-impl MaxwellDmaCopyRemap {
-    #[must_use]
-    pub const fn components(self) -> [MaxwellDmaCopyComponentSource; 4] {
-        self.components
-    }
-
-    #[must_use]
-    pub const fn component_bytes(self) -> u8 {
-        self.component_bytes
-    }
-
-    #[must_use]
-    pub const fn source_components(self) -> u8 {
-        self.source_components
-    }
-
-    #[must_use]
-    pub const fn destination_components(self) -> u8 {
-        self.destination_components
-    }
-}
-
-/// Fully validated virtual-memory copy emitted at `LAUNCH_DMA`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxwellDmaCopyOperation {
-    source_address: u64,
-    destination_address: u64,
-    source_layout: MaxwellDmaCopyMemoryLayout,
-    destination_layout: MaxwellDmaCopyMemoryLayout,
-    width: u32,
-    height: u32,
-    remap: Option<MaxwellDmaCopyRemap>,
-    source_range_size: u64,
-    destination_range_size: u64,
-    source: MaxwellMethodSource,
-}
-
-impl MaxwellDmaCopyOperation {
-    #[must_use]
-    pub const fn source_address(self) -> u64 {
-        self.source_address
-    }
-
-    #[must_use]
-    pub const fn destination_address(self) -> u64 {
-        self.destination_address
-    }
-
-    #[must_use]
-    pub const fn source_range_size(self) -> u64 {
-        self.source_range_size
-    }
-
-    #[must_use]
-    pub const fn destination_range_size(self) -> u64 {
-        self.destination_range_size
-    }
-
-    #[must_use]
-    pub const fn source(self) -> MaxwellMethodSource {
-        self.source
-    }
-
-    pub(crate) fn copy_bytes(
-        self,
-        source: &[u8],
-        destination: &mut [u8],
-    ) -> Result<(), MaxwellDmaCopyError> {
-        if source.len() as u64 != self.source_range_size
-            || destination.len() as u64 != self.destination_range_size
-        {
-            return Err(MaxwellDmaCopyError::RangeSizeMismatch);
-        }
-        let (source_element_bytes, destination_element_bytes) = self.element_sizes();
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let source_offset = layout_offset(self.source_layout, x, y, source_element_bytes)?;
-                let destination_offset =
-                    layout_offset(self.destination_layout, x, y, destination_element_bytes)?;
-                let source_end = source_offset
-                    .checked_add(source_element_bytes as usize)
-                    .ok_or(MaxwellDmaCopyError::ArithmeticOverflow)?;
-                let destination_end = destination_offset
-                    .checked_add(destination_element_bytes as usize)
-                    .ok_or(MaxwellDmaCopyError::ArithmeticOverflow)?;
-                let source_element = source
-                    .get(source_offset..source_end)
-                    .ok_or(MaxwellDmaCopyError::RangeSizeMismatch)?;
-                let destination_element = destination
-                    .get_mut(destination_offset..destination_end)
-                    .ok_or(MaxwellDmaCopyError::RangeSizeMismatch)?;
-                if let Some(remap) = self.remap {
-                    remap_element(remap, source_element, destination_element);
-                } else {
-                    destination_element.copy_from_slice(source_element);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    const fn element_sizes(self) -> (u32, u32) {
-        match self.remap {
-            Some(remap) => (
-                remap.component_bytes as u32 * remap.source_components as u32,
-                remap.component_bytes as u32 * remap.destination_components as u32,
-            ),
-            None => (1, 1),
-        }
-    }
-}
-
-/// Failure while applying a previously validated DMA operation to bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellDmaCopyError {
-    ArithmeticOverflow,
-    RangeSizeMismatch,
-    ResourceExhausted,
-}
-
-impl Display for MaxwellDmaCopyError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::ArithmeticOverflow => "DMA copy address arithmetic overflowed",
-            Self::RangeSizeMismatch => "DMA copy byte ranges do not match the validated layout",
-            Self::ResourceExhausted => "DMA copy exhausted host resources",
-        })
-    }
-}
-
-impl std::error::Error for MaxwellDmaCopyError {}
 
 #[derive(Clone, Copy)]
 struct MethodDeclaration {
@@ -308,6 +164,17 @@ macro_rules! methods {
 // https://github.com/torvalds/linux/blob/v6.16/drivers/gpu/drm/nouveau/include/nvhw/class/cla0b5.h
 // https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/rnndb/fifo/gk104_copy.xml
 methods!(
+    // Configuration alone does not release a semaphore. LAUNCH_DMA consumes
+    // its semaphore flags and still rejects unimplemented completion modes.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/dma-copy/clb0b5.h
+    SET_SEMAPHORE_A => (0x0240, "SET_SEMAPHORE_A", 0xff, SemaphoreAddressUpper),
+    SET_SEMAPHORE_B => (0x0244, "SET_SEMAPHORE_B", u32::MAX, SemaphoreAddressLower),
+    SET_SEMAPHORE_PAYLOAD => (0x0248, "SET_SEMAPHORE_PAYLOAD", u32::MAX, SemaphorePayload),
+    SET_RENDER_ENABLE_A => (0x0254, "SET_RENDER_ENABLE_A", 0xff, RenderEnableAddressUpper),
+    SET_RENDER_ENABLE_B => (0x0258, "SET_RENDER_ENABLE_B", u32::MAX, RenderEnableAddressLower),
+    SET_RENDER_ENABLE_C => (0x025c, "SET_RENDER_ENABLE_C", 7, RenderEnableControl),
+    SET_SRC_PHYS_MODE => (0x0260, "SET_SRC_PHYS_MODE", 3, SourcePhysicalTarget),
+    SET_DST_PHYS_MODE => (0x0264, "SET_DST_PHYS_MODE", 3, DestinationPhysicalTarget),
     LAUNCH_DMA => (0x0300, "LAUNCH_DMA", 0x000f_ffff, Launch),
     OFFSET_IN_UPPER => (0x0400, "OFFSET_IN_UPPER", GPU_ADDRESS_UPPER_MASK, SourceAddressUpper),
     OFFSET_IN_LOWER => (0x0404, "OFFSET_IN_LOWER", u32::MAX, SourceAddressLower),
@@ -354,6 +221,20 @@ pub(super) fn preflight(
         });
     }
 
+    if (declaration.register == MaxwellDmaCopyRegisterName::RenderEnableControl
+        && source.argument() > 4)
+        || (matches!(
+            declaration.register,
+            MaxwellDmaCopyRegisterName::SourcePhysicalTarget
+                | MaxwellDmaCopyRegisterName::DestinationPhysicalTarget
+        ) && source.argument() > 2)
+    {
+        return Err(MaxwellEngineDispatchError::InvalidMethodValue {
+            source,
+            metadata: declaration.metadata,
+            defined_mask: declaration.defined_mask,
+        });
+    }
     let write = MaxwellDmaCopyStateWrite {
         register: declaration.register,
         value: source.argument(),
@@ -368,14 +249,14 @@ pub(super) fn preflight(
     Ok(AppliedMethod::new(
         method,
         *declaration.metadata,
-        operation.map(PendingEngineOperation::DmaCopy),
+        operation.map(PendingEngineOperation::MemoryCopy),
     ))
 }
 
 fn build_operation(
     state: &MaxwellDmaCopyState,
     source: MaxwellMethodSource,
-) -> Result<MaxwellDmaCopyOperation, MaxwellEngineDispatchError> {
+) -> Result<MaxwellMemoryCopyOperation, MaxwellEngineDispatchError> {
     let raw = source.argument();
     let copy_mode = raw & 0x3;
     if !matches!(copy_mode, 1 | 2) {
@@ -384,12 +265,49 @@ fn build_operation(
             "LAUNCH_DMA requires a copy transfer mode",
         ));
     }
-    if raw & 0x000f_f878 != 0 {
+    if raw & 0x000f_f860 != 0 {
         return Err(invalid_encoding(
             source,
-            "semaphores, interrupts, physical addressing, L2 bypass, and reductions are not implemented",
+            "interrupts, physical addressing, L2 bypass, and reductions are not implemented",
         ));
     }
+    if state
+        .register(MaxwellDmaCopyRegisterName::RenderEnableControl)
+        .raw()
+        .is_some_and(|mode| mode != 1)
+    {
+        return Err(invalid_encoding(
+            source,
+            "conditional or disabled DMA execution is not implemented",
+        ));
+    }
+    let semaphore_release = match (raw >> 3) & 3 {
+        0 => None,
+        1 => {
+            let address = address(
+                state,
+                MaxwellDmaCopyRegisterName::SemaphoreAddressUpper,
+                MaxwellDmaCopyRegisterName::SemaphoreAddressLower,
+                source,
+            )?;
+            if address & 3 != 0 {
+                return Err(invalid_encoding(
+                    source,
+                    "one-word DMA semaphore address must be four-byte aligned",
+                ));
+            }
+            Some((
+                address,
+                required(state, MaxwellDmaCopyRegisterName::SemaphorePayload, source)?,
+            ))
+        }
+        _ => {
+            return Err(invalid_encoding(
+                source,
+                "four-word or reserved DMA semaphore releases are not implemented",
+            ));
+        }
+    };
     let multi_line = raw & (1 << 9) != 0;
     let remap_enabled = raw & (1 << 10) != 0;
     let width = required(state, MaxwellDmaCopyRegisterName::LineLength, source)?;
@@ -457,7 +375,8 @@ fn build_operation(
         return Err(invalid_encoding(source, "DMA GPU range overflows"));
     }
 
-    Ok(MaxwellDmaCopyOperation {
+    Ok(MaxwellMemoryCopyOperation {
+        semaphore_release,
         source_address,
         destination_address,
         source_layout,
@@ -495,19 +414,19 @@ fn address(
 fn parse_remap(
     state: &MaxwellDmaCopyState,
     source: MaxwellMethodSource,
-) -> Result<MaxwellDmaCopyRemap, MaxwellEngineDispatchError> {
+) -> Result<MaxwellMemoryCopyRemap, MaxwellEngineDispatchError> {
     let raw = required(state, MaxwellDmaCopyRegisterName::RemapComponents, source)?;
-    let mut components = [MaxwellDmaCopyComponentSource::NoWrite; 4];
+    let mut components = [MaxwellMemoryCopyComponentSource::NoWrite; 4];
     for (index, component) in components.iter_mut().enumerate() {
         *component = match (raw >> (index * 4)) & 0x7 {
-            value @ 0..=3 => MaxwellDmaCopyComponentSource::Source(value as u8),
-            4 => MaxwellDmaCopyComponentSource::ConstantA,
-            5 => MaxwellDmaCopyComponentSource::ConstantB,
-            6 => MaxwellDmaCopyComponentSource::NoWrite,
+            value @ 0..=3 => MaxwellMemoryCopyComponentSource::Source(value as u8),
+            4 => MaxwellMemoryCopyComponentSource::ConstantA,
+            5 => MaxwellMemoryCopyComponentSource::ConstantB,
+            6 => MaxwellMemoryCopyComponentSource::NoWrite,
             _ => return Err(invalid_encoding(source, "invalid component remap selector")),
         };
     }
-    let remap = MaxwellDmaCopyRemap {
+    let remap = MaxwellMemoryCopyRemap {
         components,
         component_bytes: ((raw >> 16) & 0x3) as u8 + 1,
         source_components: ((raw >> 20) & 0x3) as u8 + 1,
@@ -524,7 +443,7 @@ fn parse_remap(
     if remap.components[..remap.destination_components as usize]
         .iter()
         .any(|component| {
-            matches!(component, MaxwellDmaCopyComponentSource::Source(index) if *index >= remap.source_components)
+            matches!(component, MaxwellMemoryCopyComponentSource::Source(index) if *index >= remap.source_components)
         })
     {
         return Err(invalid_encoding(
@@ -543,7 +462,7 @@ fn layout(
     height: u32,
     element_bytes: u32,
     source: MaxwellMethodSource,
-) -> Result<MaxwellDmaCopyMemoryLayout, MaxwellEngineDispatchError> {
+) -> Result<MaxwellMemoryCopyLayout, MaxwellEngineDispatchError> {
     let (pitch_register, block, size_x, size_y, size_z, position_z, position_xy) = if source_side {
         (
             MaxwellDmaCopyRegisterName::SourcePitch,
@@ -576,7 +495,7 @@ fn layout(
                 "DMA pitch is shorter than one copied row",
             ));
         }
-        return Ok(MaxwellDmaCopyMemoryLayout::Pitch { pitch });
+        return Ok(MaxwellMemoryCopyLayout::Pitch { pitch });
     }
 
     let dimensions = required(state, block, source)?;
@@ -609,111 +528,13 @@ fn layout(
             "DMA rectangle exceeds its block-linear surface",
         ));
     }
-    Ok(MaxwellDmaCopyMemoryLayout::BlockLinear {
+    Ok(MaxwellMemoryCopyLayout::BlockLinear {
         surface_width,
         surface_height,
         x,
         y,
         block_height_log2,
     })
-}
-
-fn required_range_size(
-    layout: MaxwellDmaCopyMemoryLayout,
-    width: u32,
-    height: u32,
-    element_bytes: u32,
-) -> Result<u64, MaxwellEngineDispatchError> {
-    let offset = layout_offset(layout, width - 1, height - 1, element_bytes)
-        .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-    u64::try_from(offset)
-        .ok()
-        .and_then(|offset| offset.checked_add(u64::from(element_bytes)))
-        .ok_or(MaxwellEngineDispatchError::ResourceExhausted)
-}
-
-fn layout_offset(
-    layout: MaxwellDmaCopyMemoryLayout,
-    x: u32,
-    y: u32,
-    element_bytes: u32,
-) -> Result<usize, MaxwellDmaCopyError> {
-    let (x, y) = match layout {
-        MaxwellDmaCopyMemoryLayout::Pitch { pitch } => {
-            let offset = u64::from(y)
-                .checked_mul(u64::from(pitch))
-                .and_then(|offset| {
-                    u64::from(x)
-                        .checked_mul(u64::from(element_bytes))
-                        .and_then(|x| offset.checked_add(x))
-                })
-                .ok_or(MaxwellDmaCopyError::ArithmeticOverflow)?;
-            return usize::try_from(offset).map_err(|_| MaxwellDmaCopyError::ArithmeticOverflow);
-        }
-        MaxwellDmaCopyMemoryLayout::BlockLinear {
-            x: origin_x,
-            y: origin_y,
-            ..
-        } => (
-            origin_x
-                .checked_add(x)
-                .ok_or(MaxwellDmaCopyError::ArithmeticOverflow)?,
-            origin_y
-                .checked_add(y)
-                .ok_or(MaxwellDmaCopyError::ArithmeticOverflow)?,
-        ),
-    };
-    let MaxwellDmaCopyMemoryLayout::BlockLinear {
-        surface_width,
-        block_height_log2,
-        ..
-    } = layout
-    else {
-        unreachable!()
-    };
-    let byte_x = u64::from(x)
-        .checked_mul(u64::from(element_bytes))
-        .ok_or(MaxwellDmaCopyError::ArithmeticOverflow)?;
-    let row_bytes = u64::from(surface_width)
-        .checked_mul(u64::from(element_bytes))
-        .ok_or(MaxwellDmaCopyError::ArithmeticOverflow)?;
-    let row_pitch = row_bytes
-        .checked_add(63)
-        .map(|value| value / 64 * 64)
-        .ok_or(MaxwellDmaCopyError::ArithmeticOverflow)?;
-    let width_in_gobs = row_pitch / 64;
-    let block_height_gobs = 1_u64 << block_height_log2;
-    let y = u64::from(y);
-    let offset = (y / (8 * block_height_gobs)) * 512 * block_height_gobs * width_in_gobs
-        + (byte_x / 64) * 512 * block_height_gobs
-        + ((y % (8 * block_height_gobs)) / 8) * 512
-        + ((byte_x % 64) / 32) * 256
-        + ((y % 8) / 2) * 64
-        + ((byte_x % 32) / 16) * 32
-        + (y % 2) * 16
-        + byte_x % 16;
-    usize::try_from(offset).map_err(|_| MaxwellDmaCopyError::ArithmeticOverflow)
-}
-
-fn remap_element(remap: MaxwellDmaCopyRemap, source: &[u8], destination: &mut [u8]) {
-    let component_bytes = remap.component_bytes as usize;
-    for destination_component in 0..remap.destination_components as usize {
-        let start = destination_component * component_bytes;
-        let output = &mut destination[start..start + component_bytes];
-        match remap.components[destination_component] {
-            MaxwellDmaCopyComponentSource::Source(source_component) => {
-                let source_start = source_component as usize * component_bytes;
-                output.copy_from_slice(&source[source_start..source_start + component_bytes]);
-            }
-            MaxwellDmaCopyComponentSource::ConstantA => {
-                output.copy_from_slice(&remap.constant_a.to_le_bytes()[..component_bytes]);
-            }
-            MaxwellDmaCopyComponentSource::ConstantB => {
-                output.copy_from_slice(&remap.constant_b.to_le_bytes()[..component_bytes]);
-            }
-            MaxwellDmaCopyComponentSource::NoWrite => {}
-        }
-    }
 }
 
 fn invalid_encoding(
@@ -724,46 +545,5 @@ fn invalid_encoding(
         source,
         method_name: "LAUNCH_DMA",
         reason,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn captured_rgba_remap_is_identity() {
-        let remap = MaxwellDmaCopyRemap {
-            components: [
-                MaxwellDmaCopyComponentSource::Source(0),
-                MaxwellDmaCopyComponentSource::Source(1),
-                MaxwellDmaCopyComponentSource::Source(2),
-                MaxwellDmaCopyComponentSource::Source(3),
-            ],
-            component_bytes: 1,
-            source_components: 4,
-            destination_components: 4,
-            constant_a: 0,
-            constant_b: 0,
-        };
-        let mut destination = [0_u8; 4];
-        remap_element(remap, &[0x10, 0x20, 0x30, 0x40], &mut destination);
-        assert_eq!(destination, [0x10, 0x20, 0x30, 0x40]);
-    }
-
-    #[test]
-    fn block_linear_offsets_follow_the_tegra_gob_layout() {
-        let layout = MaxwellDmaCopyMemoryLayout::BlockLinear {
-            surface_width: 64,
-            surface_height: 16,
-            x: 0,
-            y: 0,
-            block_height_log2: 1,
-        };
-        assert_eq!(layout_offset(layout, 0, 0, 4), Ok(0));
-        assert_eq!(layout_offset(layout, 4, 0, 4), Ok(32));
-        assert_eq!(layout_offset(layout, 0, 1, 4), Ok(16));
-        assert_eq!(layout_offset(layout, 0, 2, 4), Ok(64));
-        assert_eq!(layout_offset(layout, 16, 0, 4), Ok(1024));
     }
 }

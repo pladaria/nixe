@@ -48,6 +48,14 @@ impl PartialEq for PipelineKey {
                         .tessellation
                         .map(|t| (t.mode, t.input_control_points))
                     && self.draw.topology == other.draw.topology
+                    && self
+                        .draw
+                        .viewport_transform
+                        .is_some_and(|v| v.depth_clip_negative_one_to_one())
+                        == other
+                            .draw
+                            .viewport_transform
+                            .is_some_and(|v| v.depth_clip_negative_one_to_one())
                     && self.draw.line_rasterization.map(|l| l.smooth)
                         == other.draw.line_rasterization.map(|l| l.smooth)
                     && self.draw.depth_state == other.draw.depth_state
@@ -81,6 +89,10 @@ impl Hash for PipelineKey {
             .map(|t| (t.mode, t.input_control_points))
             .hash(h);
         self.draw.topology.hash(h);
+        self.draw
+            .viewport_transform
+            .is_some_and(|v| v.depth_clip_negative_one_to_one())
+            .hash(h);
         self.draw.line_rasterization.map(|l| l.smooth).hash(h);
         self.draw.depth_state.hash(h);
         self.draw.front_face.hash(h);
@@ -775,6 +787,10 @@ impl WgpuBackendDriver {
                     evaluation,
                     fragment,
                     nixe_gpu::SpirvTessellationOptions {
+                        depth_clip_negative_one_to_one: draw
+                            .prepared
+                            .viewport_transform
+                            .is_some_and(|transform| transform.depth_clip_negative_one_to_one()),
                         input_control_points: tess.input_control_points,
                         mode: tess.mode,
                         float32: caps.float32,
@@ -788,6 +804,10 @@ impl WgpuBackendDriver {
                 vertex,
                 fragment,
                 nixe_gpu::SpirvShaderOptions {
+                    depth_clip_negative_one_to_one: draw
+                        .prepared
+                        .viewport_transform
+                        .is_some_and(|transform| transform.depth_clip_negative_one_to_one()),
                     input_control_points: 0,
                     tessellation_mode: None,
                     float32: caps.float32,

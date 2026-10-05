@@ -512,7 +512,7 @@ impl HorizonSvcDispatcher {
         settings_environment: crate::SettingsEnvironment,
         video_system: crate::VideoSystem,
     ) -> Self {
-        let virtual_clock = time_environment.clock();
+        let virtual_clock = time_environment.clock().clone();
         Self {
             observed: BTreeMap::new(),
             unknown_calls: 0,

@@ -1,6 +1,50 @@
 use super::*;
 
 #[test]
+fn disabled_depth_bias_parameters_preserve_float_bits_without_triggering_work() {
+    for (method, register, name) in [
+        (
+            0x156c,
+            MaxwellThreeDFixedFunctionRegister::SlopeScaleDepthBias,
+            "SET_SLOPE_SCALE_DEPTH_BIAS",
+        ),
+        (
+            0x15bc,
+            MaxwellThreeDFixedFunctionRegister::DepthBias,
+            "SET_DEPTH_BIAS",
+        ),
+        (
+            0x187c,
+            MaxwellThreeDFixedFunctionRegister::DepthBiasClamp,
+            "SET_DEPTH_BIAS_CLAMP",
+        ),
+    ] {
+        let mut channel = three_d_channel();
+        for bits in [
+            0,
+            (-2.5_f32).to_bits(),
+            f32::INFINITY.to_bits(),
+            0x7fc0_1234,
+        ] {
+            let dispatch = dispatch_method(&mut channel, method / 4, bits).unwrap();
+            assert_eq!(dispatch.methods()[0].metadata().method_name(), name);
+            assert!(dispatch.operations().is_empty());
+            let value = channel.three_d().fixed_function().register(register);
+            assert_eq!(
+                value.value(),
+                Some(&MaxwellThreeDFixedFunctionValue::FloatBits(
+                    MaxwellThreeDRawValue::new(bits)
+                ))
+            );
+            assert_eq!(
+                value.source(),
+                Some(dispatch.methods()[0].method().source())
+            );
+        }
+    }
+}
+
+#[test]
 fn sm_timeout_counter_bit_is_bounded_source_preserving_state() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
@@ -900,10 +944,10 @@ fn invalid_csaa_values_and_failed_packet_keeps_valid_prefix() {
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x15b4 / 4, &[1, 0]);
+    let decoded = incrementing_packet(0x15b4 / 4, &[1, 2]);
     assert!(matches!(
         dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. })
             if source.method() == GpuMethodId(0x15b8)
     ));
     assert_eq!(channel.frontend(), frontend_before);
@@ -3217,7 +3261,7 @@ fn color_clamp_and_pixel_shader_saturate_are_typed_source_preserving_state() {
 }
 
 #[test]
-fn disabled_color_clamping_is_neutral_but_effective_clamps_stop_draws() {
+fn vertex_color_clamping_is_inert_without_legacy_colors_but_fragment_saturate_is_not() {
     let target_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
     let target = map_resource(
@@ -3282,7 +3326,7 @@ fn disabled_color_clamping_is_neutral_but_effective_clamps_stop_draws() {
     program_three_d(&mut channel, 0x2600, 1);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellLoweringError::UnsupportedColorClampSemantics)
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x2600, 0);
@@ -5871,4 +5915,97 @@ fn graphics_pipeline_family_is_reused_across_effective_blend_state() {
         creation,
         nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
     )));
+}
+
+#[test]
+fn post_ps_initial_coverage_requires_consumed_mask_changes_and_never_blocks_clear() {
+    let mut channel = three_d_channel();
+    program_three_d(&mut channel, 0x121c, 0);
+    let resources =
+        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
+    let mut cache = MaxwellLoweringCache::default();
+
+    program_three_d(&mut channel, 0x1138, 0);
+    let source = channel
+        .three_d()
+        .coverage()
+        .post_ps_initial_coverage()
+        .source()
+        .unwrap();
+    assert!(matches!(
+        lower_maxwell_three_d_operation(
+            channel.three_d(),
+            &resources,
+            MaxwellThreeDOperationTrigger::DrawVertexArray {
+                source,
+                vertex_count: 3,
+            },
+            None,
+            FrontendSubmissionId::new(19),
+            Vec::new(),
+            &lowering_capabilities(BackendFeatures::empty()),
+            &mut cache,
+        ),
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
+    ));
+
+    program_three_d(&mut channel, 0x1138, 1);
+    let source = channel
+        .three_d()
+        .coverage()
+        .post_ps_initial_coverage()
+        .source()
+        .unwrap();
+    assert!(matches!(
+        lower_maxwell_three_d_operation(
+            channel.three_d(),
+            &resources,
+            MaxwellThreeDOperationTrigger::DrawVertexArray {
+                source,
+                vertex_count: 3,
+            },
+            None,
+            FrontendSubmissionId::new(20),
+            Vec::new(),
+            &lowering_capabilities(BackendFeatures::empty()),
+            &mut cache,
+        ),
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
+    ));
+
+    program_three_d(&mut channel, 0x12ec, 1);
+    assert!(matches!(
+        lower_maxwell_three_d_operation(
+            channel.three_d(),
+            &resources,
+            MaxwellThreeDOperationTrigger::DrawVertexArray {
+                source,
+                vertex_count: 3
+            },
+            None,
+            FrontendSubmissionId::new(20),
+            Vec::new(),
+            &lowering_capabilities(BackendFeatures::empty()),
+            &mut cache,
+        ),
+        Err(MaxwellLoweringError::UnsupportedPostPsInitialCoverageSemantics)
+    ));
+
+    let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
+    let triggered = &dispatch.operations()[0];
+    assert!(matches!(
+        lower_maxwell_three_d_operation(
+            triggered.state(),
+            &resources,
+            triggered.trigger(),
+            None,
+            FrontendSubmissionId::new(21),
+            Vec::new(),
+            &lowering_capabilities(BackendFeatures::empty()),
+            &mut cache,
+        ),
+        Err(MaxwellLoweringError::IncompleteClear(
+            "horizontal rectangle"
+        ))
+    ));
 }

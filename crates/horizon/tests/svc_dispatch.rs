@@ -2018,7 +2018,7 @@ fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
 #[test]
 fn vi_layer_commands_return_complete_native_window_parcels() {
     let mut instructions = vec![svc(0x1f)];
-    instructions.extend([svc(0x21); 8]);
+    instructions.extend([svc(0x21); 12]);
     let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::default();
     let buffer = process.main_thread().stack_bottom;
@@ -2078,6 +2078,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
 
     let mut layer_id = 0;
     let mut binder_id = 0;
+    let mut opened_layer = None;
     for (handle, command) in [(application, 2030), (application, 2020), (manager, 2012)] {
         let mut request = [0_u8; 0x100];
         put_u32(&mut request, 0, 4 | (1 << 24));
@@ -2124,6 +2125,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
         assert!(returned_id > 0);
         if command == 2020 {
             assert_eq!(returned_id, binder_id);
+            opened_layer = Some((layer_id, binder_id, request));
         } else {
             assert_ne!(returned_id, binder_id);
             binder_id = returned_id;
@@ -2132,6 +2134,50 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
         assert_eq!(&parcel[56..60], &0_u32.to_le_bytes());
         assert!(parcel[60..].iter().all(|byte| *byte == 0xa5));
     }
+
+    let (layer_id, binder_id, reopen) = opened_layer.unwrap();
+    let mut close = [0_u8; 0x100];
+    put_u32(&mut close, 0, 4);
+    put_u32(&mut close, 4, 12);
+    put_u32(&mut close, 16, 0x4943_4653);
+    put_u32(&mut close, 24, 2021);
+    put_u64(&mut close, 32, layer_id);
+    write_guest_bytes(&process, tls, &close);
+    state(&mut process).write_w(x(0), application);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    write_guest_bytes(&process, tls, &reopen);
+    state(&mut process).write_w(x(0), application);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    assert_eq!(
+        read_guest_u32(&process, buffer.checked_add(24).unwrap()),
+        binder_id as u32
+    );
+
+    put_u32(&mut close, 24, 2031);
+    write_guest_bytes(&process, tls, &close);
+    state(&mut process).write_w(x(0), application);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    write_guest_bytes(&process, tls, &reopen);
+    state(&mut process).write_w(x(0), application);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_ne!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
 }
 
 #[test]
@@ -2417,6 +2463,112 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
 }
 
 #[test]
+fn infrared_initialization_exposes_disconnected_read_only_cameras() {
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 12));
+    let (_directory, mut process) = fixture_process(&instructions);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..35].copy_from_slice(b"irs");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let irs = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    for (command, pid, aruid, expected) in [
+        (302, false, 1, HorizonIpcResult::CMIF_INVALID_IN_HEADER),
+        (302, true, 2, HorizonIpcResult::SF_PRECONDITION_VIOLATION),
+        (302, true, 1, HorizonIpcResult::SUCCESS),
+        (304, true, 1, HorizonIpcResult::SUCCESS),
+        (303, true, 1, HorizonIpcResult::SUCCESS),
+    ] {
+        let mut request = register;
+        if pid {
+            put_u32(&mut request, 40, command);
+            put_u64(&mut request, 48, aruid);
+        } else {
+            request = get_service;
+            put_u32(&mut request, 24, command);
+            put_u64(&mut request, 32, aruid);
+        }
+        write_guest_bytes(&process, tls, &request);
+        state(&mut process).write_w(x(0), irs);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            expected.raw()
+        );
+        if command == 304 {
+            let handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+            let shared = process
+                .handles()
+                .get_as::<SharedMemoryObject>(handle)
+                .unwrap();
+            assert_eq!(shared.size(), 0x8000);
+            assert_eq!(shared.remote_permissions(), MemoryPermissions::READ);
+            let mut status = [0; 4];
+            shared.read(0, &mut status).unwrap();
+            assert_eq!(u32::from_le_bytes(status), 2);
+        }
+    }
+    for (npad, camera) in [(0, Some(0)), (7, Some(7)), (0x20, Some(8)), (0xff, None)] {
+        let mut request = get_service;
+        put_u32(&mut request, 24, 311);
+        put_u32(&mut request, 32, npad);
+        write_guest_bytes(&process, tls, &request);
+        state(&mut process).write_w(x(0), irs);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        let expected = if camera.is_some() {
+            HorizonIpcResult::SUCCESS
+        } else {
+            HorizonIpcResult::HID_INVALID_NPAD_ID
+        };
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            expected.raw()
+        );
+        if let Some(camera) = camera {
+            assert_eq!(
+                read_guest_u32(&process, tls.checked_add(32).unwrap()),
+                camera
+            );
+        }
+    }
+}
+
+#[test]
 fn hid_activation_and_style_event_wire_contracts() {
     let mut instructions = vec![svc(0x1f)];
     instructions.extend(std::iter::repeat_n(svc(0x21), 32));
@@ -2458,6 +2610,33 @@ fn hid_activation_and_style_event_wire_contracts() {
         ExceptionHandlingResult::Resumed
     );
     let hid_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+
+    for command in [21, 31] {
+        let mut activate = register;
+        put_u32(&mut activate, 40, command);
+        put_u64(&mut activate, 48, 1);
+        activate[56] = 0xa5; // Plain CMIF alignment slack is not semantic input.
+        for _ in 0..2 {
+            write_guest_bytes(&process, tls, &activate);
+            state(&mut process).write_w(x(0), hid_handle);
+            assert_eq!(
+                dispatch_next(&mut process, &mut dispatcher),
+                ExceptionHandlingResult::Resumed
+            );
+            assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+        }
+        put_u32(&mut activate, 4, 8 | (1 << 31));
+        write_guest_bytes(&process, tls, &activate);
+        state(&mut process).write_w(x(0), hid_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+        );
+    }
 
     let activate_npad = register;
     for revision in 0..=3 {
@@ -2720,7 +2899,7 @@ fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation()
 #[test]
 fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut instructions = vec![svc(0x1f)];
-    instructions.extend(std::iter::repeat_n(svc(0x21), 52));
+    instructions.extend(std::iter::repeat_n(svc(0x21), 58));
     instructions.extend([svc(0x13), svc(0x14), svc(0x21)]);
     let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::new(
@@ -3158,6 +3337,49 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let common_state_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
     assert_eq!(common_state_object_id, 8);
 
+    let mut boost = get_common_state;
+    put_u32(&mut boost, 4, 11);
+    boost[18..20].copy_from_slice(&20_u16.to_le_bytes());
+    put_u32(&mut boost, 20, common_state_object_id);
+    put_u32(&mut boost, 40, 66);
+    for (mode, result) in [
+        (1, HorizonIpcResult::SUCCESS),
+        (2, HorizonIpcResult::SF_PRECONDITION_VIOLATION),
+        (0, HorizonIpcResult::SUCCESS),
+    ] {
+        put_u32(&mut boost, 48, mode);
+        write_guest_bytes(&process, tls, &boost);
+        state(&mut process).write_w(x(0), applet_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(40).unwrap()),
+            result.raw()
+        );
+    }
+    for command in [66, 67] {
+        let mut request = get_common_state;
+        put_u32(&mut request, 20, common_state_object_id);
+        put_u32(&mut request, 40, command);
+        write_guest_bytes(&process, tls, &request);
+        state(&mut process).write_w(x(0), applet_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        let expected = if command == 66 {
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER
+        } else {
+            HorizonIpcResult::SUCCESS
+        };
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(40).unwrap()),
+            expected.raw()
+        );
+    }
+
     let mut get_message_event = [0_u8; 0x100];
     put_u32(&mut get_message_event, 0, 4);
     put_u32(&mut get_message_event, 4, 10);
@@ -3232,6 +3454,18 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         read_guest_u32(&process, tls.checked_add(48).unwrap()) & 0xff,
         u32::from(OperationMode::Console as u8)
     );
+
+    let mut get_resolution = get_operation_mode;
+    put_u32(&mut get_resolution, 40, 60);
+    write_guest_bytes(&process, tls, &get_resolution);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    assert_eq!(read_guest_u32(&process, tls.checked_add(48).unwrap()), 1920);
+    assert_eq!(read_guest_u32(&process, tls.checked_add(52).unwrap()), 1080);
 
     let mut get_application_functions = get_common_state;
     put_u32(&mut get_application_functions, 40, 20);
@@ -3390,7 +3624,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     );
     assert_eq!(
         read_guest_u32(&process, tls.checked_add(40).unwrap()),
-        HorizonIpcResult::AM_NO_MESSAGES.raw()
+        HorizonIpcResult::AM_NO_DATA_IN_CHANNEL.raw()
     );
 
     let mut set_terminate_result = [0_u8; 0x100];
@@ -4595,6 +4829,12 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
         svc(0x21),
         svc(0x21),
         svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
     ]);
     let mut dispatcher = HorizonSvcDispatcher::default();
     let name = process.main_thread().stack_bottom;
@@ -4670,6 +4910,70 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     assert_eq!(general_service_object, 2);
     assert_eq!(process.handles().len(), handles_before_child);
 
+    let mut request = [0; 0x100];
+    put_u32(&mut request, 0, 4);
+    put_u32(&mut request, 4, 11);
+    request[16] = 1;
+    request[18..20].copy_from_slice(&20_u16.to_le_bytes());
+    put_u32(&mut request, 20, general_service_object);
+    put_u32(&mut request, 32, 0x4943_4653);
+    put_u32(&mut request, 40, 4);
+    put_u32(&mut request, 48, 2);
+    write_guest_bytes(&process, tls, &request);
+    state(&mut process).write_w(x(0), nifm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    let request_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(request_object, 3);
+    request[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut request, 4, 10);
+    put_u32(&mut request, 20, request_object);
+    put_u32(&mut request, 40, 2);
+    write_guest_bytes(&process, tls, &request);
+    state(&mut process).write_w(x(0), nifm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let event = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(
+        !process
+            .handles()
+            .get_as::<nixe_runtime::ReadableEventObject>(event)
+            .unwrap()
+            .is_signalled()
+    );
+    for (command, result) in [
+        (1, 110 | (311 << 9)),
+        (4, 0),
+        (0, 0),
+        (1, 110 | (1111 << 9)),
+    ] {
+        put_u32(&mut request, 40, command);
+        write_guest_bytes(&process, tls, &request);
+        state(&mut process).write_w(x(0), nifm_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(40).unwrap()),
+            result
+        );
+        if command == 0 {
+            assert_eq!(read_guest_u32(&process, tls.checked_add(48).unwrap()), 1);
+        }
+    }
+    assert!(
+        process
+            .handles()
+            .get_as::<nixe_runtime::ReadableEventObject>(event)
+            .unwrap()
+            .is_signalled()
+    );
     let mut close_general_service = [0_u8; 0x100];
     put_u32(&mut close_general_service, 0, 4);
     put_u32(&mut close_general_service, 4, 6);
@@ -4828,7 +5132,7 @@ fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
 #[test]
 fn account_application_info_binds_the_calling_process() {
     let mut instructions = vec![svc(0x1f)];
-    instructions.extend(std::iter::repeat_n(svc(0x21), 10));
+    instructions.extend(std::iter::repeat_n(svc(0x21), 11));
     let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::default();
     let name = process.main_thread().stack_bottom;
@@ -4871,6 +5175,19 @@ fn account_application_info_binds_the_calling_process() {
         process.handles().get_as::<HorizonIpcObject>(account_handle),
         Some(HorizonIpcObject::Account(_))
     ));
+
+    let mut count = [0_u8; 0x100];
+    put_u32(&mut count, 0, 4);
+    put_u32(&mut count, 4, 8);
+    put_u32(&mut count, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &count);
+    state(&mut process).write_w(x(0), account_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
 
     let mut initialize = [0_u8; 0x100];
     put_u32(&mut initialize, 0, 4);
@@ -6337,3 +6654,105 @@ mod account_metadata;
 
 #[path = "svc_dispatch/mutex.rs"]
 mod mutex;
+
+#[test]
+fn vibration_stop_validates_its_device_and_does_not_hide_nonzero_force() {
+    let (_directory, mut process) = fixture_process(&[
+        svc(0x1f),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+    ]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+    let mut register = [0; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let mut get = [0; 0x100];
+    put_u32(&mut get, 0, 4);
+    put_u32(&mut get, 4, 10);
+    put_u32(&mut get, 16, 0x4943_4653);
+    put_u32(&mut get, 24, 1);
+    get[32..35].copy_from_slice(b"hid");
+    write_guest_bytes(&process, tls, &get);
+    state(&mut process).write_w(x(0), sm);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    for (amplitude, reserved, expected) in [
+        (0.0f32, 0, 0),
+        (
+            f32::NAN,
+            0,
+            HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw(),
+        ),
+        (0.0, 1, HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()),
+    ] {
+        let mut message = [0; 0x100];
+        put_u32(&mut message, 0, 4);
+        put_u32(&mut message, 4, 16 | (1 << 31));
+        put_u32(&mut message, 8, 1);
+        put_u32(&mut message, 32, 0x4943_4653);
+        put_u32(&mut message, 40, 201);
+        put_u32(&mut message, 48, 3);
+        put_u32(&mut message, 52, amplitude.to_bits());
+        put_u32(&mut message, 56, 160.0f32.to_bits());
+        put_u32(&mut message, 64, 320.0f32.to_bits());
+        put_u32(&mut message, 68, reserved);
+        put_u64(&mut message, 72, 1);
+        write_guest_bytes(&process, tls, &message);
+        state(&mut process).write_w(x(0), handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(24).unwrap()),
+            expected
+        );
+    }
+    let mut message = [0; 0x100];
+    put_u32(&mut message, 0, 4);
+    put_u32(&mut message, 4, 16 | (1 << 31));
+    put_u32(&mut message, 8, 1);
+    put_u32(&mut message, 32, 0x4943_4653);
+    put_u32(&mut message, 40, 201);
+    put_u32(&mut message, 48, 3);
+    put_u32(&mut message, 52, 0.5f32.to_bits());
+    write_guest_bytes(&process, tls, &message);
+    state(&mut process).write_w(x(0), handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {
+            immediate: 0x21,
+            fault: Box::new(HorizonIpcFault::unsupported_service(
+                UnsupportedServiceOperation::CommandVariant {
+                    service: "hid",
+                    command_id: 201,
+                    detail: "nonzero vibration requires a host actuator backend",
+                }
+            )),
+        })
+    );
+}

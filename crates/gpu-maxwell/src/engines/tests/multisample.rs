@@ -81,9 +81,9 @@ fn program_resolve(channel: &mut MaxwellGpuChannel, src: u64, dst: u64) {
     }
 }
 
-fn launch(channel: &mut MaxwellGpuChannel) -> MaxwellTwoDResolveOperation {
+fn launch(channel: &mut MaxwellGpuChannel) -> MaxwellTwoDBlitOperation {
     let dispatch = two_d_write(channel, 0x08dc, 0).unwrap();
-    let [MaxwellEngineOperation::TwoDResolve(resolve)] = dispatch.ordered_operations() else {
+    let [MaxwellEngineOperation::TwoDBlit(resolve)] = dispatch.ordered_operations() else {
         panic!("one resolve expected")
     };
     *resolve
@@ -136,6 +136,7 @@ fn check_msaa_clear_draw_resolve(compression: Option<u32>, raw: u32, format: Ima
     program_basic_draw_state(&mut channel, vertex.offset().get());
     source_target(&mut channel, src.offset().get(), compression);
     program_three_d(&mut channel, 0x0810, raw);
+    program_three_d(&mut channel, 0x15b8, 1);
     program_resolve(&mut channel, src.offset().get(), dst.offset().get());
     two_d_write(&mut channel, 0x0230, raw).unwrap();
     two_d_write(&mut channel, 0x0200, raw).unwrap();
@@ -151,8 +152,8 @@ fn check_msaa_clear_draw_resolve(compression: Option<u32>, raw: u32, format: Ima
         .unwrap();
     assert!(Arc::ptr_eq(&resources, &cached));
     assert!(matches!(
-        cache.lower_color_resolve(&resources, FrontendSubmissionId::new(1), vec![]),
-        Err(MaxwellLoweringError::ResolveSourceNotResident)
+        cache.lower_color_blit(&request, &resources, FrontendSubmissionId::new(1), vec![]),
+        Err(MaxwellLoweringError::BlitSourceNotResident)
     ));
 
     let clear = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -231,7 +232,12 @@ fn check_msaa_clear_draw_resolve(compression: Option<u32>, raw: u32, format: Ima
             .resolve_color_images(&request, &address_space, 16)
             .unwrap();
         let work = cache
-            .lower_color_resolve(&resources, FrontendSubmissionId::new(serial), vec![])
+            .lower_color_blit(
+                &request,
+                &resources,
+                FrontendSubmissionId::new(serial),
+                vec![],
+            )
             .unwrap();
         let resolve = work
             .submission()
@@ -260,8 +266,8 @@ fn check_msaa_clear_draw_resolve(compression: Option<u32>, raw: u32, format: Ima
         .resolve_color_images(&request, &address_space, 16)
         .unwrap();
     assert!(matches!(
-        cache.lower_color_resolve(&resources, FrontendSubmissionId::new(5), vec![]),
-        Err(MaxwellLoweringError::ResolveSourceNotResident)
+        cache.lower_color_blit(&request, &resources, FrontendSubmissionId::new(5), vec![]),
+        Err(MaxwellLoweringError::BlitSourceNotResident)
     ));
     assert!(!Arc::ptr_eq(&cached, &resources));
     address_space.unmap(src.offset()).unwrap();

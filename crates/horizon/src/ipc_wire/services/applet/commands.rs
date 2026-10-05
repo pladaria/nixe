@@ -108,6 +108,9 @@ command_enum!(CommonStateGetterCommand {
     5 => GetOperationMode,
     6 => GetPerformanceMode,
     9 => GetCurrentFocusState,
+    60 => GetDefaultDisplayResolution,
+    66 => SetCpuBoostMode,
+    67 => CancelCpuBoostMode,
     900 => SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled,
 });
 
@@ -148,8 +151,11 @@ command_enum!(LibraryAppletCreatorCommand {
 
 command_enum!(LibraryAppletAccessorCommand {
     0 => GetAppletStateChangedEvent,
+    1 => CheckFinished,
     10 => Start,
+    30 => GetResult,
     100 => PushInData,
+    101 => PopOutData,
 });
 
 command_enum!(StorageCommand { 0 => Open });

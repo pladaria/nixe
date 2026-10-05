@@ -1180,6 +1180,7 @@ fn check_chain(
         creations.clear();
         let resident = runtime
             .acquire_presentable_image(PresentationImageRequest {
+                allow_canonical_import: true,
                 cpu_writes: CanonicalCpuWriteDependency::capture(backing.range()).unwrap(),
                 backing: backing.clone(),
                 width: SIZE,

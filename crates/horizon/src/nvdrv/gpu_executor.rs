@@ -53,6 +53,7 @@ impl Display for GpuExecutorFailure {
 impl std::error::Error for GpuExecutorFailure {}
 
 struct GpuWork {
+    clock: nixe_runtime::VirtualClock,
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
     execution: Option<GpuWorkExecution>,
@@ -394,7 +395,11 @@ impl NvDrvGpuExecutor {
         }
     }
 
-    pub(super) fn enqueue(&self, submission: GpuSubmission) -> Result<(), GpuExecutorFailure> {
+    pub(super) fn enqueue(
+        &self,
+        submission: GpuSubmission,
+        clock: &nixe_runtime::VirtualClock,
+    ) -> Result<(), GpuExecutorFailure> {
         let GpuSubmission {
             descriptor,
             request,
@@ -413,6 +418,7 @@ impl NvDrvGpuExecutor {
         // admission, so another ioctl cannot lower past this submission.
         self.require_healthy()?;
         let work = GpuWork {
+            clock: clock.clone(),
             descriptor,
             request,
             execution: Some(GpuWorkExecution::Prepared(execution)),
@@ -757,11 +763,13 @@ fn start_ready_work(
                 break;
             }
             let expected = plan.completion();
-            let completed = execute_maxwell_software_initialization(plan).map_err(|error| {
-                GpuExecutorFailure {
-                    frontend,
-                    detail: error.to_string().into(),
-                }
+            let completed = execute_maxwell_software_initialization(
+                plan,
+                nixe_gpu_maxwell::maxwell_gpu_timestamp(work.clock.scheduler_time_ns()),
+            )
+            .map_err(|error| GpuExecutorFailure {
+                frontend,
+                detail: error.to_string().into(),
             })?;
             publish_guest_completion(work, completed, expected)?;
         }
@@ -782,7 +790,9 @@ fn advance_backend_work(
     };
     let frontend = execution.frontend();
     match execution
-        .next_segment()
+        .next_segment(nixe_gpu_maxwell::maxwell_gpu_timestamp(
+            work.clock.scheduler_time_ns(),
+        ))
         .map_err(|error| GpuExecutorFailure {
             frontend,
             detail: error.to_string().into(),

@@ -342,3 +342,250 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         ));
     }
 }
+
+#[test]
+fn compressed_uploads_retain_prior_stripes_and_require_complete_coverage() {
+    use super::super::threed::{
+        MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
+        resolve_maxwell_three_d_resources_for_roles,
+    };
+    use super::super::twod::blit::{
+        BlitKind, BlitSurface, BlitSurfaceLayout, MaxwellTwoDBlitOperation,
+    };
+    let mut space =
+        MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+    space
+        .initialize(MaxwellAddressSpaceInitialization::default())
+        .unwrap();
+    let upload = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let pixels = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let metadata = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let src = map(&mut space, &upload, 1, 0);
+    let dst = map(&mut space, &pixels, 2, 0xdb);
+    let descriptors = map(&mut space, &metadata, 3, 0xfe);
+    tic(&metadata, dst, 8, 0x58d2_4908);
+    // Match the synthetic 8x8 destination rather than the helper's 32 rows.
+    metadata
+        .write(5 * 4, &(7_u32 | (1 << 31)).to_le_bytes())
+        .unwrap();
+    let mut channel = three_d_channel();
+    for (method, value) in [
+        (0x1574, (descriptors >> 32) as u32),
+        (0x1578, descriptors as u32),
+        (0x157c, 0),
+        (0x2380, 4),
+        (0x2384, (descriptors >> 32) as u32),
+        (0x2388, (descriptors + 0x100) as u32),
+        (0x2490, 1),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let sampled = MaxwellThreeDResourceRole::SampledImage {
+        texture: MaxwellThreeDTextureReference::new(4, 0, 0),
+        dimension: MaxwellThreeDTextureDimension::Two,
+    };
+    let textures =
+        resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &space, &[sampled]).unwrap();
+    let texture_index = resource_index(&textures, sampled).unwrap();
+    for stripe_height in [3, 4] {
+        let mut cache = MaxwellLoweringCache::default();
+        let mut resident = None;
+        for (serial, y) in [(1, 0), (2, 4)] {
+            let request = MaxwellTwoDBlitOperation {
+                source: channel
+                    .three_d()
+                    .shader_bindings()
+                    .texture_headers()
+                    .maximum_index()
+                    .source()
+                    .unwrap(),
+                images: [
+                    BlitSurface {
+                        address: src,
+                        width: 8,
+                        height: 4,
+                        format: 0xd5,
+                        layout: BlitSurfaceLayout::Pitch(48),
+                    },
+                    BlitSurface {
+                        address: dst,
+                        width: 8,
+                        height: 8,
+                        format: 0xd5,
+                        layout: BlitSurfaceLayout::BlockLinear(0),
+                    },
+                ],
+                destination_compression: true,
+                kind: BlitKind::Copy {
+                    origins: [
+                        ImageOrigin { x: 0, y: 0, z: 0 },
+                        ImageOrigin { x: 0, y, z: 0 },
+                    ],
+                    extent: nixe_gpu::ImageExtent {
+                        width: 8,
+                        height: stripe_height,
+                        depth: 1,
+                    },
+                },
+            };
+            let resources = cache
+                .resolved_resources_mut()
+                .resolve_color_images(&request, &space, 16)
+                .unwrap();
+            let source = resolved_image(&resources, 0).unwrap();
+            assert!(matches!(
+                source.view().bindings()[0].layout(),
+                nixe_gpu::ImageMemoryLayout::PitchLinear { row_pitch: 48, .. }
+            ));
+            let work = cache
+                .lower_color_blit(
+                    &request,
+                    &resources,
+                    FrontendSubmissionId::new(serial),
+                    vec![],
+                )
+                .unwrap();
+            let copy = work
+                .submission()
+                .operations()
+                .iter()
+                .find_map(|op| match op.command() {
+                    GpuCommand::Copy(nixe_gpu::CopyOperation::ImageToImage {
+                        destination, ..
+                    }) => Some(destination),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(copy.origin.y, y);
+            if let Some(id) = resident {
+                assert_eq!(copy.image, id);
+                assert!(work.resource_creations().is_empty());
+            } else {
+                resident = Some(copy.image);
+            }
+            let mut creations = Vec::new();
+            let mut invalidations = Vec::new();
+            let result = prepare_resources(
+                &textures,
+                &[texture_index],
+                &mut cache,
+                &mut creations,
+                &mut invalidations,
+            );
+            if y == 0 || stripe_height == 3 {
+                assert!(matches!(
+                    result,
+                    Err(MaxwellLoweringError::CompressedSampledImageImportRequired { .. })
+                ));
+            } else {
+                assert_eq!(
+                    result.unwrap()[texture_index],
+                    resident.map(ResourceDependency::Image)
+                );
+            }
+            assert!(creations.is_empty());
+            assert!(invalidations.is_empty());
+        }
+        if stripe_height == 3 {
+            // The two transfers leave rows 3 and 7 unwritten. Inline uploads
+            // must complete coverage on the existing image, without recreating it.
+            for (serial, offset, row) in [(3, 80, 3), (4, 208, 7)] {
+                let target = space
+                    .resolve_range(
+                        space.address(dst + offset).unwrap(),
+                        4,
+                        MemoryPermissions::WRITE,
+                    )
+                    .unwrap();
+                let (_, mut region) = cache.inline_image_word(&target, None).unwrap().unwrap();
+                assert_eq!(region.origin, ImageOrigin { x: 0, y: row, z: 0 });
+                region.extent.width = 8;
+                let work = cache
+                    .lower_inline_images(
+                        vec![(region, vec![0x55; 32])],
+                        FrontendSubmissionId::new(serial),
+                        vec![],
+                    )
+                    .unwrap();
+                assert!(work.resource_creations().is_empty());
+                let result = prepare_resources(
+                    &textures,
+                    &[texture_index],
+                    &mut cache,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                assert_eq!(result.is_ok(), row == 7);
+            }
+        }
+        let target = space
+            .resolve_range(
+                space.address(dst + 152).unwrap(),
+                4,
+                MemoryPermissions::WRITE,
+            )
+            .unwrap();
+        let (hint, region) = cache.inline_image_word(&target, None).unwrap().unwrap();
+        assert_eq!(region.image, resident.unwrap());
+        assert_eq!(region.origin, ImageOrigin { x: 2, y: 5, z: 0 });
+        assert_eq!(
+            cache
+                .inline_image_word(&target, Some(hint))
+                .unwrap()
+                .unwrap()
+                .1,
+            region
+        );
+        let work = cache
+            .lower_inline_images(
+                vec![(region, vec![1, 2, 3, 4])],
+                FrontendSubmissionId::new(5),
+                vec![],
+            )
+            .unwrap();
+        assert!(work.resource_creations().is_empty());
+        assert!(work.submission().operations().iter().any(|operation| matches!(operation.command(), GpuCommand::UploadImage { destination, bytes } if *destination == region && bytes.as_ref() == [1, 2, 3, 4])));
+        assert!(
+            prepare_resources(
+                &textures,
+                &[texture_index],
+                &mut cache,
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .is_ok()
+        );
+        pixels.write(0, &[1]).unwrap();
+        let textures =
+            resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &space, &[sampled])
+                .unwrap();
+        assert!(
+            prepare_resources(
+                &textures,
+                &[texture_index],
+                &mut cache,
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn inline_image_offsets_preserve_gob_coordinates_and_block_rows() {
+    for (offset, expected) in [
+        (0, (0, 0)),
+        (16, (0, 1)),
+        (32, (16, 0)),
+        (64, (0, 2)),
+        (256, (32, 0)),
+        (512, (64, 0)),
+        (1024, (0, 8)),
+    ] {
+        assert_eq!(inline_block_linear_position(offset, 32, 0), expected);
+    }
+    assert_eq!(inline_block_linear_position(512, 32, 4), (0, 8));
+    assert_eq!(inline_block_linear_position(8192, 32, 4), (64, 0));
+    assert_eq!(inline_block_linear_position(16384, 32, 4), (0, 128));
+}

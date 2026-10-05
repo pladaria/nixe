@@ -2093,6 +2093,64 @@ fn a64_scalar_float_to_integer_converts_all_switch1_width_combinations() {
 }
 
 #[test]
+fn a64_scalar_fixed_integer_to_float_scales_once_and_preserves_fp_status() {
+    let profile = TargetPlatform::Switch1;
+    for (word, value, expected) in [
+        (
+            0x1e43_8020,
+            0xe6e4_0fce,
+            (f64::from(0xe6e4_0fce_u32) / 4294967296.0).to_bits(),
+        ),
+        (0x1e42_8020, 0xffff_ffff_8000_0000, (-0.5_f64).to_bits()),
+        (0x9e43_0020, 1, 2.0_f64.powi(-64).to_bits()),
+        (0x9e42_0020, 1 << 63, (-0.5_f64).to_bits()),
+        (0x1e03_c020, 3 << 16, u64::from(3.0_f32.to_bits())),
+        (0x9e02_0020, 1, u64::from(2.0_f32.powi(-64).to_bits())),
+    ] {
+        let mut state = A64State::default();
+        state.write_x(x(1), value);
+        state.set_vector(0, u128::MAX);
+        state.set_fpsr(1 << 27);
+        assert_eq!(
+            execute_one(&profile, &mut state, word).unwrap(),
+            InstructionStep::Continue
+        );
+        assert_eq!(state.vector(0), Some(u128::from(expected)), "{word:08x}");
+        assert_eq!(state.fpsr(), 1 << 27);
+    }
+    // 16777217 / 2^32 rounds once to S, with the directed FPCR modes.
+    for (mode, expected) in [
+        (0, 0x3b80_0000),
+        (1, 0x3b80_0001),
+        (2, 0x3b80_0000),
+        (3, 0x3b80_0000),
+    ] {
+        let mut state = A64State::default();
+        state.write_x(x(1), (1 << 24) + 1);
+        state.set_fpcr(mode << 22);
+        execute_one(&profile, &mut state, 0x1e03_8020).unwrap();
+        assert_eq!(state.vector(0), Some(expected));
+        assert_eq!(state.fpsr(), 1 << 4);
+    }
+    let mut state = A64State::default();
+    state.write_x(x(1), (1 << 24) + 1);
+    state.set_fpcr(1 << 12);
+    state.set_vector(0, u128::MAX);
+    assert_floating_point_exception(execute_one(&profile, &mut state, 0x1e03_8020).unwrap());
+    assert_eq!(state.vector(0), Some(u128::MAX));
+    assert_eq!(state.pc(), 0);
+    // W sources cannot encode more than 32 fractional bits.
+    assert!(!matches!(
+        nixe_cpu::decode::decode(
+            profile,
+            source(profile, 0),
+            nixe_cpu::location::InstructionEncoding::from_u32(0x1e43_7c20)
+        ),
+        nixe_cpu::decode::DecodeResult::Decoded(_)
+    ));
+}
+
+#[test]
 fn a64_scalar_fixed_point_float_to_integer_converts_the_complete_scalar_family() {
     let profile = TargetPlatform::Switch1;
     let captured = 0x1e19_e027; // FCVTZU W7,S1,#8

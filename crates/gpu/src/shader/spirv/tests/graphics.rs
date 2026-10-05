@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn negative_one_to_one_depth_conversion_occurs_after_guest_position_exports() {
+    let ir = shader(
+        ShaderStage::Vertex,
+        vec![],
+        (0..4)
+            .map(|component| {
+                interface(
+                    ShaderIoLocation::Position,
+                    component,
+                    ShaderScalarType::Float32,
+                )
+            })
+            .collect(),
+        vec![],
+        vec![
+            immediate(0, 0.0_f32.to_bits()),
+            immediate(1, 0.0_f32.to_bits()),
+            immediate(2, (-0.5_f32).to_bits()),
+            immediate(3, 1.0_f32.to_bits()),
+            ShaderOperation::StoreOutput {
+                sources: (0..4).map(ShaderRegister).collect::<Vec<_>>().into(),
+                location: ShaderIoLocation::Position,
+                first_component: 0,
+                scalar_type: ShaderScalarType::Float32,
+            },
+            ShaderOperation::Exit,
+        ],
+    );
+    let unconverted = module(&ir, graphics_options());
+    assert!(ops(&unconverted, spv::Op::FAdd).is_empty());
+    let converted = module(
+        &ir,
+        SpirvShaderOptions {
+            depth_clip_negative_one_to_one: true,
+            ..graphics_options()
+        },
+    );
+    assert_eq!(ops(&converted, spv::Op::FMul).len(), 2);
+    assert_eq!(ops(&converted, spv::Op::FAdd).len(), 1);
+    let operations = &converted.functions[0].blocks[0].instructions;
+    let first_conversion = operations
+        .iter()
+        .position(|op| op.class.opcode == spv::Op::FMul)
+        .unwrap();
+    assert_eq!(
+        operations[..first_conversion]
+            .iter()
+            .filter(|op| op.class.opcode == spv::Op::Store)
+            .count(),
+        4
+    );
+    assert_eq!(
+        operations[first_conversion..]
+            .iter()
+            .filter(|op| op.class.opcode == spv::Op::Store)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn add_carry_spirv_snapshots_both_inputs_and_keeps_a_live_carry_only_definition() {
     let ir = shader(
         ShaderStage::Vertex,
@@ -369,4 +430,34 @@ pub(super) fn validation_fixtures() -> Vec<(String, SpirvShaderModule)> {
         )
     })
     .collect()
+}
+
+#[test]
+fn vertex_point_size_is_a_float_scalar_builtin_output() {
+    let ir = shader(
+        ShaderStage::Vertex,
+        vec![],
+        vec![interface(
+            ShaderIoLocation::PointSize,
+            0,
+            ShaderScalarType::Float32,
+        )],
+        vec![],
+        vec![
+            immediate(0, 2.5_f32.to_bits()),
+            output(0, ShaderIoLocation::PointSize, ShaderScalarType::Float32),
+            ShaderOperation::Exit,
+        ],
+    );
+    let module = module(&ir, graphics_options());
+    assert!(ops(&module, spv::Op::Decorate).iter().any(|op| {
+        op.operands
+            .contains(&Operand::BuiltIn(spv::BuiltIn::PointSize))
+    }));
+    assert_eq!(
+        evaluate_shader_ir(&ir, &ShaderEvaluationInputs::default(), 16)
+            .unwrap()
+            .output_bits(ShaderIoLocation::PointSize, 0),
+        Some(2.5_f32.to_bits())
+    );
 }

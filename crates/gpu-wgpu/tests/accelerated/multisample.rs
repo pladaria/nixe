@@ -393,6 +393,7 @@ fn color_depth_resolve(
                 let resident = runtime
                     .runtime()
                     .acquire_presentable_image(PresentationImageRequest {
+                        allow_canonical_import: true,
                         cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(
                             output_backing.range(),
                         )

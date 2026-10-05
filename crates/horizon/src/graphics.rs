@@ -1,6 +1,6 @@
 //! Switch display-service state shared by VI, Binder, and nvdrv sessions.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -133,11 +133,16 @@ pub enum ViObjectKind {
 pub struct ViSession {
     kind: ViObjectKind,
     video: VideoSystem,
+    opened_layers: Arc<Mutex<BTreeSet<u64>>>,
 }
 
 impl ViSession {
     pub(crate) fn new(kind: ViObjectKind, video: VideoSystem) -> Self {
-        Self { kind, video }
+        Self {
+            kind,
+            video,
+            opened_layers: Arc::new(Mutex::new(BTreeSet::new())),
+        }
     }
 
     pub(crate) const fn kind(&self) -> ViObjectKind {
@@ -146,6 +151,43 @@ impl ViSession {
 
     pub(crate) fn video(&self) -> &VideoSystem {
         &self.video
+    }
+
+    pub(crate) fn open_layer(&self, layer_id: u64) -> Option<LayerState> {
+        let layer = self.video.layer(layer_id)?;
+        self.opened_layers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(layer_id)
+            .then_some(layer)
+    }
+
+    // Close the application connection, not the AM/manager-owned layer.
+    // The Binder producer retains its identity across a resolution change.
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/vi/application_display_service.cpp
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/vi/container.cpp
+    pub(crate) fn close_layer(&self, layer_id: u64) -> bool {
+        if !self
+            .opened_layers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&layer_id)
+        {
+            return false;
+        }
+        let mut state = self
+            .video
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(layer) = state.layers.get(&layer_id) else {
+            return false;
+        };
+        let binder_id = layer.binder_id;
+        state
+            .pending_frames
+            .retain(|pending| pending.binder_id != binder_id);
+        true
     }
 }
 
@@ -1316,7 +1358,9 @@ fn validate_present_descriptor(
         || plane.block_height_log2 > 5
         || buffer.stride_pixels < plane.width
         || plane.pitch < plane.width.saturating_mul(bytes_per_pixel)
-        || (plane.layout == 3 && (!plane.pitch.is_multiple_of(64) || plane.kind != 0xfe))
+        || (plane.layout == 3
+            && (!plane.pitch.is_multiple_of(64)
+                || !(plane.kind == 0xfe || (plane.kind == 0xdb && bytes_per_pixel == 4))))
         || (plane.layout != 1 && plane.layout != 3)
         || required_size.is_none_or(|required| required > plane.size)
     {
@@ -1388,6 +1432,18 @@ fn presentable_image_request(
     object: &NvMapObject,
 ) -> Result<PresentationImageRequest, FramebufferError> {
     let plane = buffer.primary_plane();
+    // C32_2CRA may be scanned out from its rendered representation. Its plane
+    // size includes compression metadata/alignment, outside the texel footprint.
+    // Never reinterpret those opaque bytes as an ordinary block-linear import.
+    // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.95.05/src/common/inc/swref/published/maxwell/gm107/dev_mmu.h#L99
+    let allow_canonical_import = plane.kind != 0xdb;
+    let pixel_size = if allow_canonical_import {
+        plane.size
+    } else {
+        required_present_plane_size(plane, 4).ok_or(FramebufferError::Malformed(
+            "queued image storage size overflows",
+        ))?
+    };
     let format = match present_format(buffer, plane)? {
         PresentFormat::Rgba8 => PresentationImageFormat::Rgba8,
         PresentFormat::Rgbx8 => PresentationImageFormat::Rgbx8,
@@ -1398,7 +1454,7 @@ fn presentable_image_request(
     let layout = if plane.layout == 1 {
         ImageMemoryLayout::PitchLinear {
             row_pitch: u64::from(plane.pitch),
-            layer_stride: plane.size,
+            layer_stride: pixel_size,
         }
     } else {
         ImageMemoryLayout::BlockLinear(BlockLinearLayout {
@@ -1406,7 +1462,7 @@ fn presentable_image_request(
             block_height_log2: u8::try_from(plane.block_height_log2)
                 .expect("validated block height fits u8"),
             block_depth_log2: 0,
-            layer_stride: plane.size,
+            layer_stride: pixel_size,
         })
     };
     let backing = object
@@ -1414,7 +1470,7 @@ fn presentable_image_request(
         .ok_or(FramebufferError::Malformed(
             "queued graphic buffer has no canonical storage",
         ))?
-        .snapshot_subrange(u64::from(plane.offset), plane.size)
+        .snapshot_subrange(u64::from(plane.offset), pixel_size)
         .map_err(|_| FramebufferError::Malformed("queued image plane range is invalid"))?;
     let allocation = GpuAllocationDescription::new(
         u64::from(object.size()),
@@ -1436,6 +1492,7 @@ fn presentable_image_request(
     let cpu_writes =
         CanonicalCpuWriteDependency::capture(backing.range()).map_err(FramebufferError::Memory)?;
     Ok(PresentationImageRequest {
+        allow_canonical_import,
         backing,
         width: plane.width,
         height: plane.height,
@@ -1623,7 +1680,7 @@ mod tests {
                 MemoryMappingPurpose::Normal,
             )
             .unwrap();
-        nvdrv.initialize();
+        nvdrv.initialize(0);
         let fd = nvdrv.open(b"/dev/nvmap", 44).unwrap();
         let mut create = [0_u8; 8];
         create[..4].copy_from_slice(&0x1000_u32.to_le_bytes());
@@ -1851,6 +1908,33 @@ mod tests {
     }
 
     #[test]
+    fn compressed_scanout_requires_a_resident_image_and_excludes_metadata_padding() {
+        let (video, _, mut buffer) = video_with_rgba_nvmap();
+        buffer.planes[0].layout = 3;
+        buffer.planes[0].kind = 0xdb;
+        buffer.planes[0].pitch = 64;
+        buffer.planes[0].block_height_log2 = 0;
+        buffer.planes[0].size = 0x1000;
+        let object = video
+            .nvdrv()
+            .nvmap_object_by_id(NvMapExportedId::new(buffer.nvmap_id))
+            .unwrap();
+        validate_present_descriptor(&buffer, None).unwrap();
+        let request = presentable_image_request(&buffer, &object).unwrap();
+        assert!(!request.allow_canonical_import);
+        assert_eq!(request.backing.size(), 512);
+        assert!(matches!(
+            request.layout,
+            ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                layer_stride: 512,
+                ..
+            })
+        ));
+        buffer.planes[0].kind = 0xdc;
+        assert!(validate_present_descriptor(&buffer, None).is_err());
+    }
+
+    #[test]
     fn layers_have_stable_distinct_binder_objects() {
         let video = VideoSystem::default();
         let first = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
@@ -1858,6 +1942,26 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_ne!(first.binder_id, second.binder_id);
         assert_eq!(video.layer(first.id), Some(first));
+    }
+
+    #[test]
+    fn closing_a_vi_connection_preserves_the_managed_layer_and_shared_session_ownership() {
+        let video = VideoSystem::default();
+        let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
+        let session = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
+        let cloned = session.clone();
+        let unrelated = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
+        assert!(!session.close_layer(layer.id));
+        assert_eq!(session.open_layer(layer.id), Some(layer.clone()));
+        assert!(cloned.open_layer(layer.id).is_none());
+        assert!(!unrelated.close_layer(layer.id));
+        assert!(cloned.close_layer(layer.id));
+        assert!(!session.close_layer(layer.id));
+        assert_eq!(video.layer(layer.id), Some(layer.clone()));
+        assert_eq!(session.open_layer(layer.id), Some(layer.clone()));
+        assert!(video.remove_layer(layer.id));
+        assert!(session.open_layer(layer.id).is_none());
+        assert!(!session.close_layer(layer.id));
     }
 
     #[test]
@@ -1884,7 +1988,7 @@ mod tests {
         let video = VideoSystem::default();
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let nvdrv = video.nvdrv();
-        nvdrv.initialize();
+        nvdrv.initialize(0);
         let map_fd = nvdrv.open(b"/dev/nvmap", 1).unwrap();
         let _gpu_fd = nvdrv.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let mut create = [0_u8; 8];

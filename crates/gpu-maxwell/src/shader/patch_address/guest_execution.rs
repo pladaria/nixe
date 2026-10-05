@@ -407,6 +407,7 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
             creations.clear();
             let resident = runtime
                 .acquire_presentable_image(PresentationImageRequest {
+                    allow_canonical_import: true,
                     cpu_writes: CanonicalCpuWriteDependency::capture(target.range()).unwrap(),
                     backing: target.clone(),
                     width: SIZE,

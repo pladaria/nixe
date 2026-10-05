@@ -394,6 +394,10 @@ impl RenderPipelineKey {
             topology: draw.prepared.topology,
             triangle_rasterization: draw.prepared.triangle_rasterization,
             viewport_y_flip: viewport_y_flip(draw.prepared.viewport_transform),
+            depth_clip_negative_one_to_one: draw
+                .prepared
+                .viewport_transform
+                .is_some_and(|t| t.depth_clip_negative_one_to_one()),
             front_face: draw.prepared.front_face,
             cull_mode: draw.prepared.cull_mode,
             alpha_test: draw.prepared.alpha_test,
@@ -417,6 +421,11 @@ impl RenderPipelineKey {
             && self.topology == draw.prepared.topology
             && self.triangle_rasterization == draw.prepared.triangle_rasterization
             && self.viewport_y_flip == viewport_y_flip(draw.prepared.viewport_transform)
+            && self.depth_clip_negative_one_to_one
+                == draw
+                    .prepared
+                    .viewport_transform
+                    .is_some_and(|t| t.depth_clip_negative_one_to_one())
             && self.front_face == draw.prepared.front_face
             && self.cull_mode == draw.prepared.cull_mode
             && self.alpha_test == draw.prepared.alpha_test
@@ -438,6 +447,7 @@ impl RenderPipelineKey {
 
 struct RenderPipelineFingerprintInput<'a> {
     viewport_y_flip: bool,
+    depth_clip_negative_one_to_one: bool,
     front_face: nixe_gpu::FrontFace,
     cull_mode: nixe_gpu::CullMode,
     color_outputs: [nixe_gpu::ColorOutputState; MAX_COLOR_ATTACHMENTS],
@@ -461,6 +471,7 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.topology.hash(state);
         self.triangle_rasterization.hash(state);
         self.viewport_y_flip.hash(state);
+        self.depth_clip_negative_one_to_one.hash(state);
         self.front_face.hash(state);
         self.cull_mode.hash(state);
         self.alpha_test.hash(state);
@@ -502,6 +513,10 @@ fn render_pipeline_fingerprint(
 ) -> u128 {
     nixe_gpu::cache_fingerprint(&RenderPipelineFingerprintInput {
         viewport_y_flip: viewport_y_flip(draw.prepared.viewport_transform),
+        depth_clip_negative_one_to_one: draw
+            .prepared
+            .viewport_transform
+            .is_some_and(|t| t.depth_clip_negative_one_to_one()),
         front_face: draw.prepared.front_face,
         cull_mode: draw.prepared.cull_mode,
         quad_flat,
@@ -552,6 +567,7 @@ impl VertexPipelineLayoutKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RenderPipelineKey {
     viewport_y_flip: bool,
+    depth_clip_negative_one_to_one: bool,
     front_face: nixe_gpu::FrontFace,
     cull_mode: nixe_gpu::CullMode,
     color_outputs: [nixe_gpu::ColorOutputState; MAX_COLOR_ATTACHMENTS],
@@ -1167,7 +1183,7 @@ pub(crate) struct WgpuBackendDriver {
     draw_bind_groups: Vec<Vec<BindGroup>>,
     compute_bind_groups: Vec<BindGroup>,
     draw_pipelines: Vec<PreparedRenderPipeline>,
-    quad_indices: crate::quad_indices::QuadIndices,
+    primitive_indices: crate::primitive_indices::PrimitiveIndices,
     render_attachment_views: Vec<wgpu::TextureView>,
     uploaded_inputs: Vec<UploadMark>,
     upload_epoch: u64,
@@ -1251,7 +1267,7 @@ impl WgpuBackendDriver {
             draw_bind_groups: Vec::new(),
             compute_bind_groups: Vec::new(),
             draw_pipelines: Vec::new(),
-            quad_indices: crate::quad_indices::QuadIndices::default(),
+            primitive_indices: crate::primitive_indices::PrimitiveIndices::default(),
             render_attachment_views: Vec::new(),
             uploaded_inputs: Vec::new(),
             upload_epoch: 0,
@@ -1326,7 +1342,7 @@ impl WgpuBackendDriver {
         self.draw_bind_groups = Vec::new();
         self.compute_bind_groups = Vec::new();
         self.draw_pipelines = Vec::new();
-        self.quad_indices = crate::quad_indices::QuadIndices::default();
+        self.primitive_indices = crate::primitive_indices::PrimitiveIndices::default();
         self.render_attachment_views = Vec::new();
         self.readback_pool_bytes = 0;
         self.resident_resources = 0;
@@ -1797,6 +1813,75 @@ impl WgpuBackendDriver {
         while index < operations.len() {
             match operations[index].command() {
                 GpuCommand::Copy(copy) => self.encode_copy(&mut encoder, dependencies, copy)?,
+                GpuCommand::UploadImage { destination, bytes } => {
+                    let handle = dependency_handle(
+                        dependencies,
+                        ResourceDependency::Image(destination.image),
+                    )?;
+                    let Resource::Image {
+                        texture,
+                        description,
+                        ..
+                    } = self.resource(handle)?
+                    else {
+                        return Err(kind_mismatch(handle));
+                    };
+                    image_region_is_full(*description, *destination)?;
+                    if description.samples() != SampleCount::One
+                        || description.format().block_extent() != [1, 1]
+                        || destination.extent.height != 1
+                        || destination.extent.depth != 1
+                        || destination.subresources.layer_count != 1
+                    {
+                        return Err(unsupported(
+                            "inline image upload requires a single uncompressed row",
+                        ));
+                    }
+                    let bpp = usize::from(
+                        description
+                            .format()
+                            .plane_bytes_per_texel(destination.subresources.plane)
+                            .ok_or_else(|| unsupported("inline image upload format"))?,
+                    );
+                    if description.format().is_depth_stencil()
+                        || host_bytes_per_block(
+                            description.format(),
+                            destination.subresources.plane,
+                        )? != bpp
+                    {
+                        return Err(unsupported(
+                            "inline image upload requires native color texels",
+                        ));
+                    }
+                    if bytes.len() != destination.extent.width as usize * bpp {
+                        return Err(unsupported("inline image upload byte count"));
+                    }
+                    let texture = texture.clone();
+                    self.stage_texture_upload(
+                        &mut encoder,
+                        TexelCopyTextureInfo {
+                            texture: &texture,
+                            mip_level: u32::from(destination.subresources.mip_level),
+                            origin: Origin3d {
+                                x: destination.origin.x,
+                                y: destination.origin.y,
+                                z: u32::from(destination.subresources.base_layer),
+                            },
+                            aspect: TextureAspect::All,
+                        },
+                        bytes,
+                        TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: None,
+                            rows_per_image: None,
+                        },
+                        Extent3d {
+                            width: destination.extent.width,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                    )?;
+                }
                 GpuCommand::Resolve(resolve) => {
                     self.encode_resolve(&mut encoder, dependencies, resolve)?
                 }
@@ -2443,11 +2528,18 @@ impl WgpuBackendDriver {
                         "ordinary wgpu rectangular/smooth wireframe rasterization; native tessellation required",
                     ));
                 }
-                if draw.prepared.topology == PrimitiveTopology::Quads {
+                if matches!(
+                    draw.prepared.topology,
+                    PrimitiveTopology::Quads | PrimitiveTopology::TriangleFan
+                ) {
                     if draw.prepared.triangle_rasterization != TriangleRasterization::Fill {
-                        return Err(unsupported("non-fill quad rasterization"));
+                        return Err(unsupported("non-fill quad/fan rasterization"));
                     }
-                    self.quad_indices.reserve(&self.device, draw.arguments)?;
+                    self.primitive_indices.reserve(
+                        &self.device,
+                        draw.arguments,
+                        draw.prepared.topology,
+                    )?;
                 }
                 let location = self.render_pipeline_location(
                     dependencies,
@@ -2598,13 +2690,21 @@ impl WgpuBackendDriver {
                         first_instance,
                         instance_count,
                     } => {
-                        if draw.prepared.topology == PrimitiveTopology::Quads {
+                        if matches!(
+                            draw.prepared.topology,
+                            PrimitiveTopology::Quads | PrimitiveTopology::TriangleFan
+                        ) {
                             if draw_pipelines[draw_index].vertex_fetch.quad_flat {
                                 pass.set_immediates(0, &first_vertex.to_le_bytes());
                             }
-                            let (count, base) = crate::quad_indices::draw_indices(draw.arguments)?;
+                            let (count, base) = crate::primitive_indices::draw_indices(
+                                draw.arguments,
+                                draw.prepared.topology,
+                            )?;
                             pass.set_index_buffer(
-                                self.quad_indices.buffer().slice(..),
+                                self.primitive_indices
+                                    .buffer(draw.prepared.topology)
+                                    .slice(..),
                                 IndexFormat::Uint32,
                             );
                             pass.draw_indexed(
@@ -3117,6 +3217,18 @@ impl WgpuBackendDriver {
             self.shader_for_stage(dependencies, operation, ShaderStage::Vertex)?;
         let (_, fragment, fragment_ir) =
             self.shader_for_stage(dependencies, operation, ShaderStage::Fragment)?;
+        if draw.prepared.topology == PrimitiveTopology::Points
+            && vertex_ir
+                .ir()
+                .ir()
+                .outputs()
+                .iter()
+                .any(|output| output.location() == nixe_gpu::ShaderIoLocation::PointSize)
+        {
+            return Err(unsupported(
+                "WGSL rasterization does not support shader point sizes",
+            ));
+        }
         let vertex_fetch = VertexFetchPlan::new(draw, &vertex_ir, location.quad_flat)?;
         if vertex_fetch.quad_flat
             && (!self.device.features().contains(wgpu::Features::IMMEDIATES)
@@ -3232,6 +3344,13 @@ impl WgpuBackendDriver {
         let mut vertex_constants = location.opaque_textures.constants(&vertex_ir);
         if viewport_y_flip(draw.prepared.viewport_transform) {
             vertex_constants.push(("nixe_viewport_y_flip".to_owned(), 1.0));
+        }
+        if draw
+            .prepared
+            .viewport_transform
+            .is_some_and(|transform| transform.depth_clip_negative_one_to_one())
+        {
+            vertex_constants.push(("nixe_depth_negative_one_to_one".to_owned(), 1.0));
         }
         let mut fragment_constants = location.opaque_textures.constants(&fragment_ir);
         if let Some(test) = draw.prepared.alpha_test {
@@ -3892,6 +4011,11 @@ impl WgpuBackendDriver {
             ));
         }
 
+        if !request.allow_canonical_import {
+            return Err(unsupported(
+                "opaque presentation image has no current resident producer",
+            ));
+        }
         let mut import = match self.presentation_imports.remove(&import_key) {
             Some(import) => import,
             None => self.create_presentation_import(&request)?,
@@ -5032,9 +5156,10 @@ fn primitive_topology(
         PrimitiveTopology::Lines => wgpu::PrimitiveTopology::LineList,
         PrimitiveTopology::LineStrip => wgpu::PrimitiveTopology::LineStrip,
         PrimitiveTopology::Triangles => wgpu::PrimitiveTopology::TriangleList,
-        PrimitiveTopology::Quads => wgpu::PrimitiveTopology::TriangleList,
+        PrimitiveTopology::Quads | PrimitiveTopology::TriangleFan => {
+            wgpu::PrimitiveTopology::TriangleList
+        }
         PrimitiveTopology::TriangleStrip => wgpu::PrimitiveTopology::TriangleStrip,
-        PrimitiveTopology::TriangleFan => return Err(unsupported("triangle fan topology")),
         PrimitiveTopology::Patches => return Err(unsupported("patch topology")),
     })
 }
@@ -5975,6 +6100,7 @@ mod tests {
         };
         let mut input = super::RenderPipelineFingerprintInput {
             viewport_y_flip: false,
+            depth_clip_negative_one_to_one: false,
             front_face: nixe_gpu::FrontFace::CounterClockwise,
             cull_mode: nixe_gpu::CullMode::None,
             color_outputs: [nixe_gpu::ColorOutputState::REPLACE; super::MAX_COLOR_ATTACHMENTS],
@@ -6005,6 +6131,9 @@ mod tests {
         input.color_outputs[7].write_mask =
             nixe_gpu::ColorWriteMask::new(false, false, false, false);
         assert_eq!(multiple, nixe_gpu::cache_fingerprint(&input));
+        input.depth_clip_negative_one_to_one = true;
+        assert_ne!(multiple, nixe_gpu::cache_fingerprint(&input));
+        input.depth_clip_negative_one_to_one = false;
         input.viewport_y_flip = true;
         assert_ne!(multiple, nixe_gpu::cache_fingerprint(&input));
     }
@@ -6051,6 +6180,7 @@ mod tests {
         let fingerprint = |layout: &VertexBufferLayout, topology, quad_flat| {
             nixe_gpu::cache_fingerprint(&super::RenderPipelineFingerprintInput {
                 viewport_y_flip: false,
+                depth_clip_negative_one_to_one: false,
                 front_face: nixe_gpu::FrontFace::CounterClockwise,
                 cull_mode: nixe_gpu::CullMode::None,
                 quad_flat,

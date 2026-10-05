@@ -21,10 +21,12 @@ fn tlds_level_zero_preserves_coordinates_channels_and_samplerless_binding() {
         captured,
         8,
         &mut bindings,
+        &mut 32,
     )
     .unwrap();
+    assert_eq!(operation.len(), 1);
     assert_eq!(
-        operation,
+        operation[0],
         ShaderOperation::LoadTexture2D {
             outputs: (0..4)
                 .map(|component| ShaderTextureSampleOutput::new(
@@ -42,12 +44,26 @@ fn tlds_level_zero_preserves_coordinates_channels_and_samplerless_binding() {
     assert_eq!(bindings[&420].sampler_binding, None);
     // The same descriptor can later be filtered: reserve its sampler once.
     let sample = (captured & !(0x1f << 53)) | (1 << 53);
-    decode_texture_access_simplified(MaxwellShaderStage::Pixel, 0x38, sample, 8, &mut bindings)
-        .unwrap();
+    decode_texture_access_simplified(
+        MaxwellShaderStage::Pixel,
+        0x38,
+        sample,
+        8,
+        &mut bindings,
+        &mut 32,
+    )
+    .unwrap();
     assert_eq!(bindings.len(), 1);
     assert_eq!(bindings[&420].sampler_binding, Some(33));
-    decode_texture_access_simplified(MaxwellShaderStage::Pixel, 0x40, captured, 8, &mut bindings)
-        .unwrap();
+    decode_texture_access_simplified(
+        MaxwellShaderStage::Pixel,
+        0x40,
+        captured,
+        8,
+        &mut bindings,
+        &mut 32,
+    )
+    .unwrap();
     assert_eq!(bindings[&420].sampler_binding, Some(33));
     for word in [
         captured & !(1 << 59),
@@ -60,7 +76,8 @@ fn tlds_level_zero_preserves_coordinates_channels_and_samplerless_binding() {
                 0x30,
                 word,
                 8,
-                &mut BTreeMap::new()
+                &mut BTreeMap::new(),
+                &mut 32
             ),
             Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { .. })
         ));
@@ -128,11 +145,13 @@ fn texs_2d_implicit_lod_decodes_captured_split_rgba_operands() {
         encoding,
         4,
         &mut bindings,
+        &mut 32,
     )
     .unwrap();
+    assert_eq!(operation.len(), 1);
 
     assert_eq!(
-        operation,
+        operation[0],
         ShaderOperation::SampleTexture2D {
             outputs: (0..4)
                 .map(|component| {
@@ -170,11 +189,13 @@ fn texs_2d_array_implicit_lod_decodes_packed_layer_and_coordinates() {
         encoding,
         4,
         &mut bindings,
+        &mut 32,
     )
     .unwrap();
+    assert_eq!(operation.len(), 1);
 
     assert_eq!(
-        operation,
+        operation[0],
         ShaderOperation::SampleTexture2DArray {
             outputs: vec![ShaderTextureSampleOutput::new(ShaderRegister::new(3), 0).unwrap()]
                 .into_boxed_slice(),
@@ -255,4 +276,118 @@ fn texs_2d_implicit_lod_translates_to_verified_sample_resources_and_wgsl() {
     let module = lower_shader_ir_to_wgsl(&translated).unwrap();
     assert!(module.source().contains("textureSample"));
     validate_wgsl(&module);
+}
+
+#[test]
+fn texs_half_results_pack_pairs_without_aliasing_sample_outputs() {
+    use nixe_gpu::{
+        ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderIr, ShaderPredicate,
+        ShaderScalarType, ShaderSourceLocation, ShaderStage, VerifiedShaderIr,
+    };
+    let encoding = 0xd030_0080_1007_0100;
+    let operations = decode_texture_access_simplified(
+        MaxwellShaderStage::Pixel,
+        0x30,
+        encoding,
+        2,
+        &mut BTreeMap::new(),
+        &mut 2,
+    )
+    .unwrap();
+    let ShaderOperation::SampleTexture2D {
+        outputs,
+        coordinates,
+        ..
+    } = &operations[0]
+    else {
+        panic!("sample expected")
+    };
+    assert_eq!(
+        *coordinates,
+        [ShaderRegister::new(1), ShaderRegister::new(0)]
+    );
+    assert_eq!(
+        outputs
+            .iter()
+            .map(|o| (o.destination().index(), o.component()))
+            .collect::<Vec<_>>(),
+        [(2, 0), (3, 1), (4, 2), (5, 3)]
+    );
+    // Isolate the packing arithmetic with deterministic sampled values. The
+    // sample uses four temporaries; only two actual result registers are needed.
+    let mut code = outputs
+        .iter()
+        .zip([1.0_f32, -2.0, 0.75, 0.5])
+        .map(|(out, value)| ShaderOperation::MoveImmediate32 {
+            destination: out.destination(),
+            bits: value.to_bits(),
+            scalar_type: ShaderScalarType::Float32,
+        })
+        .collect::<Vec<_>>();
+    code.extend_from_slice(&operations[1..]);
+    code.push(ShaderOperation::StoreOutput {
+        sources: vec![ShaderRegister::new(0), ShaderRegister::new(1)].into(),
+        location: ShaderIoLocation::Color(0),
+        first_component: 0,
+        scalar_type: ShaderScalarType::Unsigned32,
+    });
+    code.push(ShaderOperation::Exit);
+    let ir = VerifiedShaderIr::verify(ShaderIr::new(
+        ShaderStage::Fragment,
+        Vec::new(),
+        (0..2)
+            .map(|c| {
+                ShaderInterfaceElement::new(
+                    ShaderIoLocation::Color(0),
+                    c,
+                    ShaderScalarType::Unsigned32,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect(),
+        Vec::new(),
+        code.into_iter()
+            .enumerate()
+            .map(|(i, op)| {
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(i as u32 * 8),
+                    ShaderPredicate::Always,
+                    op,
+                )
+            })
+            .collect(),
+    ))
+    .unwrap();
+    let result =
+        nixe_gpu::evaluate_shader_ir(&ir, &nixe_gpu::ShaderEvaluationInputs::default(), 64)
+            .unwrap();
+    assert_eq!(
+        result.output_bits(ShaderIoLocation::Color(0), 0),
+        Some(0xc000_3c00)
+    );
+    assert_eq!(
+        result.output_bits(ShaderIoLocation::Color(0), 1),
+        Some(0x3800_3a00)
+    );
+    validate_wgsl(&lower_shader_ir_to_wgsl(&ir).unwrap());
+    let mut header = [0; 20];
+    header[0] = 0x0002_5462;
+    header[18] = 3;
+    let shader = translated_fixture_with_register_count(
+        MaxwellShaderStage::Pixel,
+        header,
+        &[
+            0,
+            0x0100_0000_0007_f000,
+            0x0100_0000_0007_f001,
+            encoding,
+            0,
+            0xe300_0000_0007_000f,
+            0,
+            0,
+        ],
+        2,
+    );
+    validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
 }

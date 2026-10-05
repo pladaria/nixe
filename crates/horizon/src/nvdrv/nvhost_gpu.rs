@@ -219,14 +219,13 @@ impl NvHostGpu {
             IOCTL_CHANNEL_ALLOC_GPFIFO_EX2 => {
                 require_input_size(input, 32)?;
                 let entries = input_u32(input, 0)?;
-                let flags = input_u32(input, 4)?;
-                let unknown = [
-                    input_u32(input, 8)?,
-                    input_u32(input, 20)?,
-                    input_u32(input, 24)?,
-                    input_u32(input, 28)?,
-                ];
-                if flags & !1 != 0 || unknown != [0; 4] {
+                // Offset 4 is num_jobs, a driver job-pool allocation hint,
+                // not the VPR flags. The emulator scheduler allocates job
+                // records on demand. The final three words are ignored.
+                // https://switchbrew.org/wiki/NV_services#NVGPU_IOCTL_CHANNEL_ALLOC_GPFIFO_EX
+                // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_gpu.h
+                let flags = input_u32(input, 8)?;
+                if flags & !1 != 0 {
                     return Err(unsupported_configuration(descriptor, request));
                 }
                 if entries == 0 {
@@ -491,17 +490,21 @@ fn submit_gpfifo(
     )
     .map_err(|error| gpfifo_driver_result(descriptor, request, error))?;
     let mode = decoded.mode();
-    let completion_increments = if mode.fence_increment_value() {
+    let guest_increments = if mode.fence_increment_value() {
         // libnx's channel frontend sets bit 8 when its submitted pushbuffer
         // already contains this many syncpoint increment methods. Reserve the
         // resulting point without injecting or publishing any increment:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/gpu_channel.c#L73-L105
         decoded.fence_value()
-    } else if mode.fence_get() {
-        1
     } else {
         0
     };
+    // FENCE_GET appends two driver syncpoint increments after the user stream.
+    // Bit 8 independently reserves increments already present in that stream.
+    // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp#L288-L350
+    let completion_increments = guest_increments
+        .checked_add(if mode.fence_get() { 2 } else { 0 })
+        .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
     let dependency = mode.fence_wait().then(|| {
         GuestTimelinePoint::new(
             GuestSyncpointId::new(decoded.fence_id()),

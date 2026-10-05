@@ -1011,6 +1011,13 @@ const _: () = match SWITCH_1_GM20B_PROFILE.validate() {
     Err(_) => panic!("the built-in Switch 1 GM20B profile is inconsistent"),
 };
 
+/// Converts monotonic virtual nanoseconds to GM20B PTIMER ticks (13/8 ns).
+/// https://switchbrew.org/wiki/NV_services#NVGPU_GPU_IOCTL_GET_GPU_TIME
+#[must_use]
+pub fn maxwell_gpu_timestamp(nanoseconds: u64) -> u64 {
+    (u128::from(nanoseconds) * 8 / 13) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

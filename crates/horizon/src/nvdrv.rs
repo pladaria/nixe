@@ -36,7 +36,7 @@ pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrv
 pub(crate) use gpu_executor::PendingGpuSubmission;
 use gpu_executor::{GpuSubmissionAdmission, NvDrvGpuExecutor};
 use ioctl::NvDrvIoctlResponse;
-pub(crate) use ioctl::{NvDrvInlineBuffer, NvDrvIoctlOutcome, NvDrvIoctlRequest};
+pub(crate) use ioctl::{NvDrvInlineBuffer, NvDrvIoctlCaller, NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use nvhost_as_gpu::{decode_bind_channel, ioctl_nvhost_as_gpu};
 use nvhost_ctrl::{NvHostControl, NvHostCtrlIoctlOutcome};
 use nvhost_ctrl_gpu::NvHostControlGpuEvents;
@@ -59,6 +59,7 @@ const IOCTL_CTRL_GPU_ZCULL_GET_INFO: u32 = 0x8028_4702;
 const IOCTL_CTRL_GPU_GET_CHARACTERISTICS: u32 = 0xc0b0_4705;
 const IOCTL_CTRL_GPU_GET_TPC_MASKS: u32 = 0xc018_4706;
 const IOCTL_CTRL_GPU_ZBC_GET_ACTIVE_SLOT_MASK: u32 = 0x8008_4714;
+const IOCTL_CTRL_GPU_GET_GPU_TIME: u32 = 0xc010_471c;
 
 pub(crate) const NV_SUCCESS: u32 = 0;
 pub(crate) const NV_NOT_SUPPORTED: u32 = 2;
@@ -69,10 +70,12 @@ pub(crate) const NV_INSUFFICIENT_MEMORY: u32 = 6;
 pub(crate) const NV_INVALID_STATE: u32 = 8;
 pub(crate) const NV_BAD_VALUE: u32 = 0xb;
 pub(crate) const NV_OVERFLOW: u32 = 0x11;
+pub(crate) const NV_CONFIG_VAR_NOT_FOUND: u32 = 0x3_0006;
 
 #[derive(Debug)]
 struct NvDrvClientState {
     initialized: bool,
+    transfer_memory_size: u32,
     client_identity: Option<NvDrvClientIdentity>,
     next_session_id: u64,
     permission: NvDrvPermissionProfile,
@@ -152,6 +155,7 @@ impl NvDrvSession {
             connection_id: NvDrvSessionId::ROOT,
             state: Arc::new(Mutex::new(NvDrvClientState {
                 initialized: false,
+                transfer_memory_size: 0,
                 client_identity: None,
                 next_session_id: NvDrvSessionId::ROOT.raw() + 1,
                 permission: NvDrvPermissionProfile::Application,
@@ -191,11 +195,51 @@ impl NvDrvSession {
         )
     }
 
-    pub(crate) fn initialize(&self) {
-        self.state
+    pub(crate) fn dump_status(&self) {
+        let state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .initialized = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log::info!(
+            "nvdrv status: initialized={} client={:?} device-fds={} address-spaces={}",
+            state.initialized,
+            state.client_identity,
+            state.devices.len(),
+            state
+                .gpu_address_spaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+        );
+    }
+
+    pub(crate) fn initialize(&self, transfer_memory_size: u32) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.transfer_memory_size = transfer_memory_size;
+        state.initialized = true;
+    }
+
+    pub(crate) fn status(&self) -> ([u8; 32], u32) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut status = [0; 32];
+        if !state.initialized {
+            return (status, NV_NOT_INITIALIZED);
+        }
+        // HLE metadata is host-owned; no blocks are allocated out of the
+        // client-supplied transfer heap. GPU nvmap backing is a separate heap.
+        // Its free, largest allocatable and low-water sizes therefore all equal
+        // the actual initialized transfer range, not a fabricated memory budget.
+        // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#NvDrvStatus
+        for word in status[..16].chunks_exact_mut(4) {
+            word.copy_from_slice(&state.transfer_memory_size.to_le_bytes());
+        }
+        (status, NV_SUCCESS)
     }
 
     pub(crate) fn set_aruid(&self, process_id: u64, applet_resource_user_id: u64) {
@@ -362,7 +406,17 @@ impl NvDrvSession {
         request: u32,
         input: &[u8],
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
-        match self.ioctl_inner(fd, request, input, NvDrvInlineBuffer::None, None, 1)? {
+        match self.ioctl_inner(
+            fd,
+            request,
+            input,
+            NvDrvInlineBuffer::None,
+            None,
+            NvDrvIoctlCaller {
+                thread_id: 1,
+                clock: &nixe_runtime::VirtualClock::default(),
+            },
+        )? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
             NvDrvIoctlOutcome::PendingSyncpointWait(_)
             | NvDrvIoctlOutcome::PendingSubmission(_) => {
@@ -379,7 +433,17 @@ impl NvDrvSession {
         input: &[u8],
         thread_id: u64,
     ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
-        self.ioctl_inner(fd, request, input, NvDrvInlineBuffer::None, None, thread_id)
+        self.ioctl_inner(
+            fd,
+            request,
+            input,
+            NvDrvInlineBuffer::None,
+            None,
+            NvDrvIoctlCaller {
+                thread_id,
+                clock: &nixe_runtime::VirtualClock::default(),
+            },
+        )
     }
 
     #[cfg(test)]
@@ -396,7 +460,10 @@ impl NvDrvSession {
             input,
             NvDrvInlineBuffer::Input(additional_input),
             None,
-            1,
+            NvDrvIoctlCaller {
+                thread_id: 1,
+                clock: &nixe_runtime::VirtualClock::default(),
+            },
         )? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
             NvDrvIoctlOutcome::PendingSyncpointWait(_)
@@ -424,7 +491,10 @@ impl NvDrvSession {
             process_id,
             address_space,
             translator,
-            thread_id: 1,
+            caller: NvDrvIoctlCaller {
+                thread_id: 1,
+                clock: &nixe_runtime::VirtualClock::default(),
+            },
         })? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
             NvDrvIoctlOutcome::PendingSyncpointWait(_)
@@ -483,7 +553,7 @@ impl NvDrvSession {
                 request.address_space,
                 request.translator,
             )),
-            request.thread_id,
+            request.caller,
         )?;
         // Ioctl3 publishes complete records from the same query to its inline output.
         // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.cpp
@@ -503,7 +573,7 @@ impl NvDrvSession {
         input: &[u8],
         inline: NvDrvInlineBuffer<'_>,
         canonical_memory: Option<(u64, AddressSpaceId, &dyn CanonicalRangeTranslator)>,
-        thread_id: u64,
+        caller: NvDrvIoctlCaller<'_>,
     ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
         let mut state = self
             .state
@@ -549,7 +619,7 @@ impl NvDrvSession {
                     input,
                     nvhost_ctrl::NvHostCtrlWaiterId::new(
                         descriptor.owner().process_id(),
-                        thread_id,
+                        caller.thread_id,
                     ),
                 )
                 .map(LockedIoctlOutcome::Standard),
@@ -560,6 +630,7 @@ impl NvDrvSession {
                     request,
                     input,
                     inline.output_size().is_some(),
+                    caller.clock,
                 )
                 .map(NvHostCtrlIoctlOutcome::Complete)
                 .map(LockedIoctlOutcome::Standard)
@@ -747,7 +818,7 @@ impl NvDrvSession {
                     Err(NvDrvCallError::Unsupported(operation)) => return Err(operation),
                 };
                 let (output, submission) = result;
-                backend.enqueue(submission).map_err(|error| {
+                backend.enqueue(submission, caller.clock).map_err(|error| {
                     nvhost_gpu::queued_execution_error(descriptor, request, error)
                 })?;
                 Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
@@ -984,9 +1055,20 @@ fn ioctl_nvhost_ctrl_gpu(
     request: u32,
     input: &[u8],
     inline_output: bool,
+    clock: &nixe_runtime::VirtualClock,
 ) -> Result<Vec<u8>, NvDrvCallError> {
     debug_assert_eq!(profile.validate(), Ok(()));
     match request {
+        IOCTL_CTRL_GPU_GET_GPU_TIME => {
+            require_input_size(input, 16)?;
+            // Switch's PTIMER counter advances once per 1.625 ns (13/8 ns).
+            // Use the same monotonic clock as CPU timers and kernel waits.
+            // https://switchbrew.org/wiki/NV_services#NVGPU_GPU_IOCTL_GET_GPU_TIME
+            let ticks = nixe_gpu_maxwell::maxwell_gpu_timestamp(clock.scheduler_time_ns());
+            let mut output = vec![0; 16];
+            write_u64(&mut output, 0, ticks)?;
+            Ok(output)
+        }
         IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE => {
             require_input_size(input, 0)?;
             let mut output = sized_output(input, 4);
@@ -1377,6 +1459,21 @@ fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn driver_status_reports_only_the_initialized_transfer_heap() {
+        let session = NvDrvSession::new();
+        assert_eq!(session.status(), ([0; 32], NV_NOT_INITIALIZED));
+        session.initialize(0x800000);
+        let (status, result) = session.status();
+        assert_eq!(result, NV_SUCCESS);
+        for word in status[..16].chunks_exact(4) {
+            assert_eq!(u32::from_le_bytes(word.try_into().unwrap()), 0x800000);
+        }
+        assert_eq!(&status[16..], &[0; 16]);
+        let clone = session.clone_connection().unwrap();
+        assert_eq!(clone.status(), session.status());
+    }
+
     use nixe_cpu::memory::{ExecutionMemory, MemoryMappingPurpose, ProcessMemory};
     use nixe_gpu::{GraphicsGapKind, GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint};
     use nixe_memory::{CanonicalAllocation, CanonicalRangeTranslationError, MemoryPermissions};
@@ -1415,7 +1512,7 @@ mod tests {
     #[test]
     fn ioctl3_characteristics_match_ordinary_output_and_copy_complete_records() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let mut input = vec![0; 0xb0];
         input[..8].copy_from_slice(&0xa0_u64.to_le_bytes());
@@ -1436,7 +1533,10 @@ mod tests {
                     process_id: 1,
                     address_space: AddressSpaceId::new(1),
                     translator: &memory,
-                    thread_id: 1,
+                    caller: NvDrvIoctlCaller {
+                        thread_id: 1,
+                        clock: &nixe_runtime::VirtualClock::default(),
+                    },
                 })
                 .unwrap();
             let NvDrvIoctlOutcome::Complete(response) = outcome else {
@@ -1455,7 +1555,7 @@ mod tests {
     #[test]
     fn ioctl3_tpc_masks_use_inline_output_without_a_legacy_user_pointer() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let memory = ExecutionMemory::new();
         let mut input = [0; 24];
@@ -1469,7 +1569,10 @@ mod tests {
                 process_id: 1,
                 address_space: AddressSpaceId::new(1),
                 translator: &memory,
-                thread_id: 1,
+                caller: NvDrvIoctlCaller {
+                    thread_id: 1,
+                    clock: &nixe_runtime::VirtualClock::default(),
+                },
             })
             .unwrap();
         let NvDrvIoctlOutcome::Complete(response) = outcome else {
@@ -1495,7 +1598,7 @@ mod tests {
                 MemoryMappingPurpose::Normal,
             )
             .unwrap();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvmap", 1).unwrap();
         let (created, error) = session
             .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x2000))
@@ -1538,7 +1641,7 @@ mod tests {
         let session = NvDrvSession::new();
         let memory = ExecutionMemory::new();
         let address_space = AddressSpaceId::new(2);
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvmap", 2).unwrap();
         let (created, _) = session
             .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x1000))
@@ -1589,7 +1692,7 @@ mod tests {
                 MemoryMappingPurpose::Normal,
             )
             .unwrap();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvmap", 3).unwrap();
 
         let (created, error) = session
@@ -1738,7 +1841,7 @@ mod tests {
                 MemoryMappingPurpose::Normal,
             )
             .unwrap();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvmap", 4).unwrap();
 
         for size in [0, 7, 9] {
@@ -1937,7 +2040,7 @@ mod tests {
         ));
 
         session.set_aruid(5, 0x55);
-        session.initialize();
+        session.initialize(0);
         let original_fd = session.open(b"/dev/nvmap", 5).unwrap();
         let cloned_fd = clone.open(b"/dev/nvmap", 5).unwrap();
         assert_eq!(
@@ -2045,7 +2148,7 @@ mod tests {
 
         let foreign = NvDrvSession::new();
         foreign.set_aruid(6, 0x66);
-        foreign.initialize();
+        foreign.initialize(0);
         let foreign_fd = foreign.open(b"/dev/nvmap", 6).unwrap();
         assert_eq!(
             foreign.ioctl(
@@ -2076,9 +2179,76 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_config_query_reports_retail_config_unavailability() {
+        let session = NvDrvSession::new();
+        session.initialize(0);
+        let fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
+        let mut input = [0; 0x183];
+        input[..3].copy_from_slice(b"nv\0");
+        input[0x41..0x54].copy_from_slice(b"NV_MEMORY_PROFILER\0");
+        for bytes in [&input[..], &[0xff; 0x183][..]] {
+            let (output, result) = session.ioctl(fd, 0xc183_001b, bytes).unwrap();
+            assert_eq!(result, NV_CONFIG_VAR_NOT_FOUND);
+            assert_eq!(output, bytes);
+        }
+        for bytes in [&input[..0x182], &[0; 0x184][..]] {
+            let (_, result) = session.ioctl(fd, 0xc183_001b, bytes).unwrap();
+            assert_eq!(result, NV_BAD_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn ctrl_gpu_time_uses_shared_virtual_clock_and_ptimer_units() {
+        let session = NvDrvSession::new();
+        session.initialize(0);
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
+        let clock = nixe_runtime::VirtualClock::new(nixe_runtime::VirtualClockMode::Fixed {
+            unix_seconds: 0,
+        });
+        for (nanoseconds, expected_ticks) in [
+            (0, 0),
+            (12, 7),
+            (13, 8),
+            (1_625_000, 1_000_000),
+            (u64::MAX, (u128::from(u64::MAX) * 8 / 13) as u64),
+        ] {
+            clock.advance_scheduler_to(nanoseconds);
+            let NvDrvIoctlOutcome::Complete(response) = session
+                .ioctl_inner(
+                    fd,
+                    IOCTL_CTRL_GPU_GET_GPU_TIME,
+                    &[0xff; 16],
+                    NvDrvInlineBuffer::None,
+                    None,
+                    NvDrvIoctlCaller {
+                        thread_id: 1,
+                        clock: &clock,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("timer query cannot wait")
+            };
+            assert_eq!(response.driver_result, NV_SUCCESS);
+            assert_eq!(response.output.len(), 16);
+            assert_eq!(
+                u64::from_le_bytes(response.output[..8].try_into().unwrap()),
+                expected_ticks
+            );
+            assert_eq!(&response.output[8..], &[0; 8]);
+        }
+        for input in [vec![], vec![0; 15], vec![0; 17]] {
+            let (_, result) = session
+                .ioctl(fd, IOCTL_CTRL_GPU_GET_GPU_TIME, &input)
+                .unwrap();
+            assert_eq!(result, NV_BAD_PARAMETER);
+        }
+    }
+
+    #[test]
     fn ctrl_gpu_discovery_ioctls_encode_exact_switch_1_bytes() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let mut input = vec![0_u8; 0xb0];
         input[0..8].copy_from_slice(&0xa0_u64.to_le_bytes());
@@ -2148,7 +2318,7 @@ mod tests {
     #[test]
     fn ctrl_gpu_discovery_rejects_malformed_sizes_and_invalid_arguments() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
 
         for (request, input) in [
@@ -2200,7 +2370,7 @@ mod tests {
     #[test]
     fn ctrl_gpu_zbc_mask_reports_no_installed_entries_without_accepting_table_mutations() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let other_fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let expected = vec![7, 0, 0, 0, 0, 0, 0, 0];
@@ -2233,7 +2403,7 @@ mod tests {
     #[test]
     fn missing_emulator_semantics_are_distinct_from_driver_results() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
 
         assert_eq!(
             session.open(b"/dev/not-emulated", 1),
@@ -2297,7 +2467,7 @@ mod tests {
     #[test]
     fn teardown_releases_nvdrv_state_and_is_idempotent() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let map_fd = session.open(b"/dev/nvmap", 1).unwrap();
         let _gpu_fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         session
@@ -2345,7 +2515,7 @@ mod tests {
             })
         );
 
-        session.initialize();
+        session.initialize(0);
         let original_fd = session.open(b"/dev/nvmap", 7).unwrap();
         let original_descriptor = clone.device_descriptor(original_fd).unwrap();
         assert_eq!(
@@ -2366,7 +2536,7 @@ mod tests {
     fn as_gpu_descriptors_own_distinct_profile_bound_address_spaces() {
         let session = NvDrvSession::new();
         let clone = session.clone_connection().unwrap();
-        session.initialize();
+        session.initialize(0);
 
         let first_fd = session.open(b"/dev/nvhost-as-gpu", 7).unwrap();
         let second_fd = clone.open(b"/dev/nvhost-as-gpu", 7).unwrap();
@@ -2412,7 +2582,7 @@ mod tests {
         const SET: u32 = 0x4008_4714;
         const GET: u32 = 0x8008_4715;
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let clone = session.clone_connection().unwrap();
         let fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
         let other_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
@@ -2458,7 +2628,7 @@ mod tests {
     #[test]
     fn gpu_error_notifier_ignores_legacy_buffer_fields_and_uses_nonzero_enable() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
         let other_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
         let (event, result) = session.query_event(fd, 3, 1).unwrap();
@@ -2515,7 +2685,7 @@ mod tests {
     #[test]
     fn libnx_gpu_channel_creation_retains_typed_frontend_state() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
         let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
         let as_fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
@@ -2538,7 +2708,9 @@ mod tests {
 
         let mut allocate = [0_u8; 32];
         allocate[0..4].copy_from_slice(&0x800_u32.to_le_bytes());
-        allocate[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        allocate[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
+        allocate[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        allocate[20..32].fill(0xff);
         let (allocated, result) = session.ioctl(channel_fd, 0xc020_481a, &allocate).unwrap();
         assert_eq!(result, NV_SUCCESS);
         let syncpoint = input_u32(&allocated, 12).unwrap();
@@ -2731,7 +2903,7 @@ mod tests {
         let submission = boundary.dispatch().scheduled().submission();
         let completion = boundary.dispatch().scheduled().completion().unwrap();
         assert_eq!(completion.point().syncpoint().get(), syncpoint);
-        assert_eq!(completion.point().value().get(), 1);
+        assert_eq!(completion.point().value().get(), 2);
         let mut read_syncpoint = [0_u8; 8];
         read_syncpoint[..4].copy_from_slice(&syncpoint.to_le_bytes());
         let (read_syncpoint, result) = session
@@ -2787,8 +2959,8 @@ mod tests {
                 .point()
                 .value()
                 .get(),
-            4,
-            "the command-stream increment count must extend the prior reservation by three"
+            5,
+            "three guest increments must extend the prior driver reservation by three"
         );
 
         // Encoded-size mismatch, truncation, trailing entries, and excessive
@@ -2970,7 +3142,7 @@ mod tests {
     #[test]
     fn gpfifo_empty_close_and_process_teardown_preserve_no_false_progress() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
         let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
         let as_fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
@@ -3178,7 +3350,7 @@ mod tests {
     #[test]
     fn as_gpu_initialization_and_region_query_encode_exact_switch_bytes() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
         let mut initialize = [0_u8; 40];
         initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());
@@ -3211,7 +3383,7 @@ mod tests {
     #[test]
     fn as_gpu_reservations_allocate_and_free_exact_ranges() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
         let mut initialize = [0_u8; 40];
         initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());
@@ -3295,7 +3467,7 @@ mod tests {
                 MemoryMappingPurpose::Normal,
             )
             .unwrap();
-        session.initialize();
+        session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 12).unwrap();
         let as_fd = session.open(b"/dev/nvhost-as-gpu", 12).unwrap();
         let (created, result) = session
@@ -3443,7 +3615,7 @@ mod tests {
                 MemoryMappingPurpose::Normal,
             )
             .unwrap();
-        session.initialize();
+        session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 12).unwrap();
         let as_gpu_fd = session.open(b"/dev/nvhost-as-gpu", 12).unwrap();
 
@@ -3681,7 +3853,7 @@ mod tests {
                 MemoryMappingPurpose::Normal,
             )
             .unwrap();
-        session.initialize();
+        session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 13).unwrap();
         let as_gpu_fd = session.open(b"/dev/nvhost-as-gpu", 13).unwrap();
         let (created, _) = session
@@ -3787,7 +3959,7 @@ mod tests {
     #[test]
     fn as_gpu_rejects_malformed_or_invalid_operations_without_partial_state() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
 
         for (request, size) in [
@@ -3868,7 +4040,7 @@ mod tests {
     fn teardown_from_one_connection_invalidates_the_shared_client() {
         let session = NvDrvSession::new();
         let clone = session.clone_connection().unwrap();
-        session.initialize();
+        session.initialize(0);
         let _fd = clone.open(b"/dev/nvmap", 11).unwrap();
 
         assert_eq!(
@@ -3889,7 +4061,7 @@ mod tests {
     fn opened_descriptor_records_typed_owner_permission_and_lifecycle() {
         let session = NvDrvSession::new();
         session.set_aruid(42, 0x1234);
-        session.initialize();
+        session.initialize(0);
 
         let fd = session.open(b"/dev/nvmap", 42).unwrap();
         let descriptor = session.device_descriptor(fd).unwrap();
@@ -3907,7 +4079,7 @@ mod tests {
     #[test]
     fn host_control_events_follow_descriptor_lifetime_and_waits_do_not_complete_early() {
         let session = NvDrvSession::new();
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl", 17).unwrap();
 
         let slot = 3_u32.to_le_bytes();
@@ -3944,7 +4116,7 @@ mod tests {
         let session = NvDrvSession::new();
         let memory = ExecutionMemory::new();
         let address_space = AddressSpaceId::new(9);
-        session.initialize();
+        session.initialize(0);
         let fd = session.open(b"/dev/nvmap", 9).unwrap();
         let (created, _) = session
             .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x1000))

@@ -1,9 +1,12 @@
 //! Maxwell simplified texture instructions and their local resource bindings.
 
-use super::decode::validate_register_range;
+use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use crate::MaxwellShaderStage;
-use nixe_gpu::{ShaderOperation, ShaderRegister, ShaderResourceKind, ShaderTextureSampleOutput};
+use nixe_gpu::{
+    ShaderBitwiseOperation, ShaderOperation, ShaderRegister, ShaderResourceKind, ShaderScalarType,
+    ShaderTextureSampleOutput,
+};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +45,8 @@ pub(super) fn decode_texture_access_simplified(
     encoding: u64,
     register_count: u8,
     bindings: &mut BTreeMap<u16, MaxwellTextureResourceBinding>,
-) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+    next_temporary: &mut u16,
+) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     // TEXS/TLDS operand fields, dimensionality/LOD selectors, and split destination
     // channel masks follow envytools' pinned public GM107 ISA table:
     // https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/envydis/gm107.c
@@ -124,13 +128,14 @@ pub(super) fn decode_texture_access_simplified(
             }
         }
     };
+    let half_output = !fetch && encoding & (1 << 59) == 0;
     let primary_count = channels.len().min(2);
     validate_register_range(
         stage,
         offset,
         encoding,
         primary_destination,
-        primary_count as u8,
+        if half_output { 1 } else { primary_count as u8 },
         register_count,
     )?;
     if channels.len() > primary_count {
@@ -139,7 +144,11 @@ pub(super) fn decode_texture_access_simplified(
             offset,
             encoding,
             secondary_destination,
-            (channels.len() - primary_count) as u8,
+            if half_output {
+                1
+            } else {
+                (channels.len() - primary_count) as u8
+            },
             register_count,
         )?;
     }
@@ -187,22 +196,35 @@ pub(super) fn decode_texture_access_simplified(
         bindings.insert(constant_buffer_dword_offset, binding);
         binding
     };
-    let outputs = channels
-        .iter()
-        .enumerate()
-        .map(|(index, component)| {
-            let register = if index < primary_count {
+    let mut outputs = Vec::new();
+    for (index, &component) in channels.iter().enumerate() {
+        let register = if half_output {
+            allocate_shader_temporary(
+                stage,
+                offset,
+                encoding,
+                "TEXS half output temporary overflow",
+                next_temporary,
+            )?
+        } else {
+            ShaderRegister::new(u16::from(if index < primary_count {
                 primary_destination + index as u8
             } else {
                 secondary_destination + (index - primary_count) as u8
-            };
-            ShaderTextureSampleOutput::new(ShaderRegister::new(u16::from(register)), *component)
-                .expect("decoded texture component is in RGBA range")
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    if fetch {
-        Ok(ShaderOperation::LoadTexture2D {
+            }))
+        };
+        outputs.push(
+            ShaderTextureSampleOutput::new(register, component).expect("decoded component is RGBA"),
+        );
+    }
+    let sampled_registers = if half_output {
+        outputs.iter().map(|o| o.destination()).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let outputs = outputs.into_boxed_slice();
+    let sample = if fetch {
+        ShaderOperation::LoadTexture2D {
             outputs,
             coordinates: [
                 ShaderRegister::new(u16::from(x_coordinate)),
@@ -210,9 +232,9 @@ pub(super) fn decode_texture_access_simplified(
             ],
             image_binding: binding.image_binding,
             mip_level: 0,
-        })
+        }
     } else if selector == 1 {
-        Ok(ShaderOperation::SampleTexture2D {
+        ShaderOperation::SampleTexture2D {
             outputs,
             coordinates: [
                 ShaderRegister::new(u16::from(x_coordinate)),
@@ -220,9 +242,9 @@ pub(super) fn decode_texture_access_simplified(
             ],
             image_binding: binding.image_binding,
             sampler_binding: binding.sampler_binding.expect("TEXS reserves a sampler"),
-        })
+        }
     } else {
-        Ok(ShaderOperation::SampleTexture2DArray {
+        ShaderOperation::SampleTexture2DArray {
             outputs,
             coordinates: [
                 ShaderRegister::new(u16::from(x_coordinate + 1)),
@@ -231,8 +253,68 @@ pub(super) fn decode_texture_access_simplified(
             array_index: ShaderRegister::new(u16::from(x_coordinate)),
             image_binding: binding.image_binding,
             sampler_binding: binding.sampler_binding.expect("TEXS reserves a sampler"),
-        })
+        }
+    };
+    let mut operations = vec![sample];
+    if half_output {
+        // TEXS.F16 packs selected components in pairs, not consecutive dword
+        // outputs. Sample into temporaries first: coordinates/destinations may
+        // alias, and split destinations that overlap in F32 are valid in F16.
+        // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/frontend/maxwell/translate/impl/texture_fetch_swizzled.cpp#L218-L251
+        let temporary = |next: &mut u16| {
+            allocate_shader_temporary(
+                stage,
+                offset,
+                encoding,
+                "TEXS half packing temporary overflow",
+                next,
+            )
+        };
+        for (pair, registers) in sampled_registers.chunks(2).enumerate() {
+            let destination = ShaderRegister::new(u16::from(if pair == 0 {
+                primary_destination
+            } else {
+                secondary_destination
+            }));
+            let low = temporary(next_temporary)?;
+            operations.push(ShaderOperation::PackHalf32 {
+                destination: low,
+                source: registers[0],
+            });
+            if registers.len() == 1 {
+                operations.push(ShaderOperation::Move32 {
+                    destination,
+                    source: low,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                });
+            } else {
+                let high = temporary(next_temporary)?;
+                let shift = temporary(next_temporary)?;
+                operations.push(ShaderOperation::PackHalf32 {
+                    destination: high,
+                    source: registers[1],
+                });
+                operations.push(ShaderOperation::MoveImmediate32 {
+                    destination: shift,
+                    bits: 16,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                });
+                operations.push(ShaderOperation::ShiftLeft32 {
+                    destination: high,
+                    value: high,
+                    amount: shift,
+                    wrap: false,
+                });
+                operations.push(ShaderOperation::Bitwise32 {
+                    destination,
+                    left: low,
+                    right: high,
+                    operation: ShaderBitwiseOperation::Or,
+                });
+            }
+        }
     }
+    Ok(operations)
 }
 
 #[cfg(test)]

@@ -8,6 +8,70 @@ use nixe_memory::{
 use super::*;
 
 #[test]
+fn notification_address_state_arms_a_single_following_no_operation() {
+    let mut channel = three_d_channel();
+    for (method, value) in [(0x0104, 0x12), (0x0108, 0x3456_7890)] {
+        let dispatch = dispatch_method(&mut channel, method / 4, value).unwrap();
+        assert!(dispatch.ordered_operations().is_empty());
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register(GpuMethodId(method))
+                .and_then(MaxwellThreeDRegister::raw),
+            Some(value)
+        );
+    }
+    assert!(
+        dispatch_method(&mut channel, 0x010c / 4, 0)
+            .unwrap()
+            .ordered_operations()
+            .is_empty()
+    );
+    let dispatch = dispatch_method(&mut channel, 0x0100 / 4, 0x1234).unwrap();
+    assert!(matches!(
+        dispatch.ordered_operations(),
+        [MaxwellEngineOperation::Notification {
+            address: 0x0012_3456_7890,
+            ..
+        }]
+    ));
+    assert!(
+        dispatch_method(&mut channel, 0x0100 / 4, 0)
+            .unwrap()
+            .ordered_operations()
+            .is_empty()
+    );
+    assert!(dispatch_method(&mut channel, 0x010c / 4, 1).is_err());
+    assert!(dispatch_method(&mut channel, 0x0104 / 4, 0x100).is_err());
+}
+
+#[test]
+fn pending_notification_rejects_unimplemented_completions_and_context_switches() {
+    let mut channel = three_d_channel();
+    assert!(dispatch_method(&mut channel, 0x010c / 4, 0).is_err());
+    dispatch_first(
+        &mut channel,
+        &packet_on_subchannel(1, 0, SWITCH_1_GM20B_PROFILE.classes().compute().0),
+    )
+    .unwrap();
+    dispatch_method(&mut channel, 0x0104 / 4, 0).unwrap();
+    dispatch_method(&mut channel, 0x0108 / 4, 0x1000).unwrap();
+    dispatch_method(&mut channel, 0x010c / 4, 0).unwrap();
+    assert!(dispatch_method(&mut channel.clone(), 0x010c / 4, 0).is_err());
+    assert!(dispatch_method(&mut channel.clone(), 0x0108 / 4, 0x2000).is_err());
+    assert!(dispatch_method(&mut channel.clone(), 0x0f7c / 4, 0).is_err());
+    assert!(
+        dispatch_method(
+            &mut channel.clone(),
+            0,
+            SWITCH_1_GM20B_PROFILE.classes().three_d().0
+        )
+        .is_err()
+    );
+    assert!(dispatch_first(&mut channel, &packet_on_subchannel(1, 0x0100 / 4, 0)).is_err());
+}
+
+#[test]
 fn draws_stop_consuming_vertex_streams_when_their_attributes_are_disabled() {
     let vertices = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
     let color = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
@@ -1345,8 +1409,8 @@ fn clear_rect_scissor_and_viewport_clip_compose_into_one_neutral_region() {
         .expect("clear command");
     assert_eq!(target.origin.x, 12);
     assert_eq!(target.origin.y, 9);
-    assert_eq!(target.extent.width, 33);
-    assert_eq!(target.extent.height, 9);
+    assert_eq!(target.extent.width, 38);
+    assert_eq!(target.extent.height, 11);
 
     program_three_d(&mut channel, 0x0c00, (60 << 16) | 55);
     let empty_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -1809,6 +1873,7 @@ fn viewport_scale_offset_draw_validation_follows_enable_only() {
     ));
 
     program_three_d(&mut channel, 0x192c, 1);
+    program_three_d(&mut channel, 0x193c, 0);
     for (method, value) in [
         (0x0a00, 3.0_f32),
         (0x0a04, -4.0_f32),
@@ -2600,6 +2665,40 @@ fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
             .shadow_register(GpuMethodId(0x13ac))
             .is_none()
     );
+}
+
+#[test]
+fn mme_scratch_reads_verified_initial_values_without_defaulting_unknown_registers() {
+    for index in [0_u32, 40, 127, 128, 255] {
+        let mut channel = three_d_channel();
+        let method = 0x3400 + index * 4;
+        let read_and_exit = 5 | (1 << 4) | (1 << 7) | (2 << 8) | ((method / 4) << 14);
+        load_mme_program(&mut channel, 3, &[read_and_exit, 0x11]);
+        let before = channel.three_d().clone();
+        let result = dispatch_method(&mut channel, 0x3818 / 4, 0);
+        if index < 128 {
+            result.unwrap();
+        } else {
+            assert!(matches!(
+                result,
+                Err(MaxwellEngineDispatchError::MmeExecution {
+                    error: MaxwellThreeDMmeExecutionError::RegisterReadUnavailable { .. },
+                    ..
+                })
+            ));
+        }
+        assert_eq!(channel.three_d(), &before);
+        program_three_d(&mut channel, method, 0xcafe_babe);
+        dispatch_method(&mut channel, 0x3818 / 4, 0).unwrap();
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register(GpuMethodId(method))
+                .unwrap()
+                .raw(),
+            Some(0xcafe_babe)
+        );
+    }
 }
 
 #[test]
@@ -3804,5 +3903,26 @@ fn render_target_index_offset_is_typed_source_preserving_and_conditionally_depen
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
+    }
+}
+
+#[test]
+fn opportunistic_early_z_threshold_retains_sources_and_rejects_reserved_encodings() {
+    let mut channel = three_d_channel();
+    for raw in (0..=19).chain([31]) {
+        let dispatch = dispatch_method(&mut channel, 0x204 / 4, raw).unwrap();
+        let register = channel
+            .three_d()
+            .shader_execution()
+            .opportunistic_early_z_hysteresis();
+        assert_eq!(register.value(), Some(&(raw as u8)));
+        assert_eq!(
+            register.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+        assert!(dispatch.ordered_operations().is_empty());
+    }
+    for raw in [20, 30, 32, u32::MAX] {
+        assert!(dispatch_method(&mut channel, 0x204 / 4, raw).is_err());
     }
 }

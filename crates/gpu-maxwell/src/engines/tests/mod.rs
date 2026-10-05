@@ -423,6 +423,7 @@ mod indexed;
 mod multisample;
 mod raster_pipeline;
 mod resources_compute;
+mod solid_rect;
 mod state_validation;
 mod tessellation;
 mod zcull;

@@ -1,10 +1,10 @@
 //! `IStorage` wire command decoding.
 
+use crate::IpcRequest;
+use crate::ipc_wire::IpcWireError;
 use crate::ipc_wire::buffer::one_receive_buffer;
 use crate::ipc_wire::io::{has_ipc_descriptors, request_u64};
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
-use crate::ipc_wire::{IpcWireError, UnsupportedServiceOperation};
-use crate::{IpcRequest, MAX_IPC_STORAGE_READ_BYTES};
 
 use super::commands::StorageCommand;
 
@@ -27,17 +27,6 @@ pub(super) fn decode(
             let requested = request_u64(request.data, 8).ok_or(IpcWireError::Malformed(
                 "storage read request omits its size",
             ))?;
-            if requested > MAX_IPC_STORAGE_READ_BYTES as u64 {
-                return Err(IpcWireError::UnsupportedService(
-                    UnsupportedServiceOperation::CommandSizeLimitExceeded {
-                        service: "IStorage",
-                        command_id: request.command_id,
-                        operation: "read",
-                        requested,
-                        limit: MAX_IPC_STORAGE_READ_BYTES as u64,
-                    },
-                ));
-            }
             let requested = usize::try_from(requested).map_err(|_| {
                 IpcWireError::Malformed("storage read request size is out of range")
             })?;
@@ -62,5 +51,43 @@ pub(super) fn decode(
             }
             Ok(Some(IpcRequest::GetStorageSize))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_storage_reads_are_bounded_by_the_output_descriptor() {
+        let mut wire = [0_u8; 32];
+        wire[..4].copy_from_slice(&(4_u32 | (1 << 24)).to_le_bytes());
+        wire[8..12].copy_from_slice(&(512_u32 * 1024 * 1024).to_le_bytes());
+        wire[12..16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        let hipc = HipcRequest::decode(&wire).unwrap();
+        let mut data = [0_u8; 16];
+        let size = 394_950_880_u64;
+        data[8..].copy_from_slice(&size.to_le_bytes());
+        let request = CmifRequest {
+            command_type: 4,
+            command_id: 0,
+            token: 0,
+            context: None,
+            data: &data,
+            domain: None,
+        };
+        assert_eq!(
+            decode(&request, &hipc).unwrap(),
+            Some(IpcRequest::ReadStorage {
+                offset: 0,
+                size: size as usize,
+            })
+        );
+        wire[8..12].copy_from_slice(&16_u32.to_le_bytes());
+        let hipc = HipcRequest::decode(&wire).unwrap();
+        assert!(matches!(
+            decode(&request, &hipc),
+            Err(IpcWireError::Malformed(_))
+        ));
     }
 }

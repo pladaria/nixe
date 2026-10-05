@@ -7,6 +7,7 @@ use crate::{PipelineStages, TessellationControl};
 /// are deliberately absent. Host float guarantees are device-wide cache inputs.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SpirvTessellationOptions {
+    pub depth_clip_negative_one_to_one: bool,
     pub input_control_points: u8,
     pub mode: TessellationMode,
     pub float32: SpirvFloat32Capabilities,
@@ -118,6 +119,7 @@ pub fn lower_tessellation_shaders_to_spirv(
     );
     let evaluation = &linked_evaluation;
     let base = SpirvShaderOptions {
+        depth_clip_negative_one_to_one: false,
         input_control_points: 0,
         tessellation_mode: None,
         float32: options.float32,
@@ -165,6 +167,7 @@ pub fn lower_tessellation_shaders_to_spirv(
             SpirvShaderOptions {
                 input_control_points: output_control_points,
                 tessellation_mode: Some(options.mode),
+                depth_clip_negative_one_to_one: options.depth_clip_negative_one_to_one,
                 ..base
             },
         )?,
@@ -206,7 +209,13 @@ pub fn lower_raster_shaders_to_spirv(
     );
     let modules = [
         lower_shader_ir_to_spirv(&vertex, options)?,
-        lower_shader_ir_to_spirv(fragment, options)?,
+        lower_shader_ir_to_spirv(
+            fragment,
+            SpirvShaderOptions {
+                depth_clip_negative_one_to_one: false,
+                ..options
+            },
+        )?,
     ];
     let bindings = pipeline_bindings(modules.iter().zip([
         PipelineStages::VERTEX_SHADER,

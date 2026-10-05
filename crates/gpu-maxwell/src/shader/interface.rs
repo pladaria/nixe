@@ -29,6 +29,20 @@ pub(super) fn decode_header_inputs(
     header: MaxwellShaderProgramHeader,
     vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
 ) -> Result<Vec<ShaderInterfaceElement>, MaxwellShaderTranslationError> {
+    // Legacy vertex colors have their own map, separate from generic varyings.
+    // Do not silently drop them (including their fixed-function color clamp).
+    // https://download.nvidia.com/open-gpu-doc/Shader-Program-Header/1/Shader-Program-Header.html#ImapColor
+    let color_map_bit = if header.stage == MaxwellShaderStage::Pixel {
+        448
+    } else {
+        320
+    };
+    if header.bits(color_map_bit, 16) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedHeaderFeature {
+            stage: header.stage,
+            feature: "legacy vertex color input attributes",
+        });
+    }
     let mut inputs = Vec::new();
     if header.stage == MaxwellShaderStage::Pixel {
         for component in 0..4_u8 {
@@ -94,6 +108,12 @@ pub(super) fn decode_header_inputs(
 pub(super) fn decode_header_outputs(
     header: MaxwellShaderProgramHeader,
 ) -> Result<Vec<ShaderInterfaceElement>, MaxwellShaderTranslationError> {
+    if header.stage != MaxwellShaderStage::Pixel && header.bits(560, 16) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedHeaderFeature {
+            stage: header.stage,
+            feature: "legacy vertex color output attributes",
+        });
+    }
     let mut outputs = Vec::new();
     if header.stage == MaxwellShaderStage::Pixel {
         for target in 0..8_u8 {
@@ -115,6 +135,9 @@ pub(super) fn decode_header_outputs(
         }
     } else {
         tessellation::header_outputs(header, &mut outputs);
+        if header.bit(427) {
+            outputs.push(interface_element(ShaderIoLocation::PointSize, 0, None));
+        }
         for component in 0..4_u8 {
             if header.bit(428 + component as usize) {
                 outputs.push(interface_element(
@@ -427,7 +450,12 @@ pub(super) fn decode_attribute_store(
     }
     let address = ((encoding >> 20) & 0x3ff) as u16;
     let (location, first_component) = attribute_location(stage, offset, encoding, address)?;
-    if first_component + components > 4 {
+    let available_components = if location == ShaderIoLocation::PointSize {
+        1
+    } else {
+        4
+    };
+    if first_component + components > available_components {
         return Err(malformed(
             stage,
             offset,
@@ -721,6 +749,11 @@ pub(super) fn attribute_location(
     encoding: u64,
     address: u16,
 ) -> Result<(ShaderIoLocation, u8), MaxwellShaderTranslationError> {
+    // Scalar point-size slot in the public Maxwell shader ABI.
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak_private.h#L48
+    if address == 0x6c {
+        return Ok((ShaderIoLocation::PointSize, 0));
+    }
     if (0x70..=0x7c).contains(&address) && address.is_multiple_of(4) {
         return Ok((ShaderIoLocation::Position, ((address - 0x70) / 4) as u8));
     }

@@ -214,13 +214,13 @@ pub(in crate::ipc_wire) fn dispatch_vi(
                     let Some(layer_id) = request_u64(request.data, 0x40) else {
                         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                     };
-                    let Some(layer) = video.layer(layer_id) else {
+                    let descriptor = one_receive_buffer(hipc)?;
+                    let Some(layer) = session.open_layer(layer_id) else {
                         return cmif_error(
                             request.token,
                             HorizonIpcResult::SF_PRECONDITION_VIOLATION,
                         );
                     };
-                    let descriptor = one_receive_buffer(hipc)?;
                     let native_window = crate::graphics::encode_native_window(layer.binder_id);
                     write_descriptor_bytes(process, descriptor, &native_window)?;
                     Ok((
@@ -254,8 +254,18 @@ pub(in crate::ipc_wire) fn dispatch_vi(
                         None,
                     ))
                 }
-                ApplicationDisplayCommand::CloseLayer
-                | ApplicationDisplayCommand::DestroyStrayLayer => {
+                ApplicationDisplayCommand::CloseLayer => {
+                    let Some(layer_id) = request_u64(request.data, 0) else {
+                        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                    };
+                    let result = if session.close_layer(layer_id) {
+                        HorizonIpcResult::SUCCESS
+                    } else {
+                        HorizonIpcResult::SF_PRECONDITION_VIOLATION
+                    };
+                    cmif_error(request.token, result)
+                }
+                ApplicationDisplayCommand::DestroyStrayLayer => {
                     let Some(layer_id) = request_u64(request.data, 0) else {
                         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                     };

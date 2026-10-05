@@ -53,6 +53,13 @@ impl Emitter {
                         return Err(SpirvShaderError::Interface(location));
                     }
                     ShaderIoLocation::Position => (Some(spv::BuiltIn::Position), 4, false),
+                    // PointSize is a float scalar output of the vertex stage.
+                    // https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-builtin-variables-pointsize
+                    ShaderIoLocation::PointSize
+                        if !input && ir.stage == ShaderStage::Vertex && scalar == self.float =>
+                    {
+                        (Some(spv::BuiltIn::PointSize), 1, false)
+                    }
                     ShaderIoLocation::VertexId | ShaderIoLocation::InstanceId
                         if input && ir.stage == ShaderStage::Vertex && scalar != self.float =>
                     {

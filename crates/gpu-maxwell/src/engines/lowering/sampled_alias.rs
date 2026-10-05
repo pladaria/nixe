@@ -143,6 +143,9 @@ pub(super) fn prepare(
             materialization: ViewMaterialization::CopiedColor { source, revision },
             cpu_writes: Some(image.cpu_write_dependency().clone()),
             write_revision: 0,
+            last_used: 0,
+            uninitialized_color_regions: Vec::new(),
+            uninitialized_depth_stencil_regions: Default::default(),
         });
         id
     };

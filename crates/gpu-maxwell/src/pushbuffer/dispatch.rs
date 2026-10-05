@@ -111,9 +111,18 @@ pub enum MaxwellSetObjectTransition {
     Replaced { previous: GpuClassId },
 }
 
-/// Verified operation selected by a legacy channel `MEM_OP_B` write.
+/// Verified synchronization selected by a channel host-method write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellHostMemoryOperation {
+pub enum MaxwellHostSynchronizationKind {
+    /// Drain prior engine work before processing subsequent channel methods.
+    WaitForIdle { all: bool },
+    SemaphoreRelease {
+        address: u64,
+        payload: u32,
+        short: bool,
+        wait: bool,
+        source: MaxwellMethodSource,
+    },
     /// Discard cached system-memory reads before later channel work proceeds.
     L2SysmemInvalidate { operand_high: u8 },
     /// Write back dirty device L2 data before later channel work proceeds.
@@ -124,8 +133,12 @@ pub enum MaxwellHostMemoryOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellHostMethod {
     Nop,
+    WaitForIdle { all: bool },
+    SemaphoreState,
+    SemaphoreRelease(MaxwellHostSynchronizationKind),
+    SetReference,
     LegacyMemOpA { operand_low: u32 },
-    LegacyMemOpB(MaxwellHostMemoryOperation),
+    LegacyMemOpB(MaxwellHostSynchronizationKind),
 }
 
 /// Semantic kind of a source-preserving method record.
@@ -447,6 +460,54 @@ fn dispatch_method(
     if method.method() == MAXWELL_SET_OBJECT_METHOD {
         return preflight_set_object(profile, source, frontend);
     }
+    // Host semaphore registers are channel-wide, independent of subchannel
+    // binding. RELEASE writes 4 bytes or {payload, zero, PTIMER} in 16 bytes.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/host/clb06f.h#L64-L97
+    // https://ni.4a.si/anonymous/yuzu/commit/?id=f1a2e367113518b277f34ffbb04499882c3b6051
+    if (0x10..=0x1c).contains(&method.method().0) {
+        let host = if method.method().0 < 0x1c {
+            let index = ((method.method().0 - 0x10) / 4) as usize;
+            let mask = [0xff, 0xffff_fffc, u32::MAX][index];
+            if source.argument & !mask != 0 {
+                return Err(MaxwellMethodDispatchError::InvalidHostMethodValue {
+                    source,
+                    defined_mask: mask,
+                });
+            }
+            frontend.set_host_semaphore(index, source.argument);
+            MaxwellHostMethod::SemaphoreState
+        } else {
+            // Acquire and reduction modes require different execution semantics.
+            // Keep them as actionable unsupported boundaries.
+            if source.argument & 0x1f != 2 || source.argument & !0x0110_001f != 0 {
+                return Err(MaxwellMethodDispatchError::UnsupportedHostMethod { source });
+            }
+            let [high, low, payload] = frontend.host_semaphore();
+            MaxwellHostMethod::SemaphoreRelease(MaxwellHostSynchronizationKind::SemaphoreRelease {
+                address: (u64::from(high) << 32) | u64::from(low),
+                payload,
+                short: source.argument & (1 << 24) != 0,
+                wait: source.argument & (1 << 20) == 0,
+                source,
+            })
+        };
+        return Ok(MaxwellMethodDispatch {
+            source,
+            class: profile.classes().gpfifo(),
+            kind: MaxwellMethodDispatchKind::HostMethod(host),
+        });
+    }
+    // SET_REFERENCE implicitly waits for prior engine work before publishing
+    // its 32-bit channel reference count.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/host/clb06f.h#L128-L129
+    if method.method() == GpuMethodId(0x50) {
+        frontend.set_reference_count(source.argument);
+        return Ok(MaxwellMethodDispatch {
+            source,
+            class: profile.classes().gpfifo(),
+            kind: MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::SetReference),
+        });
+    }
     // NVB06F_NOP accepts all 32 handle bits and is discarded by PBDMA.
     // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/host/clb06f.h
     // https://github.com/NVIDIA/open-gpu-doc/blob/master/manuals/turing/tu104/dev_pbdma.ref.txt
@@ -459,6 +520,23 @@ fn dispatch_method(
     }
     if method.method() == MAXWELL_LEGACY_MEM_OP_A_METHOD {
         return preflight_legacy_mem_op_a(profile, source, frontend);
+    }
+    // NVB06F_WFI has one scope bit: current SCG type or all types.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/host/clb06f.h#L130-L133
+    if method.method() == GpuMethodId(0x78) {
+        if source.argument & !1 != 0 {
+            return Err(MaxwellMethodDispatchError::InvalidHostMethodValue {
+                source,
+                defined_mask: 1,
+            });
+        }
+        return Ok(MaxwellMethodDispatch {
+            source,
+            class: profile.classes().gpfifo(),
+            kind: MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::WaitForIdle {
+                all: source.argument != 0,
+            }),
+        });
     }
     if method.method() == MAXWELL_LEGACY_MEM_OP_B_METHOD {
         return preflight_legacy_mem_op_b(profile, source);
@@ -515,10 +593,10 @@ fn preflight_legacy_mem_op_b(
     }
     let operation = ((source.argument & MEM_OP_B_OPERATION_MASK) >> MEM_OP_B_OPERATION_SHIFT) as u8;
     let operation = match operation {
-        MEM_OP_B_L2_SYSMEM_INVALIDATE => MaxwellHostMemoryOperation::L2SysmemInvalidate {
+        MEM_OP_B_L2_SYSMEM_INVALIDATE => MaxwellHostSynchronizationKind::L2SysmemInvalidate {
             operand_high: (source.argument & MEM_OP_B_OPERAND_HIGH_MASK) as u8,
         },
-        MEM_OP_B_L2_FLUSH_DIRTY => MaxwellHostMemoryOperation::L2FlushDirty {
+        MEM_OP_B_L2_FLUSH_DIRTY => MaxwellHostSynchronizationKind::L2FlushDirty {
             operand_high: (source.argument & MEM_OP_B_OPERAND_HIGH_MASK) as u8,
         },
         operation => {
@@ -855,6 +933,40 @@ mod tests {
     }
 
     #[test]
+    fn host_wfi_validates_scope_without_needing_an_engine_binding() {
+        for value in [0, 1, 2, u32::MAX] {
+            let decoded = decode(&[word(header(1, 0x78 / 4, 6, 1), 0), word(value, 1)]);
+            let mut channel = channel();
+            let result = dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(11),
+                &decoded.packets()[0],
+            );
+            if value <= 1 {
+                let dispatch = result.unwrap();
+                assert_eq!(
+                    dispatch.methods()[0].kind(),
+                    MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::WaitForIdle {
+                        all: value == 1
+                    })
+                );
+                assert_eq!(
+                    dispatch.methods()[0].class(),
+                    SWITCH_1_GM20B_PROFILE.classes().gpfifo()
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(MaxwellMethodDispatchError::InvalidHostMethodValue {
+                        defined_mask: 1,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn captured_legacy_mem_op_b_flushes_l2_without_a_subchannel_binding() {
         let decoded = decode(&[word(0x2001_c00b, 0), word(0x8000_0000, 1)]);
         let mut channel = channel();
@@ -872,7 +984,7 @@ mod tests {
         assert_eq!(
             method.kind(),
             MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpB(
-                MaxwellHostMemoryOperation::L2FlushDirty { operand_high: 0 },
+                MaxwellHostSynchronizationKind::L2FlushDirty { operand_high: 0 },
             ))
         );
         assert_eq!(
@@ -900,7 +1012,7 @@ mod tests {
         assert_eq!(
             method.kind(),
             MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpB(
-                MaxwellHostMemoryOperation::L2SysmemInvalidate { operand_high: 0 },
+                MaxwellHostSynchronizationKind::L2SysmemInvalidate { operand_high: 0 },
             ))
         );
     }
@@ -930,7 +1042,7 @@ mod tests {
         assert_eq!(
             dispatched.methods()[1].kind(),
             MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpB(
-                MaxwellHostMemoryOperation::L2FlushDirty { operand_high: 0xab },
+                MaxwellHostSynchronizationKind::L2FlushDirty { operand_high: 0xab },
             ))
         );
     }

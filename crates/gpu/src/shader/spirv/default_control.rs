@@ -168,6 +168,7 @@ pub fn lower_default_tessellation_control_to_spirv(
     )
     .with_tessellation_control_points(Some(u32::from(options.input_control_points)));
     let mut e = Emitter::new(SpirvShaderOptions {
+        depth_clip_negative_one_to_one: false,
         input_control_points: u32::from(options.input_control_points),
         tessellation_mode: None,
         float32: Default::default(),

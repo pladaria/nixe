@@ -645,6 +645,7 @@ pub struct MaxwellThreeDDepthStencilTargetState {
     array_pitch: MaxwellThreeDRegister<u32>,
     layer: MaxwellThreeDRegister<u16>,
     compression: MaxwellThreeDRegister<MaxwellThreeDZCompressionMode>,
+    sparse: MaxwellThreeDRegister<u8>,
 }
 
 impl Default for MaxwellThreeDDepthStencilTargetState {
@@ -670,11 +671,22 @@ impl Default for MaxwellThreeDDepthStencilTargetState {
                 Some(MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET as u16),
             ),
             compression: MaxwellThreeDRegister::default(),
+            // NVIDIA's public GM20B context writes zero to B197 dword 0x482.
+            // Table SHA256: 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24.
+            // https://gitlab.com/kernel-firmware/linux-firmware/-/blob/main/WHENCE
+            // https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
+            sparse: MaxwellThreeDRegister::verified_reset(0, Some(0)),
         }
     }
 }
 
 impl MaxwellThreeDDepthStencilTargetState {
+    /// Bit 0 enables sparse depth; bit 1 selects the unmapped comparison policy.
+    #[must_use]
+    pub const fn sparse(&self) -> &MaxwellThreeDRegister<u8> {
+        &self.sparse
+    }
+
     #[must_use]
     pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
         &self.address_upper
@@ -874,10 +886,11 @@ impl MaxwellThreeDClearState {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDRenderTargetState {
     color: [MaxwellThreeDColorTargetState; MAXWELL_COLOR_TARGET_COUNT],
     color_target_selection: MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection>,
+    srgb_write: MaxwellThreeDRegister<bool>,
     compression_threshold: MaxwellThreeDRegister<MaxwellThreeDCompressionThreshold>,
     color_zero_bandwidth_clear: MaxwellThreeDRegister<u16>,
     depth_zero_bandwidth_clear: MaxwellThreeDRegister<u16>,
@@ -889,7 +902,32 @@ pub struct MaxwellThreeDRenderTargetState {
     clear: MaxwellThreeDClearState,
 }
 
+impl Default for MaxwellThreeDRenderTargetState {
+    fn default() -> Self {
+        Self {
+            color: Default::default(),
+            color_target_selection: Default::default(),
+            // GM20B's public context method table clears B197 dword 0x56e.
+            // Provenance and hash are documented in verified_raw_register_reset.
+            srgb_write: MaxwellThreeDRegister::verified_reset(0, Some(false)),
+            compression_threshold: Default::default(),
+            color_zero_bandwidth_clear: Default::default(),
+            depth_zero_bandwidth_clear: Default::default(),
+            separate_fragment_data: Default::default(),
+            render_target_layer: Default::default(),
+            render_target_index_offset: Default::default(),
+            depth_target_count: Default::default(),
+            depth_stencil: Default::default(),
+            clear: Default::default(),
+        }
+    }
+}
+
 impl MaxwellThreeDRenderTargetState {
+    #[must_use]
+    pub const fn srgb_write(&self) -> &MaxwellThreeDRegister<bool> {
+        &self.srgb_write
+    }
     #[must_use]
     pub const fn color(&self) -> &[MaxwellThreeDColorTargetState; MAXWELL_COLOR_TARGET_COUNT] {
         &self.color
@@ -1023,6 +1061,9 @@ impl MaxwellThreeDRenderTargetState {
                 self.depth_zero_bandwidth_clear =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDRenderTargetWrite::SrgbWrite { value, .. } => {
+                self.srgb_write = MaxwellThreeDRegister::programmed(raw, value, source);
+            }
             MaxwellThreeDRenderTargetWrite::SeparateFragmentData { value, .. } => {
                 self.separate_fragment_data = MaxwellThreeDRegister::programmed(raw, value, source)
             }
@@ -1043,6 +1084,9 @@ impl MaxwellThreeDRenderTargetState {
             MaxwellThreeDRenderTargetWrite::DepthAddressLower { value, .. } => {
                 self.depth_stencil.address_lower =
                     MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDRenderTargetWrite::DepthSparse { value, .. } => {
+                self.depth_stencil.sparse = MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDRenderTargetWrite::DepthFormat { value, .. } => {
                 self.depth_stencil.format = MaxwellThreeDRegister::programmed(raw, value, source)
@@ -1170,6 +1214,10 @@ pub enum MaxwellThreeDRenderTargetWrite {
         value: u16,
         source: MaxwellMethodSource,
     },
+    SrgbWrite {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
     SeparateFragmentData {
         value: MaxwellThreeDSeparateFragmentData,
         source: MaxwellMethodSource,
@@ -1192,6 +1240,10 @@ pub enum MaxwellThreeDRenderTargetWrite {
     },
     DepthAddressLower {
         value: u32,
+        source: MaxwellMethodSource,
+    },
+    DepthSparse {
+        value: u8,
         source: MaxwellMethodSource,
     },
     DepthFormat {
@@ -1275,6 +1327,7 @@ impl MaxwellThreeDRenderTargetWrite {
             | Self::CompressionThreshold { source, .. }
             | Self::ColorZeroBandwidthClear { source, .. }
             | Self::DepthZeroBandwidthClear { source, .. }
+            | Self::SrgbWrite { source, .. }
             | Self::SeparateFragmentData { source, .. }
             | Self::RenderTargetLayer { source, .. }
             | Self::RenderTargetIndexOffset { source, .. }
@@ -1282,6 +1335,7 @@ impl MaxwellThreeDRenderTargetWrite {
             | Self::DepthAddressUpper { source, .. }
             | Self::DepthAddressLower { source, .. }
             | Self::DepthFormat { source, .. }
+            | Self::DepthSparse { source, .. }
             | Self::DepthLayout { source, .. }
             | Self::DepthWidth { source, .. }
             | Self::DepthHeight { source, .. }

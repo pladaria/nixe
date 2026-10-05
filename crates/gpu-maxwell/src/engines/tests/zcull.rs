@@ -305,13 +305,128 @@ fn zcull_geometry_does_not_fabricate_draw_resources_or_counter_operations() {
         ),
         Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
-    // Configuring subregions must not accidentally accept the separate report,
-    // allocation or guest-storage operations before they are implemented.
-    for method in [0x02f8, 0x036c, 0x0370, 0x07e8] {
-        assert!(matches!(
-            dispatch_method(&mut channel, method / 4, 0),
-            Err(MaxwellEngineDispatchError::UnknownMethod { .. })
-                | Err(MaxwellEngineDispatchError::UnsupportedMethod { .. })
-        ));
+}
+
+#[test]
+fn zcull_storage_retains_addresses_without_creating_attachment_operations() {
+    let mut channel = three_d_channel();
+    let before = channel.three_d().clone();
+    for (index, (method, value)) in [
+        (0x7e8, 0xab),
+        (0x7ec, 0x1234_0000),
+        (0x7f0, 0xab),
+        (0x7f4, 0x1234_ffff),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dispatch = dispatch_method(&mut channel, method / 4, value).unwrap();
+        assert!(dispatch.ordered_operations().is_empty());
+        let register = channel.three_d().zcull().storage_word(index).unwrap();
+        assert_eq!(register.raw(), Some(value));
+        assert_eq!(
+            register.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
     }
+    assert!(channel.three_d().draw_state_identity().matches(&before));
+    assert!(
+        before
+            .resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false)
+            .matches(channel.three_d())
+    );
+    assert!(dispatch_method(&mut channel, 0x7e8 / 4, 0x100).is_err());
+    assert_eq!(
+        channel.three_d().zcull().storage_word(0).unwrap().raw(),
+        Some(0xab)
+    );
+}
+
+#[test]
+fn zcull_serialization_does_not_change_depth_resources_or_draw_state() {
+    let mut channel = three_d_channel();
+    let before = channel.three_d().clone();
+    for method in [0x1464, 0x1500] {
+        for value in [0, 1] {
+            let dispatch = dispatch_method(&mut channel, method / 4, value).unwrap();
+            assert!(dispatch.ordered_operations().is_empty());
+            assert!(before.draw_state_identity().matches(channel.three_d()));
+            assert!(
+                before
+                    .resource_state_identity(
+                        &[MaxwellThreeDResourceRole::DepthStencilTarget],
+                        false
+                    )
+                    .matches(channel.three_d())
+            );
+        }
+        assert!(dispatch_method(&mut channel, method / 4, 2).is_err());
+    }
+}
+
+#[test]
+fn zcull_allocation_decodes_documented_formats_and_rejects_reserved_values() {
+    let mut channel = three_d_channel();
+    for format in (0..=12).chain([15]) {
+        let raw = 0x0012_34ab | format << 24;
+        dispatch_method(&mut channel, 0x2f8 / 4, raw).unwrap();
+        let register = channel.three_d().zcull().subregion_allocation();
+        assert_eq!(register.raw(), Some(raw));
+        let allocation = register.value().unwrap();
+        assert_eq!(allocation.id(), 0xab);
+        assert_eq!(allocation.aliquots(), 0x1234);
+        assert_eq!(
+            allocation.format().map(u32::from),
+            if format == 15 { None } else { Some(format) }
+        );
+    }
+    for raw in [13 << 24, 14 << 24, 1 << 28] {
+        assert!(dispatch_method(&mut channel, 0x2f8 / 4, raw).is_err());
+    }
+    for value in [0, 1] {
+        dispatch_method(&mut channel, 0x2fc / 4, value).unwrap();
+        assert_eq!(
+            channel.three_d().zcull().subregion_algorithm().raw(),
+            Some(value)
+        );
+    }
+    assert!(dispatch_method(&mut channel, 0x2fc / 4, 2).is_err());
+}
+
+#[test]
+fn zcull_report_configuration_does_not_emit_a_counter_report() {
+    let mut channel = three_d_channel();
+    for value in [0, 1, 0x0ff1] {
+        let dispatch = dispatch_method(&mut channel, 0x36c / 4, value).unwrap();
+        assert!(dispatch.ordered_operations().is_empty());
+        assert_eq!(
+            channel.three_d().zcull().report_selection().raw(),
+            Some(value)
+        );
+    }
+    for kind in 0..4 {
+        for enabled in [0, 1] {
+            let value = kind << 4 | enabled;
+            let dispatch = dispatch_method(&mut channel, 0x370 / 4, value).unwrap();
+            assert!(dispatch.ordered_operations().is_empty());
+            assert_eq!(channel.three_d().zcull().report_type().raw(), Some(value));
+        }
+    }
+    assert!(dispatch_method(&mut channel, 0x36c / 4, 2).is_err());
+    assert!(dispatch_method(&mut channel, 0x370 / 4, 0x41).is_err());
+}
+
+#[test]
+fn clearing_zcull_statistics_does_not_clear_depth_or_other_counters() {
+    let mut channel = three_d_channel();
+    let before = channel.three_d().clone();
+    let dispatch = dispatch_method(&mut channel, 0x1530 / 4, 2).unwrap();
+    assert!(dispatch.ordered_operations().is_empty());
+    assert_eq!(channel.three_d().zcull(), before.zcull());
+    assert!(
+        before
+            .resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false)
+            .matches(channel.three_d())
+    );
+    assert!(dispatch_method(&mut channel, 0x1530 / 4, 1).is_err());
 }

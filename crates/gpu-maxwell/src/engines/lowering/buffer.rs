@@ -122,6 +122,9 @@ pub(super) fn prepare_buffer(
         materialization: ViewMaterialization::Direct,
         cpu_writes: None,
         write_revision: 0,
+        last_used: 0,
+        uninitialized_color_regions: Vec::new(),
+        uninitialized_depth_stencil_regions: Default::default(),
     });
     Ok(dependency)
 }

@@ -239,6 +239,9 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             .clone();
         assert!(!event.is_signalled());
         let mut buffer = [0; 40];
+        // Reserved fields must not chain buffers or shift the PCM address.
+        put_u64(&mut buffer, 0, u64::MAX);
+        put_u64(&mut buffer, 32, u64::MAX);
         put_u64(&mut buffer, 8, samples.get());
         put_u64(&mut buffer, 16, 4096);
         put_u64(&mut buffer, 24, 8);

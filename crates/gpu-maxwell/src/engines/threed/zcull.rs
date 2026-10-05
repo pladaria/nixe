@@ -4,8 +4,8 @@
 //! Z-cull binding and from immutable GPU-profile capabilities. Region geometry
 //! describes the hardware's hierarchical depth/stencil cache, not the depth
 //! attachment. Neutral backends perform ordinary depth/stencil testing and do
-//! not consume this cache layout. Storage transfers and counter reports still
-//! require their own semantics; these register writes do not implement them.
+//! not consume this cache layout or serialize hardware culling metadata.
+//! Guest-visible counter reports still require their own accumulation semantics.
 //!
 //! Register fields and enumerants:
 //! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h>
@@ -435,9 +435,86 @@ impl MaxwellThreeDZCullStatsEnable {
     }
 }
 
+/// Allocation policy for one hierarchical-cache subregion. Format 15 selects
+/// NONE; formats 13 and 14 are reserved by the public class header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDZCullSubregionAllocation {
+    id: u8,
+    aliquots: u16,
+    format: Option<u8>,
+}
+
+impl MaxwellThreeDZCullSubregionAllocation {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        if raw & 0xf000_0000 != 0 {
+            return None;
+        }
+        let format = match raw >> 24 {
+            15 => None,
+            value @ 0..=12 => Some(value as u8),
+            _ => return None,
+        };
+        Some(Self {
+            id: raw as u8,
+            aliquots: (raw >> 8) as u16,
+            format,
+        })
+    }
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        self.id
+    }
+    #[must_use]
+    pub const fn aliquots(self) -> u16 {
+        self.aliquots
+    }
+    #[must_use]
+    pub const fn format(self) -> Option<u8> {
+        self.format
+    }
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.id as u32
+            | (self.aliquots as u32) << 8
+            | match self.format {
+                Some(f) => f as u32,
+                None => 15,
+            } << 24
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDZCullSubregionAlgorithm {
+    Static = 0,
+    Adaptive = 1,
+}
+
 /// One validated Z-cull register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDZCullStateWrite {
+    ReportSelection {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    ReportType {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    SubregionAllocation {
+        value: MaxwellThreeDZCullSubregionAllocation,
+        source: MaxwellMethodSource,
+    },
+    SubregionAlgorithm {
+        value: MaxwellThreeDZCullSubregionAlgorithm,
+        source: MaxwellMethodSource,
+    },
+    Storage {
+        index: usize,
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     RegionLocation {
         value: MaxwellThreeDZCullRegionLocation,
         source: MaxwellMethodSource,
@@ -493,6 +570,11 @@ pub enum MaxwellThreeDZCullStateWrite {
 /// Persistent Z-cull configuration on one `MAXWELL_B` engine.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDZCullState {
+    report_selection: MaxwellThreeDRegister<u32>,
+    report_type: MaxwellThreeDRegister<u32>,
+    subregion_allocation: MaxwellThreeDRegister<MaxwellThreeDZCullSubregionAllocation>,
+    subregion_algorithm: MaxwellThreeDRegister<MaxwellThreeDZCullSubregionAlgorithm>,
+    storage: [MaxwellThreeDRegister<u32>; 4],
     region_location: MaxwellThreeDRegister<MaxwellThreeDZCullRegionLocation>,
     region_aliquots: MaxwellThreeDRegister<u16>,
     region_format: MaxwellThreeDRegister<MaxwellThreeDZCullRegionFormat>,
@@ -508,6 +590,38 @@ pub struct MaxwellThreeDZCullState {
 }
 
 impl MaxwellThreeDZCullState {
+    /// Configuration for a later semaphore counter report; programming these
+    /// registers does not itself query a counter or write a result to memory.
+    #[must_use]
+    pub const fn report_selection(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.report_selection
+    }
+    #[must_use]
+    pub const fn report_type(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.report_type
+    }
+
+    #[must_use]
+    pub const fn subregion_allocation(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDZCullSubregionAllocation> {
+        &self.subregion_allocation
+    }
+    #[must_use]
+    pub const fn subregion_algorithm(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDZCullSubregionAlgorithm> {
+        &self.subregion_algorithm
+    }
+
+    /// Address upper/lower followed by limit-address upper/lower. Backends
+    /// use their native depth cache rather than this guest hardware backing;
+    /// no storage transfer is triggered by programming these registers.
+    #[must_use]
+    pub fn storage_word(&self, index: usize) -> Option<&MaxwellThreeDRegister<u32>> {
+        self.storage.get(index)
+    }
+
     #[must_use]
     pub const fn region_location(
         &self,
@@ -577,6 +691,30 @@ impl MaxwellThreeDZCullState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDZCullStateWrite) {
         match write {
+            MaxwellThreeDZCullStateWrite::ReportSelection { value, source } => {
+                self.report_selection = MaxwellThreeDRegister::programmed(value, value, source);
+            }
+            MaxwellThreeDZCullStateWrite::ReportType { value, source } => {
+                self.report_type = MaxwellThreeDRegister::programmed(value, value, source);
+            }
+
+            MaxwellThreeDZCullStateWrite::SubregionAllocation { value, source } => {
+                self.subregion_allocation =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDZCullStateWrite::SubregionAlgorithm { value, source } => {
+                self.subregion_algorithm =
+                    MaxwellThreeDRegister::programmed(value as u32, value, source);
+            }
+
+            MaxwellThreeDZCullStateWrite::Storage {
+                index,
+                value,
+                source,
+            } => {
+                self.storage[index] = MaxwellThreeDRegister::programmed(value, value, source);
+            }
+
             MaxwellThreeDZCullStateWrite::RegionLocation { value, source } => {
                 self.region_location =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);

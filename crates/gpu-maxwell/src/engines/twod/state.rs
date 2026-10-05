@@ -216,6 +216,7 @@ pub enum MaxwellTwoDStateWrite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellTwoDState {
     pub(super) blit: super::blit::MaxwellTwoDBlitState,
+    pub(super) solid: super::solid::SolidState,
     processing_clusters: MaxwellTwoDRegister<MaxwellTwoDProcessingClusters>,
     operation: MaxwellTwoDRegister<MaxwellTwoDOperation>,
     clip_enable: MaxwellTwoDRegister<MaxwellTwoDClipEnable>,
@@ -236,6 +237,7 @@ impl Default for MaxwellTwoDState {
         // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_transfer.cpp
         Self {
             blit: Default::default(),
+            solid: Default::default(),
             processing_clusters: Default::default(),
             operation: Default::default(),
             clip_enable: Default::default(),

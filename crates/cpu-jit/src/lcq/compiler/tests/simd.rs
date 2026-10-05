@@ -1,6 +1,245 @@
 use super::integer::{compare, initial_state};
 
 #[test]
+fn table_lookup_matches_all_indices_table_lengths_and_aliases() {
+    for count in 1..=4_u32 {
+        for full in [false, true] {
+            for extend in [false, true] {
+                for rd in [0, 1, 2, 4, 31] {
+                    for batch in 0..16_u8 {
+                        let mut initial = initial_state();
+                        for register in 0..32_u8 {
+                            initial.set_vector(
+                                register,
+                                u128::from_le_bytes(std::array::from_fn(|i| {
+                                    register.wrapping_mul(17).wrapping_add(i as u8)
+                                })),
+                            );
+                        }
+                        initial.set_vector(
+                            4,
+                            u128::from_le_bytes(std::array::from_fn(|i| batch * 16 + i as u8)),
+                        );
+                        initial.set_fpsr(0x0800_009f);
+                        compare(
+                            0x0e04_03e0
+                                | ((count - 1) << 13)
+                                | (u32::from(full) << 30)
+                                | (u32::from(extend) << 12)
+                                | rd,
+                            initial,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn integer_sign_matches_wrapping_extremes_and_aliases() {
+    for scalar in [false, true] {
+        for size in 0..4 {
+            if scalar && size != 3 {
+                continue;
+            }
+            for full in [false, true] {
+                if scalar && !full || !scalar && size == 3 && !full {
+                    continue;
+                }
+                for negate in [false, true] {
+                    for (rd, rn) in [(0, 1), (1, 1), (31, 31)] {
+                        let mut initial = initial_state();
+                        initial.set_vector(rd, u128::MAX);
+                        initial.set_vector(rn, 0x8000_0000_0000_0000_807f_0100_ffff_8000);
+                        initial.set_fpsr(0x0800_009f);
+                        let base = if scalar { 0x5e20_b800 } else { 0x0e20_b800 };
+                        compare(
+                            base | (size << 22)
+                                | (u32::from(full) << 30)
+                                | (u32::from(negate) << 29)
+                                | (u32::from(rn) << 5)
+                                | u32::from(rd),
+                            initial,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn integer_add_wide_matches_signed_unsigned_source_halves_and_aliases() {
+    for size in 0..3 {
+        for unsigned in [false, true] {
+            for upper in [false, true] {
+                for (rd, rn, rm) in [(0, 1, 2), (1, 1, 2), (2, 1, 2), (31, 31, 31)] {
+                    let mut initial = initial_state();
+                    initial.set_vector(rd, u128::MAX);
+                    initial.set_vector(rn, 0xffff_ffff_0000_0001_7fff_ffff_8000_0000);
+                    initial.set_vector(rm, 0x8000_0001_ffff_ffff_807f_0203_fefd_0001);
+                    initial.set_fpsr(0x0800_009f);
+                    compare(
+                        0x0e20_1000
+                            | (size << 22)
+                            | (u32::from(unsigned) << 29)
+                            | (u32::from(upper) << 30)
+                            | (u32::from(rm) << 16)
+                            | (u32::from(rn) << 5)
+                            | u32::from(rd),
+                        initial,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scalar_integer_comparisons_match_masks_signedness_and_aliases() {
+    for base in [
+        0x5ee0_3400,
+        0x7ee0_3400,
+        0x5ee0_3c00,
+        0x7ee0_3c00,
+        0x5ee0_8c00,
+        0x7ee0_8c00,
+    ] {
+        for (rd, rn, rm) in [(0, 1, 2), (1, 2, 1), (31, 31, 31)] {
+            for (lhs, rhs) in [
+                (0_u64, 0_u64),
+                (0, 1),
+                (u64::MAX, 1),
+                (1 << 63, 0),
+                (0x1234, 0x1234),
+                (0xff00, 0x00ff),
+            ] {
+                let mut initial = initial_state();
+                initial.set_vector(rd, u128::MAX);
+                initial.set_vector(rn, u128::from(lhs) | (u128::from(rhs) << 64));
+                initial.set_vector(rm, u128::from(rhs) | (u128::from(lhs) << 64));
+                initial.set_fpsr(0x0800_009f);
+                compare(
+                    base | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd),
+                    initial,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn integer_min_max_across_matches_active_arrangements_and_aliases() {
+    for base in [0x0e30_a800, 0x0e31_a800, 0x2e30_a800, 0x2e31_a800] {
+        for size in 0..3 {
+            for full in [false, true] {
+                if size == 2 && !full {
+                    continue;
+                }
+                for (rd, rn) in [(0, 1), (31, 31)] {
+                    for value in [0, u128::MAX, 0x8000_0001_7fff_ffff_807f_0001_ffff_0203] {
+                        let mut initial = initial_state();
+                        initial.set_vector(rd, u128::MAX);
+                        initial.set_vector(rn, value);
+                        initial.set_fpsr(0x0800_009f);
+                        compare(
+                            base | (size << 22)
+                                | (u32::from(full) << 30)
+                                | (u32::from(rn) << 5)
+                                | u32::from(rd),
+                            initial,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shift_right_accumulate_matches_signed_unsigned_full_shifts_and_aliases() {
+    for size in 0..4 {
+        let width = 8 << size;
+        for scalar in [false, true] {
+            for full in [false, true] {
+                if (scalar && size != 3) || (!scalar && !full && size == 3) {
+                    continue;
+                }
+                for unsigned in [false, true] {
+                    for shift in [1, width / 2, width] {
+                        for (rd, rn) in [(0, 1), (31, 31)] {
+                            let mut initial = initial_state();
+                            initial.set_vector(rd, u128::MAX);
+                            initial.set_vector(rn, 0x8000_0001_ffff_ffff_807f_0102_fefd_0304);
+                            initial.set_fpsr(0x0800_009f);
+                            let word = (if scalar { 0x5f00_1400 } else { 0x0f00_1400 })
+                                | (u32::from(unsigned) << 29)
+                                | (u32::from(full || scalar) << 30)
+                                | ((width * 2 - shift) << 16)
+                                | (u32::from(rn) << 5)
+                                | u32::from(rd);
+                            compare(word, initial);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_integer_multiply_matches_lane_widths_wrapping_and_aliases() {
+    for size in 0..3 {
+        for full in [false, true] {
+            for (rd, rn, rm) in [(0, 1, 2), (31, 31, 2), (2, 31, 2), (31, 31, 31)] {
+                for (lhs, rhs) in [
+                    (0, u128::MAX),
+                    (u128::MAX, u128::MAX),
+                    (
+                        0x8000_ffff_7fff_0002_0102_0304_0506_0708,
+                        0x1234_5678_9abc_def0_fedc_ba98_7654_3210,
+                    ),
+                ] {
+                    let mut initial = initial_state();
+                    initial.set_vector(rd, u128::MAX);
+                    initial.set_vector(rn, lhs);
+                    initial.set_vector(rm, rhs);
+                    initial.set_fpsr(0x0800_009f);
+                    initial.set_fpcr(0x07c0_0000);
+                    compare(
+                        0x0e20_9c00
+                            | (size << 22)
+                            | (u32::from(full) << 30)
+                            | (u32::from(rm) << 16)
+                            | (u32::from(rn) << 5)
+                            | u32::from(rd),
+                        initial,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_not_native_lowering_matches_active_widths_and_aliases() {
+    for full in [false, true] {
+        for (rd, rn) in [(0, 0), (31, 31), (2, 31), (31, 2)] {
+            let mut initial = initial_state();
+            initial.set_vector(rd, u128::MAX);
+            initial.set_vector(rn, 0x1234_5678_9abc_def0_0123_4567_89ab_cdef);
+            initial.set_fpsr(0x0800_009f);
+            initial.set_fpcr(0x07c0_0000);
+            compare(
+                0x2e20_5800 | (u32::from(full) << 30) | (u32::from(rn) << 5) | u32::from(rd),
+                initial,
+            );
+        }
+    }
+}
+
+#[test]
 fn scalar_dup_native_lowering_matches_all_lanes_and_register_aliases() {
     for size in 0..4_u32 {
         for index in 0..16 >> size {

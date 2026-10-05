@@ -451,6 +451,53 @@ fn captured_deko_basic_color_target_accepts_its_matching_c32_pte_kind() {
 }
 
 #[test]
+fn sparse_depth_state_is_validated_only_when_the_attachment_is_consumed() {
+    let mut channel = three_d_channel();
+    assert_eq!(
+        channel
+            .three_d()
+            .render_targets()
+            .depth_stencil()
+            .sparse()
+            .value(),
+        Some(&0)
+    );
+    program_three_d(&mut channel, 0x0fe0, 0);
+    let space = resource_address_space();
+    for value in 0..4 {
+        let dispatch = dispatch_method(&mut channel, 0x1208 / 4, value).unwrap();
+        assert!(dispatch.ordered_operations().is_empty());
+        let state = channel.three_d().render_targets().depth_stencil().sparse();
+        assert_eq!(state.raw(), Some(value));
+        assert_eq!(state.value(), Some(&(value as u8)));
+        assert_eq!(
+            state.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+        program_three_d(&mut channel, 0x1538, 0);
+        assert!(resolve_maxwell_three_d_resources(channel.three_d(), &space).is_ok());
+        program_three_d(&mut channel, 0x1538, 1);
+        let error = resolve_maxwell_three_d_resources(channel.three_d(), &space).unwrap_err();
+        if value & 1 != 0 {
+            assert!(matches!(
+                error,
+                MaxwellThreeDResourceError::UnsupportedSparseDepth { .. }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                MaxwellThreeDResourceError::IncompleteState {
+                    role: MaxwellThreeDResourceRole::DepthStencilTarget
+                }
+            ));
+        }
+    }
+    let before = channel.clone();
+    assert!(dispatch_method(&mut channel, 0x1208 / 4, 4).is_err());
+    assert_eq!(channel, before);
+}
+
+#[test]
 fn three_d_depth_target_selection_controls_resolution_and_rejects_extra_targets_atomically() {
     let mut channel = three_d_channel();
     let dispatch = dispatch_method(&mut channel, 0x1538 / 4, 1).unwrap();
@@ -1642,16 +1689,16 @@ fn standalone_inline_to_memory_rejects_invalid_sequences_atomically() {
     ));
     assert_eq!(channel, before);
 
-    let setup = incrementing_packet_on_subchannel(2, 0x0180 / 4, &[4, 2, 4, 0x082b_30c0, 4]);
+    let setup = incrementing_packet_on_subchannel(2, 0x0180 / 4, &[4, 2, 4, 0x082b_30c0, 3]);
     dispatch_first(&mut channel, &setup).unwrap();
     let before = channel.clone();
-    let unsupported_completion = packet_on_subchannel(2, 0x01b0 / 4, 0x11);
+    let unsupported_completion = packet_on_subchannel(2, 0x01b0 / 4, 0x21);
     assert!(matches!(
         dispatch_first(&mut channel, &unsupported_completion),
         Err(
             MaxwellEngineDispatchError::InvalidInlineToMemoryMethodEncoding {
                 method_name: "LAUNCH_DMA",
-                reason: "only pitch, no-reduction, no-completion inline uploads are implemented",
+                reason: "interrupt, reduction, and semaphore release inline uploads are not implemented",
                 ..
             }
         )
@@ -1664,7 +1711,7 @@ fn standalone_inline_to_memory_rejects_invalid_sequences_atomically() {
         Err(
             MaxwellEngineDispatchError::InvalidInlineToMemoryMethodEncoding {
                 method_name: "LAUNCH_DMA",
-                reason: "multi-line pitch uploads are not implemented",
+                reason: "destination pitch is smaller than the line length",
                 ..
             }
         )
@@ -1801,6 +1848,46 @@ fn incomplete_bindings_reject_and_misaligned_descriptor_tables_defer() {
             .reason,
         "a descriptor pool address/range is misaligned or overflows"
     );
+}
+
+#[test]
+fn linked_sampler_pool_uses_the_texture_limit_and_tracks_mode_changes() {
+    let allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
+    let mut address_space = resource_address_space();
+    let mapping = map_resource(
+        &mut address_space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        11,
+        0,
+    );
+    let address = mapping.offset().get();
+    let mut channel = three_d_channel();
+    for (method, argument) in [
+        (0x155c, (address >> 32) as u32),
+        (0x1560, address as u32),
+        (0x1564, 0),
+        (0x157c, 63),
+        (0x1234, 1),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let roles = [MaxwellThreeDResourceRole::Samplers];
+    let mut cache = super::super::threed::MaxwellThreeDResolvedResourceCache::default();
+    for (mode, maximum, expected_size) in [(1, 63, 2048), (0, 63, 32), (1, 31, 1024)] {
+        program_three_d(&mut channel, 0x1234, mode);
+        program_three_d(&mut channel, 0x157c, maximum);
+        let resolved = cache
+            .resolve(channel.three_d(), &address_space, &roles, None, false, 4)
+            .unwrap();
+        let [MaxwellThreeDResolvedResource::Buffer(pool)] = resolved.resources() else {
+            panic!("expected only the consumed sampler pool");
+        };
+        assert_eq!(pool.role(), MaxwellThreeDResourceRole::Samplers);
+        assert_eq!(pool.view().size(), expected_size);
+        assert_eq!(pool.source().offset().get(), address);
+    }
 }
 
 #[test]
@@ -2183,6 +2270,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
         (0x0c08, 0.0_f32.to_bits()),
         (0x0c0c, 1.0_f32.to_bits()),
         (0x192c, 1),
+        (0x193c, 0),
         (0x0800, (target >> 32) as u32),
         (0x0804, target as u32),
         (0x0808, 64),
@@ -2578,6 +2666,7 @@ fn procedural_draw_lowers_without_fabricating_a_vertex_stream() {
         (0x0c08, 0.0_f32.to_bits()),
         (0x0c0c, 1.0_f32.to_bits()),
         (0x192c, 1),
+        (0x193c, 0),
         (0x0800, (target >> 32) as u32),
         (0x0804, target as u32),
         (0x0808, 64),
@@ -2929,7 +3018,7 @@ fn three_d_register_writes_do_not_mutate_compute_state() {
 fn taxonomy_separates_unsupported_invalid_capability_and_unknown_methods() {
     let mut channel = three_d_channel();
     let cases = [
-        (0x104, 0, "known Maxwell method is not implemented"),
+        (0x10c, 1, "known Maxwell method is not implemented"),
         (
             0x124,
             4,
@@ -4817,4 +4906,177 @@ fn known_compute_class_distinguishes_missing_method_coverage() {
             ..
         }
     ));
+}
+
+#[test]
+fn standalone_inline_upload_addresses_block_linear_rows_and_nonzero_origins() {
+    for (block_height, width, height, x, y, line_length, line_count, expected) in [
+        (
+            1,
+            64,
+            16,
+            0,
+            0,
+            64,
+            16,
+            vec![(0, 0), (4, 4), (16, 32), (32, 256), (64, 16), (512, 512)],
+        ),
+        (
+            3,
+            2048,
+            64,
+            0,
+            63,
+            2048,
+            1,
+            vec![(0, 3792), (16, 3824), (64, 7888)],
+        ),
+        (
+            0,
+            128,
+            16,
+            16,
+            8,
+            64,
+            2,
+            vec![(0, 1056), (16, 1280), (48, 1536), (64, 1072)],
+        ),
+    ] {
+        let mut channel = inline_to_memory_channel();
+        dispatch_first(
+            &mut channel,
+            &incrementing_packet_on_subchannel(
+                2,
+                0x180 / 4,
+                &[line_length, line_count, 4, 0x1000, 0],
+            ),
+        )
+        .unwrap();
+        let geometry = incrementing_packet_on_subchannel(
+            2,
+            0x194 / 4,
+            &[block_height << 4, width, height, 1, 0, x, y],
+        );
+        let registers = dispatch_first(&mut channel, &geometry).unwrap();
+        assert_eq!(
+            channel.inline_to_memory().origin_y().source(),
+            Some(registers.methods()[6].method().source())
+        );
+        dispatch_first(&mut channel, &packet_on_subchannel(2, 0x1b0 / 4, 0x1000)).unwrap();
+        let data: Vec<u32> = (0..line_length * line_count / 4).collect();
+        let dispatch = dispatch_first(
+            &mut channel,
+            &non_incrementing_packet_on_subchannel(2, 0x1b4 / 4, &data),
+        )
+        .unwrap();
+        for (linear, physical) in expected {
+            assert!(
+                matches!(dispatch.ordered_operations()[linear / 4], MaxwellEngineOperation::InlineToMemory(upload)
+                if upload.address().get() == 0x4_00001000 && upload.offset() == physical && upload.value() == (linear / 4) as u32)
+            );
+        }
+        assert!(channel.inline_to_memory().pending().is_none());
+    }
+}
+
+#[test]
+fn standalone_inline_pitch_rows_use_pitch_and_ignore_block_geometry() {
+    let mut channel = inline_to_memory_channel();
+    dispatch_first(
+        &mut channel,
+        &incrementing_packet_on_subchannel(2, 0x180 / 4, &[4, 2, 4, 0x1000, 8]),
+    )
+    .unwrap();
+    dispatch_first(
+        &mut channel,
+        &incrementing_packet_on_subchannel(2, 0x194 / 4, &[0xfff, 0, 0, 0, 7, 3, 9]),
+    )
+    .unwrap();
+    dispatch_first(&mut channel, &packet_on_subchannel(2, 0x1b0 / 4, 0x11)).unwrap();
+    let dispatch = dispatch_first(
+        &mut channel,
+        &non_incrementing_packet_on_subchannel(2, 0x1b4 / 4, &[11, 22]),
+    )
+    .unwrap();
+    for (index, offset) in [0, 8].into_iter().enumerate() {
+        assert!(
+            matches!(dispatch.ordered_operations()[index], MaxwellEngineOperation::InlineToMemory(upload) if upload.offset() == offset)
+        );
+    }
+    for (method, invalid) in [(0x194, 0x1000), (0x1a8, 0x200000), (0x1ac, 0x20000)] {
+        assert!(
+            dispatch_first(&mut channel, &packet_on_subchannel(2, method / 4, invalid)).is_err()
+        );
+    }
+    // Invalid geometry must be rejected when a block-linear launch consumes it.
+    assert!(dispatch_first(&mut channel, &packet_on_subchannel(2, 0x1b0 / 4, 0x1000)).is_err());
+}
+
+#[test]
+fn srgb_write_selects_linear_or_srgb_color_attachment_views() {
+    let allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
+    let backing = allocation
+        .backing_range(MemoryPermissions::READ_WRITE)
+        .unwrap();
+    let mut address_space = resource_address_space();
+    let address = map_resource(&mut address_space, backing, 12, 0xfe)
+        .offset()
+        .get();
+    let mut channel = three_d_channel();
+    assert_eq!(
+        channel.three_d().render_targets().srgb_write().value(),
+        Some(&false)
+    );
+    for (method, value) in [
+        (0x800, (address >> 32) as u32),
+        (0x804, address as u32),
+        (0x808, 16),
+        (0x80c, 16),
+        (0x814, 0x40),
+        (0x818, 1),
+        (0x81c, 0),
+        (0x15d0, 0),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    for (guest_format, linear, srgb) in [
+        (
+            0xd6,
+            nixe_gpu::ImageFormat::Rgba8Unorm,
+            nixe_gpu::ImageFormat::Rgba8Srgb,
+        ),
+        (
+            0xd0,
+            nixe_gpu::ImageFormat::Bgra8Unorm,
+            nixe_gpu::ImageFormat::Bgra8Srgb,
+        ),
+        (
+            0xd5,
+            nixe_gpu::ImageFormat::Rgba8Unorm,
+            nixe_gpu::ImageFormat::Rgba8Unorm,
+        ),
+    ] {
+        program_three_d(&mut channel, 0x810, guest_format);
+        for enabled in [false, true] {
+            let dispatch = dispatch_method(&mut channel, 0x15b8 / 4, u32::from(enabled)).unwrap();
+            assert_eq!(
+                channel.three_d().render_targets().srgb_write().source(),
+                Some(dispatch.methods()[0].method().source())
+            );
+            let resources = resolve_maxwell_three_d_resources_for_roles(
+                channel.three_d(),
+                &address_space,
+                &[MaxwellThreeDResourceRole::ColorTarget(0)],
+            )
+            .unwrap();
+            let MaxwellThreeDResolvedResource::Image(image) = &resources.resources()[0] else {
+                panic!("expected attachment")
+            };
+            assert_eq!(
+                image.description().format(),
+                if enabled { srgb } else { linear }
+            );
+        }
+    }
+    assert!(dispatch_method(&mut channel, 0x15b8 / 4, 2).is_err());
 }

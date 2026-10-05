@@ -1253,6 +1253,7 @@ dependencies = [
 name = "nixe-gpu"
 version = "0.1.0"
 dependencies = [
+ "half",
  "naga",
  "nixe-memory",
  "rspirv",

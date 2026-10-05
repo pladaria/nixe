@@ -154,6 +154,9 @@ pub(super) fn preflight(
     if let Some(result) = super::blit::apply(method, candidate) {
         return result;
     }
+    if let Some(result) = super::solid::apply(method, candidate) {
+        return result;
+    }
     let source = method.source();
     let declaration = METHODS
         .iter()

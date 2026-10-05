@@ -25,6 +25,11 @@ pub struct HorizonIpcResult(u32);
 
 impl HorizonIpcResult {
     pub const SUCCESS: Self = Self(0);
+    // NIFM request results used by the public client and offline service.
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nifm.c
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/nifm/nifm.cpp
+    pub(crate) const NIFM_NOT_SUBMITTED: Self = Self::new(110, 311);
+    pub(crate) const NIFM_COMMUNICATION_DISABLED: Self = Self::new(110, 1111);
 
     /// Decodes an arbitrary result received from guest memory.
     #[must_use]
@@ -41,6 +46,8 @@ impl HorizonIpcResult {
 
     pub const CMIF_NOT_SUPPORTED: Self = Self::new(MODULE_SF, 1);
     pub const SF_PRECONDITION_VIOLATION: Self = Self::new(MODULE_SF, 3);
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/hid_core/hid_result.h
+    pub const HID_INVALID_NPAD_ID: Self = Self::new(202, 709);
     pub const CMIF_INVALID_IN_HEADER: Self = Self::new(MODULE_SF, 211);
     pub const CMIF_UNKNOWN_COMMAND_ID: Self = Self::new(MODULE_SF, 221);
     pub const CMIF_TARGET_NOT_FOUND: Self = Self::new(MODULE_SF, 261);
@@ -51,6 +58,10 @@ impl HorizonIpcResult {
     pub const TIME_NOT_COMPARABLE: Self = Self::new(MODULE_TIME, 200);
     /// A time calculation exceeded Horizon's signed 64-bit representation.
     pub const TIME_OVERFLOWED: Self = Self::new(MODULE_TIME, 201);
+    /// A launch/storage channel has no data to pop. This is distinct from
+    /// ReceiveMessage's empty message queue result.
+    /// https://source.hodakov.me/hdkv/yuzu/commit/6cc741a886fa26a0a332d4968b86560cb73f3e2f
+    pub const AM_NO_DATA_IN_CHANNEL: Self = Self::new(MODULE_AM, 2);
     /// `ICommonStateGetter::ReceiveMessage` found no queued applet message.
     /// https://switchbrew.org/w/index.php?title=Applet_Manager_services&oldid=14818#ReceiveMessage
     pub const AM_NO_MESSAGES: Self = Self::new(MODULE_AM, 3);
@@ -144,6 +155,7 @@ mod tests {
             (HorizonIpcResult::TIME_NOT_COMPARABLE, 116, 200, 0x19074),
             (HorizonIpcResult::TIME_OVERFLOWED, 116, 201, 0x19274),
             (HorizonIpcResult::AM_NO_MESSAGES, 128, 3, 0x680),
+            (HorizonIpcResult::AM_NO_DATA_IN_CHANNEL, 128, 2, 0x480),
             (HorizonIpcResult::FS_PATH_NOT_FOUND, 2, 1, 0x202),
             (HorizonIpcResult::FS_OUT_OF_RANGE, 2, 3005, 0x177a02),
             (

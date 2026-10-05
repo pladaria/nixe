@@ -3,6 +3,7 @@ use super::prelude::*;
 enum NetworkInterfaceTarget {
     Root,
     GeneralService(NetworkGeneralServiceSession),
+    Request(NetworkRequestSession),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +62,9 @@ pub(in crate::ipc_wire) fn dispatch_network_interface(
                     NetworkInterfaceObject::GeneralService(service) => {
                         NetworkInterfaceTarget::GeneralService(service)
                     }
+                    NetworkInterfaceObject::Request(session) => {
+                        NetworkInterfaceTarget::Request(session)
+                    }
                 }
             }
         }
@@ -77,7 +81,10 @@ pub(in crate::ipc_wire) fn dispatch_network_interface(
             dispatch_network_interface_manager(process, manager, request, hipc)
         }
         NetworkInterfaceTarget::GeneralService(service) => {
-            dispatch_network_general_service(&service, request)
+            dispatch_network_general_service(process, Some(manager), &service, request, hipc)
+        }
+        NetworkInterfaceTarget::Request(session) => {
+            dispatch_network_request(process, true, &session, request, hipc)
         }
     }
 }
@@ -150,10 +157,120 @@ fn dispatch_network_interface_manager(
 }
 
 pub(in crate::ipc_wire) fn dispatch_network_general_service(
+    process: &mut ExceptionProcessContext<'_>,
+    manager: Option<&NetworkInterfaceManagerSession>,
     _service: &NetworkGeneralServiceSession,
     request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    unsupported_service_command("IGeneralService", request.command_id)
+    if request.command_id != 4 {
+        return unsupported_service_command("IGeneralService", request.command_id);
+    }
+    let is_domain = manager.is_some_and(NetworkInterfaceManagerSession::is_domain);
+    // CreateRequest takes the request revision, currently revision 2.
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nifm.c
+    if !request.has_payload_size(4) || has_ipc_descriptors(hipc) {
+        return network_request_response(
+            request.token,
+            is_domain,
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+            &[],
+        );
+    }
+    if request_u32(request.data, 0) != Some(2) {
+        return Err(IpcWireError::UnsupportedService(
+            UnsupportedServiceOperation::CommandVariant {
+                service: "IGeneralService",
+                command_id: 4,
+                detail: "unsupported network request revision",
+            },
+        ));
+    }
+    let session = NetworkRequestSession::new();
+    if is_domain {
+        let Some(id) =
+            manager.and_then(|m| m.insert_object(NetworkInterfaceObject::Request(session)))
+        else {
+            return network_request_response(
+                request.token,
+                true,
+                HorizonIpcResult::CMIF_OUT_OF_DOMAIN_ENTRIES,
+                &[],
+            );
+        };
+        semantic_success(request.token, true, &[], &[], &[id], None)
+    } else {
+        let handle = process
+            .handles_mut()
+            .insert(HorizonIpcObject::NetworkRequest(session))
+            .map_err(|_| {
+                IpcWireError::HostResourceExhausted("installing a network request handle")
+            })?;
+        semantic_success(request.token, false, &[], &[], &[], Some(handle))
+    }
+}
+
+pub(in crate::ipc_wire) fn dispatch_network_request(
+    process: &mut ExceptionProcessContext<'_>,
+    is_domain: bool,
+    session: &NetworkRequestSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if !matches!(request.command_id, 0..=4) {
+        return unsupported_service_command("IRequest", request.command_id);
+    }
+    if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+        return network_request_response(
+            request.token,
+            is_domain,
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+            &[],
+        );
+    }
+    match request.command_id {
+        0 => network_request_response(
+            request.token,
+            is_domain,
+            HorizonIpcResult::SUCCESS,
+            &1_u32.to_le_bytes(),
+        ),
+        1 => network_request_response(request.token, is_domain, session.result(), &[]),
+        2 => {
+            let mut handles = [0; 2];
+            for (handle, event) in handles.iter_mut().zip(session.events()) {
+                *handle = process.handles_mut().insert(event).map_err(|_| {
+                    IpcWireError::HostResourceExhausted("installing a network request event")
+                })?;
+            }
+            semantic_success(request.token, is_domain, &[], &handles, &[], None)
+        }
+        3 => {
+            // Offline requests finish synchronously; cancel has no pending work.
+            network_request_response(request.token, is_domain, HorizonIpcResult::SUCCESS, &[])
+        }
+        4 => {
+            session.submit();
+            network_request_response(request.token, is_domain, HorizonIpcResult::SUCCESS, &[])
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn network_request_response(
+    token: u32,
+    is_domain: bool,
+    result: HorizonIpcResult,
+    data: &[u8],
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    Ok((
+        if is_domain {
+            encode_domain_response(token, result, data, &[], &[])?
+        } else {
+            encode_response(token, result, data, None)?
+        },
+        None,
+    ))
 }
 
 fn network_interface_response(

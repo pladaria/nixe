@@ -207,6 +207,8 @@ pub struct MaxwellChannelFrontendState {
     error_notifier_enabled: bool,
     z_cull_binding: Option<MaxwellZCullBinding>,
     legacy_mem_op_a: Option<u32>,
+    host_semaphore: [u32; 3],
+    reference_count: u32,
     subchannel_bindings: [Option<GpuClassId>; 8],
 }
 
@@ -264,6 +266,18 @@ impl MaxwellChannelFrontendState {
         self.legacy_mem_op_a = Some(operand);
     }
 
+    pub(crate) fn set_host_semaphore(&mut self, index: usize, value: u32) {
+        self.host_semaphore[index] = value;
+    }
+
+    pub(crate) const fn host_semaphore(self) -> [u32; 3] {
+        self.host_semaphore
+    }
+
+    pub(crate) fn set_reference_count(&mut self, value: u32) {
+        self.reference_count = value;
+    }
+
     pub(crate) fn reset_subchannel_bindings(&mut self) {
         self.subchannel_bindings = [None; 8];
     }
@@ -312,6 +326,8 @@ impl MaxwellGpuChannel {
                 error_notifier_enabled: false,
                 z_cull_binding: None,
                 legacy_mem_op_a: None,
+                host_semaphore: [0; 3],
+                reference_count: 0,
                 subchannel_bindings: [None; 8],
             },
             compute: MaxwellComputeState::new(),

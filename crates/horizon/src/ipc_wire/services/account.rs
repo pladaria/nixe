@@ -2,12 +2,19 @@ use super::prelude::*;
 
 enum AccountTarget {
     Root,
+    Profile(crate::AccountProfileSession),
     BaasManagerForApplication(AccountManagerForApplicationSession),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AccountCommand {
+    GetUserCount,
     GetUserExistence,
+    GetLastOpenedUser,
+    GetProfile,
+    ListAllUsers,
+    ListOpenUsers,
+    IsUserRegistrationRequestPermitted,
     InitializeApplicationInfo,
     GetBaasAccountManagerForApplication,
     IsUserAccountSwitchLocked,
@@ -16,7 +23,13 @@ enum AccountCommand {
 impl AccountCommand {
     const fn decode(command_id: u32) -> Option<Self> {
         match command_id {
+            0 => Some(Self::GetUserCount),
             1 => Some(Self::GetUserExistence),
+            2 => Some(Self::ListAllUsers),
+            3 => Some(Self::ListOpenUsers),
+            4 => Some(Self::GetLastOpenedUser),
+            5 => Some(Self::GetProfile),
+            50 => Some(Self::IsUserRegistrationRequestPermitted),
             // Application-info initialization versions share the caller-PID
             // association. V2 also carries only the PID placeholder, with no
             // scalar output; this session stores the authenticated process ID.
@@ -67,6 +80,7 @@ pub(in crate::ipc_wire) fn dispatch_account(
                     );
                 };
                 match object {
+                    AccountObject::Profile(profile) => AccountTarget::Profile(profile),
                     AccountObject::BaasManagerForApplication(manager) => {
                         AccountTarget::BaasManagerForApplication(manager)
                     }
@@ -85,6 +99,7 @@ pub(in crate::ipc_wire) fn dispatch_account(
         AccountTarget::Root => {
             dispatch_account_root(process, session, request, hipc, user_account_switch_locked)
         }
+        AccountTarget::Profile(profile) => dispatch_account_profile(profile, request, hipc, true),
         AccountTarget::BaasManagerForApplication(manager) => {
             dispatch_account_manager_for_application(&manager, request)
         }
@@ -103,6 +118,144 @@ fn dispatch_account_root(
     };
 
     match command {
+        AccountCommand::GetProfile => {
+            if !request.has_payload_size(16) || has_ipc_descriptors(hipc) {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            }
+            if !is_configured_user(session, &request.data[..16]) {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::CommandVariant {
+                        service: "acc:u0",
+                        command_id: 5,
+                        detail: "requested account UID is not configured",
+                    },
+                ));
+            }
+            let profile = crate::AccountProfileSession {
+                user: session.user(),
+            };
+            if session.is_domain() {
+                let object = session
+                    .insert_object(AccountObject::Profile(profile))
+                    .ok_or(IpcWireError::HostResourceExhausted(
+                        "opening account profile domain object",
+                    ))?;
+                semantic_success(request.token, true, &[], &[], &[object], None)
+            } else {
+                let handle = process
+                    .handles_mut()
+                    .insert(HorizonIpcObject::AccountProfile(profile))
+                    .map_err(|_| {
+                        IpcWireError::HostResourceExhausted("opening account profile session")
+                    })?;
+                semantic_success(request.token, false, &[], &[], &[], Some(handle))
+            }
+        }
+
+        // Both lists contain the local profile opened for application launch.
+        // The eight-entry pointer array is terminated/padded with invalid UIDs;
+        // these commands have no scalar output count.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L77-L105
+        AccountCommand::ListAllUsers | AccountCommand::ListOpenUsers => {
+            let ReceiveStatics::Entries(pointers) = &hipc.receive_statics else {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            };
+            let [pointer] = pointers.as_slice() else {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            };
+            if !request.has_payload_size(0)
+                || hipc.pid.is_some()
+                || !hipc.copy_handles.is_empty()
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+                || pointer.size != 128
+            {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            }
+            let mut users = [0; 128];
+            users[..16].copy_from_slice(&session.user().id().encode());
+            write_bytes(process, GuestVirtualAddress::new(pointer.address), &users)?;
+            account_response(session, request.token, HorizonIpcResult::SUCCESS)
+        }
+        // Account registration requires a system profile-creation UI. Nixe
+        // currently launches with its configured local profile and offers no
+        // registration applet, so applications may not request registration.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L119-L128
+        AccountCommand::IsUserRegistrationRequestPermitted => {
+            if hipc.pid.is_none()
+                || request_u64(request.data, 0) != Some(0)
+                || !request.has_payload_size(8)
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            }
+            semantic_success(request.token, session.is_domain(), &[0], &[], &[], None)
+        }
+        // The configured local profile is opened for application launch (also
+        // supplied as the applet's PreselectedUser). Return that same UID,
+        // independently of whether it has an online-linked account.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L108-L110
+        AccountCommand::GetLastOpenedUser => {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            }
+            semantic_success(
+                request.token,
+                session.is_domain(),
+                &session.user().id().encode(),
+                &[],
+                &[],
+                None,
+            )
+        }
+        // The account environment currently contains exactly one configured
+        // local UserIdentity. This counts profiles, not online-linked accounts.
+        // No semantic input; one signed 32-bit count is returned.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/acc.h#L57-L61
+        AccountCommand::GetUserCount => {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+                return account_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                );
+            }
+            semantic_success(
+                request.token,
+                session.is_domain(),
+                &1_i32.to_le_bytes(),
+                &[],
+                &[],
+                None,
+            )
+        }
         // A well-formed UID absent from the local account database produces
         // false, rather than an unsupported account-manager operation.
         // https://switchbrew.org/wiki/Account_services#acc:u0
@@ -250,6 +403,36 @@ pub(in crate::ipc_wire) fn dispatch_account_manager_for_application(
     request: CmifRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     unsupported_service_command("IManagerForApplication", request.command_id)
+}
+
+// IProfile::GetBase does not consume profile icon or Mii data.
+// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L150-L152
+pub(in crate::ipc_wire) fn dispatch_account_profile(
+    profile: crate::AccountProfileSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+    domain: bool,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if request.command_id != 1 {
+        return unsupported_service_command("IProfile", request.command_id);
+    }
+    if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+        return if domain {
+            Ok((
+                encode_domain_response(
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                )?,
+                None,
+            ))
+        } else {
+            cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER)
+        };
+    }
+    semantic_success(request.token, domain, &profile.base(), &[], &[], None)
 }
 
 fn account_response(

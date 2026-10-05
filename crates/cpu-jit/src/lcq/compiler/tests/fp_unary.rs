@@ -182,3 +182,143 @@ fn unary_boundaries_use_final_maps_and_keep_pending_status() {
     assert_eq!(actual, expected);
     assert_eq!(actual.fpsr(), 0x11);
 }
+
+#[test]
+fn fcvtl_source_halves_aliases_native_results_exact_status_and_traps() {
+    for upper in [false, true] {
+        for alias in [false, true] {
+            for fpcr in [0, 1 << 24, 1 << 25, 1 << 8, 1 << 15] {
+                for sample in [
+                    0_u32,
+                    0x8000_0000,
+                    0x3fc0_0000,
+                    1,
+                    0x7fc0_1234,
+                    0x7f80_0123,
+                    0x7f80_0000,
+                ] {
+                    let rd = if alias { 1 } else { 0 };
+                    let word = 0x0e61_7820 | (u32::from(upper) << 30) | rd;
+                    let words = [word, 0xd420_0000];
+                    let mem = memory(&words);
+                    let mut actual = A64State::default();
+                    actual.set_pc(PC);
+                    actual.set_fpcr(fpcr);
+                    actual.set_fpsr(1 << 27);
+                    actual.set_vector(rd as u8, u128::MAX);
+                    let selected = u128::from(sample) | (u128::from((-2.5_f32).to_bits()) << 32);
+                    let source = if upper {
+                        (selected << 64) | u128::from(0x7f80_0001_u64)
+                    } else {
+                        selected | (u128::from(0x7f80_0001_u64) << 64)
+                    };
+                    actual.set_vector(1, source);
+                    let pre = actual.clone();
+                    let mut expected = actual.clone();
+                    let reference =
+                        execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap();
+                    let (_, exit) = execute_memory(&mem, words.len(), &mut actual);
+                    match exit.kind {
+                        EdgeKind::FpUnary(operation) => {
+                            assert_eq!(actual, pre);
+                            match complete_unary(operation, &mut actual) {
+                                Ok(()) => assert_eq!(reference, InstructionStep::Continue),
+                                Err(CompletionError::Trap(_)) => {
+                                    assert!(matches!(reference, InstructionStep::Exit(_)))
+                                }
+                                Err(error) => panic!("{error:?}"),
+                            }
+                        }
+                        EdgeKind::Breakpoint(0) => {
+                            assert_eq!(reference, InstructionStep::Continue);
+                            if sample == 0x3fc0_0000 {
+                                assert_eq!(
+                                    actual.vector(rd as u8),
+                                    Some(
+                                        u128::from(1.5_f64.to_bits())
+                                            | (u128::from((-2.5_f64).to_bits()) << 64)
+                                    )
+                                );
+                            }
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "FCVTL upper={upper} alias={alias} source={sample:x} FPCR={fpcr:x}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fcvtn_destination_halves_aliases_rounding_status_and_traps() {
+    for upper in [false, true] {
+        for alias in [false, true] {
+            for fpcr in [
+                0,
+                1 << 22,
+                2 << 22,
+                3 << 22,
+                1 << 24,
+                1 << 25,
+                1 << 8,
+                1 << 11,
+                1 << 12,
+                1 << 15,
+            ] {
+                for sample in [
+                    0_u64,
+                    1 << 63,
+                    1.5_f64.to_bits(),
+                    1,
+                    0x7ff8_0000_0000_1234,
+                    0x7ff0_0000_0000_0123,
+                    f64::INFINITY.to_bits(),
+                    f64::MAX.to_bits(),
+                    (f32::MIN_POSITIVE as f64).to_bits() - 1,
+                    0x3ff0_0000_1000_0000,
+                ] {
+                    let rd = if alias { 1 } else { 0 };
+                    let word = 0x0e61_6820 | (u32::from(upper) << 30) | rd;
+                    let words = [word, 0xd420_0000];
+                    let mem = memory(&words);
+                    let mut actual = A64State::default();
+                    actual.set_pc(PC);
+                    actual.set_fpcr(fpcr);
+                    actual.set_fpsr(1 << 27);
+                    actual.set_vector(rd as u8, u128::MAX);
+                    let source = u128::from(sample) | (u128::from((-2.5_f64).to_bits()) << 64);
+                    actual.set_vector(1, source);
+                    let pre = actual.clone();
+                    let mut expected = actual.clone();
+                    let reference =
+                        execute_one(&TargetPlatform::Switch1, &mut expected, word).unwrap();
+                    let (_, exit) = execute_memory(&mem, words.len(), &mut actual);
+                    match exit.kind {
+                        EdgeKind::FpUnary(operation) => {
+                            assert_eq!(actual, pre);
+                            match complete_unary(operation, &mut actual) {
+                                Ok(()) => assert_eq!(reference, InstructionStep::Continue),
+                                Err(CompletionError::Trap(_)) => {
+                                    assert!(matches!(reference, InstructionStep::Exit(_)))
+                                }
+                                Err(error) => panic!("{error:?}"),
+                            }
+                        }
+                        EdgeKind::Breakpoint(0) => {
+                            assert_eq!(reference, InstructionStep::Continue);
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "FCVTN upper={upper} alias={alias} source={sample:x} FPCR={fpcr:x}"
+                    );
+                }
+            }
+        }
+    }
+}

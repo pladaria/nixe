@@ -132,6 +132,7 @@ pub fn check(ctx: &Context) {
             &te,
             &fs,
             SpirvTessellationOptions {
+                depth_clip_negative_one_to_one: false,
                 input_control_points: points,
                 mode: TessellationMode {
                     domain: TessellationDomain::Triangles,

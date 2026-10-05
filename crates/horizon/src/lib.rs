@@ -35,7 +35,6 @@ pub use hid::HidSystem;
 pub use ipc::{
     AddOnContentEntry, HorizonProcess, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
     IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
-    MAX_IPC_STORAGE_READ_BYTES,
 };
 pub use ipc_result::HorizonIpcResult;
 pub use ipc_wire::{HorizonIpcFault, UnsupportedServiceOperation};
@@ -47,15 +46,16 @@ pub use nvdrv::{
     UnsupportedNvDrvOperation,
 };
 pub use object::{
-    AccountManagerForApplicationSession, AccountSession, AppletSession, DirectoryEntry,
-    DirectoryEntryKind, HidActiveVibrationDeviceList, HidAppletResource, HidSession,
-    HorizonIpcObject, HostDirectoryFileSystem, HostFile, IpcSession, LogManagerSession,
-    LoggerSession, NetworkGeneralServiceSession, NetworkInterfaceManagerSession, OperationMode,
-    ParentalControlFactorySession, ParentalControlSession, PerformanceManagerSession,
-    PerformanceSession, ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ReadOnlyStorage,
-    RegionCode, SemanticIpcObject, ServiceManagerSession, SettingsEnvironment, SslSession,
-    SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage, SystemSettingsSession,
-    TimeEnvironment, TimeServiceSession, TimeZoneServiceSession, UserSettingsSession,
+    AccountManagerForApplicationSession, AccountProfileSession, AccountSession, AppletSession,
+    DirectoryEntry, DirectoryEntryKind, HidActiveVibrationDeviceList, HidAppletResource,
+    HidSession, HorizonIpcObject, HostDirectoryFileSystem, HostFile, IpcSession, LogManagerSession,
+    LoggerSession, NetworkGeneralServiceSession, NetworkInterfaceManagerSession,
+    NetworkRequestSession, OperationMode, ParentalControlFactorySession, ParentalControlSession,
+    PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
+    ReadOnlyFileSystem, ReadOnlyStorage, RegionCode, SemanticIpcObject, ServiceManagerSession,
+    SettingsEnvironment, SslSession, SteadyClockSession, SystemClockKind, SystemClockSession,
+    SystemLanguage, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
+    TimeZoneServiceSession, UserSettingsSession,
 };
 pub use scheduler_profile::{
     HorizonMachineProfile, switch_1_machine_profile, switch_1_scheduler_profile,

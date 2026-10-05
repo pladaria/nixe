@@ -25,8 +25,6 @@ use crate::{
 pub const MAX_IPC_PATH_BYTES: usize = 0x300;
 /// Largest file payload returned by one request.
 pub const MAX_IPC_READ_BYTES: usize = 1024 * 1024;
-/// Largest raw storage payload returned by one request.
-pub const MAX_IPC_STORAGE_READ_BYTES: usize = 256 * 1024 * 1024;
 /// Largest number of directory or add-on entries returned by one request.
 pub const MAX_IPC_LIST_ENTRIES: usize = 1024;
 // Guest-visible file and directory mode bits follow libnx's pinned FsOpenMode
@@ -551,10 +549,10 @@ fn dispatch_storage(
             Ok(IpcResponse::Size(size))
         }
         IpcRequest::ReadStorage { offset, size } => {
-            if size > MAX_IPC_STORAGE_READ_BYTES {
-                return Err(IpcResultCode::RESOURCE_LIMIT);
-            }
-            if offset > i64::MAX as u64 {
+            // IStorage offset and size are signed 64-bit values. Payloads are
+            // streamed at the wire boundary, so no materialization limit applies.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L975-L983
+            if offset > i64::MAX as u64 || size as u64 > i64::MAX as u64 {
                 return Err(IpcResultCode::OUT_OF_RANGE);
             }
             let size_u64 = u64::try_from(size).map_err(|_| IpcResultCode::OUT_OF_RANGE)?;
@@ -1289,21 +1287,21 @@ mod tests {
     }
 
     #[test]
-    fn storage_reads_use_the_dedicated_limit_without_materializing_the_payload() {
-        let storage =
-            ReadOnlyStorage::new(Arc::new(SizedStorage(MAX_IPC_STORAGE_READ_BYTES as u64)));
+    fn storage_reads_validate_source_ranges_without_materializing_large_payloads() {
+        const SIZE: usize = 512 * 1024 * 1024;
+        let storage = ReadOnlyStorage::new(Arc::new(SizedStorage(SIZE as u64)));
 
         assert_eq!(
             dispatch_storage(
                 &storage,
                 IpcRequest::ReadStorage {
                     offset: 0,
-                    size: MAX_IPC_STORAGE_READ_BYTES,
+                    size: SIZE,
                 },
             ),
             Ok(IpcResponse::StorageRead {
                 offset: 0,
-                size: MAX_IPC_STORAGE_READ_BYTES,
+                size: SIZE,
             })
         );
         assert_eq!(
@@ -1311,10 +1309,20 @@ mod tests {
                 &storage,
                 IpcRequest::ReadStorage {
                     offset: 0,
-                    size: MAX_IPC_STORAGE_READ_BYTES + 1,
+                    size: SIZE + 1,
                 },
             ),
-            Err(IpcResultCode::RESOURCE_LIMIT)
+            Err(IpcResultCode::OUT_OF_RANGE)
+        );
+        assert_eq!(
+            dispatch_storage(
+                &storage,
+                IpcRequest::ReadStorage {
+                    offset: 0,
+                    size: usize::MAX,
+                }
+            ),
+            Err(IpcResultCode::OUT_OF_RANGE)
         );
     }
 }

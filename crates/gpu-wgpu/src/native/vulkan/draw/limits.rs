@@ -14,7 +14,12 @@ pub(super) fn native_viewport(
         let s = t.scale();
         let o = t.offset();
         let [min, max] = t.depth_range();
-        if s[0] <= 0.0 || s[2] != max - min || o[2] != min {
+        let (depth_scale, depth_offset) = if t.depth_clip_negative_one_to_one() {
+            ((max - min) * 0.5, (max + min) * 0.5)
+        } else {
+            (max - min, min)
+        };
+        if s[0] <= 0.0 || s[2] != depth_scale || o[2] != depth_offset {
             return Err(unsupported(
                 "native viewport needs positive X and zero-to-one affine depth",
             ));

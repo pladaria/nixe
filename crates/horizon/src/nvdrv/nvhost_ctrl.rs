@@ -13,9 +13,9 @@ use crate::GraphicsEventSource;
 
 use super::diagnostics::NvDrvCallError;
 use super::{
-    NV_BAD_PARAMETER, NV_INVALID_STATE, NV_TIMEOUT, NvDrvDeviceDescriptor, NvDrvErrorContext,
-    NvDrvFileDescriptor, NvDrvValidationReason, UnsupportedNvDrvOperation, input_u32,
-    require_input_size, sized_output, write_u32,
+    NV_BAD_PARAMETER, NV_CONFIG_VAR_NOT_FOUND, NV_INVALID_STATE, NV_TIMEOUT, NvDrvDeviceDescriptor,
+    NvDrvErrorContext, NvDrvFileDescriptor, NvDrvValidationReason, UnsupportedNvDrvOperation,
+    input_u32, require_input_size, sized_output, write_u32,
 };
 
 // Exact libnx layouts used by the pinned target revision:
@@ -23,6 +23,7 @@ use super::{
 const IOCTL_SYNCPT_READ: u32 = 0xc008_0014;
 const IOCTL_SYNCPT_INCREMENT: u32 = 0xc004_0015;
 const IOCTL_SYNCPT_WAIT: u32 = 0xc00c_0016;
+const IOCTL_GET_CONFIG: u32 = 0xc183_001b;
 const IOCTL_SYNCPT_CLEAR_EVENT_WAIT: u32 = 0xc004_001c;
 const IOCTL_SYNCPT_WAIT_EVENT: u32 = 0xc010_001d;
 const IOCTL_SYNCPT_WAIT_EVENT_EX: u32 = 0xc010_001e;
@@ -440,6 +441,15 @@ impl NvHostControl {
         }
 
         match request {
+            IOCTL_GET_CONFIG => {
+                require_input_size(input, 0x183)?;
+                // { char name[0x41], key[0x41], value[0x101] }. Retail
+                // systems do not expose development driver overrides and
+                // return ConfigVarNotFound rather than an invented value.
+                // https://switchbrew.org/wiki/NV_services#NVHOST_IOCTL_CTRL_GET_CONFIG
+                // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
+                Err(NvDrvCallError::GuestResult(NV_CONFIG_VAR_NOT_FOUND))
+            }
             IOCTL_SYNCPT_READ => {
                 require_input_size(input, 8)?;
                 let id = parse_syncpoint(input_u32(input, 0)?)?;

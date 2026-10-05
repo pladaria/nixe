@@ -84,8 +84,8 @@ pub enum MaxwellThreeDResourceRole {
     Sampler(MaxwellThreeDTextureReference),
     ColorTarget(u8),
     DepthStencilTarget,
-    ResolveSource,
-    ResolveDestination,
+    BlitSource,
+    BlitDestination,
 }
 
 /// Shader-visible dimensionality required from a Maxwell sampled-image TIC.
@@ -772,6 +772,7 @@ fn resolve_maxwell_three_d_resources_inner(
         builder.descriptor_pool(
             MaxwellThreeDResourceRole::TextureHeaders,
             bindings.texture_headers(),
+            bindings.texture_headers().maximum_index().value().copied(),
         )?;
     }
     let samplers_required = required_roles.iter().any(|role| {
@@ -781,7 +782,21 @@ fn resolve_maxwell_three_d_resources_inner(
         )
     });
     if inspect_complete_state || samplers_required {
-        builder.descriptor_pool(MaxwellThreeDResourceRole::Samplers, bindings.samplers())?;
+        // Linked TSC entries use the TIC pool limit; the independent sampler
+        // limit is not consumed in this mode (and may remain zero).
+        // https://git.axenov.dev/Museum/ryujinx/src/commit/ec3e848d7998038ce22c41acdbf81032bf47991f/Ryujinx.Graphics.Gpu/Engine/Threed/StateUpdater.cs#L636-L649
+        let maximum = if bindings.sampler_binding().value()
+            == Some(&MaxwellThreeDSamplerBindingMode::ViaTextureHeader)
+        {
+            bindings.texture_headers().maximum_index().value()
+        } else {
+            bindings.samplers().maximum_index().value()
+        };
+        builder.descriptor_pool(
+            MaxwellThreeDResourceRole::Samplers,
+            bindings.samplers(),
+            maximum.copied(),
+        )?;
     }
     let mut descriptors = BTreeMap::new();
     for role in required_roles {
@@ -806,7 +821,11 @@ fn resolve_maxwell_three_d_resources_inner(
         match target.readiness(true) {
             MaxwellThreeDAttachmentReadiness::Unprogrammed
             | MaxwellThreeDAttachmentReadiness::Disabled => {}
-            MaxwellThreeDAttachmentReadiness::Ready => builder.color_target(index as u8, target)?,
+            MaxwellThreeDAttachmentReadiness::Ready => builder.color_target(
+                index as u8,
+                target,
+                state.render_targets().srgb_write().value() == Some(&true),
+            )?,
             _ => {
                 return Err(MaxwellThreeDResourceError::IncompleteState { role });
             }
@@ -901,14 +920,23 @@ impl MaxwellThreeDResolvedResourceCacheEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ColorResolveKey {
+struct ColorBlitKey {
     address_space: crate::MaxwellAddressSpaceId,
-    surfaces: [crate::engines::twod::blit::ResolveSurface; 2],
+    surfaces: [crate::engines::twod::blit::BlitSurface; 2],
     destination_compression: bool,
+    resolve: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SolidImageKey {
+    address_space: crate::MaxwellAddressSpaceId,
+    surface: crate::engines::twod::blit::BlitSurface,
+    zeta: bool,
+    compression: bool,
 }
 
 #[derive(Debug)]
-struct ColorResolveCacheEntry {
+struct ColorBlitCacheEntry {
     resources: Arc<MaxwellThreeDResolvedResources>,
     mapping_generation: Cell<u64>,
     last_used: Cell<u64>,
@@ -916,7 +944,8 @@ struct ColorResolveCacheEntry {
 
 #[derive(Debug, Default)]
 pub(crate) struct MaxwellThreeDResolvedResourceCache {
-    resolves: HashMap<ColorResolveKey, ColorResolveCacheEntry>,
+    blits: HashMap<ColorBlitKey, ColorBlitCacheEntry>,
+    solid_images: HashMap<SolidImageKey, ColorBlitCacheEntry>,
     entries: Vec<MaxwellThreeDResolvedResourceCacheEntry>,
     // Only role lists with the same state domains share a bucket. Contents,
     // descriptor writes and mapping generations are still checked on a hit.
@@ -929,18 +958,149 @@ pub(crate) struct MaxwellThreeDResolvedResourceCache {
 }
 
 impl MaxwellThreeDResolvedResourceCache {
-    pub(crate) fn resolve_color_images(
+    pub(crate) fn resolve_solid_image(
         &mut self,
-        request: &crate::engines::twod::MaxwellTwoDResolveOperation,
+        request: &crate::engines::twod::MaxwellTwoDSolidOperation,
         address_space: &MaxwellGpuAddressSpace,
         limit: usize,
     ) -> Result<Arc<MaxwellThreeDResolvedResources>, MaxwellThreeDResourceError> {
-        let key = ColorResolveKey {
+        let key = SolidImageKey {
+            address_space: address_space.id(),
+            surface: request.destination,
+            zeta: request.zeta,
+            compression: request.compression,
+        };
+        if let Some(entry) = self.solid_images.get(&key) {
+            let generation = address_space.mapping_generation().get();
+            if entry.resources.image_content_dependencies_current()
+                && (entry.mapping_generation.get() == generation
+                    || entry.resources.validate_mappings(address_space).is_ok())
+            {
+                entry.mapping_generation.set(generation);
+                entry.last_used.set(self.take_use());
+                return Ok(Arc::clone(&entry.resources));
+            }
+        }
+        let surface = request.destination;
+        let role = if request.zeta {
+            MaxwellThreeDResourceRole::DepthStencilTarget
+        } else {
+            MaxwellThreeDResourceRole::BlitDestination
+        };
+        let (format, kind, guest_format) = if request.zeta {
+            // COLOR_RENDER_TO_ZETA preserves the packed pixel value, while the
+            // PTE kind identifies depth/stencil packing independently of 2D color format.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9e6d83fe0770bc8644850a0b1bf5ddb1519905ba/classes/twod/cl902d.h#L578-L581
+            let address = address_space.address(surface.address).map_err(|error| {
+                MaxwellThreeDResourceError::Resolution {
+                    role,
+                    error: MaxwellGpuAccessError::Address(error),
+                }
+            })?;
+            let range = address_space
+                .resolve_range(address, 1, MemoryPermissions::WRITE)
+                .map_err(|error| MaxwellThreeDResourceError::Resolution { role, error })?;
+            let actual = range.segments()[0].mapping().kind();
+            let depth_format = match actual {
+                MAXWELL_S8Z24_2CZ_KIND => MaxwellThreeDDepthStencilFormat::Stencil8Z24,
+                MAXWELL_Z24S8_2CZ_KIND => MaxwellThreeDDepthStencilFormat::Z24Stencil8,
+                _ => {
+                    return Err(MaxwellThreeDResourceError::UnsupportedKind {
+                        role,
+                        expected: MAXWELL_Z24S8_2CZ_KIND,
+                        actual,
+                    });
+                }
+            };
+            (
+                ImageFormat::Depth24UnormStencil8Uint,
+                ImageKind::DepthStencil,
+                MaxwellThreeDGuestImageFormat::DepthStencil(depth_format),
+            )
+        } else {
+            (
+                color_image_format(surface.format, role)?,
+                ImageKind::Color,
+                MaxwellThreeDGuestImageFormat::Color(MaxwellThreeDColorTargetFormat::Color(
+                    surface.format,
+                )),
+            )
+        };
+        let mut builder =
+            ResourceBuilder::new(address_space, None, None, Some(&mut self.retained_backings));
+        builder.sample_mode = Some(MaxwellThreeDSampleMode::Samples1x1);
+        let description = image_description(MaxwellImageDescriptionRequest {
+            dimension: ImageDimension::Two,
+            extent: ImageExtent {
+                width: surface.width,
+                height: surface.height,
+                depth: 1,
+            },
+            format,
+            kind,
+            layers: 1,
+            role,
+        })?;
+        builder.image(
+            role,
+            MaxwellThreeDUnresolvedAddress::new(
+                (surface.address >> 32) as u8,
+                surface.address as u32,
+            ),
+            description,
+            match surface.layout {
+                crate::engines::twod::blit::BlitSurfaceLayout::Pitch(_) => {
+                    MaxwellThreeDImageLayout::PitchLinear
+                }
+                crate::engines::twod::blit::BlitSurfaceLayout::BlockLinear(block_height_log2) => {
+                    MaxwellThreeDImageLayout::BlockLinear {
+                        block_height_log2,
+                        block_depth_log2: 0,
+                    }
+                }
+            },
+            None,
+            0,
+            guest_format,
+            request.compression,
+            match surface.layout {
+                crate::engines::twod::blit::BlitSurfaceLayout::Pitch(pitch) => Some(pitch),
+                _ => None,
+            },
+        )?;
+        let resources = Arc::new(builder.finish()?.0);
+        if self.solid_images.len() >= limit && !self.solid_images.contains_key(&key) {
+            let oldest = *self
+                .solid_images
+                .iter()
+                .min_by_key(|(_, v)| v.last_used.get())
+                .expect("nonzero cache limit")
+                .0;
+            self.solid_images.remove(&oldest);
+        }
+        self.solid_images.insert(
+            key,
+            ColorBlitCacheEntry {
+                resources: Arc::clone(&resources),
+                mapping_generation: Cell::new(address_space.mapping_generation().get()),
+                last_used: Cell::new(self.take_use()),
+            },
+        );
+        Ok(resources)
+    }
+    pub(crate) fn resolve_color_images(
+        &mut self,
+        request: &crate::engines::twod::MaxwellTwoDBlitOperation,
+        address_space: &MaxwellGpuAddressSpace,
+        limit: usize,
+    ) -> Result<Arc<MaxwellThreeDResolvedResources>, MaxwellThreeDResourceError> {
+        let key = ColorBlitKey {
             address_space: address_space.id(),
             surfaces: request.images,
             destination_compression: request.destination_compression,
+            resolve: request.kind == crate::engines::twod::blit::BlitKind::Resolve,
         };
-        if let Some(entry) = self.resolves.get(&key) {
+        if let Some(entry) = self.blits.get(&key) {
             let generation = address_space.mapping_generation().get();
             if entry.resources.image_content_dependencies_current()
                 && (entry.mapping_generation.get() == generation
@@ -955,11 +1115,11 @@ impl MaxwellThreeDResolvedResourceCache {
             ResourceBuilder::new(address_space, None, None, Some(&mut self.retained_backings));
         for (index, surface) in request.images.iter().enumerate() {
             let role = if index == 0 {
-                MaxwellThreeDResourceRole::ResolveSource
+                MaxwellThreeDResourceRole::BlitSource
             } else {
-                MaxwellThreeDResourceRole::ResolveDestination
+                MaxwellThreeDResourceRole::BlitDestination
             };
-            builder.sample_mode = Some(if index == 0 {
+            builder.sample_mode = Some(if index == 0 && key.resolve {
                 MaxwellThreeDSampleMode::Samples2x2
             } else {
                 MaxwellThreeDSampleMode::Samples1x1
@@ -983,31 +1143,49 @@ impl MaxwellThreeDResolvedResourceCache {
                     surface.address as u32,
                 ),
                 description,
-                MaxwellThreeDImageLayout::BlockLinear {
-                    block_height_log2: surface.block_height_log2,
-                    block_depth_log2: 0,
+                match surface.layout {
+                    crate::engines::twod::blit::BlitSurfaceLayout::Pitch(_) => {
+                        MaxwellThreeDImageLayout::PitchLinear
+                    }
+                    crate::engines::twod::blit::BlitSurfaceLayout::BlockLinear(
+                        block_height_log2,
+                    ) => MaxwellThreeDImageLayout::BlockLinear {
+                        block_height_log2,
+                        block_depth_log2: 0,
+                    },
                 },
                 None,
                 0,
                 MaxwellThreeDGuestImageFormat::Color(MaxwellThreeDColorTargetFormat::Color(
                     surface.format,
                 )),
-                index == 1 && request.destination_compression,
+                if index == 0 {
+                    matches!(
+                        surface.layout,
+                        crate::engines::twod::blit::BlitSurfaceLayout::BlockLinear(_)
+                    )
+                } else {
+                    request.destination_compression
+                },
+                match surface.layout {
+                    crate::engines::twod::blit::BlitSurfaceLayout::Pitch(pitch) => Some(pitch),
+                    _ => None,
+                },
             )?;
         }
         let resources = Arc::new(builder.finish()?.0);
-        if self.resolves.len() >= limit && !self.resolves.contains_key(&key) {
+        if self.blits.len() >= limit && !self.blits.contains_key(&key) {
             let oldest = *self
-                .resolves
+                .blits
                 .iter()
                 .min_by_key(|(_, value)| value.last_used.get())
                 .expect("nonzero resolved-resource cache limit")
                 .0;
-            self.resolves.remove(&oldest);
+            self.blits.remove(&oldest);
         }
-        self.resolves.insert(
+        self.blits.insert(
             key,
-            ColorResolveCacheEntry {
+            ColorBlitCacheEntry {
                 resources: Arc::clone(&resources),
                 mapping_generation: Cell::new(address_space.mapping_generation().get()),
                 last_used: Cell::new(self.take_use()),
@@ -1350,20 +1528,18 @@ impl<'a> ResourceBuilder<'a> {
         &mut self,
         role: MaxwellThreeDResourceRole,
         pool: &super::MaxwellThreeDDescriptorPoolState,
+        maximum_index: Option<u32>,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let programmed = pool.address_upper().raw().is_some()
             || pool.address_lower().raw().is_some()
-            || pool.maximum_index().raw().is_some();
+            || maximum_index.is_some();
         if !programmed {
             return Ok(());
         }
         let address = pool
             .address()
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let maximum = *pool
-            .maximum_index()
-            .value()
-            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+        let maximum = maximum_index.ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
         let size = u64::from(maximum)
             .checked_add(1)
             .and_then(|count| count.checked_mul(MAXWELL_DESCRIPTOR_SIZE))
@@ -1748,6 +1924,7 @@ impl<'a> ResourceBuilder<'a> {
         &mut self,
         index: u8,
         target: &MaxwellThreeDColorTargetState,
+        srgb_write: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let role = MaxwellThreeDResourceRole::ColorTarget(index);
         let address = unresolved(
@@ -1777,6 +1954,18 @@ impl<'a> ResourceBuilder<'a> {
             .copied()
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
         let format = color_image_format(guest_format.raw(), role)?;
+        // Framebuffer sRGB controls attachment conversion and blending, while
+        // sampled texture descriptors independently retain their sRGB format.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2883-L2886
+        let format = if srgb_write {
+            format
+        } else {
+            match format {
+                ImageFormat::Rgba8Srgb => ImageFormat::Rgba8Unorm,
+                ImageFormat::Bgra8Srgb => ImageFormat::Bgra8Unorm,
+                other => other,
+            }
+        };
         let (dimension, depth, layers, selected_layer) = match kind {
             MaxwellThreeDImageKind::Array => {
                 let layers = u16::try_from(third)
@@ -1817,6 +2006,7 @@ impl<'a> ResourceBuilder<'a> {
             MaxwellThreeDGuestImageFormat::Color(guest_format),
             target.compression().value()
                 == Some(&super::MaxwellThreeDColorCompressionMode::Enabled),
+            None,
         )
     }
 
@@ -1825,6 +2015,14 @@ impl<'a> ResourceBuilder<'a> {
         target: &MaxwellThreeDDepthStencilTargetState,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let role = MaxwellThreeDResourceRole::DepthStencilTarget;
+        if target.sparse().value().is_some_and(|value| value & 1 != 0) {
+            return Err(MaxwellThreeDResourceError::UnsupportedSparseDepth {
+                source: target
+                    .sparse()
+                    .source()
+                    .expect("enabled sparse depth is programmed"),
+            });
+        }
         let address = unresolved(
             target.address_upper().value(),
             target.address_lower().value(),
@@ -1899,6 +2097,7 @@ impl<'a> ResourceBuilder<'a> {
             selected_layer,
             MaxwellThreeDGuestImageFormat::DepthStencil(guest_format),
             target.compression().value() == Some(&super::MaxwellThreeDZCompressionMode::Enabled),
+            None,
         )
     }
 
@@ -1913,6 +2112,7 @@ impl<'a> ResourceBuilder<'a> {
         selected_layer: u16,
         guest_format: MaxwellThreeDGuestImageFormat,
         compression_enabled: bool,
+        row_pitch_bytes: Option<u32>,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let samples = match self
             .sample_mode
@@ -1992,12 +2192,16 @@ impl<'a> ResourceBuilder<'a> {
         let array_pitch = array_pitch_dwords.map(|pitch| u64::from(pitch) * 4);
         let (neutral_layout, layer_stride, expected_kind, generic_kind_allowed) = match layout {
             MaxwellThreeDImageLayout::PitchLinear => {
+                let row_pitch = row_pitch_bytes.map(u64::from).unwrap_or(compact_row);
+                if row_pitch < compact_row || compression_enabled {
+                    return Err(MaxwellThreeDResourceError::ContradictoryState { role });
+                }
                 let stride = array_pitch
                     .filter(|value| *value != 0)
-                    .unwrap_or(compact_layer);
+                    .unwrap_or(row_pitch * u64::from(extent.height));
                 (
                     ImageMemoryLayout::PitchLinear {
-                        row_pitch: compact_row,
+                        row_pitch,
                         layer_stride: stride,
                     },
                     stride,
@@ -2083,7 +2287,7 @@ impl<'a> ResourceBuilder<'a> {
         let source = self.resolve(
             resolved_address,
             size,
-            if role == MaxwellThreeDResourceRole::ResolveSource {
+            if role == MaxwellThreeDResourceRole::BlitSource {
                 MemoryPermissions::READ
             } else {
                 MemoryPermissions::WRITE
@@ -2140,7 +2344,7 @@ impl<'a> ResourceBuilder<'a> {
         self.resources.push(MaxwellThreeDResolvedResource::Image(
             MaxwellThreeDResolvedImage {
                 role,
-                access: if role == MaxwellThreeDResourceRole::ResolveSource {
+                access: if role == MaxwellThreeDResourceRole::BlitSource {
                     MaxwellThreeDResourceAccess::Read
                 } else {
                     MaxwellThreeDResourceAccess::Write
@@ -2691,6 +2895,9 @@ pub enum MaxwellThreeDResourceError {
         role: MaxwellThreeDResourceRole,
         format: u8,
     },
+    UnsupportedSparseDepth {
+        source: crate::MaxwellMethodSource,
+    },
     UnsupportedDepthFormat {
         role: MaxwellThreeDResourceRole,
         format: u32,
@@ -2778,6 +2985,10 @@ impl Display for MaxwellThreeDResourceError {
             Self::UnsupportedColorFormat { role, format } => write!(
                 formatter,
                 "Maxwell color format has no neutral interpretation: role={role:?} format=0x{format:02x}"
+            ),
+            Self::UnsupportedSparseDepth { source } => write!(
+                formatter,
+                "sparse depth attachment semantics are not implemented: {source}"
             ),
             Self::UnsupportedDepthFormat { role, format } => write!(
                 formatter,

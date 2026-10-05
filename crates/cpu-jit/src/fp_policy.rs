@@ -95,6 +95,8 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::VectorFloatFusedElement(_)
         | Instruction::VectorFloatFused(_)
         | Instruction::ScalarFloatConvert(_)
+        | Instruction::VectorFloatConvertLong(_)
+        | Instruction::VectorFloatConvertNarrow(_)
         | Instruction::ScalarFloatDivide(_)
         | Instruction::ScalarFloatAdd(_)
         | Instruction::ScalarFloatMultiply(_)
@@ -104,6 +106,8 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::ScalarFloatSquareRoot(_) => FpLoweringDisposition::GuardedNative,
         Instruction::ScalarFloatMaxNumber(_)
         | Instruction::ScalarFloatMinNumber(_)
+        | Instruction::ScalarFloatMax(_)
+        | Instruction::ScalarFloatMin(_)
         | Instruction::CompareRegister(_)
         | Instruction::CompareZero(_)
         | Instruction::ConditionalCompare(_) => FpLoweringDisposition::GuardedExact,
@@ -129,6 +133,10 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::MemoryPair(_)
         | Instruction::Bitwise(_)
         | Instruction::Integer(_)
+        | Instruction::IntegerMultiply(_)
+        | Instruction::IntegerWideAdd(_)
+        | Instruction::IntegerSign(_)
+        | Instruction::ScalarIntegerSign(_)
         | Instruction::ScalarMove(_)
         | Instruction::ScalarAbsolute(_)
         | Instruction::ScalarNegate(_)
@@ -152,6 +160,7 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::PermuteTwoSource(_)
         | Instruction::Extract(_)
         | Instruction::IntegerCompare(_)
+        | Instruction::ScalarIntegerCompare(_)
         | Instruction::IntegerPairwise(_)
         | Instruction::IntegerMinMax(_)
         | Instruction::ShiftRightNarrow(_)
@@ -165,11 +174,14 @@ pub(crate) fn fp_lowering_for_host(
         | Instruction::CountBits(_)
         | Instruction::Reverse64(_)
         | Instruction::Reverse32(_)
+        | Instruction::IntegerMinMaxAcross(_)
         | Instruction::AddAcrossVector(_)
         | Instruction::UnsignedAddLongAcrossVector(_)
         | Instruction::ExtractNarrow(_)
         | Instruction::VectorFloatImmediate(_)
         | Instruction::ScalarFloatImmediate(_)
-        | Instruction::ScalarFloatConditionalSelect(_) => FpLoweringDisposition::Direct,
+        | Instruction::ScalarFloatConditionalSelect(_)
+        | Instruction::TableLookup(_)
+        | Instruction::TableLookupExtension(_) => FpLoweringDisposition::Direct,
     }
 }

@@ -354,6 +354,7 @@ pub struct ViewportTransform {
     scale: [u32; 3],
     offset: [u32; 3],
     depth_range: [u32; 2],
+    depth_clip_negative_one_to_one: bool,
 }
 
 impl ViewportTransform {
@@ -377,6 +378,7 @@ impl ViewportTransform {
             scale: scale.map(f32::to_bits),
             offset: offset.map(f32::to_bits),
             depth_range: depth_range.map(f32::to_bits),
+            depth_clip_negative_one_to_one: false,
         })
     }
 
@@ -390,7 +392,20 @@ impl ViewportTransform {
         self.offset.map(f32::from_bits)
     }
 
-    /// Returns the guest-programmed minimum and maximum window-space depth.
+    /// Selects the homogeneous clip-space Z interval before the affine viewport.
+    /// The default is zero-to-one; negative-one-to-one requires a final-stage
+    /// position conversion on host APIs with a zero-to-one clip volume.
+    pub fn with_negative_one_to_one_depth(mut self, enabled: bool) -> Self {
+        self.depth_clip_negative_one_to_one = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn depth_clip_negative_one_to_one(self) -> bool {
+        self.depth_clip_negative_one_to_one
+    }
+
+    /// Returns the affine viewport endpoints in window-space depth.
     #[must_use]
     pub fn depth_range(self) -> [f32; 2] {
         self.depth_range.map(f32::from_bits)
@@ -1060,6 +1075,11 @@ impl RenderPassOperation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum GpuCommand {
     Copy(CopyOperation),
+    /// Ordered host-authored texels, copied through backend staging storage.
+    UploadImage {
+        destination: ImageRegion,
+        bytes: Arc<[u8]>,
+    },
     Resolve(ResolveOperation),
     Clear(ClearOperation),
     Draw(DrawOperation),
@@ -1148,6 +1168,14 @@ impl GpuCommand {
     fn accesses(&self) -> Vec<ResourceAccess> {
         match self {
             Self::Copy(copy) => copy_accesses(copy),
+            Self::UploadImage { destination, .. } => vec![ResourceAccess::new(
+                destination.target(),
+                scope(
+                    PipelineStages::COPY,
+                    AccessMode::Write,
+                    ResourceUsage::TransferDestination,
+                ),
+            )],
             Self::Resolve(resolve) => vec![
                 ResourceAccess::new(
                     resolve.source.target(),
@@ -1179,7 +1207,7 @@ impl GpuCommand {
     fn dependencies(&self) -> Vec<ResourceDependency> {
         let mut dependencies = Vec::new();
         match self {
-            Self::Copy(_) | Self::Resolve(_) | Self::Clear(_) => {
+            Self::Copy(_) | Self::UploadImage { .. } | Self::Resolve(_) | Self::Clear(_) => {
                 for access in self.accesses() {
                     push_target_dependency(&mut dependencies, access.target());
                 }
@@ -1226,7 +1254,7 @@ impl GpuCommand {
 
     fn capability_requirements(&self) -> CapabilityRequirements {
         let mut requirements = vec![CapabilityRequirement::Features(match self {
-            Self::Copy(_) => BackendFeatures::COPY,
+            Self::Copy(_) | Self::UploadImage { .. } => BackendFeatures::COPY,
             Self::Resolve(_) => BackendFeatures::RESOLVE,
             Self::Clear(_) => BackendFeatures::CLEAR,
             Self::Draw(draw) if draw.arguments.is_indexed() => {

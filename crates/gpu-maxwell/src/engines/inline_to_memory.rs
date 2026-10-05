@@ -1,4 +1,4 @@
-//! GM20B `MAXWELL_INLINE_TO_MEMORY_A` state and pitch-upload semantics.
+//! GM20B `MAXWELL_INLINE_TO_MEMORY_A` state and pitch/block-linear upload semantics.
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
@@ -80,7 +80,7 @@ pub enum MaxwellInlineToMemorySemaphoreStructureSize {
     OneWord,
 }
 
-/// Validated single-line pitch launch configuration.
+/// Validated inline upload launch configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellInlineToMemoryLaunch {
     system_memory_barrier_disabled: bool,
@@ -88,7 +88,7 @@ pub struct MaxwellInlineToMemoryLaunch {
 }
 
 impl MaxwellInlineToMemoryLaunch {
-    const fn pitch(
+    const fn new(
         system_memory_barrier_disabled: bool,
         semaphore_structure_size: MaxwellInlineToMemorySemaphoreStructureSize,
     ) -> Self {
@@ -115,14 +115,23 @@ pub struct MaxwellInlineToMemoryPendingTransfer {
     address: MaxwellInlineToMemoryAddress,
     byte_length: u32,
     next_offset: u32,
+    line_length: u32,
+    layout: DestinationLayout,
 }
 
 impl MaxwellInlineToMemoryPendingTransfer {
-    const fn new(address: MaxwellInlineToMemoryAddress, byte_length: u32) -> Self {
+    const fn new(
+        address: MaxwellInlineToMemoryAddress,
+        byte_length: u32,
+        line_length: u32,
+        layout: DestinationLayout,
+    ) -> Self {
         Self {
             address,
             byte_length,
             next_offset: 0,
+            line_length,
+            layout,
         }
     }
 
@@ -153,6 +162,50 @@ impl MaxwellInlineToMemoryPendingTransfer {
     }
 }
 
+// Pitch uploads use OFFSET_OUT + row * PITCH_OUT. Origins and block geometry
+// are consumed only by block-linear uploads, whose X coordinate is in bytes.
+// https://github.com/eden-emulator/mirror/blob/master/src/video_core/engines/engine_upload.cpp
+// Tegra 16Bx2 GOB address mapping (also used by the DMA engine):
+// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/display/framebuffer.c
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DestinationLayout {
+    Pitch {
+        pitch: u32,
+    },
+    BlockLinear {
+        width_in_gobs: u64,
+        block_height_gobs: u64,
+        x: u32,
+        y: u32,
+    },
+}
+
+impl DestinationLayout {
+    fn offset(self, x: u32, y: u32) -> u64 {
+        match self {
+            Self::Pitch { pitch } => u64::from(y) * u64::from(pitch) + u64::from(x),
+            Self::BlockLinear {
+                width_in_gobs,
+                block_height_gobs,
+                x: origin_x,
+                y: origin_y,
+            } => {
+                let x = u64::from(x) + u64::from(origin_x);
+                let y = u64::from(y) + u64::from(origin_y);
+                let block_rows = 8 * block_height_gobs;
+                (y / block_rows) * 512 * block_height_gobs * width_in_gobs
+                    + (x / 64) * 512 * block_height_gobs
+                    + ((y % block_rows) / 8) * 512
+                    + ((x % 64) / 32) * 256
+                    + ((y % 8) / 2) * 64
+                    + ((x % 32) / 16) * 32
+                    + (y % 2) * 16
+                    + x % 16
+            }
+        }
+    }
+}
+
 /// Persistent setup and upload cursor for `MAXWELL_INLINE_TO_MEMORY_A`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellInlineToMemoryState {
@@ -161,6 +214,14 @@ pub struct MaxwellInlineToMemoryState {
     address_upper: MaxwellInlineToMemoryRegister<u32>,
     address_lower: MaxwellInlineToMemoryRegister<u32>,
     pitch: MaxwellInlineToMemoryRegister<u32>,
+    block_size: MaxwellInlineToMemoryRegister<u32>,
+    width: MaxwellInlineToMemoryRegister<u32>,
+    height: MaxwellInlineToMemoryRegister<u32>,
+    depth: MaxwellInlineToMemoryRegister<u32>,
+    layer: MaxwellInlineToMemoryRegister<u32>,
+    origin_x: MaxwellInlineToMemoryRegister<u32>,
+    origin_y: MaxwellInlineToMemoryRegister<u32>,
+
     launch: MaxwellInlineToMemoryRegister<MaxwellInlineToMemoryLaunch>,
     last_data: MaxwellInlineToMemoryRegister<u32>,
     pending: Option<MaxwellInlineToMemoryPendingTransfer>,
@@ -198,6 +259,41 @@ impl MaxwellInlineToMemoryState {
     }
 
     #[must_use]
+    pub const fn block_size(&self) -> &MaxwellInlineToMemoryRegister<u32> {
+        &self.block_size
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> &MaxwellInlineToMemoryRegister<u32> {
+        &self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> &MaxwellInlineToMemoryRegister<u32> {
+        &self.height
+    }
+
+    #[must_use]
+    pub const fn depth(&self) -> &MaxwellInlineToMemoryRegister<u32> {
+        &self.depth
+    }
+
+    #[must_use]
+    pub const fn layer(&self) -> &MaxwellInlineToMemoryRegister<u32> {
+        &self.layer
+    }
+
+    #[must_use]
+    pub const fn origin_x(&self) -> &MaxwellInlineToMemoryRegister<u32> {
+        &self.origin_x
+    }
+
+    #[must_use]
+    pub const fn origin_y(&self) -> &MaxwellInlineToMemoryRegister<u32> {
+        &self.origin_y
+    }
+
+    #[must_use]
     pub const fn launch(&self) -> &MaxwellInlineToMemoryRegister<MaxwellInlineToMemoryLaunch> {
         &self.launch
     }
@@ -230,6 +326,27 @@ impl MaxwellInlineToMemoryState {
             }
             MaxwellInlineToMemoryStateWrite::Pitch { value, source } => {
                 self.pitch = MaxwellInlineToMemoryRegister::programmed(value, value, source);
+            }
+            MaxwellInlineToMemoryStateWrite::BlockSize { value, source } => {
+                self.block_size = MaxwellInlineToMemoryRegister::programmed(value, value, source);
+            }
+            MaxwellInlineToMemoryStateWrite::Width { value, source } => {
+                self.width = MaxwellInlineToMemoryRegister::programmed(value, value, source);
+            }
+            MaxwellInlineToMemoryStateWrite::Height { value, source } => {
+                self.height = MaxwellInlineToMemoryRegister::programmed(value, value, source);
+            }
+            MaxwellInlineToMemoryStateWrite::Depth { value, source } => {
+                self.depth = MaxwellInlineToMemoryRegister::programmed(value, value, source);
+            }
+            MaxwellInlineToMemoryStateWrite::Layer { value, source } => {
+                self.layer = MaxwellInlineToMemoryRegister::programmed(value, value, source);
+            }
+            MaxwellInlineToMemoryStateWrite::OriginX { value, source } => {
+                self.origin_x = MaxwellInlineToMemoryRegister::programmed(value, value, source);
+            }
+            MaxwellInlineToMemoryStateWrite::OriginY { value, source } => {
+                self.origin_y = MaxwellInlineToMemoryRegister::programmed(value, value, source);
             }
             MaxwellInlineToMemoryStateWrite::Launch {
                 value,
@@ -274,6 +391,34 @@ pub enum MaxwellInlineToMemoryStateWrite {
         source: MaxwellMethodSource,
     },
     Pitch {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    BlockSize {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    Width {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    Height {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    Depth {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    Layer {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    OriginX {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    OriginY {
         value: u32,
         source: MaxwellMethodSource,
     },
@@ -341,6 +486,13 @@ enum MethodAction {
     AddressUpper,
     AddressLower,
     Pitch,
+    BlockSize,
+    Width,
+    Height,
+    Depth,
+    Layer,
+    OriginX,
+    OriginY,
     Launch,
     Data,
 }
@@ -381,6 +533,13 @@ methods!(
     OFFSET_OUT_UPPER => (0x0188, "OFFSET_OUT_UPPER", 0x01ff_ffff, MethodAction::AddressUpper),
     OFFSET_OUT => (0x018c, "OFFSET_OUT", u32::MAX, MethodAction::AddressLower),
     PITCH_OUT => (0x0190, "PITCH_OUT", u32::MAX, MethodAction::Pitch),
+    SET_DST_BLOCK_SIZE => (0x0194, "SET_DST_BLOCK_SIZE", 0xfff, MethodAction::BlockSize),
+    SET_DST_WIDTH => (0x0198, "SET_DST_WIDTH", u32::MAX, MethodAction::Width),
+    SET_DST_HEIGHT => (0x019c, "SET_DST_HEIGHT", u32::MAX, MethodAction::Height),
+    SET_DST_DEPTH => (0x01a0, "SET_DST_DEPTH", u32::MAX, MethodAction::Depth),
+    SET_DST_LAYER => (0x01a4, "SET_DST_LAYER", u32::MAX, MethodAction::Layer),
+    SET_DST_ORIGIN_BYTES_X => (0x01a8, "SET_DST_ORIGIN_BYTES_X", 0x001f_ffff, MethodAction::OriginX),
+    SET_DST_ORIGIN_SAMPLES_Y => (0x01ac, "SET_DST_ORIGIN_SAMPLES_Y", 0x0001_ffff, MethodAction::OriginY),
     LAUNCH_DMA => (0x01b0, "LAUNCH_DMA", 0x0000_f37f, MethodAction::Launch),
     LOAD_INLINE_DATA => (0x01b4, "LOAD_INLINE_DATA", u32::MAX, MethodAction::Data),
 );
@@ -435,7 +594,10 @@ pub(super) fn preflight(
         };
         let upload = MaxwellInlineToMemoryUpload {
             address: pending.address(),
-            offset: pending.next_offset(),
+            offset: pending.layout.offset(
+                pending.next_offset() % pending.line_length,
+                pending.next_offset() / pending.line_length,
+            ) as u32,
             value: raw,
             source,
         };
@@ -461,12 +623,21 @@ pub(super) fn preflight(
             MaxwellInlineToMemoryStateWrite::AddressLower { value: raw, source }
         }
         MethodAction::Pitch => MaxwellInlineToMemoryStateWrite::Pitch { value: raw, source },
+        MethodAction::BlockSize => {
+            MaxwellInlineToMemoryStateWrite::BlockSize { value: raw, source }
+        }
+        MethodAction::Width => MaxwellInlineToMemoryStateWrite::Width { value: raw, source },
+        MethodAction::Height => MaxwellInlineToMemoryStateWrite::Height { value: raw, source },
+        MethodAction::Depth => MaxwellInlineToMemoryStateWrite::Depth { value: raw, source },
+        MethodAction::Layer => MaxwellInlineToMemoryStateWrite::Layer { value: raw, source },
+        MethodAction::OriginX => MaxwellInlineToMemoryStateWrite::OriginX { value: raw, source },
+        MethodAction::OriginY => MaxwellInlineToMemoryStateWrite::OriginY { value: raw, source },
         MethodAction::Launch => {
-            if raw & !0x0000_1040 != 1 {
+            if raw & !0x0000_1051 != 0 {
                 return Err(invalid_encoding(
                     source,
                     declaration.metadata.method_name(),
-                    "only pitch, no-reduction, no-completion inline uploads are implemented",
+                    "interrupt, reduction, and semaphore release inline uploads are not implemented",
                 ));
             }
             if candidate.pending().is_some() {
@@ -518,26 +689,93 @@ pub(super) fn preflight(
                     "inline upload length must be nonzero and word-aligned",
                 ));
             }
-            if line_count != 1 {
-                return Err(invalid_encoding(
-                    source,
-                    declaration.metadata.method_name(),
-                    "multi-line pitch uploads are not implemented",
-                ));
-            }
-            if address
-                .get()
-                .checked_add(u64::from(line_length))
-                .is_none_or(|end| end > (1_u64 << 40))
+            let byte_length = line_length
+                .checked_mul(line_count)
+                .filter(|&length| length != 0)
+                .ok_or_else(|| {
+                    invalid_encoding(
+                        source,
+                        "LAUNCH_DMA",
+                        "inline transfer size is zero or overflows",
+                    )
+                })?;
+            let layout = if raw & 1 != 0 {
+                let pitch = if line_count == 1 {
+                    0
+                } else {
+                    *candidate.pitch.value().ok_or_else(|| {
+                        invalid_encoding(
+                            source,
+                            "LAUNCH_DMA",
+                            "multi-line launch requires PITCH_OUT",
+                        )
+                    })?
+                };
+                if line_count > 1 && pitch < line_length {
+                    return Err(invalid_encoding(
+                        source,
+                        "LAUNCH_DMA",
+                        "destination pitch is smaller than the line length",
+                    ));
+                }
+                DestinationLayout::Pitch { pitch }
+            } else {
+                let required = |register: &MaxwellInlineToMemoryRegister<u32>| {
+                    register.value().copied().ok_or_else(|| {
+                        invalid_encoding(
+                            source,
+                            "LAUNCH_DMA",
+                            "block-linear launch requires destination geometry and origins",
+                        )
+                    })
+                };
+                let block_size = required(&candidate.block_size)?;
+                let width = required(&candidate.width)?;
+                let height = required(&candidate.height)?;
+                let depth = required(&candidate.depth)?;
+                let layer = required(&candidate.layer)?;
+                let x = required(&candidate.origin_x)?;
+                let y = required(&candidate.origin_y)?;
+                let height_log2 = (block_size >> 4) & 0xf;
+                if block_size & 0xf0f != 0 || height_log2 > 5 || depth != 1 || layer != 0 {
+                    return Err(invalid_encoding(
+                        source,
+                        "LAUNCH_DMA",
+                        "only two-dimensional, one-GOB-wide block-linear uploads are implemented",
+                    ));
+                }
+                if !x.is_multiple_of(4)
+                    || x.checked_add(line_length).is_none_or(|end| end > width)
+                    || y.checked_add(line_count).is_none_or(|end| end > height)
+                {
+                    return Err(invalid_encoding(
+                        source,
+                        "LAUNCH_DMA",
+                        "block-linear upload is unaligned or exceeds destination dimensions",
+                    ));
+                }
+                DestinationLayout::BlockLinear {
+                    width_in_gobs: u64::from(width).div_ceil(64),
+                    block_height_gobs: 1 << height_log2,
+                    x,
+                    y,
+                }
+            };
+            let last_byte = layout.offset(line_length - 1, line_count - 1);
+            if last_byte > u64::from(u32::MAX)
+                || address
+                    .get()
+                    .checked_add(last_byte + 1)
+                    .is_none_or(|end| end > 1 << 40)
             {
                 return Err(invalid_encoding(
                     source,
-                    declaration.metadata.method_name(),
+                    "LAUNCH_DMA",
                     "inline upload GPU range overflows",
                 ));
             }
             MaxwellInlineToMemoryStateWrite::Launch {
-                value: MaxwellInlineToMemoryLaunch::pitch(
+                value: MaxwellInlineToMemoryLaunch::new(
                     raw & 0x40 != 0,
                     if raw & 0x1000 == 0 {
                         MaxwellInlineToMemorySemaphoreStructureSize::FourWords
@@ -545,7 +783,12 @@ pub(super) fn preflight(
                         MaxwellInlineToMemorySemaphoreStructureSize::OneWord
                     },
                 ),
-                pending: MaxwellInlineToMemoryPendingTransfer::new(address, line_length),
+                pending: MaxwellInlineToMemoryPendingTransfer::new(
+                    address,
+                    byte_length,
+                    line_length,
+                    layout,
+                ),
                 source,
             }
         }

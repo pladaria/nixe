@@ -5,6 +5,7 @@ use ShaderScalarType as T;
 
 fn options() -> SpirvTessellationOptions {
     SpirvTessellationOptions {
+        depth_clip_negative_one_to_one: false,
         input_control_points: 5,
         mode: TessellationMode {
             domain: TessellationDomain::Triangles,
@@ -138,6 +139,7 @@ fn final_stage_prunes_unconsumed_components_before_arithmetic_and_resource_liven
     let standalone = lower_shader_ir_to_spirv(
         &chain[2],
         SpirvShaderOptions {
+            depth_clip_negative_one_to_one: false,
             input_control_points: 3,
             tessellation_mode: Some(options().mode),
             float32: Default::default(),

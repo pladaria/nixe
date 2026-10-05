@@ -89,6 +89,38 @@ fn check(word: u32, source: u64, fpcr: u32) -> EdgeKind {
 }
 
 #[test]
+fn scalar_fixed_integer_to_fp_matches_exact_rounding_status_and_traps() {
+    for source_64 in [false, true] {
+        for destination_64 in [false, true] {
+            for signed in [false, true] {
+                for fractional_bits in [1, 16, 32, if source_64 { 64 } else { 31 }] {
+                    let word = 0x1e02_0020
+                        | ((source_64 as u32) << 31)
+                        | ((destination_64 as u32) << 22)
+                        | ((!signed as u32) << 16)
+                        | ((64 - fractional_bits) << 10);
+                    for source in [
+                        0,
+                        1,
+                        u64::MAX,
+                        0xe6e4_0fce,
+                        1 << 63,
+                        (1 << 24) + 1,
+                        (1 << 53) + 1,
+                    ] {
+                        for mode in 0..4 {
+                            check(word, source, mode << 22);
+                        }
+                        check(word, source, 1 << 12);
+                    }
+                    check((word & !(31 << 5)) | (31 << 5), u64::MAX, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn scalar_integer_to_fp_rounding_widths_and_exceptions_match_interpreter() {
     for source_64 in [false, true] {
         for destination_64 in [false, true] {

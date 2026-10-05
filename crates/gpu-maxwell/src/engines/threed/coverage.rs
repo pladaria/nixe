@@ -506,6 +506,10 @@ pub enum MaxwellThreeDCoverageStateWrite {
         value: MaxwellThreeDAlphaToCoverageDither,
         source: MaxwellMethodSource,
     },
+    PostPsInitialCoverage {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
     PostZPixelShaderImask {
         value: MaxwellThreeDPostZPixelShaderImask,
         source: MaxwellMethodSource,
@@ -557,6 +561,7 @@ pub enum MaxwellThreeDCoverageStateWrite {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDCoverageState {
     alpha_to_coverage_dither: MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageDither>,
+    post_ps_initial_coverage: MaxwellThreeDRegister<bool>,
     post_z_pixel_shader_imask: MaxwellThreeDRegister<MaxwellThreeDPostZPixelShaderImask>,
     tir_mode: MaxwellThreeDRegister<MaxwellThreeDTirMode>,
     tir_control: MaxwellThreeDRegister<MaxwellThreeDTirControl>,
@@ -577,6 +582,15 @@ impl MaxwellThreeDCoverageState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageDither> {
         &self.alpha_to_coverage_dither
+    }
+
+    /// Whether post-shader coverage starts from the pre-shader mask. False
+    /// retains normal post-shader coverage; true needs distinct lowering only
+    /// when the shader or alpha test changes the mask.
+    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1817-L1820
+    #[must_use]
+    pub const fn post_ps_initial_coverage(&self) -> &MaxwellThreeDRegister<bool> {
+        &self.post_ps_initial_coverage
     }
 
     #[must_use]
@@ -654,6 +668,10 @@ impl MaxwellThreeDCoverageState {
             MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source } => {
                 self.alpha_to_coverage_dither =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDCoverageStateWrite::PostPsInitialCoverage { value, source } => {
+                self.post_ps_initial_coverage =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source } => {
                 self.post_z_pixel_shader_imask =

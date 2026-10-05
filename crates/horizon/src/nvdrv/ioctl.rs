@@ -12,7 +12,13 @@ pub(crate) struct NvDrvIoctlRequest<'a> {
     pub process_id: u64,
     pub address_space: AddressSpaceId,
     pub translator: &'a dyn CanonicalRangeTranslator,
+    pub caller: NvDrvIoctlCaller<'a>,
+}
+
+/// Caller identity and the process clock consumed by waits and timer queries.
+pub(crate) struct NvDrvIoctlCaller<'a> {
     pub thread_id: u64,
+    pub clock: &'a nixe_runtime::VirtualClock,
 }
 
 /// Distinct extra buffers carried by Ioctl2 and Ioctl3.

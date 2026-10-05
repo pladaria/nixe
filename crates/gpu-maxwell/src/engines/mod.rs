@@ -8,6 +8,7 @@ mod compute;
 mod dma_copy;
 mod inline_to_memory;
 mod lowering;
+pub(crate) mod memory_copy;
 mod spa;
 mod threed;
 pub(crate) use lowering::lower_maxwell_three_d_operation_into_cache;
@@ -32,16 +33,16 @@ pub use compute::{
 };
 
 pub(crate) use compute::resolve_compute_launch;
-pub use dma_copy::{
-    MaxwellDmaCopyComponentSource, MaxwellDmaCopyError, MaxwellDmaCopyMemoryLayout,
-    MaxwellDmaCopyOperation, MaxwellDmaCopyRegister, MaxwellDmaCopyRegisterName,
-    MaxwellDmaCopyRemap, MaxwellDmaCopyState,
-};
+pub use dma_copy::{MaxwellDmaCopyRegister, MaxwellDmaCopyRegisterName, MaxwellDmaCopyState};
 pub use inline_to_memory::{
     MaxwellInlineToMemoryAddress, MaxwellInlineToMemoryLaunch,
     MaxwellInlineToMemoryPendingTransfer, MaxwellInlineToMemoryRegister,
     MaxwellInlineToMemorySemaphoreStructureSize, MaxwellInlineToMemoryState,
     MaxwellInlineToMemoryUpload,
+};
+pub use memory_copy::{
+    MaxwellMemoryCopyComponentSource, MaxwellMemoryCopyError, MaxwellMemoryCopyLayout,
+    MaxwellMemoryCopyOperation, MaxwellMemoryCopyRemap,
 };
 #[cfg(test)]
 use threed::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
@@ -66,25 +67,25 @@ pub use threed::{
     MaxwellThreeDBlendFactor, MaxwellThreeDBlendFloatPixelKillEnable, MaxwellThreeDBlendOp,
     MaxwellThreeDBlendPerFormatEnable, MaxwellThreeDBlendZeroTimesAnythingIsZero,
     MaxwellThreeDClearState, MaxwellThreeDClearSurface, MaxwellThreeDClearSurfaceControl,
-    MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorCompressionMode, MaxwellThreeDColorMask,
-    MaxwellThreeDColorReductionFp16Threshold, MaxwellThreeDColorReductionSrgb8Threshold,
-    MaxwellThreeDColorReductionState, MaxwellThreeDColorReductionThresholdsEnable,
-    MaxwellThreeDColorReductionThresholdsFp16, MaxwellThreeDColorReductionThresholdsSrgb8,
-    MaxwellThreeDColorReductionThresholdsUnorm8, MaxwellThreeDColorReductionThresholdsUnorm10,
-    MaxwellThreeDColorReductionThresholdsUnorm16, MaxwellThreeDColorTargetFormat,
-    MaxwellThreeDColorTargetSelection, MaxwellThreeDColorTargetState, MaxwellThreeDCompareOp,
-    MaxwellThreeDCompressionThreshold, MaxwellThreeDConditionalLoadConstantBuffer,
-    MaxwellThreeDConservativeRasterEnable, MaxwellThreeDConstantBufferBinding,
-    MaxwellThreeDConstantBufferLoadState, MaxwellThreeDConstantBufferSelectorState,
-    MaxwellThreeDConstantColorComponent, MaxwellThreeDConstantColorRenderingState,
-    MaxwellThreeDConstantColorValue, MaxwellThreeDCounterState, MaxwellThreeDCoverageState,
-    MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable, MaxwellThreeDCullFace,
-    MaxwellThreeDDecompressSurface, MaxwellThreeDDepthArrayControl,
-    MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
-    MaxwellThreeDDepthTargetCount, MaxwellThreeDDescriptorPoolState,
-    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDDirtySubresource,
-    MaxwellThreeDDirtySubresources, MaxwellThreeDEdgeFlag, MaxwellThreeDFalconError,
-    MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
+    MaxwellThreeDClipAxis, MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorCompressionMode,
+    MaxwellThreeDColorMask, MaxwellThreeDColorReductionFp16Threshold,
+    MaxwellThreeDColorReductionSrgb8Threshold, MaxwellThreeDColorReductionState,
+    MaxwellThreeDColorReductionThresholdsEnable, MaxwellThreeDColorReductionThresholdsFp16,
+    MaxwellThreeDColorReductionThresholdsSrgb8, MaxwellThreeDColorReductionThresholdsUnorm8,
+    MaxwellThreeDColorReductionThresholdsUnorm10, MaxwellThreeDColorReductionThresholdsUnorm16,
+    MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetSelection,
+    MaxwellThreeDColorTargetState, MaxwellThreeDCompareOp, MaxwellThreeDCompressionThreshold,
+    MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConservativeRasterEnable,
+    MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferLoadState,
+    MaxwellThreeDConstantBufferSelectorState, MaxwellThreeDConstantColorComponent,
+    MaxwellThreeDConstantColorRenderingState, MaxwellThreeDConstantColorValue,
+    MaxwellThreeDCounterState, MaxwellThreeDCoverageState, MaxwellThreeDCoverageToColor,
+    MaxwellThreeDCsaaEnable, MaxwellThreeDCullFace, MaxwellThreeDDecompressSurface,
+    MaxwellThreeDDepthArrayControl, MaxwellThreeDDepthStencilFormat,
+    MaxwellThreeDDepthStencilTargetState, MaxwellThreeDDepthTargetCount,
+    MaxwellThreeDDescriptorPoolState, MaxwellThreeDDirectlyAddressableMemory,
+    MaxwellThreeDDirtySubresource, MaxwellThreeDDirtySubresources, MaxwellThreeDEdgeFlag,
+    MaxwellThreeDFalconError, MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
     MaxwellThreeDFalconRegisterAddress, MaxwellThreeDFalconState, MaxwellThreeDFillViaTriangleMode,
     MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDFlushPendingWrites, MaxwellThreeDFrontFace,
@@ -131,7 +132,7 @@ pub use threed::{
     MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderResourceUse,
     MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
     MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDStencilOp,
-    MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB, MaxwellThreeDSurfaceClipAxis,
+    MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
     MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
     MaxwellThreeDSyncpointIncrement, MaxwellThreeDSystemMemoryVolatile,
@@ -164,13 +165,12 @@ pub use threed::{
 };
 pub use twod::{
     MAXWELL_TWO_D_CORRAL_SIZE_MAX, MAXWELL_TWO_D_NOTIFY_ADDRESS_UPPER_MAX, MaxwellTwoDBeta1,
-    MaxwellTwoDBeta4, MaxwellTwoDBetaState, MaxwellTwoDClipEnable, MaxwellTwoDColorKeyEnable,
-    MaxwellTwoDNotifyAddressLower, MaxwellTwoDNotifyAddressUpper, MaxwellTwoDNotifyState,
-    MaxwellTwoDOperation, MaxwellTwoDPixelsFromMemoryCorralSize,
+    MaxwellTwoDBeta4, MaxwellTwoDBetaState, MaxwellTwoDBlitOperation, MaxwellTwoDClipEnable,
+    MaxwellTwoDColorKeyEnable, MaxwellTwoDNotifyAddressLower, MaxwellTwoDNotifyAddressUpper,
+    MaxwellTwoDNotifyState, MaxwellTwoDOperation, MaxwellTwoDPixelsFromMemoryCorralSize,
     MaxwellTwoDPixelsFromMemorySafeOverlap, MaxwellTwoDPixelsFromMemoryState,
     MaxwellTwoDProcessingClusters, MaxwellTwoDRegister, MaxwellTwoDRegisterOrigin,
-    MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDResolveOperation,
-    MaxwellTwoDState,
+    MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDState,
 };
 
 use std::fmt::{Display, Formatter};
@@ -182,8 +182,8 @@ use nixe_gpu::{FrontendSubmissionId, GpuClassId, GpuMethodId};
 
 use crate::pushbuffer::dispatch::{MaxwellMethodStreamError, stream_maxwell_packet_methods};
 use crate::{
-    MaxwellAamVersionRange, MaxwellDecodedPacket, MaxwellGpuChannel, MaxwellHostMemoryOperation,
-    MaxwellHostMethod, MaxwellMethodDispatch, MaxwellMethodDispatchError,
+    MaxwellAamVersionRange, MaxwellDecodedPacket, MaxwellGpuChannel, MaxwellHostMethod,
+    MaxwellHostSynchronizationKind, MaxwellMethodDispatch, MaxwellMethodDispatchError,
     MaxwellMethodDispatchKind, MaxwellMethodSource, MaxwellShaderProgramHeaderVersionRange,
 };
 
@@ -256,11 +256,16 @@ impl MaxwellEngineMethodMetadata {
 /// One execution-relevant effect produced while applying a method.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PendingEngineOperation {
-    TwoDResolve(twod::MaxwellTwoDResolveOperation),
+    Notification {
+        address: u64,
+        source: MaxwellMethodSource,
+    },
+    TwoDBlit(twod::MaxwellTwoDBlitOperation),
+    TwoDSolid(twod::MaxwellTwoDSolidOperation),
     HostSynchronization(MaxwellHostSynchronizationOperation),
     ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
     InlineToMemory(MaxwellInlineToMemoryUpload),
-    DmaCopy(MaxwellDmaCopyOperation),
+    MemoryCopy(MaxwellMemoryCopyOperation),
     ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
     ComputeLaunch(MaxwellComputeLaunch),
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
@@ -276,15 +281,15 @@ pub(crate) struct MaxwellEngineEvent<'a> {
     pub(crate) compute: Option<&'a MaxwellComputeState>,
 }
 
-/// One validated host cache operation at its exact pushbuffer source.
+/// One validated host synchronization at its exact pushbuffer source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellHostSynchronizationOperation {
-    operation: MaxwellHostMemoryOperation,
+    operation: MaxwellHostSynchronizationKind,
 }
 
 impl MaxwellHostSynchronizationOperation {
     #[must_use]
-    pub const fn operation(self) -> MaxwellHostMemoryOperation {
+    pub const fn operation(self) -> MaxwellHostSynchronizationKind {
         self.operation
     }
 }
@@ -346,11 +351,16 @@ pub struct MaxwellEnginePacketDispatch {
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellEngineOperation {
-    TwoDResolve(twod::MaxwellTwoDResolveOperation),
+    Notification {
+        address: u64,
+        source: MaxwellMethodSource,
+    },
+    TwoDBlit(twod::MaxwellTwoDBlitOperation),
+    TwoDSolid(twod::MaxwellTwoDSolidOperation),
     HostSynchronization(MaxwellHostSynchronizationOperation),
     ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
     InlineToMemory(MaxwellInlineToMemoryUpload),
-    DmaCopy(MaxwellDmaCopyOperation),
+    MemoryCopy(MaxwellMemoryCopyOperation),
     ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
     ComputeLaunch {
         launch: MaxwellComputeLaunch,
@@ -685,6 +695,20 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
             }
             flush_mme_methods(channel, mme_methods, mme_parameters, &mut methods, consume)?;
         }
+        if let Some((_, source)) = channel.three_d_mut().pending_notification
+            && (method.source().subchannel() != source.subchannel()
+                || (!matches!(method.kind(), MaxwellMethodDispatchKind::HostMethod(_))
+                    && (method.kind() != MaxwellMethodDispatchKind::ClassMethod
+                        || method.class() != threed::CLASS)))
+        {
+            return Err(MaxwellEngineStreamError::dispatch(
+                MaxwellEngineDispatchError::InvalidMethodEncoding {
+                    source: method.source(),
+                    method_name: "NOTIFY",
+                    reason: "object or subchannel switched with a pending notification",
+                },
+            ));
+        }
         if let MaxwellMethodDispatchKind::HostMethod(host) = method.kind() {
             let applied = preflight_host_method(method, host);
             if let Some(operation) = applied.operation {
@@ -786,6 +810,60 @@ fn flush_mme_methods<E>(
 
 fn preflight_host_method(method: MaxwellMethodDispatch, host: MaxwellHostMethod) -> AppliedMethod {
     match host {
+        MaxwellHostMethod::SemaphoreState => AppliedMethod::new(
+            method,
+            MaxwellEngineMethodMetadata::new(
+                method.class(),
+                "MAXWELL_CHANNEL_GPFIFO_A",
+                method.source().method(),
+                match method.source().method().0 {
+                    0x10 => "SEMAPHOREA",
+                    0x14 => "SEMAPHOREB",
+                    _ => "SEMAPHOREC",
+                },
+            ),
+            None,
+        ),
+        MaxwellHostMethod::SemaphoreRelease(operation) => AppliedMethod::new(
+            method,
+            MaxwellEngineMethodMetadata::new(
+                method.class(),
+                "MAXWELL_CHANNEL_GPFIFO_A",
+                method.source().method(),
+                "SEMAPHORED",
+            ),
+            Some(PendingEngineOperation::HostSynchronization(
+                MaxwellHostSynchronizationOperation { operation },
+            )),
+        ),
+        MaxwellHostMethod::SetReference => AppliedMethod::new(
+            method,
+            MaxwellEngineMethodMetadata::new(
+                method.class(),
+                "MAXWELL_CHANNEL_GPFIFO_A",
+                method.source().method(),
+                "SET_REFERENCE",
+            ),
+            Some(PendingEngineOperation::HostSynchronization(
+                MaxwellHostSynchronizationOperation {
+                    operation: MaxwellHostSynchronizationKind::WaitForIdle { all: true },
+                },
+            )),
+        ),
+        MaxwellHostMethod::WaitForIdle { all } => AppliedMethod::new(
+            method,
+            MaxwellEngineMethodMetadata::new(
+                method.class(),
+                "MAXWELL_CHANNEL_GPFIFO_A",
+                method.source().method(),
+                "WFI",
+            ),
+            Some(PendingEngineOperation::HostSynchronization(
+                MaxwellHostSynchronizationOperation {
+                    operation: MaxwellHostSynchronizationKind::WaitForIdle { all },
+                },
+            )),
+        ),
         MaxwellHostMethod::Nop => AppliedMethod::new(
             method,
             MaxwellEngineMethodMetadata::new(
@@ -841,8 +919,12 @@ pub fn dispatch_maxwell_engine_packet(
         &mut mme_parameters,
         &mut |event| {
             let operation = match event.operation {
-                PendingEngineOperation::TwoDResolve(resolve) => {
-                    MaxwellEngineOperation::TwoDResolve(resolve)
+                PendingEngineOperation::Notification { address, source } => {
+                    MaxwellEngineOperation::Notification { address, source }
+                }
+                PendingEngineOperation::TwoDSolid(rect) => MaxwellEngineOperation::TwoDSolid(rect),
+                PendingEngineOperation::TwoDBlit(resolve) => {
+                    MaxwellEngineOperation::TwoDBlit(resolve)
                 }
                 PendingEngineOperation::HostSynchronization(operation) => {
                     MaxwellEngineOperation::HostSynchronization(operation)
@@ -853,8 +935,8 @@ pub fn dispatch_maxwell_engine_packet(
                 PendingEngineOperation::InlineToMemory(upload) => {
                     MaxwellEngineOperation::InlineToMemory(upload)
                 }
-                PendingEngineOperation::DmaCopy(operation) => {
-                    MaxwellEngineOperation::DmaCopy(operation)
+                PendingEngineOperation::MemoryCopy(operation) => {
+                    MaxwellEngineOperation::MemoryCopy(operation)
                 }
                 PendingEngineOperation::ComputeSynchronization(operation) => {
                     MaxwellEngineOperation::ComputeSynchronization(operation)

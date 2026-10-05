@@ -5,6 +5,8 @@
 //! guest code never reaches the host backend as a shader module.
 
 mod buffer;
+#[cfg(test)]
+mod buffer_cache_tests;
 mod color;
 #[cfg(test)]
 mod compressed_sampling_tests;
@@ -186,16 +188,15 @@ impl MaxwellThreeDOperationTrigger {
 /// old streams configured while disabling all their attributes (for example,
 /// when a subsequent shader generates geometry from the vertex ID).
 fn consumed_vertex_streams(state: &MaxwellThreeDState) -> impl Iterator<Item = u8> {
-    let mut mask = state
-        .vertex_input()
-        .attributes()
-        .iter()
-        .fold(0_u32, |mask, attribute| {
-            match attribute.value().filter(|attribute| attribute.enabled()) {
-                Some(attribute) => mask | (1 << attribute.stream()),
-                None => mask,
-            }
-        });
+    let mut mask = state.vertex_input().attributes().iter().enumerate().fold(
+        0_u32,
+        |mask, (index, attribute)| match attribute.value().filter(|attribute| {
+            attribute.enabled() && state.vertex_input().attribute_skip_mask(index as u8) != 15
+        }) {
+            Some(attribute) => mask | (1 << attribute.stream()),
+            None => mask,
+        },
+    );
     std::iter::from_fn(move || {
         if mask == 0 {
             return None;
@@ -475,12 +476,13 @@ impl ViewKey {
         };
         *description == image.description()
             && *swizzle == image.view().swizzle()
-            && same_guest_image_interpretation(
+            && (same_guest_image_interpretation(
                 *guest_format,
                 *guest_compression_enabled,
                 image.guest_format(),
                 image.guest_layout().requires_materialization(),
-            )
+            ) || (image.role() == MaxwellThreeDResourceRole::BlitSource
+                && *guest_format == image.guest_format()))
             && *guest_pte_kind == image.guest_layout().pte_kind()
             && bindings.len() == image.view().bindings().len()
             && bindings.iter().zip(image.view().bindings()).all(
@@ -493,7 +495,196 @@ impl ViewKey {
     }
 }
 
+impl MaxwellLoweringCache {
+    pub(crate) fn inline_image_word(
+        &self,
+        target: &crate::MaxwellResolvedRange,
+        hint: Option<usize>,
+    ) -> Result<Option<(usize, ImageRegion)>, MaxwellLoweringError> {
+        let [segment] = target.segments() else {
+            return Ok(None);
+        };
+        let matches = |record: &ViewRecord| {
+            let ViewKey::Image { bindings, .. } = &record.key else {
+                return false;
+            };
+            record.materialization == ViewMaterialization::CompressedColor
+                && bindings.len() == 1
+                && bindings[0].2.allocation().get() == segment.mapping().allocation().get()
+                && segment.backing_offset() >= bindings[0].2.allocation_offset()
+                && segment.backing_offset() + 4
+                    <= bindings[0].2.allocation_offset() + bindings[0].2.range().size()
+        };
+        let index = hint
+            .filter(|index| self.views.get(*index).is_some_and(&matches))
+            .or_else(|| self.views.iter().position(matches));
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let record = &self.views[index];
+        let ViewKey::Image {
+            description,
+            bindings,
+            ..
+        } = &record.key
+        else {
+            unreachable!();
+        };
+        if hint != Some(index)
+            && (!record
+                .cpu_writes
+                .as_ref()
+                .is_some_and(CanonicalCpuWriteDependency::remains_current))
+        {
+            return Err(MaxwellLoweringError::ContradictoryState {
+                reason: "inline image upload requires a current producer",
+            });
+        }
+        if description.format().plane_bytes_per_texel(0) != Some(4)
+            || description.samples() != nixe_gpu::SampleCount::One
+            || bindings[0].0.layer_count != 1
+        {
+            return Err(MaxwellLoweringError::ContradictoryState {
+                reason: "inline image upload requires single-layer C32 storage",
+            });
+        }
+        let nixe_gpu::ImageMemoryLayout::BlockLinear(layout) = bindings[0].1 else {
+            return Ok(None);
+        };
+        let offset = segment.backing_offset() - bindings[0].2.allocation_offset();
+        let (x, y) = inline_block_linear_position(
+            offset,
+            description.extent().width,
+            layout.block_height_log2,
+        );
+        if x % 4 != 0
+            || x / 4 >= u64::from(description.extent().width)
+            || y >= u64::from(description.extent().height)
+        {
+            return Err(MaxwellLoweringError::ContradictoryState {
+                reason: "inline image upload targets padding or an unaligned texel",
+            });
+        }
+        Ok(Some((
+            index,
+            ImageRegion {
+                image: image_dependency(record.dependency)?,
+                subresources: bindings[0].0,
+                origin: ImageOrigin {
+                    x: (x / 4) as u32,
+                    y: y as u32,
+                    z: 0,
+                },
+                extent: nixe_gpu::ImageExtent {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            },
+        )))
+    }
+
+    pub(crate) fn lower_inline_images(
+        &mut self,
+        uploads: Vec<(ImageRegion, Vec<u8>)>,
+        submission: FrontendSubmissionId,
+        predecessors: Vec<FrontendSubmissionId>,
+    ) -> Result<MaxwellLoweredWork, MaxwellLoweringError> {
+        let revision = self.revision.saturating_add(1);
+        let mut commands = Vec::with_capacity(uploads.len());
+        for (destination, bytes) in uploads {
+            if let Some(record) = self
+                .views
+                .iter_mut()
+                .find(|record| record.dependency == ResourceDependency::Image(destination.image))
+            {
+                record.write_revision = revision;
+                let incomplete = !record.uninitialized_color_regions.is_empty();
+                resolve::subtract_initialized_rect(
+                    &mut record.uninitialized_color_regions,
+                    [
+                        destination.origin.x,
+                        destination.origin.y,
+                        destination.origin.x + destination.extent.width,
+                        destination.origin.y + destination.extent.height,
+                    ],
+                );
+                if incomplete && record.uninitialized_color_regions.is_empty() {
+                    let ViewKey::Image {
+                        description,
+                        swizzle,
+                        guest_format,
+                        guest_pte_kind,
+                        guest_compression_enabled,
+                        bindings,
+                        ..
+                    } = &record.key
+                    else {
+                        unreachable!();
+                    };
+                    self.color_materializations.push(ColorRepresentationRecord {
+                        description: *description,
+                        swizzle: *swizzle,
+                        guest_format: *guest_format,
+                        guest_pte_kind: *guest_pte_kind,
+                        guest_compression_enabled: *guest_compression_enabled,
+                        bindings: bindings
+                            .iter()
+                            .map(
+                                |(subresources, layout, backing)| ColorRepresentationBinding {
+                                    subresources: *subresources,
+                                    layout: *layout,
+                                    backing: backing.clone(),
+                                },
+                            )
+                            .collect(),
+                        cpu_writes: record.cpu_writes.clone(),
+                    });
+                }
+            }
+            commands.push(GpuOperation::new(
+                GpuCommand::UploadImage {
+                    destination,
+                    bytes: bytes.into(),
+                },
+                [],
+                [],
+                CapabilityRequirements::none(),
+            ));
+        }
+        finish_lowered_work(
+            self,
+            submission,
+            predecessors,
+            Vec::new(),
+            Vec::new(),
+            commands,
+            Arc::from([]),
+        )
+    }
+}
+
+fn inline_block_linear_position(offset: u64, width: u32, block_height_log2: u8) -> (u64, u64) {
+    // Inverse of Tegra's documented 16Bx2 GOB address mapping.
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/display/framebuffer.c
+    let height = 1_u64 << block_height_log2;
+    let row = (u64::from(width) * 4).div_ceil(64) * 512 * height;
+    let gob = offset % 512;
+    let x = (offset % row) / (512 * height) * 64 + gob / 256 * 32 + gob % 64 / 32 * 16 + gob % 16;
+    let y = offset / row * 8 * height
+        + offset % (512 * height) / 512 * 8
+        + gob % 256 / 64 * 2
+        + gob % 32 / 16;
+    (x, y)
+}
+
 fn same_canonical_backing(left: &nixe_gpu::BackingView, right: &nixe_gpu::BackingView) -> bool {
+    // Reject distinct byte coverage using the compressed span index before
+    // comparing potentially thousands of retained page segments. The ordered
+    // segment comparison below still distinguishes differently ordered aliases.
+    if left.canonical_spans() != right.canonical_spans() {
+        return false;
+    }
     left.range() == right.range()
         || (left.range().segments().len() == right.range().segments().len()
             && left
@@ -552,12 +743,13 @@ impl ColorRepresentationRecord {
     fn same_domain_as_image(&self, image: &super::threed::MaxwellThreeDResolvedImage) -> bool {
         self.description == image.description()
             && self.swizzle == image.view().swizzle()
-            && same_guest_image_interpretation(
+            && (same_guest_image_interpretation(
                 self.guest_format,
                 self.guest_compression_enabled,
                 image.guest_format(),
                 image.guest_layout().requires_materialization(),
-            )
+            ) || (image.role() == MaxwellThreeDResourceRole::BlitSource
+                && self.guest_format == image.guest_format()))
             && self.guest_pte_kind == image.guest_layout().pte_kind()
             && self.bindings.len() == image.view().bindings().len()
             && self.bindings.iter().zip(image.view().bindings()).all(
@@ -589,6 +781,9 @@ struct ViewRecord {
     materialization: ViewMaterialization,
     cpu_writes: Option<CanonicalCpuWriteDependency>,
     write_revision: u64,
+    last_used: u64,
+    uninitialized_color_regions: Vec<[u32; 4]>,
+    uninitialized_depth_stencil_regions: [Vec<[u32; 4]>; 2],
 }
 
 impl ViewRecord {
@@ -1454,15 +1649,12 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     {
         return Err(MaxwellLoweringError::UnsupportedTwoSidedLightSemantics);
     }
-    if trigger.is_draw()
-        && state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::ColorClampEnable)
-            .value()
-            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
-    {
-        return Err(MaxwellLoweringError::UnsupportedColorClampSemantics);
-    }
+    // SET_COLOR_CLAMP applies to legacy vertex COLOR/BCOLOR attributes,
+    // not generic varyings or fragment outputs. Their SPH maps/attribute
+    // transfers are rejected explicitly by the shader translator until that
+    // interface is implemented, so no supported draw consumes this clamp.
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/gallium/drivers/nouveau/nvc0/nvc0_state.c#L231-L233
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/gallium/drivers/nouveau/nvc0/nvc0_program.c#L53-L54
     if trigger.is_draw()
         && let Some(MaxwellThreeDFixedFunctionValue::PixelShaderSaturate(value)) = state
             .fixed_function()
@@ -1522,6 +1714,18 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled)
     {
         return Err(MaxwellLoweringError::UnsupportedApiMandatedEarlyZSemantics);
+    }
+    if trigger.is_draw()
+        && state.coverage().post_ps_initial_coverage().value() == Some(&true)
+        && state
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::AlphaTestEnable)
+            .value()
+            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+    {
+        // The host implements alpha test through shader discard. Its
+        // interaction with a pre-PS initial mask needs explicit lowering.
+        return Err(MaxwellLoweringError::UnsupportedPostPsInitialCoverageSemantics);
     }
     if trigger.is_draw()
         && state.coverage().post_z_pixel_shader_imask().value()
@@ -1883,12 +2087,13 @@ fn finish_lowered_work(
     submission: FrontendSubmissionId,
     predecessors: Vec<FrontendSubmissionId>,
     creations: Vec<BackendResourceCreateInfo>,
-    invalidations: Vec<ResourceDependency>,
+    mut invalidations: Vec<ResourceDependency>,
     commands: impl IntoIterator<Item = GpuOperation>,
     dirty_images: Arc<[usize]>,
 ) -> Result<MaxwellLoweredWork, MaxwellLoweringError> {
     let copies = std::mem::take(&mut cache.image_alias_copies);
     let operations = sequence_with_transitions(copies.into_iter().chain(commands), cache)?;
+    trim_read_only_buffer_views(cache, &operations, &mut invalidations);
     let submission = OperationSubmission::new(submission, predecessors, operations)
         .map_err(MaxwellLoweringError::Command)?;
     cache.revision = cache
@@ -2256,6 +2461,12 @@ fn record_clear_materialization(
             })?;
         let materialization = cache.views[position].materialization;
         if let ViewMaterialization::CompressedDepthStencil { depth, stencil } = materialization {
+            if surface.depth() {
+                cache.views[position].uninitialized_depth_stencil_regions[0].clear();
+            }
+            if surface.stencil() {
+                cache.views[position].uninitialized_depth_stencil_regions[1].clear();
+            }
             let depth = depth || surface.depth();
             let stencil = stencil || surface.stencil();
             if materialization != (ViewMaterialization::CompressedDepthStencil { depth, stencil }) {
@@ -2305,6 +2516,13 @@ fn record_color_materialization(
     image: &super::threed::MaxwellThreeDResolvedImage,
     cache: &mut MaxwellLoweringCache,
 ) {
+    if let Some(record) = cache
+        .views
+        .iter_mut()
+        .find(|record| record.key.same_domain_as_image(image))
+    {
+        record.uninitialized_color_regions.clear();
+    }
     if let Some(position) = cache
         .color_materializations
         .iter()
@@ -2698,6 +2916,21 @@ fn draw_scissor_region(
     }
     let scissor = &state.fixed_function().scissor()[0];
     if scissor.enable().value() == Some(&true) {
+        let mut scissor_y =
+            scissor
+                .vertical()
+                .value()
+                .copied()
+                .ok_or(MaxwellLoweringError::IncompleteDraw(
+                    "SET_SCISSOR_VERTICAL(0)",
+                ))?;
+        if lower_left_window_origin(state) {
+            let height = window_origin_height(state)?;
+            scissor_y = super::threed::MaxwellThreeDRectangle {
+                min: height.saturating_sub(scissor_y.max),
+                max: height.saturating_sub(scissor_y.min),
+            };
+        }
         region.intersect(
             scissor
                 .horizontal()
@@ -2706,13 +2939,7 @@ fn draw_scissor_region(
                 .ok_or(MaxwellLoweringError::IncompleteDraw(
                     "SET_SCISSOR_HORIZONTAL(0)",
                 ))?,
-            scissor
-                .vertical()
-                .value()
-                .copied()
-                .ok_or(MaxwellLoweringError::IncompleteDraw(
-                    "SET_SCISSOR_VERTICAL(0)",
-                ))?,
+            scissor_y,
         );
     }
     Ok(nixe_gpu::ScissorRect {
@@ -2721,6 +2948,22 @@ fn draw_scissor_region(
         width: region.max_x.saturating_sub(region.min_x),
         height: region.max_y.saturating_sub(region.min_y),
     })
+}
+
+fn lower_left_window_origin(state: &MaxwellThreeDState) -> bool {
+    matches!(state.fixed_function().register(MaxwellThreeDFixedFunctionRegister::WindowOrigin).value(),
+        Some(MaxwellThreeDFixedFunctionValue::Mask(value)) if value & 1 != 0)
+}
+
+fn window_origin_height(state: &MaxwellThreeDState) -> Result<u16, MaxwellLoweringError> {
+    state
+        .fixed_function()
+        .surface_clip_vertical()
+        .value()
+        .map(|axis| axis.extent())
+        .ok_or(MaxwellLoweringError::IncompleteDraw(
+            "SET_SURFACE_CLIP_VERTICAL",
+        ))
 }
 
 fn draw_viewport_transform(
@@ -2736,6 +2979,14 @@ fn draw_viewport_transform(
     // The current draw contract selects viewport zero. Shader-selected or
     // replicated viewports require a distinct draw contract.
     let viewport = &state.fixed_function().viewport()[0];
+    if let Some(&precision) = viewport.snap_grid_precision().value()
+        && precision != [0, 0]
+    {
+        return Err(MaxwellLoweringError::UnsupportedViewportSnapGridPrecision {
+            viewport: 0,
+            precision,
+        });
+    }
     let swizzle = viewport.coordinate_swizzle().value().copied();
     let reflect_y = if let Some(swizzle) = swizzle {
         use MaxwellThreeDViewportSwizzleComponent::{NegativeY, PositiveW, PositiveX, PositiveZ};
@@ -2755,6 +3006,9 @@ fn draw_viewport_transform(
         false
     };
     if !enabled {
+        if lower_left_window_origin(state) {
+            return Err(MaxwellLoweringError::UnsupportedWindowOrigin(1));
+        }
         return Ok(None);
     }
     let scale = viewport
@@ -2803,11 +3057,54 @@ fn draw_viewport_transform(
     // Fold the sign into the existing neutral transform; the backend applies
     // it at vertex output, preserving varyings, depth, and polygon facing.
     // https://registry.khronos.org/OpenGL/extensions/NV/NV_viewport_swizzle.txt
+    let negative_one_to_one = match state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::ViewportClipControl)
+        .value()
+    {
+        Some(MaxwellThreeDFixedFunctionValue::ClipControl(control)) => control.raw() & 1 == 0,
+        _ => {
+            return Err(MaxwellLoweringError::IncompleteDraw(
+                "SET_VIEWPORT_CLIP_CONTROL",
+            ));
+        }
+    };
+    // ClipMin/MaxZ are post-transform pixel bounds, not viewport endpoints.
+    // Unbounded values are legal. The affine range comes from the configured
+    // clip volume and ScaleZ/OffsetZ, without guessing the guest API's mode.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3372-L3399
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L98-L110
+    let depth_range = [
+        if negative_one_to_one {
+            offset_z - scale_z
+        } else {
+            offset_z
+        },
+        offset_z + scale_z,
+    ];
+    if clip_min_z.is_nan()
+        || clip_max_z.is_nan()
+        || clip_min_z > depth_range[0].min(depth_range[1])
+        || clip_max_z < depth_range[0].max(depth_range[1])
+    {
+        return Err(MaxwellLoweringError::UnsupportedViewportPixelDepthBounds);
+    }
+    let mut effective_scale_y = if reflect_y { -scale_y } else { scale_y };
+    let mut effective_offset_y = offset_y;
+    if lower_left_window_origin(state) {
+        // Convert bottom-left window coordinates to the neutral top-left
+        // framebuffer convention: y_host = surface_height - y_guest.
+        // Scissor bounds use the same origin, independently of FLIP_Y facing.
+        // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L128-L134
+        effective_scale_y = -effective_scale_y;
+        effective_offset_y = f32::from(window_origin_height(state)?) - offset_y;
+    }
     ViewportTransform::new(
-        [scale_x, if reflect_y { -scale_y } else { scale_y }, scale_z],
-        [offset_x, offset_y, offset_z],
-        [clip_min_z, clip_max_z],
+        [scale_x, effective_scale_y, scale_z],
+        [offset_x, effective_offset_y, offset_z],
+        depth_range,
     )
+    .map(|transform| transform.with_negative_one_to_one_depth(negative_one_to_one))
     .map(Some)
     .map_err(MaxwellLoweringError::Command)
 }
@@ -2889,11 +3186,11 @@ fn prepare_resources(
             }
         }
 
-        if let Some(record) = cache
-            .views
-            .iter()
-            .find(|record| record.key.matches_resource(resource))
-        {
+        if let Some(record) = cache.views.iter().find(|record| {
+            record.key.matches_resource(resource)
+                && (!image.guest_layout().requires_materialization()
+                    || record.remains_current_for_image(image))
+        }) {
             result[*index] = Some(record.dependency);
             continue;
         }
@@ -2961,6 +3258,24 @@ fn prepare_resources(
             materialization,
             cpu_writes,
             write_revision: 0,
+            last_used: 0,
+            uninitialized_depth_stencil_regions: if matches!(
+                materialization,
+                ViewMaterialization::CompressedDepthStencil { .. }
+            ) {
+                let extent = image.description().extent();
+                std::array::from_fn(|_| vec![[0, 0, extent.width, extent.height]])
+            } else {
+                Default::default()
+            },
+            uninitialized_color_regions: if materialization == ViewMaterialization::CompressedColor
+                && !image.guest_layout().has_direct_canonical_representation()
+            {
+                let extent = image.description().extent();
+                vec![[0, 0, extent.width, extent.height]]
+            } else {
+                Vec::new()
+            },
         });
         result[*index] = Some(dependency);
     }
@@ -2984,6 +3299,14 @@ fn retire_overlapping_views(
         })
         .map(|record| record.dependency)
         .collect::<Vec<_>>();
+    retire_view_dependencies(&invalidated, cache, invalidations);
+}
+
+fn retire_view_dependencies(
+    invalidated: &[ResourceDependency],
+    cache: &mut MaxwellLoweringCache,
+    invalidations: &mut Vec<ResourceDependency>,
+) {
     if !invalidated.is_empty() {
         cache.prepared_draw = None;
     }
@@ -3014,11 +3337,65 @@ fn retire_overlapping_views(
             invalidations.push(dependency);
         }
     }
-    for dependency in invalidated {
+    for dependency in invalidated.iter().copied() {
         if !invalidations.contains(&dependency) {
             invalidations.push(dependency);
         }
     }
+}
+
+// Dynamic vertex/index/uniform slices are derived read-only host views. Keeping
+// every slice of a guest ring buffer forever makes alias checks, transitions,
+// and backend residency selection grow with the number of rendered frames.
+// This budget bounds that metadata without evicting canonical guest bytes.
+const MAX_CACHED_READ_ONLY_BUFFER_VIEWS: usize = 256;
+
+fn trim_read_only_buffer_views(
+    cache: &mut MaxwellLoweringCache,
+    operations: &[GpuOperation],
+    invalidations: &mut Vec<ResourceDependency>,
+) {
+    let limit = cache
+        .resource_cache_limit()
+        .min(MAX_CACHED_READ_ONLY_BUFFER_VIEWS);
+    if cache.views.len() <= limit {
+        return;
+    }
+    let eligible = |record: &&ViewRecord| {
+        matches!(record.key, ViewKey::Buffer { .. }) && record.write_revision == 0
+    };
+    let count = cache.views.iter().filter(eligible).count();
+    if count <= limit {
+        return;
+    }
+    // The ordered backend submission retires these resources only after its
+    // completion. Also protect all views used by this delivery, including
+    // indirect references in descriptor tables. GPU-written views remain
+    // pinned: discarding them would require canonical writeback first.
+    let mut protected = operations
+        .iter()
+        .flat_map(GpuOperation::dependencies)
+        .copied()
+        .collect::<Vec<_>>();
+    for descriptor in &cache.descriptors {
+        if protected.contains(&ResourceDependency::DescriptorTable(descriptor.id)) {
+            protected.extend_from_slice(&descriptor.dependencies);
+        }
+    }
+    let mut candidates = cache
+        .views
+        .iter()
+        .filter(eligible)
+        .filter(|record| !protected.contains(&record.dependency))
+        .map(|record| (record.last_used, record.dependency))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
+    let retired = candidates
+        .into_iter()
+        .take(count - limit)
+        .map(|(_, dependency)| dependency)
+        .collect::<Vec<_>>();
+    retire_view_dependencies(&retired, cache, invalidations);
 }
 
 fn binding_at(
@@ -3162,8 +3539,8 @@ struct MaxwellThreeDClearRegions {
         super::threed::MaxwellThreeDRectangle,
     )>,
     viewport_clip: Option<(
-        super::threed::MaxwellThreeDRectangle,
-        super::threed::MaxwellThreeDRectangle,
+        super::threed::MaxwellThreeDClipAxis,
+        super::threed::MaxwellThreeDClipAxis,
     )>,
 }
 
@@ -3223,11 +3600,18 @@ impl MaxwellThreeDClearRegions {
 
     fn for_attachment(self, width: u32, height: u32) -> MaxwellThreeDRasterRegion {
         let mut region = MaxwellThreeDRasterRegion::attachment(width, height);
-        for (horizontal, vertical) in [self.clear, self.scissor, self.viewport_clip]
-            .into_iter()
-            .flatten()
-        {
+        for (horizontal, vertical) in [self.clear, self.scissor].into_iter().flatten() {
             region.intersect(horizontal, vertical);
+        }
+        if let Some((horizontal, vertical)) = self.viewport_clip {
+            region.min_x = region.min_x.max(u32::from(horizontal.origin()));
+            region.max_x = region
+                .max_x
+                .min(u32::from(horizontal.origin()) + u32::from(horizontal.extent()));
+            region.min_y = region.min_y.max(u32::from(vertical.origin()));
+            region.max_y = region
+                .max_y
+                .min(u32::from(vertical.origin()) + u32::from(vertical.extent()));
         }
         region
     }
@@ -3416,6 +3800,17 @@ fn lower_draw(
         if record.module.stage() != translated.stage {
             return Err(MaxwellLoweringError::InvalidTranslatedShaders);
         }
+        if translated.stage == ShaderStage::Vertex {
+            validate_vertex_attribute_skip_masks(state, record.module.ir().ir())?;
+        }
+        if translated.stage == ShaderStage::Fragment
+            && lower_left_window_origin(state)
+            && record.module.ir().ir().inputs().iter().any(|input| {
+                input.location() == nixe_gpu::ShaderIoLocation::Position && input.component() == 1
+            })
+        {
+            return Err(MaxwellLoweringError::UnsupportedWindowOriginFragmentPosition);
+        }
         if let Some(tessellation) = tessellation {
             super::threed::tessellation::validate_default_level_inputs(
                 tessellation.control,
@@ -3460,7 +3855,9 @@ fn lower_draw(
                 attribute
                     .value()
                     .filter(|attribute| {
-                        attribute.enabled() && usize::from(attribute.stream()) == index
+                        attribute.enabled()
+                            && usize::from(attribute.stream()) == index
+                            && state.vertex_input().attribute_skip_mask(location as u8) != 15
                     })
                     .map(|attribute| (location, *attribute))
             })
@@ -3853,6 +4250,18 @@ fn sequence_with_transitions(
             ));
         }
         for access in command.accesses() {
+            let dependency = access.target().dependency();
+            if matches!(dependency, ResourceDependency::Buffer(_))
+                && let Some(record) = cache
+                    .views
+                    .iter_mut()
+                    .find(|record| record.dependency == dependency)
+            {
+                record.last_used = cache.revision.saturating_add(1);
+                if access.scope().mode().writes() {
+                    record.write_revision = cache.revision.saturating_add(1);
+                }
+            }
             let previous = cache
                 .accesses
                 .iter()
@@ -3872,6 +4281,25 @@ fn sequence_with_transitions(
         result.push(command);
     }
     Ok(result)
+}
+
+fn validate_vertex_attribute_skip_masks(
+    state: &MaxwellThreeDState,
+    ir: &nixe_gpu::ShaderIr,
+) -> Result<(), MaxwellLoweringError> {
+    for input in ir.inputs() {
+        if let nixe_gpu::ShaderIoLocation::Generic(attribute) = input.location()
+            && state.vertex_input().attribute_skip_mask(attribute) & (1 << input.component()) != 0
+        {
+            // Skipped components receive the DA default, not the fetched vertex
+            // value. Reject consumption until that constant-input path is lowered.
+            return Err(MaxwellLoweringError::UnsupportedSkippedVertexComponent {
+                attribute,
+                component: input.component(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_shader_stages(
@@ -4264,7 +4692,7 @@ pub enum MaxwellLoweringError {
     ComputeShader(MaxwellShaderTranslationError),
     BufferBacking(String),
     UnsupportedMultisampleState(&'static str),
-    ResolveSourceNotResident,
+    BlitSourceNotResident,
     UnsupportedPolygonRasterization(&'static str),
     UnsupportedWindowOrigin(u32),
     ContradictoryState {
@@ -4281,6 +4709,9 @@ pub enum MaxwellLoweringError {
     UnsupportedColorReductionSemantics,
     UnsupportedConstantColorRenderingSemantics,
     UnsupportedApiMandatedEarlyZSemantics,
+    UnsupportedPostPsInitialCoverageSemantics,
+    UnsupportedViewportPixelDepthBounds,
+    UnsupportedWindowOriginFragmentPosition,
     UnsupportedPostZPixelShaderImaskSemantics,
     UnsupportedPixelShaderInterlockSemantics(MaxwellThreeDPixelShaderInterlockControl),
     UnsupportedGlobalBaseVertexIndex(u32),
@@ -4310,6 +4741,10 @@ pub enum MaxwellLoweringError {
         default_size_per_warp: MaxwellThreeDShaderLocalMemoryPerWarpSize,
     },
     UnsupportedViewportPixelCenterSemantics(MaxwellThreeDViewportPixelCenter),
+    UnsupportedViewportSnapGridPrecision {
+        viewport: u8,
+        precision: [u8; 2],
+    },
     UnsupportedViewportCoordinateSwizzleSemantics {
         viewport: u8,
         swizzle: MaxwellThreeDViewportCoordinateSwizzle,
@@ -4326,6 +4761,10 @@ pub enum MaxwellLoweringError {
         pattern: u16,
     },
     UnsupportedPolygonClipGeneratedEdgeSemantics,
+    UnsupportedSkippedVertexComponent {
+        attribute: u8,
+        component: u8,
+    },
     UnsupportedVertexAttributeFormat {
         attribute: u8,
         component_widths: super::threed::MaxwellThreeDVertexComponentWidths,
@@ -4359,7 +4798,6 @@ pub enum MaxwellLoweringError {
     UnsupportedShadeModeSemantics(MaxwellThreeDShadeMode),
     UnsupportedProvokingVertexSemantics(MaxwellThreeDProvokingVertex),
     UnsupportedTwoSidedLightSemantics,
-    UnsupportedColorClampSemantics,
     UnsupportedPixelShaderSaturateSemantics {
         output: u8,
         range: MaxwellThreeDPixelShaderClampRange,
@@ -4467,7 +4905,7 @@ impl Display for MaxwellLoweringError {
             Self::ComputeLaunch(error) => Display::fmt(error, formatter),
             Self::ComputeShader(error) => Display::fmt(error, formatter),
             Self::BufferBacking(reason) => write!(formatter, "Maxwell buffer backing cannot be lowered: {reason}"),
-            Self::ResolveSourceNotResident => formatter.write_str("Maxwell color resolve requires a current, fully initialized resident multisample source"),
+            Self::BlitSourceNotResident => formatter.write_str("Maxwell color blit requires a current, fully initialized resident source"),
             Self::UnsupportedMultisampleState(reason) => write!(formatter, "Maxwell multisample state has no neutral lowering: {reason}"),
             Self::UnsupportedPolygonRasterization(reason) => write!(formatter, "MAXWELL_B polygon rasterization is unsupported: {reason}"),
             Self::UnsupportedWindowOrigin(value) => write!(formatter,
@@ -4502,6 +4940,9 @@ impl Display for MaxwellLoweringError {
             Self::UnsupportedApiMandatedEarlyZSemantics => formatter.write_str(
                 "MAXWELL_B API-mandated early depth/stencil ordering is not represented by the neutral pipeline",
             ),
+            Self::UnsupportedPostPsInitialCoverageSemantics => formatter.write_str("MAXWELL_B pre-shader initial coverage for post-shader tests is not represented by the neutral pipeline"),
+            Self::UnsupportedViewportPixelDepthBounds => formatter.write_str("MAXWELL_B pixel depth bounds narrow the affine viewport range and require explicit clip/clamp lowering"),
+            Self::UnsupportedWindowOriginFragmentPosition => formatter.write_str("MAXWELL_B lower-left fragment position Y requires shader coordinate lowering"),
             Self::UnsupportedPostZPixelShaderImaskSemantics => formatter.write_str(
                 "MAXWELL_B post-Z pixel-shader invocation mask is not represented by the neutral pipeline",
             ),
@@ -4580,6 +5021,7 @@ impl Display for MaxwellLoweringError {
                 formatter,
                 "MAXWELL_B viewport pixel-center convention is not represented by the neutral pipeline contract: center={center:?}"
             ),
+            Self::UnsupportedViewportSnapGridPrecision { viewport, precision } => write!(formatter, "MAXWELL_B viewport {viewport} increased snap-grid precision is unsupported: X={} Y={}", precision[0], precision[1]),
             Self::UnsupportedViewportCoordinateSwizzleSemantics { viewport, swizzle } => write!(
                 formatter,
                 "MAXWELL_B viewport coordinate swizzle is not represented by the neutral pipeline contract: viewport={viewport} components={:?}",
@@ -4608,6 +5050,8 @@ impl Display for MaxwellLoweringError {
             Self::UnsupportedPolygonClipGeneratedEdgeSemantics => formatter.write_str(
                 "MAXWELL_B suppression of polygon-clip-generated edges has no neutral backend representation",
             ),
+            Self::UnsupportedSkippedVertexComponent { attribute, component } => write!(formatter,
+                "vertex shader consumes a skipped DA attribute component: attribute={attribute} component={component}; DA default input lowering is not implemented"),
             Self::UnsupportedVertexAttributeFormat {
                 attribute,
                 component_widths,
@@ -4681,9 +5125,6 @@ impl Display for MaxwellLoweringError {
             ),
             Self::UnsupportedTwoSidedLightSemantics => formatter.write_str(
                 "MAXWELL_B enabled two-sided fixed-function lighting is not represented by shader or neutral backend lowering",
-            ),
-            Self::UnsupportedColorClampSemantics => formatter.write_str(
-                "MAXWELL_B enabled color clamping is not represented by shader or neutral backend lowering",
             ),
             Self::UnsupportedPixelShaderSaturateSemantics { output, range } => write!(
                 formatter,
@@ -4934,9 +5375,126 @@ mod tests {
     }
 
     #[test]
+    fn snap_grid_precision_only_rejects_the_consumed_viewport() {
+        use crate::engines::tests::{program_three_d, three_d_channel};
+        let mut channel = three_d_channel();
+        program_three_d(&mut channel, 0x0a1c, 0);
+        program_three_d(&mut channel, 0x0bfc, 0x1f1f);
+        assert!(super::draw_viewport_transform(channel.three_d()).is_ok());
+        let register = channel.three_d().fixed_function().viewport()[15].snap_grid_precision();
+        assert_eq!(register.value(), Some(&[31, 31]));
+        assert_eq!(
+            register.source().unwrap().method(),
+            nixe_gpu::GpuMethodId(0x0bfc)
+        );
+        program_three_d(&mut channel, 0x0a1c, 0x0302);
+        assert!(matches!(
+            super::draw_viewport_transform(channel.three_d()),
+            Err(MaxwellLoweringError::UnsupportedViewportSnapGridPrecision {
+                viewport: 0,
+                precision: [2, 3]
+            })
+        ));
+        program_three_d(&mut channel, 0x0a1c, 0);
+        assert!(super::draw_viewport_transform(channel.three_d()).is_ok());
+    }
+
+    #[test]
+    fn lower_left_origin_reflects_viewport_and_scissor_independently_of_facing() {
+        use crate::engines::tests::{program_three_d, three_d_channel};
+        let mut channel = three_d_channel();
+        for (method, value) in [
+            (0x0a00, 32.0_f32.to_bits()),
+            (0x0a04, 16.0_f32.to_bits()),
+            (0x0a08, 1.0_f32.to_bits()),
+            (0x0a0c, 37.0_f32.to_bits()),
+            (0x0a10, 19.0_f32.to_bits()),
+            (0x0a14, 0.0_f32.to_bits()),
+            (0x193c, 1),
+            (0x192c, 1),
+            (0x13ac, 1),
+            (0x0ff4, 128 << 16),
+            (0x0ff8, 64 << 16),
+            (0x0e00, 1),
+            (0x0e04, (100 << 16) | 8),
+            (0x0e08, (20 << 16) | 4),
+        ] {
+            program_three_d(&mut channel, method, value);
+        }
+        for origin in [1, 0x11] {
+            program_three_d(&mut channel, 0x13ac, origin);
+            let viewport = super::draw_viewport_transform(channel.three_d())
+                .unwrap()
+                .unwrap();
+            assert_eq!(viewport.scale(), [32.0, -16.0, 1.0]);
+            assert_eq!(viewport.offset(), [37.0, 45.0, 0.0]);
+            assert_eq!(
+                super::draw_scissor_region(channel.three_d(), 128, 64).unwrap(),
+                nixe_gpu::ScissorRect {
+                    x: 8,
+                    y: 44,
+                    width: 92,
+                    height: 16
+                }
+            );
+        }
+        program_three_d(&mut channel, 0x0a18, 0x6430);
+        assert_eq!(
+            super::draw_viewport_transform(channel.three_d())
+                .unwrap()
+                .unwrap()
+                .scale()[1],
+            16.0
+        );
+    }
+
+    #[test]
+    fn viewport_depth_mode_and_unbounded_pixel_limits_are_independent() {
+        use crate::engines::tests::{program_three_d, three_d_channel};
+        let mut channel = three_d_channel();
+        for (method, argument) in [
+            (0x0a00, 640.0_f32.to_bits()),
+            (0x0a04, 360.0_f32.to_bits()),
+            (0x0a08, 0.5_f32.to_bits()),
+            (0x0a0c, 640.0_f32.to_bits()),
+            (0x0a10, 360.0_f32.to_bits()),
+            (0x0a14, 0.5_f32.to_bits()),
+            (0x0c08, f32::NEG_INFINITY.to_bits()),
+            (0x0c0c, f32::INFINITY.to_bits()),
+            (0x192c, 1),
+        ] {
+            program_three_d(&mut channel, method, argument);
+        }
+        assert!(matches!(
+            super::draw_viewport_transform(channel.three_d()),
+            Err(MaxwellLoweringError::IncompleteDraw(
+                "SET_VIEWPORT_CLIP_CONTROL"
+            ))
+        ));
+        program_three_d(&mut channel, 0x193c, 0x281c);
+        let gl = super::draw_viewport_transform(channel.three_d())
+            .unwrap()
+            .unwrap();
+        assert_eq!(gl.depth_range(), [0.0, 1.0]);
+        assert!(gl.depth_clip_negative_one_to_one());
+        program_three_d(&mut channel, 0x193c, 0x281d);
+        let zero = super::draw_viewport_transform(channel.three_d())
+            .unwrap()
+            .unwrap();
+        assert_eq!(zero.depth_range(), [0.5, 1.0]);
+        assert!(!zero.depth_clip_negative_one_to_one());
+        program_three_d(&mut channel, 0x0c08, 0.75_f32.to_bits());
+        assert!(matches!(
+            super::draw_viewport_transform(channel.three_d()),
+            Err(MaxwellLoweringError::UnsupportedViewportPixelDepthBounds)
+        ));
+    }
+
+    #[test]
     fn viewport_y_swizzle_composes_with_both_scale_signs_and_preserves_offsets() {
         use crate::engines::tests::{program_three_d, three_d_channel};
         let mut channel = three_d_channel();
+        program_three_d(&mut channel, 0x193c, 0);
         for (method, argument) in [
             (0x0a00, 32.0_f32.to_bits()),
             (0x0a08, 0.5_f32.to_bits()),
@@ -5016,6 +5574,58 @@ mod tests {
         assert_eq!(
             super::consumed_vertex_streams(channel.three_d()).collect::<Vec<_>>(),
             [3, 31]
+        );
+    }
+
+    #[test]
+    fn da_attribute_skip_masks_gate_fetch_without_hiding_consumed_components() {
+        use crate::engines::tests::{program_three_d, three_d_channel};
+        use nixe_gpu::{ShaderInterfaceElement, ShaderIoLocation, ShaderScalarType};
+        let mut channel = three_d_channel();
+        program_three_d(&mut channel, 0x1160, 0x3820_001f);
+        program_three_d(&mut channel, 0x1180, 0x3820_0003);
+        program_three_d(&mut channel, 0x11a0, 0x3820_0004);
+        program_three_d(&mut channel, 0x11c0, 0x3820_0005);
+        for (method, value) in [(0x1120, 0xf), (0x1124, 0xf), (0x1128, 0xf), (0x112c, 0xf)] {
+            program_three_d(&mut channel, method, value);
+            let index = (method - 0x1120) as usize / 4;
+            let register = &channel.three_d().vertex_input().attribute_skip_masks()[index];
+            assert_eq!(register.raw(), Some(value));
+            assert_eq!(register.source().unwrap().method().0, method);
+        }
+        assert!(
+            super::consumed_vertex_streams(channel.three_d())
+                .next()
+                .is_none()
+        );
+        let ir = ShaderIr::new(
+            ShaderStage::Vertex,
+            vec![
+                ShaderInterfaceElement::new(
+                    ShaderIoLocation::Generic(0),
+                    1,
+                    ShaderScalarType::Float32,
+                    None,
+                )
+                .unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(matches!(
+            super::validate_vertex_attribute_skip_masks(channel.three_d(), &ir),
+            Err(MaxwellLoweringError::UnsupportedSkippedVertexComponent {
+                attribute: 0,
+                component: 1
+            })
+        ));
+        // Component zero remains skipped; component one is fetched.
+        program_three_d(&mut channel, 0x1120, 0xd);
+        assert!(super::validate_vertex_attribute_skip_masks(channel.three_d(), &ir).is_ok());
+        assert_eq!(
+            super::consumed_vertex_streams(channel.three_d()).collect::<Vec<_>>(),
+            [31]
         );
     }
 

@@ -4,6 +4,8 @@ use super::prelude::*;
 enum HidCommand {
     CreateAppletResource,
     ActivateTouchScreen,
+    ActivateMouse,
+    ActivateKeyboard,
     StartSixAxisSensor,
     StopSixAxisSensor,
     SetSupportedNpadStyleSet,
@@ -15,6 +17,7 @@ enum HidCommand {
     SetNpadJoyHoldType,
     GetNpadJoyHoldType,
     GetVibrationDeviceInfo,
+    SendVibrationValue,
     CreateActiveVibrationDeviceList,
 }
 
@@ -23,6 +26,8 @@ impl HidCommand {
         match command_id {
             0 => Some(Self::CreateAppletResource),
             11 => Some(Self::ActivateTouchScreen),
+            21 => Some(Self::ActivateMouse),
+            31 => Some(Self::ActivateKeyboard),
             66 => Some(Self::StartSixAxisSensor),
             67 => Some(Self::StopSixAxisSensor),
             100 => Some(Self::SetSupportedNpadStyleSet),
@@ -34,6 +39,7 @@ impl HidCommand {
             120 => Some(Self::SetNpadJoyHoldType),
             121 => Some(Self::GetNpadJoyHoldType),
             200 => Some(Self::GetVibrationDeviceInfo),
+            201 => Some(Self::SendVibrationValue),
             203 => Some(Self::CreateActiveVibrationDeviceList),
             _ => None,
         }
@@ -66,6 +72,44 @@ pub(in crate::ipc_wire) fn dispatch_hid(
     };
 
     match command {
+        // The two amplitudes determine actuator force; with both zero the
+        // operation stops vibration regardless of the carrier frequencies.
+        // Nonzero force requires an actuator backend and remains unsupported.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1043-L1054
+        HidCommand::SendVibrationValue => {
+            if !request.has_payload_size(32)
+                || request_u32(request.data, 20) != Some(0)
+                || hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let handle = request_u32(request.data, 0).unwrap();
+            if crate::hid::vibration_device_position(handle).is_none() {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            let values = [4, 8, 12, 16].map(|offset| request_f32(request.data, offset).unwrap());
+            if values
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            if values[0] != 0.0 || values[2] != 0.0 {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::CommandVariant {
+                        service: "hid",
+                        command_id: 201,
+                        detail: "nonzero vibration requires a host actuator backend",
+                    },
+                ));
+            }
+            // All currently implemented actuator operations leave the motors
+            // stopped. Accept the real zero-force command without inventing
+            // active vibration state or silently dropping a nonzero request.
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+
         // One u32 handle, no PID or descriptors. The output is two u32s:
         // actuator type (LRA = 1) and its left/right position (1/2).
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1039-L1041
@@ -134,7 +178,11 @@ pub(in crate::ipc_wire) fn dispatch_hid(
         // memory only after this command succeeds.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L538-L543
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L734-L735
-        HidCommand::ActivateTouchScreen => {
+        // Mouse/keyboard use the same PID + ARUID activation ABI.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L734-L744
+        command @ (HidCommand::ActivateTouchScreen
+        | HidCommand::ActivateMouse
+        | HidCommand::ActivateKeyboard) => {
             // Plain CMIF carries alignment slack after this u64. libnx writes
             // only the semantic payload, so those trailing bytes retain prior
             // TLS contents and are not command input:
@@ -145,7 +193,12 @@ pub(in crate::ipc_wire) fn dispatch_hid(
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            hid_system.activate_touch_screen();
+            match command {
+                HidCommand::ActivateTouchScreen => hid_system.activate_touch_screen(),
+                HidCommand::ActivateMouse => hid_system.activate_mouse(),
+                HidCommand::ActivateKeyboard => hid_system.activate_keyboard(),
+                _ => unreachable!(),
+            }
             semantic_success(request.token, false, &[], &[], &[], None)
         }
         command @ (HidCommand::StartSixAxisSensor | HidCommand::StopSixAxisSensor) => {

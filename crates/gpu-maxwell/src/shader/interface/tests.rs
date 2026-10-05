@@ -9,6 +9,35 @@ use nixe_gpu::{
 use std::collections::BTreeMap;
 
 #[test]
+fn legacy_color_maps_stop_at_the_shader_interface_boundary() {
+    for (stage, first_word, map_bit, output) in [
+        (MaxwellShaderStage::Vertex, 0x0006_0461, 320, false),
+        (MaxwellShaderStage::Vertex, 0x0006_0461, 560, true),
+        (MaxwellShaderStage::Pixel, 0x0006_1462, 448, false),
+    ] {
+        for component in 0..16 {
+            let mut words = [0_u32; 20];
+            words[0] = first_word;
+            let bit = map_bit + component;
+            words[bit / 32] |= 1 << (bit % 32);
+            let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let header = super::super::binary::decode_program_header(&bytes).unwrap();
+            let result = if output {
+                decode_header_outputs(header)
+            } else {
+                decode_header_inputs(header, &BTreeMap::new())
+            };
+            assert!(
+                matches!(result, Err(MaxwellShaderTranslationError::UnsupportedHeaderFeature {
+                stage: actual,
+                feature: "legacy vertex color input attributes" | "legacy vertex color output attributes",
+            }) if actual == stage)
+            );
+        }
+    }
+}
+
+#[test]
 fn captured_vertex_system_value_ald_family_reaches_verified_ir_and_wgsl() {
     let mut header = [0_u32; 20];
     header[0] = 0x0006_0461;
@@ -197,6 +226,7 @@ fn perspective_pass_exposes_the_unnormalized_barycentric_numerator() {
     nixe_gpu::lower_shader_ir_to_spirv(
         &shader,
         nixe_gpu::SpirvShaderOptions {
+            depth_clip_negative_one_to_one: false,
             input_control_points: 0,
             tessellation_mode: None,
             float32: nixe_gpu::SpirvFloat32Capabilities {
@@ -370,4 +400,37 @@ fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodele
             Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { .. })
         ));
     }
+}
+
+#[test]
+fn vertex_ast_point_size_preserves_scalar_value_and_rejects_vector_stores() {
+    let operation =
+        decode_attribute_store(MaxwellShaderStage::Vertex, 8, 0xeff0_7f80_06c7_ff00, 4).unwrap();
+    assert!(
+        matches!(operation, ShaderOperation::StoreOutput { ref sources,
+        location: ShaderIoLocation::PointSize, first_component: 0, .. } if sources.len() == 1)
+    );
+    let mut header = [0; 20];
+    header[0] = 0x0006_0461;
+    header[13] = 1 << 11;
+    let shader = translated_fixture(
+        MaxwellShaderStage::Vertex,
+        header,
+        &[
+            0,
+            0x0100_0000_0007_f000 | (u64::from(2.5_f32.to_bits()) << 20),
+            0xeff0_7f80_06c7_ff00,
+            0xe300_0000_0007_000f,
+        ],
+    );
+    let result =
+        nixe_gpu::evaluate_shader_ir(&shader, &nixe_gpu::ShaderEvaluationInputs::default(), 16)
+            .unwrap();
+    assert_eq!(
+        result.output_bits(ShaderIoLocation::PointSize, 0),
+        Some(2.5_f32.to_bits())
+    );
+    assert!(
+        decode_attribute_store(MaxwellShaderStage::Vertex, 8, 0xeff0_ff80_06c7_ff00, 4).is_err()
+    );
 }

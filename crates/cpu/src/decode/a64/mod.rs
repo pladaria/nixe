@@ -52,7 +52,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0022..=0x0000_002f | 0x0000_005e..=0x0000_005f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00b1 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00ca => {
             A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -350,6 +350,63 @@ mod tests {
                 ),
                 crate::decode::table::AllocationStatus::Reserved(_)
             ));
+        }
+    }
+
+    #[test]
+    fn integer_sign_decodes_valid_shapes_and_rejects_single_doubleword_vectors() {
+        let platform = TargetPlatform::Switch1;
+        let location =
+            LocationDescriptor::new(GuestVirtualAddress::new(0x7100_0000), platform.profile_id());
+        for size in 0..4 {
+            for full in [false, true] {
+                for negate in [false, true] {
+                    let word = 0x0e20_b800
+                        | (size << 22)
+                        | (u32::from(full) << 30)
+                        | (u32::from(negate) << 29);
+                    let decoded = decode(platform, location, InstructionEncoding::from_u32(word));
+                    if size == 3 && !full {
+                        assert!(!matches!(decoded, DecodeResult::Decoded(_)));
+                    } else {
+                        let DecodeResult::Decoded(decoded) = decoded else {
+                            panic!("{word:08x}")
+                        };
+                        assert!(matches!(
+                            normalize(&decoded.instruction, InstructionEncoding::from_u32(word)),
+                            A64Instruction::FpSimd(fp_simd::Instruction::IntegerSign(_))
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_integer_multiply_decodes_all_arrangements_and_rejects_doubleword_lanes() {
+        let platform = TargetPlatform::Switch1;
+        let location =
+            LocationDescriptor::new(GuestVirtualAddress::new(0x739e_2804), platform.profile_id());
+        for size in 0..4 {
+            for full in [false, true] {
+                let word = 0x0e20_9c40 | (size << 22) | (u32::from(full) << 30);
+                let decoded = decode(platform, location, InstructionEncoding::from_u32(word));
+                if size == 3 {
+                    assert!(!matches!(decoded, DecodeResult::Decoded(_)));
+                } else {
+                    let DecodeResult::Decoded(decoded) = decoded else {
+                        panic!("{word:08x}")
+                    };
+                    let A64Instruction::FpSimd(fp_simd::Instruction::IntegerMultiply(fields)) =
+                        normalize(&decoded.instruction, InstructionEncoding::from_u32(word))
+                    else {
+                        panic!("{decoded:?}")
+                    };
+                    assert_eq!((fields.rd, fields.rn, fields.rm), (0, 2, 0));
+                    assert_eq!(fields.opc, size as u8);
+                    assert_eq!(fields.vector_128, full);
+                }
+            }
         }
     }
 

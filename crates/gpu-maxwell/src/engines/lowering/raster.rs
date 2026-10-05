@@ -193,14 +193,14 @@ pub(super) fn face_state(
             .ok_or(MaxwellLoweringError::IncompleteDraw(name))
     };
     // FLIP_Y reverses polygon facing; it does not negate viewport coordinates.
-    // Lower-left origin additionally changes window coordinates and remains
-    // unsupported here. Keep it distinct from the facing-only FLIP_Y bit.
+    // Lower-left origin changes window coordinates in viewport/scissor
+    // lowering. Keep it distinct from the facing-only FLIP_Y bit.
     // Encodings: https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2599-L2605
     // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L1338-L1349
     let V::Mask(origin) = required(R::WindowOrigin, "SET_WINDOW_ORIGIN")? else {
         return Err(wrong_type());
     };
-    if origin & !0x10 != 0 {
+    if origin & !0x11 != 0 {
         return Err(MaxwellLoweringError::UnsupportedWindowOrigin(origin));
     }
     let V::FrontFace(face) = required(R::FrontFace, "SET_FRONT_FACE")? else {
@@ -279,6 +279,33 @@ mod tests {
             program_three_d(&mut channel, method, value);
         }
         channel
+    }
+
+    #[test]
+    fn depth_bias_parameters_are_consumed_only_for_the_enabled_polygon_mode() {
+        let mut channel = wireframe_channel();
+        for method in [0x156c, 0x15bc, 0x187c] {
+            program_three_d(&mut channel, method, 2_f32.to_bits());
+        }
+        assert!(draw_state(channel.three_d()).is_ok());
+        program_three_d(&mut channel, 0x0dc8, 1);
+        assert!(draw_state(channel.three_d()).is_ok());
+        program_three_d(&mut channel, 0x0dc4, 1);
+        assert!(matches!(
+            draw_state(channel.three_d()),
+            Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
+                "depth bias for the consumed polygon mode"
+            ))
+        ));
+        program_three_d(&mut channel, 0x0dc4, 0);
+        assert!(draw_state(channel.three_d()).is_ok());
+        program_three_d(&mut channel, 0x0dac, 0x1b02);
+        assert!(matches!(
+            draw_state(channel.three_d()),
+            Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
+                "depth bias for the consumed polygon mode"
+            ))
+        ));
     }
 
     #[test]
@@ -429,10 +456,10 @@ mod tests {
             (FrontFace::CounterClockwise, CullMode::FrontAndBack)
         );
         program_three_d(&mut channel, 0x13ac, 0x1);
-        assert!(matches!(
-            face_state(channel.three_d()),
-            Err(MaxwellLoweringError::UnsupportedWindowOrigin(0x1))
-        ));
+        assert_eq!(
+            face_state(channel.three_d()).unwrap(),
+            (FrontFace::Clockwise, CullMode::FrontAndBack)
+        );
         // Direct lines/points do not consume polygon facing, including stale
         // unsupported polygon state left by the previous draw.
         for topology in [0, 1, 3] {

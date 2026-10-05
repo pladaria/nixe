@@ -6,7 +6,7 @@
 mod driver;
 mod native;
 mod page_resources;
-mod quad_indices;
+mod primitive_indices;
 mod texture_sampling;
 mod visibility;
 

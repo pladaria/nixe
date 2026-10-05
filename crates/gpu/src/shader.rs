@@ -424,6 +424,17 @@ pub enum ShaderOperation {
         destination: ShaderRegister,
         source: ShaderRegister,
     },
+    /// Convert the selected IEEE binary16 lane to binary32, preserving subnormals.
+    UnpackHalf32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+        high: bool,
+    },
+    /// Round binary32 to IEEE binary16, ties to even, in the low sixteen bits.
+    PackHalf32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+    },
     ConvertIntegerToFloat32 {
         destination: ShaderRegister,
         source: ShaderRegister,
@@ -997,6 +1008,26 @@ pub fn evaluate_shader_ir(
             } => {
                 registers[destination.index() as usize] =
                     Some(register_bits(&registers, *source)? ^ 0x8000_0000);
+            }
+            ShaderOperation::UnpackHalf32 {
+                destination,
+                source,
+                high,
+            } => {
+                let packed = register_bits(&registers, *source)?;
+                registers[destination.index() as usize] = Some(
+                    half::f16::from_bits((packed >> if *high { 16 } else { 0 }) as u16)
+                        .to_f32()
+                        .to_bits(),
+                );
+            }
+            ShaderOperation::PackHalf32 {
+                destination,
+                source,
+            } => {
+                let value = f32::from_bits(register_bits(&registers, *source)?);
+                registers[destination.index() as usize] =
+                    Some(u32::from(half::f16::from_f32(value).to_bits()));
             }
             ShaderOperation::ConvertIntegerToFloat32 {
                 destination,
@@ -1760,8 +1791,16 @@ fn lower_shader_ir_to_wgsl_impl(
                 });
         }
     }
-    let output_groups = interface_groups(&ir.outputs)?;
+    let mut output_groups = interface_groups(&ir.outputs)?;
     let mut source = String::new();
+    if ir.instructions.iter().any(|i| {
+        matches!(
+            i.operation,
+            ShaderOperation::UnpackHalf32 { .. } | ShaderOperation::PackHalf32 { .. }
+        )
+    }) {
+        source.push_str(include_str!("shader/half.wgsl"));
+    }
     emit_wgsl_resources(&mut source, ir)?;
     if ir.instructions.iter().any(|i| {
         matches!(i.operation,
@@ -1851,6 +1890,22 @@ fn lower_shader_ir_to_wgsl_impl(
         && output_groups
             .get(&ShaderIoLocation::Position)
             .is_some_and(|position| position.scalar_type == ShaderScalarType::Float32);
+    let has_point_size =
+        has_vertex_position && output_groups.contains_key(&ShaderIoLocation::PointSize);
+    if has_point_size {
+        // Keep shader-visible PointSize stores/reads in the guest result. WGSL
+        // has no point-size builtin, so non-point rasterization exports only
+        // the other fields. Point draws must use a backend supporting it.
+        // https://www.w3.org/TR/WGSL/#builtin-values
+        emit_interface_struct(
+            &mut source,
+            "GuestShaderOutput",
+            ir.stage,
+            false,
+            &output_groups,
+        )?;
+        output_groups.remove(&ShaderIoLocation::PointSize);
+    }
     let return_statement = if ir.stage == ShaderStage::Compute {
         "return;"
     } else if has_vertex_position {
@@ -1868,9 +1923,21 @@ fn lower_shader_ir_to_wgsl_impl(
         // https://www.w3.org/TR/webgpu/#coordinate-systems
         source.push_str(
             "override nixe_viewport_y_flip: bool = false;\n\
-            fn nixe_host_vertex_position(guest: ShaderOutput) -> ShaderOutput {\n\
-                var host = guest;\n\
+            override nixe_depth_negative_one_to_one: bool = false;\n",
+        );
+        if has_point_size {
+            source.push_str("fn nixe_host_vertex_position(guest: GuestShaderOutput) -> ShaderOutput {\n  var host: ShaderOutput;\n");
+            for location in output_groups.keys() {
+                let field = wgsl_field_name(*location);
+                source.push_str(&format!("  host.{field} = guest.{field};\n"));
+            }
+        } else {
+            source.push_str("fn nixe_host_vertex_position(guest: ShaderOutput) -> ShaderOutput {\n  var host = guest;\n");
+        }
+        source.push_str(
+            "\
                 if (nixe_viewport_y_flip) { host.position.y = -host.position.y; }\n\
+                if (nixe_depth_negative_one_to_one) { host.position.z = 0.5 * host.position.z + 0.5 * host.position.w; }\n\
                 return host;\n}\n",
         );
     }
@@ -1895,7 +1962,11 @@ fn lower_shader_ir_to_wgsl_impl(
     source.push_str("  var registers: array<u32, 256>;\n");
     source.push_str("  var predicates: array<bool, 7>;\n");
     if ir.stage != ShaderStage::Compute {
-        source.push_str("  var output: ShaderOutput;\n");
+        source.push_str(if has_point_size {
+            "  var output: GuestShaderOutput;\n"
+        } else {
+            "  var output: ShaderOutput;\n"
+        });
     }
     if ir
         .instructions
@@ -2474,7 +2545,11 @@ fn emit_interface_struct(
 ) -> Result<(), ShaderBackendLoweringError> {
     source.push_str(&format!("struct {name} {{\n"));
     for (location, group) in groups {
-        let attribute = wgsl_interface_attribute(stage, input, *location, group.interpolation)?;
+        let attribute = if name == "GuestShaderOutput" {
+            String::new()
+        } else {
+            wgsl_interface_attribute(stage, input, *location, group.interpolation)?
+        };
         source.push_str(&format!(
             "  {attribute} {}: {},\n",
             wgsl_field_name(*location),
@@ -2643,6 +2718,24 @@ fn emit_wgsl_operation(
             source: operand,
         } => source.push_str(&format!(
             "  registers[{}] = registers[{}] ^ 0x80000000u;\n",
+            destination.index(),
+            operand.index()
+        )),
+        ShaderOperation::UnpackHalf32 {
+            destination,
+            source: operand,
+            high,
+        } => source.push_str(&format!(
+            "  registers[{}] = nixe_unpack_half((registers[{}] >> {}u) & 0xffffu);\n",
+            destination.index(),
+            operand.index(),
+            if *high { 16 } else { 0 }
+        )),
+        ShaderOperation::PackHalf32 {
+            destination,
+            source: operand,
+        } => source.push_str(&format!(
+            "  registers[{}] = nixe_pack_half(registers[{}]);\n",
             destination.index(),
             operand.index()
         )),
@@ -3777,6 +3870,8 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::Move32 { destination, .. }
             | ShaderOperation::FloatAbsolute32 { destination, .. }
             | ShaderOperation::FloatNegate32 { destination, .. }
+            | ShaderOperation::UnpackHalf32 { destination, .. }
+            | ShaderOperation::PackHalf32 { destination, .. }
             | ShaderOperation::ConvertIntegerToFloat32 { destination, .. }
             | ShaderOperation::RoundFloat32ToIntegral { destination, .. }
             | ShaderOperation::ConvertFloat32ToInteger { destination, .. }
@@ -4177,6 +4272,8 @@ fn visit_operation_destinations(
         | ShaderOperation::Move32 { destination, .. }
         | ShaderOperation::FloatAbsolute32 { destination, .. }
         | ShaderOperation::FloatNegate32 { destination, .. }
+        | ShaderOperation::UnpackHalf32 { destination, .. }
+        | ShaderOperation::PackHalf32 { destination, .. }
         | ShaderOperation::ConvertIntegerToFloat32 { destination, .. }
         | ShaderOperation::RoundFloat32ToIntegral { destination, .. }
         | ShaderOperation::ConvertFloat32ToInteger { destination, .. }
@@ -4290,6 +4387,8 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         ShaderOperation::FloatMinMax32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::FloatAbsolute32 { source, .. }
         | ShaderOperation::FloatNegate32 { source, .. }
+        | ShaderOperation::UnpackHalf32 { source, .. }
+        | ShaderOperation::PackHalf32 { source, .. }
         | ShaderOperation::ConvertIntegerToFloat32 { source, .. }
         | ShaderOperation::RoundFloat32ToIntegral { source, .. } => vec![*source],
         ShaderOperation::ConvertFloat32ToInteger { source, .. } => vec![*source],
@@ -5523,6 +5622,93 @@ mod tests {
         assert!(module.source().contains("& 0x7fffffffu"));
         assert!(module.source().contains("^ 0x80000000u"));
         naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
+    fn point_size_stays_in_guest_output_without_a_wgsl_raster_binding() {
+        let mut outputs: Vec<_> = (0..4)
+            .map(|component| {
+                ShaderInterfaceElement::new(
+                    ShaderIoLocation::Position,
+                    component,
+                    ShaderScalarType::Float32,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        outputs.push(
+            ShaderInterfaceElement::new(
+                ShaderIoLocation::PointSize,
+                0,
+                ShaderScalarType::Float32,
+                None,
+            )
+            .unwrap(),
+        );
+        let operations = [
+            ShaderOperation::MoveImmediate32 {
+                destination: ShaderRegister::new(0),
+                bits: 1.0_f32.to_bits(),
+                scalar_type: ShaderScalarType::Float32,
+            },
+            ShaderOperation::StoreOutput {
+                sources: vec![ShaderRegister::new(0); 4].into_boxed_slice(),
+                location: ShaderIoLocation::Position,
+                first_component: 0,
+                scalar_type: ShaderScalarType::Float32,
+            },
+            ShaderOperation::StoreOutput {
+                sources: vec![ShaderRegister::new(0)].into_boxed_slice(),
+                location: ShaderIoLocation::PointSize,
+                first_component: 0,
+                scalar_type: ShaderScalarType::Float32,
+            },
+            ShaderOperation::Exit,
+        ];
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            outputs,
+            Vec::new(),
+            operations
+                .into_iter()
+                .enumerate()
+                .map(|(i, op)| {
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(i as u32 * 8),
+                        ShaderPredicate::Always,
+                        op,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        assert_eq!(
+            evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 16)
+                .unwrap()
+                .output_bits(ShaderIoLocation::PointSize, 0),
+            Some(1.0_f32.to_bits())
+        );
+        let wgsl = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(wgsl.source().contains("struct GuestShaderOutput"));
+        assert!(wgsl.source().contains("output.point_size ="));
+        let host = wgsl
+            .source()
+            .split("struct ShaderOutput {")
+            .nth(1)
+            .unwrap()
+            .split("};")
+            .next()
+            .unwrap();
+        assert!(!host.contains("point_size"));
+        let module = naga::front::wgsl::parse_str(wgsl.source()).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
     }
 
     #[test]

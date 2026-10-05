@@ -7,6 +7,8 @@ enum NvDrvCommand {
     Close,
     Initialize,
     QueryEvent,
+    DumpStatus,
+    GetStatus,
     SetAruid,
     Ioctl2,
     Ioctl3,
@@ -22,6 +24,8 @@ impl NvDrvCommand {
             3 => Some(Self::Initialize),
             4 => Some(Self::QueryEvent),
             8 => Some(Self::SetAruid),
+            6 => Some(Self::GetStatus),
+            9 => Some(Self::DumpStatus),
             11 => Some(Self::Ioctl2),
             12 => Some(Self::Ioctl3),
             13 => Some(Self::SetGraphicsFirmwareMemoryMarginEnabled),
@@ -36,6 +40,7 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
     caller_thread_id: u64,
+    clock: &nixe_runtime::VirtualClock,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let service = NvDrvService::new(session);
     let Some(command) = NvDrvCommand::decode(request.command_id) else {
@@ -46,6 +51,35 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
         ));
     };
     match command {
+        // GetStatus returns NvError followed by NvDrvStatus.
+        // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#GetStatus
+        NvDrvCommand::GetStatus => {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let (status, error) = session.status();
+            let mut data = [0; 36];
+            data[..4].copy_from_slice(&error.to_le_bytes());
+            data[4..].copy_from_slice(&status);
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &data, None)?,
+                None,
+            ))
+        }
+
+        // DumpStatus emits driver diagnostics and carries no input or output.
+        // https://switchbrew.org/wiki/NV_services#DumpStatus
+        NvDrvCommand::DumpStatus => {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            session.dump_status();
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                None,
+            ))
+        }
+
         NvDrvCommand::Open => {
             let descriptor = one_send_buffer(hipc)?;
             let size = usize::try_from(descriptor.size)
@@ -107,6 +141,11 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                     &mut input,
                 )?;
             }
+            log::trace!(
+                "nvdrv ioctl input: fd={fd:#010x} request={ioctl:#010x} input-size={} input-prefix={:02x?}",
+                input.len(),
+                &input[..input.len().min(64)],
+            );
             let additional_input_size = buffers
                 .additional_input
                 .map(|descriptor| descriptor.size)
@@ -142,7 +181,10 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                     process_id: process.process_id(),
                     address_space: process.cpu().address_space_id(),
                     translator: process.canonical_memory(),
-                    thread_id: caller_thread_id,
+                    caller: crate::nvdrv::NvDrvIoctlCaller {
+                        thread_id: caller_thread_id,
+                        clock,
+                    },
                 })
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
             let response = match response {
@@ -203,7 +245,7 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
             ))
         }
         NvDrvCommand::Initialize => {
-            let Some(_transfer_size) = request_u32(request.data, 0) else {
+            let Some(transfer_size) = request_u32(request.data, 0) else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
             if hipc.copy_handles.len() != 2
@@ -215,9 +257,21 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            service.initialize();
+            let transfer = process
+                .handles()
+                .get_as::<TransferMemoryObject>(hipc.copy_handles[1])
+                .expect("validated transfer memory");
+            if u64::from(transfer_size) > transfer.size() || transfer_size == 0 {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            service.initialize(transfer_size);
             Ok((
-                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                encode_response(
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &crate::nvdrv::NV_SUCCESS.to_le_bytes(),
+                    None,
+                )?,
                 None,
             ))
         }

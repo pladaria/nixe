@@ -86,6 +86,13 @@ fn native_pipeline_key_excludes_dynamic_levels_bindings_and_viewport() {
     let mut keys = HashMap::new();
     keys.insert(a, 42);
     assert_eq!(keys.get(&b), Some(&42));
+    let mut depth_mode = (*b.draw).clone();
+    depth_mode.viewport_transform = depth_mode
+        .viewport_transform
+        .map(|v| v.with_negative_one_to_one_depth(true));
+    let depth_mode = key(depth_mode);
+    assert!(depth_mode != b);
+    assert_ne!(fingerprint(&depth_mode), fingerprint(&b));
 }
 
 #[test]

@@ -57,13 +57,6 @@ pub(super) fn header_outputs(
             }
         }
     }
-    if matches!(
-        header.stage,
-        MaxwellShaderStage::TessellationInit | MaxwellShaderStage::Tessellation
-    ) && header.bit(427)
-    {
-        outputs.push(interface_element(ShaderIoLocation::PointSize, 0, None));
-    }
 }
 
 pub(super) fn patch_location(address: u16) -> Option<(ShaderIoLocation, u8)> {

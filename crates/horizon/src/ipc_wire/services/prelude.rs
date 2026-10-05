@@ -37,12 +37,12 @@ pub(super) use crate::{
     AccountManagerForApplicationSession, AccountSession, AppletSession,
     HidActiveVibrationDeviceList, HidAppletResource, HidSession, HidSystem, HorizonIpcObject,
     HorizonIpcResult, IpcService, IpcSession, LogManagerSession, LoggerSession,
-    NetworkGeneralServiceSession, NetworkInterfaceManagerSession, NvDrvSession, OperationMode,
-    ParentalControlFactorySession, ParentalControlSession, PerformanceManagerSession,
-    PerformanceSession, ServiceManagerSession, SslSession, SteadyClockSession, SystemClockKind,
-    SystemClockSession, SystemLanguage, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
-    TimeZoneServiceSession, UserSettingsSession, ViObjectKind, ViServiceKind, ViSession,
-    VideoSystem,
+    NetworkGeneralServiceSession, NetworkInterfaceManagerSession, NetworkRequestSession,
+    NvDrvSession, OperationMode, ParentalControlFactorySession, ParentalControlSession,
+    PerformanceManagerSession, PerformanceSession, ServiceManagerSession, SslSession,
+    SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage, SystemSettingsSession,
+    TimeEnvironment, TimeServiceSession, TimeZoneServiceSession, UserSettingsSession, ViObjectKind,
+    ViServiceKind, ViSession, VideoSystem,
 };
 
 pub(super) use super::response::semantic_success;
