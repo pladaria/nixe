@@ -23,6 +23,7 @@ use crate::{
 
 /// Largest path accepted by the semantic filesystem boundary.
 pub const MAX_IPC_PATH_BYTES: usize = 0x300;
+const MAX_HOST_NAME_BYTES: usize = 255;
 /// Largest file payload returned by one request.
 pub const MAX_IPC_READ_BYTES: usize = 1024 * 1024;
 /// Largest number of directory or add-on entries returned by one request.
@@ -82,6 +83,7 @@ impl IpcResultCode {
     pub const INTERNAL_STATE: Self = Self(11);
     pub const NO_SPACE: Self = Self(12);
     pub const WRITE_FILE_NOT_CLOSED: Self = Self(13);
+    pub const TARGET_LOCKED: Self = Self(14);
 
     pub(crate) const fn semantic_id(self) -> u32 {
         self.0
@@ -121,6 +123,9 @@ pub enum IpcRequest {
     CreateDirectory {
         path: String,
     },
+    DeleteFile {
+        path: String,
+    },
     OpenFile {
         path: String,
         mode: u32,
@@ -133,6 +138,7 @@ pub enum IpcRequest {
         path: String,
     },
     CommitFileSystem,
+    GetFileSystemAttribute,
     GetFileSize,
     ReadFile {
         offset: u64,
@@ -186,10 +192,20 @@ pub enum IpcResponse {
     Event(u32),
     Size(u64),
     EntryType(DirectoryEntryKind),
+    FileSystemAttribute {
+        name_length_max: u32,
+        path_length_max: u32,
+    },
     FileSystemAccessLogMode(FileSystemAccessLogMode),
-    AccessLogProgramIndex { version: u32, program_index: u32 },
+    AccessLogProgramIndex {
+        version: u32,
+        program_index: u32,
+    },
     Data(Vec<u8>),
-    StorageRead { offset: u64, size: usize },
+    StorageRead {
+        offset: u64,
+        size: usize,
+    },
     DirectoryEntries(Vec<DirectoryEntry>),
     AddOnContentEntries(Vec<AddOnContentEntry>),
 }
@@ -586,8 +602,35 @@ fn dispatch_host_filesystem(
         require_sd_card_access(mounts)?;
     }
     match request {
+        IpcRequest::GetFileSystemAttribute => Ok(IpcResponse::FileSystemAttribute {
+            name_length_max: MAX_HOST_NAME_BYTES as u32,
+            path_length_max: MAX_IPC_PATH_BYTES as u32,
+        }),
+        IpcRequest::DeleteFile { path } => {
+            let path = normalize_host_path(&path)?;
+            if is_reserved_homebrew_path(mounts, &path) {
+                return Err(IpcResultCode::ACCESS_DENIED);
+            }
+            let host_path = filesystem
+                .resolve_existing(&path)
+                .map_err(map_host_io_error)?;
+            let metadata = std::fs::metadata(&host_path).map_err(map_host_io_error)?;
+            if !metadata.is_file() {
+                return Err(IpcResultCode::NOT_A_FILE);
+            }
+            // Open guest files retain shared locks until their last handle
+            // closes. Unlinking a live save file would invalidate quota and
+            // commit accounting for later writes to that handle.
+            let deleting = std::fs::File::open(&host_path).map_err(map_host_io_error)?;
+            deleting.try_lock().map_err(map_host_file_lock_error)?;
+            std::fs::remove_file(host_path).map_err(map_host_io_error)?;
+            if let Some(volume) = save.as_mut() {
+                volume.record_resize(&path, metadata.len(), 0);
+            }
+            Ok(IpcResponse::None)
+        }
         IpcRequest::GetEntryType { path } => {
-            let path = normalize_path(&path)?;
+            let path = normalize_host_path(&path)?;
             if save.is_none()
                 && let Some(identity) = mounts.homebrew_executable()
             {
@@ -617,7 +660,7 @@ fn dispatch_host_filesystem(
             if option != 0 {
                 return Err(IpcResultCode::INVALID_ARGUMENT);
             }
-            let path = normalize_path(&path)?;
+            let path = normalize_host_path(&path)?;
             if is_reserved_homebrew_path(mounts, &path) {
                 return Err(IpcResultCode::ACCESS_DENIED);
             }
@@ -644,7 +687,7 @@ fn dispatch_host_filesystem(
             Ok(IpcResponse::None)
         }
         IpcRequest::CreateDirectory { path } => {
-            let path = normalize_path(&path)?;
+            let path = normalize_host_path(&path)?;
             if is_reserved_homebrew_path(mounts, &path) {
                 return Err(IpcResultCode::ACCESS_DENIED);
             }
@@ -661,7 +704,7 @@ fn dispatch_host_filesystem(
             {
                 return Err(IpcResultCode::INVALID_ARGUMENT);
             }
-            let path = normalize_path(&path)?;
+            let path = normalize_host_path(&path)?;
             if let Some(identity) = mounts.homebrew_executable() {
                 if path == identity.guest_path() {
                     if mode & (FILE_OPEN_WRITE | FILE_OPEN_APPEND) != 0 {
@@ -698,6 +741,7 @@ fn dispatch_host_filesystem(
                 .write(writable)
                 .open(host_path)
                 .map_err(map_host_io_error)?;
+            file.try_lock_shared().map_err(map_host_file_lock_error)?;
             insert_handle(
                 handles,
                 SemanticIpcObject::HostFile(
@@ -723,7 +767,7 @@ fn dispatch_host_filesystem(
             {
                 return Err(IpcResultCode::INVALID_ARGUMENT);
             }
-            let path = normalize_path(&path)?;
+            let path = normalize_host_path(&path)?;
             let entries = host_directory_entries(mounts, filesystem, &path, mode)?;
             insert_handle(
                 handles,
@@ -971,6 +1015,14 @@ fn normalize_path(path: &str) -> Result<String, IpcResultCode> {
     Ok(path.to_owned())
 }
 
+fn normalize_host_path(path: &str) -> Result<String, IpcResultCode> {
+    let path = normalize_path(path)?;
+    if path.split('/').any(|name| name.len() > MAX_HOST_NAME_BYTES) {
+        return Err(IpcResultCode::INVALID_ARGUMENT);
+    }
+    Ok(path)
+}
+
 fn directory_entries(
     filesystem: &ReadOnlyFileSystem,
     path: &str,
@@ -1150,6 +1202,13 @@ fn map_host_io_error(error: io::Error) -> IpcResultCode {
     }
 }
 
+fn map_host_file_lock_error(error: std::fs::TryLockError) -> IpcResultCode {
+    match error {
+        std::fs::TryLockError::WouldBlock => IpcResultCode::TARGET_LOCKED,
+        std::fs::TryLockError::Error(error) => map_host_io_error(error),
+    }
+}
+
 fn validate_list_limit(limit: usize) -> Result<(), IpcResultCode> {
     if limit > MAX_IPC_LIST_ENTRIES {
         Err(IpcResultCode::RESOURCE_LIMIT)
@@ -1164,9 +1223,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn save_files_enforce_quota_and_publish_only_after_writers_close() {
-        use nixe_runtime::{Launcher, LauncherInput, ProcessBuilder, TransactionalDirectory};
+    fn save_test_process() -> (tempfile::TempDir, RunnableProcess) {
+        use nixe_runtime::{Launcher, LauncherInput, ProcessBuilder};
         let directory = tempfile::tempdir().unwrap();
         let mut nro = vec![0; 0x2800];
         nro[0x10..0x14].copy_from_slice(b"NRO0");
@@ -1184,7 +1242,14 @@ mod tests {
         let path = directory.path().join("test.nro");
         std::fs::write(&path, nro).unwrap();
         let plan = Launcher::build(LauncherInput::new(path)).unwrap();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let process = ProcessBuilder::new().build(&plan).unwrap();
+        (directory, process)
+    }
+
+    #[test]
+    fn save_files_enforce_quota_and_publish_only_after_writers_close() {
+        use nixe_runtime::TransactionalDirectory;
+        let (directory, mut process) = save_test_process();
         let base = directory.path().join("volume");
         std::fs::create_dir_all(base.join("data")).unwrap();
         let volume = Arc::new(std::sync::Mutex::new(
@@ -1261,6 +1326,17 @@ mod tests {
             dispatch_host_filesystem(mounts, handles, &filesystem, IpcRequest::CommitFileSystem),
             Err(IpcResultCode::WRITE_FILE_NOT_CLOSED)
         );
+        assert_eq!(
+            dispatch_host_filesystem(
+                mounts,
+                handles,
+                &filesystem,
+                IpcRequest::DeleteFile {
+                    path: "/progress".into()
+                },
+            ),
+            Err(IpcResultCode::TARGET_LOCKED)
+        );
         handles.close(handle).unwrap();
         drop(file);
         dispatch_host_filesystem(mounts, handles, &filesystem, IpcRequest::CommitFileSystem)
@@ -1272,6 +1348,184 @@ mod tests {
             std::fs::read(reopened.working_directory().join("progress")).unwrap(),
             b"save"
         );
+    }
+
+    #[test]
+    fn save_deletion_releases_quota_and_is_durable_only_after_commit() {
+        use nixe_runtime::TransactionalDirectory;
+        let (directory, mut process) = save_test_process();
+        let base = directory.path().join("volume");
+        std::fs::create_dir_all(base.join("data/slot")).unwrap();
+        std::fs::write(base.join("data/slot/progress"), b"save").unwrap();
+        std::fs::write(base.join("data/settings"), b"keep").unwrap();
+        let (mounts, handles) = process.mounts_and_handles_mut();
+        for commit in [false, true] {
+            let volume = Arc::new(std::sync::Mutex::new(
+                TransactionalDirectory::open(base.clone(), 8).unwrap(),
+            ));
+            let filesystem = HostDirectoryFileSystem::from_save(volume.clone());
+            assert_eq!(
+                dispatch_host_filesystem(
+                    mounts,
+                    handles,
+                    &filesystem,
+                    IpcRequest::GetFileSystemAttribute
+                ),
+                Ok(IpcResponse::FileSystemAttribute {
+                    name_length_max: 255,
+                    path_length_max: 768
+                })
+            );
+            for (path, result) in [
+                ("/missing", IpcResultCode::PATH_NOT_FOUND),
+                ("/slot", IpcResultCode::NOT_A_FILE),
+                ("/", IpcResultCode::NOT_A_FILE),
+                ("/../settings", IpcResultCode::INVALID_ARGUMENT),
+            ] {
+                assert_eq!(
+                    dispatch_host_filesystem(
+                        mounts,
+                        handles,
+                        &filesystem,
+                        IpcRequest::DeleteFile { path: path.into() }
+                    ),
+                    Err(result)
+                );
+            }
+            let path = "/slot/progress";
+            let mut opened = Vec::new();
+            for _ in 0..2 {
+                let IpcResponse::Handle(handle) = dispatch_host_filesystem(
+                    mounts,
+                    handles,
+                    &filesystem,
+                    IpcRequest::OpenFile {
+                        path: path.into(),
+                        mode: FILE_OPEN_READ,
+                    },
+                )
+                .unwrap() else {
+                    panic!()
+                };
+                opened.push(handle);
+            }
+            for handle in opened {
+                assert_eq!(
+                    dispatch_host_filesystem(
+                        mounts,
+                        handles,
+                        &filesystem,
+                        IpcRequest::DeleteFile { path: path.into() }
+                    ),
+                    Err(IpcResultCode::TARGET_LOCKED)
+                );
+                assert!(!volume.lock().unwrap().can_resize(0, 1));
+                handles.close(handle).unwrap();
+            }
+            dispatch_host_filesystem(
+                mounts,
+                handles,
+                &filesystem,
+                IpcRequest::DeleteFile { path: path.into() },
+            )
+            .unwrap();
+            assert!(volume.lock().unwrap().can_resize(0, 4));
+            assert!(
+                !filesystem
+                    .resolve_existing(path)
+                    .unwrap_or_default()
+                    .is_file()
+            );
+            if commit {
+                dispatch_host_filesystem(
+                    mounts,
+                    handles,
+                    &filesystem,
+                    IpcRequest::CommitFileSystem,
+                )
+                .unwrap();
+            }
+        }
+        let volume = TransactionalDirectory::open(base, 8).unwrap();
+        assert!(!volume.working_directory().join("slot/progress").exists());
+        assert_eq!(
+            std::fs::read(volume.working_directory().join("settings")).unwrap(),
+            b"keep"
+        );
+        assert!(volume.can_resize(0, 4));
+    }
+
+    #[test]
+    fn deleting_and_recreating_a_save_file_does_not_reuse_committed_contents() {
+        use nixe_runtime::TransactionalDirectory;
+        let (directory, mut process) = save_test_process();
+        let base = directory.path().join("volume");
+        std::fs::create_dir_all(base.join("data")).unwrap();
+        std::fs::write(base.join("data/progress"), b"old!").unwrap();
+        let volume = Arc::new(std::sync::Mutex::new(
+            TransactionalDirectory::open(base.clone(), 4).unwrap(),
+        ));
+        let filesystem = HostDirectoryFileSystem::from_save(volume.clone());
+        let (mounts, handles) = process.mounts_and_handles_mut();
+        dispatch_host_filesystem(
+            mounts,
+            handles,
+            &filesystem,
+            IpcRequest::DeleteFile {
+                path: "/progress".into(),
+            },
+        )
+        .unwrap();
+        dispatch_host_filesystem(
+            mounts,
+            handles,
+            &filesystem,
+            IpcRequest::CreateFile {
+                path: "/progress".into(),
+                size: 4,
+                option: 0,
+            },
+        )
+        .unwrap();
+        std::fs::write(filesystem.resolve_existing("/progress").unwrap(), b"new!").unwrap();
+        dispatch_host_filesystem(mounts, handles, &filesystem, IpcRequest::CommitFileSystem)
+            .unwrap();
+        drop(filesystem);
+        drop(volume);
+        let reopened = TransactionalDirectory::open(base, 4).unwrap();
+        assert_eq!(
+            std::fs::read(reopened.working_directory().join("progress")).unwrap(),
+            b"new!"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_deletion_rejects_symbolic_links_without_touching_their_targets() {
+        use nixe_runtime::TransactionalDirectory;
+        let (directory, mut process) = save_test_process();
+        let base = directory.path().join("volume");
+        std::fs::create_dir_all(base.join("data")).unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        let volume = Arc::new(std::sync::Mutex::new(
+            TransactionalDirectory::open(base, 4).unwrap(),
+        ));
+        let filesystem = HostDirectoryFileSystem::from_save(volume);
+        std::os::unix::fs::symlink(&outside, filesystem.resolve_new("/link").unwrap()).unwrap();
+        let (mounts, handles) = process.mounts_and_handles_mut();
+        assert_eq!(
+            dispatch_host_filesystem(
+                mounts,
+                handles,
+                &filesystem,
+                IpcRequest::DeleteFile {
+                    path: "/link".into()
+                }
+            ),
+            Err(IpcResultCode::ACCESS_DENIED)
+        );
+        assert_eq!(std::fs::read(outside).unwrap(), b"keep");
     }
 
     struct SizedStorage(u64);

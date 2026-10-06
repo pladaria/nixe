@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 # Share physical-GPU helpers with frontend tests through a crate dependency.
 test-support = []
+performance-counters = ["nixe-gpu/performance-counters"]
 
 [dependencies]
 log.workspace = true

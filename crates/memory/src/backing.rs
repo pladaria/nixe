@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::direct::DirectArenaWeak;
 use crate::host_mapped::{HostMappedBacking, HostMappedStore};
@@ -103,22 +103,114 @@ impl std::fmt::Debug for CanonicalBackingStore {
     }
 }
 
+/// Shared completion authority for a homogeneous retained range. Pages retain
+/// this record independently of the resource which first published it.
+pub(crate) struct RangeDeviceOwner {
+    device: NonCpuDeviceId,
+    point: AtomicU64,
+    fractured: Mutex<bool>,
+    coordinator: Arc<dyn VisibilityCoordinator>,
+}
+
+impl std::fmt::Debug for RangeDeviceOwner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RangeDeviceOwner")
+            .field("device", &self.device)
+            .field("point", &self.point())
+            .finish()
+    }
+}
+
+impl RangeDeviceOwner {
+    pub(crate) fn new(
+        device: NonCpuDeviceId,
+        point: crate::DeviceVisibilityPoint,
+        coordinator: Arc<dyn VisibilityCoordinator>,
+    ) -> Self {
+        Self {
+            device,
+            point: AtomicU64::new(point.get()),
+            fractured: Mutex::new(false),
+            coordinator,
+        }
+    }
+
+    pub(crate) fn point(&self) -> crate::DeviceVisibilityPoint {
+        crate::DeviceVisibilityPoint::new(self.point.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn is_current_for(&self, declaration: DeviceAccessDeclaration) -> bool {
+        crate::metrics::record(crate::metrics::Counter::TrackingLocks, 1);
+        self.device == declaration.device()
+            && self.point() <= declaration.device_visible_at()
+            && !*self
+                .fractured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn advance(&self, declaration: DeviceAccessDeclaration) -> bool {
+        crate::metrics::record(crate::metrics::Counter::TrackingLocks, 1);
+        let fractured = self
+            .fractured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(point) = declaration.cpu_visible_at() else {
+            return false;
+        };
+        // Equal completion points cannot distinguish a racing older readback.
+        // Reattach pages in that case so their visibility epochs advance.
+        if *fractured || self.device != declaration.device() || self.point() >= point {
+            return false;
+        }
+        self.point.store(point.get(), Ordering::Release);
+        true
+    }
+
+    fn detach(&self) {
+        crate::metrics::record(crate::metrics::Counter::TrackingLocks, 1);
+        *self
+            .fractured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+
+    fn detach_at(&self, expected: crate::DeviceVisibilityPoint) -> bool {
+        crate::metrics::record(crate::metrics::Counter::TrackingLocks, 1);
+        let mut fractured = self
+            .fractured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.point() != expected {
+            return false;
+        }
+        *fractured = true;
+        true
+    }
+}
+
 enum PageVisibility {
     Clean,
     CpuNewer,
-    GpuNewer {
-        device: NonCpuDeviceId,
-        visible_at: crate::DeviceVisibilityPoint,
-        coordinator: Arc<dyn VisibilityCoordinator>,
-    },
+    GpuNewer { owner: Arc<RangeDeviceOwner> },
     Conflicting,
     Invalid,
+}
+
+impl PageVisibility {
+    fn detach_owner(&self) {
+        if let Self::GpuNewer { owner } = self {
+            owner.detach();
+        }
+    }
 }
 
 struct CanonicalPageState {
     visibility: PageVisibility,
     visibility_epoch: u64,
     cpu_dirty_observer_armed: bool,
+    cpu_dirty_summaries: Vec<(Weak<crate::range::CpuWriteSummary>, usize)>,
+    visibility_summaries: Vec<Weak<AtomicU64>>,
     direct_aliases: BTreeMap<(usize, u64), CanonicalDirectAlias>,
 }
 
@@ -252,6 +344,8 @@ impl CanonicalBackingPage {
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
                     cpu_dirty_observer_armed: false,
+                    cpu_dirty_summaries: Vec::new(),
+                    visibility_summaries: Vec::new(),
                     direct_aliases: BTreeMap::new(),
                 }),
             }),
@@ -287,6 +381,8 @@ impl CanonicalBackingPage {
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
                     cpu_dirty_observer_armed: false,
+                    cpu_dirty_summaries: Vec::new(),
+                    visibility_summaries: Vec::new(),
                     direct_aliases: BTreeMap::new(),
                 }),
             }),
@@ -394,6 +490,55 @@ impl CanonicalBackingPage {
     pub(crate) fn arm_cpu_dirty_observer_quiescent(&self) -> Result<u64, CanonicalPageError> {
         self.ensure_backing()?;
         let mut state = self.lock_state();
+        self.arm_cpu_dirty_observer_locked(&mut state)
+    }
+
+    pub(crate) fn needs_cpu_dirty_tracking(&self) -> Result<bool, CanonicalPageError> {
+        let state = self.lock_state();
+        match state.visibility {
+            PageVisibility::Invalid => Err(CanonicalPageError::Visibility(
+                VisibilityError::InvalidState,
+            )),
+            PageVisibility::Conflicting => Err(CanonicalPageError::Visibility(
+                VisibilityError::ConflictingAccess,
+            )),
+            _ => Ok(!state.cpu_dirty_observer_armed),
+        }
+    }
+
+    pub(crate) fn observe_visibility_summary(&self, summary: &Arc<AtomicU64>) {
+        let mut state = self.lock_state();
+        state
+            .visibility_summaries
+            .retain(|existing| existing.strong_count() != 0);
+        state.visibility_summaries.push(Arc::downgrade(summary));
+    }
+
+    fn notify_visibility_summaries(state: &mut CanonicalPageState) {
+        state.visibility_summaries.retain(|summary| {
+            if let Some(summary) = summary.upgrade() {
+                let _ = summary.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    Some(value.saturating_add(1))
+                });
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub(crate) fn observe_cpu_write_summary(
+        &self,
+        summary: &Arc<crate::range::CpuWriteSummary>,
+        group: usize,
+    ) -> Result<u64, CanonicalPageError> {
+        let mut state = self.lock_state();
+        state
+            .cpu_dirty_summaries
+            .retain(|(existing, _)| existing.strong_count() != 0);
+        state
+            .cpu_dirty_summaries
+            .push((Arc::downgrade(summary), group));
         self.arm_cpu_dirty_observer_locked(&mut state)
     }
 
@@ -792,9 +937,11 @@ impl CanonicalBackingPage {
         let (bytes, generation, epoch) = {
             let mut state = self.lock_state();
             match &state.visibility {
-                PageVisibility::GpuNewer {
-                    device, visible_at, ..
-                } if *device == declaration.device() && *visible_at <= target => return Ok(()),
+                PageVisibility::GpuNewer { owner }
+                    if owner.device == declaration.device() && owner.point() <= target =>
+                {
+                    return Ok(());
+                }
                 PageVisibility::GpuNewer { .. } | PageVisibility::Conflicting => {
                     self.publish_visibility(&mut state, PageVisibility::Conflicting)?;
                     return Err(VisibilityError::ConflictingAccess);
@@ -835,16 +982,15 @@ impl CanonicalBackingPage {
         declaration: DeviceAccessDeclaration,
     ) -> Result<(), VisibilityError> {
         let mut state = self.lock_state();
-        match state.visibility {
+        match &state.visibility {
             PageVisibility::Clean => Ok(()),
             PageVisibility::CpuNewer => {
                 self.revoke_direct_access(&mut state)?;
                 self.publish_visibility(&mut state, PageVisibility::Clean)
             }
-            PageVisibility::GpuNewer {
-                device, visible_at, ..
-            } if device == declaration.device()
-                && visible_at <= declaration.device_visible_at() =>
+            PageVisibility::GpuNewer { owner }
+                if owner.device == declaration.device()
+                    && owner.point() <= declaration.device_visible_at() =>
             {
                 Ok(())
             }
@@ -856,32 +1002,21 @@ impl CanonicalBackingPage {
         }
     }
 
-    /// Advances an existing device owner's completion point without changing
-    /// CPU permissions or executable bytes. The first handoff already revoked
-    /// every alias and invalidated compiled code. A concurrent CPU writeback
-    /// observes the visibility epoch and retries against the newer point.
-    pub(crate) fn advance_resident_device_write(
+    pub(crate) fn attach_resident_device_owner(
         &self,
         declaration: DeviceAccessDeclaration,
-        coordinator: &Arc<dyn VisibilityCoordinator>,
+        owner: &Arc<RangeDeviceOwner>,
     ) -> Result<bool, VisibilityError> {
-        let Some(visible_at) = declaration.cpu_visible_at() else {
-            return Err(VisibilityError::DeclarationDoesNotWrite);
-        };
         let mut state = self.lock_state();
-        if !matches!(
-            state.visibility,
-            PageVisibility::GpuNewer { device, visible_at: previous, .. }
-                if device == declaration.device() && previous <= visible_at
-        ) {
+        if !matches!(&state.visibility, PageVisibility::GpuNewer { owner: previous }
+            if previous.device == declaration.device() && previous.point() <= owner.point())
+        {
             return Ok(false);
         }
         self.publish_visibility(
             &mut state,
             PageVisibility::GpuNewer {
-                device: declaration.device(),
-                visible_at,
-                coordinator: Arc::clone(coordinator),
+                owner: Arc::clone(owner),
             },
         )?;
         Ok(true)
@@ -890,7 +1025,7 @@ impl CanonicalBackingPage {
     pub(crate) fn publish_device_write(
         &self,
         declaration: DeviceAccessDeclaration,
-        coordinator: Arc<dyn VisibilityCoordinator>,
+        owner: Arc<RangeDeviceOwner>,
     ) -> Result<(), VisibilityError> {
         let Some(visible_at) = declaration.cpu_visible_at() else {
             return Err(VisibilityError::DeclarationDoesNotWrite);
@@ -914,11 +1049,8 @@ impl CanonicalBackingPage {
         self.revoke_direct_access(&mut state)?;
         match &state.visibility {
             PageVisibility::Clean => {}
-            PageVisibility::GpuNewer {
-                device,
-                visible_at: previous,
-                ..
-            } if *device == declaration.device() && *previous <= visible_at => {}
+            PageVisibility::GpuNewer { owner: previous }
+                if previous.device == declaration.device() && previous.point() <= visible_at => {}
             PageVisibility::CpuNewer
             | PageVisibility::GpuNewer { .. }
             | PageVisibility::Conflicting => {
@@ -927,14 +1059,7 @@ impl CanonicalBackingPage {
             }
             PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
         }
-        self.publish_visibility(
-            &mut state,
-            PageVisibility::GpuNewer {
-                device: declaration.device(),
-                visible_at,
-                coordinator,
-            },
-        )?;
+        self.publish_visibility(&mut state, PageVisibility::GpuNewer { owner })?;
         if let Some(invalidation) = invalidation {
             invalidation.commit();
         }
@@ -958,7 +1083,7 @@ impl CanonicalBackingPage {
         resolve: &mut crate::CpuVisibilityResolver<'_>,
     ) -> Result<(), VisibilityError> {
         loop {
-            let (device, visible_at, coordinator, epoch, next_generation) = {
+            let (owner, visible_at, epoch, next_generation) = {
                 let mut state = self.lock_state();
                 match &state.visibility {
                     PageVisibility::Clean | PageVisibility::CpuNewer => return Ok(()),
@@ -966,11 +1091,7 @@ impl CanonicalBackingPage {
                         return Err(VisibilityError::ConflictingAccess);
                     }
                     PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
-                    PageVisibility::GpuNewer {
-                        device,
-                        visible_at,
-                        coordinator,
-                    } => {
+                    PageVisibility::GpuNewer { owner } => {
                         let next = match self.content_generation().next() {
                             Ok(next) => next,
                             Err(error) => {
@@ -979,9 +1100,8 @@ impl CanonicalBackingPage {
                             }
                         };
                         (
-                            *device,
-                            *visible_at,
-                            Arc::clone(coordinator),
+                            Arc::clone(owner),
+                            owner.point(),
                             state.visibility_epoch,
                             next,
                         )
@@ -993,10 +1113,10 @@ impl CanonicalBackingPage {
             let request = CpuVisibilityRequest {
                 page: self.identity(),
                 size: self.size(),
-                device,
+                device: owner.device,
                 visible_at,
             };
-            let writeback = resolve(coordinator.as_ref(), request);
+            let writeback = resolve(owner.coordinator.as_ref(), request);
             let mut state = self.lock_state();
             if state.visibility_epoch != epoch {
                 match state.visibility {
@@ -1007,6 +1127,12 @@ impl CanonicalBackingPage {
                     }
                     PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
                 }
+            }
+            // A range publication advances one shared point, without changing
+            // this page's epoch. Serialize detachment against that advance so
+            // a completed older readback can never expose newer GPU bytes.
+            if !owner.detach_at(visible_at) {
+                continue;
             }
             let bytes = match writeback {
                 Ok(bytes) => bytes,
@@ -1048,11 +1174,9 @@ impl CanonicalBackingPage {
         match visibility {
             PageVisibility::Clean => VisibilityState::Clean,
             PageVisibility::CpuNewer => VisibilityState::CpuNewer,
-            PageVisibility::GpuNewer {
-                device, visible_at, ..
-            } => VisibilityState::GpuNewer {
-                device: *device,
-                visible_at: *visible_at,
+            PageVisibility::GpuNewer { owner } => VisibilityState::GpuNewer {
+                device: owner.device,
+                visible_at: owner.point(),
             },
             PageVisibility::Conflicting => VisibilityState::Conflicting,
             PageVisibility::Invalid => VisibilityState::Invalid,
@@ -1075,8 +1199,17 @@ impl CanonicalBackingPage {
         state: &mut CanonicalPageState,
         visibility: PageVisibility,
     ) -> Result<(), VisibilityError> {
+        Self::notify_visibility_summaries(state);
+        if !matches!((&state.visibility, &visibility),
+            (PageVisibility::GpuNewer { owner: old }, PageVisibility::GpuNewer { owner: new })
+                if Arc::ptr_eq(old, new))
+        {
+            state.visibility.detach_owner();
+        }
         self.inner.visibility_clean.store(false, Ordering::Release);
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
+            state.visibility.detach_owner();
+            Self::notify_visibility_summaries(state);
             state.visibility = PageVisibility::Invalid;
             return Err(VisibilityError::VisibilityEpochExhausted);
         };
@@ -1093,6 +1226,8 @@ impl CanonicalBackingPage {
             self.publish_direct_alias_protection_for(state, cpu_visible, cpu_writable)
         };
         protection.map_err(|error| {
+            state.visibility.detach_owner();
+            Self::notify_visibility_summaries(state);
             state.visibility = PageVisibility::Invalid;
             VisibilityError::HostMemory(error.to_string().into_boxed_str())
         })?;
@@ -1113,11 +1248,21 @@ impl CanonicalBackingPage {
             self.revoke_direct_access(state)
                 .map_err(CanonicalPageError::Visibility)?;
             self.inner.visibility_clean.store(false, Ordering::Release);
+            state.visibility.detach_owner();
+            Self::notify_visibility_summaries(state);
             state.visibility = PageVisibility::Invalid;
             return Err(CanonicalPageError::CpuDirtyEpochExhausted);
         };
         state.cpu_dirty_observer_armed = false;
         self.inner.cpu_dirty_epoch.store(next, Ordering::Release);
+        state.cpu_dirty_summaries.retain(|(summary, group)| {
+            if let Some(summary) = summary.upgrade() {
+                summary.publish(*group);
+                true
+            } else {
+                false
+            }
+        });
         self.publish_direct_alias_protection(state)
             .map_err(|error| {
                 CanonicalPageError::Visibility(VisibilityError::HostMemory(
@@ -1135,12 +1280,16 @@ impl CanonicalBackingPage {
         };
         protection.map_err(|error| {
             self.inner.visibility_clean.store(false, Ordering::Release);
+            state.visibility.detach_owner();
+            Self::notify_visibility_summaries(state);
             state.visibility = PageVisibility::Invalid;
             VisibilityError::HostMemory(error.to_string().into_boxed_str())
         })?;
         self.inner.visibility_clean.store(false, Ordering::Release);
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
             self.inner.visibility_clean.store(false, Ordering::Release);
+            state.visibility.detach_owner();
+            Self::notify_visibility_summaries(state);
             state.visibility = PageVisibility::Invalid;
             return Err(VisibilityError::VisibilityEpochExhausted);
         };
@@ -1222,6 +1371,7 @@ impl CanonicalBackingPage {
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, CanonicalPageState> {
+        crate::metrics::record(crate::metrics::Counter::TrackingLocks, 1);
         self.inner
             .state
             .lock()
@@ -1788,6 +1938,8 @@ impl CanonicalWriteBatch {
                 .inner
                 .visibility_clean
                 .store(false, Ordering::Release);
+            state.visibility.detach_owner();
+            CanonicalBackingPage::notify_visibility_summaries(state);
             state.visibility = PageVisibility::CpuNewer;
             backing
                 .publish_cpu_dirty(state)

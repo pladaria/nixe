@@ -227,6 +227,16 @@ impl ExecutionGate {
         transition: ExecutionTransitionGuard<'a>,
         changes: Option<&[MemoryInvalidationKind]>,
     ) -> Result<ExecutionMutationGuard<'a>, ExecutionMutationError> {
+        #[cfg(feature = "performance-counters")]
+        let started = std::time::Instant::now();
+        crate::metrics::record(
+            if changes.is_some() {
+                crate::metrics::Counter::MutationHandshakes
+            } else {
+                crate::metrics::Counter::ReadOnlyCaptures
+            },
+            1,
+        );
         let observer = self
             .inner
             .mutation_observer
@@ -238,6 +248,11 @@ impl ExecutionGate {
             .map(|(observer, changes)| observer.begin(changes))
             .transpose()?;
         self.wait_shared();
+        #[cfg(feature = "performance-counters")]
+        crate::metrics::record(
+            crate::metrics::Counter::HandshakeNanoseconds,
+            started.elapsed().as_nanos() as u64,
+        );
         Ok(ExecutionMutationGuard {
             participant,
             transition,

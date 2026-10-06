@@ -2597,3 +2597,274 @@ fn exit(offset: u32) -> ShaderInstruction {
         ShaderOperation::Exit,
     )
 }
+
+#[test]
+fn separate_array_layers_preserve_cpu_bytes_sharing_a_physical_page() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(970),
+        NonCpuDeviceId::new(970),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+    allocation.write(2048, &[0x35; 2048]).unwrap();
+    let allocation_id = GpuAllocationId::new(970);
+    let allocation_description = GpuAllocationDescription::new(4096, 4).unwrap();
+    let backing = BackingView::new(
+        allocation_id,
+        allocation_description,
+        0,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+    )
+    .unwrap();
+    let image = ImageId::new(970);
+    let description = ImageDescription::new(
+        ImageDimension::Two,
+        ImageExtent::new(64, 8, 1).unwrap(),
+        ImageFormat::Rgba8Unorm,
+        ImageKind::Color,
+        1,
+        2,
+        SampleCount::One,
+    )
+    .unwrap();
+    let all = ImageSubresourceRange {
+        plane: 0,
+        mip_level: 0,
+        base_layer: 0,
+        layer_count: 2,
+    };
+    let creations = vec![
+        BackendResourceCreateInfo::Allocation {
+            id: allocation_id,
+            description: allocation_description,
+        },
+        BackendResourceCreateInfo::Image {
+            id: image,
+            description,
+            view: Some(
+                ImageView::new(
+                    image,
+                    description,
+                    Swizzle::IDENTITY,
+                    vec![(
+                        all,
+                        ImageMemoryLayout::PitchLinear {
+                            row_pitch: 256,
+                            layer_stride: 2048,
+                        },
+                        backing.clone(),
+                    )],
+                )
+                .unwrap(),
+            ),
+        },
+    ];
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let first = ImageSubresourceRange {
+        layer_count: 1,
+        ..all
+    };
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                image,
+                first,
+                ImageFormat::Rgba8Unorm,
+                64,
+                8,
+                [1.0, 0.0, 0.0, 1.0],
+                970,
+            ),
+        )
+        .unwrap();
+    let mut bytes = [0; 4096];
+    backing.range().read(0, &mut bytes).unwrap();
+    assert!(
+        bytes[..2048]
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 0, 0, 255])
+    );
+    assert_eq!(bytes[2048..], [0x35; 2048]);
+    let second = ImageSubresourceRange {
+        base_layer: 1,
+        ..first
+    };
+    runtime
+        .runtime()
+        .submit(
+            &[],
+            &[],
+            &color_clear_submission(
+                image,
+                second,
+                ImageFormat::Rgba8Unorm,
+                64,
+                8,
+                [0.0, 0.0, 1.0, 1.0],
+                971,
+            ),
+        )
+        .unwrap();
+    backing.range().read(0, &mut bytes).unwrap();
+    assert!(
+        bytes[..2048]
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 0, 0, 255])
+    );
+    assert!(
+        bytes[2048..]
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 0, 255, 255])
+    );
+}
+
+#[test]
+fn a_single_dirty_image_page_refreshes_only_that_upload_region() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(980),
+        NonCpuDeviceId::new(980),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let bytes = 1024 * 1024 * 4;
+    let source_memory = CanonicalAllocation::zeroed(bytes, 4096).unwrap();
+    let destination_memory = CanonicalAllocation::zeroed(bytes, 4096).unwrap();
+    let description = ImageDescription::new(
+        ImageDimension::Two,
+        ImageExtent::new(1024, 1024, 1).unwrap(),
+        ImageFormat::Rgba8Unorm,
+        ImageKind::Color,
+        1,
+        1,
+        SampleCount::One,
+    )
+    .unwrap();
+    let subresources = ImageSubresourceRange {
+        plane: 0,
+        mip_level: 0,
+        base_layer: 0,
+        layer_count: 1,
+    };
+    let source = ImageId::new(980);
+    let destination = ImageId::new(981);
+    let mut creations = Vec::new();
+    for (image, memory) in [(source, &source_memory), (destination, &destination_memory)] {
+        let allocation = GpuAllocationId::new(image.get());
+        let allocation_description = GpuAllocationDescription::new(bytes as u64, 4).unwrap();
+        let backing = BackingView::new(
+            allocation,
+            allocation_description,
+            0,
+            memory.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+        )
+        .unwrap();
+        creations.push(BackendResourceCreateInfo::Allocation {
+            id: allocation,
+            description: allocation_description,
+        });
+        creations.push(BackendResourceCreateInfo::Image {
+            id: image,
+            description,
+            view: Some(
+                ImageView::new(
+                    image,
+                    description,
+                    Swizzle::IDENTITY,
+                    vec![(
+                        subresources,
+                        ImageMemoryLayout::PitchLinear {
+                            row_pitch: 4096,
+                            layer_stride: bytes as u64,
+                        },
+                        backing,
+                    )],
+                )
+                .unwrap(),
+            ),
+        });
+    }
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                source,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                1024,
+                1024,
+                [1.0, 0.0, 0.0, 1.0],
+                980,
+            ),
+        )
+        .unwrap();
+    source_memory.write(4096 * 256, &[0, 255, 0, 255]).unwrap();
+    #[cfg(feature = "performance-counters")]
+    let before = nixe_gpu::metrics::snapshot()
+        .into_iter()
+        .find(|(name, _)| *name == "ImageUploadedBytes")
+        .unwrap()
+        .1;
+    let region = |image| nixe_gpu::ImageRegion {
+        image,
+        subresources,
+        origin: nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 },
+        extent: ImageExtent::new(1024, 1024, 1).unwrap(),
+    };
+    runtime
+        .runtime()
+        .submit(
+            &[],
+            &[],
+            &OperationSubmission::new(
+                FrontendSubmissionId::new(981),
+                vec![],
+                vec![GpuOperation::new(
+                    GpuCommand::Copy(CopyOperation::ImageToImage {
+                        source: region(source),
+                        destination: region(destination),
+                    }),
+                    [],
+                    [],
+                    CapabilityRequirements::none(),
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    #[cfg(feature = "performance-counters")]
+    {
+        let after = nixe_gpu::metrics::snapshot()
+            .into_iter()
+            .find(|(name, _)| *name == "ImageUploadedBytes")
+            .unwrap()
+            .1;
+        assert_eq!(
+            after - before,
+            4096,
+            "one changed page must not upload the 4 MiB image"
+        );
+    }
+    let mut pixels = vec![0; bytes];
+    destination_memory.read(0, &mut pixels).unwrap();
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let expected = if index == 1024 * 256 {
+            [0, 255, 0, 255]
+        } else {
+            [255, 0, 0, 255]
+        };
+        assert_eq!(pixel, expected, "pixel {index}");
+    }
+}

@@ -101,7 +101,7 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                 high_amplitude: values[2],
                 high_frequency: values[3],
             };
-            log::debug!("HID vibration request: handle={handle:#010x} value={value:?}");
+            log::trace!("HID vibration request: handle={handle:#010x} value={value:?}");
             if let Some(result) = hid_system.send_vibration(handle, value) {
                 result.map_err(|e| IpcWireError::InputBackend(e.to_string().into_boxed_str()))?;
             } else if !value.is_stopped() {

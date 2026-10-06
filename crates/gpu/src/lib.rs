@@ -4,6 +4,8 @@
 //! Horizon ABI, console packet formats, or concrete host graphics objects.
 
 mod access;
+mod access_plan;
+pub use access_plan::{PlannedAccess, SubmissionAccessPlan};
 mod address;
 mod allocation;
 mod backend;
@@ -112,3 +114,6 @@ pub use view::{
     ImageMemoryLayout, ImageSubresourceBinding, ImageSubresourceRange, ImageView, ImageViewError,
     Swizzle,
 };
+
+/// Diagnostic counters compiled only when explicitly enabled.
+pub mod metrics;

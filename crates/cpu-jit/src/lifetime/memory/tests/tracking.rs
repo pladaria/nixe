@@ -116,7 +116,7 @@ fn tracking_rearm_and_snapshots_drain_fault_readers_without_retiring_code() {
                 .unwrap();
             let worker = scope.spawn(|| match mode {
                 0 => {
-                    assert!(dependency.rearm().unwrap());
+                    dependency.rearm().unwrap();
                 }
                 1 => {
                     let snapshots = dependency.snapshot_dirty_pages(&range, 4).unwrap();
@@ -191,7 +191,7 @@ fn clean_tracking_queries_do_not_close_admission_or_cancel_captures() {
 }
 
 #[test]
-fn tracking_coordinator_errors_are_not_reported_as_volatile_or_clean() {
+fn tracking_coordinator_errors_are_not_reported_as_clean() {
     let (process, memory) = fixture();
     let range = data_range(&memory);
     let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
@@ -214,6 +214,6 @@ fn tracking_coordinator_errors_are_not_reported_as_volatile_or_clean() {
     );
     assert_eq!(dependency.snapshot_all(&range), Err(expected));
     assert!(!dependency.remains_current());
-    assert!(!dependency.is_volatile());
+    assert!(!dependency.has_streaming_pages());
     assert!(!memory.mapping_mutation_pending());
 }

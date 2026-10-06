@@ -27,22 +27,26 @@ impl FileSystemProxyCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FileSystemCommand {
     CreateFile,
+    DeleteFile,
     CreateDirectory,
     Commit,
     GetEntryType,
     OpenFile,
     OpenDirectory,
+    GetFileSystemAttribute,
 }
 
 impl FileSystemCommand {
     pub(super) const fn decode(command_id: u32) -> Option<Self> {
         match command_id {
             0 => Some(Self::CreateFile),
+            1 => Some(Self::DeleteFile),
             2 => Some(Self::CreateDirectory),
             7 => Some(Self::GetEntryType),
             8 => Some(Self::OpenFile),
             9 => Some(Self::OpenDirectory),
             10 => Some(Self::Commit),
+            16 => Some(Self::GetFileSystemAttribute),
             _ => None,
         }
     }

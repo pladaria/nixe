@@ -3,7 +3,7 @@
 //! The composition root selects a concrete backend driver. Console frontends
 //! only receive this interface and therefore cannot observe host API objects.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -14,8 +14,8 @@ use nixe_memory::{
 
 use crate::{
     AccessMode, Backend, BackendCapabilities, BackendDriver, BackendResourceCreateInfo,
-    BackendSubmissionToken, FrontendSubmissionId, OperationSubmission, PresentationImageRequest,
-    ResidentImage, ResourceDependency,
+    BackendResourceHandle, BackendSubmissionToken, FrontendSubmissionId, OperationSubmission,
+    PresentationImageRequest, ResidentImage, ResourceDependency,
 };
 
 /// Evidence that host execution and canonical device ownership both finished.
@@ -155,24 +155,20 @@ impl<D: BackendDriver> BackendRuntime<D> {
         &mut self,
         submission: &OperationSubmission,
         point: DeviceVisibilityPoint,
+        dependencies: &[(ResourceDependency, BackendResourceHandle)],
     ) -> Result<Vec<PreparedAccess>, BackendRuntimeError> {
-        let mut modes = HashMap::<ResourceDependency, AccessMode>::new();
-        for operation in submission.operations() {
-            for access in operation.accesses() {
-                let dependency = access.target().dependency();
-                modes
-                    .entry(dependency)
-                    .and_modify(|mode| *mode = merge_access_modes(*mode, access.scope().mode()))
-                    .or_insert(access.scope().mode());
-            }
-        }
-
+        #[cfg(feature = "performance-counters")]
+        let started = std::time::Instant::now();
         let mut prepared = Vec::new();
-        for (dependency, mode) in modes {
+        for access in submission.access_plan().accesses() {
+            let mode = access.mode();
             let backings = self
                 .backend
-                .resource_backings(dependency)
-                .ok_or(BackendRuntimeError::UnknownResource(dependency))?;
+                .resource_access_backings(
+                    access.target(),
+                    dependencies[access.dependency_index()].1,
+                )
+                .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?;
             let declaration = match mode {
                 AccessMode::Read => DeviceAccessDeclaration::read(self.device, point),
                 AccessMode::Write => DeviceAccessDeclaration::write(self.device, point, point)
@@ -182,7 +178,7 @@ impl<D: BackendDriver> BackendRuntime<D> {
                         .map_err(|_| BackendRuntimeError::InvalidVisibilityDeclaration)?
                 }
             };
-            for backing in backings {
+            for backing in backings.iter() {
                 // Visibility is owned by the retained canonical pages, not by
                 // the content generations captured in a range. Keep the exact
                 // range alive for completion without rebuilding a versioned
@@ -200,6 +196,11 @@ impl<D: BackendDriver> BackendRuntime<D> {
                 });
             }
         }
+        #[cfg(feature = "performance-counters")]
+        crate::metrics::record(
+            crate::metrics::Counter::AccessPreparationNanoseconds,
+            started.elapsed().as_nanos() as u64,
+        );
         Ok(prepared)
     }
 
@@ -293,14 +294,21 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
             .ok_or(BackendRuntimeError::VisibilityPointExhausted)?;
         let point = DeviceVisibilityPoint::new(raw_point);
         let created = self.create_resources(creations)?;
-        let prepared = match self.prepare_accesses(submission, point) {
+        let dependencies = match self.backend.resolve_submission_dependencies(submission) {
+            Ok(dependencies) => dependencies,
+            Err(error) => {
+                self.rollback_created(&created);
+                return Err(BackendRuntimeError::Backend(error.to_string().into()));
+            }
+        };
+        let prepared = match self.prepare_accesses(submission, point, &dependencies) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.rollback_created(&created);
                 return Err(error);
             }
         };
-        let token = match self.backend.submit(submission) {
+        let token = match self.backend.submit_resolved(submission, dependencies) {
             Ok(token) => token,
             Err(error) => {
                 invalidate_prepared(&prepared);
@@ -396,14 +404,6 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
         self.backend
             .teardown()
             .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))
-    }
-}
-
-fn merge_access_modes(left: AccessMode, right: AccessMode) -> AccessMode {
-    if left == right {
-        left
-    } else {
-        AccessMode::ReadWrite
     }
 }
 

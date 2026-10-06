@@ -460,3 +460,6 @@ mod tests {
         );
     }
 }
+
+/// Diagnostic counters compiled only when explicitly enabled.
+pub mod metrics;

@@ -12,3 +12,7 @@ half = "2.7"
 
 [dev-dependencies]
 naga = { version = "30.0.0", features = ["wgsl-in"] }
+
+
+[features]
+performance-counters = ["nixe-memory/performance-counters"]

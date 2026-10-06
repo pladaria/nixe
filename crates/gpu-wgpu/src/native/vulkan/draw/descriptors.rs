@@ -248,8 +248,11 @@ impl WgpuBackendDriver {
             })?;
             // Upload_inputs already applies canonical CPU/GPU coherence. Raw
             // reads may not bypass initialization or expose an unbacked suffix.
-            if !record.content.as_ref().is_some_and(|c| c.initialized)
-                || view.buffer_offset() != 0
+            if !record.content.as_ref().is_some_and(|c| {
+                c.buffer_is_initialized(
+                    nixe_gpu::BufferRange::new(0, view.size()).expect("nonempty buffer backing"),
+                )
+            }) || view.buffer_offset() != 0
                 || view.size() != buffer.size()
                 || !buffer.size().is_multiple_of(4)
                 || buffer.size() > u64::from(limit)

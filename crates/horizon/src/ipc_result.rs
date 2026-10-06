@@ -75,6 +75,8 @@ impl HorizonIpcResult {
     pub const AUDIO_INVALID_ADDRESS_INFO: Self = Self::new(MODULE_AUDIO, 42);
     pub const AUDIO_INVALID_HANDLE: Self = Self::new(MODULE_AUDIO, 1536);
     pub const FS_PATH_NOT_FOUND: Self = Self::new(MODULE_FS, 1);
+    // https://github.com/Atmosphere-NX/Atmosphere/blob/36cc9a9f490da37dd1d5f958ee9a256be132cc1d/libraries/libvapours/include/vapours/results/fs_results.hpp
+    pub const FS_TARGET_LOCKED: Self = Self::new(MODULE_FS, 7);
     pub const FS_OUT_OF_RANGE: Self = Self::new(MODULE_FS, 3005);
     pub const FS_ALLOCATION_MEMORY_FAILED: Self = Self::new(MODULE_FS, 3420);
     pub const FS_UNEXPECTED: Self = Self::new(MODULE_FS, 5000);
@@ -109,6 +111,7 @@ impl HorizonIpcResult {
             // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libvapours/include/vapours/results/fs_results.hpp
             12 => Self::new(MODULE_FS, 30),
             13 => Self::new(MODULE_FS, 6457),
+            14 => Self::FS_TARGET_LOCKED,
             _ => unreachable!(),
         }
     }
@@ -157,6 +160,7 @@ mod tests {
             (HorizonIpcResult::AM_NO_MESSAGES, 128, 3, 0x680),
             (HorizonIpcResult::AM_NO_DATA_IN_CHANNEL, 128, 2, 0x480),
             (HorizonIpcResult::FS_PATH_NOT_FOUND, 2, 1, 0x202),
+            (HorizonIpcResult::FS_TARGET_LOCKED, 2, 7, 0xe02),
             (HorizonIpcResult::FS_OUT_OF_RANGE, 2, 3005, 0x177a02),
             (
                 HorizonIpcResult::FS_ALLOCATION_MEMORY_FAILED,
@@ -181,6 +185,10 @@ mod tests {
     fn every_semantic_failure_has_a_contextual_official_mapping() {
         let filesystem_cases = [
             (IpcResultCode::SUCCESS, HorizonIpcResult::SUCCESS),
+            (
+                IpcResultCode::TARGET_LOCKED,
+                HorizonIpcResult::FS_TARGET_LOCKED,
+            ),
             (
                 IpcResultCode::INVALID_HANDLE,
                 HorizonIpcResult::CMIF_TARGET_NOT_FOUND,

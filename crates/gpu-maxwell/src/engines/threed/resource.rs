@@ -1416,9 +1416,8 @@ struct RetainedBackingCacheEntry {
     retained: RetainedResourceBacking,
 }
 
-/// Owner-local cache for page-versioned backing views derived from stable
-/// Maxwell mappings. Page dirty dependencies retain entries until one of the
-/// physical pages represented by the resource becomes dirty.
+/// Owner-local topology cache derived from stable Maxwell mappings. CPU writes
+/// refresh content observations without rebuilding immutable page layouts.
 #[derive(Debug, Default)]
 pub(crate) struct MaxwellThreeDRetainedBackingCache {
     entries: BTreeMap<RetainedBackingKey, Arc<RetainedBackingCacheEntry>>,
@@ -1431,14 +1430,22 @@ impl MaxwellThreeDRetainedBackingCache {
         role: MaxwellThreeDResourceRole,
     ) -> Result<RetainedResourceBacking, MaxwellThreeDResourceError> {
         let key = RetainedBackingKey::from(source);
-        if let Some(entry) = self.entries.get(&key)
+        let retained = if let Some(entry) = self.entries.get(&key)
             && entry.source == *source
-            && entry.retained.cpu_writes.remains_current()
         {
-            return Ok(entry.retained.clone());
-        }
-
-        let retained = retained_backing(source, role)?;
+            if entry.retained.cpu_writes.remains_current() {
+                return Ok(entry.retained.clone());
+            }
+            let mut retained = entry.retained.clone();
+            // Existing images must keep their old observation so opaque
+            // contents are still invalidated. Only the resolver gets a fresh
+            // dependency; backing identity and mapping topology stay shared.
+            retained.cpu_writes = CanonicalCpuWriteDependency::capture(retained.backing.range())
+                .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
+            retained
+        } else {
+            retained_backing(source, role)?
+        };
         self.entries.insert(
             key,
             Arc::new(RetainedBackingCacheEntry {
@@ -3765,10 +3772,18 @@ mod tests {
 
         allocation.write(0, &[2]).unwrap();
         let after_overlapping_write = cache.retain(&source, role).unwrap();
-        assert!(!Arc::ptr_eq(
+        assert!(Arc::ptr_eq(
             &after_disjoint_write.mappings,
             &after_overlapping_write.mappings
         ));
+        assert!(
+            first
+                .backing
+                .range()
+                .shares_layout(after_overlapping_write.backing.range())
+        );
+        assert!(!first.cpu_writes.remains_current());
+        assert!(after_overlapping_write.cpu_writes.remains_current());
 
         address_space.unmap(mapping.offset()).unwrap();
         let replacement = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();

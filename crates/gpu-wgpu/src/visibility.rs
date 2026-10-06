@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use nixe_gpu::{BackendVisibilityRequester, BackingView};
+use nixe_gpu::BackendVisibilityRequester;
 use nixe_memory::{
     CanonicalPageId, CpuVisibilityRequest, DeviceVisibilityPoint, DeviceVisibilityRequest,
     NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
@@ -37,7 +37,7 @@ impl WgpuVisibilityCoordinator {
 
     pub(crate) fn write_backing(
         &self,
-        backing: &BackingView,
+        backing: &nixe_memory::CanonicalBackingRange,
         bytes: &[u8],
     ) -> Result<(), VisibilityCoordinatorError> {
         if bytes.len() != backing.size() as usize {
@@ -50,7 +50,7 @@ impl WgpuVisibilityCoordinator {
             .lock()
             .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
         let mut source = 0_usize;
-        for segment in backing.range().segments() {
+        for segment in backing.segments() {
             let size = usize::try_from(segment.size())
                 .map_err(|_| VisibilityCoordinatorError::new("segment size overflows usize"))?;
             let offset = usize::try_from(segment.offset())
@@ -113,7 +113,7 @@ impl WgpuVisibilityCoordinator {
 
     pub(crate) fn read_backing(
         &self,
-        backing: &BackingView,
+        backing: &nixe_memory::CanonicalBackingRange,
         output: &mut [u8],
     ) -> Result<(), VisibilityCoordinatorError> {
         if output.len() != backing.size() as usize {
@@ -126,7 +126,7 @@ impl WgpuVisibilityCoordinator {
             .lock()
             .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
         let mut destination = 0_usize;
-        for segment in backing.range().segments() {
+        for segment in backing.segments() {
             let size = usize::try_from(segment.size())
                 .map_err(|_| VisibilityCoordinatorError::new("segment size overflows usize"))?;
             let offset = usize::try_from(segment.offset())
@@ -192,26 +192,6 @@ impl WgpuVisibilityCoordinator {
             .remove(&request.page)
             .expect("validated page remains present while locked")
             .bytes)
-    }
-
-    pub(crate) fn mark_backing_completed(
-        &self,
-        backing: &BackingView,
-        point: DeviceVisibilityPoint,
-    ) -> Result<(), VisibilityCoordinatorError> {
-        let mut pages = self
-            .pages
-            .lock()
-            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
-        for segment in backing.range().segments() {
-            let page = pages.get_mut(&segment.page()).ok_or_else(|| {
-                VisibilityCoordinatorError::new(
-                    "completed GPU write has no prepared canonical page mirror",
-                )
-            })?;
-            page.completed = Some(page.completed.map_or(point, |current| current.max(point)));
-        }
-        Ok(())
     }
 
     pub(crate) fn mark_page_completed(

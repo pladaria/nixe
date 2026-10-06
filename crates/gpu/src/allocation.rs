@@ -259,6 +259,11 @@ impl BackingView {
     /// comparison depends on discontiguous runs rather than retained pages.
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
+        crate::metrics::record(crate::metrics::Counter::AliasComparisons, 1);
+        crate::metrics::record(
+            crate::metrics::Counter::AliasInputSpans,
+            (self.canonical_spans.len() + other.canonical_spans.len()) as u64,
+        );
         sorted_spans_overlap(&self.canonical_spans, &other.canonical_spans)
     }
 }

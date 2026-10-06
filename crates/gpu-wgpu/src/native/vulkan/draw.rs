@@ -487,7 +487,10 @@ impl WgpuBackendDriver {
                         "native vertex fetch requires a canonically initialized buffer",
                     ));
                 };
-                if !record.content.as_ref().is_some_and(|c| c.initialized)
+                if !record
+                    .content
+                    .as_ref()
+                    .is_some_and(|c| c.buffer_is_initialized(layout.buffer.range))
                     || layout.buffer.range.offset() < view.buffer_offset()
                     || layout.buffer.range.end() > view.buffer_offset() + view.size()
                 {
@@ -537,7 +540,10 @@ impl WgpuBackendDriver {
                 else {
                     return Err(unsupported("native index fetch requires canonical backing"));
                 };
-                if !record.content.as_ref().is_some_and(|c| c.initialized)
+                if !record
+                    .content
+                    .as_ref()
+                    .is_some_and(|c| c.buffer_is_initialized(region.range))
                     || region.range.offset() < view.buffer_offset()
                     || region.range.end() > view.buffer_offset() + view.size()
                     || region.range.end() > buffer.size()

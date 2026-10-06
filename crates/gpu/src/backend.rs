@@ -180,23 +180,6 @@ impl BackendResourceCreateInfo {
         }
     }
 
-    fn canonical_backings(&self) -> Box<[nixe_memory::CanonicalBackingRange]> {
-        match self {
-            Self::Buffer {
-                view: Some(view), ..
-            } => vec![view.backing().range().clone()].into_boxed_slice(),
-            Self::Image {
-                view: Some(view), ..
-            } => view
-                .bindings()
-                .iter()
-                .map(|binding| binding.backing().range().clone())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            _ => Box::new([]),
-        }
-    }
-
     fn references_allocation(&self, allocation: GpuAllocationId) -> bool {
         match self {
             Self::Buffer {
@@ -262,6 +245,11 @@ impl<'a> ResolvedBackendResources<'a> {
             .binary_search_by_key(dependency, |(candidate, _)| *candidate)
             .ok()
             .map(|index| &self.entries[index].1)
+    }
+
+    #[must_use]
+    pub fn indexed(&self, index: usize) -> BackendResourceHandle {
+        self.entries[index].1
     }
 
     pub fn values(&self) -> impl ExactSizeIterator<Item = &BackendResourceHandle> {
@@ -423,7 +411,7 @@ struct ResourceSlot {
 
 struct ResourceRecord {
     info: BackendResourceCreateInfo,
-    canonical_backings: Box<[nixe_memory::CanonicalBackingRange]>,
+    access_backings: HashMap<crate::AccessTarget, Arc<[nixe_memory::CanonicalBackingRange]>>,
 }
 
 struct SubmissionSlot {
@@ -554,7 +542,7 @@ impl<D: BackendDriver> Backend<D> {
             return Err(self.handle_driver_error(error));
         }
         let record = ResourceRecord {
-            canonical_backings: info.canonical_backings(),
+            access_backings: HashMap::new(),
             info,
         };
         commit_resource_slot(&mut self.resources, slot, generation, record);
@@ -601,6 +589,55 @@ impl<D: BackendDriver> Backend<D> {
     pub fn submit(
         &mut self,
         submission: &OperationSubmission,
+    ) -> Result<BackendSubmissionToken, BackendError> {
+        let entries = self.resolve_submission_dependencies(submission)?;
+        self.submit_resolved(submission, entries)
+    }
+
+    pub(crate) fn resolve_submission_dependencies(
+        &mut self,
+        submission: &OperationSubmission,
+    ) -> Result<Vec<(ResourceDependency, BackendResourceHandle)>, BackendError> {
+        self.require_active()?;
+        let mut entries = std::mem::take(&mut self.resolved_resource_scratch);
+        entries.clear();
+        let plan = submission.access_plan();
+        entries
+            .try_reserve(plan.dependencies().len())
+            .map_err(|_| BackendError::ResourceExhausted)?;
+        crate::metrics::record(
+            crate::metrics::Counter::ResolvedDependencies,
+            plan.dependencies().len() as u64,
+        );
+        crate::metrics::record(
+            crate::metrics::Counter::AccessIntervals,
+            plan.accesses().len() as u64,
+        );
+        crate::metrics::record(
+            crate::metrics::Counter::SubmissionOperations,
+            submission.operations().len() as u64,
+        );
+        #[cfg(feature = "performance-counters")]
+        crate::metrics::record(
+            crate::metrics::Counter::DependencyOccurrences,
+            submission
+                .operations()
+                .iter()
+                .map(|operation| operation.dependencies().len() as u64)
+                .sum(),
+        );
+        for dependency in plan.dependencies() {
+            let handle = self.resolve_dependency(*dependency)?;
+            self.validate_resource_handle(handle)?;
+            entries.push((*dependency, handle));
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn submit_resolved(
+        &mut self,
+        submission: &OperationSubmission,
+        entries: Vec<(ResourceDependency, BackendResourceHandle)>,
     ) -> Result<BackendSubmissionToken, BackendError> {
         self.require_active()?;
         if self.accepted_frontends.contains(&submission.id()) {
@@ -674,39 +711,28 @@ impl<D: BackendDriver> Backend<D> {
 
         let mut shader_stages = std::mem::take(&mut self.shader_stage_scratch);
         shader_stages.clear();
-        let mut entries = std::mem::take(&mut self.resolved_resource_scratch);
-        entries.clear();
-        let dependency_count = submission
-            .operations()
-            .iter()
-            .map(|operation| operation.dependencies().len())
-            .sum();
-        entries
-            .try_reserve(dependency_count)
-            .map_err(|_| BackendError::ResourceExhausted)?;
+        let plan = submission.access_plan();
+        // The runtime passes the same dense generation-checked identities used
+        // for visibility; direct Backend callers resolve through the same path.
+        debug_assert_eq!(entries.len(), plan.dependencies().len());
         shader_stages
             .try_reserve_exact(submission.operations().len())
             .map_err(|_| BackendError::ResourceExhausted)?;
+        for access in plan.accesses() {
+            self.validate_access_target_with_handle(
+                access.target(),
+                entries[access.dependency_index()].1,
+            )?;
+        }
         for (operation_index, operation) in submission.operations().iter().enumerate() {
             let mut operation_shaders = [None; 6];
-            for access in operation.accesses() {
-                self.validate_access_target(access.target())?;
-            }
             if let crate::GpuCommand::Barrier(barrier) = operation.command() {
                 for transition in barrier.transitions() {
                     self.validate_access_target(transition.target())?;
                 }
             }
-            for dependency in operation.dependencies() {
-                let handle = if let Some((_, handle)) =
-                    entries.iter().find(|(resolved, _)| resolved == dependency)
-                {
-                    *handle
-                } else {
-                    let handle = self.resolve_dependency(*dependency)?;
-                    entries.push((*dependency, handle));
-                    handle
-                };
+            for index in plan.operation_dependencies(operation_index) {
+                let handle = entries[*index].1;
                 let record = self.validate_resource_handle(handle)?;
                 if let BackendResourceCreateInfo::Shader { description, .. } = &record.info {
                     let stage_index = shader_stage_index(description.stage);
@@ -720,7 +746,6 @@ impl<D: BackendDriver> Backend<D> {
             }
             shader_stages.push(operation_shaders);
         }
-        entries.sort_unstable_by_key(|(dependency, _)| *dependency);
         let resolved = ResolvedBackendResources::new(&entries, &shader_stages);
         let (slot, generation) = next_submission_slot(&self.submissions)?;
         let token = BackendSubmissionToken::new(self.instance, slot, generation);
@@ -879,16 +904,92 @@ impl<D: BackendDriver> Backend<D> {
         self.resources_by_dependency.contains_key(&dependency)
     }
 
-    pub(crate) fn resource_backings(
-        &self,
-        dependency: ResourceDependency,
-    ) -> Option<&[nixe_memory::CanonicalBackingRange]> {
-        let handle = self.resources_by_dependency.get(&dependency)?;
-        self.resources
-            .get(handle.slot as usize)?
+    pub(crate) fn resource_access_backings(
+        &mut self,
+        target: crate::AccessTarget,
+        handle: BackendResourceHandle,
+    ) -> Result<Arc<[nixe_memory::CanonicalBackingRange]>, BackendError> {
+        self.validate_access_target_with_handle(target, handle)?;
+        let record = self.resources[handle.slot as usize]
             .record
-            .as_ref()
-            .map(|record| record.canonical_backings.as_ref())
+            .as_mut()
+            .expect("validated live resource");
+        if let Some(backings) = record.access_backings.get(&target) {
+            return Ok(Arc::clone(backings));
+        }
+        let slice = |backing: &nixe_memory::CanonicalBackingRange, offset, size| {
+            if offset == 0 && size == backing.size() {
+                Ok(backing.clone())
+            } else {
+                backing
+                    .snapshot_subrange(offset, size)
+                    .map_err(|error| BackendError::BackingAccess(error.to_string().into()))
+            }
+        };
+        let mut backings = Vec::new();
+        match (target, &record.info) {
+            (
+                crate::AccessTarget::Buffer { range, .. },
+                BackendResourceCreateInfo::Buffer {
+                    view: Some(view), ..
+                },
+            ) => {
+                backings.push(slice(
+                    view.backing().range(),
+                    range.offset() - view.buffer_offset(),
+                    range.size(),
+                )?);
+            }
+            (
+                crate::AccessTarget::Image { subresources, .. },
+                BackendResourceCreateInfo::Image {
+                    view: Some(view), ..
+                },
+            ) => {
+                for binding in view.bindings() {
+                    let bound = binding.subresources();
+                    if bound.plane != subresources.plane
+                        || bound.mip_level != subresources.mip_level
+                    {
+                        continue;
+                    }
+                    let start = bound.base_layer.max(subresources.base_layer);
+                    let end = (u32::from(bound.base_layer) + u32::from(bound.layer_count)).min(
+                        u32::from(subresources.base_layer) + u32::from(subresources.layer_count),
+                    );
+                    if u32::from(start) >= end {
+                        continue;
+                    }
+                    if start == bound.base_layer
+                        && end == u32::from(bound.base_layer) + u32::from(bound.layer_count)
+                    {
+                        backings.push(binding.backing().range().clone());
+                    } else {
+                        let stride = match binding.layout() {
+                            crate::ImageMemoryLayout::PitchLinear { layer_stride, .. } => {
+                                layer_stride
+                            }
+                            crate::ImageMemoryLayout::BlockLinear(layout) => layout.layer_stride,
+                        };
+                        backings.push(slice(
+                            binding.backing().range(),
+                            u64::from(start - bound.base_layer) * stride,
+                            u64::from(end - u32::from(start)) * stride,
+                        )?);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let backings: Arc<[_]> = backings.into();
+        // Changing offsets must not grow retained topology with session length.
+        // Whole-view hits remain shared, and a resource keeps a bounded set of
+        // immutable partial access layouts between submissions.
+        if record.access_backings.len() == 64 {
+            record.access_backings.clear();
+        }
+        record.access_backings.insert(target, Arc::clone(&backings));
+        Ok(backings)
     }
 
     pub(crate) fn destroy_dependency(
@@ -1019,7 +1120,18 @@ impl<D: BackendDriver> Backend<D> {
     fn validate_access_target(&self, target: crate::AccessTarget) -> Result<(), BackendError> {
         let dependency = target.dependency();
         let handle = self.resolve_dependency(dependency)?;
+        self.validate_access_target_with_handle(target, handle)
+    }
+
+    fn validate_access_target_with_handle(
+        &self,
+        target: crate::AccessTarget,
+        handle: BackendResourceHandle,
+    ) -> Result<(), BackendError> {
         let record = self.validate_resource_handle(handle)?;
+        if record.access_backings.contains_key(&target) {
+            return Ok(());
+        }
         match (target, &record.info) {
             (
                 crate::AccessTarget::Buffer { range, .. },
@@ -1298,6 +1410,7 @@ pub enum BackendError {
     UnknownResource(ResourceDependency),
     AccessOutOfBounds(crate::AccessTarget),
     AccessOutsideBacking(crate::AccessTarget),
+    BackingAccess(Box<str>),
     DuplicateShaderStage {
         operation: usize,
         stage: ShaderStage,
@@ -1338,6 +1451,10 @@ impl Display for BackendError {
             Self::InvalidResource(error) => error.fmt(formatter),
             Self::DuplicateResource(resource) => write!(formatter, "duplicate {resource:?}"),
             Self::UnknownResource(resource) => write!(formatter, "unknown {resource:?}"),
+            Self::BackingAccess(reason) => write!(
+                formatter,
+                "canonical access backing cannot be retained: {reason}"
+            ),
             Self::AccessOutOfBounds(target) => {
                 write!(formatter, "resource access is out of bounds: {target:?}")
             }
@@ -1783,6 +1900,68 @@ mod tests {
             )))
         );
         assert!(backend.driver().submissions.is_empty());
+    }
+
+    #[test]
+    fn exact_backing_domains_reuse_topology_and_follow_resource_generations() {
+        use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+        let mut backend = backend(41);
+        let memory = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+        let allocation = GpuAllocationId::new(41);
+        let allocation_description = GpuAllocationDescription::new(0x10000, 4).unwrap();
+        backend
+            .create_resource(BackendResourceCreateInfo::Allocation {
+                id: allocation,
+                description: allocation_description,
+            })
+            .unwrap();
+        let backing = crate::BackingView::new(
+            allocation,
+            allocation_description,
+            0,
+            memory.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+        )
+        .unwrap();
+        let buffer = BufferId::new(41);
+        let description = BufferDescription::new(0x10000).unwrap();
+        let create = |backing| BackendResourceCreateInfo::Buffer {
+            id: buffer,
+            description,
+            view: Some(crate::BufferView::new(buffer, description, 0, backing).unwrap()),
+        };
+        let handle = backend.create_resource(create(backing)).unwrap();
+        let target = crate::AccessTarget::Buffer {
+            buffer,
+            range: BufferRange::new(0x1200, 0x80).unwrap(),
+        };
+        let first = backend.resource_access_backings(target, handle).unwrap();
+        let again = backend.resource_access_backings(target, handle).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(first[0].size(), 0x80);
+        assert_eq!(first[0].segments().len(), 1);
+        assert_eq!(first[0].segments()[0].offset(), 0x200);
+        backend.destroy_resource(handle).unwrap();
+        let replacement = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+        let replacement_backing = crate::BackingView::new(
+            allocation,
+            allocation_description,
+            0,
+            replacement
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+        )
+        .unwrap();
+        let replacement_handle = backend
+            .create_resource(create(replacement_backing))
+            .unwrap();
+        let changed = backend
+            .resource_access_backings(target, replacement_handle)
+            .unwrap();
+        assert_ne!(
+            first[0].segments()[0].page(),
+            changed[0].segments()[0].page()
+        );
+        assert!(!first[0].shares_layout(&changed[0]));
     }
 
     #[test]

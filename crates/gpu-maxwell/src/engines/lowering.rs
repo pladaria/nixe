@@ -678,6 +678,7 @@ fn inline_block_linear_position(offset: u64, width: u32, block_height_log2: u8) 
 }
 
 fn same_canonical_backing(left: &nixe_gpu::BackingView, right: &nixe_gpu::BackingView) -> bool {
+    nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::CanonicalBackingComparisons, 1);
     // Reject distinct byte coverage using the compressed span index before
     // comparing potentially thousands of retained page segments. The ordered
     // segment comparison below still distinguishes differently ordered aliases.

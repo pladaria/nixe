@@ -1,5 +1,7 @@
 mod commands;
 mod logging;
+#[cfg(feature = "performance-counters")]
+mod performance;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -43,11 +45,26 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    #[cfg(feature = "performance-counters")]
+    let capture = match performance::Capture::start() {
+        Ok(capture) => capture,
+        Err(error) => {
+            log::error!("cannot start performance capture: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let result = match invocation.command {
         Command::Input => commands::input::run(),
         Command::List(arguments) => commands::list::run(arguments),
         Command::Run(arguments) => commands::run::run(arguments),
     };
+    #[cfg(feature = "performance-counters")]
+    if let Some(capture) = capture
+        && let Err(error) = capture.finish()
+    {
+        log::error!("cannot finish performance capture: {error}");
+        return ExitCode::FAILURE;
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

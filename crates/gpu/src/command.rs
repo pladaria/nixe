@@ -1311,6 +1311,7 @@ pub struct OperationSubmission {
     final_segment: bool,
     predecessors: Box<[FrontendSubmissionId]>,
     operations: Box<[GpuOperation]>,
+    access_plan: crate::SubmissionAccessPlan,
 }
 
 impl OperationSubmission {
@@ -1354,6 +1355,7 @@ impl OperationSubmission {
             segment,
             final_segment,
             predecessors: predecessors.into_boxed_slice(),
+            access_plan: crate::SubmissionAccessPlan::compile(&operations),
             operations: operations.into_boxed_slice(),
         })
     }
@@ -1376,6 +1378,11 @@ impl OperationSubmission {
     #[must_use]
     pub fn predecessors(&self) -> &[FrontendSubmissionId] {
         &self.predecessors
+    }
+
+    #[must_use]
+    pub const fn access_plan(&self) -> &crate::SubmissionAccessPlan {
+        &self.access_plan
     }
 
     #[must_use]

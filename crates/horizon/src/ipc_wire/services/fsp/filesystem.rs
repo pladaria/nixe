@@ -23,6 +23,28 @@ pub(super) fn decode(
         return Ok(None);
     };
     match command {
+        // GetFileSystemAttribute has no input and returns its 0xc0-byte
+        // attribute structure inline, rather than through a buffer:
+        // https://github.com/switchbrew/libnx/blob/master/nx/source/services/fs.c#L915-L920
+        FileSystemCommand::GetFileSystemAttribute => {
+            if !matches!(object, SemanticIpcObject::HostDirectoryFileSystem(_))
+                || !request.has_payload_size(0)
+                || crate::ipc_wire::io::has_ipc_descriptors(hipc)
+            {
+                return Ok(None);
+            }
+            Ok(Some(IpcRequest::GetFileSystemAttribute))
+        }
+        FileSystemCommand::DeleteFile => {
+            if !matches!(object, SemanticIpcObject::HostDirectoryFileSystem(_))
+                || !request.has_payload_size(0)
+            {
+                return Ok(None);
+            }
+            Ok(Some(IpcRequest::DeleteFile {
+                path: read_path(process, hipc)?,
+            }))
+        }
         FileSystemCommand::GetEntryType => {
             if !matches!(object, SemanticIpcObject::HostDirectoryFileSystem(_)) {
                 return Ok(None);

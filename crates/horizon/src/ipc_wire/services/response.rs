@@ -29,6 +29,25 @@ pub(super) fn encode_semantic_response(
     let is_domain = domain_session.is_some_and(IpcSession::is_domain);
     match response {
         IpcResponse::None => semantic_success(request.token, is_domain, &[], &[], &[], None),
+        IpcResponse::FileSystemAttribute {
+            name_length_max,
+            path_length_max,
+        } => {
+            // FsFileSystemAttribute: optional UTF-8 limits start at 0x28;
+            // UTF-16-specific limits remain absent for this UTF-8 backend.
+            // https://github.com/switchbrew/libnx/blob/master/nx/include/switch/services/fs.h#L302-L332
+            let mut data = [0; 0xc0];
+            data[..4].fill(1);
+            for (offset, value) in [
+                (0x28, name_length_max),
+                (0x2c, name_length_max),
+                (0x30, path_length_max),
+                (0x34, path_length_max),
+            ] {
+                data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            semantic_success(request.token, is_domain, &data, &[], &[], None)
+        }
         IpcResponse::EntryType(kind) => {
             // FsDirectoryEntryType: Directory=0, File=1.
             // https://github.com/switchbrew/libnx/blob/master/nx/include/switch/services/fs.h

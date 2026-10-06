@@ -5425,6 +5425,136 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
 }
 
 #[test]
+fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sessions() {
+    for domain in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("svc.nro");
+        fs::write(&path, synthetic_nro(&[svc(0x21); 6])).unwrap();
+        let sd = directory.path().join("sd");
+        fs::create_dir(&sd).unwrap();
+        fs::write(sd.join("progress"), b"save").unwrap();
+        let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
+        let mut process = reference_process_builder()
+            .with_sd_card_root(sd.clone())
+            .build(&plan)
+            .unwrap();
+        let test_entry = process.entry_module().entry_address() + 0x80;
+        state(&mut process).set_pc(test_entry);
+        let mut process = ScheduledProcess::new(process);
+        let mut dispatcher = HorizonSvcDispatcher::default();
+        let fsp = process.connect_ipc_service(IpcService::FileSystem).unwrap();
+        let tls = process.main_thread().tls_base;
+        let path_address = process
+            .main_thread()
+            .stack_bottom
+            .checked_add(0x400)
+            .unwrap();
+        if domain {
+            let mut convert = [0_u8; 0x100];
+            put_u32(&mut convert, 0, 5);
+            put_u32(&mut convert, 4, 8);
+            put_u32(&mut convert, 16, 0x4943_4653);
+            write_guest_bytes(&process, tls, &convert);
+            state(&mut process).write_w(x(0), fsp);
+            assert_eq!(
+                dispatch_next(&mut process, &mut dispatcher),
+                ExceptionHandlingResult::Resumed
+            );
+        }
+        let mut open = [0_u8; 0x100];
+        put_u32(&mut open, 0, 4);
+        put_u32(&mut open, 4, if domain { 10 } else { 8 });
+        let header = if domain {
+            open[16] = 1;
+            open[18..20].copy_from_slice(&16_u16.to_le_bytes());
+            put_u32(&mut open, 20, 1);
+            32
+        } else {
+            16
+        };
+        put_u32(&mut open, header, 0x4943_4653);
+        put_u32(&mut open, header + 8, 18);
+        write_guest_bytes(&process, tls, &open);
+        state(&mut process).write_w(x(0), fsp);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        let filesystem = read_guest_u32(
+            &process,
+            tls.checked_add(if domain { 48 } else { 12 }).unwrap(),
+        );
+        let target = if domain { fsp } else { filesystem };
+        let mut query = [0_u8; 0x100];
+        put_u32(&mut query, 0, 4);
+        put_u32(&mut query, 4, if domain { 10 } else { 8 });
+        if domain {
+            query[16] = 1;
+            query[18..20].copy_from_slice(&16_u16.to_le_bytes());
+            put_u32(&mut query, 20, filesystem);
+        }
+        put_u32(&mut query, header, 0x4943_4653);
+        put_u32(&mut query, header + 8, 16);
+        write_guest_bytes(&process, tls, &query);
+        state(&mut process).write_w(x(0), target);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add((header + 8) as u64).unwrap()),
+            0
+        );
+        let data_address = tls.checked_add((header + 16) as u64).unwrap();
+        let attributes = read_guest_bytes(&process, data_address, 0xc0);
+        assert_eq!(&attributes[..4], &[1; 4]);
+        assert!(attributes[4..0x28].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            u32::from_le_bytes(attributes[0x28..0x2c].try_into().unwrap()),
+            255
+        );
+        assert_eq!(
+            u32::from_le_bytes(attributes[0x2c..0x30].try_into().unwrap()),
+            255
+        );
+        assert_eq!(
+            u32::from_le_bytes(attributes[0x30..0x34].try_into().unwrap()),
+            768
+        );
+        assert_eq!(
+            u32::from_le_bytes(attributes[0x34..0x38].try_into().unwrap()),
+            768
+        );
+        assert!(attributes[0x38..].iter().all(|byte| *byte == 0));
+        write_guest_bytes(&process, path_address, b"/progress\0");
+        for expected_result in [0, HorizonIpcResult::FS_PATH_NOT_FOUND.raw()] {
+            let mut delete = [0_u8; 0x100];
+            put_u32(&mut delete, 0, 4 | (1 << 16));
+            put_u32(&mut delete, 4, if domain { 12 } else { 8 });
+            put_send_static(&mut delete, 8, path_address.get(), 10);
+            if domain {
+                delete[16] = 1;
+                delete[18..20].copy_from_slice(&16_u16.to_le_bytes());
+                put_u32(&mut delete, 20, filesystem);
+            }
+            put_u32(&mut delete, header, 0x4943_4653);
+            put_u32(&mut delete, header + 8, 1);
+            write_guest_bytes(&process, tls, &delete);
+            state(&mut process).write_w(x(0), target);
+            assert_eq!(
+                dispatch_next(&mut process, &mut dispatcher),
+                ExceptionHandlingResult::Resumed
+            );
+            assert_eq!(
+                read_guest_u32(&process, tls.checked_add((header + 8) as u64).unwrap()),
+                expected_result
+            );
+            assert!(!sd.join("progress").exists());
+        }
+    }
+}
+
+#[test]
 fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     let (_directory, mut process) = fixture_process_with_romfs(
         &[
