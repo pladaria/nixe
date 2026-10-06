@@ -1087,7 +1087,7 @@ fn patch_size_is_typed_source_preserving_and_reserved_bits_are_atomic() {
 #[test]
 fn iterated_blend_family_is_typed_source_preserving_and_disabled_pipeline_neutral() {
     let mut channel = three_d_channel();
-    let ordinary_blend_before = *channel.three_d().fixed_function().blend_enable_common();
+    let ordinary_blend_before = *channel.three_d().fixed_function().single_rop_control();
     let dispatch = dispatch_incrementing(&mut channel, 0x0dd0 / 4, &[0, 5]).unwrap();
 
     assert_eq!(
@@ -1123,7 +1123,7 @@ fn iterated_blend_family_is_typed_source_preserving_and_disabled_pipeline_neutra
         Some(dispatch.methods()[1].method().source())
     );
     assert_eq!(
-        channel.three_d().fixed_function().blend_enable_common(),
+        channel.three_d().fixed_function().single_rop_control(),
         &ordinary_blend_before
     );
 }
@@ -2252,7 +2252,7 @@ fn smooth_shade_mode_reaches_shader_translation_while_flat_remains_typed() {
 #[test]
 fn blend_controls_are_typed_source_preserving_and_family_isolated() {
     let mut channel = three_d_channel();
-    let common_before = *channel.three_d().fixed_function().blend_enable_common();
+    let common_before = *channel.three_d().fixed_function().single_rop_control();
     let per_target_enable_before = *channel.three_d().fixed_function().blend_enable();
     let per_target_state_before = *channel.three_d().fixed_function().per_target_blend();
     let two_d_before = channel.two_d().clone();
@@ -2375,7 +2375,7 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
     }
 
     let fixed = channel.three_d().fixed_function();
-    assert_eq!(fixed.blend_enable_common(), &common_before);
+    assert_eq!(fixed.single_rop_control(), &common_before);
     assert_eq!(fixed.blend_enable(), &per_target_enable_before);
     assert_eq!(fixed.per_target_blend(), &per_target_state_before);
     assert_eq!(channel.two_d(), &two_d_before);
@@ -2457,7 +2457,7 @@ fn invalid_blend_controls_and_failed_packet_keeps_valid_prefix() {
 }
 
 #[test]
-fn common_blend_enable_is_typed_source_preserving_and_family_isolated() {
+fn single_rop_control_is_typed_source_preserving_and_family_isolated() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x12e4, 1);
     program_three_d(&mut channel, 0x1360, 1);
@@ -2474,23 +2474,23 @@ fn common_blend_enable_is_typed_source_preserving_and_family_isolated() {
         channel
             .three_d()
             .fixed_function()
-            .blend_enable_common()
+            .single_rop_control()
             .origin(),
         MaxwellThreeDRegisterOrigin::Unset
     );
 
     for (argument, expected) in [
-        (0, MaxwellThreeDBlendEnableCommon::Disabled),
-        (1, MaxwellThreeDBlendEnableCommon::Enabled),
+        (0, MaxwellThreeDSingleRopControl::Disabled),
+        (1, MaxwellThreeDSingleRopControl::Enabled),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x135c / 4, argument).unwrap();
         let source = dispatch.methods()[0].method().source();
         let fixed = channel.three_d().fixed_function();
-        let register = fixed.blend_enable_common();
+        let register = fixed.single_rop_control();
 
         assert_eq!(
             dispatch.methods()[0].metadata().method_name(),
-            "SET_BLEND_ENABLE_COMMON"
+            "SET_SINGLE_ROP_CONTROL"
         );
 
         assert!(dispatch.operations().is_empty());
@@ -2511,19 +2511,19 @@ fn common_blend_enable_is_typed_source_preserving_and_family_isolated() {
     let common_before = channel
         .three_d()
         .fixed_function()
-        .blend_enable_common()
+        .single_rop_control()
         .to_owned();
     program_three_d(&mut channel, 0x12e4, 0);
     program_three_d(&mut channel, 0x1360, 0);
     program_three_d(&mut channel, 0x1e00, 1);
     assert_eq!(
-        channel.three_d().fixed_function().blend_enable_common(),
+        channel.three_d().fixed_function().single_rop_control(),
         &common_before
     );
 }
 
 #[test]
-fn invalid_common_blend_enable_values_and_failed_packet_keeps_valid_prefix() {
+fn invalid_single_rop_control_values_and_failed_packet_keeps_valid_prefix() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x135c, 0);
 
@@ -2536,7 +2536,7 @@ fn invalid_common_blend_enable_values_and_failed_packet_keeps_valid_prefix() {
             dispatch_first(&mut channel, &decoded),
             Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
                 source,
-                method_name: "SET_BLEND_ENABLE_COMMON",
+                method_name: "SET_SINGLE_ROP_CONTROL",
                 ..
             }) if source.argument() == argument
         ));
@@ -2619,7 +2619,7 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
         preflight(&channel),
         Err(MaxwellLoweringError::IncompleteBlendState {
             target: None,
-            field: "SET_BLEND_ENABLE_COMMON"
+            field: "SET_SINGLE_ROP_CONTROL"
         })
     ));
     program_three_d(&mut channel, 0x135c, 0);
@@ -2631,12 +2631,17 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     program_three_d(&mut channel, 0x135c, 1);
     assert!(matches!(
         preflight(&channel),
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
+    ));
+    program_three_d(&mut channel, 0x1360, 1);
+    assert!(matches!(
+        preflight(&channel),
         Err(MaxwellLoweringError::IncompleteBlendState {
             target: None,
-            field: "SET_BLEND_SEPARATE_FOR_ALPHA"
+            field: "SET_BLEND_OP_COLOR"
         })
     ));
-    for (method, argument) in [(0x133c, 1), (0x1340, 1), (0x1344, 1), (0x1348, 1)] {
+    for (method, argument) in [(0x1340, 1), (0x1344, 1), (0x1348, 1)] {
         program_three_d(&mut channel, method, argument);
     }
     assert!(matches!(
@@ -2655,10 +2660,6 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
     ));
 
     program_three_d(&mut channel, 0x12e4, 1);
-    assert!(matches!(
-        preflight(&channel),
-        Err(MaxwellLoweringError::ShaderTranslationRequired)
-    ));
     program_three_d(&mut channel, 0x1360, 0);
     assert!(matches!(
         preflight(&channel),
@@ -5840,8 +5841,8 @@ fn graphics_pipeline_family_is_reused_across_effective_blend_state() {
         nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
     )));
 
-    // Per-target state and common equations are inactive while common
-    // blending is selected and explicitly disabled.
+    // Equations and unselected target enables are inactive while the active
+    // target's SET_BLEND(0) is disabled, independently of selector state.
     for (method, argument) in [
         (0x1364, 1),
         (0x1e20, 1),
@@ -5894,7 +5895,7 @@ fn graphics_pipeline_family_is_reused_across_effective_blend_state() {
         nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
     )));
 
-    // Common and unselected target selectors are now inactive.
+    // Broadcasting SET_BLEND(0) preserves the active target's disabled blend.
     program_three_d(&mut channel, 0x135c, 1);
     program_three_d(&mut channel, 0x1364, 0);
     let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use sdl3::{
     EventSubsystem, GamepadSubsystem, Sdl,
@@ -59,6 +60,36 @@ struct OpenGamepad {
     gamepad: Gamepad,
 }
 
+impl OpenGamepad {
+    fn send_vibration(&mut self, values: [crate::VibrationValue; 2]) -> Result<(), SdlInputError> {
+        // The safe wrapper marks this query unsafe; our Gamepad is live and
+        // owned exclusively by this thread, as required by SDL.
+        if !unsafe { self.gamepad.has_rumble() } {
+            return Err(SdlInputError::new(
+                "vibration",
+                format!("{} has no rumble actuator", self.name),
+            ));
+        }
+        if self.gamepad.vendor_id() == Some(0x057e) && self.gamepad.product_id() == Some(0x2009) {
+            // Native Nintendo Switch Pro: preserve both carriers on each side.
+            self.gamepad
+                .send_effect(&crate::switch_rumble::packet(values))
+                .map_err(|e| SdlInputError::new("Switch Pro HD rumble", e))
+        } else {
+            // Conventional host motors cannot reproduce arbitrary frequencies.
+            // Map each band to SDL's corresponding motor, combining the sides.
+            // https://wiki.libsdl.org/SDL3/SDL_RumbleGamepad
+            let strength =
+                |amplitude: f32| (amplitude.min(1.0) * f32::from(u16::MAX)).round() as u16;
+            let low = strength(values[0].low_amplitude.max(values[1].low_amplitude));
+            let high = strength(values[0].high_amplitude.max(values[1].high_amplitude));
+            self.gamepad
+                .set_rumble(low, high, 1000)
+                .map_err(|e| SdlInputError::new("gamepad rumble", e))
+        }
+    }
+}
+
 struct DeviceChanges(Arc<AtomicBool>);
 
 impl EventWatchCallback for DeviceChanges {
@@ -105,6 +136,10 @@ pub(crate) struct SdlInputBackend {
     events: EventSubsystem,
     gamepad_subsystem: GamepadSubsystem,
     next_controller_id: u64,
+    vibration: crate::vibration::VibrationState,
+    vibration_dirty: bool,
+    vibration_active: bool,
+    last_vibration_send: Option<Instant>,
 }
 
 impl SdlInputBackend {
@@ -143,7 +178,82 @@ impl SdlInputBackend {
             events,
             gamepad_subsystem,
             next_controller_id: 1,
+            vibration: Default::default(),
+            vibration_dirty: false,
+            vibration_active: false,
+            last_vibration_send: None,
         }
+    }
+
+    pub(crate) fn apply_vibration(
+        &mut self,
+        receiver: &crate::vibration::VibrationReceiver,
+    ) -> Result<(), SdlInputError> {
+        if let Some(state) = receiver
+            .take_latest()
+            .map_err(|e| SdlInputError::new("vibration mailbox", e))?
+        {
+            if state.controller != self.vibration.controller {
+                self.stop_vibration()?;
+                self.last_vibration_send = None;
+            }
+            self.vibration_dirty = !state.is_stopped() || self.vibration_active;
+            self.vibration = state;
+        }
+        // SDL's Nintendo driver spaces writes by 30 ms and refreshes sustained
+        // rumble every 50 ms. send_effect bypasses that scheduling, so preserve
+        // it here without device I/O on the emulation thread.
+        // https://github.com/libsdl-org/SDL/blob/release-3.4.12/src/joystick/hidapi/SDL_hidapi_switch.c
+        let elapsed = self.last_vibration_send.map(|last| last.elapsed());
+        let due = if self.vibration_dirty {
+            elapsed.is_none_or(|elapsed| elapsed >= Duration::from_millis(30))
+        } else {
+            !self.vibration.is_stopped()
+                && elapsed.is_some_and(|elapsed| elapsed >= Duration::from_millis(50))
+        };
+        if due {
+            if let Some(open) = self
+                .open_gamepads
+                .iter_mut()
+                .find(|open| Some(open.controller_id) == self.vibration.controller)
+                && open.gamepad.connected()
+            {
+                if self.vibration_dirty {
+                    log::debug!(
+                        "controller vibration output: device={} values={:?}",
+                        open.name,
+                        self.vibration.values
+                    );
+                }
+                // A failed transport write may have reached the actuator.
+                // Shutdown must still attempt a neutral packet in that case.
+                self.vibration_active |= !self.vibration.is_stopped();
+                open.send_vibration(self.vibration.values)?;
+                self.vibration_active = !self.vibration.is_stopped();
+            }
+            self.last_vibration_send = Some(Instant::now());
+            self.vibration_dirty = false;
+        }
+        Ok(())
+    }
+
+    fn stop_vibration(&mut self) -> Result<(), SdlInputError> {
+        if self.vibration_active
+            && let Some(open) = self
+                .open_gamepads
+                .iter_mut()
+                .find(|open| Some(open.controller_id) == self.vibration.controller)
+            && open.gamepad.connected()
+        {
+            if let Some(last) = self.last_vibration_send {
+                // Closing or retargeting must also respect Nintendo's minimum
+                // write interval. This wait belongs to the device thread only.
+                std::thread::sleep(Duration::from_millis(30).saturating_sub(last.elapsed()));
+            }
+            open.send_vibration([crate::VibrationValue::default(); 2])?;
+        }
+        self.vibration_active = false;
+        Ok(())
     }
 
     fn reconcile_gamepads(&mut self) -> Result<(), SdlInputError> {
@@ -232,6 +342,14 @@ impl SdlInputBackend {
             });
         }
         Ok(())
+    }
+}
+
+impl Drop for SdlInputBackend {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop_vibration() {
+            log::error!("cannot stop controller vibration during shutdown: {error}");
+        }
     }
 }
 

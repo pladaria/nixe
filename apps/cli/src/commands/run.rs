@@ -284,6 +284,9 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let host_input = HostInputReaders {
         controller: input,
         touch_screen,
+        vibration: input_owner
+            .vibration_output()
+            .expect("SDL input owns actuator output"),
     };
     let audio_backend = audio.backend();
 
@@ -322,7 +325,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let frontend = frontend
         .with_gpu_context(presentation_context)
         .with_window_state(saved_window_state)
-        .with_screenshots(title.name.clone(), PathBuf::from("docs/screenshots/nixe"));
+        .with_screenshots(title.name.clone(), PathBuf::from("dump/screenshots/nixe"));
 
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");
@@ -551,6 +554,7 @@ struct HorizonEnvironment {
 struct HostInputReaders {
     controller: InputReader<Option<ProfiledControllerState>>,
     touch_screen: Option<TouchScreenReader>,
+    vibration: nixe_input::VibrationOutput,
 }
 
 fn execute_worker(
@@ -700,7 +704,8 @@ fn execute(
         video_system,
     )
     .with_diagnostics(horizon_environment.diagnostics)
-    .with_audio_backend(audio_backend);
+    .with_audio_backend(audio_backend)
+    .with_vibration_output(host_input.vibration.clone());
     if let Some(save_data) = horizon_environment.save_data {
         dispatcher = dispatcher.with_save_data(save_data);
     }
@@ -764,6 +769,10 @@ fn execute(
             let delta = last_input_sample.map_or(Duration::ZERO, |previous| {
                 sample.captured_at.saturating_duration_since(previous)
             });
+            host_input
+                .vibration
+                .select_controller(profiled.map(|controller| controller.controller_id))
+                .map_err(|error| format!("cannot route controller vibration: {error}"))?;
             dispatcher
                 .advance_input(profiled.map(|controller| &controller.state), delta)
                 .map_err(|error| format!("cannot publish Horizon HID state: {error}"))?;

@@ -58,6 +58,7 @@ pub struct InputWorker<T> {
     shared: Arc<Shared<T>>,
     thread: Option<JoinHandle<Result<(), String>>>,
     _subsystems: Option<crate::sdl::InputSubsystems>,
+    vibration: Option<crate::VibrationOutput>,
 }
 
 impl InputWorker<Option<ProfiledControllerState>> {
@@ -71,15 +72,21 @@ impl InputWorker<Option<ProfiledControllerState>> {
     ) -> io::Result<Self> {
         let owner = crate::sdl::InputSubsystems::new(sdl).map_err(io::Error::other)?;
         let subsystems = WorkerSubsystems(owner.clone());
+        let (vibration, receiver) = crate::vibration::vibration_channel();
         let mut worker = Self::spawn(
             move || {
                 let backend = SdlInputBackend::new(subsystems.take());
                 let mut input = InputManager::with_profiles(backend, profiles);
-                Ok::<_, crate::sdl::SdlInputError>(move || input.read_profiled_input())
+                Ok::<_, crate::sdl::SdlInputError>(move || {
+                    let state = input.read_profiled_input()?;
+                    input.backend.apply_vibration(&receiver)?;
+                    Ok(state)
+                })
             },
             notify,
         )?;
         worker._subsystems = Some(owner);
+        worker.vibration = Some(vibration);
         Ok(worker)
     }
 }
@@ -88,15 +95,21 @@ impl InputWorker<Option<ControllerState>> {
     pub fn unmapped(sdl: &sdl3::Sdl) -> io::Result<Self> {
         let owner = crate::sdl::InputSubsystems::new(sdl).map_err(io::Error::other)?;
         let subsystems = WorkerSubsystems(owner.clone());
+        let (vibration, receiver) = crate::vibration::vibration_channel();
         let mut worker = Self::spawn(
             move || {
                 let backend = SdlInputBackend::new(subsystems.take());
                 let mut input = InputManager::new(backend);
-                Ok::<_, crate::sdl::SdlInputError>(move || input.read_input())
+                Ok::<_, crate::sdl::SdlInputError>(move || {
+                    let state = input.read_input()?;
+                    input.backend.apply_vibration(&receiver)?;
+                    Ok(state)
+                })
             },
             || {},
         )?;
         worker._subsystems = Some(owner);
+        worker.vibration = Some(vibration);
         Ok(worker)
     }
 }
@@ -165,6 +178,7 @@ impl<T: Send + 'static> InputWorker<T> {
             shared,
             thread: Some(thread),
             _subsystems: None,
+            vibration: None,
         })
     }
 }
@@ -175,6 +189,11 @@ pub struct InputReader<T> {
 }
 
 impl<T> InputWorker<T> {
+    /// SDL device output belongs to the same worker as controller sampling.
+    pub fn vibration_output(&self) -> Option<crate::VibrationOutput> {
+        self.vibration.clone()
+    }
+
     pub fn reader(&self) -> InputReader<T> {
         InputReader {
             shared: Arc::clone(&self.shared),

@@ -149,8 +149,21 @@ fn deko_blending_consumes_initial_separate_alpha_without_selector_write() {
 fn separate_alpha_initial_state_is_consistent_across_targets_and_shadow_replay() {
     for _ in 0..2 {
         let mut channel = three_d_channel();
-        for target in 0..8 {
-            let register = &channel.three_d().fixed_function().per_target_blend()[target][0];
+        for target in 0..=8 {
+            let (register, method) = if target == 8 {
+                (
+                    channel
+                        .three_d()
+                        .fixed_function()
+                        .register(MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha),
+                    0x133c,
+                )
+            } else {
+                (
+                    &channel.three_d().fixed_function().per_target_blend()[target][0],
+                    0x1e00 + target as u32 * 0x20,
+                )
+            };
             assert_eq!(
                 register.origin(),
                 MaxwellThreeDRegisterOrigin::VerifiedReset
@@ -163,15 +176,24 @@ fn separate_alpha_initial_state_is_consistent_across_targets_and_shadow_replay()
             assert_eq!(register.source(), None);
             let raw = channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(0x1e00 + target as u32 * 0x20))
+                .raw_register(GpuMethodId(method))
                 .unwrap();
             assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
             assert_eq!(raw.value(), Some(&1));
             assert_eq!(raw.source(), None);
         }
         // Replay an unprogrammed selector: the supplied invalid argument must
-        // be replaced by the initial shadow value, independently for each RT.
+        // be replaced by the initial shadow value for common and per-RT state.
         program_three_d(&mut channel, 0x124, 3);
+        program_three_d(&mut channel, 0x133c, u32::MAX);
+        assert_eq!(
+            channel
+                .three_d()
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha)
+                .raw(),
+            Some(1)
+        );
         for target in 0..8 {
             program_three_d(&mut channel, 0x1e00 + target * 0x20, u32::MAX);
             assert_eq!(
@@ -236,7 +258,7 @@ fn consumed_color_state_routes_physical_targets_and_invalidates_prepared_draws()
         (0x0f90, 0),
         (0x1a04, 0x1011),
         (0x135c, 1),
-        (0x133c, 1),
+        (0x1360, 1),
         (0x1340, 0x8006),
         (0x1344, 0x4302),
         (0x1348, 0x4303),
@@ -298,9 +320,27 @@ fn consumed_color_state_routes_physical_targets_and_invalidates_prepared_draws()
     );
     assert_eq!(common.color_outputs[1], ColorOutputState::REPLACE);
 
+    // Common equations still consume the physical target's enable when
+    // SINGLE_ROP_CONTROL is off. Disabling that target must disable blending
+    // even though target zero remains enabled.
+    program_three_d(&mut channel, 0x135c, 0);
+    program_three_d(&mut channel, 0x1364, 1);
+    assert_eq!(
+        lower(&mut channel).unwrap().color_outputs,
+        common.color_outputs
+    );
+    program_three_d(&mut channel, 0x1364, 0);
+    assert_eq!(lower(&mut channel).unwrap().color_outputs[0].blend, None);
+
     // Per-target state is physical target 1, not fragment-output slot 0.
     // Min/max ignore unset coefficients and separate-alpha=false ignores its op.
-    for (method, value) in [(0x12e4, 1), (0x1364, 1), (0x1e20, 0), (0x1e24, 0x8008)] {
+    for (method, value) in [
+        (0x12e4, 1),
+        (0x135c, 0),
+        (0x1364, 1),
+        (0x1e20, 0),
+        (0x1e24, 0x8008),
+    ] {
         program_three_d(&mut channel, method, value);
     }
     let per_target = lower(&mut channel).unwrap();
@@ -313,6 +353,22 @@ fn consumed_color_state_routes_physical_targets_and_invalidates_prepared_draws()
             alpha: max
         })
     );
+
+    // SINGLE_ROP_CONTROL broadcasts target zero's enable independently of
+    // the per-target equation selector, which must continue selecting Max.
+    program_three_d(&mut channel, 0x135c, 1);
+    assert_eq!(
+        lower(&mut channel).unwrap().color_outputs,
+        per_target.color_outputs
+    );
+    program_three_d(&mut channel, 0x1360, 0);
+    assert_eq!(lower(&mut channel).unwrap().color_outputs[0].blend, None);
+    program_three_d(&mut channel, 0x135c, 0);
+    assert_eq!(
+        lower(&mut channel).unwrap().color_outputs,
+        per_target.color_outputs
+    );
+    program_three_d(&mut channel, 0x1360, 1);
 
     program_three_d(&mut channel, 0x0f90, 1);
     program_three_d(&mut channel, 0x1a00, 0x0100);
@@ -338,6 +394,7 @@ fn consumed_color_state_routes_physical_targets_and_invalidates_prepared_draws()
     assert_eq!(disabled.color_outputs[0].blend, None);
 
     program_three_d(&mut channel, 0x12e4, 0);
+    program_three_d(&mut channel, 0x135c, 1);
     program_three_d(&mut channel, 0x0f90, 0);
     assert_eq!(
         lower(&mut channel).unwrap().color_outputs,

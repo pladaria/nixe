@@ -8,13 +8,21 @@ pub(super) fn copy_is_current(record: &ViewRecord, cache: &MaxwellLoweringCache)
     let ViewMaterialization::CopiedColor { source, revision } = record.materialization else {
         return false;
     };
+    if !record
+        .cpu_writes
+        .as_ref()
+        .is_some_and(CanonicalCpuWriteDependency::remains_current)
+    {
+        return false;
+    }
     cache.views.iter().any(|producer| {
         producer.dependency == ResourceDependency::Image(source)
             && producer.write_revision == revision
-            && producer
-                .cpu_writes
-                .as_ref()
-                .is_some_and(CanonicalCpuWriteDependency::remains_current)
+            && (producer.materialization == ViewMaterialization::Direct
+                || producer
+                    .cpu_writes
+                    .as_ref()
+                    .is_some_and(CanonicalCpuWriteDependency::remains_current))
     })
 }
 
@@ -65,10 +73,11 @@ fn can_copy(record: &ViewRecord, image: &MaxwellThreeDResolvedImage) -> bool {
         && *layout == current.layout()
         && *subresources == current.subresources()
         && same_canonical_backing(backing, current.backing())
-        && record
-            .cpu_writes
-            .as_ref()
-            .is_some_and(CanonicalCpuWriteDependency::remains_current)
+        && (record.materialization == ViewMaterialization::Direct
+            || record
+                .cpu_writes
+                .as_ref()
+                .is_some_and(CanonicalCpuWriteDependency::remains_current))
 }
 
 fn materialization_matches(materialized: &ColorRepresentationRecord, key: &ViewKey) -> bool {
@@ -128,6 +137,13 @@ pub(super) fn prepare(
     let key = view_key(&MaxwellThreeDResolvedResource::Image(image.clone()));
     let destination = if let Some(record) = cache.views.iter_mut().find(|record| record.key == key)
     {
+        if !record
+            .cpu_writes
+            .as_ref()
+            .is_some_and(CanonicalCpuWriteDependency::remains_current)
+        {
+            record.cpu_writes = Some(capture_copy_cpu_writes(image)?);
+        }
         record.materialization = ViewMaterialization::CopiedColor { source, revision };
         image_dependency(record.dependency)?
     } else {
@@ -141,7 +157,7 @@ pub(super) fn prepare(
             key,
             dependency: ResourceDependency::Image(id),
             materialization: ViewMaterialization::CopiedColor { source, revision },
-            cpu_writes: Some(image.cpu_write_dependency().clone()),
+            cpu_writes: Some(capture_copy_cpu_writes(image)?),
             write_revision: 0,
             last_used: 0,
             uninitialized_color_regions: Vec::new(),
@@ -168,4 +184,21 @@ pub(super) fn prepare(
         CapabilityRequirements::none(),
     ));
     Ok(Some(ResourceDependency::Image(destination)))
+}
+
+fn capture_copy_cpu_writes(
+    image: &MaxwellThreeDResolvedImage,
+) -> Result<CanonicalCpuWriteDependency, MaxwellLoweringError> {
+    // A direct producer's canonical bytes remain importable after CPU writes;
+    // the backend uploads them before the copy's read access. Track each copy
+    // independently: refreshing one alias must not make another stale copy
+    // current, or depend on the resolver's original observation epoch.
+    CanonicalCpuWriteDependency::capture_ranges(
+        image
+            .view()
+            .bindings()
+            .iter()
+            .map(|binding| binding.backing().range()),
+    )
+    .map_err(|error| MaxwellLoweringError::ImageBacking(error.to_string()))
 }

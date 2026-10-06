@@ -74,7 +74,7 @@ pub(in crate::ipc_wire) fn dispatch_hid(
     match command {
         // The two amplitudes determine actuator force; with both zero the
         // operation stops vibration regardless of the carrier frequencies.
-        // Nonzero force requires an actuator backend and remains unsupported.
+        // The configured input worker owns actuator output, including stops.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1043-L1054
         HidCommand::SendVibrationValue => {
             if !request.has_payload_size(32)
@@ -95,7 +95,16 @@ pub(in crate::ipc_wire) fn dispatch_hid(
             {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             }
-            if values[0] != 0.0 || values[2] != 0.0 {
+            let value = nixe_input::VibrationValue {
+                low_amplitude: values[0],
+                low_frequency: values[1],
+                high_amplitude: values[2],
+                high_frequency: values[3],
+            };
+            log::debug!("HID vibration request: handle={handle:#010x} value={value:?}");
+            if let Some(result) = hid_system.send_vibration(handle, value) {
+                result.map_err(|e| IpcWireError::InputBackend(e.to_string().into_boxed_str()))?;
+            } else if !value.is_stopped() {
                 return Err(IpcWireError::UnsupportedService(
                     UnsupportedServiceOperation::CommandVariant {
                         service: "hid",
@@ -104,9 +113,6 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                     },
                 ));
             }
-            // All currently implemented actuator operations leave the motors
-            // stopped. Accept the real zero-force command without inventing
-            // active vibration state or silently dropping a nonzero request.
             semantic_success(request.token, false, &[], &[], &[], None)
         }
 

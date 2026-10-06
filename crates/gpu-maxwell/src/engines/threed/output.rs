@@ -14,7 +14,8 @@ pub const MAXWELL_WINDOW_CLIP_COUNT: usize = 8;
 pub(super) const BLEND_SEPARATE_ALPHA_BASE: u32 = 0x1e00;
 pub(super) const BLEND_TARGET_STRIDE: u32 = 0x20;
 /// Initial channel context, not a draw-time fallback. NVIDIA's GM20B method
-/// initialization (shared with GM200) sets all eight B197 selectors to one.
+/// initialization (shared with GM200) sets the common selector (0x133c) and
+/// all eight per-target B197 selectors (0x1e00 + i*0x20) to one.
 /// The installed table's SHA-256 is
 /// 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24.
 /// No firmware bytes are embedded here. Nouveau's public Maxwell context table
@@ -393,19 +394,20 @@ impl MaxwellThreeDLogicOp {
     }
 }
 
-/// Whether the common blend state is active for later color-target draws.
+/// Whether `SET_BLEND(0)` supplies the blend enable for every color target.
+/// Disabled selects each physical target's own `SET_BLEND(i)` instead. This
+/// selector is independent of common versus per-target blend equations.
 ///
-/// NVIDIA's public class header defines the boolean selector but does not
-/// establish a neutral host blend-state contract:
+/// NVIDIA's `SET_SINGLE_ROP_CONTROL` (0x135c):
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h>
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
-pub enum MaxwellThreeDBlendEnableCommon {
+pub enum MaxwellThreeDSingleRopControl {
     Disabled = 0,
     Enabled = 1,
 }
 
-impl MaxwellThreeDBlendEnableCommon {
+impl MaxwellThreeDSingleRopControl {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         match raw {
             0 => Some(Self::Disabled),
@@ -1098,7 +1100,7 @@ pub struct MaxwellThreeDFixedFunctionState {
     window_clip: [MaxwellThreeDWindowClipState; MAXWELL_WINDOW_CLIP_COUNT],
     registers: [MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>;
         MaxwellThreeDFixedFunctionRegister::COUNT],
-    blend_enable_common: MaxwellThreeDRegister<MaxwellThreeDBlendEnableCommon>,
+    single_rop_control: MaxwellThreeDRegister<MaxwellThreeDSingleRopControl>,
     blend_enable: [MaxwellThreeDRegister<bool>; 8],
     color_mask: [MaxwellThreeDRegister<MaxwellThreeDColorMask>; 8],
     per_target_blend: [[MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>; 7]; 8],
@@ -1129,6 +1131,11 @@ impl Default for MaxwellThreeDFixedFunctionState {
         // MME shadow reads; provenance and firmware table hash live in state.rs.
         for (register, method, value) in [
             (
+                MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha,
+                0x133c,
+                MaxwellThreeDFixedFunctionValue::Boolean(true),
+            ),
+            (
                 MaxwellThreeDFixedFunctionRegister::FrontFace,
                 0x191c,
                 MaxwellThreeDFixedFunctionValue::FrontFace(MaxwellThreeDFrontFace::Clockwise),
@@ -1155,7 +1162,7 @@ impl Default for MaxwellThreeDFixedFunctionState {
             scissor: std::array::from_fn(|_| Default::default()),
             window_clip: std::array::from_fn(|_| Default::default()),
             registers,
-            blend_enable_common: Default::default(),
+            single_rop_control: Default::default(),
             blend_enable: std::array::from_fn(|index| {
                 let raw = super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(
                     0x1360 + index as u32 * 4,
@@ -1217,10 +1224,10 @@ impl MaxwellThreeDFixedFunctionState {
         &self.blend_enable
     }
     #[must_use]
-    pub const fn blend_enable_common(
+    pub const fn single_rop_control(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendEnableCommon> {
-        &self.blend_enable_common
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDSingleRopControl> {
+        &self.single_rop_control
     }
     #[must_use]
     pub const fn color_mask(&self) -> &[MaxwellThreeDRegister<MaxwellThreeDColorMask>; 8] {
@@ -1348,8 +1355,8 @@ impl MaxwellThreeDFixedFunctionState {
                 self.registers[register.index()] =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
-            MaxwellThreeDFixedFunctionWrite::BlendEnableCommon { value, .. } => {
-                self.blend_enable_common = MaxwellThreeDRegister::programmed(raw, value, source)
+            MaxwellThreeDFixedFunctionWrite::SingleRopControl { value, .. } => {
+                self.single_rop_control = MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDFixedFunctionWrite::BlendEnable { target, value, .. } => {
                 self.blend_enable[target as usize] =
@@ -1449,8 +1456,8 @@ pub enum MaxwellThreeDFixedFunctionWrite {
         value: MaxwellThreeDFixedFunctionValue,
         source: MaxwellMethodSource,
     },
-    BlendEnableCommon {
-        value: MaxwellThreeDBlendEnableCommon,
+    SingleRopControl {
+        value: MaxwellThreeDSingleRopControl,
         source: MaxwellMethodSource,
     },
     BlendEnable {
@@ -1503,7 +1510,7 @@ impl MaxwellThreeDFixedFunctionWrite {
             | Self::ScissorRectangle { source, .. }
             | Self::WindowClipRectangle { source, .. }
             | Self::Register { source, .. }
-            | Self::BlendEnableCommon { source, .. }
+            | Self::SingleRopControl { source, .. }
             | Self::BlendEnable { source, .. }
             | Self::ColorMask { source, .. }
             | Self::BlendState { source, .. }

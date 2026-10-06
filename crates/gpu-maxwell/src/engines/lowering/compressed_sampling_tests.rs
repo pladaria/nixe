@@ -312,17 +312,84 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
             .is_err()
         );
         cache.views.push(resident);
+        // Two sampled widths share the direct producer, but each copied
+        // image must observe CPU writes independently of every other alias.
+        tic(&metadata, address, 62, texture_format);
+        let second_cropped = resolve(&space, sampled);
+        let second_binding = prepare(
+            &second_cropped,
+            texture_index,
+            &mut cache,
+            &mut creations,
+            &mut invalidations,
+        )
+        .unwrap()[texture_index];
+        creations.clear();
+        cache.image_alias_copies.clear();
         pixels.write(0, &[0; 4]).unwrap();
-        assert!(
-            prepare(
-                &resolve(&space, sampled),
+        for (textures, binding) in [
+            (&cropped, cropped_binding),
+            (&second_cropped, second_binding),
+        ] {
+            let prepared = prepare(
+                textures,
                 texture_index,
                 &mut cache,
                 &mut creations,
-                &mut invalidations
-            )
-            .is_err()
+                &mut invalidations,
+            );
+            if compression != 0 {
+                assert!(matches!(
+                    prepared,
+                    Err(MaxwellLoweringError::CompressedSampledImageImportRequired { .. })
+                ));
+                assert!(cache.image_alias_copies.is_empty());
+            } else {
+                // Direct canonical storage can be uploaded before copying,
+                // even when the resolver and producer observation are stale.
+                assert_eq!(prepared.unwrap()[texture_index], binding);
+                assert_eq!(cache.image_alias_copies.len(), 1);
+                cache.image_alias_copies.clear();
+                assert_eq!(
+                    prepare(
+                        textures,
+                        texture_index,
+                        &mut cache,
+                        &mut creations,
+                        &mut invalidations
+                    )
+                    .unwrap()[texture_index],
+                    binding
+                );
+                assert!(cache.image_alias_copies.is_empty());
+            }
+        }
+        // A fresh, full-width sampled alias is also legal only for a direct
+        // producer. Its new copy must capture the current CPU-write baseline.
+        let prepared = prepare(
+            &textures,
+            texture_index,
+            &mut cache,
+            &mut creations,
+            &mut invalidations,
         );
+        assert_eq!(prepared.is_err(), compression != 0);
+        if compression == 0 {
+            assert_eq!(creations.len(), 1);
+            assert_eq!(cache.image_alias_copies.len(), 1);
+            creations.clear();
+            cache.image_alias_copies.clear();
+            assert!(
+                prepare(
+                    &textures,
+                    texture_index,
+                    &mut cache,
+                    &mut creations,
+                    &mut invalidations
+                )
+                .is_ok()
+            );
+        }
         assert!(creations.is_empty());
         assert!(invalidations.is_empty());
 

@@ -164,7 +164,7 @@ fn color_clear_submission(
 }
 
 #[test]
-fn resident_image_copy_preserves_a_smaller_logical_extent() {
+fn resident_image_copy_preserves_extent_and_refreshes_cpu_writes() {
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
         BackendInstanceId::new(701),
@@ -177,19 +177,51 @@ fn resident_image_copy_preserves_a_smaller_logical_extent() {
     let (mut creations, backing, destination, subresources) =
         backed_color_image(ImageFormat::Rgba8Unorm, 13, 8, &[page]);
     let source = ImageId::new(702);
+    let source_pixels = CanonicalAllocation::zeroed(16 * 8 * 4, 4).unwrap();
+    let source_allocation = GpuAllocationId::new(702);
+    let source_allocation_description = GpuAllocationDescription::new(16 * 8 * 4, 4).unwrap();
+    let source_backing = BackingView::new(
+        source_allocation,
+        source_allocation_description,
+        0,
+        source_pixels
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+    )
+    .unwrap();
+    creations.push(BackendResourceCreateInfo::Allocation {
+        id: source_allocation,
+        description: source_allocation_description,
+    });
+    let source_description = ImageDescription::new(
+        ImageDimension::Two,
+        ImageExtent::new(16, 8, 1).unwrap(),
+        ImageFormat::Rgba8Unorm,
+        ImageKind::Color,
+        1,
+        1,
+        SampleCount::One,
+    )
+    .unwrap();
     creations.push(BackendResourceCreateInfo::Image {
         id: source,
-        description: ImageDescription::new(
-            ImageDimension::Two,
-            ImageExtent::new(16, 8, 1).unwrap(),
-            ImageFormat::Rgba8Unorm,
-            ImageKind::Color,
-            1,
-            1,
-            SampleCount::One,
-        )
-        .unwrap(),
-        view: None,
+        description: source_description,
+        view: Some(
+            ImageView::new(
+                source,
+                source_description,
+                Swizzle::IDENTITY,
+                vec![(
+                    subresources,
+                    ImageMemoryLayout::PitchLinear {
+                        row_pitch: 16 * 4,
+                        layer_stride: 16 * 8 * 4,
+                    },
+                    source_backing,
+                )],
+            )
+            .unwrap(),
+        ),
     });
     let mut operations = color_clear_submission(
         source,
@@ -247,6 +279,47 @@ fn resident_image_copy_preserves_a_smaller_logical_extent() {
             [255, 0, 0, 255]
         };
         assert_eq!(pixel, expected, "pixel {index}");
+    }
+    // Reading the smaller copy must upload a direct producer again after CPU
+    // writes, even though the destination has no CPU changes of its own.
+    let mut updated = [0; 16 * 8 * 4];
+    for (index, pixel) in updated.chunks_exact_mut(4).enumerate() {
+        pixel.copy_from_slice(if index % 16 == 0 {
+            &[255, 255, 0, 255]
+        } else {
+            &[0, 255, 0, 255]
+        });
+    }
+    source_pixels.write(0, &updated).unwrap();
+    runtime
+        .runtime()
+        .submit(
+            &[],
+            &[],
+            &OperationSubmission::new(
+                FrontendSubmissionId::new(702),
+                vec![FrontendSubmissionId::new(701)],
+                vec![GpuOperation::new(
+                    GpuCommand::Copy(CopyOperation::ImageToImage {
+                        source: region(source),
+                        destination: region(destination),
+                    }),
+                    [],
+                    [],
+                    CapabilityRequirements::none(),
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    backing.range().read(0, &mut pixels).unwrap();
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let expected = if index % 13 == 0 {
+            [255, 255, 0, 255]
+        } else {
+            [0, 255, 0, 255]
+        };
+        assert_eq!(pixel, expected, "updated pixel {index}");
     }
 }
 

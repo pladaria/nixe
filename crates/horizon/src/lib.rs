@@ -31,7 +31,7 @@ pub use graphics::{
     FramebufferError, GraphicsTeardownReport, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
 };
 pub use graphics_event::GraphicsEventSource;
-pub use hid::HidSystem;
+pub use hid::{HidInputError, HidSystem};
 pub use ipc::{
     AddOnContentEntry, HorizonProcess, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
     IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,

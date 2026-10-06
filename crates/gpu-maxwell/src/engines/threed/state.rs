@@ -114,6 +114,9 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
         {
             Some(BLEND_SEPARATE_ALPHA_RESET)
         }
+        // The common selector is initialized alongside the per-target ones.
+        // Firmware table provenance and hash are documented in output.rs.
+        0x133c => Some(BLEND_SEPARATE_ALPHA_RESET),
         // GM200 method initialization: disabled culling, clockwise front
         // faces, back-face cull selector, and target-zero RGBA write enable.
         // The same public table provenance as the polygon context above.
@@ -1037,6 +1040,7 @@ impl Default for MaxwellThreeDFrontendState {
             0x1918,
             0x191c,
             0x1920,
+            0x133c,
             MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD,

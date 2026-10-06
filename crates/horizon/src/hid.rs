@@ -78,6 +78,47 @@ pub struct HidSystem {
     capture: Lifo,
     connected: bool,
     configuration: Mutex<HidConfiguration>,
+    vibration_output: Option<nixe_input::VibrationOutput>,
+}
+
+impl Drop for HidSystem {
+    fn drop(&mut self) {
+        if let Some(output) = &self.vibration_output
+            && let Err(error) = output.stop()
+        {
+            log::error!("cannot stop Horizon HID vibration: {error}");
+        }
+    }
+}
+
+#[derive(Debug)]
+/// Failures from HID shared-memory publication or host actuator output.
+pub enum HidInputError {
+    SharedMemory(HandleError),
+    Vibration(nixe_input::VibrationError),
+}
+
+impl std::fmt::Display for HidInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SharedMemory(error) => error.fmt(f),
+            Self::Vibration(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for HidInputError {}
+
+impl From<HandleError> for HidInputError {
+    fn from(error: HandleError) -> Self {
+        Self::SharedMemory(error)
+    }
+}
+
+impl From<nixe_input::VibrationError> for HidInputError {
+    fn from(error: nixe_input::VibrationError) -> Self {
+        Self::Vibration(error)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -150,7 +191,32 @@ impl HidSystem {
             capture: Lifo::default(),
             connected: false,
             configuration: Mutex::new(HidConfiguration::default()),
+            vibration_output: None,
         }
+    }
+
+    pub(crate) fn set_vibration_output(&mut self, output: nixe_input::VibrationOutput) {
+        self.vibration_output = Some(output);
+    }
+
+    pub(crate) fn send_vibration(
+        &self,
+        handle: u32,
+        value: nixe_input::VibrationValue,
+    ) -> Option<Result<(), nixe_input::VibrationError>> {
+        let output = self.vibration_output.as_ref()?;
+        // Only player one FullKey is currently published by this HID producer.
+        // Valid handles for other Npads address disconnected actuators.
+        let [style, npad_id, _, _] = handle.to_le_bytes();
+        if !self.connected || style != 3 || npad_id != 0 {
+            return Some(Ok(()));
+        }
+        let side = match vibration_device_position(handle).expect("validated HID actuator") {
+            1 => nixe_input::VibrationSide::Left,
+            2 => nixe_input::VibrationSide::Right,
+            _ => unreachable!(),
+        };
+        Some(output.send(side, value))
     }
 
     /// Controller-support applets use the same connection state published to HID.
@@ -355,7 +421,7 @@ impl HidSystem {
         &mut self,
         state: Option<&EmulatedControllerState>,
         delta: Duration,
-    ) -> Result<(), HandleError> {
+    ) -> Result<(), HidInputError> {
         if self.shared_memory.get().is_none() {
             return Ok(());
         }
@@ -401,6 +467,9 @@ impl HidSystem {
         }
         let Some(state) = state.filter(|_| publish_player_one) else {
             if self.connected {
+                if let Some(output) = &self.vibration_output {
+                    output.stop()?;
+                }
                 self.sampling_number = self.sampling_number.saturating_add(1);
                 self.memory().write(NPAD_OFFSET, &[0; NPAD_ENTRY_SIZE])?;
                 self.full_key = Lifo::default();

@@ -110,7 +110,7 @@ pub use l2_cache::{
 };
 pub use output::{
     MAXWELL_SCISSOR_COUNT, MAXWELL_VIEWPORT_COUNT, MAXWELL_WINDOW_CLIP_COUNT,
-    MaxwellThreeDBlendControlState, MaxwellThreeDBlendEnableCommon, MaxwellThreeDBlendFactor,
+    MaxwellThreeDBlendControlState, MaxwellThreeDBlendFactor,
     MaxwellThreeDBlendFloatPixelKillEnable, MaxwellThreeDBlendOp,
     MaxwellThreeDBlendPerFormatEnable, MaxwellThreeDBlendZeroTimesAnythingIsZero,
     MaxwellThreeDClipAxis, MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorMask,
@@ -120,7 +120,7 @@ pub use output::{
     MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDLogicOp, MaxwellThreeDPixelShaderClampRange,
     MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPolygonMode, MaxwellThreeDProvokingVertex,
     MaxwellThreeDSampleMode, MaxwellThreeDScissorState, MaxwellThreeDShadeMode,
-    MaxwellThreeDStencilOp, MaxwellThreeDViewportClipControl,
+    MaxwellThreeDSingleRopControl, MaxwellThreeDStencilOp, MaxwellThreeDViewportClipControl,
     MaxwellThreeDViewportCoordinateSwizzle, MaxwellThreeDViewportScaleOffsetEnable,
     MaxwellThreeDViewportSwizzleComponent, MaxwellThreeDViewportTransformState,
     MaxwellThreeDWindowClipState, MaxwellThreeDWindowClipType,
@@ -4546,18 +4546,18 @@ fn preflight_output_state(
     use MaxwellThreeDFixedFunctionValue as V;
     let fixed = match method {
         0x135c => {
-            let value = MaxwellThreeDBlendEnableCommon::parse(raw).ok_or_else(|| {
+            let value = MaxwellThreeDSingleRopControl::parse(raw).ok_or_else(|| {
                 invalid_encoding(
                     source,
-                    "SET_BLEND_ENABLE_COMMON",
+                    "SET_SINGLE_ROP_CONTROL",
                     "undefined boolean encoding or reserved bits",
                 )
             })?;
             return Ok(Some((
                 MaxwellThreeDStateWrite::FixedFunction(
-                    MaxwellThreeDFixedFunctionWrite::BlendEnableCommon { value, source },
+                    MaxwellThreeDFixedFunctionWrite::SingleRopControl { value, source },
                 ),
-                "SET_BLEND_ENABLE_COMMON",
+                "SET_SINGLE_ROP_CONTROL",
             )));
         }
         0x037c => (

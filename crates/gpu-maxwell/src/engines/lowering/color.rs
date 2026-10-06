@@ -25,24 +25,29 @@ pub(super) fn draw_color_outputs(
         None,
         "SET_BLEND_STATE_PER_TARGET",
     )?)?;
+    // Equation selection (0x12e4) and enable selection (0x135c) are independent.
+    // SINGLE_ROP_CONTROL broadcasts SET_BLEND(0); otherwise SET_BLEND(target)
+    // still controls each target even when all targets use common equations.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2446-L2454
+    let single_rop =
+        *fixed
+            .single_rop_control()
+            .value()
+            .ok_or(MaxwellLoweringError::IncompleteBlendState {
+                target: None,
+                field: "SET_SINGLE_ROP_CONTROL",
+            })?
+            == MaxwellThreeDSingleRopControl::Enabled;
     for (slot, target) in attachments.color_targets().enumerate() {
         let selected = per_target.then_some(target);
-        let enabled = if per_target {
-            fixed.blend_enable()[usize::from(target)]
-                .value()
-                .copied()
-                .ok_or(MaxwellLoweringError::IncompleteBlendState {
-                    target: selected,
-                    field: "SET_BLEND(i)",
-                })?
-        } else {
-            *fixed.blend_enable_common().value().ok_or(
-                MaxwellLoweringError::IncompleteBlendState {
-                    target: None,
-                    field: "SET_BLEND_ENABLE_COMMON",
-                },
-            )? == MaxwellThreeDBlendEnableCommon::Enabled
-        };
+        let enable_target = if single_rop { 0 } else { target };
+        let enabled = fixed.blend_enable()[usize::from(enable_target)]
+            .value()
+            .copied()
+            .ok_or(MaxwellLoweringError::IncompleteBlendState {
+                target: Some(enable_target),
+                field: "SET_BLEND(i)",
+            })?;
         if enabled {
             // Float and 16-bit normalized formats consume additional Maxwell
             // arithmetic controls; do not inherit host defaults for those.

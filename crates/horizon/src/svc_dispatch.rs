@@ -576,6 +576,12 @@ impl HorizonSvcDispatcher {
         self
     }
 
+    /// Supplies real controller actuator output owned by the host input worker.
+    pub fn with_vibration_output(mut self, output: nixe_input::VibrationOutput) -> Self {
+        self.hid_system.set_vibration_output(output);
+        self
+    }
+
     #[must_use]
     pub fn video_system(&self) -> crate::VideoSystem {
         self.video_system.clone()
@@ -595,7 +601,7 @@ impl HorizonSvcDispatcher {
         &mut self,
         state: Option<&nixe_input::EmulatedControllerState>,
         delta: Duration,
-    ) -> Result<(), nixe_runtime::HandleError> {
+    ) -> Result<(), crate::HidInputError> {
         self.hid_system.publish(state, delta)
     }
 

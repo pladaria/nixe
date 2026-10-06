@@ -4,8 +4,12 @@ mod model;
 mod motion;
 mod profile;
 mod sdl;
+mod switch_rumble;
 mod touch;
+mod vibration;
 mod worker;
+
+pub use vibration::{VibrationError, VibrationOutput, VibrationSide, VibrationValue};
 
 pub use worker::{InputReader, InputSample, InputWorker, InputWorkerError};
 
