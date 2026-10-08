@@ -26,8 +26,12 @@ use registry::{Handle, Registry};
 use std::hash::{BuildHasher, RandomState};
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+// Optional branch installation retains valid fallbacks until the next batch.
+const LINK_BATCH_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
@@ -294,6 +298,7 @@ struct State {
     // Shared by every batch/owner of one stop. Only reopening resets it;
     // abandoning and reacquiring Closed cannot bypass the installation cap.
     link_install_attempts: usize,
+    link_batch_due: Option<Instant>,
     memory_mutations: usize,
     // Cold claims can outlive their dispatch reservation after closure/eviction.
     // Shutdown must drain those compilers before releasing the cache/indexes.
@@ -385,6 +390,7 @@ pub(crate) struct Lifetime {
     // Same single process-pending word consumed by the native control poll.
     // It notifies; it is never used as an independent admission authority.
     pending: AtomicU32,
+    optional_links: AtomicBool,
     cache: Arc<Cache>,
     // Dropped after the state's actual metadata owners and allocations.
     _storage: MetadataLease,
@@ -420,6 +426,7 @@ impl Lifetime {
                 completed: [None; 5],
                 transition_owned: false,
                 link_install_attempts: 0,
+                link_batch_due: None,
                 memory_mutations: 0,
                 compilers: 0,
                 background_tokens: background::Tokens::default(),
@@ -443,6 +450,7 @@ impl Lifetime {
             changed: Condvar::new(),
             directory: directory::Directory::new(cache.executable_base()),
             pending: AtomicU32::new(0),
+            optional_links: AtomicBool::new(false),
             cache,
             _storage: storage,
         })
@@ -487,6 +495,11 @@ impl Lifetime {
             self.fail(state, error);
             error
         })
+    }
+
+    /// Checked once at canonical slice entry, never on native branches.
+    pub(crate) fn optional_links_pending(&self) -> bool {
+        self.optional_links.load(Ordering::Acquire)
     }
 
     pub(crate) fn control_word(&self) -> &AtomicU32 {
@@ -780,7 +793,7 @@ impl Lifetime {
         }
         let result = state.sequences.next_id();
         let sequence = self.checked(state, result)?;
-        if state.phase == Phase::Open {
+        if state.phase == Phase::Open && reason != Reason::LinkPatch {
             let result = state.admissions.next_id();
             state.admission = self.checked(state, result)?;
             // Closure linearizes under the same lock as reader announcement
@@ -792,8 +805,18 @@ impl Lifetime {
         if reason == Reason::Shutdown {
             state.units.mark_shutdown(sequence);
         }
-        self.pending
-            .fetch_or(1 << reason as usize, Ordering::Release);
+        if reason == Reason::LinkPatch {
+            state
+                .link_batch_due
+                .get_or_insert_with(|| Instant::now() + LINK_BATCH_INTERVAL);
+            self.optional_links.store(true, Ordering::Release);
+        }
+        // Only work requiring immediate quiescence reaches the native poll.
+        // Optional requests remain in authoritative state with their tickets.
+        if state.phase != Phase::Open {
+            self.pending
+                .fetch_or(1 << reason as usize, Ordering::Release);
+        }
         self.changed.notify_all();
         Ok(sequence)
     }
@@ -816,14 +839,17 @@ impl Lifetime {
             return Ok(None);
         }
         if state.phase == Phase::Open {
-            // Deferred performance-only links retain their control request and
-            // start a later coalesced stop; no fabricated request/sequence.
+            // Explicit owners may join optional work to an existing operation.
+            // Canonical link service checks the batch deadline before calling.
             if state.pending.iter().all(Option::is_none) {
                 return Ok(None);
             }
             let result = state.admissions.next_id();
             state.admission = self.checked(&mut state, result)?;
             state.phase = Phase::Closing;
+            self.pending
+                .fetch_or(1 << Reason::LinkPatch as usize, Ordering::Release);
+            nixe_trace::event("jit.links.batch_stop", self.identity, 0);
         }
         state.transition_owned = true;
         Ok(Some(Transition {
@@ -1168,12 +1194,18 @@ impl<'p> Transition<'p> {
             state.admission = self.process.checked(&mut state, result)?;
             state.phase = Phase::Open;
             state.link_install_attempts = 0;
+            let optional = state.pending[Reason::LinkPatch as usize].is_some();
+            state.link_batch_due = optional.then(|| Instant::now() + LINK_BATCH_INTERVAL);
+            self.process
+                .optional_links
+                .store(optional, Ordering::Release);
             let reasons = state
                 .pending
                 .iter()
                 .enumerate()
                 .fold(0, |bits, (index, sequence)| {
-                    bits | (u32::from(sequence.is_some()) << index)
+                    bits | (u32::from(sequence.is_some() && index != Reason::LinkPatch as usize)
+                        << index)
                 });
             self.process.pending.store(reasons, Ordering::Release);
         }
@@ -1217,7 +1249,7 @@ impl Batch<'_, '_> {
     /// The link installer uses this after its 4096-record limit. Only optional
     /// installation may be deferred; safety-critical unlinks are completed as
     /// safety work. Uninstalled links must retain their valid native fallback.
-    /// Their sequences remain incomplete and the control request survives reopen.
+    /// Their sequences remain incomplete and join the next timed batch.
     pub(crate) fn complete_with_links_deferred(self) -> Result<(), Error> {
         self.acknowledge(true)
     }

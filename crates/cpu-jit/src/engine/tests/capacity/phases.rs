@@ -41,7 +41,9 @@ fn fixture() -> (JitThread, Arc<AtomicUsize>) {
             )?;
             Ok(move |resources: &mut Resources, work: Work<'_>| {
                 let result = compiler(resources, work);
-                counted.fetch_add(1, Ordering::Release);
+                if result.is_ok() {
+                    counted.fetch_add(1, Ordering::Release);
+                }
                 result
             })
         })
@@ -99,7 +101,6 @@ fn promote(thread: &mut JitThread, native: &mut NativeWorker, pc: GuestVirtualAd
         let mut state = A64State::default();
         state.set_pc(pc.get());
         match thread.invoke(
-            &mut crate::ReturnStack::default(),
             native,
             &mut state,
             PollBudget::new(1, 4).unwrap(),
@@ -122,14 +123,7 @@ fn execute(
     state.set_pc(pc.get());
     state.general_register_storage_mut()[0] = 100;
     let report = thread
-        .run_slice(
-            &mut crate::ReturnStack::default(),
-            native,
-            &mut state,
-            10,
-            &Timer,
-            &VcpuEventState::default(),
-        )
+        .run_slice(native, &mut state, 10, &Timer, &VcpuEventState::default())
         .unwrap();
     assert_eq!(report.progress, 2); // ADD; BRK, not compilation or maintenance.
     assert!(
@@ -231,6 +225,10 @@ fn retained_hcq_and_unpublished_bridges_preserve_capacity_then_allow_lcq_reserve
             bytes: bytes.into_boxed_slice(),
             alignment: 16,
             metadata: Metadata {
+                #[cfg(feature = "jit-profile")]
+                regions: Box::new([]),
+                #[cfg(feature = "jit-profile")]
+                profile_body_length: 0,
                 abi: host,
                 frame_extent: 0,
                 entries: Box::new([]),
@@ -264,7 +262,6 @@ fn retained_hcq_and_unpublished_bridges_preserve_capacity_then_allow_lcq_reserve
     let before = state.clone();
     let error = thread
         .run_slice(
-            &mut crate::ReturnStack::default(),
             &mut native,
             &mut state,
             10,
@@ -303,7 +300,6 @@ fn retained_hcq_and_unpublished_bridges_preserve_capacity_then_allow_lcq_reserve
         state.set_pc(next.get());
         thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut native,
                 &mut state,
                 PollBudget::new(1, 4).unwrap(),

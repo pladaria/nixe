@@ -52,9 +52,24 @@ pub(crate) struct NvDrvIoctlResponse {
 }
 
 /// Semantic disposition of an ioctl before scheduler or wire adaptation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum NvDrvIoctlOutcome {
     Complete(NvDrvIoctlResponse),
+    Frontend(FrontendWork),
+    PendingFrontend(crate::host_work::PendingHostWork),
     PendingSyncpointWait(PendingNvHostCtrlWait),
     PendingSubmission(super::PendingGpuSubmission),
+}
+
+type FrontendJob = Box<dyn FnOnce() -> Result<(), super::UnsupportedNvDrvOperation> + Send>;
+pub(crate) struct FrontendWork {
+    pub frontend: nixe_gpu::FrontendSubmissionId,
+    pub response: NvDrvIoctlResponse,
+    pub run: FrontendJob,
+    pub guard: crate::host_work::WorkGuard,
+}
+impl std::fmt::Debug for FrontendWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrontendWork")
+    }
 }

@@ -61,8 +61,26 @@ fn hcq_discovery_stops_before_foreign_interior_membership() {
 }
 
 #[test]
-fn hcq_discovery_does_not_pull_callees_or_return_continuations_from_samples() {
-    for branch in [0x94000002, RET] {
+fn hcq_discovery_does_not_inline_an_unobserved_call_or_pin_its_continuation() {
+    let (process, queue, mut samples) = setup(0);
+    publish_words(&process, 0, &[0x94000002]);
+    publish_words(&process, 4, &[RET]);
+    publish_words(&process, 8, &[RET]);
+    enqueue(&process, &queue, &mut samples, 0);
+    let work = process
+        .accept_background(queue.wait().unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    let graph = Graph::discover(&work).unwrap();
+    assert_eq!(graph.instructions.len(), 1);
+    assert_eq!(graph.inputs.len(), 1);
+    assert_eq!(graph.units.len(), 1);
+    assert!(graph.blocks[0].dispatch.is_empty());
+}
+
+#[test]
+fn hcq_discovery_captures_callees_continuations_and_inferred_returns() {
+    for branch in [0x94000002, 0xd63f0000] {
         let (process, queue, mut samples) = setup(0);
         publish_words(&process, 0, &[branch]);
         publish_words(&process, 4, &[RET]);
@@ -87,8 +105,9 @@ fn hcq_discovery_does_not_pull_callees_or_return_continuations_from_samples() {
             .unwrap()
             .unwrap();
         let graph = Graph::discover(&work).unwrap();
-        assert_eq!(graph.instructions.len(), 1);
-        assert_eq!(graph.units.len(), 1);
+        assert_eq!(graph.instructions.len(), 3);
+        assert!(!graph.blocks[0].dispatch.is_empty());
+        assert_eq!(graph.units.len(), 3);
     }
 }
 

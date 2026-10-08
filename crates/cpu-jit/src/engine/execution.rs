@@ -10,11 +10,8 @@ use nixe_cpu::execution::{
 impl JitThread {
     /// Memory and CPU identity come from this vCPU's immutable process binding;
     /// callers must not retain an execution lease across this cold loop.
-    /// `returns` belongs to the scheduled guest and must follow it across slices
-    /// and vCPU migration, independently of this worker's PIC registration.
     pub fn run_slice(
         &mut self,
-        returns: &mut crate::ReturnStack,
         worker: &mut NativeWorker,
         state: &mut A64State,
         instruction_budget: u64,
@@ -38,6 +35,8 @@ impl JitThread {
             // At most one reclamation pass per miss, including soft pressure. A
             // failed retry reports capacity instead of recompiling/evicting forever.
             let mut capacity_pass = false;
+            let mut entry_plan = None;
+            let mut check_optional = true;
             loop {
                 // Check host notifications whenever execution is canonical.
                 // Native chains observe requests through bounded cold polls,
@@ -48,6 +47,11 @@ impl JitThread {
                     // We hold no reader/lease and retain no entry across this ack.
                     self.control.acknowledge(control);
                     if control.contains(ControlRequest::Preempt) {
+                        nixe_trace::event(
+                            "cpu.safepoint.preempt",
+                            state.pc(),
+                            initial.abs_diff(budget.slice_remaining),
+                        );
                         return Ok(CpuExit::Safepoint);
                     }
                 }
@@ -59,8 +63,36 @@ impl JitThread {
                 if budget.slice_remaining <= 0 {
                     return Ok(CpuExit::BudgetExhausted);
                 }
+                // Time is sampled only when optional links are queued and execution
+                // is canonical. Native chains keep their valid fallback until due.
+                if check_optional
+                    && self.process.lifetime.optional_links_pending()
+                    && !self
+                        .process
+                        .lifetime
+                        .try_service_optional_links()
+                        .map_err(|error| {
+                            fault(
+                                if matches!(
+                                    error,
+                                    lifetime::Error::Capacity(_) | lifetime::Error::Shutdown
+                                ) {
+                                    CpuFaultKind::Unavailable
+                                } else {
+                                    CpuFaultKind::Internal
+                                },
+                                format!("JIT optional maintenance: {error}"),
+                                0,
+                                state,
+                            )
+                        })?
+                {
+                    nixe_trace::event("cpu.safepoint.maintenance", state.pc(), 0);
+                    return Ok(CpuExit::Safepoint);
+                }
+                check_optional = false;
                 let progress = initial.abs_diff(budget.slice_remaining);
-                let exit = match self.invoke(returns, worker, state, budget, events) {
+                let exit = match self.invoke(worker, state, budget, events) {
                     Ok((exit, reconciled)) => {
                         budget = reconciled;
                         exit
@@ -72,6 +104,7 @@ impl JitThread {
                         if self.service_links(state, progress)? {
                             continue;
                         }
+                        nixe_trace::event("cpu.safepoint.admission", state.pc(), progress);
                         return Ok(CpuExit::Safepoint);
                     }
                     Err(invocation::Error::Lifetime(lifetime::Error::Shutdown)) => {
@@ -91,7 +124,11 @@ impl JitThread {
                         ));
                     }
                 };
-                if let Some(exit) = exit {
+                if let Some(mut exit) = exit {
+                    entry_plan = match &mut exit {
+                        invocation::Exit::Native { entry_plan, .. } => entry_plan.take(),
+                        invocation::Exit::Memory { .. } => None,
+                    };
                     capacity_pass = false;
                     let control = matches!(&exit, invocation::Exit::Native { returned, .. }
                         if returned.reason == crate::abi::NativeExitReason::Control);
@@ -126,7 +163,7 @@ impl JitThread {
                         self.recover_capacity(state, progress)?;
                         continue;
                     }
-                    match self.demand(pc) {
+                    match self.demand_with_plan(pc, entry_plan.take()) {
                         Ok(Demand::Ready | Demand::Retry)
                         | Err(PublishError::StaleCapture)
                         | Err(PublishError::Lifetime(lifetime::Error::StalePublication)) => {}
@@ -135,6 +172,7 @@ impl JitThread {
                             if self.service_links(state, progress)? {
                                 continue;
                             }
+                            nixe_trace::event("cpu.safepoint.demand", state.pc(), progress);
                             return Ok(CpuExit::Safepoint);
                         }
                         Err(PublishError::Lifetime(lifetime::Error::Shutdown)) => {

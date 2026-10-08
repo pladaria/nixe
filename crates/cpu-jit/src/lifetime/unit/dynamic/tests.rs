@@ -46,10 +46,12 @@ fn source_with_binding(
             state.site.state_map = id;
             if constant_x0 {
                 state.live.integer.x.insert(0);
-                state.bindings = std::sync::Arc::from([ValueBinding {
+                state.bindings = [ValueBinding {
                     value: GuestValue::General(0),
                     location: ValueLocation::constant(17),
-                }]);
+                }]
+                .to_vec()
+                .into();
             }
             StateRecord {
                 native_offset: 8,
@@ -144,6 +146,18 @@ fn dynamic_resolution_rejects_wrong_execution_keys_and_nondynamic_sources() {
         Err(Error::InvalidUnit(_))
     ));
     wrong = key(4);
+    wrong.profile = nixe_cpu::profile::CpuProfileId::new(2);
+    assert!(matches!(
+        process.prepare_dynamic_bridge(a, 0, wrong),
+        Err(Error::InvalidUnit(_))
+    ));
+    wrong = key(4);
+    wrong.platform = nixe_cpu::platform::TargetPlatform::Switch2;
+    assert!(matches!(
+        process.prepare_dynamic_bridge(a, 0, wrong),
+        Err(Error::InvalidUnit(_))
+    ));
+    wrong = key(4);
     wrong.pc = nixe_memory::GuestVirtualAddress::new(5);
     assert!(matches!(
         process.prepare_dynamic_bridge(a, 0, wrong),
@@ -228,13 +242,15 @@ fn dynamic_nonempty_transfer_is_charged_reusable_and_has_no_static_islands() {
         )
         .unwrap();
     candidate.entries[0].contract.live_in.integer.x.insert(0);
-    candidate.entries[0].contract.bindings = std::sync::Arc::from([ValueBinding {
+    candidate.entries[0].contract.bindings = [ValueBinding {
         value: GuestValue::General(0),
         location: ValueLocation::Register {
             class: RegisterClass::Integer,
             index: 0,
         },
-    }]);
+    }]
+    .to_vec()
+    .into();
     process
         .prepare_unit(&[process.reserve(key(4)).unwrap()], candidate, &cursor)
         .unwrap()
@@ -274,7 +290,7 @@ fn dynamic_preparations_do_not_survive_admission_changes_as_callable_entries() {
     publish(&process, &cursor, &[4], Tier::Lcq);
     let a = source(&process, &cursor, 0, EdgeKind::Indirect);
     let transfer = bridge(&process, a, 0).emit().unwrap();
-    process.request(Reason::LinkPatch).unwrap();
+    process.request(Reason::TierCutover).unwrap();
     assert_eq!(
         transfer.prepared.validate(&process.lock()),
         Err(Error::Closed)

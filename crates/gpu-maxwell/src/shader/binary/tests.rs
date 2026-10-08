@@ -7,7 +7,6 @@ use crate::{
     MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuChannel, MaxwellShaderStage,
     SWITCH_1_GM20B_PROFILE,
 };
-use nixe_memory::CanonicalWriteBatch;
 
 #[test]
 fn shader_memory_view_overlays_ordered_submission_writes_without_publication() {
@@ -112,7 +111,7 @@ fn header_validation_rejects_unimplemented_semantic_flags() {
 fn shader_reads_are_bounded_before_address_space_access() {
     let (_, address_space, address) = mapped_memory();
     assert!(matches!(
-        MaxwellShaderMemoryView::new(&address_space, &CanonicalWriteBatch::new()).read(
+        MaxwellShaderMemoryView::new(&address_space, &crate::projection::MemoryProjection::default()).read(
             MaxwellShaderStage::Vertex,
             address,
             MAXWELL_SHADER_READ_LIMIT + 1,
@@ -126,7 +125,7 @@ fn shader_reads_are_bounded_before_address_space_access() {
 #[test]
 fn shader_fetches_cannot_escape_the_bound_executable_program_range() {
     let (_, address_space, address) = mapped_memory();
-    let writes = CanonicalWriteBatch::new();
+    let writes = crate::projection::MemoryProjection::default();
     let memory = MaxwellShaderMemoryView::new(&address_space, &writes);
     let executable =
         MaxwellShaderExecutableRange::new(MaxwellShaderStage::Vertex, address).unwrap();

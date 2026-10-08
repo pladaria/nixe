@@ -167,3 +167,130 @@ fn prefault_maps_keep_inputs_needed_only_after_the_fault() {
         state.validate().unwrap();
     }
 }
+
+#[test]
+fn coordinated_entries_carry_unused_values_without_a_state_adapter() {
+    // A produces X19 and V1. B does not read either; C eventually consumes both.
+    // Allocation constraints must survive real codegen on both host backends.
+    let words = [
+        0x9100_0673, // ADD X19,X19,#1
+        0x4ea3_1c61, // ORR V1.16B,V3.16B,V3.16B
+        0x1400_0001, // B B
+        0xd503_201f, // NOP
+        0x1400_0001, // B C
+        0x9100_0260, // ADD X0,X19,#0
+        0x4ea1_1c20, // ORR V0.16B,V1.16B,V1.16B
+        0xd420_0000,
+    ];
+    let memory = memory(&words);
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        let mut compiler = Compiler::new(abi).unwrap();
+        let a = compiler
+            .lower(
+                &Fragment::capture(&memory, key()).unwrap(),
+                CodeVersion::new(1).unwrap(),
+            )
+            .unwrap();
+        let source = &a.states[0].state;
+        let plan = crate::frontend::entry::Plan::from_exit(source);
+        let b = compiler
+            .lower_with_plan(
+                &Fragment::capture(
+                    &memory,
+                    key().at(GuestVirtualAddress::new(PC + 12)).unwrap(),
+                )
+                .unwrap(),
+                CodeVersion::new(2).unwrap(),
+                &plan,
+            )
+            .unwrap();
+        assert!(b.entry.live_in.integer.x.contains(19));
+        assert!(b.entry.live_in.vector.contains(1));
+        assert!(
+            crate::native::emit_chain_transfer(source, &b.entry)
+                .unwrap()
+                .is_empty()
+        );
+        let c = compiler
+            .lower_with_plan(
+                &Fragment::capture(
+                    &memory,
+                    key().at(GuestVirtualAddress::new(PC + 20)).unwrap(),
+                )
+                .unwrap(),
+                CodeVersion::new(3).unwrap(),
+                &crate::frontend::entry::Plan::from_exit(&b.states[0].state),
+            )
+            .unwrap();
+        assert!(
+            crate::native::emit_chain_transfer(&b.states[0].state, &c.entry)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn unused_faulting_destination_keeps_its_old_canonical_home() {
+    let memory = memory(&[0x9100_0400, 0x1400_0001, 0xf940_0020, 0xd420_0000]);
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        let mut compiler = Compiler::for_arena(abi, 1 << 20).unwrap();
+        let a = compiler
+            .lower(
+                &Fragment::capture(&memory, key()).unwrap(),
+                CodeVersion::new(1).unwrap(),
+            )
+            .unwrap();
+        let plan = crate::frontend::entry::Plan::from_exit(&a.states[0].state);
+        let b = compiler
+            .lower_with_plan(
+                &Fragment::capture(&memory, key().at(GuestVirtualAddress::new(PC + 8)).unwrap())
+                    .unwrap(),
+                CodeVersion::new(2).unwrap(),
+                &plan,
+            )
+            .unwrap();
+        let pre = &b.states[b.faults[0].state_map as usize].state;
+        assert!(!b.entry.live_in.integer.x.contains(0));
+        assert!(!b.entry.discard.integer.x.contains(0));
+        assert!(!pre.dirty_live.integer.x.contains(0));
+        assert!(
+            !crate::native::emit_chain_transfer(&a.states[0].state, &b.entry)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn discarded_inputs_are_overwritten_before_every_precise_observation() {
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        for (words, discard_x0) in [
+            (vec![0xd28000e0, 0xd4200000], true),  // MOVZ X0,#7
+            (vec![0xf9400020, 0xd4200000], false), // LDR X0,[X1] can fault PRE
+            (vec![0xd53b4420, 0xd4200000], false), // MRS X0,FPSR exits PRE
+            (vec![0xd28000e0, 0xf9400021, 0xd4200000], true),
+            (vec![0xf9400021, 0xd28000e0, 0xd4200000], false),
+            (vec![0xf28000e0, 0xd4200000], false), // MOVK reads old destination
+        ] {
+            let memory = memory(&words);
+            let fragment = Fragment::capture(&memory, key()).unwrap();
+            let lowered = Compiler::for_arena(abi, 1 << 20)
+                .unwrap()
+                .lower(&fragment, CodeVersion::new(1).unwrap())
+                .unwrap();
+            assert_eq!(
+                lowered.entry.discard.integer.x.contains(0),
+                discard_x0,
+                "{abi:?}: {words:x?}"
+            );
+            assert!(
+                lowered
+                    .entry
+                    .live_in
+                    .intersection(lowered.entry.discard)
+                    .is_empty()
+            );
+        }
+    }
+}

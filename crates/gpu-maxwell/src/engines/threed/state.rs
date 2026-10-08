@@ -4,7 +4,10 @@
 //! In particular, an undocumented hardware reset must stay `Unset`: zero is
 //! not a reset value unless a pinned public source establishes that fact.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
+
+mod identity;
+pub(super) mod registers;
 
 use nixe_gpu::GpuMethodId;
 
@@ -873,16 +876,15 @@ impl MaxwellThreeDViewportState {
 /// so queued operations do not retain or copy command-decoding state.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDState {
-    // Revisions are local to one register-file lifetime. Retain a namespace
-    // across snapshots so shared caches cannot confuse two channels whose
-    // independent revision counters happen to have the same numeric value.
+    // Retain a register-file namespace across snapshots. Resource identities
+    // describe values; shader translation retains its independent revision.
     cache_scope: Arc<()>,
-    draw_state_revision: u64,
-    render_target_revision: u64,
-    vertex_resource_revision: u64,
-    constant_buffer_revision: u64,
-    texture_revision: u64,
-    sample_mode_revision: u64,
+    fixed_draw: identity::Registers,
+    render_target_identity: identity::Registers,
+    vertex_resource_identity: identity::Registers,
+    constant_buffer_identity: identity::Registers,
+    texture_identity: identity::Registers,
+    sample_mode_identity: identity::Registers,
     shader_revision: u64,
     render_targets: Arc<MaxwellThreeDRenderTargetState>,
     fixed_function: Arc<MaxwellThreeDFixedFunctionState>,
@@ -908,16 +910,16 @@ pub struct MaxwellThreeDState {
 
 /// Retained identity of the state domains which determine resource bindings.
 ///
-/// State domains unrelated to resource resolution deliberately do not advance
-/// the retained revisions or invalidate this identity.
+/// State domains unrelated to resource resolution do not invalidate this
+/// identity. Restoring exact binding values permits reuse of an older plan.
 #[derive(Clone, Debug)]
 pub(crate) struct MaxwellThreeDResourceStateIdentity {
     scope: Arc<()>,
-    render_targets: Option<u64>,
-    vertex_resources: Option<u64>,
-    constant_buffers: Option<u64>,
-    textures: Option<u64>,
-    sample_mode: Option<u64>,
+    render_targets: Option<identity::Registers>,
+    vertex_resources: Option<identity::Registers>,
+    constant_buffers: Option<identity::Registers>,
+    textures: Option<identity::Registers>,
+    sample_mode: Option<identity::Registers>,
 }
 
 #[derive(Clone, Debug)]
@@ -927,14 +929,13 @@ pub(crate) struct MaxwellThreeDShaderStateIdentity {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MaxwellThreeDDrawStateIdentity {
+pub(crate) struct MaxwellThreeDFixedDrawIdentity {
     scope: Arc<()>,
-    revision: u64,
+    registers: identity::Registers,
 }
-
-impl MaxwellThreeDDrawStateIdentity {
+impl MaxwellThreeDFixedDrawIdentity {
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        Arc::ptr_eq(&self.scope, &state.cache_scope) && self.revision == state.draw_state_revision
+        Arc::ptr_eq(&self.scope, &state.cache_scope) && self.registers.matches(&state.fixed_draw)
     }
 }
 
@@ -957,19 +958,24 @@ impl MaxwellThreeDResourceStateIdentity {
         Arc::ptr_eq(&self.scope, &state.cache_scope)
             && self
                 .render_targets
-                .is_none_or(|revision| revision == state.render_target_revision)
+                .as_ref()
+                .is_none_or(|identity| identity.matches(&state.render_target_identity))
             && self
                 .vertex_resources
-                .is_none_or(|revision| revision == state.vertex_resource_revision)
+                .as_ref()
+                .is_none_or(|identity| identity.matches(&state.vertex_resource_identity))
             && self
                 .constant_buffers
-                .is_none_or(|revision| revision == state.constant_buffer_revision)
+                .as_ref()
+                .is_none_or(|identity| identity.matches(&state.constant_buffer_identity))
             && self
                 .textures
-                .is_none_or(|revision| revision == state.texture_revision)
+                .as_ref()
+                .is_none_or(|identity| identity.matches(&state.texture_identity))
             && self
                 .sample_mode
-                .is_none_or(|revision| revision == state.sample_mode_revision)
+                .as_ref()
+                .is_none_or(|identity| identity.matches(&state.sample_mode_identity))
     }
 }
 
@@ -999,29 +1005,17 @@ impl std::hash::Hash for MaxwellThreeDResourceStateIdentity {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MaxwellThreeDResourceSemanticWrites {
-    draw_state: bool,
+    fixed_draw: bool,
     render_targets: bool,
     vertex_resources: bool,
-    constant_buffers: bool,
     textures: bool,
     sample_mode: bool,
 }
 
-impl MaxwellThreeDResourceSemanticWrites {
-    const fn any(self) -> bool {
-        self.draw_state
-            || self.render_targets
-            || self.vertex_resources
-            || self.constant_buffers
-            || self.textures
-            || self.sample_mode
-    }
-}
-
 /// Complete currently modeled live state of one channel's `MAXWELL_B` engine.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct MaxwellThreeDFrontendState {
-    raw_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
+    raw_registers: registers::Registers,
     pub(in crate::engines) pending_notification: Option<(u64, MaxwellMethodSource)>,
     operation: MaxwellThreeDState,
     mme: MaxwellThreeDMmeState,
@@ -1029,9 +1023,21 @@ pub(crate) struct MaxwellThreeDFrontendState {
     shader_semantic_write: bool,
 }
 
+impl PartialEq for MaxwellThreeDFrontendState {
+    fn eq(&self, other: &Self) -> bool {
+        // Per-method effects are decoding scratch, not channel state. A failed
+        // decode may clear them without changing any register or command effect.
+        self.raw_registers == other.raw_registers
+            && self.pending_notification == other.pending_notification
+            && self.operation == other.operation
+            && self.mme == other.mme
+    }
+}
+impl Eq for MaxwellThreeDFrontendState {}
+
 impl Default for MaxwellThreeDFrontendState {
     fn default() -> Self {
-        let mut raw_registers = BTreeMap::new();
+        let mut raw_registers = registers::Registers::default();
         for method in [
             0x1208,
             0x15b8,
@@ -1135,6 +1141,11 @@ impl MaxwellThreeDFrontendState {
     }
 
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
+        if self.resource_semantic_writes.fixed_draw || self.shader_semantic_write {
+            self.operation
+                .fixed_draw
+                .insert(source.method().0, source.argument());
+        }
         self.raw_registers.insert(
             source.method().0,
             MaxwellThreeDRegister::programmed(source.argument(), source.argument(), source),
@@ -1143,10 +1154,13 @@ impl MaxwellThreeDFrontendState {
 }
 
 impl MaxwellThreeDState {
-    pub(crate) fn draw_state_identity(&self) -> MaxwellThreeDDrawStateIdentity {
-        MaxwellThreeDDrawStateIdentity {
+    pub(super) fn fixed_draw_fingerprint(&self) -> u128 {
+        self.fixed_draw.fingerprint
+    }
+    pub(crate) fn fixed_draw_identity(&self) -> MaxwellThreeDFixedDrawIdentity {
+        MaxwellThreeDFixedDrawIdentity {
             scope: Arc::clone(&self.cache_scope),
-            revision: self.draw_state_revision,
+            registers: self.fixed_draw.clone(),
         }
     }
 
@@ -1192,11 +1206,11 @@ impl MaxwellThreeDState {
             });
         MaxwellThreeDResourceStateIdentity {
             scope: Arc::clone(&self.cache_scope),
-            render_targets: needs_render_targets.then_some(self.render_target_revision),
-            vertex_resources: needs_vertex_resources.then_some(self.vertex_resource_revision),
-            constant_buffers: needs_constant_buffers.then_some(self.constant_buffer_revision),
-            textures: needs_textures.then_some(self.texture_revision),
-            sample_mode: needs_render_targets.then_some(self.sample_mode_revision),
+            render_targets: needs_render_targets.then(|| self.render_target_identity.clone()),
+            vertex_resources: needs_vertex_resources.then(|| self.vertex_resource_identity.clone()),
+            constant_buffers: needs_constant_buffers.then(|| self.constant_buffer_identity.clone()),
+            textures: needs_textures.then(|| self.texture_identity.clone()),
+            sample_mode: needs_render_targets.then(|| self.sample_mode_identity.clone()),
         }
     }
 
@@ -1344,42 +1358,78 @@ impl MaxwellThreeDState {
 }
 
 impl MaxwellThreeDFrontendState {
+    pub(super) fn begin_method(&mut self) {
+        self.resource_semantic_writes = MaxwellThreeDResourceSemanticWrites::default();
+        self.shader_semantic_write = false;
+    }
+
     pub(super) fn refresh_semantic_identities(&mut self, register_changed: bool) {
-        if !register_changed {
-            return;
-        }
-        if !self.resource_semantic_writes.any() && !self.shader_semantic_write {
-            return;
-        }
-        let resource_semantic_writes = self.resource_semantic_writes;
-        let shader_semantic_write = self.shader_semantic_write;
-        let state = self.operation_state_mut();
-        if resource_semantic_writes.draw_state {
-            advance_revision(&mut state.draw_state_revision);
-        }
-        if resource_semantic_writes.render_targets {
-            advance_revision(&mut state.render_target_revision);
-        }
-        if resource_semantic_writes.vertex_resources {
-            advance_revision(&mut state.vertex_resource_revision);
-        }
-        if resource_semantic_writes.constant_buffers {
-            advance_revision(&mut state.constant_buffer_revision);
-        }
-        if resource_semantic_writes.textures {
-            advance_revision(&mut state.texture_revision);
-        }
-        if resource_semantic_writes.sample_mode {
-            advance_revision(&mut state.sample_mode_revision);
-        }
-        if shader_semantic_write {
-            advance_revision(&mut state.shader_revision);
+        if register_changed && self.shader_semantic_write {
+            advance_revision(&mut self.operation.shader_revision);
         }
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDStateWrite) {
         self.resource_semantic_writes = write.resource_semantic_writes();
-        self.resource_semantic_writes.draw_state = write.affects_prepared_draw();
+        let resource_source = match write {
+            MaxwellThreeDStateWrite::RenderTarget(write) => Some(write.source()),
+            MaxwellThreeDStateWrite::VertexInput(write) => Some(write.source()),
+            MaxwellThreeDStateWrite::ShaderBinding(write) => Some(write.source()),
+            MaxwellThreeDStateWrite::FixedFunction(write) => Some(write.source()),
+            _ => None,
+        };
+        if let Some(source) = resource_source {
+            // Resource keys describe final values, so restoring a binding restores
+            // its identity. Exact immutable pages reject fingerprint collisions.
+            let flags = self.resource_semantic_writes;
+            for (affected, identity) in [
+                (
+                    flags.render_targets,
+                    &mut self.operation.render_target_identity,
+                ),
+                (
+                    flags.vertex_resources,
+                    &mut self.operation.vertex_resource_identity,
+                ),
+                (flags.textures, &mut self.operation.texture_identity),
+                (flags.sample_mode, &mut self.operation.sample_mode_identity),
+            ] {
+                if affected {
+                    identity.insert(source.method().0, source.argument());
+                }
+            }
+        }
+
+        if let MaxwellThreeDStateWrite::ShaderBinding(
+            MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
+                group,
+                slot,
+                enabled,
+                address,
+                size,
+                ..
+            },
+        ) = write
+        {
+            // A bind consumes the current selector, not just its command word.
+            // Four private words per (group,slot) encode the captured binding;
+            // selector changes alone must not change an already bound buffer.
+            let method = (u32::from(group) * 32 + u32::from(slot)) * 16;
+            let address = address.map_or(0, |address| address.get());
+            let identity = &mut self.operation.constant_buffer_identity;
+            for (word, value) in [
+                u32::from(enabled),
+                address as u32,
+                (address >> 32) as u32,
+                size.unwrap_or(0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                identity.insert(method + word as u32 * 4, value);
+            }
+        }
+        self.resource_semantic_writes.fixed_draw = write.affects_fixed_draw();
         self.shader_semantic_write = write.affects_shader_translation();
         match write {
             MaxwellThreeDStateWrite::PointSize { value, source } => {
@@ -1792,6 +1842,25 @@ pub enum MaxwellThreeDStateWrite {
 }
 
 impl MaxwellThreeDStateWrite {
+    const fn affects_fixed_draw(self) -> bool {
+        self.affects_prepared_draw()
+            && !matches!(
+                self,
+                Self::VertexInput(
+                    MaxwellThreeDVertexInputWrite::StreamAddressUpper { .. }
+                        | MaxwellThreeDVertexInputWrite::StreamAddressLower { .. }
+                        | MaxwellThreeDVertexInputWrite::StreamLimitUpper { .. }
+                        | MaxwellThreeDVertexInputWrite::StreamLimitLower { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexAddressUpper { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexAddressLower { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexLimitUpper { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexLimitLower { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexFirst { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexCount { .. }
+                )
+            )
+    }
+
     const fn affects_prepared_draw(self) -> bool {
         match self {
             Self::PointSize { .. }
@@ -1905,12 +1974,6 @@ impl MaxwellThreeDStateWrite {
                 vertex_resources: true,
                 ..MaxwellThreeDResourceSemanticWrites::default()
             },
-            Self::ShaderBinding(MaxwellThreeDShaderBindingWrite::BindConstantBuffer { .. }) => {
-                MaxwellThreeDResourceSemanticWrites {
-                    constant_buffers: true,
-                    ..MaxwellThreeDResourceSemanticWrites::default()
-                }
-            }
             Self::ShaderBinding(
                 MaxwellThreeDShaderBindingWrite::TextureHeaderAddressUpper { .. }
                 | MaxwellThreeDShaderBindingWrite::TextureHeaderAddressLower { .. }
@@ -1997,7 +2060,6 @@ mod tests {
             .operation_state()
             .resource_state_identity(&[MaxwellThreeDResourceRole::VertexStream(0)], false);
         let shaders = frontend.operation_state().shader_state_identity();
-        let draw = frontend.operation_state().draw_state_identity();
 
         frontend.resource_semantic_writes = MaxwellThreeDResourceSemanticWrites {
             render_targets: true,
@@ -2006,19 +2068,10 @@ mod tests {
         frontend.refresh_semantic_identities(false);
         assert!(resources.matches(frontend.operation_state()));
         assert!(shaders.matches(frontend.operation_state()));
-        assert!(draw.matches(frontend.operation_state()));
 
-        frontend.refresh_semantic_identities(true);
+        frontend.operation.render_target_identity.insert(0x800, 1);
         assert!(!resources.matches(frontend.operation_state()));
         assert!(vertex_resources.matches(frontend.operation_state()));
         assert!(shaders.matches(frontend.operation_state()));
-        assert!(draw.matches(frontend.operation_state()));
-
-        frontend.resource_semantic_writes = MaxwellThreeDResourceSemanticWrites {
-            draw_state: true,
-            ..MaxwellThreeDResourceSemanticWrites::default()
-        };
-        frontend.refresh_semantic_identities(true);
-        assert!(!draw.matches(frontend.operation_state()));
     }
 }

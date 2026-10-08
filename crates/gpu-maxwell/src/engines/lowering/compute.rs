@@ -4,7 +4,6 @@ use crate::MaxwellGpuAddressSpace;
 use crate::engines::compute::MaxwellResolvedComputeLaunch;
 use crate::shader::MaxwellComputeProgram;
 use nixe_gpu::BackingView;
-use nixe_memory::CanonicalWriteBatch;
 
 #[derive(Debug)]
 pub(super) struct ComputeShaderRecord {
@@ -18,7 +17,7 @@ impl MaxwellLoweringCache {
         &mut self,
         launch: &MaxwellResolvedComputeLaunch,
         address_space: &MaxwellGpuAddressSpace,
-        writes: &CanonicalWriteBatch,
+        writes: &crate::projection::MemoryProjection,
         frontend: FrontendSubmissionId,
         predecessors: Vec<FrontendSubmissionId>,
     ) -> Result<MaxwellLoweredWork, MaxwellLoweringError> {

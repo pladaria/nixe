@@ -105,6 +105,17 @@ pub fn emit_canonical_writeback(source: &ExitStateMap) -> Result<Vec<u8>, Transf
 // The bridge may supply an already materialized NZCV in ABI-owned transfer
 // storage. Public maps still prohibit that storage; only emission creates it.
 pub(super) fn writeback(emitter: &mut Emitter, source: &ExitStateMap, nzcv: &NzcvLocation) {
+    writeback_with_scratch(emitter, source, nzcv, None);
+}
+
+/// A bridge may clobber a register proven absent from every source binding.
+/// Ordinary observation adapters preserve physical source values as before.
+pub(super) fn writeback_with_scratch(
+    emitter: &mut Emitter,
+    source: &ExitStateMap,
+    nzcv: &NzcvLocation,
+    scratch: Option<u8>,
+) {
     let operands = source
         .bindings
         .iter()
@@ -125,14 +136,14 @@ pub(super) fn writeback(emitter: &mut Emitter, source: &ExitStateMap, nzcv: &Nzc
     } else {
         nzcv.clone()
     };
-    emit_operands(emitter, source.abi, false, operands);
+    emit_operands_with_scratch(emitter, source.abi, false, operands, scratch);
     if source.dirty_live.nzcv != 0 {
         let NzcvLocation::Packed(location) = nzcv else {
             unreachable!()
         };
         let pointer = source.abi.reserved().link_scratch[0];
-        let value = temporary_register(source.abi);
-        if source.abi == HostAbi::X86_64 {
+        let value = scratch.unwrap_or_else(|| temporary_register(source.abi));
+        if source.abi == HostAbi::X86_64 && scratch.is_none() {
             emitter.memory(false, RegisterClass::Integer, value, BORROW_SAVE, 8);
         }
         emitter.copy(Copy {
@@ -149,7 +160,7 @@ pub(super) fn writeback(emitter: &mut Emitter, source: &ExitStateMap, nzcv: &Nzc
             emitter.memory(true, RegisterClass::Integer, pointer, NZCV_POINTER, 8);
         }
         emitter.memory_at(false, RegisterClass::Integer, value, pointer, 0, 4);
-        if source.abi == HostAbi::X86_64 {
+        if source.abi == HostAbi::X86_64 && scratch.is_none() {
             emitter.memory(true, RegisterClass::Integer, value, BORROW_SAVE, 8);
         }
     }
@@ -157,8 +168,13 @@ pub(super) fn writeback(emitter: &mut Emitter, source: &ExitStateMap, nzcv: &Nzc
 
 /// Load missing clean bridge inputs after physical copies. Unlike canonical
 /// ingress, already-installed inputs (including RAX) must remain untouched.
-pub(super) fn load_missing(emitter: &mut Emitter, bindings: &[crate::abi::ValueBinding]) {
-    let preserve_rax = emitter.abi == HostAbi::X86_64
+pub(super) fn load_missing(
+    emitter: &mut Emitter,
+    bindings: &[crate::abi::ValueBinding],
+    scratch: Option<u8>,
+) {
+    let preserve_rax = scratch.is_none()
+        && emitter.abi == HostAbi::X86_64
         && bindings
             .iter()
             .any(|b| matches!(b.location, ValueLocation::Spill { .. }))
@@ -172,7 +188,7 @@ pub(super) fn load_missing(emitter: &mut Emitter, bindings: &[crate::abi::ValueB
     if preserve_rax {
         emitter.memory(false, RegisterClass::Integer, 0, BORROW_SAVE, 8);
     }
-    emit_operands(
+    emit_operands_with_scratch(
         emitter,
         emitter.abi,
         true,
@@ -180,6 +196,7 @@ pub(super) fn load_missing(emitter: &mut Emitter, bindings: &[crate::abi::ValueB
             .iter()
             .map(|b| operand(b.value, b.location))
             .collect(),
+        scratch,
     );
     if preserve_rax {
         emitter.memory(true, RegisterClass::Integer, 0, BORROW_SAVE, 8);
@@ -268,18 +285,12 @@ fn emit_exit(
     Ok(emitter.finish())
 }
 
-/// Cold entries with one state materialization and one RSB update. Entry zero
-/// is the dispatch fallback; returned offsets are [slice, control]. A lookup
-/// miss has already updated the RSB, whereas both poll exits must still do so.
-/// The reason/map pair is
-/// selected before writeback using only link scratch and flag-transparent moves.
-/// No new frame storage, relocation, shared owner or hot-edge work is required.
-/// Both entries have already charged their terminal checkpoint.
+/// Shared cold state materialization. Entry zero is the dispatch/slice fallback;
+/// the second entry selects control before writeback. The already charged
+/// terminal and its architectural destination are authoritative for every edge.
 pub(crate) fn emit_polled_exit(
     source: &ExitStateMap,
     pc: ValueLocation,
-    operation: &[u8],
-    indirect: bool,
 ) -> Result<(Vec<u8>, [usize; 2]), TransferError> {
     let mut emitter = Emitter::new(source.abi);
     exit_identity(&mut emitter, source, NativeExitReason::Dispatch);
@@ -292,34 +303,13 @@ pub(crate) fn emit_polled_exit(
     }
     let control = emitter.code.len();
     exit_identity(&mut emitter, source, NativeExitReason::Control);
-    let mut control_skip = None;
-    let slice = if indirect && !operation.is_empty() {
-        control_skip = Some(emitter.code.len());
-        if source.abi == HostAbi::X86_64 {
-            emitter.code_byte(0xe9);
-            emitter.word(0);
-        } else {
-            emitter.word(0x14000000);
-        }
-        let slice = emitter.code.len();
-        exit_identity(&mut emitter, source, NativeExitReason::Dispatch);
-        slice
-    } else {
-        0
-    };
-    let update = emitter.code.len();
-    emitter.code.extend_from_slice(operation);
     let common = emitter.code.len();
-    for (branch, target) in std::iter::once((skip, if indirect { common } else { update }))
-        .chain(control_skip.map(|branch| (branch, update)))
-    {
-        if source.abi == HostAbi::X86_64 {
-            emitter.code[branch + 1..branch + 5]
-                .copy_from_slice(&((target - branch - 5) as i32).to_le_bytes());
-        } else {
-            emitter.code[branch..branch + 4]
-                .copy_from_slice(&(0x14000000 | ((target - branch) as u32 / 4)).to_le_bytes());
-        }
+    if source.abi == HostAbi::X86_64 {
+        emitter.code[skip + 1..skip + 5]
+            .copy_from_slice(&((common - skip - 5) as i32).to_le_bytes());
+    } else {
+        emitter.code[skip..skip + 4]
+            .copy_from_slice(&(0x14000000 | ((common - skip) as u32 / 4)).to_le_bytes());
     }
     emitter.code.extend(exit_state(source, pc, 0)?.finish());
     // Architectural values are now canonical, including lazy flags. Only these
@@ -363,7 +353,7 @@ pub(crate) fn emit_polled_exit(
     };
     emitter.code[branch..branch + 4].copy_from_slice(&patch.to_le_bytes());
     exit_continuation(&mut emitter, offset_of!(NativeFrame<'static>, gateway_exit));
-    Ok((emitter.finish(), [slice, control]))
+    Ok((emitter.finish(), [0, control]))
 }
 
 fn exit_state(
@@ -502,13 +492,32 @@ fn temporary_register(abi: HostAbi) -> u8 {
     }
 }
 
-fn emit_operands(emitter: &mut Emitter, abi: HostAbi, load: bool, mut operands: Vec<Operand>) {
+fn emit_operands(emitter: &mut Emitter, abi: HostAbi, load: bool, operands: Vec<Operand>) {
+    emit_operands_with_scratch(emitter, abi, load, operands, None);
+}
+
+fn emit_operands_with_scratch(
+    emitter: &mut Emitter,
+    abi: HostAbi,
+    load: bool,
+    mut operands: Vec<Operand>,
+    scratch: Option<u8>,
+) {
     let pointer = abi.reserved().link_scratch[0];
-    let temporary = temporary_register(abi);
-    let borrow = abi == HostAbi::X86_64
-        && operands
-            .iter()
-            .any(|operand| !matches!(operand.location, ValueLocation::Register { .. }));
+    let temporary = scratch.unwrap_or_else(|| temporary_register(abi));
+    let borrow = scratch.is_none()
+        && abi == HostAbi::X86_64
+        && operands.iter().any(|operand| match operand.location {
+            ValueLocation::Register { .. } => false,
+            ValueLocation::Spill { .. } => true,
+            ValueLocation::Constant(value) => {
+                let part = operand.bytes.min(8);
+                (0..operand.bytes).step_by(usize::from(part)).any(|delta| {
+                    let value = (value.get() >> (delta * 8)) as u64;
+                    part != 4 && value != value as i32 as i64 as u64
+                })
+            }
+        });
     // Reuse each field pointer for contiguous X/V elements. When loading, a
     // bound RAX must be initialized after all memory-to-memory transfers.
     operands.sort_by_key(|operand| {

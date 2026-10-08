@@ -23,10 +23,27 @@ impl NativeFlow {
     pub(super) fn build(
         graph: &Graph,
         entries: &[usize],
+        contracts: &[crate::frontend::entry::Plan],
         effects: &[InstructionEffects],
         architectural: &[FlowBlock<'_>],
     ) -> Self {
+        // Carry bypass values, not an old version that this region overwrites.
+        // Semantic inputs remain live independently. Otherwise the predecessor
+        // commits the old home once for any PRE observation, instead of forcing
+        // an unused SSA input through faults, register allocation and spill maps.
+        let writes = architectural
+            .iter()
+            .fold(StateSet::default(), |state, block| {
+                state.union(block.effects.writes)
+            });
+        let carried: Vec<_> = contracts
+            .iter()
+            .map(|plan| plan.carry().without(writes))
+            .collect();
         let mut inherited = vec![StateSet::default(); graph.blocks.len()];
+        for (&entry, &carry) in entries.iter().zip(&carried) {
+            inherited[entry] = carry;
+        }
         let mut dirty_in = inherited.clone();
         let mut pending = VecDeque::with_capacity(graph.blocks.len());
         let mut queued = vec![false; graph.blocks.len()];
@@ -86,8 +103,8 @@ impl NativeFlow {
                 .collect();
             let blocks = analysis::liveness(&flow);
             let mut changed = false;
-            for &entry in entries {
-                let next = stale(blocks[entry].live_in);
+            for (&entry, &carry) in entries.iter().zip(&carried) {
+                let next = stale(blocks[entry].live_in).union(carry);
                 debug_assert!(inherited[entry].without(next).is_empty());
                 changed |= next != inherited[entry];
                 inherited[entry] = next;

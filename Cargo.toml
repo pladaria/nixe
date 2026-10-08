@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/trace",
     "apps/cli",
     "crates/config",
     "crates/audio",
@@ -33,6 +34,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
+nixe-trace = { path = "crates/trace" }
 aes = "0.8.4"
 bytemuck = "1.22"
 chrono = "0.4.41"

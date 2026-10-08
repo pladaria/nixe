@@ -78,6 +78,11 @@ pub struct MaxwellMemoryCopyOperation {
     pub(crate) semaphore_release: Option<(u64, u32)>,
 }
 
+pub(crate) enum ProjectedCopyByte {
+    Source(u64),
+    Constant(u8),
+}
+
 impl MaxwellMemoryCopyOperation {
     pub(crate) fn byte_copy(
         source_address: u64,
@@ -117,6 +122,151 @@ impl MaxwellMemoryCopyOperation {
             destination_range_size,
             source,
         })
+    }
+
+    pub(crate) fn device_transform(
+        self,
+        source: nixe_gpu::BufferRegion,
+        destination: nixe_gpu::BufferRegion,
+    ) -> Option<nixe_gpu::BufferTransform> {
+        let (
+            component_bytes,
+            source_components,
+            destination_components,
+            components,
+            constant_a,
+            constant_b,
+        ) = match self.remap {
+            Some(remap) => (
+                remap.component_bytes,
+                remap.source_components,
+                remap.destination_components,
+                remap.components.map(|source| match source {
+                    MaxwellMemoryCopyComponentSource::Source(index) => {
+                        nixe_gpu::TransferComponent::Source(index)
+                    }
+                    MaxwellMemoryCopyComponentSource::ConstantA => {
+                        nixe_gpu::TransferComponent::ConstantA
+                    }
+                    MaxwellMemoryCopyComponentSource::ConstantB => {
+                        nixe_gpu::TransferComponent::ConstantB
+                    }
+                    MaxwellMemoryCopyComponentSource::NoWrite => {
+                        nixe_gpu::TransferComponent::Preserve
+                    }
+                }),
+                remap.constant_a,
+                remap.constant_b,
+            ),
+            None => (1, 1, 1, [nixe_gpu::TransferComponent::Source(0); 4], 0, 0),
+        };
+        let layout = |layout, bytes: u8| {
+            Some(match layout {
+                MaxwellMemoryCopyLayout::Pitch { pitch } => {
+                    nixe_gpu::TransferLayout::Pitch { pitch }
+                }
+                MaxwellMemoryCopyLayout::BlockLinear {
+                    surface_width,
+                    x,
+                    y,
+                    block_height_log2,
+                    ..
+                } => nixe_gpu::TransferLayout::BlockLinear {
+                    row_bytes: surface_width.checked_mul(u32::from(bytes))?,
+                    origin_x_bytes: x.checked_mul(u32::from(bytes))?,
+                    origin_y: y,
+                    block_height_log2,
+                },
+            })
+        };
+        let transform = nixe_gpu::BufferTransform {
+            source,
+            destination,
+            source_layout: layout(self.source_layout, component_bytes * source_components)?,
+            destination_layout: layout(
+                self.destination_layout,
+                component_bytes * destination_components,
+            )?,
+            width: self.width,
+            height: self.height,
+            component_bytes,
+            source_components,
+            destination_components,
+            components,
+            constant_a,
+            constant_b,
+        };
+        transform.validate().ok()?;
+        Some(transform)
+    }
+
+    pub(crate) fn project_byte(
+        self,
+        offset: u64,
+    ) -> Result<Option<ProjectedCopyByte>, MaxwellMemoryCopyError> {
+        let (source_bytes, destination_bytes) = self.element_sizes();
+        let (x_byte, y) = match self.destination_layout {
+            MaxwellMemoryCopyLayout::Pitch { pitch } => {
+                (offset % u64::from(pitch), offset / u64::from(pitch))
+            }
+            MaxwellMemoryCopyLayout::BlockLinear {
+                surface_width,
+                block_height_log2,
+                x,
+                y,
+                ..
+            } => {
+                let height = 1_u64 << block_height_log2;
+                let row = (u64::from(surface_width) * u64::from(destination_bytes)).div_ceil(64)
+                    * 512
+                    * height;
+                let gob = offset % 512;
+                let bx = offset % row / (512 * height) * 64
+                    + gob / 256 * 32
+                    + gob % 64 / 32 * 16
+                    + gob % 16;
+                let by = offset / row * 8 * height
+                    + offset % (512 * height) / 512 * 8
+                    + gob % 256 / 64 * 2
+                    + gob % 32 / 16;
+                let Some(bx) = bx.checked_sub(u64::from(x) * u64::from(destination_bytes)) else {
+                    return Ok(None);
+                };
+                let Some(by) = by.checked_sub(u64::from(y)) else {
+                    return Ok(None);
+                };
+                (bx, by)
+            }
+        };
+        let x = x_byte / u64::from(destination_bytes);
+        if x >= u64::from(self.width) || y >= u64::from(self.height) {
+            return Ok(None);
+        }
+        let byte = x_byte % u64::from(destination_bytes);
+        let source_offset =
+            layout_offset(self.source_layout, x as u32, y as u32, source_bytes)? as u64;
+        let Some(remap) = self.remap else {
+            return Ok(Some(ProjectedCopyByte::Source(source_offset + byte)));
+        };
+        let component_byte = byte % u64::from(remap.component_bytes);
+        Ok(
+            match remap.components[(byte / u64::from(remap.component_bytes)) as usize] {
+                MaxwellMemoryCopyComponentSource::Source(component) => {
+                    Some(ProjectedCopyByte::Source(
+                        source_offset
+                            + u64::from(component) * u64::from(remap.component_bytes)
+                            + component_byte,
+                    ))
+                }
+                MaxwellMemoryCopyComponentSource::ConstantA => Some(ProjectedCopyByte::Constant(
+                    (remap.constant_a >> (component_byte * 8)) as u8,
+                )),
+                MaxwellMemoryCopyComponentSource::ConstantB => Some(ProjectedCopyByte::Constant(
+                    (remap.constant_b >> (component_byte * 8)) as u8,
+                )),
+                MaxwellMemoryCopyComponentSource::NoWrite => None,
+            },
+        )
     }
 
     pub(crate) const fn has_remap(self) -> bool {

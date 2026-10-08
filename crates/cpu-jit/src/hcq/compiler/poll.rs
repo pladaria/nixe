@@ -102,6 +102,6 @@ pub(super) fn append(
             crate::native::emit_canonical_exit(&record.state, pc, reason, 0).map_err(fail)?;
         *target = staging::append(bytes, &adapter) as u32;
     }
-    let cold = exit::append_poll(bytes, map, &record.state, pc, targets)?;
+    let cold = exit::append_poll(bytes, map, &record.state, pc, targets, false)?;
     map.patch_exit(bytes, 0, cold as u64).map_err(fail)
 }

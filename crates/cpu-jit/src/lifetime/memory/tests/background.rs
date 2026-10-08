@@ -10,6 +10,7 @@ fn mapping_change_cancels_running_compilation_without_waiting_and_allows_retry()
     let old = publish(&process, &memory, 0x1000);
     let block = key(0x1000);
     let snapshot = || AdmissionSnapshot {
+        observations: 128,
         key: block,
         version: process.reserve(block).unwrap().reachability,
         sequence: 8,
@@ -22,26 +23,31 @@ fn mapping_change_cancels_running_compilation_without_waiting_and_allows_retry()
     let wait = Mutex::new(wait);
     let (finished, done) = mpsc::channel();
     let calls = AtomicUsize::new(0);
-    let mut workers = Workers::start(1, Arc::clone(&process), move |_, work| {
-        let call = calls.fetch_add(1, Ordering::Relaxed);
-        let source = work.lcq(block)?.unwrap();
-        if call == 0 {
-            started.send(()).unwrap();
-            wait.lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap();
-        }
-        let result = work.check();
-        // The immutable old image survives unlink/republication until this
-        // compiler releases it. It does not hold an execution epoch open.
-        assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xf9400020);
-        drop(source);
-        drop(work);
-        finished.send((call, result)).unwrap();
-        result?;
-        Ok(())
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |_, work| {
+            let call = calls.fetch_add(1, Ordering::Relaxed);
+            let source = work.lcq(block)?.unwrap();
+            if call == 0 {
+                started.send(()).unwrap();
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+            let result = work.check();
+            // The immutable old image survives unlink/republication until this
+            // compiler releases it. It does not hold an execution epoch open.
+            assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xf9400020);
+            drop(source);
+            drop(work);
+            finished.send((call, result)).unwrap();
+            result?;
+            Ok(())
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     let mut samples = Samples::new();

@@ -260,7 +260,7 @@ fn hcq_policy_preserves_native_capabilities_and_lcq_compile_policy() {
         assert_eq!(lcq.flags().opt_level(), OptLevel::None);
         assert_eq!(
             lcq.flags().regalloc_algorithm(),
-            RegallocAlgorithm::SinglePass
+            RegallocAlgorithm::Backtracking
         );
         let capabilities = |isa: &dyn TargetIsa| {
             isa.isa_flags()

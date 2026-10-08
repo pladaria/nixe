@@ -123,7 +123,14 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
                        cache: &mut MaxwellLoweringCache,
                        creations: &mut Vec<_>,
                        invalidations: &mut Vec<_>| {
-            prepare_resources(resources, &[index], cache, creations, invalidations)
+            prepare_resources(
+                resources,
+                &[index],
+                vec![None; resources.resources().len()],
+                cache,
+                creations,
+                invalidations,
+            )
         };
         assert!(matches!(
             prepare(
@@ -535,6 +542,7 @@ fn compressed_uploads_retain_prior_stripes_and_require_complete_coverage() {
             let result = prepare_resources(
                 &textures,
                 &[texture_index],
+                vec![None; textures.resources().len()],
                 &mut cache,
                 &mut creations,
                 &mut invalidations,
@@ -578,6 +586,7 @@ fn compressed_uploads_retain_prior_stripes_and_require_complete_coverage() {
                 let result = prepare_resources(
                     &textures,
                     &[texture_index],
+                    vec![None; textures.resources().len()],
                     &mut cache,
                     &mut Vec::new(),
                     &mut Vec::new(),
@@ -616,6 +625,7 @@ fn compressed_uploads_retain_prior_stripes_and_require_complete_coverage() {
             prepare_resources(
                 &textures,
                 &[texture_index],
+                vec![None; textures.resources().len()],
                 &mut cache,
                 &mut Vec::new(),
                 &mut Vec::new()
@@ -630,6 +640,7 @@ fn compressed_uploads_retain_prior_stripes_and_require_complete_coverage() {
             prepare_resources(
                 &textures,
                 &[texture_index],
+                vec![None; textures.resources().len()],
                 &mut cache,
                 &mut Vec::new(),
                 &mut Vec::new()
@@ -655,4 +666,154 @@ fn inline_image_offsets_preserve_gob_coordinates_and_block_rows() {
     assert_eq!(inline_block_linear_position(512, 32, 4), (0, 8));
     assert_eq!(inline_block_linear_position(8192, 32, 4), (64, 0));
     assert_eq!(inline_block_linear_position(16384, 32, 4), (0, 128));
+}
+
+#[test]
+fn sampled_image_rebinding_retains_fixed_draw_and_rejects_uninitialized_opaque_storage() {
+    use super::super::threed::{
+        MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
+        resolve_maxwell_three_d_resources_for_roles,
+    };
+    let mut space =
+        MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+    space
+        .initialize(MaxwellAddressSpaceInitialization::default())
+        .unwrap();
+    let metadata = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let descriptors = map(&mut space, &metadata, 1, 0xfe);
+    let mut images = Vec::new();
+    for (id, kind) in [(2, 0xfe), (3, 0xfe), (4, 0xdb)] {
+        let pixels = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+        images.push(map(&mut space, &pixels, id, kind));
+    }
+    let mut channel = three_d_channel();
+    for (method, value) in [
+        (0x1574, (descriptors >> 32) as u32),
+        (0x1578, descriptors as u32),
+        (0x157c, 0),
+        (0x2380, 4),
+        (0x2384, (descriptors >> 32) as u32),
+        (0x2388, (descriptors + 0x100) as u32),
+        (0x2490, 1),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let role = MaxwellThreeDResourceRole::SampledImage {
+        texture: MaxwellThreeDTextureReference::new(4, 0, 0),
+        dimension: MaxwellThreeDTextureDimension::Two,
+    };
+    let resources: Vec<_> = images
+        .iter()
+        .map(|&address| {
+            tic(&metadata, address, 64, 0x58d2_4908);
+            resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &space, &[role]).unwrap()
+        })
+        .collect();
+    let index = resource_index(&resources[0], role).unwrap();
+    let (shaders, mut cache) = crate::engines::tests::translated_graphics_shaders();
+    let shaders = MaxwellThreeDTranslatedShaders::new(
+        shaders.shaders.to_vec(),
+        vec![
+            MaxwellThreeDShaderResourceUse::new(
+                role,
+                0,
+                DescriptorKind::SampledImage,
+                PipelineStages::FRAGMENT_SHADER,
+                Some(ResourceUsage::SampledImage),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut creations = Vec::new();
+    let bindings = prepare_resources(
+        &resources[0],
+        &[index],
+        vec![None; resources[0].resources().len()],
+        &mut cache,
+        &mut creations,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let first_image = bindings[index].unwrap();
+    let tables = prepare_descriptors(
+        vec![DescriptorTableBinding {
+            binding: 0,
+            resource: first_image,
+        }],
+        vec![DescriptorKind::SampledImage],
+        &mut cache,
+        &mut creations,
+    )
+    .unwrap();
+    let draw = Arc::new(
+        PreparedDraw::new(
+            PipelineId::new(1000),
+            RenderPassId::new(1001),
+            PrimitiveTopology::Triangles,
+            tables,
+            vec![],
+            None,
+        )
+        .unwrap(),
+    );
+    let arguments = DrawArguments::NonIndexed {
+        first_vertex: 0,
+        vertex_count: 3,
+        first_instance: 0,
+        instance_count: 1,
+    };
+    let (accesses, dependencies) =
+        draw_shader_dependencies(&resources[0], &bindings, &[], &shaders).unwrap();
+    let operation = GpuOperation::new(
+        GpuCommand::Draw(DrawOperation::new(draw, arguments).unwrap()),
+        accesses.iter().copied(),
+        dependencies.iter().copied(),
+        CapabilityRequirements::none(),
+    );
+    let end = GpuOperation::new(
+        GpuCommand::RenderPass(RenderPassOperation::end(RenderPassId::new(1001))),
+        [],
+        [],
+        CapabilityRequirements::none(),
+    );
+    let prepared = Arc::new(PreparedDrawRecord {
+        indexed: false,
+        state: channel.three_d().fixed_draw_identity(),
+        components: resources[0].resources().into(),
+        samplers: Box::new([]),
+        bindings: bindings.into(),
+        sampler_bindings: Box::new([]),
+        consumed: Arc::from([index]),
+        vertex_streams: Arc::from([]),
+        shader_accesses: accesses.into(),
+        shader_dependencies: dependencies.into(),
+        shaders,
+        operations: [end.clone(), operation, end],
+        dirty_images: Arc::from([]),
+        sampled_aliases: Box::new([]),
+    });
+    let refreshed = refresh_draw_bindings(&resources[1], arguments, &prepared, &mut cache)
+        .unwrap()
+        .unwrap();
+    assert!(
+        refreshed.record.operations[1]
+            .dependencies()
+            .contains(&refreshed.record.bindings[index].unwrap())
+    );
+    assert!(
+        !refreshed.record.operations[1]
+            .dependencies()
+            .contains(&first_image)
+    );
+    assert!(prepared.operations[1].dependencies().contains(&first_image));
+    let GpuCommand::Draw(current) = refreshed.record.operations[1].command() else {
+        panic!()
+    };
+    assert_eq!(current.prepared.pipeline, PipelineId::new(1000));
+    assert_eq!(current.prepared.render_pass, RenderPassId::new(1001));
+    assert!(matches!(
+        refresh_draw_bindings(&resources[2], arguments, &refreshed.record, &mut cache),
+        Err(MaxwellLoweringError::CompressedSampledImageImportRequired { .. })
+    ));
 }

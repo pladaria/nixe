@@ -6,7 +6,9 @@ use nixe_cpu::decode::a64::{A64Instruction, control, system as a64_system};
 use nixe_cpu::decode::{self, DecodeResult};
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::{ExecutableMemory, InstructionImage};
+#[cfg(test)]
 use nixe_memory::GuestVirtualAddress;
+use std::cell::RefCell;
 use std::num::NonZeroU16;
 
 const MAX_INSTRUCTIONS: NonZeroU16 = NonZeroU16::new(512).unwrap();
@@ -23,16 +25,28 @@ pub(crate) struct Compilation<'a> {
     pub claim: crate::lifetime::compile::Claim<'a>,
     pub fragment: Fragment,
     pub identity: crate::lifetime::unit::EmissionIdentity,
+    /// Actual cold predecessor, before an indirect target has a PIC backlink.
+    /// Physical preferences only; it retains neither code nor an invocation.
+    pub entry_plan: Option<crate::frontend::entry::Plan>,
 }
 
 impl<'a> Compilation<'a> {
+    #[cfg(test)]
     pub(crate) fn capture(
         claim: crate::lifetime::compile::Claim<'a>,
         memory: &impl ExecutableMemory,
     ) -> Result<Self, crate::lifetime::Error> {
+        Self::capture_with(claim, memory, &mut Capture::default())
+    }
+
+    pub(crate) fn capture_with(
+        claim: crate::lifetime::compile::Claim<'a>,
+        memory: &impl ExecutableMemory,
+        capture: &mut Capture,
+    ) -> Result<Self, crate::lifetime::Error> {
         claim.validate()?;
-        let fragment =
-            Fragment::capture(memory, claim.key()).map_err(crate::lifetime::Error::InvalidUnit)?;
+        let fragment = Fragment::capture_with(memory, claim.key(), capture)
+            .map_err(crate::lifetime::Error::InvalidUnit)?;
         let claim = claim.after_capture()?;
         if !memory.image_is_current(&fragment.image) {
             return Err(crate::lifetime::Error::StalePublication);
@@ -42,6 +56,7 @@ impl<'a> Compilation<'a> {
             claim,
             fragment,
             identity,
+            entry_plan: None,
         })
     }
 }
@@ -71,11 +86,29 @@ pub(crate) enum End {
     },
 }
 
+/// One scratch allocation per compiler owner. Final fragments take decoded
+/// values out of these slots; only restart-safe (PC ordinal, exact bits) pairs
+/// are reused during capture. No decoded value survives into another image.
+#[derive(Default)]
+pub(crate) struct Capture {
+    decoded: RefCell<Vec<(u32, Option<DecodeResult>)>>,
+}
+
 impl Fragment {
+    #[cfg(test)]
     pub(crate) fn capture(
         memory: &impl ExecutableMemory,
         key: BlockKey,
     ) -> Result<Self, &'static str> {
+        Self::capture_with(memory, key, &mut Capture::default())
+    }
+
+    pub(crate) fn capture_with(
+        memory: &impl ExecutableMemory,
+        key: BlockKey,
+        capture: &mut Capture,
+    ) -> Result<Self, &'static str> {
+        let _trace = nixe_trace::Span::new("cpu.lcq.capture_decode", 0, 0);
         if key.pc.get() & 3 != 0 || key.profile != key.platform.profile_id() {
             return Err("LCQ key has an unaligned PC or inconsistent platform/profile");
         }
@@ -86,23 +119,37 @@ impl Fragment {
                 bits.into(),
             )
         };
-        // Classification only: callback execution is bounded, cannot touch
-        // memory, and is restartable for tracking or device reconciliation.
+        // Memoize by image ordinal AND exact bits. Capture can restart after
+        // tracking/reconciliation, including with different executable bytes.
+        // No memory access or assumption about callback order crosses a restart.
+        let decoded = &mut capture.decoded;
+        decoded.get_mut().clear();
         let image = memory.capture_instructions(
             key.address_space,
             key.pc,
             MAX_INSTRUCTIONS,
-            &|pc, bits| boundary(&decode(pc, bits), key).is_some(),
+            &|pc, bits| {
+                let index = ((pc.get() - key.pc.get()) / 4) as usize;
+                let mut decoded = decoded.borrow_mut();
+                if index < decoded.len() {
+                    if decoded[index].0 != bits {
+                        decoded[index] = (bits, Some(decode(pc, bits)));
+                    }
+                } else {
+                    assert_eq!(index, decoded.len(), "noncontiguous executable capture");
+                    decoded.push((bits, Some(decode(pc, bits))));
+                }
+                boundary(decoded[index].1.as_ref().unwrap(), key).is_some()
+            },
         );
+        let mut decoded = decoded.get_mut().iter_mut();
         let instructions: Box<[_]> = image
             .words()
             .iter()
-            .enumerate()
-            .map(|(index, word)| {
-                decode(
-                    GuestVirtualAddress::new(key.pc.get().wrapping_add(index as u64 * 4)),
-                    word.bits,
-                )
+            .map(|word| {
+                let (bits, instruction) = decoded.next().expect("captured word was classified");
+                assert_eq!(*bits, word.bits, "capture returned an unclassified word");
+                instruction.take().unwrap()
             })
             .collect();
         #[cfg(test)]

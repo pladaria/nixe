@@ -10,6 +10,7 @@ test-support = []
 performance-counters = ["nixe-gpu/performance-counters"]
 
 [dependencies]
+nixe-trace.workspace = true
 log.workspace = true
 nixe-gpu.workspace = true
 nixe-memory.workspace = true

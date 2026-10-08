@@ -669,6 +669,15 @@ fn segment_size(index: usize) -> usize {
     (WINDOW_BYTES - index * SEGMENT_BYTES).min(SEGMENT_BYTES)
 }
 
+// Every allocation retains the cache. Its last owner therefore flushes after
+// all reclamation events, outside both cache and JIT lifetime locks.
+#[cfg(feature = "jit-profile")]
+impl Drop for Cache {
+    fn drop(&mut self) {
+        crate::profiling::flush();
+    }
+}
+
 pub(crate) struct Allocation {
     cache: Arc<Cache>,
     pub tier: Tier,
@@ -703,6 +712,8 @@ impl Allocation {
 }
 impl Drop for Allocation {
     fn drop(&mut self) {
+        #[cfg(feature = "jit-profile")]
+        crate::profiling::retire(self.address(), self.span.len);
         if let Ok(mut state) = self.cache.lock() {
             let segment = &mut state.segments[self.segment];
             assert_eq!(segment.generation, Some(self.generation));

@@ -2078,7 +2078,7 @@ fn emit_wgsl_vertex_pull_entry_points(
 ) -> Result<(), ShaderBackendLoweringError> {
     let mut pulled = std::collections::BTreeMap::new();
     for (slot, layout) in layouts.iter().enumerate() {
-        for attribute in &layout.attributes {
+        for attribute in layout.attributes.iter() {
             if pull_all || attribute.format.requires_vertex_pulling() {
                 pulled.insert(attribute.shader_location, (slot, layout, attribute));
             }

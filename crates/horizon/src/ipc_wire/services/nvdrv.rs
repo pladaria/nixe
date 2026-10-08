@@ -41,6 +41,7 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
     hipc: &HipcRequest<'_>,
     caller_thread_id: u64,
     clock: &nixe_runtime::VirtualClock,
+    async_reply: &crate::host_work::AsyncReply<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let service = NvDrvService::new(session);
     let Some(command) = NvDrvCommand::decode(request.command_id) else {
@@ -50,6 +51,14 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
             },
         ));
     };
+    async_reply.system.require_graphics_healthy()?;
+    if !matches!(
+        command,
+        NvDrvCommand::Ioctl | NvDrvCommand::Ioctl2 | NvDrvCommand::Ioctl3
+    ) && let Some(wait) = session.frontend_wait()
+    {
+        return Err(IpcWireError::PendingHostWork(wait));
+    }
     match command {
         // GetStatus returns NvError followed by NvDrvStatus.
         // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#GetStatus
@@ -189,6 +198,18 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
             let response = match response {
                 NvDrvIoctlOutcome::Complete(response) => response,
+                NvDrvIoctlOutcome::Frontend(work) => {
+                    let response = work.response;
+                    async_reply.system.submit_graphics(
+                        work.frontend.get(),
+                        work.guard,
+                        move || (work.run)().map_err(IpcWireError::UnsupportedNvDrv),
+                    )?;
+                    response
+                }
+                NvDrvIoctlOutcome::PendingFrontend(wait) => {
+                    return Err(IpcWireError::PendingHostWork(wait));
+                }
                 NvDrvIoctlOutcome::PendingSubmission(wait) => {
                     return Err(IpcWireError::PendingGpuSubmission(wait));
                 }

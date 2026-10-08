@@ -545,7 +545,7 @@ fn queued_running_and_staged_reshapes_survive_unrelated_closed_maintenance() {
             );
             let mut work = running.then(|| {
                 process
-                    .accept_background(queue.pop().unwrap().unwrap())
+                    .accept_background(queue.pop_ready().unwrap().unwrap())
                     .unwrap()
                     .unwrap()
             });
@@ -555,7 +555,7 @@ fn queued_running_and_staged_reshapes_survive_unrelated_closed_maintenance() {
             if !running {
                 work = Some(
                     process
-                        .accept_background(queue.pop().unwrap().unwrap())
+                        .accept_background(queue.pop_ready().unwrap().unwrap())
                         .unwrap()
                         .unwrap(),
                 );

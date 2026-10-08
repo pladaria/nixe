@@ -196,6 +196,7 @@ impl Compiler {
         frozen: &Frozen<'_, '_>,
         memory: &(impl ExecutableMemory + MemoryInvalidationSource),
     ) -> Result<UnitHandle, Failure> {
+        let _trace = nixe_trace::Span::new("cpu.compile_hcq", 0, 0);
         // Positive publication keeps its cursor guard from before input capture.
         // Negative results only need the exact memory images and owner evidence.
         let cursor = memory.invalidation_cursor();

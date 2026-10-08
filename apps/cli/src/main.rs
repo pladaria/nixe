@@ -2,6 +2,8 @@ mod commands;
 mod logging;
 #[cfg(feature = "performance-counters")]
 mod performance;
+#[cfg(feature = "frame-trace")]
+mod timeline;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -53,6 +55,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    #[cfg(feature = "frame-trace")]
+    let timeline = match timeline::Timeline::start() {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("cannot start timeline: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let result = match invocation.command {
         Command::Input => commands::input::run(),
         Command::List(arguments) => commands::list::run(arguments),
@@ -63,6 +73,13 @@ fn main() -> ExitCode {
         && let Err(error) = capture.finish()
     {
         log::error!("cannot finish performance capture: {error}");
+        return ExitCode::FAILURE;
+    }
+    #[cfg(feature = "frame-trace")]
+    if let Some(timeline) = timeline
+        && let Err(error) = timeline.finish()
+    {
+        log::error!("cannot finish timeline: {error}");
         return ExitCode::FAILURE;
     }
     match result {

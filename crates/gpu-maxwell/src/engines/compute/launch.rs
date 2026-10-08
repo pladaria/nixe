@@ -2,7 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 
-use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
+use nixe_memory::{CanonicalWriteBatchError, MemoryPermissions};
 
 use super::{
     MaxwellComputeAddress, MaxwellComputeState,
@@ -173,7 +173,7 @@ impl MaxwellResolvedComputeLaunch {
         &self,
         program: &crate::shader::MaxwellComputeProgram,
         address_space: &MaxwellGpuAddressSpace,
-        writes: &CanonicalWriteBatch,
+        writes: &crate::projection::MemoryProjection,
     ) -> Result<Vec<(u8, crate::MaxwellResolvedRange)>, MaxwellComputeLaunchError> {
         let buffer_error = |binding, reason| MaxwellComputeLaunchError::Buffer {
             source: Box::new(self.source),
@@ -267,7 +267,7 @@ impl MaxwellResolvedComputeLaunch {
     pub(crate) fn translate_kernel(
         &self,
         address_space: &MaxwellGpuAddressSpace,
-        writes: &CanonicalWriteBatch,
+        writes: &crate::projection::MemoryProjection,
     ) -> Result<crate::shader::MaxwellComputeProgram, crate::MaxwellShaderTranslationError> {
         crate::shader::translate_compute_program(
             address_space,
@@ -283,7 +283,7 @@ pub(crate) fn resolve_compute_launch(
     launch: &MaxwellComputeLaunch,
     state: &MaxwellComputeState,
     address_space: &MaxwellGpuAddressSpace,
-    writes: &CanonicalWriteBatch,
+    writes: &crate::projection::MemoryProjection,
 ) -> Result<MaxwellResolvedComputeLaunch, MaxwellComputeLaunchError> {
     let source = launch.source();
     if state.shader_exceptions_enable().value() == Some(&true) {

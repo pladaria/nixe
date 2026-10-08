@@ -10,6 +10,11 @@ impl HorizonSvcDispatcher {
         stop: &nixe_runtime::ExecutionStop,
     ) -> Result<nixe_runtime::ExceptionHandlingResult<HorizonSvcFault>, HorizonScheduledDispatchError>
     {
+        let immediate = match stop {
+            nixe_runtime::ExecutionStop::SupervisorCall { immediate, .. } => u64::from(*immediate),
+            _ => 0,
+        };
+        let _trace = nixe_trace::Span::new("horizon.svc", lease.thread.get(), immediate);
         self.synchronize_virtual_time(coordinator.virtual_time_ns());
         let handling = coordinator
             .route_supervisor_call(lease, stop, self)

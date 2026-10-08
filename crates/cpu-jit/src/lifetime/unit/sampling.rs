@@ -213,12 +213,15 @@ mod tests {
                 }
                 .unwrap();
                 if count < 8 {
-                    assert!(queue.pop().unwrap().is_none());
+                    assert!(queue.pop_ready().unwrap().is_none());
                 }
             }
             // If the identity mutex still covered admission, its try-lock
             // would defer instead of producing this exact threshold job.
-            let job = queue.pop().unwrap().expect("eighth sample must enqueue");
+            let job = queue
+                .pop_ready()
+                .unwrap()
+                .expect("eighth sample must enqueue");
             let work = process.accept_background(job).unwrap().unwrap();
             let crate::lifetime::background::Observation::Seed(snapshot) = work.observation()
             else {
@@ -298,7 +301,7 @@ mod tests {
         process.sample_lcq(&unit, &mut samples, None).unwrap();
         let observed = samples.seed_snapshot(key(0)).unwrap();
         assert_eq!(observed.1, 1);
-        process.request(Reason::LinkPatch).unwrap();
+        process.request(Reason::TierCutover).unwrap();
         process.sample_lcq(&unit, &mut samples, None).unwrap();
         assert_eq!(samples.seed_snapshot(key(0)).unwrap(), observed);
     }

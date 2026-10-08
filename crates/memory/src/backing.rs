@@ -214,6 +214,66 @@ struct CanonicalPageState {
     direct_aliases: BTreeMap<(usize, u64), CanonicalDirectAlias>,
 }
 
+/// Metadata-only registration while all pages already exclude direct writes.
+/// Locks follow canonical page order, shared with checked multi-page writers.
+/// A fault cannot disarm tracking or make an alias writable until these guards
+/// drop. This path neither copies bytes nor changes host protections.
+pub(crate) struct CpuTrackingCapture<'a> {
+    pages: &'a [CanonicalBackingPage],
+    states: Vec<std::sync::MutexGuard<'a, CanonicalPageState>>,
+}
+
+impl<'a> CpuTrackingCapture<'a> {
+    pub(crate) fn try_lock(
+        pages: &'a [CanonicalBackingPage],
+    ) -> Result<Option<Self>, CanonicalPageError> {
+        debug_assert!(
+            pages
+                .windows(2)
+                .all(|pair| pair[0].identity() < pair[1].identity())
+        );
+        let mut states = Vec::with_capacity(pages.len());
+        for page in pages {
+            let state = page.lock_state();
+            match state.visibility {
+                PageVisibility::Invalid => {
+                    return Err(CanonicalPageError::Visibility(
+                        VisibilityError::InvalidState,
+                    ));
+                }
+                PageVisibility::Conflicting => {
+                    return Err(CanonicalPageError::Visibility(
+                        VisibilityError::ConflictingAccess,
+                    ));
+                }
+                _ => {}
+            }
+            if !state.cpu_dirty_observer_armed {
+                return Ok(None);
+            }
+            states.push(state);
+        }
+        Ok(Some(Self { pages, states }))
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        index: usize,
+        summary: Option<(&Arc<crate::range::CpuWriteSummary>, usize)>,
+    ) -> u64 {
+        if let Some((summary, group)) = summary {
+            let state = &mut self.states[index];
+            state
+                .cpu_dirty_summaries
+                .retain(|(existing, _)| existing.strong_count() != 0);
+            state
+                .cpu_dirty_summaries
+                .push((Arc::downgrade(summary), group));
+        }
+        self.pages[index].cpu_dirty_epoch()
+    }
+}
+
 struct CanonicalDirectAlias {
     arena: DirectArenaWeak,
     guest_address: u64,
@@ -491,19 +551,6 @@ impl CanonicalBackingPage {
         self.ensure_backing()?;
         let mut state = self.lock_state();
         self.arm_cpu_dirty_observer_locked(&mut state)
-    }
-
-    pub(crate) fn needs_cpu_dirty_tracking(&self) -> Result<bool, CanonicalPageError> {
-        let state = self.lock_state();
-        match state.visibility {
-            PageVisibility::Invalid => Err(CanonicalPageError::Visibility(
-                VisibilityError::InvalidState,
-            )),
-            PageVisibility::Conflicting => Err(CanonicalPageError::Visibility(
-                VisibilityError::ConflictingAccess,
-            )),
-            _ => Ok(!state.cpu_dirty_observer_armed),
-        }
     }
 
     pub(crate) fn observe_visibility_summary(&self, summary: &Arc<AtomicU64>) {

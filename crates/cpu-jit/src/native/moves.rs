@@ -362,14 +362,23 @@ impl Emitter {
             self.code.push(rex);
         }
         self.code.extend_from_slice(opcode);
+        // Memory through RSP/R12 needs a SIB byte even without an index;
+        // RBP/R13 needs a displacement to distinguish it from RIP-relative.
+        // https://cdrdv2-public.intel.com/782151/253667-sdm-vol-2b.pdf
+        let forced_displacement = offset == Some(0) && rm & 7 == 5;
         let mode = match offset {
             None => 0xc0,
+            Some(0) if forced_displacement => 0x40,
             Some(0) => 0,
             Some(1..=127) => 0x40,
             Some(_) => 0x80,
         };
         self.code.push(mode | ((reg & 7) << 3) | (rm & 7));
+        if offset.is_some() && rm & 7 == 4 {
+            self.code.push(0x24); // no index, base RSP/R12
+        }
         match offset {
+            Some(0) if forced_displacement => self.code.push(0),
             None | Some(0) => {}
             Some(offset @ 1..=127) => self.code.push(offset as u8),
             Some(offset) => self.code.extend_from_slice(&offset.to_le_bytes()),

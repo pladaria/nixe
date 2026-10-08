@@ -109,7 +109,7 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
     else {
         panic!()
     };
-    let mut writes = CanonicalWriteBatch::new();
+    let mut writes = crate::projection::MemoryProjection::default();
     writes
         .stage(&backing, 0x800, &(address + 0xc00).to_le_bytes())
         .unwrap();
@@ -141,7 +141,11 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
     if let Some(runtime) = &mut runtime {
         // Commit the same command-processor write before device consumption.
         // Planning itself must not publish guest memory or completion.
-        writes.commit().unwrap();
+        let mut committed = CanonicalWriteBatch::new();
+        committed
+            .stage(&backing, 0x800, &(address + 0xc00).to_le_bytes())
+            .unwrap();
+        committed.commit().unwrap();
         allocation.write(0xc00, &[0xa5; 8]).unwrap();
         for work in [&first, &second] {
             runtime
@@ -176,7 +180,7 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
     for frame in 0..384_u64 {
         let slot = frame % 128;
         let cb = alias + 0x800 + slot * 8;
-        let mut pending = CanonicalWriteBatch::new();
+        let mut pending = crate::projection::MemoryProjection::default();
         pending
             .stage(&backing, 0x74, &(cb as u32).to_le_bytes())
             .unwrap();
@@ -235,7 +239,7 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
             assert_eq!(tables, ring_tables[slot as usize]);
         }
     }
-    let mut patched = CanonicalWriteBatch::new();
+    let mut patched = crate::projection::MemoryProjection::default();
     patched
         .stage(&backing, 0x218, &0xeedc200000070000_u64.to_le_bytes())
         .unwrap();
@@ -279,7 +283,7 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
     assert_eq!(unchanged, [0; 8]);
 
     // Aliasing through a distinct GPU mapping is still the same canonical RAM.
-    let mut overlapping = CanonicalWriteBatch::new();
+    let mut overlapping = crate::projection::MemoryProjection::default();
     overlapping
         .stage(&backing, 0x800, &(address + 0x804).to_le_bytes())
         .unwrap();
@@ -296,7 +300,7 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
     ));
 
     for pointer in [address + 0xc02, 1 << 40, read_only + 0xc00] {
-        let mut writes = CanonicalWriteBatch::new();
+        let mut writes = crate::projection::MemoryProjection::default();
         writes
             .stage(&backing, 0x800, &pointer.to_le_bytes())
             .unwrap();
@@ -313,7 +317,7 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
             &((((alias + 0x800) >> 32) as u32) | (4 << 15)).to_le_bytes(),
         )
         .unwrap();
-    let writes = CanonicalWriteBatch::new();
+    let writes = crate::projection::MemoryProjection::default();
     let resolved = resolve_compute_launch(launch, state, &address_space, &writes).unwrap();
     assert!(matches!(
         resolved.resolve_resources(&program, &address_space, &writes),
@@ -453,7 +457,7 @@ fn qmd_resolution_checks_memory_version_and_program_address_on_consumption() {
         .offset()
         .get();
     let mut channel = compute_channel();
-    let writes = CanonicalWriteBatch::new();
+    let writes = crate::projection::MemoryProjection::default();
 
     for qmd_address in [0xffff_ffff00, write_only] {
         // Programming a pointer is legal; validate memory only at scheduling.

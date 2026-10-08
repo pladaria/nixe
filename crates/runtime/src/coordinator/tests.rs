@@ -1380,6 +1380,8 @@ fn parallel_adaptive_quanta_do_not_reset_compute_cores_on_another_cores_svc() {
             .unwrap();
     }
     let mut svc = false;
+    let compute_ceiling = coordinator.parallel_budgets[&VirtualCpuId::new(7)].ceiling;
+    let mut compute_budget = 10;
     let mut computed = false;
     while !svc || !computed {
         let execution = coordinator.run_parallel_adaptive().unwrap().unwrap();
@@ -1389,8 +1391,11 @@ fn parallel_adaptive_quanta_do_not_reset_compute_cores_on_another_cores_svc() {
                 ExecutionStop::SupervisorCall { .. }
             ));
             svc = true;
-        } else if !computed {
-            assert_eq!(execution.report.progress, 10);
+        } else {
+            // Host scheduling may deliver several compute completions before
+            // the other worker's SVC. Validate each independent quantum.
+            assert_eq!(execution.report.progress, compute_budget);
+            compute_budget = (compute_budget * 2).min(compute_ceiling);
             computed = true;
         }
     }
@@ -1400,13 +1405,14 @@ fn parallel_adaptive_quanta_do_not_reset_compute_cores_on_another_cores_svc() {
     );
     assert_eq!(
         coordinator.parallel_budgets[&VirtualCpuId::new(7)].current,
-        20
+        compute_budget
     );
     let execution = coordinator.run_parallel_adaptive().unwrap().unwrap();
-    assert_eq!(execution.report.progress, 20);
+    assert_eq!(execution.lease.vcpu, VirtualCpuId::new(7));
+    assert_eq!(execution.report.progress, compute_budget);
     assert_eq!(
         coordinator.parallel_budgets[&VirtualCpuId::new(7)].current,
-        40
+        (compute_budget * 2).min(compute_ceiling)
     );
 }
 
@@ -1487,4 +1493,58 @@ fn parallel_completion_returns_before_a_busy_core_and_quiescence_restores_its_st
         stopped.report.stop,
         ExecutionStop::Safepoint | ExecutionStop::BudgetExhausted
     ));
+}
+
+#[test]
+fn live_quantum_targets_elapsed_compute_and_bounds_each_adjustment() {
+    use std::time::Duration;
+    let mut budget = AdaptiveExecutionBudget::new(10_000);
+    budget.observe_elapsed(10_000, Duration::from_micros(10));
+    assert_eq!(budget.current, 20_000);
+    budget.observe_elapsed(20_000, Duration::from_micros(10));
+    assert_eq!(budget.current, 40_000);
+    budget.observe_elapsed(40_000, Duration::from_millis(4));
+    assert_eq!(budget.current, 20_000);
+    budget.observe_elapsed(20_000, Duration::from_secs(1));
+    assert_eq!(budget.current, 10_000);
+    for _ in 0..30 {
+        budget.observe_elapsed(budget.current, Duration::from_nanos(1));
+    }
+    assert_eq!(budget.current, 4_000_000);
+    budget.observe_elapsed(0, Duration::from_secs(1));
+    budget.observe_elapsed(u64::MAX, Duration::ZERO);
+    assert_eq!(budget.current, 4_000_000);
+    let mut explicit_large_baseline = AdaptiveExecutionBudget::new(8_000_000);
+    explicit_large_baseline.observe_elapsed(8_000_000, Duration::from_secs(1));
+    assert_eq!(explicit_large_baseline.current, 8_000_000);
+}
+
+#[test]
+fn live_parallel_svc_preserves_the_learned_compute_quantum() {
+    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+        profile(),
+        crate::VirtualClock::new(crate::VirtualClockMode::Realtime),
+        VcpuExecutionMode::Parallel,
+    )
+    .unwrap();
+    coordinator
+        .register_process(
+            synthetic_svc_process_for_coordinator(1),
+            registration(&coordinator),
+        )
+        .unwrap();
+    coordinator
+        .parallel_budgets
+        .get_mut(&VirtualCpuId::new(7))
+        .unwrap()
+        .current = 200_000;
+    let execution = coordinator.run_parallel_adaptive().unwrap().unwrap();
+    assert!(matches!(
+        execution.report.stop,
+        ExecutionStop::SupervisorCall { .. }
+    ));
+    assert_eq!(
+        coordinator.parallel_budgets[&VirtualCpuId::new(7)].current,
+        200_000
+    );
 }

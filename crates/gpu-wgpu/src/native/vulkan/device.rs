@@ -78,6 +78,11 @@ pub(crate) fn create_device(
         }
         let mut extensions = hal.required_device_extensions(descriptor.required_features);
         let supported = hal.physical_device_capabilities();
+        if nixe_trace::capture_compiled()
+            && supported.supports_extension(ash::ext::calibrated_timestamps::NAME)
+        {
+            add_extension(&mut extensions, ash::ext::calibrated_timestamps::NAME);
+        }
         let float_controls = properties.api_version >= vk::API_VERSION_1_2
             || supported.supports_extension(ash::khr::shader_float_controls::NAME);
         let mut floats = vk::PhysicalDeviceFloatControlsProperties::default();

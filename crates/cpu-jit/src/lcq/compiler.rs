@@ -79,6 +79,7 @@ pub(crate) struct Compiler {
     context: Context,
     frontend: FunctionBuilderContext,
     arena_size: Option<u64>,
+    exit_maps: Vec<usize>,
 }
 
 struct Lowered {
@@ -98,6 +99,7 @@ impl Compiler {
             context: Context::new(),
             frontend: FunctionBuilderContext::new(),
             arena_size: None,
+            exit_maps: Vec::new(),
         })
     }
 
@@ -114,13 +116,19 @@ impl Compiler {
     /// rejects stale captures; it does not replace the bound mutation observer.
     pub(crate) fn publish(
         &mut self,
-        compilation: Compilation<'_>,
+        mut compilation: Compilation<'_>,
         process: &Lifetime,
         cache: &Arc<Cache>,
         memory: &(impl ExecutableMemory + MemoryInvalidationSource),
     ) -> Result<UnitHandle, PublishError> {
+        let _trace = nixe_trace::Span::new("cpu.compile_lcq", 0, 0);
         compilation.claim.validate()?;
-        let lowered = self.lower(&compilation.fragment, compilation.identity.version())?;
+        let plan = compilation
+            .entry_plan
+            .take()
+            .unwrap_or_else(|| process.entry_plan(compilation.fragment.key));
+        let lowered =
+            self.lower_with_plan(&compilation.fragment, compilation.identity.version(), &plan)?;
         Self::publish_lowered(compilation, lowered, process, cache, memory)
     }
 
@@ -131,10 +139,12 @@ impl Compiler {
         cache: &Arc<Cache>,
         memory: &(impl ExecutableMemory + MemoryInvalidationSource),
     ) -> Result<UnitHandle, PublishError> {
+        let _trace = nixe_trace::Span::new("cpu.lcq.install_publish", 0, 0);
         let Compilation {
             claim,
             fragment,
             identity,
+            entry_plan: _,
         } = compilation;
         if !memory.image_is_current(&fragment.image) {
             return Err(PublishError::StaleCapture);
@@ -203,8 +213,18 @@ impl Compiler {
             .map_err(PublishError::Lifetime)
     }
 
+    #[cfg(test)]
     fn lower(&mut self, fragment: &Fragment, version: CodeVersion) -> Result<Lowered, Error> {
-        let result = self.lower_fragment(fragment, version);
+        self.lower_with_plan(fragment, version, &Default::default())
+    }
+
+    fn lower_with_plan(
+        &mut self,
+        fragment: &Fragment,
+        version: CodeVersion,
+        plan: &crate::frontend::entry::Plan,
+    ) -> Result<Lowered, Error> {
+        let result = self.lower_fragment(fragment, version, plan);
         if result.is_err() {
             // An error may leave a FunctionBuilder without finalize(). Discard
             // only that failed compilation's scratch; successful compiles reuse it.
@@ -218,7 +238,10 @@ impl Compiler {
         &mut self,
         fragment: &Fragment,
         version: CodeVersion,
+        plan: &crate::frontend::entry::Plan,
     ) -> Result<Lowered, Error> {
+        let lowering =
+            nixe_trace::Span::new("cpu.lcq.lower", 0, fragment.instructions.len() as u64);
         // These families require the native helper/memory ports before they
         // can be admitted. Never masquerade missing lowering as guest behavior.
         if fragment.instructions.is_empty() {
@@ -231,8 +254,9 @@ impl Compiler {
             )));
         }
         let mut effects = BlockEffects::default();
-        for decoded in &fragment.instructions {
-            if let DecodeResult::Decoded(decoded) = decoded {
+        let mut architectural = BlockEffects::default();
+        for word in &fragment.instructions {
+            if let DecodeResult::Decoded(decoded) = word {
                 let normalized = decode::a64::normalize(&decoded.instruction, decoded.encoding);
                 crate::frontend::check_memory_host(self.abi, &*self.isa, normalized)?;
                 if !matches!(
@@ -249,21 +273,39 @@ impl Compiler {
                     )));
                 }
                 let mut effect = instruction_effects(normalized);
+                let mut precise = effect;
+                if super::boundary(word, fragment.key)
+                    .is_some_and(|end| !matches!(end, super::End::Control))
+                {
+                    // Native helpers/unsupported terminals complete after the
+                    // PRE exit. Their nominal writes cannot kill old values.
+                    precise.writes = StateSet::default();
+                    precise.observe_before = StateSet::ALL;
+                }
+                architectural.push(precise);
                 // Semantic reads/defs determine fast inputs. Bridges keep homes
                 // current for values not carried by that contract; snapshots
                 // retain carried inputs as potentially dirty, even if only read.
                 effect.observe_before = StateSet::default();
                 effect.observe_after = StateSet::default();
                 effects.push(effect);
+            } else {
+                architectural.push(crate::analysis::InstructionEffects {
+                    observe_before: StateSet::ALL,
+                    ..Default::default()
+                });
             }
         }
+        let discard = StateSet::ALL.without(architectural.live_before(StateSet::ALL));
         let live_in = liveness(&[FlowBlock {
             effects,
             successors: &[],
             exit_live: effects.writes,
         }])[0]
-            .live_in;
+            .live_in
+            .union(plan.carry().without(architectural.writes));
         let inputs = register_operands(live_in);
+        nixe_trace::event("cpu.lcq.inputs", fragment.key.pc.get(), inputs.len() as u64);
         let mut inherited = live_in;
         // FPCR changes leave fast mode and TPIDRRO_EL0 is read-only, so their
         // canonical homes remain current. FPSR ownership is invocation-wide,
@@ -291,6 +333,11 @@ impl Compiler {
             .collect();
         let signature = translator.builder.import_signature(signature);
         let inst = translator.builder.ins().nixe_entry(signature, 0);
+        translator
+            .builder
+            .func
+            .nixe_entry_constraints
+            .insert(0, plan.constraints(&inputs, true));
         let values = translator.builder.func.dfg.inst_results(inst).to_vec();
         for (index, guest) in inputs.iter().enumerate() {
             translator.values.bind(*guest, values[index]);
@@ -299,7 +346,15 @@ impl Compiler {
         // physical input bits observable; Canonical is not a clean-home proof.
         let mut flags = LazyFlags::Canonical(values[inputs.len()]);
         let mut terminated = false;
+        #[cfg(feature = "jit-profile")]
+        let profiling = crate::profiling::enabled();
         for (index, decoded) in fragment.instructions.iter().enumerate() {
+            #[cfg(feature = "jit-profile")]
+            if profiling {
+                translator
+                    .builder
+                    .set_srcloc(ir::SourceLoc::new(index as u32 + 1));
+            }
             translator.instruction_prefix = u16::try_from(index).map_err(fail)?;
             translator.instruction_index = translator.instruction_prefix;
             let pc = GuestVirtualAddress::new(fragment.key.pc.get().wrapping_add(index as u64 * 4));
@@ -355,10 +410,30 @@ impl Compiler {
                     .insert(index as u64 + 1, pending.completed);
             }
         }
+        drop(lowering);
+        let backend =
+            nixe_trace::Span::new("cpu.lcq.backend", 0, fragment.instructions.len() as u64);
         self.context
             .compile(&*self.isa, &mut ControlPlane::default())
             .map_err(|error| Error::internal(format!("LCQ Cranelift: {error:?}")))?;
         let code = self.context.take_compiled_code().unwrap();
+        drop(backend);
+        let _staging = nixe_trace::Span::new("cpu.lcq.stage_adapters", 0, 0);
+        self.exit_maps.clear();
+        self.exit_maps.resize(exits.len(), usize::MAX);
+        for (index, map) in code.buffer.nixe_states.iter().enumerate() {
+            if !map.entry
+                && let Some(slot) = map
+                    .id
+                    .checked_sub(1)
+                    .and_then(|id| self.exit_maps.get_mut(id as usize))
+            {
+                if *slot != usize::MAX {
+                    return Err(Error::internal("duplicate LCQ exit map"));
+                }
+                *slot = index;
+            }
+        }
         let input_map = code
             .buffer
             .nixe_states
@@ -366,8 +441,13 @@ impl Compiler {
             .find(|map| map.entry && map.id == 0)
             .ok_or_else(|| Error::internal("LCQ entry map missing"))?;
         let allocated = AllocatedBoundary::new(self.abi, &code, input_map).map_err(fail)?;
-        let entry =
-            crate::frontend::entry::contract(self.abi, &allocated, &inputs, Some(live_in.nzcv))?;
+        let entry = crate::frontend::entry::contract(
+            self.abi,
+            &allocated,
+            &inputs,
+            Some(live_in.nzcv),
+            discard,
+        )?;
         let fast = input_map.offset;
         let mut records = Vec::new();
         let mut patches = Vec::new();
@@ -375,8 +455,7 @@ impl Compiler {
             let map = code
                 .buffer
                 .nixe_states
-                .iter()
-                .find(|map| !map.entry && map.id == index as u64 + 1)
+                .get(self.exit_maps[index])
                 .ok_or_else(|| Error::internal("LCQ exit map missing"))?;
             let allocated = AllocatedBoundary::new(self.abi, &code, map).map_err(fail)?;
             let (patch, record) = crate::frontend::exit::prepare(

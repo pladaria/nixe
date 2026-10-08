@@ -165,7 +165,6 @@ fn exit_at_sample(
     let mut worker = NativeWorker::default();
     let (exit, budget) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             state,
             PollBudget::new(sample, 1).unwrap(),
@@ -242,7 +241,6 @@ fn ic_completion_can_unlink_its_source_and_faults_do_not_earn_work() {
             assert!(
                 thread
                     .invoke(
-                        &mut crate::ReturnStack::default(),
                         &mut worker,
                         &mut state,
                         PollBudget::new(4096, 1).unwrap(),

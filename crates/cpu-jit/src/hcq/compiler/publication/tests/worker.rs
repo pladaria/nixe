@@ -19,11 +19,16 @@ fn real_worker_replaces_two_families_then_persists_no_op_without_recompilation()
     let memory = Arc::new(memory);
     let consumer = crate::hcq::worker::consumer(host(), 0x10000, Arc::clone(&memory)).unwrap();
     let (done, received) = mpsc::channel();
-    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-        let result = consumer(resources, work);
-        done.send(result.is_ok()).unwrap();
-        result
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |resources, work| {
+            let result = consumer(resources, work);
+            done.send(result.is_ok()).unwrap();
+            result
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     assert_eq!(
@@ -90,41 +95,46 @@ fn real_worker_records_disconnected_boundary_without_poisoning_initial_promotion
     let memory = Arc::new(memory);
     let consumer = crate::hcq::worker::consumer(host(), 0x10000, Arc::clone(&memory)).unwrap();
     let (done, received) = mpsc::channel();
-    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-        let result = consumer(resources, work);
-        done.send(result.is_ok()).unwrap();
-        result
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |resources, work| {
+            let result = consumer(resources, work);
+            done.send(result.is_ok()).unwrap();
+            result
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
-    // RET is deliberately not traversed by region discovery.
-    let before = payload(&mut reader, 0x7000).unwrap();
+    // An architectural BRK must never become an internal edge.
+    let before = payload(&mut reader, 0x5000).unwrap();
     assert_eq!(
         admit_to(
             &process,
             workers.queue(),
             &mut reader,
-            0x7000,
-            0x7000,
+            0x5000,
+            0x5000,
             0x2000
         ),
         Outcome::Queued
     );
     assert!(received.recv_timeout(Duration::from_secs(10)).unwrap());
-    assert_eq!(payload(&mut reader, 0x7000).unwrap(), before);
+    assert_eq!(payload(&mut reader, 0x5000).unwrap(), before);
     assert_eq!(
         admit_to(
             &process,
             workers.queue(),
             &mut reader,
-            0x7000,
-            0x7000,
+            0x5000,
+            0x5000,
             0x2000
         ),
         Outcome::Suppressed
     );
-    promote_at(&process, &memory, &mut reader, 0x7000);
-    run(&process, &memory, &mut reader, 0x7000, 2);
+    promote_at(&process, &memory, &mut reader, 0x5000);
+
     workers.shutdown().unwrap();
     assert!(process.background_failure().is_none());
     assert!(process.try_shutdown().unwrap());
@@ -140,16 +150,21 @@ fn real_worker_keeps_its_running_reshape_reservation_across_unrelated_stop() {
     let (release, wait) = mpsc::channel();
     let wait = Mutex::new(wait);
     let (done, received) = mpsc::channel();
-    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-        started.send(()).unwrap();
-        wait.lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        let result = consumer(resources, work);
-        done.send(result.is_ok()).unwrap();
-        result
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |resources, work| {
+            started.send(()).unwrap();
+            wait.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let result = consumer(resources, work);
+            done.send(result.is_ok()).unwrap();
+            result
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     assert_eq!(
@@ -194,18 +209,20 @@ fn shared_target_merges_retain_all_callers_and_stop_recompiling() {
     let memory = Arc::new(memory);
     let consumer = crate::hcq::worker::consumer(host(), 0x10000, Arc::clone(&memory)).unwrap();
     let (done, received) = mpsc::channel();
-    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-        let result = consumer(resources, work);
-        done.send(result.is_ok()).unwrap();
-        result
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |resources, work| {
+            let result = consumer(resources, work);
+            done.send(result.is_ok()).unwrap();
+            result
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     for (root, target) in [(0x3000, 0x1000), (0x4000, 0x2000)] {
-        assert_eq!(
-            admit_to(&process, workers.queue(), &mut reader, root, root, target),
-            Outcome::Queued
-        );
+        races::enqueue(&process, &workers, &mut reader, root, root, target);
         assert!(received.recv_timeout(Duration::from_secs(10)).unwrap());
         process.try_service_links().unwrap();
     }
@@ -217,10 +234,7 @@ fn shared_target_merges_retain_all_callers_and_stop_recompiling() {
             .all(|entry| entry.hcq().unwrap().family == family)
     );
     for (root, target) in [(0x3000, 0x1000), (0x4000, 0x2000)] {
-        assert_eq!(
-            admit_to(&process, workers.queue(), &mut reader, root, root, target),
-            Outcome::Queued
-        );
+        races::enqueue(&process, &workers, &mut reader, root, root, target);
         assert!(received.recv_timeout(Duration::from_secs(10)).unwrap());
         assert_eq!(
             admit_to(&process, workers.queue(), &mut reader, root, root, target),

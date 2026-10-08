@@ -31,6 +31,7 @@ pub(in crate::ipc_wire) fn dispatch_service(
     hipc: &HipcRequest<'_>,
     file_system_access_log_mode: FileSystemAccessLogMode,
     save_data: Option<&crate::SaveDataSystem>,
+    async_reply: &crate::host_work::AsyncReply<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let target = match &request.domain {
         Some(DomainRequest::Close { object_id }) => {
@@ -79,7 +80,7 @@ pub(in crate::ipc_wire) fn dispatch_service(
         && session.service() == IpcService::FileSystem
         && request.command_id == 51
     {
-        return fsp::open_save_data(process, session, request, hipc, save_data);
+        return fsp::open_save_data(process, session, request, hipc, save_data, async_reply);
     }
 
     dispatch_command(
@@ -90,6 +91,7 @@ pub(in crate::ipc_wire) fn dispatch_service(
         request,
         hipc,
         file_system_access_log_mode,
+        async_reply,
     )
 }
 
@@ -98,6 +100,7 @@ pub(in crate::ipc_wire) fn dispatch_plain_object(
     object: &SemanticIpcObject,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    async_reply: &crate::host_work::AsyncReply<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     dispatch_command(
         process,
@@ -107,9 +110,11 @@ pub(in crate::ipc_wire) fn dispatch_plain_object(
         request,
         hipc,
         FileSystemAccessLogMode::None,
+        async_reply,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_command(
     process: &mut ExceptionProcessContext<'_>,
     service: IpcService,
@@ -118,6 +123,7 @@ fn dispatch_command(
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
     file_system_access_log_mode: FileSystemAccessLogMode,
+    async_reply: &crate::host_work::AsyncReply<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let (decoded, name) = match &target {
         Target::Root => (
@@ -132,6 +138,159 @@ fn dispatch_command(
     let Some(decoded) = decoded else {
         return unsupported_service_command(name, request.command_id);
     };
+
+    if let Target::Object(object @ SemanticIpcObject::HostDirectoryFileSystem(_)) = &target
+        && matches!(
+            decoded,
+            IpcRequest::OpenFile { .. } | IpcRequest::OpenDirectory { .. }
+        )
+    {
+        let mounts = process.mounts().clone();
+        let object = object.clone();
+        let session = session.cloned();
+        let token = request.token;
+        async_reply.submit_prepared(
+            process,
+            move || {
+                let _trace = nixe_trace::Span::new("storage.open", 0, 0);
+                let mut handles = nixe_runtime::HandleTable::new();
+                match IpcDispatcher::dispatch_semantic_object(
+                    &mounts,
+                    &mut handles,
+                    &object,
+                    decoded,
+                ) {
+                    Ok(crate::IpcResponse::Handle(handle)) => {
+                        let object = handles.close(handle).map_err(|_| {
+                            IpcWireError::Internal("prepared file handle disappeared")
+                        })?;
+                        match object.downcast_ref::<crate::HorizonIpcObject>() {
+                            Some(crate::HorizonIpcObject::SemanticObject(object)) => {
+                                Ok(Ok(object.clone()))
+                            }
+                            _ => Err(IpcWireError::Internal(
+                                "prepared file object has an invalid type",
+                            )),
+                        }
+                    }
+                    Err(error) => Ok(Err(error)),
+                    _ => Err(IpcWireError::Internal(
+                        "file open produced an unexpected response",
+                    )),
+                }
+            },
+            move |process, result| match result {
+                Ok(object) => {
+                    super::response::encode_semantic_child(process, session.as_ref(), token, object)
+                }
+                Err(error) => semantic_error(
+                    token,
+                    session.as_ref(),
+                    HorizonIpcResult::from_semantic(IpcService::FileSystem, error),
+                ),
+            },
+        )?;
+        unreachable!("accepted file open suspends its caller")
+    }
+
+    // Child file operations and non-handle-producing directory operations need
+    // no process handle-table authority while host I/O is in progress.
+    if let Target::Object(
+        object @ (SemanticIpcObject::HostFile(_) | SemanticIpcObject::HostDirectoryFileSystem(_)),
+    ) = &target
+        && !matches!(
+            decoded,
+            IpcRequest::OpenFile { .. } | IpcRequest::OpenDirectory { .. }
+        )
+    {
+        let output = if matches!(decoded, IpcRequest::ReadFile { .. }) {
+            let descriptor = crate::ipc_wire::buffer::one_receive_buffer(hipc)?;
+            if descriptor.size == 0 {
+                None
+            } else {
+                Some(crate::host_work::retain_output(
+                    process,
+                    descriptor.address,
+                    descriptor.size,
+                )?)
+            }
+        } else {
+            None
+        };
+        let mounts = process.mounts().clone();
+        let object = object.clone();
+        let token = request.token;
+        let is_domain = session.is_some_and(IpcSession::is_domain);
+        let command_id = request.command_id;
+        async_reply.submit(process, move |cancelled| {
+            let _trace = nixe_trace::Span::new("storage.operation", 0, 0);
+            let mut handles = nixe_runtime::HandleTable::new();
+            let response =
+                IpcDispatcher::dispatch_semantic_object(&mounts, &mut handles, &object, decoded);
+            let mut data = Vec::new();
+            let result = match response {
+                Ok(crate::IpcResponse::None) => HorizonIpcResult::SUCCESS,
+                Ok(crate::IpcResponse::Size(size)) => {
+                    data.extend_from_slice(&size.to_le_bytes());
+                    HorizonIpcResult::SUCCESS
+                }
+                Ok(crate::IpcResponse::EntryType(kind)) => {
+                    let kind: u32 = match kind {
+                        crate::DirectoryEntryKind::Directory => 0,
+                        crate::DirectoryEntryKind::File => 1,
+                    };
+                    data.extend_from_slice(&kind.to_le_bytes());
+                    HorizonIpcResult::SUCCESS
+                }
+                Ok(crate::IpcResponse::FileSystemAttribute {
+                    name_length_max,
+                    path_length_max,
+                }) => {
+                    data.extend_from_slice(&super::response::file_system_attribute_data(
+                        name_length_max,
+                        path_length_max,
+                    ));
+                    HorizonIpcResult::SUCCESS
+                }
+                Ok(crate::IpcResponse::Data(bytes)) => {
+                    if !cancelled.load(std::sync::atomic::Ordering::Acquire) && !bytes.is_empty() {
+                        crate::host_work::write_retained(
+                            output
+                                .as_ref()
+                                .ok_or(IpcWireError::Internal("file read lacks retained output"))?,
+                            0,
+                            &bytes,
+                        )?;
+                    }
+                    data.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                    HorizonIpcResult::SUCCESS
+                }
+                Ok(_) => {
+                    return Err(IpcWireError::Internal(
+                        "host file operation produced an unexpected response",
+                    ));
+                }
+                Err(IpcResultCode::INVALID_COMMAND) => {
+                    return unsupported_service_command(name, command_id);
+                }
+                Err(IpcResultCode::INTERNAL_STATE) => {
+                    return Err(IpcWireError::Internal(
+                        "content-service IPC entered an invalid internal state",
+                    ));
+                }
+                Err(error) => HorizonIpcResult::from_semantic(IpcService::FileSystem, error),
+            };
+            Ok(crate::ipc_wire::message::CmifResponse {
+                token,
+                result: result.raw(),
+                data: &data,
+                is_domain,
+                ..Default::default()
+            }
+            .encode()?)
+        })?;
+        unreachable!("host I/O suspends its guest caller")
+    }
 
     let result = {
         let (mounts, handles) = process.mounts_and_handles_mut();
@@ -160,6 +319,7 @@ fn dispatch_command(
             request,
             hipc,
             response,
+            Some(async_reply),
         ),
         Err(IpcResultCode::INVALID_COMMAND) => {
             unsupported_service_command(name, request.command_id)

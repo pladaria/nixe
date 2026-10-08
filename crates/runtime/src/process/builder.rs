@@ -7,6 +7,7 @@ pub struct ProcessBuilder {
     virtual_clock: crate::VirtualClock,
     sd_card_root: Option<PathBuf>,
     cpu_backend: execution::CpuBackendConfig,
+    jit_warmup_directory: Option<PathBuf>,
     memory_backend: nixe_memory::DirectBackendPolicy,
 }
 
@@ -55,6 +56,13 @@ impl ProcessBuilder {
     #[must_use]
     pub fn with_cpu_backend(mut self, backend: execution::CpuBackendConfig) -> Self {
         self.cpu_backend = backend;
+        self
+    }
+
+    /// Enables bounded, content-keyed CPU warmup hints in a host cache directory.
+    #[must_use]
+    pub fn with_jit_warmup_directory(mut self, directory: PathBuf) -> Self {
+        self.jit_warmup_directory = Some(directory);
         self
     }
 
@@ -254,8 +262,6 @@ impl ProcessBuilder {
             object: main_thread_object,
             exit: None,
             state: Some(state),
-            jit_returns: matches!(self.cpu_backend, execution::CpuBackendConfig::Jit)
-                .then(Box::<nixe_cpu_jit::ReturnStack>::default),
             handle: main_thread_handle,
             stack_bottom,
             stack_top,
@@ -309,6 +315,33 @@ impl ProcessBuilder {
                 virtual_clock: self.virtual_clock.clone(),
                 timer_frequency: self.config.architectural_timer_frequency,
                 cpu,
+                warmup: self
+                    .jit_warmup_directory
+                    .as_ref()
+                    .filter(|_| matches!(self.cpu_backend, execution::CpuBackendConfig::Jit))
+                    .map(|directory| {
+                        use sha2::{Digest, Sha256};
+                        nixe_cpu_jit::WarmupConfig {
+                            directory: directory.clone(),
+                            modules: modules
+                                .iter()
+                                .map(|module| {
+                                    let mut content = Sha256::new();
+                                    content.update(module.module_id());
+                                    for mapping in module.mappings() {
+                                        content.update(mapping.image_offset().to_le_bytes());
+                                        // Hash all initialized content, not only an untrusted build ID.
+                                        content.update(mapping.bytes());
+                                    }
+                                    nixe_cpu_jit::WarmupModule {
+                                        content: content.finalize().into(),
+                                        base: module.image_base(),
+                                        extent: module.image_extent(),
+                                    }
+                                })
+                                .collect(),
+                        }
+                    }),
                 address_space_end: nixe_memory::GuestVirtualAddress::new(
                     address_space.exclusive_limit(),
                 ),

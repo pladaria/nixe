@@ -13,10 +13,18 @@ use crate::{ExecutionReport, ProcessExecutionError};
 
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum QuantumPolicy {
+    Explicit,
+    InstructionAdaptive,
+    TimedAdaptive,
+}
+
 pub(super) struct WorkerRequest {
     pub(super) lease: Lease,
     pub(super) cpu_thread: WorkerCpuThreadKey,
     pub(super) execution: VcpuExecutionState,
+    pub(super) quantum: QuantumPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -28,7 +36,9 @@ pub(super) struct WorkerCpuThreadKey {
 pub(super) struct WorkerResult {
     pub(super) lease: Lease,
     pub(super) execution: VcpuExecutionState,
+    pub(super) quantum: QuantumPolicy,
     pub(super) outcome: Result<ExecutionReport, WorkerRunFailure>,
+    pub(super) elapsed: Duration,
 }
 
 pub(super) enum WorkerRunFailure {
@@ -404,7 +414,11 @@ fn worker_main(
             WorkerCommand::Run(request) => request,
             WorkerCommand::Shutdown => break,
         };
+        let started = (request.quantum == QuantumPolicy::TimedAdaptive).then(Instant::now);
         let run = || {
+            let _cpu =
+                nixe_trace::CpuSpan::new("vcpu.execution_cpu_ns", request.lease.thread.get());
+            let _trace = nixe_trace::Span::new("vcpu.execute", request.lease.thread.get(), 0);
             let thread = cpu_threads.get_mut(&request.cpu_thread).ok_or(
                 ProcessExecutionError::BackendUnavailable {
                     process: request.cpu_thread.cpu_process,
@@ -420,11 +434,26 @@ fn worker_main(
         } else {
             catch_worker_panic(run)
         };
+        let elapsed = started.map_or(Duration::ZERO, |started| started.elapsed());
+        if let Ok(report) = &outcome {
+            let name = match report.stop {
+                crate::ExecutionStop::BudgetExhausted => "vcpu.stop.budget",
+                crate::ExecutionStop::SupervisorCall { .. } => "vcpu.stop.svc",
+                crate::ExecutionStop::Safepoint => "vcpu.stop.safepoint",
+                crate::ExecutionStop::PendingEvent { .. } => "vcpu.stop.event",
+                crate::ExecutionStop::Scheduled { .. } => "vcpu.stop.scheduled",
+                _ => "vcpu.stop.other",
+            };
+            nixe_trace::event(name, request.lease.thread.get(), report.progress);
+        }
+        nixe_trace::event("vcpu.idle", request.lease.thread.get(), 0);
         if results
             .send(WorkerResult {
                 lease: request.lease,
                 execution: request.execution,
                 outcome,
+                quantum: request.quantum,
+                elapsed,
             })
             .is_err()
         {

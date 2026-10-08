@@ -30,7 +30,21 @@ impl JitProcess {
                 "JIT background workers already started or closed",
             ));
         }
-        *owner = match Workers::start(selected, Arc::clone(&self.lifetime), compile)? {
+        *owner = match Workers::start(
+            selected,
+            Arc::clone(&self.lifetime),
+            compile,
+            self.warmup.as_ref().map(|profile| crate::warmup::Task {
+                profile: profile.clone(),
+                memory: self.memory.clone(),
+                cpu: self.cpu,
+                arena_size: self
+                    .memory
+                    .direct_address_space_view(self.cpu.address_space_id())
+                    .unwrap()
+                    .address_space_size,
+            }),
+        )? {
             Some(workers) => Background::Running(workers),
             None => Background::Joined,
         };
@@ -74,6 +88,9 @@ impl Drop for JitProcess {
     fn drop(&mut self) {
         // Last-owner cleanup also closes admission before join, even on failed
         // explicit teardown. Exclusive ownership needs no lock across join.
+        if let Some(warmup) = &self.warmup {
+            warmup.cancel();
+        }
         let _ = self.lifetime.request_shutdown();
         let owner = self
             .background
@@ -83,5 +100,6 @@ impl Drop for JitProcess {
             // Worker shutdown retains errors in Lifetime; Drop cannot return them.
             let _ = workers.shutdown();
         }
+        self.save_warmup();
     }
 }

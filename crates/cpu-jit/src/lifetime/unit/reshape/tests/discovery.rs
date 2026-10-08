@@ -52,7 +52,7 @@ pub(super) fn reshape(process: &Lifetime, block: u64, source: u64, target: u64) 
         Outcome::Queued
     );
     process
-        .accept_background(queue.pop().unwrap().unwrap())
+        .accept_background(queue.pop_ready().unwrap().unwrap())
         .unwrap()
         .unwrap()
 }
@@ -160,6 +160,7 @@ fn reshape_rediscovers_every_previous_public_entry_across_indirect_boundaries() 
 fn seed(process: &Lifetime, pc: u64) -> Work<'_> {
     let queue = Queue::new(1, process).unwrap().unwrap();
     let observed = crate::sampling::AdmissionSnapshot {
+        observations: 128,
         key: key(pc),
         version: process.reserve(key(pc)).unwrap().reachability,
         sequence: 8,
@@ -173,7 +174,7 @@ fn seed(process: &Lifetime, pc: u64) -> Work<'_> {
         Outcome::Queued
     );
     process
-        .accept_background(queue.pop().unwrap().unwrap())
+        .accept_background(queue.pop_ready().unwrap().unwrap())
         .unwrap()
         .unwrap()
 }
@@ -324,16 +325,22 @@ fn reshape_candidate_and_owner_reservation_survive_unrelated_maintenance() {
 }
 
 #[test]
-fn reshape_discovery_does_not_connect_calls_returns_or_unobserved_edges() {
+fn reshape_discovery_connects_calls_but_rejects_external_returns_or_semantic_boundaries() {
     for bits in [0x94000004, RET, 0xd4000001, 0x14000008] {
         let process = process();
         publish_words(&process, 0, &[bits]);
         publish_words(&process, 16, &[RET]);
         let work = reshape(&process, 0, 0, 16);
         let result = Graph::discover(&work);
-        // Missing successors are watched absence evidence, never invented edges.
-        assert!(matches!(result, Err(DiscoveryError::Structural(result))
-            if result.reason() == StructuralReason::Disconnected));
+        if bits == 0x94000004 {
+            let graph = result.unwrap();
+            assert_eq!(graph.instructions.len(), 2);
+            assert_eq!(graph.blocks[0].dispatch, [Target::Internal(1)]);
+        } else {
+            // Semantic stops and static-target mismatches never invent an edge.
+            assert!(matches!(result, Err(DiscoveryError::Structural(result))
+                if result.reason() == StructuralReason::Disconnected));
+        }
     }
 }
 

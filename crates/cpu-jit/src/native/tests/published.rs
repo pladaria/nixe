@@ -297,6 +297,10 @@ pub(super) fn encoded(
                 bytes: bytes.into_boxed_slice(),
                 alignment: 16,
                 metadata: Metadata {
+                    #[cfg(feature = "jit-profile")]
+                    regions: Box::new([]),
+                    #[cfg(feature = "jit-profile")]
+                    profile_body_length: 0,
                     abi: entry.contract.abi,
                     frame_extent: SPILL_BYTES,
                     entries: Box::new([(

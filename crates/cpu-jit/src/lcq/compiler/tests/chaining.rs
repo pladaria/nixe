@@ -386,3 +386,143 @@ fn request_after_poll_resume_exits_later_unit_before_maintenance_can_close() {
     drop(invocation);
     assert_eq!(cpu, expected);
 }
+
+#[test]
+fn published_contracts_preserve_registers_across_an_unrelated_region() {
+    crate::native::check_host().unwrap();
+    let words = [
+        0x9100_0673,
+        0x4ea3_1c61,
+        0x1400_0001, // A: update X19/V1; B B
+        0xd503_201f,
+        0x1400_0001, // B: NOP; B C
+        0x9100_0260,
+        0x4ea1_1c20,
+        0xd420_0000, // C: consume X19/V1; BRK
+    ];
+    let memory = memory(&words);
+    let cache = Cache::new().unwrap();
+    let process = Arc::new(Lifetime::new(cache.clone()).unwrap());
+    let mut reader = process.register().unwrap();
+    let mut compiler = Compiler::new(native_abi()).unwrap();
+    let mut handles = Vec::new();
+    for offset in [0, 12, 20] {
+        let entry = key().at(GuestVirtualAddress::new(PC + offset)).unwrap();
+        let Request::Owner(claim) = reader.claim(entry).unwrap() else {
+            panic!()
+        };
+        handles.push(
+            compiler
+                .publish(
+                    Compilation::capture(claim, &memory).unwrap(),
+                    &process,
+                    &cache,
+                    &memory,
+                )
+                .unwrap(),
+        );
+    }
+    for pair in handles.windows(2) {
+        install(&process, pair[0], pair[1]);
+        let from = process.snapshot(pair[0]).unwrap();
+        let to = process.snapshot(pair[1]).unwrap();
+        assert!(
+            crate::native::emit_chain_transfer(&from.states[0].state, &to.entries[0].contract)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    // Canonical entry into any region remains valid, independent of the source
+    // whose allocation supplied its hint. Exercise normal and short poll exits.
+    for (offset, budget, executed) in [(0, 1000, 7), (12, 1000, 4), (20, 1000, 2), (0, 3, 3)] {
+        let mut state = integer::initial_state();
+        let mut expected = state.clone();
+        expected.set_pc(PC + offset);
+        state.set_pc(PC + offset);
+        for &word in words.iter().skip(offset as usize / 4).take(executed) {
+            nixe_cpu_interpreter::execute_one(&TargetPlatform::Switch1, &mut expected, word)
+                .unwrap();
+        }
+        let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, budget).unwrap());
+        let entry_key = key().at(GuestVirtualAddress::new(PC + offset)).unwrap();
+        let mut invocation = unsafe { reader.admit(&mut frame, entry_key) }
+            .unwrap()
+            .unwrap();
+        let entry = invocation.payload().preferred().unwrap();
+        unsafe {
+            crate::native::enter_protected(
+                invocation.frame(),
+                std::ptr::null_mut(),
+                entry.canonical.get() as *const u8,
+            )
+        }
+        .unwrap();
+        drop(invocation);
+        assert_eq!(state, expected, "entry {offset}, budget {budget}");
+    }
+}
+
+#[test]
+fn overwrite_contract_eliminates_dead_stores_but_keeps_source_poll_state() {
+    let words = [0x91000400, 0x14000001, 0xd28000e0, 0xd4200000];
+    let memory = memory(&words);
+    let cache = Cache::new().unwrap();
+    let process = Arc::new(Lifetime::new(cache.clone()).unwrap());
+    let mut reader = process.register().unwrap();
+    let mut compiler = Compiler::new(native_abi()).unwrap();
+    let mut units = Vec::new();
+    for offset in [0, 8] {
+        let entry = key().at(GuestVirtualAddress::new(PC + offset)).unwrap();
+        let Request::Owner(claim) = reader.claim(entry).unwrap() else {
+            panic!()
+        };
+        units.push(
+            compiler
+                .publish(
+                    Compilation::capture(claim, &memory).unwrap(),
+                    &process,
+                    &cache,
+                    &memory,
+                )
+                .unwrap(),
+        );
+    }
+    install(&process, units[0], units[1]);
+    let source = process.snapshot(units[0]).unwrap();
+    let target = process.snapshot(units[1]).unwrap();
+    assert!(target.entries[0].contract.discard.integer.x.contains(0));
+    assert!(!target.entries[0].contract.live_in.integer.x.contains(0));
+    assert!(
+        crate::native::emit_chain_transfer(&source.states[0].state, &target.entries[0].contract)
+            .unwrap()
+            .is_empty()
+    );
+    for budget in [2, 100] {
+        let mut state = integer::initial_state();
+        state.general_register_storage_mut()[0] = 100;
+        let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, budget).unwrap());
+        let mut invocation = unsafe { reader.admit(&mut frame, key()) }.unwrap().unwrap();
+        let entry = invocation.payload().preferred().unwrap();
+        let returned = unsafe {
+            crate::native::enter_protected(
+                invocation.frame(),
+                std::ptr::null_mut(),
+                entry.canonical.get() as *const u8,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            returned.reason,
+            if budget == 2 {
+                NativeExitReason::Dispatch
+            } else {
+                NativeExitReason::Architectural
+            }
+        );
+        drop(invocation);
+        assert_eq!(
+            state.general_register_storage_mut()[0],
+            if budget == 2 { 101 } else { 7 }
+        );
+    }
+}

@@ -133,7 +133,6 @@ fn late_source_retirement_cancels_preparations_without_cutting_surviving_returns
                 assert!(
                     thread
                         .invoke(
-                            &mut ReturnStack::default(),
                             &mut NativeWorker::default(),
                             &mut missing,
                             PollBudget::new(4096, 64).unwrap(),
@@ -146,16 +145,10 @@ fn late_source_retirement_cancels_preparations_without_cutting_surviving_returns
                 // Callee->continuation roots are independent of the retired
                 // callers. A pending guest return still hits without Rust.
                 let continuation = PC.checked_add(offset + 4).unwrap();
-                let mut returns = ReturnStack::default();
-                returns.entries[0] =
-                    crate::rsb::Continuation::from(thread.key(continuation).unwrap());
-                returns.head = 1;
-                returns.depth = 1;
                 let mut state = initial(offset);
                 state.set_pc(TARGET.get());
                 state.general_register_storage_mut()[30] = continuation.get();
                 let (returned, budget) = fallback::without_resolver(
-                    &mut returns,
                     thread,
                     &mut state,
                     PollBudget::new(1, 64).unwrap(),
@@ -165,7 +158,6 @@ fn late_source_retirement_cancels_preparations_without_cutting_surviving_returns
                 assert_eq!(budget.slice_remaining, 62);
                 assert_eq!(state.pc(), continuation.get());
                 assert_eq!(state.general_register_storage_mut()[0], 1);
-                assert_eq!(returns.depth, 0);
             }
         }
         previous = Some((direct, indirect));
@@ -266,7 +258,6 @@ fn mixed_root_pressure_reuses_segments_after_snapshot_and_bridge_release() {
                 let before = state.clone();
                 let (exit, budget) = thread
                     .invoke(
-                        &mut ReturnStack::default(),
                         &mut NativeWorker::default(),
                         &mut state,
                         PollBudget::new(4096, 64).unwrap(),

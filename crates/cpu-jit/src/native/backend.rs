@@ -155,7 +155,7 @@ impl<'a> AllocatedBoundary<'a> {
     pub fn bindings(
         &self,
         operands: &[(GuestValue, usize)],
-    ) -> Result<std::sync::Arc<[ValueBinding]>, TransferError> {
+    ) -> Result<crate::abi::Bindings, TransferError> {
         operands
             .iter()
             .map(|&(value, index)| {

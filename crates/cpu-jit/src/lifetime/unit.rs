@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 mod bridge;
+mod contracts;
 mod diagnostic;
 pub(crate) mod dynamic;
 mod image;
@@ -72,10 +73,8 @@ pub(crate) struct TerminalTransfer {
     /// Completed guest prefix: dispatch includes the branch, PRE exits do not.
     pub completed: u16,
     pub patch_bytes: u8,
-    /// Canonical fallback after any indirect RSB/PIC operation. A static call
-    /// includes its push here because unlinking bypasses the installed bridge.
-    /// Call/return slice polls perform their update on a separate path when
-    /// necessary; they must neither probe a successor nor repeat an update.
+    /// Canonical fallback after an indirect PIC miss. Budget/control exits
+    /// bypass the probe and preserve the already completed guest transfer.
     pub fallback_offset: u32,
     /// Already-charged cold patch. Resume at native_offset, never at the
     /// subtraction preceding it. None for uncheckpointed PRE observations.
@@ -196,6 +195,14 @@ pub(crate) struct EmissionIdentity {
     version: CodeVersion,
 }
 impl EmissionIdentity {
+    #[cfg(feature = "jit-profile")]
+    pub(crate) fn process(&self) -> u64 {
+        self.process
+    }
+    #[cfg(feature = "jit-profile")]
+    pub(crate) fn id(&self) -> CodeUnitId {
+        self.id
+    }
     pub(crate) fn version(&self) -> CodeVersion {
         self.version
     }
@@ -691,17 +698,17 @@ impl<I, F> Input<I, F> {
     /// Intern only within this immutable unit. The table dies before
     /// publication; executing/faulting code still reads an ordinary slice.
     fn share_bindings(&mut self) {
-        let mut unique = std::collections::HashSet::<Arc<[crate::abi::ValueBinding]>>::new();
+        let mut unique = std::collections::HashSet::<crate::abi::Bindings>::new();
         for bindings in self
             .entries
             .iter_mut()
             .map(|entry| &mut entry.contract.bindings)
             .chain(self.states.iter_mut().map(|map| &mut map.state.bindings))
         {
-            if let Some(existing) = unique.get(bindings.as_ref()) {
-                *bindings = Arc::clone(existing);
+            if let Some(existing) = unique.get(bindings) {
+                *bindings = existing.clone();
             } else {
-                unique.insert(Arc::clone(bindings));
+                unique.insert(bindings.clone());
             }
         }
     }
@@ -714,7 +721,7 @@ impl<I, F> Input<I, F> {
             .map(|entry| &entry.contract.bindings)
             .chain(self.states.iter().map(|map| &map.state.bindings))
             .filter(|bindings| seen.insert(bindings.as_ptr()))
-            .map(|bindings| size_of_val(&**bindings) + 2 * size_of::<usize>())
+            .map(|bindings| bindings.allocation_bytes())
             .sum::<usize>();
         // Installed already charges its own inline storage and backend metadata.
         size_of::<Accounted<CodeUnit>>() - size_of::<Installed>()
@@ -1048,8 +1055,13 @@ impl Lifetime {
         cursor: &'a AtomicU64,
         candidate: Option<&'a Frozen<'a, 'a>>,
     ) -> Result<PreparedUnit<'a>, Error> {
-        input.validate(self, publications)?;
+        {
+            let _trace = nixe_trace::Span::new("cpu.unit.validate", 0, 0);
+            input.validate(self, publications)?;
+        }
         input.share_bindings();
+        #[cfg(feature = "jit-profile")]
+        let profile = crate::profiling::prepare(&input);
         input.code.finish_validation();
         self.collect_tables()?;
         let static_sites = input.source_sites();
@@ -1291,6 +1303,8 @@ impl Lifetime {
             .then(|| super::background::Owner::new(&self.cache, Tier::Hcq))
             .transpose()?;
         Ok(PreparedUnit {
+            #[cfg(feature = "jit-profile")]
+            profile,
             process: self,
             candidate,
             publications,
@@ -1539,6 +1553,8 @@ fn same_snapshot<T>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
 }
 
 pub(crate) struct PreparedUnit<'a> {
+    #[cfg(feature = "jit-profile")]
+    profile: Option<crate::profiling::Load>,
     process: &'a Lifetime,
     candidate: Option<&'a Frozen<'a, 'a>>,
     publications: Accounted<Box<[Publication<'a>]>>,
@@ -1578,7 +1594,7 @@ impl PreparedUnit<'_> {
             // A publication can itself request LinkPatch with no active guest
             // to service it. Help the existing coordinator; never hold an
             // execution epoch, queue lock or memory lock while waiting.
-            self.process.try_service_links()?;
+            self.process.try_service_optional_links()?;
             let state = self.process.lock();
             candidate.validate_locked(&state)?;
             if state.phase == super::Phase::Open {
@@ -1813,6 +1829,10 @@ impl PreparedUnit<'_> {
                 state.units.family_owners.publish(instruction.key, family);
             }
         }
+        // Queue diagnostics before first exposure. All I/O and symbol creation
+        // occur on the diagnostic worker; a full queue is reported as lost data.
+        #[cfg(feature = "jit-profile")]
+        crate::profiling::publish(self.profile.take());
         // Swap table owners before the signal-visible pointer. Old tables
         // remain owned by the epoch retire list and any compiler preparation.
         std::mem::swap(&mut state.units.tables[segment], &mut self.table);

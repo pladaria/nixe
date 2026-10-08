@@ -448,7 +448,7 @@ fn poison_disables_admission_but_reader_cleanup_still_completes() {
 }
 
 #[test]
-fn deferred_links_keep_their_ticket_and_control_request_for_the_next_stop() {
+fn deferred_links_keep_their_ticket_without_a_native_poll_until_the_next_batch() {
     let process = new_process();
     let link = process.request(Reason::LinkPatch).unwrap();
     let mut first = process.try_transition().unwrap().unwrap();
@@ -473,10 +473,7 @@ fn deferred_links_keep_their_ticket_and_control_request_for_the_next_stop() {
             .maintenance_complete(Reason::MappingChange, safety)
             .unwrap()
     );
-    assert_eq!(
-        process.control_word().load(Ordering::Acquire),
-        1 << Reason::LinkPatch as usize
-    );
+    assert_eq!(process.control_word().load(Ordering::Acquire), 0);
     // No new request is needed to service the retained LinkPatch reason.
     drain(&process);
     assert!(
@@ -691,5 +688,71 @@ fn publication_capacity_failure_keeps_the_old_entry_and_admission_works_without_
     assert_eq!(
         cache.usage().unwrap().total(),
         crate::executable::HARD_BYTES
+    );
+}
+
+impl Lifetime {
+    /// Advance only the optional deadline; safety requests are never delayed.
+    pub(crate) fn make_links_due(&self) {
+        self.lock().link_batch_due = Some(Instant::now());
+    }
+}
+
+#[test]
+fn optional_links_batch_without_closing_admission_and_safety_bypasses_the_deadline() {
+    let process = new_process();
+    install(&process, key(0), 1);
+    let link = process.request(Reason::LinkPatch).unwrap();
+    process.lock().link_batch_due = Some(Instant::now() + Duration::from_secs(60));
+    assert!(process.try_service_optional_links().unwrap());
+    assert_eq!(process.lock().phase, Phase::Open);
+    assert_eq!(process.control_word().load(Ordering::Acquire), 0);
+    assert!(
+        !process
+            .maintenance_complete(Reason::LinkPatch, link)
+            .unwrap()
+    );
+    let admission = process.lock().admission;
+    process.request(Reason::LinkPatch).unwrap();
+    assert_eq!(process.lock().admission, admission);
+    let safety = process.request(Reason::MappingChange).unwrap();
+    assert_eq!(process.lock().phase, Phase::Closing);
+    assert_ne!(process.control_word().load(Ordering::Acquire), 0);
+    assert!(!process.try_service_optional_links().unwrap());
+    drain(&process);
+    assert!(
+        process
+            .maintenance_complete(Reason::MappingChange, safety)
+            .unwrap()
+    );
+    assert!(
+        process
+            .maintenance_complete(Reason::LinkPatch, link)
+            .unwrap()
+    );
+    assert!(!process.optional_links_pending());
+}
+
+#[test]
+fn optional_link_deadline_eventually_notifies_active_native_readers() {
+    let process = Arc::new(new_process());
+    install(&process, key(0), 1);
+    let mut reader = process.register().unwrap();
+    let mut cpu = A64State::default();
+    let mut frame = frame(&mut cpu);
+    let invocation = unsafe { reader.admit(&mut frame, key(0)) }
+        .unwrap()
+        .unwrap();
+    let ticket = process.request(Reason::LinkPatch).unwrap();
+    process.make_links_due();
+    assert!(!process.try_service_optional_links().unwrap());
+    assert_eq!(process.lock().phase, Phase::Closing);
+    assert_ne!(process.control_word().load(Ordering::Acquire), 0);
+    drop(invocation);
+    assert!(process.try_service_optional_links().unwrap());
+    assert!(
+        process
+            .maintenance_complete(Reason::LinkPatch, ticket)
+            .unwrap()
     );
 }

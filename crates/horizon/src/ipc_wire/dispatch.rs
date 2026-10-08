@@ -37,6 +37,7 @@ pub(crate) struct HostSystems<'a> {
     pub user_account_switch_locked: Option<bool>,
     pub save_data: Option<&'a crate::SaveDataSystem>,
     pub diagnostics: &'a crate::HorizonDiagnostics,
+    pub host_work: &'a crate::host_work::HostWorkSystem,
     pub caller_thread_id: u64,
 }
 
@@ -157,6 +158,22 @@ pub(crate) fn send_sync_request_from_buffer(
     time_environment: &TimeEnvironment,
     host_systems: HostSystems<'_>,
 ) -> Result<SyncRequestResult, IpcWireError> {
+    let key = (process.process_id(), host_systems.caller_thread_id);
+    if let Some(result) = host_systems.host_work.poll(key, process) {
+        return match result {
+            Ok(()) => Ok(SyncRequestResult::Success),
+            Err(IpcWireError::PendingHostWork(wait)) => {
+                Ok(SyncRequestResult::PendingHostWork(wait))
+            }
+            Err(error) => Err(error),
+        };
+    }
+    let async_reply = crate::host_work::AsyncReply {
+        system: host_systems.host_work,
+        key,
+        address,
+        size,
+    };
     let Some(target) = process
         .handles()
         .get_as::<HorizonIpcObject>(handle)
@@ -234,6 +251,15 @@ pub(crate) fn send_sync_request_from_buffer(
             IpcWireError::Malformed(error.0)
         }
     })?;
+    let _timeline = nixe_trace::Span::new(
+        if nixe_trace::enabled() {
+            target.diagnostic_name(&request)
+        } else {
+            "ipc"
+        },
+        host_systems.caller_thread_id,
+        u64::from(request.command_id),
+    );
     let trace_service =
         log::log_enabled!(log::Level::Trace).then(|| target.diagnostic_name(&request));
     if let Some(service) = trace_service {
@@ -280,155 +306,169 @@ pub(crate) fn send_sync_request_from_buffer(
         }
         _ => false,
     };
-    let (response, created_handle) = match target {
-        HorizonIpcObject::ServiceManager(manager) => services::dispatch_service_manager(
-            process,
-            &manager,
-            services::ServiceManagerRequest::Cmif(request),
-            hipc.pid.is_some(),
-            initial_operation_mode,
-            time_environment,
-            host_systems,
-        )?,
-        HorizonIpcObject::SemanticService(service) => dispatch_service(
-            process,
-            &service,
-            request,
-            &hipc,
-            host_systems.diagnostics.file_system_access_log_mode(),
-            host_systems.save_data,
-        )?,
-        HorizonIpcObject::SystemSettings(_) => {
-            services::dispatch_system_settings(process, request, &hipc.receive_statics)?
-        }
-        HorizonIpcObject::UserSettings(settings) => {
-            services::dispatch_user_settings(process, &settings, request, &hipc)?
-        }
-        HorizonIpcObject::PerformanceManager(manager) => {
-            services::dispatch_performance_manager(process, &manager, request)?
-        }
-        HorizonIpcObject::Performance(session) => {
-            services::dispatch_performance_session(&session, request)?
-        }
-        HorizonIpcObject::Applet(applet) => {
-            services::dispatch_applet(process, &applet, request, &hipc, &host_systems)?
-        }
-        HorizonIpcObject::Account(account) => services::dispatch_account(
-            process,
-            &account,
-            request,
-            &hipc,
-            host_systems.user_account_switch_locked,
-        )?,
-        HorizonIpcObject::AccountProfile(profile) => {
-            services::dispatch_account_profile(profile, request, &hipc, false)?
-        }
-        HorizonIpcObject::AccountManagerForApplication(manager) => {
-            services::dispatch_account_manager_for_application(&manager, request)?
-        }
-        HorizonIpcObject::Bsd(session) => {
-            services::dispatch_bsd(process, &session, request, &hipc)?
-        }
-        HorizonIpcObject::Ssl(session) => services::dispatch_ssl(&session, request, &hipc)?,
-        HorizonIpcObject::AudioOutManager(session) => {
-            services::dispatch_audio_out_manager(process, &session, request, &hipc)?
-        }
-        HorizonIpcObject::AudioOut(session) => {
-            services::dispatch_audio_out(process, &session, request, &hipc)?
-        }
-        HorizonIpcObject::Hid(hid) => {
-            services::dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?
-        }
-        HorizonIpcObject::Irs(session) => {
-            services::dispatch_irs(process, &session, request, &hipc)?
-        }
-        HorizonIpcObject::HidAppletResource(resource) => {
-            services::dispatch_hid_applet_resource(process, &resource, request)?
-        }
-        HorizonIpcObject::HidActiveVibrationDeviceList(list) => {
-            services::dispatch_hid_active_vibration_device_list(&list, request, &hipc)?
-        }
-        HorizonIpcObject::Time(time) => services::dispatch_time(process, &time, request, &hipc)?,
-        HorizonIpcObject::SystemClock(clock) => {
-            services::dispatch_system_clock(&clock, request, &hipc)?
-        }
-        HorizonIpcObject::SteadyClock(clock) => services::dispatch_steady_clock(&clock, request)?,
-        HorizonIpcObject::TimeZone(timezone) => services::dispatch_timezone(&timezone, request)?,
-        HorizonIpcObject::Vi(vi) => services::dispatch_vi(process, &vi, request, &hipc)?,
-        HorizonIpcObject::NvDrv(nvdrv) => match services::dispatch_nvdrv(
-            process,
-            &nvdrv,
-            request,
-            &hipc,
-            host_systems.caller_thread_id,
-            time_environment.clock(),
-        ) {
-            Ok(response) => response,
-            Err(IpcWireError::PendingGpuSubmission(wait)) => {
-                return Ok(trace_completion(SyncRequestResult::PendingGpuSubmission(
-                    wait,
-                )));
+    let dispatched = (|| {
+        let (response, created_handle) = match target {
+            HorizonIpcObject::ServiceManager(manager) => services::dispatch_service_manager(
+                process,
+                &manager,
+                services::ServiceManagerRequest::Cmif(request),
+                hipc.pid.is_some(),
+                initial_operation_mode,
+                time_environment,
+                host_systems,
+            )?,
+            HorizonIpcObject::SemanticService(service) => dispatch_service(
+                process,
+                &service,
+                request,
+                &hipc,
+                host_systems.diagnostics.file_system_access_log_mode(),
+                host_systems.save_data,
+                &async_reply,
+            )?,
+            HorizonIpcObject::SystemSettings(_) => {
+                services::dispatch_system_settings(process, request, &hipc.receive_statics)?
             }
-            Err(IpcWireError::PendingNvDrv(wait)) => {
-                return Ok(trace_completion(SyncRequestResult::PendingNvDrv(wait)));
+            HorizonIpcObject::UserSettings(settings) => {
+                services::dispatch_user_settings(process, &settings, request, &hipc)?
             }
-            Err(error) => return Err(error),
-        },
-        HorizonIpcObject::LogManager(manager) => services::dispatch_log_manager(
-            process,
-            &manager,
-            request,
-            &hipc,
-            host_systems.diagnostics.guest_logs_level,
-        )?,
-        HorizonIpcObject::Logger(logger) => services::dispatch_logger(
-            process,
-            &logger,
-            request,
-            &hipc,
-            host_systems.diagnostics.guest_logs_level,
-        )?,
-        HorizonIpcObject::ParentalControl(factory) => {
-            services::dispatch_parental_control(process, &factory, request, &hipc)?
+            HorizonIpcObject::PerformanceManager(manager) => {
+                services::dispatch_performance_manager(process, &manager, request)?
+            }
+            HorizonIpcObject::Performance(session) => {
+                services::dispatch_performance_session(&session, request)?
+            }
+            HorizonIpcObject::Applet(applet) => {
+                services::dispatch_applet(process, &applet, request, &hipc, &host_systems)?
+            }
+            HorizonIpcObject::Account(account) => services::dispatch_account(
+                process,
+                &account,
+                request,
+                &hipc,
+                host_systems.user_account_switch_locked,
+            )?,
+            HorizonIpcObject::AccountProfile(profile) => {
+                services::dispatch_account_profile(profile, request, &hipc, false)?
+            }
+            HorizonIpcObject::AccountManagerForApplication(manager) => {
+                services::dispatch_account_manager_for_application(&manager, request)?
+            }
+            HorizonIpcObject::Bsd(session) => {
+                services::dispatch_bsd(process, &session, request, &hipc)?
+            }
+            HorizonIpcObject::Ssl(session) => services::dispatch_ssl(&session, request, &hipc)?,
+            HorizonIpcObject::AudioOutManager(session) => {
+                services::dispatch_audio_out_manager(process, &session, request, &hipc)?
+            }
+            HorizonIpcObject::AudioOut(session) => {
+                services::dispatch_audio_out(process, &session, request, &hipc)?
+            }
+            HorizonIpcObject::Hid(hid) => {
+                services::dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?
+            }
+            HorizonIpcObject::Irs(session) => {
+                services::dispatch_irs(process, &session, request, &hipc)?
+            }
+            HorizonIpcObject::HidAppletResource(resource) => {
+                services::dispatch_hid_applet_resource(process, &resource, request)?
+            }
+            HorizonIpcObject::HidActiveVibrationDeviceList(list) => {
+                services::dispatch_hid_active_vibration_device_list(&list, request, &hipc)?
+            }
+            HorizonIpcObject::Time(time) => {
+                services::dispatch_time(process, &time, request, &hipc)?
+            }
+            HorizonIpcObject::SystemClock(clock) => {
+                services::dispatch_system_clock(&clock, request, &hipc)?
+            }
+            HorizonIpcObject::SteadyClock(clock) => {
+                services::dispatch_steady_clock(&clock, request)?
+            }
+            HorizonIpcObject::TimeZone(timezone) => {
+                services::dispatch_timezone(&timezone, request)?
+            }
+            HorizonIpcObject::Vi(vi) => services::dispatch_vi(process, &vi, request, &hipc)?,
+            HorizonIpcObject::NvDrv(nvdrv) => match services::dispatch_nvdrv(
+                process,
+                &nvdrv,
+                request,
+                &hipc,
+                host_systems.caller_thread_id,
+                time_environment.clock(),
+                &async_reply,
+            ) {
+                Ok(response) => response,
+                Err(IpcWireError::PendingGpuSubmission(wait)) => {
+                    return Ok(trace_completion(SyncRequestResult::PendingGpuSubmission(
+                        wait,
+                    )));
+                }
+                Err(IpcWireError::PendingNvDrv(wait)) => {
+                    return Ok(trace_completion(SyncRequestResult::PendingNvDrv(wait)));
+                }
+                Err(error) => return Err(error),
+            },
+            HorizonIpcObject::LogManager(manager) => services::dispatch_log_manager(
+                process,
+                &manager,
+                request,
+                &hipc,
+                host_systems.diagnostics.guest_logs_level,
+            )?,
+            HorizonIpcObject::Logger(logger) => services::dispatch_logger(
+                process,
+                &logger,
+                request,
+                &hipc,
+                host_systems.diagnostics.guest_logs_level,
+            )?,
+            HorizonIpcObject::ParentalControl(factory) => {
+                services::dispatch_parental_control(process, &factory, request, &hipc)?
+            }
+            HorizonIpcObject::ParentalControlService(service) => {
+                services::dispatch_parental_control_service(None, &service, request, &hipc)?
+            }
+            HorizonIpcObject::NetworkInterface(manager) => {
+                services::dispatch_network_interface(process, &manager, request, &hipc)?
+            }
+            HorizonIpcObject::ErrorContextWriter(session) => {
+                services::dispatch_error_context_writer(&session, request, &hipc)?
+            }
+            HorizonIpcObject::NetworkGeneralService(service) => {
+                services::dispatch_network_general_service(process, None, &service, request, &hipc)?
+            }
+            HorizonIpcObject::NetworkRequest(session) => {
+                services::dispatch_network_request(process, false, &session, request, &hipc)?
+            }
+            HorizonIpcObject::SemanticObject(object) => {
+                dispatch_plain_object(process, &object, request, &hipc, &async_reply)?
+            }
+        };
+        if let Some(service) = trace_service {
+            let response_prefix = &response[..response.len().min(64)];
+            log::trace!(
+                "SendSyncRequest response service={service} handle={handle:#x} type={command_type} command={command_id} bytes={} created_handle={created_handle:?} prefix={response_prefix:02x?}",
+                response.len(),
+            );
         }
-        HorizonIpcObject::ParentalControlService(service) => {
-            services::dispatch_parental_control_service(None, &service, request, &hipc)?
+        if let Err(error) = write_response(process, address, size, &response) {
+            if let Some(handle) = created_handle {
+                let _ = process.handles_mut().close(handle);
+            }
+            return Err(error);
         }
-        HorizonIpcObject::NetworkInterface(manager) => {
-            services::dispatch_network_interface(process, &manager, request, &hipc)?
-        }
-        HorizonIpcObject::ErrorContextWriter(session) => {
-            services::dispatch_error_context_writer(&session, request, &hipc)?
-        }
-        HorizonIpcObject::NetworkGeneralService(service) => {
-            services::dispatch_network_general_service(process, None, &service, request, &hipc)?
-        }
-        HorizonIpcObject::NetworkRequest(session) => {
-            services::dispatch_network_request(process, false, &session, request, &hipc)?
-        }
-        HorizonIpcObject::SemanticObject(object) => {
-            dispatch_plain_object(process, &object, request, &hipc)?
-        }
-    };
-    if let Some(service) = trace_service {
-        let response_prefix = &response[..response.len().min(64)];
-        log::trace!(
-            "SendSyncRequest response service={service} handle={handle:#x} type={command_type} command={command_id} bytes={} created_handle={created_handle:?} prefix={response_prefix:02x?}",
-            response.len(),
-        );
+        let outcome = if applet_exit_requested {
+            SyncRequestResult::AppletExitRequested
+        } else {
+            SyncRequestResult::Success
+        };
+        Ok(trace_completion(outcome))
+    })();
+    match dispatched {
+        Err(IpcWireError::PendingHostWork(wait)) => Ok(SyncRequestResult::PendingHostWork(wait)),
+        other => other,
     }
-    if let Err(error) = write_response(process, address, size, &response) {
-        if let Some(handle) = created_handle {
-            let _ = process.handles_mut().close(handle);
-        }
-        return Err(error);
-    }
-    let outcome = if applet_exit_requested {
-        SyncRequestResult::AppletExitRequested
-    } else {
-        SyncRequestResult::Success
-    };
-    Ok(trace_completion(outcome))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -438,6 +478,7 @@ pub(crate) enum SyncRequestResult {
     AppletExitRequested,
     PendingNvDrv(crate::nvdrv::PendingNvHostCtrlWait),
     PendingGpuSubmission(crate::nvdrv::PendingGpuSubmission),
+    PendingHostWork(crate::host_work::PendingHostWork),
 }
 
 #[cfg(test)]

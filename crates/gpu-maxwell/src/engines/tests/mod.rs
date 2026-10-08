@@ -390,7 +390,8 @@ fn program_polygon_fill(channel: &mut MaxwellGpuChannel) {
     }
 }
 
-fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellLoweringCache) {
+pub(super) fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellLoweringCache)
+{
     let shaders = MaxwellThreeDTranslatedShaders::new(
         vec![
             MaxwellThreeDTranslatedShader::new(

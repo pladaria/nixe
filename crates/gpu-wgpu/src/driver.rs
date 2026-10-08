@@ -45,10 +45,14 @@ use crate::{
 
 mod color;
 mod compute;
+mod known;
 mod multisample;
 #[cfg(not(target_os = "macos"))]
 #[path = "native/vulkan/draw.rs"]
 mod native_draw;
+mod readback;
+mod timestamps;
+mod transfer;
 
 // WebGPU and Maxwell expose at most eight simultaneous color attachments.
 const MAX_COLOR_ATTACHMENTS: usize = 8;
@@ -297,6 +301,7 @@ struct ResourceContent {
     buffer_domains: HashMap<nixe_gpu::BufferRange, BufferContentDomain>,
     buffer_initialized: Vec<(u64, u64)>,
     device_writes: Vec<DeviceWrite>,
+    image_materialized: HashMap<usize, std::collections::HashSet<CanonicalPageId>>,
 }
 
 #[derive(Clone)]
@@ -412,6 +417,7 @@ impl ResourceContent {
             buffer_domains: HashMap::new(),
             buffer_initialized: Vec::new(),
             device_writes: Vec::new(),
+            image_materialized: HashMap::new(),
         }))
     }
 
@@ -891,10 +897,21 @@ struct VertexPipelineLayoutKey {
     pulled_buffer_offset: Option<u64>,
     array_stride: u64,
     step_mode: VertexStepMode,
-    attributes: Box<[nixe_gpu::VertexAttribute]>,
+    attributes: Arc<[nixe_gpu::VertexAttribute]>,
+}
+
+struct PageWriteRun {
+    page_offset: usize,
+    staging_offset: usize,
+    size: usize,
 }
 
 enum PendingWriteback {
+    ImagePage {
+        staging: Buffer,
+        page: CanonicalPageId,
+        runs: Vec<PageWriteRun>,
+    },
     Buffer {
         staging: Buffer,
         page: CanonicalPageId,
@@ -916,6 +933,7 @@ enum PendingWriteback {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DemandedBufferWriteback {
+    page: CanonicalPageId,
     handle: BackendResourceHandle,
     serial: u64,
     range: TransferRange,
@@ -929,6 +947,7 @@ enum DemandedWriteback {
         handle: BackendResourceHandle,
         binding: usize,
         serial: u64,
+        page: Option<CanonicalPageId>,
     },
 }
 
@@ -1236,10 +1255,13 @@ pub(crate) struct WgpuBackendDriver {
     presentation_images: HashMap<PresentationSourceKey, Vec<PresentationSource>>,
     presentation_imports: HashMap<PresentationImportKey, PresentationImport>,
     presentation_import_pipeline: Option<ComputePipeline>,
+    transfer_pipeline: Option<ComputePipeline>,
+    transfer_scratch: Option<Buffer>,
     partial_clear_pipelines: HashMap<PartialClearPipelineKey, RenderPipeline>,
     partial_clear_parameters: PartialClearParameters,
     submissions: HashMap<BackendSubmissionToken, HostSubmission>,
     completion_sender: std::sync::mpsc::Sender<BackendSubmissionToken>,
+    timestamps: Option<timestamps::Timestamps>,
     completion_receiver: std::sync::mpsc::Receiver<BackendSubmissionToken>,
     next_use: u64,
     next_cache_use: u64,
@@ -1318,10 +1340,13 @@ impl WgpuBackendDriver {
             presentation_images: HashMap::new(),
             presentation_imports: HashMap::new(),
             presentation_import_pipeline: None,
+            transfer_pipeline: None,
+            transfer_scratch: None,
             partial_clear_pipelines: HashMap::new(),
             partial_clear_parameters,
             submissions: HashMap::new(),
             completion_sender,
+            timestamps: None,
             completion_receiver,
             next_use: 1,
             next_cache_use: 1,
@@ -1395,8 +1420,11 @@ impl WgpuBackendDriver {
         self.presentation_images.clear();
         self.presentation_imports.clear();
         self.presentation_import_pipeline = None;
+        self.transfer_pipeline = None;
+        self.transfer_scratch = None;
         self.partial_clear_pipelines.clear();
         self.submissions.clear();
+        self.timestamps = None;
         self.readback_pool.clear();
         self.upload_staging = StagingBelt::new(self.device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         self.upload_canonical = Vec::new();
@@ -1915,7 +1943,31 @@ impl WgpuBackendDriver {
         let mut index = 0;
         while index < operations.len() {
             match operations[index].command() {
+                GpuCommand::TransformBuffer(copy) => {
+                    self.encode_buffer_transform(&mut encoder, dependencies, copy)?
+                }
                 GpuCommand::Copy(copy) => self.encode_copy(&mut encoder, dependencies, copy)?,
+                GpuCommand::UploadBuffer { destination, bytes } => {
+                    if bytes.len() as u64 != destination.range.size()
+                        || !destination.range.offset().is_multiple_of(4)
+                        || !destination.range.size().is_multiple_of(4)
+                    {
+                        return Err(unsupported(
+                            "inline buffer upload requires aligned exact bytes",
+                        ));
+                    }
+                    let handle = dependency_handle(
+                        dependencies,
+                        ResourceDependency::Buffer(destination.buffer),
+                    )?;
+                    let buffer = self.buffer(handle)?.clone();
+                    self.stage_buffer_upload(
+                        &mut encoder,
+                        &buffer,
+                        destination.range.offset(),
+                        bytes,
+                    )?;
+                }
                 GpuCommand::UploadImage { destination, bytes } => {
                     let handle = dependency_handle(
                         dependencies,
@@ -3604,6 +3656,7 @@ impl WgpuBackendDriver {
         if let Some(module) = module {
             return Ok((module.clone(), neutral));
         }
+        let _trace = nixe_trace::Span::new("gpu.shader_compile", handle.slot(), 0);
         let wgsl = nixe_gpu::lower_shader_ir_to_wgsl(neutral.ir()).map_err(|error| {
             let instruction = match error {
                 nixe_gpu::ShaderBackendLoweringError::NumericControl(location) => neutral
@@ -3636,7 +3689,6 @@ impl WgpuBackendDriver {
         &mut self,
         encoder: &mut CommandEncoder,
         writeback: DemandedBufferWriteback,
-        page: CanonicalPageId,
         output: &mut Vec<PendingWriteback>,
     ) -> Result<(), BackendDriverError> {
         let (buffer, buffer_size, view) = match self.resource(writeback.handle)? {
@@ -3667,9 +3719,10 @@ impl WgpuBackendDriver {
         let copy_size = aligned_end - aligned_source;
         let staging = self.take_readback_buffer(copy_size, "Nixe buffer readback");
         encoder.copy_buffer_to_buffer(&buffer, aligned_source, &staging, 0, copy_size);
+        nixe_trace::event("gpu.readback_bytes", 0, copy_size);
         output.push(PendingWriteback::Buffer {
             staging,
-            page,
+            page: writeback.page,
             page_offset: usize_from_u64(writeback.page_offset, "page writeback offset")?,
             staging_offset: usize_from_u64(source - aligned_source, "staging writeback offset")?,
             size: usize_from_u64(writeback.range.size, "buffer writeback size")?,
@@ -3731,6 +3784,7 @@ impl WgpuBackendDriver {
             .and_then(|value| value.checked_mul(u64::from(layers)))
             .ok_or_else(|| unsupported("image writeback size overflow"))?;
         let staging = self.take_readback_buffer(size, "Nixe image readback");
+        nixe_trace::event("gpu.readback_bytes", 0, size);
         encoder.copy_texture_to_buffer(
             TexelCopyTextureInfo {
                 texture: &texture,
@@ -3772,7 +3826,9 @@ impl WgpuBackendDriver {
     fn finish_writebacks(
         &mut self,
         writebacks: Vec<PendingWriteback>,
+        submission: wgpu::SubmissionIndex,
     ) -> Result<(), BackendDriverError> {
+        let _trace = nixe_trace::Span::new("gpu.readback", 0, writebacks.len() as u64);
         if writebacks.is_empty() {
             return Ok(());
         }
@@ -3780,6 +3836,7 @@ impl WgpuBackendDriver {
         for writeback in &writebacks {
             let staging = match &writeback {
                 PendingWriteback::Buffer { staging, .. }
+                | PendingWriteback::ImagePage { staging, .. }
                 | PendingWriteback::Image { staging, .. } => staging,
             };
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -3789,11 +3846,15 @@ impl WgpuBackendDriver {
             receivers.push(receiver);
         }
         self.device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
             .map_err(|error| BackendDriverError::device_lost(error.to_string()))?;
         for (writeback, receiver) in writebacks.into_iter().zip(receivers) {
             let staging = match &writeback {
                 PendingWriteback::Buffer { staging, .. }
+                | PendingWriteback::ImagePage { staging, .. }
                 | PendingWriteback::Image { staging, .. } => staging,
             };
             receiver
@@ -3804,6 +3865,17 @@ impl WgpuBackendDriver {
                 BackendDriverError::failure(format!("wgpu readback mapping failed: {error}"))
             })?;
             match &writeback {
+                PendingWriteback::ImagePage { page, runs, .. } => {
+                    for run in runs {
+                        self.visibility
+                            .write_page_range(
+                                *page,
+                                run.page_offset,
+                                &mapped[run.staging_offset..run.staging_offset + run.size],
+                            )
+                            .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+                    }
+                }
                 PendingWriteback::Buffer {
                     page,
                     page_offset,
@@ -3857,6 +3929,7 @@ impl WgpuBackendDriver {
             staging.unmap();
             let staging = match writeback {
                 PendingWriteback::Buffer { staging, .. }
+                | PendingWriteback::ImagePage { staging, .. }
                 | PendingWriteback::Image { staging, .. } => staging,
             };
             self.recycle_readback_buffer(staging);
@@ -4563,39 +4636,148 @@ impl WgpuBackendDriver {
         request: CpuVisibilityRequest,
         retain_mirror: bool,
     ) -> Result<Box<[u8]>, BackendDriverError> {
-        let mut demanded = Vec::new();
+        let _visibility = nixe_trace::Span::new(
+            "gpu.cpu_visibility",
+            request.visible_at.get(),
+            request.size as u64,
+        );
+        // Small resident buffer demands share one directed transfer. Populate
+        // page mirrors without changing another page's canonical ownership.
+        let mut pages = std::collections::BTreeSet::from([request.page]);
         for candidate in self.page_resources.get(request.page) {
-            let record = self.resource_record(candidate.handle)?;
-            collect_demanded_writebacks(candidate.handle, record, candidate.binding, &mut demanded);
+            if let BackendResourceCreateInfo::Buffer {
+                view: Some(view), ..
+            } = &self.resource_record(candidate.handle)?.immutable
+                && view.backing().size() <= 256 * 1024
+            {
+                pages.extend(
+                    view.backing()
+                        .range()
+                        .segments()
+                        .iter()
+                        .map(|segment| segment.page()),
+                );
+            }
+        }
+        let mut demanded = Vec::new();
+        for page in pages.iter().copied() {
+            for candidate in self.page_resources.get(page) {
+                let record = self.resource_record(candidate.handle)?;
+                collect_demanded_writebacks(
+                    candidate.handle,
+                    record,
+                    candidate.binding,
+                    page,
+                    &mut demanded,
+                );
+            }
         }
         prepare_demanded_writebacks(&mut demanded);
-        if !demanded.is_empty() {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("Nixe demanded canonical visibility"),
-                });
-            let mut writebacks = Vec::with_capacity(demanded.len());
-            for demanded_writeback in &demanded {
-                match *demanded_writeback {
-                    DemandedWriteback::Buffer(buffer) => self.encode_buffer_writeback(
-                        &mut encoder,
-                        buffer,
-                        request.page,
-                        &mut writebacks,
-                    )?,
-                    DemandedWriteback::Image {
-                        handle, binding, ..
-                    } => {
-                        self.encode_image_writeback(&mut encoder, handle, binding, &mut writebacks)?
-                    }
+        // A fault can race a newer accepted write. Wait the actual last-use
+        // fence before consuming any mirror bytes or retiring dirty ranges.
+        // The canonical owner/epoch check still rejects a stale CPU request.
+        let mut pending = Vec::new();
+        for page in &pages {
+            for candidate in self.page_resources.get(*page) {
+                if let Some(last) = self.resource_record(candidate.handle)?.last_use
+                    && self
+                        .submissions
+                        .get(&last.submission)
+                        .is_some_and(|work| !work.completed)
+                    && !pending.contains(&last.submission)
+                {
+                    pending.push(last.submission);
                 }
             }
-            {
-                let _queue_access = self.queue_access.lock();
-                self.queue.submit([encoder.finish()]);
+        }
+        for token in pending {
+            self.wait_for_completion(token)?;
+        }
+        let mut transfers = self.unknown_writebacks(&demanded)?;
+        if !demanded.is_empty() {
+            if !transfers.is_empty() {
+                let mut encoder = self
+                    .device
+                    .create_command_encoder(&CommandEncoderDescriptor {
+                        label: Some("Nixe demanded canonical visibility"),
+                    });
+                let mut writebacks = Vec::with_capacity(demanded.len());
+                for demanded_writeback in &mut transfers {
+                    match *demanded_writeback {
+                        DemandedWriteback::Buffer(buffer) => {
+                            self.encode_buffer_writeback(&mut encoder, buffer, &mut writebacks)?
+                        }
+                        DemandedWriteback::Image {
+                            handle,
+                            binding,
+                            page,
+                            ..
+                        } => {
+                            if !page.is_some_and(|page| {
+                                self.supports_image_page_writeback(handle, binding, page)
+                            }) {
+                                if let DemandedWriteback::Image {
+                                    handle,
+                                    binding,
+                                    page,
+                                    ..
+                                } = demanded_writeback
+                                {
+                                    for original in &mut demanded {
+                                        if let DemandedWriteback::Image {
+                                            handle: h,
+                                            binding: b,
+                                            page,
+                                            ..
+                                        } = original
+                                            && h == handle
+                                            && b == binding
+                                        {
+                                            *page = None;
+                                        }
+                                    }
+                                    *page = None;
+                                }
+                                self.encode_image_writeback(
+                                    &mut encoder,
+                                    handle,
+                                    binding,
+                                    &mut writebacks,
+                                )?;
+                            } else {
+                                self.encode_image_page_writeback(
+                                    &mut encoder,
+                                    handle,
+                                    binding,
+                                    page.unwrap(),
+                                    &mut writebacks,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                if !writebacks.is_empty() {
+                    let submission = {
+                        let _queue_access = self.queue_access.lock();
+                        self.queue.submit([encoder.finish()])
+                    };
+                    self.finish_writebacks(writebacks, submission)?;
+                }
             }
-            self.finish_writebacks(writebacks)?;
+            for page in pages.into_iter().filter(|page| {
+                demanded.iter().any(|write| match write {
+                    DemandedWriteback::Buffer(write) => write.page == *page,
+                    DemandedWriteback::Image {
+                        page: Some(written),
+                        ..
+                    } => written == page,
+                    _ => false,
+                })
+            }) {
+                self.visibility
+                    .mark_page_completed(page, request.visible_at)
+                    .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+            }
             for writeback in &demanded {
                 let record = self
                     .resource_record_mut(writeback.handle())
@@ -4847,13 +5029,33 @@ impl BackendDriver for WgpuBackendDriver {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Nixe neutral submission"),
             });
+        let stamp = if nixe_trace::enabled()
+            && self.device.features().contains(
+                wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+            ) {
+            let timestamps = self
+                .timestamps
+                .get_or_insert_with(|| timestamps::Timestamps::new(&self.device));
+            timestamps.begin(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                accepted.submission().id().get(),
+                u64::from(accepted.submission().segment().get()),
+            )
+        } else {
+            None
+        };
         self.upload_inputs(accepted, dependencies, &mut encoder)?;
         let EncodedSubmission {
-            last: encoder,
+            last: mut encoder,
             segments,
             #[cfg(not(target_os = "macos"))]
             native,
         } = self.encode_submission(accepted, dependencies, encoder)?;
+        if let Some(stamp) = &stamp {
+            stamp.end(&mut encoder);
+        }
         self.upload_staging.finish_and_recall_on_submit(&encoder);
         let submission_index = {
             let _queue_access = self.queue_access.lock();
@@ -4863,6 +5065,9 @@ impl BackendDriver for WgpuBackendDriver {
                     .chain(std::iter::once(encoder.finish())),
             )
         };
+        if let Some(stamp) = stamp {
+            stamp.map();
+        }
         let token = accepted.token();
         self.submissions.insert(
             token,
@@ -4885,28 +5090,13 @@ impl BackendDriver for WgpuBackendDriver {
                 });
             }
         }
+        self.record_ordered_writes(accepted)?;
         for access in accepted.submission().access_plan().accesses() {
-            if !access.mode().writes() {
-                continue;
-            }
-            let handle = dependencies.indexed(access.dependency_index());
-            record_device_write(
-                self.resource_record_mut(handle)?,
-                access.target(),
-                use_serial,
-            )?;
-            self.index_presentable_image(handle, access.target());
-        }
-        for operation in accepted.submission().operations() {
-            if let GpuCommand::Clear(ClearOperation::Image {
-                target,
-                value: ClearValue::Color(_),
-                ..
-            }) = operation.command()
-            {
-                let handle =
-                    dependency_handle(dependencies, ResourceDependency::Image(target.image))?;
-                self.reclaim_cleared_retired_images(handle, *target)?;
+            if access.mode().writes() {
+                self.index_presentable_image(
+                    dependencies.indexed(access.dependency_index()),
+                    access.target(),
+                );
             }
         }
         Ok(())
@@ -5470,6 +5660,7 @@ fn record_device_write(
                         "device-write region budget is exhausted",
                     ));
                 }
+                content.image_materialized.remove(&index);
                 content.initialized[index] = true;
                 content.device_writes.push(DeviceWrite {
                     region: DeviceWriteRegion::ImageDomain(index),
@@ -5518,11 +5709,11 @@ fn record_buffer_device_write(
             continue;
         }
         let old_serial = writes[index].serial;
-        let left = (old.offset < new.offset).then_some(TransferRange {
+        let left = (old.offset < new.offset).then(|| TransferRange {
             offset: old.offset,
             size: new.offset - old.offset,
         });
-        let right = (old_end > new_end).then_some(TransferRange {
+        let right = (old_end > new_end).then(|| TransferRange {
             offset: new_end,
             size: old_end - new_end,
         });
@@ -5568,6 +5759,7 @@ fn collect_demanded_writebacks(
     handle: BackendResourceHandle,
     record: &ResourceRecord,
     binding: PageBinding,
+    page: CanonicalPageId,
     output: &mut Vec<DemandedWriteback>,
 ) {
     let Some(content) = record.content.as_ref() else {
@@ -5588,6 +5780,7 @@ fn collect_demanded_writebacks(
                 let end = dirty_end.min(offset + size);
                 if start < end {
                     output.push(DemandedWriteback::Buffer(DemandedBufferWriteback {
+                        page,
                         handle,
                         serial: write.serial,
                         range: TransferRange {
@@ -5603,11 +5796,16 @@ fn collect_demanded_writebacks(
             for write in &content.device_writes {
                 if let DeviceWriteRegion::ImageDomain(domain) = write.region
                     && content.image_domains[domain].binding == binding
+                    && !content
+                        .image_materialized
+                        .get(&domain)
+                        .is_some_and(|pages| pages.contains(&page))
                 {
                     output.push(DemandedWriteback::Image {
                         handle,
                         binding: domain,
                         serial: write.serial,
+                        page: Some(page),
                     });
                 }
             }
@@ -5622,6 +5820,7 @@ fn coalesce_demanded_buffer_writebacks(writebacks: &mut Vec<DemandedWriteback>) 
         if output != 0
             && let (DemandedWriteback::Buffer(previous), DemandedWriteback::Buffer(current_buffer)) =
                 (&mut writebacks[output - 1], current)
+            && previous.page == current_buffer.page
             && previous.handle == current_buffer.handle
             && previous.serial == current_buffer.serial
             && previous.range.offset + previous.range.size == current_buffer.range.offset
@@ -5660,10 +5859,31 @@ fn complete_demanded_writeback(record: &mut ResourceRecord, completed: DemandedW
             );
         }
         DemandedWriteback::Image {
-            binding, serial, ..
-        } => content.device_writes.retain(|write| {
-            write.serial != serial || write.region != DeviceWriteRegion::ImageDomain(binding)
-        }),
+            binding,
+            serial,
+            page,
+            ..
+        } => {
+            let completed = match page {
+                None => true,
+                Some(page) => {
+                    let pages = content.image_materialized.entry(binding).or_default();
+                    pages.insert(page);
+                    content.image_domains[binding]
+                        .backing
+                        .segments()
+                        .iter()
+                        .all(|segment| pages.contains(&segment.page()))
+                }
+            };
+            if completed {
+                content.device_writes.retain(|write| {
+                    write.serial != serial
+                        || write.region != DeviceWriteRegion::ImageDomain(binding)
+                });
+                content.image_materialized.remove(&binding);
+            }
+        }
     }
 }
 
@@ -5695,11 +5915,11 @@ fn subtract_buffer_write_range(
             index += 1;
             continue;
         }
-        let left = (current.offset < completed.offset).then_some(TransferRange {
+        let left = (current.offset < completed.offset).then(|| TransferRange {
             offset: current.offset,
             size: completed.offset - current.offset,
         });
-        let right = (current_end > completed_end).then_some(TransferRange {
+        let right = (current_end > completed_end).then(|| TransferRange {
             offset: completed_end,
             size: current_end - completed_end,
         });
@@ -6607,18 +6827,30 @@ mod tests {
         let newer = BackendResourceHandle::new(instance, 1, 1, BackendResourceKind::Buffer);
         let mut demanded = vec![
             DemandedWriteback::Buffer(DemandedBufferWriteback {
+                page: nixe_memory::CanonicalPageId::new(
+                    nixe_memory::BackingStoreId::new(1),
+                    nixe_memory::GuestPhysicalPageId::new(0),
+                ),
                 handle: newer,
                 serial: 2,
                 range: TransferRange { offset: 4, size: 4 },
                 page_offset: 4,
             }),
             DemandedWriteback::Buffer(DemandedBufferWriteback {
+                page: nixe_memory::CanonicalPageId::new(
+                    nixe_memory::BackingStoreId::new(1),
+                    nixe_memory::GuestPhysicalPageId::new(0),
+                ),
                 handle: older,
                 serial: 1,
                 range: TransferRange { offset: 0, size: 4 },
                 page_offset: 0,
             }),
             DemandedWriteback::Buffer(DemandedBufferWriteback {
+                page: nixe_memory::CanonicalPageId::new(
+                    nixe_memory::BackingStoreId::new(1),
+                    nixe_memory::GuestPhysicalPageId::new(0),
+                ),
                 handle: older,
                 serial: 1,
                 range: TransferRange { offset: 4, size: 4 },
@@ -6634,6 +6866,10 @@ mod tests {
         assert_eq!(
             demanded[0],
             DemandedWriteback::Buffer(DemandedBufferWriteback {
+                page: nixe_memory::CanonicalPageId::new(
+                    nixe_memory::BackingStoreId::new(1),
+                    nixe_memory::GuestPhysicalPageId::new(0)
+                ),
                 handle: older,
                 serial: 1,
                 range: TransferRange { offset: 0, size: 8 },

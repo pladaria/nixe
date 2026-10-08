@@ -23,7 +23,7 @@ mod worker;
 
 use identity::{GuestThreadIdAllocator, ProcessIdAllocator};
 pub use worker::WorkerFailure;
-use worker::{VcpuWorkerPool, WorkerCpuThreadKey, WorkerRequest, WorkerRunFailure};
+use worker::{QuantumPolicy, VcpuWorkerPool, WorkerCpuThreadKey, WorkerRequest, WorkerRunFailure};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum VcpuExecutionMode {
@@ -98,6 +98,25 @@ impl AdaptiveExecutionBudget {
         } else {
             self.baseline
         };
+    }
+
+    /// Live execution targets one millisecond of worker execution per handoff, bounded
+    /// by instruction count and a factor-of-two adjustment. This changes host
+    /// scheduling granularity, never guest clock rate or retired-instruction
+    /// accounting. Native control/interrupt polls remain independent.
+    fn observe_elapsed(&mut self, progress: u64, elapsed: std::time::Duration) {
+        const TARGET_NS: u128 = 1_000_000;
+        const MAX_INSTRUCTIONS: u64 = 4_000_000;
+        if progress == 0 || elapsed.is_zero() {
+            return;
+        }
+        let estimate = (u128::from(progress) * TARGET_NS / elapsed.as_nanos())
+            .min(u128::from(u64::MAX)) as u64;
+        let lower = (self.current / 2).max(self.baseline);
+        let upper = self.current.saturating_mul(2).max(lower);
+        self.current = estimate
+            .clamp(lower, upper)
+            .min(MAX_INSTRUCTIONS.max(self.baseline));
     }
 }
 
@@ -578,6 +597,7 @@ impl RuntimeCoordinator {
     /// Makes one waiting guest thread ready.
     pub fn make_thread_ready(&mut self, thread: GuestThreadId) -> Result<(), CoordinatorError> {
         self.scheduler.apply(SchedulerCommand::MakeReady(thread))?;
+        nixe_trace::event("scheduler.ready", thread.get(), 0);
         self.cpu_waits.remove(&thread);
         Ok(())
     }

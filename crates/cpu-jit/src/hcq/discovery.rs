@@ -154,10 +154,10 @@ impl Graph {
             // Samples have no per-successor edge kind. Validate them against the
             // captured seed terminator, not the snapshot's optional last edge:
             // earlier samples may describe calls even after a non-edge sample.
-            let successors: Vec<_> = if key == observation.root().0
-                && complete_image
-                && boundary.is_none_or(|boundary| boundary.source == last.key)
-            {
+            let sampled_source = boundary.map_or(key == observation.root().0, |boundary| {
+                boundary.source == last.key
+            });
+            let successors: Vec<_> = if complete_image && sampled_source {
                 observed
                     .iter()
                     .flatten()
@@ -168,6 +168,9 @@ impl Graph {
                 Vec::new()
             };
             for successor in &successors {
+                if matches!(exit, Exit::Indirect | Exit::Call(None)) {
+                    builder.observe(last.key.block_key(), successor.target)?;
+                }
                 if root.at(successor.target.pc) == Some(successor.target) {
                     builder.leader(successor.target)?;
                 }
@@ -202,6 +205,14 @@ impl Graph {
                     pending.sample(successor);
                 }
                 pending.successors(&exit);
+                if matches!(exit, Exit::Call(_))
+                    && let Some(continuation) = key.at(GuestVirtualAddress::new(
+                        last.key.block_key().pc.get().wrapping_add(4),
+                    ))
+                {
+                    builder.leader(continuation)?;
+                    pending.push(continuation, 4, 0, 0);
+                }
             }
             inputs.push(Selected {
                 input,
@@ -212,6 +223,13 @@ impl Graph {
         let mut graph = Self::finish(builder, inputs)?;
         if let Some(inspected) = inspected {
             graph.discovery = Some(work.discovery_evidence(inspected, blocked, leaders, missing)?);
+        }
+        if boundary.is_none() {
+            // A continuation is reachable only through a captured callee's
+            // guarded return. Do not compile or pin disconnected continuation
+            // trees when that call is still external.
+            let blocked = vec![false; graph.instructions.len()];
+            graph = graph.trim(&blocked, &[])?;
         }
         if let Some(boundary) = boundary {
             let source = graph
@@ -233,20 +251,14 @@ impl Graph {
                 ))
             });
             if !permits_sample(&exit, boundary.target.block_key()) {
-                // Calls/returns/runtime boundaries never become region edges,
-                // even if a queued observation names a demanded destination.
+                // Semantic boundaries cannot become native region edges.
                 return Err(rejection::finish(work, graph, limited));
             }
             // A mandatory queue item is not proof of root connectivity. Use
             // the same captured-graph traversal as collision trimming; no live
             // lookup, extra body or speculative indirect edge is introduced.
             let blocked = vec![false; graph.instructions.len()];
-            graph = graph.trim(
-                &blocked,
-                &observed,
-                Some(boundary.source),
-                &retained_entries,
-            )?;
+            graph = graph.trim(&blocked, &retained_entries)?;
             if !graph.contains(boundary.source) || !graph.contains(boundary.target) {
                 // Preserve the reason and complete acquired-input ledger,
                 // without passing a disconnected graph into reservations.
@@ -308,6 +320,11 @@ impl Worklist {
                 self.push(no, 4, 0, 0);
                 self.push(yes, 5, 0, 0);
             }
+            // Calls cross function boundaries. Only an executed sample (or a
+            // retained/mandatory reshape endpoint) admits the callee. Walking
+            // every demanded callee transitively inflates cold regions, pins
+            // their LCQ images and evicts code still needed during startup.
+            // Captured callees still become ordinary native SSA edges.
             _ => {}
         }
     }
@@ -331,12 +348,14 @@ fn direct_targets(exit: &Exit) -> [Option<BlockKey>; 2] {
             fallthrough: Target::External(no),
             taken: Target::External(yes),
         } => [Some(no), Some(yes)],
+        Exit::Call(Some(key)) => [Some(key), None],
         _ => [None; 2],
     }
 }
 
 fn permits_sample(exit: &Exit, target: BlockKey) -> bool {
-    matches!(exit, Exit::Indirect) || direct_targets(exit).contains(&Some(target))
+    matches!(exit, Exit::Indirect | Exit::Call(None))
+        || direct_targets(exit).contains(&Some(target))
 }
 
 /// Include complete canonical blocks, not an arbitrary word prefix. Existing

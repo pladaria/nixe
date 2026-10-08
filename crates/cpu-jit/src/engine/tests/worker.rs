@@ -26,14 +26,7 @@ fn data_fault(thread: &mut JitThread, worker: &mut NativeWorker) {
     state.set_pc(PC.get());
     state.general_register_storage_mut()[1] = 0x5000;
     let report = thread
-        .run_slice(
-            &mut crate::ReturnStack::default(),
-            worker,
-            &mut state,
-            10,
-            &Timer,
-            &VcpuEventState::default(),
-        )
+        .run_slice(worker, &mut state, 10, &Timer, &VcpuEventState::default())
         .unwrap();
     assert!(
         matches!(report.stop, CpuExit::DataFault { source, fault } if source.pc.get() == PC.get() + 4 && fault.address.get() == 0x5000)

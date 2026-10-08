@@ -133,7 +133,7 @@ fn current_process_content_does_not_require_general_mount_permission() {
         process
             .dispatch_ipc(file, IpcRequest::ReadFile { offset: 0, size: 5 })
             .unwrap(),
-        IpcResponse::Data(b"bytes".to_vec())
+        IpcResponse::StorageRead { offset: 0, size: 5 }
     );
 
     let IpcResponse::Handle(storage) = process
@@ -240,7 +240,10 @@ fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions(
                     }
                 )
                 .unwrap(),
-            IpcResponse::Data(b"public-content".to_vec())
+            IpcResponse::StorageRead {
+                offset: 0,
+                size: 14
+            }
         );
         assert_eq!(
             process.dispatch_ipc(
@@ -510,7 +513,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
         process
             .dispatch_ipc(file, IpcRequest::ReadFile { offset: 1, size: 8 })
             .unwrap(),
-        IpcResponse::Data(b"ew!".to_vec())
+        IpcResponse::StorageRead { offset: 1, size: 3 }
     );
 
     let add_on_session = process
@@ -588,7 +591,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
         process
             .dispatch_ipc(revision, IpcRequest::ReadFile { offset: 0, size: 3 })
             .unwrap(),
-        IpcResponse::Data(b"new".to_vec())
+        IpcResponse::StorageRead { offset: 0, size: 3 }
     );
 
     process.handles_mut().close(file).unwrap();

@@ -11,8 +11,9 @@ use std::num::NonZeroU16;
 /// Memory authority capable of copying a coherent demanded instruction image.
 pub trait ExecutableMemory: InstructionMemory {
     /// The caller holds no execution lease, JIT epoch or memory lock. `stop`
-    /// only classifies the copied word; it must not call memory or retain state
-    /// across calls (tracking or device reconciliation may restart capture). No word after
+    /// only classifies the copied word; it must not call memory. Memoization
+    /// must use the exact (PC, bits), independent of callback order: tracking or
+    /// device reconciliation may restart capture with changed bytes. No word after
     /// the first stop is fetched. A fetch fault retains the preceding prefix.
     /// Arming dirty tracking can stop a bound engine. Publication must validate
     /// the captured dependencies through that engine's mutation coordinator.

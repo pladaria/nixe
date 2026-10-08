@@ -2,9 +2,7 @@
 
 use super::error::MaxwellShaderTranslationError;
 use crate::{MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellShaderStage};
-use nixe_memory::{
-    CanonicalBackingRange, CanonicalCpuWriteDependency, CanonicalWriteBatch, MemoryPermissions,
-};
+use nixe_memory::{CanonicalBackingRange, CanonicalCpuWriteDependency, MemoryPermissions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
@@ -199,7 +197,7 @@ impl MaxwellStagedShaderWrite {
 
 pub(super) struct MaxwellShaderMemoryView<'a> {
     address_space: &'a MaxwellGpuAddressSpace,
-    staged_writes: &'a CanonicalWriteBatch,
+    staged_writes: &'a crate::projection::MemoryProjection,
 }
 
 // Graphics cache keys retain ordered VA writes; resolve their bytes once on a
@@ -209,8 +207,8 @@ pub(super) fn canonical_shader_writes(
     address_space: &MaxwellGpuAddressSpace,
     writes: &[MaxwellStagedShaderWrite],
     stage: MaxwellShaderStage,
-) -> Result<CanonicalWriteBatch, MaxwellShaderTranslationError> {
-    let mut batch = CanonicalWriteBatch::new();
+) -> Result<crate::projection::MemoryProjection, MaxwellShaderTranslationError> {
+    let mut batch = crate::projection::MemoryProjection::default();
     for write in writes {
         let address = write.address;
         let memory_error = |error| MaxwellShaderTranslationError::Memory {
@@ -225,23 +223,13 @@ pub(super) fn canonical_shader_writes(
         let range = address_space
             .resolve_range(gpu_address, 4, MemoryPermissions::READ)
             .map_err(memory_error)?;
-        let mut offset = 0;
-        let bytes = write.value.to_le_bytes();
-        for segment in range.segments() {
-            let end = offset + segment.size() as usize;
-            batch
-                .stage(
-                    segment.mapping().backing(),
-                    segment.backing_offset(),
-                    &bytes[offset..end],
-                )
-                .map_err(|error| MaxwellShaderTranslationError::StagedMemory {
-                    stage,
-                    address,
-                    error,
-                })?;
-            offset = end;
-        }
+        batch
+            .write(&range, &write.value.to_le_bytes())
+            .map_err(|error| MaxwellShaderTranslationError::StagedMemory {
+                stage,
+                address,
+                error,
+            })?;
     }
     Ok(batch)
 }
@@ -256,7 +244,7 @@ pub(super) struct MaxwellShaderRead {
 impl<'a> MaxwellShaderMemoryView<'a> {
     pub(super) const fn new(
         address_space: &'a MaxwellGpuAddressSpace,
-        staged_writes: &'a CanonicalWriteBatch,
+        staged_writes: &'a crate::projection::MemoryProjection,
     ) -> Self {
         Self {
             address_space,

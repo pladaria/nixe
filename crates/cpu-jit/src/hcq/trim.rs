@@ -1,17 +1,10 @@
-//! Collision-only graph surgery over captured words; no registry lock or new
-//! discovery. Removed targets become external, and unreachable tails disappear.
+//! Connectivity and collision trimming over captured words; no registry lock
+//! or new discovery. Removed targets become external and unreachable tails disappear.
 
 use super::*;
-use crate::sampling::Successor;
 
 impl Graph {
-    pub(crate) fn trim(
-        self,
-        blocked: &[bool],
-        successors: &[Option<Successor>; 4],
-        observed_source: Option<crate::abi::InstructionKey>,
-        entries: &[BlockKey],
-    ) -> Result<Self, Error> {
+    pub(crate) fn trim(self, blocked: &[bool], entries: &[BlockKey]) -> Result<Self, Error> {
         if blocked.len() != self.instructions.len() {
             return Err(Error::InvalidInput("collision mask does not match graph"));
         }
@@ -30,14 +23,6 @@ impl Graph {
         if ends[0] == self.blocks[0].instructions.start {
             return Err(Error::EmptySeed);
         }
-        // Only the observation's real, reachable indirect terminal authorizes
-        // its successors. Reshape's terminal need not belong to the seed image.
-        let indirect = observed_source.or_else(|| {
-            self.seed_is_indirect().then(|| {
-                let input = self.inputs.iter().find(|input| input.key == seed).unwrap();
-                self.units[input.unit].instructions.last().unwrap().key
-            })
-        });
         let indexes: HashMap<_, _> = self
             .blocks
             .iter()
@@ -60,32 +45,10 @@ impl Graph {
             if ends[index] != block.instructions.end {
                 continue; // The truncated prefix exits at the first collision.
             }
-            let mut visit = |target: Target| {
+            for target in block.successors() {
                 if let Target::Internal(next) = target {
                     pending.push(next);
                 }
-            };
-            match block.exit {
-                Exit::Fallthrough(target) | Exit::Jump(target) => visit(target),
-                Exit::Conditional { fallthrough, taken } => {
-                    visit(fallthrough);
-                    visit(taken);
-                }
-                Exit::Indirect
-                    if indirect
-                        == Some(
-                            self.instructions[block.instructions.end - 1]
-                                .instruction
-                                .key,
-                        ) =>
-                {
-                    for successor in successors.iter().flatten() {
-                        if let Some(&next) = indexes.get(&successor.target) {
-                            pending.push(next);
-                        }
-                    }
-                }
-                _ => {}
             }
         }
 
@@ -104,6 +67,15 @@ impl Graph {
         for (index, block) in self.blocks.iter().enumerate() {
             if reachable[index] {
                 builder.leader(block.key)?;
+                let source = self.instructions[block.instructions.end - 1]
+                    .instruction
+                    .key
+                    .block_key();
+                for target in &block.dispatch {
+                    if let Target::Internal(next) = target {
+                        builder.observe(source, self.blocks[*next].key)?;
+                    }
+                }
                 for word in &self.instructions[block.instructions.start..ends[index]] {
                     let instruction = word.instruction;
                     builder

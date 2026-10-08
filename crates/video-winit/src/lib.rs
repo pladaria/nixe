@@ -506,6 +506,11 @@ impl Presenter {
         if !self.configured {
             return Ok(());
         }
+        let frame_id = self
+            .pending_frame
+            .as_ref()
+            .map_or(0, |frame| frame.sequence());
+        let acquire_trace = nixe_trace::Span::new("display.surface_acquire", frame_id, 0);
         let (surface_texture, reconfigure_after_present) = match self.surface.get_current_texture()
         {
             CurrentSurfaceTexture::Success(texture) => (texture, false),
@@ -525,6 +530,7 @@ impl Presenter {
                 return Err(WindowError::surface("surface texture validation failed"));
             }
         };
+        drop(acquire_trace);
         let view = surface_texture
             .texture
             .create_view(&TextureViewDescriptor::default());
@@ -587,9 +593,13 @@ impl Presenter {
         };
         let submission;
         {
+            let queue_trace = nixe_trace::Span::new("display.queue_lock", frame_id, 0);
             let _queue_access = self.queue_access.lock();
+            drop(queue_trace);
             submission = self.queue.submit([encoder.finish()]);
+            let _trace = nixe_trace::Span::new("display.present", frame_id, 0);
             self.queue.present(surface_texture);
+            nixe_trace::event("display.presented", frame_id, 0);
         }
         self.pending_frame = None;
         if let Some(capture) = capture {

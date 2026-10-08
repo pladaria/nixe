@@ -149,8 +149,9 @@ impl Drop for Reservation {
     }
 }
 
-/// Immutable observations plus exact owner identities, never a native pointer
-/// or a borrow of the vCPU's tables. Strong code acquisition belongs to dequeue.
+/// Owned observations plus exact owner identities, never a native pointer or
+/// a borrow of the vCPU's tables. Input becomes immutable at dequeue, when
+/// the worker acquires strong code references.
 pub(crate) struct SeedJob {
     process: u64,
     slot: Handle<DispatchSlot>,
@@ -203,7 +204,10 @@ pub(crate) enum Outcome {
     Stale,
 }
 
+const DISCOVERY_BATCH: std::time::Duration = std::time::Duration::from_millis(2);
+
 struct Pending {
+    ready: Option<std::time::Instant>,
     jobs: VecDeque<Job>,
     limit: usize,
     removals: u8,
@@ -211,7 +215,10 @@ struct Pending {
 }
 
 impl Pending {
-    fn pop(&mut self) -> Option<Job> {
+    fn pop(&mut self, now: std::time::Instant) -> Option<Job> {
+        if self.ready.is_some_and(|ready| now < ready) {
+            return None;
+        }
         let job = if self.removals == 7 {
             self.jobs.pop_front()
         } else {
@@ -219,6 +226,9 @@ impl Pending {
         };
         if job.is_some() {
             self.removals = (self.removals + 1) & 7;
+        }
+        if self.jobs.is_empty() {
+            self.ready = None;
         }
         job
     }
@@ -232,6 +242,27 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
+    /// Collect newer observations into an admitted but unstarted seed. The
+    /// bounded queue owns this snapshot; running compiler input is immutable.
+    fn observe_seed(&self, snapshot: AdmissionSnapshot) -> Result<(), Error> {
+        let mut pending = match self.pending.try_lock() {
+            Ok(pending) => pending,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+        };
+        for job in &mut pending.jobs {
+            if let Job::Seed(job) = job
+                && job.snapshot.key == snapshot.key
+                && job.snapshot.version == snapshot.version
+                && snapshot.observations >= job.snapshot.observations
+            {
+                job.snapshot = snapshot;
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Selected worker count, not logical CPU count. Zero creates no container.
     pub fn new(workers: usize, process: &Lifetime) -> Result<Option<Self>, Error> {
         if workers == 0 {
@@ -249,6 +280,7 @@ impl Queue {
         Ok(Some(Self {
             process: process.identity,
             pending: Mutex::new(Pending {
+                ready: None,
                 jobs,
                 limit,
                 removals: 0,
@@ -277,17 +309,30 @@ impl Queue {
         if !job.mark_queued() {
             return Ok(Outcome::Stale);
         }
+        // One bounded discovery window per batch; later arrivals never extend
+        // it. Guest demand can expose neighboring blocks and incoming entries
+        // while immutable job identities remain reserved and revalidated.
+        if pending.jobs.is_empty() {
+            pending.ready = Some(std::time::Instant::now() + DISCOVERY_BATCH);
+        }
         pending.jobs.push_back(job);
         drop(pending);
         self.changed.notify_one();
         Ok(Outcome::Queued)
     }
 
-    /// Non-waiting removal used by tests. Production workers sleep through wait.
-    #[cfg(test)]
+    /// Non-waiting removal between bounded warmup batches. Idle workers sleep
+    /// through wait; a warmup compiler must not delay queued HCQ work.
     pub fn pop(&self) -> Result<Option<Job>, Error> {
         let mut pending = self.pending.lock().map_err(|_| Error::Poisoned)?;
-        Ok(pending.pop())
+        Ok(pending.pop(std::time::Instant::now()))
+    }
+
+    /// Advance the discovery clock for ownership tests without sleeping.
+    #[cfg(test)]
+    pub(crate) fn pop_ready(&self) -> Result<Option<Job>, Error> {
+        let mut pending = self.pending.lock().map_err(|_| Error::Poisoned)?;
+        Ok(pending.pop(std::time::Instant::now() + DISCOVERY_BATCH))
     }
 
     /// Worker-side sleeping dequeue. The single queue owns the removal cycle,
@@ -295,13 +340,21 @@ impl Queue {
     pub fn wait(&self) -> Result<Option<Job>, Error> {
         let mut pending = self.pending.lock().map_err(|_| Error::Poisoned)?;
         loop {
-            if let Some(job) = pending.pop() {
+            let now = std::time::Instant::now();
+            if let Some(job) = pending.pop(now) {
                 return Ok(Some(job));
             }
             if pending.closed {
                 return Ok(None);
             }
-            pending = self.changed.wait(pending).map_err(|_| Error::Poisoned)?;
+            pending = if let Some(ready) = pending.ready {
+                self.changed
+                    .wait_timeout(pending, ready.saturating_duration_since(now))
+                    .map_err(|_| Error::Poisoned)?
+                    .0
+            } else {
+                self.changed.wait(pending).map_err(|_| Error::Poisoned)?
+            };
         }
     }
 
@@ -354,6 +407,10 @@ impl Lifetime {
         }
         let outcome = match self.reserve_seed(snapshot)? {
             Ok(job) => queue.enqueue(job)?,
+            Err(Outcome::Duplicate) => {
+                queue.observe_seed(snapshot)?;
+                Outcome::Duplicate
+            }
             Err(outcome) => outcome,
         };
         if outcome == Outcome::Deferred {

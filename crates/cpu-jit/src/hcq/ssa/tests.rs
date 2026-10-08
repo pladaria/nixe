@@ -300,6 +300,10 @@ fn hcq_ssa_partial_packing_executes_only_the_required_flag_contract() {
                         bytes: compiled.buffer.data().into(),
                         alignment: compiled.buffer.alignment as usize,
                         metadata: Metadata {
+                            #[cfg(feature = "jit-profile")]
+                            regions: Box::new([]),
+                            #[cfg(feature = "jit-profile")]
+                            profile_body_length: 0,
                             abi,
                             // No NativeFrame or published Nixe state maps in this host-ABI fixture.
                             frame_extent: 0,

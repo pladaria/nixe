@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::executable::output::{Metadata, Output};
-use nixe_memory::GuestVirtualAddress;
 
 pub(super) enum Tail {
     StaticIsland,
@@ -18,35 +17,10 @@ pub(super) fn install(
     target_entry: usize,
     tail_kind: Tail,
 ) -> Result<Option<Box<Installed>>, Error> {
+    let _trace = nixe_trace::Span::new("cpu.bridge.emit_install", 0, 0);
     let entry = &target.entries[target_entry];
-    let state = &source.states[state_map as usize];
-    // Static BL reaches this bridge directly, bypassing its canonical fallback.
-    // BLR pushes before its PIC probe; dynamic bridges must not push again.
-    let mut transfer = if matches!(tail_kind, Tail::StaticIsland)
-        && state.exit.is_some_and(|exit| exit.kind == EdgeKind::Call)
-    {
-        let continuation = source
-            .instructions
-            .get(0)
-            .unwrap()
-            .key
-            .block_key()
-            .at(GuestVirtualAddress::new(
-                state.exit.unwrap().pc.get().wrapping_add(4),
-            ))
-            .ok_or(Error::InvalidUnit("unaligned call continuation"))?;
-        crate::native::rsb::emit_push(&state.state, continuation)
-            .map_err(|_| Error::InvalidUnit("cannot emit static call prediction"))?
-    } else {
-        Vec::new()
-    };
-    transfer.extend(
-        crate::native::emit_chain_transfer(
-            &source.states[state_map as usize].state,
-            &entry.contract,
-        )
-        .map_err(|_| Error::InvalidUnit("cannot emit link state transfer"))?,
-    );
+    let transfer = crate::native::emit_published_transfer(source, state_map, target, target_entry)
+        .map_err(|_| Error::InvalidUnit("cannot emit link state transfer"))?;
     if transfer.is_empty() {
         return Ok(None);
     }
@@ -64,6 +38,10 @@ pub(super) fn install(
         bytes,
         alignment: 16,
         metadata: Metadata {
+            #[cfg(feature = "jit-profile")]
+            regions: Box::new([]),
+            #[cfg(feature = "jit-profile")]
+            profile_body_length: 0,
             abi,
             frame_extent: source
                 .code
@@ -78,6 +56,8 @@ pub(super) fn install(
         },
     };
     let address = target.code.allocation.address() + entry.fast_offset as usize;
+    #[cfg(feature = "jit-profile")]
+    let dynamic = matches!(tail_kind, Tail::DynamicInline);
     let installed = match tail_kind {
         Tail::StaticIsland => process
             .cache
@@ -88,5 +68,7 @@ pub(super) fn install(
                 .install_with_inline_branch(output, source.tier, tail, address)
         }
     }?;
+    #[cfg(feature = "jit-profile")]
+    crate::profiling::bridge(&installed, source, target, process.identity, dynamic);
     Ok(Some(Box::new(installed)))
 }

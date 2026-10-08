@@ -94,7 +94,7 @@ impl Prepared<'_, '_> {
         let process = self.work.process;
         let mut state = loop {
             self.work.capacity()?;
-            process.try_service_links()?;
+            process.try_service_optional_links()?;
             let state = process.lock();
             self.work.validate(&state)?;
             validate(&state)?;
@@ -150,6 +150,44 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn negative_publication_does_not_force_a_premature_optional_link_batch() {
+        let (process, queue, mut samples) = setup(2);
+        let boundary = observed_boundary(&process, &mut samples);
+        assert_eq!(
+            process
+                .admit_reshape(&queue, &mut samples, key(0), boundary)
+                .unwrap(),
+            Outcome::Queued
+        );
+        let work = process
+            .accept_background(queue.pop_ready().unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        let mut owners = Vec::new();
+        let Job::Reshape(job) = &work.job else {
+            panic!()
+        };
+        job.negative_owners(&mut owners);
+        let prepared = work.prepare_negative(owners).unwrap();
+        let ticket = process.request(crate::lifetime::Reason::LinkPatch).unwrap();
+        let admission = {
+            let mut state = process.lock();
+            state.link_batch_due = Some(std::time::Instant::now() + Duration::from_secs(60));
+            state.admission
+        };
+        assert!(prepared.install(|state| work.validate(state)).unwrap());
+        assert_eq!(process.lock().admission, admission);
+        assert_eq!(process.control_word().load(Ordering::Acquire), 0);
+        assert!(
+            !process
+                .maintenance_complete(crate::lifetime::Reason::LinkPatch, ticket)
+                .unwrap()
+        );
+        drop(work);
+        assert!(process.try_shutdown().unwrap());
+    }
+
+    #[test]
     fn prepared_negative_waits_for_open_and_revalidates_participants_after_wakeup() {
         for withdraw in [false, true] {
             let (process, queue, mut samples) = setup(2);
@@ -161,7 +199,7 @@ mod tests {
                 Outcome::Queued
             );
             let work = process
-                .accept_background(queue.pop().unwrap().unwrap())
+                .accept_background(queue.pop_ready().unwrap().unwrap())
                 .unwrap()
                 .unwrap();
             let source = work

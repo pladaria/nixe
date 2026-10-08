@@ -14,10 +14,11 @@ mod moves;
 pub(crate) mod observation;
 pub(crate) mod pic;
 mod poll;
-pub(crate) mod rsb;
 
 pub use backend::AllocatedBoundary;
-pub use bridge::emit_chain_transfer;
+#[cfg(test)]
+pub(super) use bridge::emit_chain_transfer;
+pub(crate) use bridge::emit_published_transfer;
 pub(crate) use canonical::emit_dispatch_fallback;
 pub(crate) use canonical::emit_polled_exit;
 pub use canonical::{emit_canonical_entry, emit_canonical_exit};
@@ -25,7 +26,7 @@ pub(crate) use fp::emit_fp_activation;
 pub use gateway::{NativeReturn, NativeReturnError, check_host, enter_protected};
 pub(crate) use poll::emit_poll;
 
-use crate::abi::{EntryContract, ExitStateMap, GuestValue, NzcvLocation, ValueLocation};
+use crate::abi::{EntryContract, ExitStateMap, GuestValue, LazyFlags, NzcvLocation, ValueLocation};
 use moves::{Copy, Emitter};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,12 +80,20 @@ impl std::error::Error for TransferError {}
 /// absent from that contract, missing clean target inputs and dirtiness inherited
 /// by the target. Unnamed locations surviving these copies does not mean that
 /// the target's independently allocated body preserves them.
+#[cfg(test)]
 pub fn emit_fast_transfer(
     source: &ExitStateMap,
     target: &EntryContract,
 ) -> Result<Vec<u8>, TransferError> {
     source.validate().map_err(TransferError::InvalidContract)?;
     target.validate().map_err(TransferError::InvalidContract)?;
+    emit_fast_transfer_validated(source, target)
+}
+
+fn emit_fast_transfer_validated(
+    source: &ExitStateMap,
+    target: &EntryContract,
+) -> Result<Vec<u8>, TransferError> {
     if source.abi != target.abi {
         return Err(TransferError::DifferentHostAbis);
     }
@@ -94,8 +103,7 @@ pub fn emit_fast_transfer(
     for binding in target.bindings.iter() {
         let input = source
             .bindings
-            .iter()
-            .find(|input| input.value == binding.value)
+            .get_value(binding.value)
             .ok_or(TransferError::MissingValue(binding.value))?;
         copies.push(Copy {
             source: input.location,
@@ -108,7 +116,11 @@ pub fn emit_fast_transfer(
             return Err(TransferError::MissingFlags);
         }
         match (&source.nzcv, &target.nzcv) {
-            (NzcvLocation::Packed(source), NzcvLocation::Packed(destination)) => {
+            (
+                NzcvLocation::Packed(source)
+                | NzcvLocation::Deferred(LazyFlags::Packed(source) | LazyFlags::Canonical(source)),
+                NzcvLocation::Packed(destination),
+            ) => {
                 copies.push(Copy {
                     source: *source,
                     destination: *destination,

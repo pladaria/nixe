@@ -23,7 +23,7 @@ fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
     let before = channel.three_d().clone();
     let frontend = channel.frontend();
     let two_d = channel.two_d().clone();
-    let draw = before.draw_state_identity();
+    let draw = before.fixed_draw_identity();
     let shaders = before.shader_state_identity();
     let resources =
         before.resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false);
@@ -236,7 +236,7 @@ fn zcull_maintenance_never_clears_the_attachment_or_invalidates_prepared_draws()
         dispatch_method(&mut channel, method / 4, value).unwrap();
     }
     let before = channel.three_d().clone();
-    let draw = before.draw_state_identity();
+    let draw = before.fixed_draw_identity();
     for (method, values) in [(0x12c8, &[0, 0x19, 0x1f_ffff][..]), (0x1958, &[0][..])] {
         for &value in values {
             let dispatch = dispatch_method(&mut channel, method / 4, value).unwrap();
@@ -267,7 +267,7 @@ fn mme_can_clear_zcull_conservatively_without_emitting_an_attachment_clear() {
         &[set_method, send_parameter_and_exit, 0x11],
     );
     let before = channel.three_d().clone();
-    let draw = before.draw_state_identity();
+    let draw = before.fixed_draw_identity();
     let dispatch = dispatch_method(&mut channel, 0x3840 / 4, 0x19).unwrap();
     assert!(dispatch.ordered_operations().is_empty());
     assert_eq!(channel.three_d().render_targets(), before.render_targets());
@@ -329,7 +329,7 @@ fn zcull_storage_retains_addresses_without_creating_attachment_operations() {
             Some(dispatch.methods()[0].method().source())
         );
     }
-    assert!(channel.three_d().draw_state_identity().matches(&before));
+    assert!(channel.three_d().fixed_draw_identity().matches(&before));
     assert!(
         before
             .resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false)
@@ -350,7 +350,7 @@ fn zcull_serialization_does_not_change_depth_resources_or_draw_state() {
         for value in [0, 1] {
             let dispatch = dispatch_method(&mut channel, method / 4, value).unwrap();
             assert!(dispatch.ordered_operations().is_empty());
-            assert!(before.draw_state_identity().matches(channel.three_d()));
+            assert!(before.fixed_draw_identity().matches(channel.three_d()));
             assert!(
                 before
                     .resource_state_identity(

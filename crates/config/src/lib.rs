@@ -267,6 +267,8 @@ pub struct CpuConfig {
     /// Enables host-parallel execution. Deterministic serialized workers
     /// remain the default.
     pub parallel_vcpus: bool,
+    /// Rebuild previously demanded CPU fragments early from validated cache hints.
+    pub warmup_profile: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -397,6 +399,8 @@ struct RawCpuConfig {
     backend: CpuBackendSelection,
     #[serde(default)]
     parallel_vcpus: bool,
+    #[serde(default)]
+    warmup_profile: bool,
 }
 
 #[derive(Deserialize)]
@@ -564,6 +568,7 @@ fn cpu_configuration(raw: RawCpuConfig) -> CpuConfig {
     CpuConfig {
         backend: raw.backend,
         parallel_vcpus: raw.parallel_vcpus,
+        warmup_profile: raw.warmup_profile,
     }
 }
 
@@ -750,6 +755,31 @@ mod tests {
             WindowState::load(&path).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn cpu_warmup_defaults_off_and_can_be_enabled() {
+        for (contents, expected) in [
+            ("version = 2\n", false),
+            ("version = 2\n[cpu]\n", false),
+            ("version = 2\n[cpu]\nwarmup_profile = true\n", true),
+        ] {
+            let file = TemporaryConfig::new(&format!(
+                r#"{contents}
+[library]
+paths = []
+[system]
+preferred_languages = ["AmericanEnglish"]
+keys = "./keys"
+initial_operation_mode = "docked"
+"#
+            ));
+            assert_eq!(
+                NixeConfig::load(&file.path).unwrap().cpu.warmup_profile,
+                expected
+            );
+        }
+        assert!(!CpuConfig::default().warmup_profile);
     }
 
     #[test]

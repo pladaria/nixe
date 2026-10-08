@@ -28,6 +28,7 @@ mod execution;
 
 pub struct JitProcess {
     cpu: ProcessCpuContext,
+    pub(crate) warmup: Option<Arc<crate::warmup::Warmup>>,
     memory: Arc<ExecutionMemory>,
     lifetime: Arc<Lifetime>,
     background: Mutex<background::Background>,
@@ -60,24 +61,49 @@ impl JitProcess {
         if !joined? {
             return Ok(false);
         }
-        self.lifetime
+        let stopped = self
+            .lifetime
             .try_shutdown()
-            .map_err(|error| self.lifetime.diagnostic(error))
+            .map_err(|error| self.lifetime.diagnostic(error))?;
+        #[cfg(feature = "jit-profile")]
+        if stopped {
+            crate::profiling::flush();
+        }
+        if stopped {
+            self.save_warmup();
+        }
+        Ok(stopped)
     }
 
     /// Bind the complete memory authority before creating execution workers.
     /// Start the fixed HCQ pool before exposing the process. Memory owns only
     /// Lifetime, never the process/pool responsible for joining those workers.
     pub fn new(cpu: ProcessCpuContext, memory: Arc<ExecutionMemory>) -> Result<Self, Error> {
+        Self::with_warmup(cpu, memory, None)
+    }
+
+    /// Warmup records are hints only. The existing compiler pool rebuilds all
+    /// native ownership from currently executable, byte-validated captures.
+    pub fn with_warmup(
+        cpu: ProcessCpuContext,
+        memory: Arc<ExecutionMemory>,
+        config: Option<crate::WarmupConfig>,
+    ) -> Result<Self, Error> {
         let logical_cpus = std::thread::available_parallelism()
             .map_err(|error| Error::internal(format!("query JIT worker CPU count: {error}")))?;
-        Self::with_workers(
+        let warmup = config
+            .map(|config| crate::warmup::Warmup::load(cpu, config))
+            .transpose()?;
+        Self::with_setup(
             cpu,
             memory,
             lifetime::background::workers::count(logical_cpus.get()),
+            warmup,
+            |size, memory| crate::hcq::worker::consumer(crate::warmup::host_abi(), size, memory),
         )
     }
 
+    #[cfg(test)]
     fn with_workers(
         cpu: ProcessCpuContext,
         memory: Arc<ExecutionMemory>,
@@ -96,10 +122,30 @@ impl JitProcess {
         })
     }
 
+    #[cfg(test)]
     fn with_compiler<F>(
         cpu: ProcessCpuContext,
         memory: Arc<ExecutionMemory>,
         selected: usize,
+        make_compiler: impl FnOnce(usize, Arc<ExecutionMemory>) -> Result<F, Error>,
+    ) -> Result<Self, Error>
+    where
+        F: Fn(
+                &mut lifetime::background::workers::Resources,
+                lifetime::background::Work<'_>,
+            ) -> Result<(), lifetime::background::workers::CompileError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::with_setup(cpu, memory, selected, None, make_compiler)
+    }
+
+    fn with_setup<F>(
+        cpu: ProcessCpuContext,
+        memory: Arc<ExecutionMemory>,
+        selected: usize,
+        warmup: Option<Arc<crate::warmup::Warmup>>,
         make_compiler: impl FnOnce(usize, Arc<ExecutionMemory>) -> Result<F, Error>,
     ) -> Result<Self, Error>
     where
@@ -129,6 +175,7 @@ impl JitProcess {
             Arc::new(Lifetime::new(cache).map_err(|error| Error::internal(error.to_string()))?);
         let mut process = Self {
             cpu,
+            warmup,
             memory,
             lifetime,
             background: Mutex::new(background::Background::Dormant),
@@ -145,6 +192,9 @@ impl JitProcess {
             .memory
             .set_mutation_observer(process.lifetime.clone())
             .map_err(|error| Error::internal(error.to_string()))?;
+        if let Some(warmup) = &process.warmup {
+            warmup.start(true);
+        }
         Ok(process)
     }
 }
@@ -153,6 +203,7 @@ pub struct JitThread {
     process: Arc<JitProcess>,
     reader: Reader,
     compiler: Compiler,
+    capture: crate::lcq::Capture,
     control: CpuControl,
     exclusive: ExclusiveMonitorState,
     // Preserve the functional sampling phase across runtime slices.
@@ -191,6 +242,7 @@ impl JitThread {
             process,
             reader,
             compiler,
+            capture: crate::lcq::Capture::default(),
             control: CpuControl::default(),
             exclusive: ExclusiveMonitorState::default(),
             sample_remaining: crate::abi::SAMPLE_INTERVAL,
@@ -234,7 +286,16 @@ impl JitThread {
     /// One cold attempt, holding no invocation or memory lease. The slice loop
     /// handles stale admission, maintenance, capacity and stop requests; no
     /// output is relabelled and no failure is hidden in an internal retry loop.
+    #[cfg(test)]
     pub(crate) fn demand(&mut self, pc: GuestVirtualAddress) -> Result<Demand, PublishError> {
+        self.demand_with_plan(pc, None)
+    }
+
+    fn demand_with_plan(
+        &mut self,
+        pc: GuestVirtualAddress,
+        entry_plan: Option<crate::frontend::entry::Plan>,
+    ) -> Result<Demand, PublishError> {
         let Some(key) = self.key(pc) else {
             return Ok(Demand::FetchFault(InstructionFetchFault::new(
                 self.process.cpu.address_space_id(),
@@ -249,7 +310,9 @@ impl JitThread {
                 Ok(Demand::Retry)
             }
             Request::Owner(claim) => {
-                let compilation = Compilation::capture(claim, &*self.process.memory)?;
+                let mut compilation =
+                    Compilation::capture_with(claim, &*self.process.memory, &mut self.capture)?;
+                compilation.entry_plan = entry_plan;
                 if compilation.fragment.image.words().is_empty() {
                     return compilation
                         .fragment
@@ -262,12 +325,22 @@ impl JitThread {
                                 .into()
                         });
                 }
+                let observed = self
+                    .process
+                    .warmup
+                    .as_ref()
+                    .map(|warmup| (warmup, &compilation.fragment));
+                // Publication consumes compilation; retain only bounded profile words.
+                let record = observed.and_then(|(warmup, fragment)| warmup.record(fragment));
                 self.compiler.publish(
                     compilation,
                     &self.process.lifetime,
                     self.process.lifetime.executable_cache(),
                     &*self.process.memory,
                 )?;
+                if let (Some(warmup), Some(record)) = (&self.process.warmup, record) {
+                    warmup.observe(record);
+                }
                 Ok(Demand::Ready)
             }
         }
@@ -277,7 +350,6 @@ impl JitThread {
     /// native protections are gone, together with the reconciled budget.
     pub(crate) fn invoke(
         &mut self,
-        returns: &mut crate::ReturnStack,
         worker: &mut NativeWorker,
         state: &mut A64State,
         budget: PollBudget,
@@ -292,8 +364,7 @@ impl JitThread {
             return Ok((None, budget)); // Demand reports the precise fetch fault.
         };
         let faults = worker.faults().map_err(invocation::Error::Runtime)?;
-        returns.prepare(key);
-        let mut frame = NativeFrame::new(state, budget).with_return_stack(returns);
+        let mut frame = NativeFrame::new(state, budget);
         // The process is bound by Reader::admit. These Arc-backed request words
         // remain alive throughout run; native cold polls only acquire-read them.
         frame.poll_requests[1] = self.control.pending_word_address() as *const _;

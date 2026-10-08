@@ -75,6 +75,35 @@ impl ScheduledProcess {
             .route_supervisor_call(lease, stop, dispatcher)
     }
 
+    pub fn route_horizon_supervisor_call(
+        &mut self,
+        stop: &ExecutionStop,
+        dispatcher: &mut nixe_horizon::HorizonSvcDispatcher,
+    ) -> Result<
+        ExceptionHandlingResult<nixe_horizon::HorizonSvcFault>,
+        nixe_horizon::HorizonScheduledDispatchError,
+    > {
+        let lease = self.last_execution.as_ref().unwrap().lease;
+        dispatcher.route_scheduled_supervisor_call(&mut self.coordinator, lease, stop)
+    }
+
+    pub fn wait_for_thread_ready(&mut self, thread: nixe_scheduler::GuestThreadId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            self.coordinator.drain_external_events().unwrap();
+            if self.thread_lifecycle(thread) == nixe_scheduler::ThreadLifecycle::Ready {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host work did not resume the guest thread"
+            );
+            self.coordinator
+                .wait_for_external_event_for(std::time::Duration::from_millis(10))
+                .unwrap();
+        }
+    }
+
     pub fn resume(&mut self) -> bool {
         let thread = self.deref().main_thread_id();
         self.coordinator.make_thread_ready(thread).is_ok()

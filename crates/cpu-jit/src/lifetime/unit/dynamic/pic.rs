@@ -111,26 +111,10 @@ impl State {
         key: BlockKey,
         contains: impl Fn(InstructionKey) -> bool,
     ) -> bool {
-        let mut next = self.units.records.get(target.unit.0).unwrap().pic_incoming;
-        while let Some(site) = next {
-            let way = self.readers.get(site.reader).unwrap().pic.way(site.slot);
-            next = way.incoming.next;
-            let bridge = way.bridge.as_ref().unwrap();
-            let source = self.units.records.get(bridge.source.0).unwrap();
-            if bridge.key.target != key
-                || source.retirement.is_some()
-                || !matches!(
-                    source.lifecycle,
-                    Lifecycle::Published | Lifecycle::Superseded
-                )
-            {
-                continue;
-            }
-            let exit = source.code.states[bridge.key.source.state_map as usize]
-                .exit
-                .unwrap();
-            let source = source
-                .code
+        self.dynamic_sources(target, key).any(|(unit, map)| {
+            let code = &self.units.records.get(unit.0).unwrap().code;
+            let exit = code.states[map as usize].exit.unwrap();
+            let source = code
                 .instructions
                 .get(0)
                 .unwrap()
@@ -138,11 +122,37 @@ impl State {
                 .block_key()
                 .at(exit.pc)
                 .unwrap();
-            if !contains(InstructionKey::new(source).unwrap()) {
-                return true;
-            }
-        }
-        false
+            !contains(InstructionKey::new(source).unwrap())
+        })
+    }
+
+    pub(in crate::lifetime) fn dynamic_sources(
+        &self,
+        target: UnitEntry,
+        key: BlockKey,
+    ) -> impl Iterator<Item = (UnitHandle, u32)> + '_ {
+        let head = self.units.records.get(target.unit.0).unwrap().pic_incoming;
+        std::iter::successors(head, |site| {
+            self.readers
+                .get(site.reader)
+                .unwrap()
+                .pic
+                .way(site.slot)
+                .incoming
+                .next
+        })
+        .filter_map(move |site| {
+            let way = self.readers.get(site.reader).unwrap().pic.way(site.slot);
+            let bridge = way.bridge.as_ref().unwrap();
+            let source = self.units.records.get(bridge.source.0).unwrap();
+            (bridge.key.target == key
+                && source.retirement.is_none()
+                && matches!(
+                    source.lifecycle,
+                    Lifecycle::Published | Lifecycle::Superseded
+                ))
+            .then_some((bridge.source, bridge.key.source.state_map))
+        })
     }
 
     fn pic_way_mut(&mut self, site: Site) -> &mut Way {

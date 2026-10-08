@@ -67,6 +67,57 @@ fn finish(cache: &mut MaxwellLoweringCache, commands: Vec<GpuOperation>) -> Maxw
 }
 
 #[test]
+fn work_retains_backing_identity_when_a_new_version_is_retired_in_the_same_work() {
+    let bytes = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let mut cache = MaxwellLoweringCache::default();
+    let dependency = prepare_slice(&mut cache, &bytes, 64);
+    let view = &cache.views[0];
+    let ViewKey::Buffer {
+        description,
+        buffer_offset,
+        backing,
+        ..
+    } = &view.key
+    else {
+        panic!("buffer");
+    };
+    let ResourceDependency::Buffer(id) = dependency else {
+        panic!("buffer");
+    };
+    let creation = BackendResourceCreateInfo::Buffer {
+        id,
+        description: *description,
+        view: Some(BufferView::new(id, *description, *buffer_offset, backing.clone()).unwrap()),
+    };
+    let work = finish_lowered_work(
+        &mut cache,
+        FrontendSubmissionId::new(1),
+        vec![],
+        vec![creation],
+        vec![dependency],
+        vec![GpuOperation::new(
+            GpuCommand::UploadBuffer {
+                destination: region(dependency),
+                bytes: Arc::from([7; 16]),
+            },
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+        Arc::from([]),
+    )
+    .unwrap();
+    assert_eq!(work.resident_resources.len(), 1);
+    assert_eq!(work.resident_resources[0].dependency, dependency);
+    assert_eq!(
+        work.resident_resources[0].backings[0].allocation_offset(),
+        64
+    );
+    assert_eq!(work.resource_invalidations(), &[dependency]);
+    assert_eq!(work.resource_creations()[0].dependency(), dependency);
+}
+
+#[test]
 fn read_only_buffer_eviction_preserves_gpu_writes_current_descriptors_and_recent_slices() {
     let bytes = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
     let mut cache = MaxwellLoweringCache::new(GpuCacheConfiguration::new(6, 2, 1, 1, 1).unwrap());

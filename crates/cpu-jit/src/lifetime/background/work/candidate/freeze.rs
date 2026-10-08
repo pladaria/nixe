@@ -35,7 +35,7 @@ impl<'w, 'p> Candidate<'w, 'p> {
             Observation::Seed(_) => None,
             Observation::Reshape { snapshot, .. } => Some(snapshot.key.target.block_key()),
         };
-        let dynamic = mandatory_target.is_none() && graph.seed_is_indirect();
+        let dynamic = mandatory_target.is_none() && graph.seed_is_dynamic();
         let mut entries = Vec::with_capacity(graph.blocks.len());
         let mut selected_blocks = vec![false; graph.blocks.len()];
         let dependencies = dependency_union(graph.units.iter().map(|unit| &*unit.dependencies));
@@ -99,6 +99,19 @@ impl<'w, 'p> Candidate<'w, 'p> {
 }
 
 impl Frozen<'_, '_> {
+    pub(crate) fn predecessor_size(&self) -> (usize, usize, usize) {
+        self.replacement.predecessors.iter().flatten().fold(
+            (0, 0, 0),
+            |(words, entries, count), old| {
+                (
+                    words + old.instructions.len(),
+                    entries + old.entries.len(),
+                    count + 1,
+                )
+            },
+        )
+    }
+
     /// An optimizer limit rejects only this still-current seed version. Check
     /// every input/claim under the same lock as the persistent token update;
     /// an obsolete compilation may cancel, but cannot reject its replacement.
@@ -175,8 +188,23 @@ impl Frozen<'_, '_> {
             // or recompile an unchanged partition through the positive path.
             return Err(CompileError::Deferred);
         }
+        let contracts = {
+            let state = self.lifetime().lock();
+            self.validate_locked(&state)?;
+            self.entries
+                .iter()
+                .map(|&entry| {
+                    state.entry_plan(self.graph().blocks[entry].key, |key| {
+                        self.graph().contains(key)
+                    })
+                })
+                .collect()
+        };
+        // Copy physical preferences only: predecessor retirement/replacement
+        // cannot invalidate them. Bridges consume the final allocated maps.
         // No registry/cache lock or guest read spans the CFG fixed points.
-        let analysis = crate::hcq::flow::Analysis::build(self.graph(), self.entries());
+        let analysis =
+            crate::hcq::flow::Analysis::with_contracts(self.graph(), self.entries(), contracts);
         self.check()?;
         Ok(analysis)
     }

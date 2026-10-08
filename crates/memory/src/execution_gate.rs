@@ -37,6 +37,8 @@ impl std::error::Error for ExecutionMutationError {}
 struct ExecutionGateState {
     active_shared: usize,
     transition_pending: bool,
+    next_transition_ticket: u64,
+    serving_transition_ticket: u64,
     epoch: u64,
 }
 
@@ -85,6 +87,8 @@ impl ExecutionGate {
                 state: Mutex::new(ExecutionGateState {
                     active_shared: 0,
                     transition_pending: false,
+                    next_transition_ticket: 0,
+                    serving_transition_ticket: 0,
                     epoch: 1,
                 }),
                 changed: Condvar::new(),
@@ -157,7 +161,7 @@ impl ExecutionGate {
     /// Closes admission and waits until every bounded CPU slice reaches its
     /// safepoint. Pending transitions cannot be overtaken by new readers.
     pub fn acquire_exclusive(&self) -> ExecutionTransitionGuard<'_> {
-        let transition = self.close_admission();
+        let transition = self.close_admission("memory.transition.exclusive");
         self.wait_shared();
         transition
     }
@@ -169,7 +173,7 @@ impl ExecutionGate {
         &self,
         changes: &[MemoryInvalidationKind],
     ) -> Result<ExecutionMutationGuard<'_>, ExecutionMutationError> {
-        let transition = self.close_admission();
+        let transition = self.close_admission("memory.transition.mutation");
         self.coordinate_mutation(transition, Some(changes))
     }
 
@@ -181,7 +185,7 @@ impl ExecutionGate {
         &self,
         arm_tracking: bool,
     ) -> Result<ExecutionMutationGuard<'_>, ExecutionMutationError> {
-        let transition = self.close_admission();
+        let transition = self.close_admission("memory.transition.capture");
         self.coordinate_mutation(transition, arm_tracking.then_some(&[]))
     }
 
@@ -193,7 +197,7 @@ impl ExecutionGate {
         &self,
         targets: impl FnOnce() -> Vec<MemoryInvalidationKind>,
     ) -> Result<ExecutionMutationGuard<'_>, ExecutionMutationError> {
-        let transition = self.close_admission();
+        let transition = self.close_admission("memory.transition.write");
         let changes = targets();
         self.coordinate_mutation(
             transition,
@@ -260,17 +264,25 @@ impl ExecutionGate {
         })
     }
 
-    fn close_admission(&self) -> ExecutionTransitionGuard<'_> {
+    fn close_admission(&self, cause: &'static str) -> ExecutionTransitionGuard<'_> {
         let mut state = self.lock_state();
-        while state.transition_pending {
+        // Keep execution admission closed across transitions already queued.
+        // Each operation retains its own guard, handshake and commit epoch;
+        // no CPU lease can slip between owners and demand another safepoint.
+        let ticket = state.next_transition_ticket;
+        state.next_transition_ticket = ticket
+            .checked_add(1)
+            .expect("execution transition tickets cannot exhaust in one host run");
+        state.transition_pending = true;
+        while ticket != state.serving_transition_ticket {
             state = self
                 .inner
                 .changed
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        state.transition_pending = true;
         let notify = state.active_shared != 0;
+        nixe_trace::event(cause, self.identity() as u64, state.active_shared as u64);
         drop(state);
         if notify {
             self.notify_transition();
@@ -383,7 +395,8 @@ impl Drop for ExecutionTransitionGuard<'_> {
                 .checked_add(1)
                 .expect("execution transition epoch cannot exhaust in one host run");
         }
-        state.transition_pending = false;
+        state.serving_transition_ticket += 1;
+        state.transition_pending = state.serving_transition_ticket != state.next_transition_ticket;
         self.gate.inner.changed.notify_all();
         drop(state);
     }
@@ -585,6 +598,49 @@ mod tests {
         // sufficient for the next writer even without an outstanding waiter.
         drop(gate.acquire_shared());
         drop(gate.acquire_exclusive());
+    }
+
+    #[test]
+    fn queued_transitions_share_one_stop_and_keep_execution_excluded() {
+        let gate = ExecutionGate::new();
+        let active = gate.acquire_shared();
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel();
+        gate.set_transition_notifier(Some(Arc::new(move || {
+            notify_tx.send(()).unwrap();
+        })));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_gate = gate.clone();
+        let first = std::thread::spawn(move || {
+            let mut guard = first_gate.acquire_exclusive();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            guard.commit();
+        });
+        notify_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(active);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second_gate = gate.clone();
+        let second = std::thread::spawn(move || {
+            let mut guard = second_gate.acquire_exclusive();
+            guard.commit();
+        });
+        loop {
+            let state = gate.lock_state();
+            if state.next_transition_ticket - state.serving_transition_ticket == 2 {
+                break;
+            }
+            drop(state);
+            std::thread::yield_now();
+        }
+        let reader_gate = gate.clone();
+        let reader = std::thread::spawn(move || reader_gate.acquire_shared().epoch());
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(reader.join().unwrap(), 3);
+        assert!(notify_rx.try_recv().is_err());
+        assert!(!gate.transition_pending());
     }
 
     #[test]

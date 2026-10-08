@@ -42,7 +42,7 @@ fn civac_probes_keep_distinct_byte_fault_sites_without_runtime_exits() {
     }
 }
 
-fn terminal_hot_offset(record: &StateRecord, key: BlockKey, bytes: &[u8]) -> u32 {
+fn terminal_hot_offset(record: &StateRecord, _key: BlockKey, bytes: &[u8]) -> u32 {
     let transfer = record.transfer.as_ref().unwrap();
     if transfer.static_target.is_none()
         && record.exit.is_some_and(|exit| {
@@ -52,25 +52,7 @@ fn terminal_hot_offset(record: &StateRecord, key: BlockKey, bytes: &[u8]) -> u32
             )
         })
     {
-        let exit = record.exit.unwrap();
-        let probe = if exit.kind == EdgeKind::Return {
-            crate::native::rsb::emit_return_probe(&record.state, key, transfer.destination).unwrap()
-        } else {
-            let mut prefix = if exit.kind == EdgeKind::Call {
-                crate::native::rsb::emit_push(
-                    &record.state,
-                    key.at(GuestVirtualAddress::new(exit.pc.get().wrapping_add(4)))
-                        .unwrap(),
-                )
-                .unwrap()
-            } else {
-                Vec::new()
-            };
-            prefix.extend(
-                crate::native::pic::probe::emit(&record.state, key, transfer.destination).unwrap(),
-            );
-            prefix
-        };
+        let probe = crate::native::pic::probe::emit(&record.state, transfer.destination).unwrap();
         let start = transfer.fallback_offset - probe.len() as u32;
         assert_eq!(
             &bytes[start as usize..transfer.fallback_offset as usize],

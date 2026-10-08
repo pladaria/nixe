@@ -372,6 +372,7 @@ pub struct HorizonSvcDispatcher {
     user_account_switch_locked: Option<bool>,
     save_data: Option<crate::SaveDataSystem>,
     diagnostics: crate::HorizonDiagnostics,
+    host_work: crate::host_work::HostWorkSystem,
     video_system: crate::VideoSystem,
     hid_system: crate::HidSystem,
     audio_backend: Option<std::sync::Arc<dyn nixe_audio::AudioBackend>>,
@@ -523,6 +524,7 @@ impl HorizonSvcDispatcher {
             user_account_switch_locked: None,
             save_data: None,
             diagnostics: crate::HorizonDiagnostics::default(),
+            host_work: crate::host_work::HostWorkSystem::default(),
             video_system,
             hid_system: crate::HidSystem::new(),
             audio_backend: None,
@@ -582,18 +584,15 @@ impl HorizonSvcDispatcher {
         self
     }
 
-    #[must_use]
+    /// Fail asynchronous graphics work even when every guest thread is waiting.
+    pub fn require_graphics_healthy(&self) -> Result<(), HorizonIpcFault> {
+        self.host_work
+            .require_graphics_healthy()
+            .map_err(HorizonIpcFault::from_wire)
+    }
+
     pub fn video_system(&self) -> crate::VideoSystem {
         self.video_system.clone()
-    }
-
-    /// Advances the guest display clock and signals VI VSync when due.
-    pub fn advance_video(&self, elapsed: Duration) -> Result<u64, crate::FramebufferError> {
-        self.video_system.advance(elapsed)
-    }
-
-    pub fn next_video_deadline(&self) -> Duration {
-        self.video_system.next_display_deadline()
     }
 
     /// Publishes the latest player-one controller state to Horizon HID.

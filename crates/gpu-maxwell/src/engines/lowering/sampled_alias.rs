@@ -134,7 +134,9 @@ pub(super) fn prepare(
     };
     let source = image_dependency(producer.dependency)?;
     let revision = producer.write_revision;
-    let key = view_key(&MaxwellThreeDResolvedResource::Image(image.clone()));
+    let key = view_key(&MaxwellThreeDResolvedResource::Image(Arc::new(
+        image.clone(),
+    )));
     let destination = if let Some(record) = cache.views.iter_mut().find(|record| record.key == key)
     {
         if !record

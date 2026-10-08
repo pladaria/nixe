@@ -8,7 +8,6 @@ fn sample_at(thread: &mut JitThread, native: &mut NativeWorker, pc: GuestVirtual
     let mut state = A64State::default();
     state.set_pc(pc.get());
     let result = thread.invoke(
-        &mut crate::ReturnStack::default(),
         native,
         &mut state,
         PollBudget::new(1, 2).unwrap(),

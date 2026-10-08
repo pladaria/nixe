@@ -539,11 +539,10 @@ fn dispatch_file(file: &ReadOnlyFile, request: IpcRequest) -> Result<IpcResponse
             let remaining = file.size() - offset;
             let read_size = usize::try_from(remaining.min(size as u64))
                 .map_err(|_| IpcResultCode::OUT_OF_RANGE)?;
-            let mut bytes = vec![0; read_size];
-            file.storage()
-                .read_at(offset, &mut bytes)
-                .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
-            Ok(IpcResponse::Data(bytes))
+            Ok(IpcResponse::StorageRead {
+                offset,
+                size: read_size,
+            })
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
     }

@@ -21,6 +21,22 @@ impl State {
 }
 
 impl Lifetime {
+    /// Canonical slice entry batches performance-only work by time. Mandatory
+    /// owners call `try_service_links` directly and join queued links to their
+    /// existing stop, regardless of this deadline.
+    pub(crate) fn try_service_optional_links(&self) -> Result<bool, Error> {
+        {
+            let state = self.lock();
+            state.healthy()?;
+            if state.phase == Phase::Open
+                && state.link_batch_due.is_some_and(|due| Instant::now() < due)
+            {
+                return Ok(true);
+            }
+        }
+        self.try_service_links()
+    }
+
     /// Called with no own invocation or memory lease. Immutable HCQ compiler
     /// references do not block ordinary link maintenance. False
     /// means another reader/owner or foreign maintenance still needs to drain;

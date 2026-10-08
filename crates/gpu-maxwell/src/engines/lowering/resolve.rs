@@ -17,8 +17,14 @@ impl MaxwellLoweringCache {
         // alignment padding which the guest did not request.
         let mut creations = Vec::new();
         let mut invalidations = std::mem::take(&mut self.retired_resources);
-        let bindings =
-            prepare_resources(resources, &[0], self, &mut creations, &mut invalidations)?;
+        let bindings = prepare_resources(
+            resources,
+            &[0],
+            vec![None; resources.resources().len()],
+            self,
+            &mut creations,
+            &mut invalidations,
+        )?;
         let target = ImageRegion {
             image: image_dependency(binding_at(resources, &bindings, 0)?)?,
             subresources: image.view().bindings()[0].subresources(),
@@ -112,8 +118,14 @@ impl MaxwellLoweringCache {
         }
         let mut creations = Vec::new();
         let mut invalidations = std::mem::take(&mut self.retired_resources);
-        let bindings =
-            prepare_resources(resources, &[0, 1], self, &mut creations, &mut invalidations)?;
+        let bindings = prepare_resources(
+            resources,
+            &[0, 1],
+            vec![None; resources.resources().len()],
+            self,
+            &mut creations,
+            &mut invalidations,
+        )?;
         let region = |index,
                       image: &super::super::threed::MaxwellThreeDResolvedImage|
          -> Result<ImageRegion, MaxwellLoweringError> {

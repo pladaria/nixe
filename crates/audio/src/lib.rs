@@ -98,6 +98,7 @@ impl AudioFeed {
     /// Fill one playback quantum with interleaved signed-16-bit PCM.
     /// Empty queues produce silence, without advancing guest buffer completion.
     pub fn render(&self, output: &mut [i16]) {
+        let _trace = nixe_trace::Span::new("audio.callback", 0, output.len() as u64);
         output.fill(0);
         let mut state = self.lock();
         if !state.started || state.failure.is_some() {
@@ -108,6 +109,7 @@ impl AudioFeed {
         let capacity = output.len() / self.format.layout.channels() * self.format.layout.channels();
         while written < capacity {
             let Some(buffer) = state.queued.front_mut() else {
+                nixe_trace::event("audio.underrun", 0, (output.len() - written) as u64);
                 break;
             };
             let count = (buffer.samples.len() - buffer.cursor).min(capacity - written);
@@ -202,6 +204,10 @@ impl AudioOutput {
     }
 
     pub fn append(&self, tag: u64, samples: Vec<i16>) -> Result<(), AudioError> {
+        nixe_trace::event("audio.append", tag, samples.len() as u64);
+        if nixe_trace::enabled() && samples.iter().any(|sample| *sample != 0) {
+            nixe_trace::event("audio.nonzero", tag, samples.len() as u64);
+        }
         if !samples
             .len()
             .is_multiple_of(self.feed.format.layout.channels())

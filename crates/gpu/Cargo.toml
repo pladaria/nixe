@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nixe-trace.workspace = true
 nixe-memory.workspace = true
 twox-hash.workspace = true
 rspirv = "0.13"

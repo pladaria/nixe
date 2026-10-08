@@ -305,3 +305,37 @@ fn closure_between_slot_reservation_and_claim_leaves_no_empty_slot() {
     ));
     fresh.validate().unwrap();
 }
+
+#[test]
+fn warmup_wait_respects_foreign_maintenance_and_cancels_without_its_owner() {
+    use std::sync::atomic::AtomicBool;
+    for cancel in [false, true] {
+        let process = process();
+        process.request(Reason::MappingChange).unwrap();
+        let mut transition = process.try_transition().unwrap().unwrap();
+        transition.wait_closed().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiting = process.clone();
+        let flag = cancelled.clone();
+        let (done, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done.send(waiting.wait_for_warmup(&flag)).unwrap();
+        });
+        // Warmup must neither reopen nor acknowledge a foreign owner's stop.
+        assert!(result.recv_timeout(Duration::from_millis(20)).is_err());
+        if cancel {
+            cancelled.store(true, Ordering::Release);
+        } else {
+            transition.batch().unwrap().complete().unwrap();
+            assert!(transition.try_reopen().unwrap());
+        }
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(!cancel)
+        );
+        worker.join().unwrap();
+        drop(transition);
+        process.request_shutdown().unwrap();
+        assert!(process.try_shutdown().unwrap());
+    }
+}

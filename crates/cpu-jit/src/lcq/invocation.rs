@@ -31,6 +31,7 @@ pub(crate) enum Exit {
         /// The exiting instruction, not the destination PC's current bytes.
         instruction: Instruction,
         completion_sample: Option<lifetime::unit::CompletionSample>,
+        entry_plan: Option<crate::frontend::entry::Plan>,
     },
     Memory {
         instruction: Instruction,
@@ -133,6 +134,7 @@ pub(crate) unsafe fn run(
         dispatch_error: None,
         samples,
         observation_status: 0,
+        entry_plan: None,
     };
     frame.dispatch_resolver = Some(dispatch_link);
     frame.sample_observer = Some(observe_sample);
@@ -241,6 +243,7 @@ pub(crate) unsafe fn run(
                     guest,
                     instruction,
                     completion_sample,
+                    entry_plan: dispatch.entry_plan.take(),
                 }
             }
         }
@@ -363,6 +366,7 @@ struct Dispatch<'a> {
     dispatch_error: Option<Error>,
     samples: &'a mut crate::sampling::Samples,
     observation_status: u32,
+    entry_plan: Option<crate::frontend::entry::Plan>,
 }
 
 unsafe extern "C" fn observe_sample(
@@ -528,7 +532,17 @@ unsafe extern "C" fn dispatch_link(
             )
         };
         match resolved {
-            Ok(entry) => Ok(entry.map_or(0, |entry| entry.canonical.get())),
+            Ok(Some(entry)) => Ok(entry.canonical.get()),
+            Ok(None) => {
+                // The target has no contract yet. Copy this actual predecessor
+                // while its map is protected, then release the invocation
+                // before demand compilation. No native pointers escape.
+                let unit = dispatch.lookup.unit(frame.exit_native_pc).unwrap();
+                dispatch.entry_plan = Some(crate::frontend::entry::Plan::from_exit(
+                    &unit.states[frame.exit_state_map as usize].state,
+                ));
+                Ok(0)
+            }
             Err(
                 lifetime::Error::Closed
                 | lifetime::Error::Shutdown
@@ -713,6 +727,7 @@ mod tests {
             dispatch_error: None,
             samples: &mut samples,
             observation_status: 0,
+            entry_plan: None,
         };
         frame.sample_observer = Some(wrong_version);
         frame.dispatch_context = std::ptr::from_mut(&mut dispatch).cast();
@@ -867,6 +882,7 @@ mod tests {
             dispatch_error: None,
             samples: &mut samples,
             observation_status: 0,
+            entry_plan: None,
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         // The arena address is valid for capture, but this Rust load has no

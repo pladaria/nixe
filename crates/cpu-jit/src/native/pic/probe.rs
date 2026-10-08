@@ -4,8 +4,7 @@
 
 use super::{Record, SETS};
 use crate::abi::{
-    BlockKey, ExitStateMap, HostAbi, NativeFrame, NzcvLocation, RegisterClass::Integer,
-    ValueLocation,
+    ExitStateMap, HostAbi, NativeFrame, NzcvLocation, RegisterClass::Integer, ValueLocation,
 };
 use crate::native::{
     TransferError,
@@ -21,14 +20,10 @@ pub(in crate::native) const RECORD: u32 = 16;
 const RAX: u32 = 24;
 const FLAGS: u32 = 32;
 
-/// The PC in `target` is supplied dynamically by `pc`; all other BlockKey
-/// fields and the source site are immutable compilation inputs. The source
+/// The target PC is supplied dynamically. The published source site identifies
+/// its complete execution context; admission checked the full target key. The source
 /// checkpoint must already have charged this terminal's instruction prefix.
-pub(crate) fn emit(
-    source: &ExitStateMap,
-    target: BlockKey,
-    pc: ValueLocation,
-) -> Result<Vec<u8>, TransferError> {
+pub(crate) fn emit(source: &ExitStateMap, pc: ValueLocation) -> Result<Vec<u8>, TransferError> {
     source.validate().map_err(TransferError::InvalidContract)?;
     if !pc.valid(source.abi, 8) {
         return Err(TransferError::InvalidContract(
@@ -46,20 +41,16 @@ pub(crate) fn emit(
         },
         bytes: 8,
     });
-    lookup(&mut e, source, target, host_flags);
+    lookup(&mut e, source, host_flags, pc);
     Ok(e.finish())
 }
 
-/// Shared tail for ordinary indirect probes and matched RSB returns. TARGET
+/// Shared tail for indirect branches, calls and returns. TARGET
 /// and the original host flags have already been saved in transfer storage.
 /// A hit restores those flags and jumps; a miss restores them and falls through.
-pub(in crate::native) fn lookup(
-    e: &mut Emitter,
-    source: &ExitStateMap,
-    target: BlockKey,
-    host_flags: bool,
-) {
+fn lookup(e: &mut Emitter, source: &ExitStateMap, host_flags: bool, pc: ValueLocation) {
     let scratch = source.abi.reserved().link_scratch[0];
+    let record_register = free_record_register(source, pc);
     e.memory(
         true,
         Integer,
@@ -118,10 +109,65 @@ pub(in crate::native) fn lookup(
         }
     }
     e.memory(false, Integer, scratch, SET, 8);
-    let expected = Record::new(source.site, target, 0);
     for way in 0..2 {
         if way != 0 {
             e.memory(true, Integer, scratch, SET, 8);
+        }
+        if let Some(record) = record_register {
+            // The source map proves this register dead. Retain the immutable
+            // record pointer across comparisons instead of spilling/reloading
+            // it through NativeFrame for every key field on every native hit.
+            e.memory_at(true, Integer, record, scratch, way * 8, 8);
+            e.x64(&[], true, &[0x85], record, record, None);
+            let mut failures = vec![conditional(e, true)];
+            let target = if let ValueLocation::Register {
+                class: Integer,
+                index,
+            } = pc
+            {
+                index
+            } else {
+                e.memory(true, Integer, scratch, TARGET, 8);
+                scratch
+            };
+            e.x64(
+                &[],
+                true,
+                &[0x3b],
+                target,
+                record,
+                Some(offset_of!(Record, pc) as u32),
+            );
+            failures.push(conditional(e, false));
+            compare_x64(
+                e,
+                record,
+                offset_of!(Record, source) as u32,
+                source.site.source.get(),
+                &mut failures,
+            );
+            compare_x64(
+                e,
+                record,
+                offset_of!(Record, state_map) as u32,
+                u64::from(source.site.state_map),
+                &mut failures,
+            );
+            e.memory_at(
+                true,
+                Integer,
+                scratch,
+                record,
+                offset_of!(Record, address) as u32,
+                8,
+            );
+            preserve_flags(e, host_flags, true);
+            e.jump_register(scratch);
+            let next = e.code.len();
+            for branch in failures {
+                patch(e, branch, next);
+            }
+            continue;
         }
         e.memory_at(true, Integer, scratch, scratch, way * 8, 8);
         let mut failures = Vec::new();
@@ -159,14 +205,12 @@ pub(in crate::native) fn lookup(
         failures.push(conditional(e, false));
         e.memory(true, Integer, scratch, RECORD, 8);
         for (offset, value) in [
-            (offset_of!(Record, source), expected.source),
+            (offset_of!(Record, source), source.site.source.get()),
+            // Padding is zero, so the qword compare also checks the full ordinal.
             (
                 offset_of!(Record, state_map),
-                u64::from(expected.state_map) | (u64::from(expected.platform) << 32),
+                u64::from(source.site.state_map),
             ),
-            (offset_of!(Record, address_space), expected.address_space),
-            (offset_of!(Record, profile), expected.profile),
-            (offset_of!(Record, fp), expected.fp),
         ] {
             compare(e, offset as u32, value, &mut failures);
         }
@@ -190,25 +234,10 @@ pub(in crate::native) fn lookup(
     preserve_flags(e, host_flags, true);
 }
 
-pub(in crate::native) fn compare(
-    e: &mut Emitter,
-    offset: u32,
-    value: u64,
-    failures: &mut Vec<usize>,
-) {
+fn compare(e: &mut Emitter, offset: u32, value: u64, failures: &mut Vec<usize>) {
     let scratch = e.abi.reserved().link_scratch[0];
     if e.abi == HostAbi::X86_64 {
-        if value == (value as i32 as i64) as u64 {
-            e.x64(&[], true, &[0x81], 7, scratch, Some(offset));
-            e.word(value as u32);
-            failures.push(conditional(e, false));
-        } else {
-            for half in 0..2 {
-                e.x64(&[], false, &[0x81], 7, scratch, Some(offset + half * 4));
-                e.word((value >> (half * 32)) as u32);
-                failures.push(conditional(e, false));
-            }
-        }
+        compare_x64(e, scratch, offset, value, failures);
     } else {
         e.memory_at(true, Integer, 17, 16, offset, 8);
         if value < 4096 {
@@ -221,6 +250,60 @@ pub(in crate::native) fn compare(
             e.memory(true, Integer, 16, RECORD, 8);
         }
     }
+}
+
+fn compare_x64(e: &mut Emitter, base: u8, offset: u32, value: u64, failures: &mut Vec<usize>) {
+    if value == (value as i32 as i64) as u64 {
+        e.x64(&[], true, &[0x81], 7, base, Some(offset));
+        e.word(value as u32);
+        failures.push(conditional(e, false));
+    } else {
+        for half in 0..2 {
+            e.x64(&[], false, &[0x81], 7, base, Some(offset + half * 4));
+            e.word((value >> (half * 32)) as u32);
+            failures.push(conditional(e, false));
+        }
+    }
+}
+
+fn free_record_register(source: &ExitStateMap, pc: ValueLocation) -> Option<u8> {
+    if source.abi != HostAbi::X86_64 {
+        return None;
+    }
+    let mut used = 0u16;
+    let mut protect = |location| {
+        if let ValueLocation::Register {
+            class: Integer,
+            index,
+        } = location
+        {
+            used |= 1 << index;
+        }
+    };
+    protect(pc);
+    for binding in source.bindings.iter() {
+        protect(binding.location);
+    }
+    match &source.nzcv {
+        NzcvLocation::Packed(location) => protect(*location),
+        NzcvLocation::Deferred(recipe) => {
+            recipe
+                .try_map(&mut |location| {
+                    protect(*location);
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .unwrap();
+        }
+        _ => {}
+    }
+    (0..16).find(|&index| {
+        used & (1 << index) == 0
+            && ValueLocation::Register {
+                class: Integer,
+                index,
+            }
+            .valid(source.abi, 8)
+    })
 }
 
 pub(in crate::native) fn conditional(e: &mut Emitter, equal: bool) -> usize {

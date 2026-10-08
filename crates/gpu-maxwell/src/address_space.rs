@@ -491,21 +491,21 @@ pub struct MaxwellGpuAddressSpace {
     id: MaxwellAddressSpaceId,
     profile: MaxwellGpuProfile,
     regions: Option<[MaxwellVaRegion; 2]>,
-    reservations: BTreeMap<GpuVirtualAddress, MaxwellVaReservation>,
-    mappings: BTreeMap<GpuVirtualAddress, MaxwellGpuMapping>,
+    reservations: std::sync::Arc<BTreeMap<GpuVirtualAddress, MaxwellVaReservation>>,
+    mappings: std::sync::Arc<BTreeMap<GpuVirtualAddress, MaxwellGpuMapping>>,
     next_mapping_id: u64,
     mapping_generation: MappingGeneration,
 }
 
 impl MaxwellGpuAddressSpace {
     #[must_use]
-    pub const fn new(id: MaxwellAddressSpaceId, profile: MaxwellGpuProfile) -> Self {
+    pub fn new(id: MaxwellAddressSpaceId, profile: MaxwellGpuProfile) -> Self {
         Self {
             id,
             profile,
             regions: None,
-            reservations: BTreeMap::new(),
-            mappings: BTreeMap::new(),
+            reservations: std::sync::Arc::new(BTreeMap::new()),
+            mappings: std::sync::Arc::new(BTreeMap::new()),
             next_mapping_id: 1,
             mapping_generation: MappingGeneration::INITIAL,
         }
@@ -689,7 +689,7 @@ impl MaxwellGpuAddressSpace {
             page_size,
             sparse,
         };
-        self.reservations.insert(offset, reservation);
+        std::sync::Arc::make_mut(&mut self.reservations).insert(offset, reservation);
         Ok(reservation)
     }
 
@@ -722,10 +722,10 @@ impl MaxwellGpuAddressSpace {
         if !mappings.is_empty() {
             self.advance_mapping_generation()?;
             for mapping_offset in mappings {
-                self.mappings.remove(&mapping_offset);
+                std::sync::Arc::make_mut(&mut self.mappings).remove(&mapping_offset);
             }
         }
-        self.reservations.remove(&offset);
+        std::sync::Arc::make_mut(&mut self.reservations).remove(&offset);
         Ok(reservation)
     }
 
@@ -839,7 +839,7 @@ impl MaxwellGpuAddressSpace {
             fixed,
             sparse,
         };
-        self.mappings.insert(offset, mapping.clone());
+        std::sync::Arc::make_mut(&mut self.mappings).insert(offset, mapping.clone());
         self.next_mapping_id = next_mapping_id;
         self.mapping_generation = generation;
         Ok(mapping)
@@ -871,7 +871,9 @@ impl MaxwellGpuAddressSpace {
         self.advance_mapping_generation()?;
         Ok(removed
             .into_iter()
-            .filter_map(|mapping_offset| self.mappings.remove(&mapping_offset))
+            .filter_map(|mapping_offset| {
+                std::sync::Arc::make_mut(&mut self.mappings).remove(&mapping_offset)
+            })
             .collect())
     }
 
@@ -915,7 +917,7 @@ impl MaxwellGpuAddressSpace {
             )
             .ok_or(MaxwellAddressSpaceError::MappingIdentityExhausted)?;
         let mut mapping_id = self.next_mapping_id;
-        let mut mappings = self.mappings.clone();
+        let mut mappings = (*self.mappings).clone();
         for request in requests {
             let end = request
                 .offset
@@ -955,7 +957,7 @@ impl MaxwellGpuAddressSpace {
                 );
             }
         }
-        self.mappings = mappings;
+        self.mappings = std::sync::Arc::new(mappings);
         self.next_mapping_id = next_mapping_id;
         self.mapping_generation = generation;
         Ok(())
@@ -1026,7 +1028,7 @@ impl MaxwellGpuAddressSpace {
 
         let generation = self.next_mapping_generation()?;
         let address_bits = self.profile.virtual_address().address_bits().bits();
-        let mut mappings = self.mappings.clone();
+        let mut mappings = (*self.mappings).clone();
         let affected = mappings
             .iter()
             .filter_map(|(offset, mapping)| {
@@ -1078,7 +1080,7 @@ impl MaxwellGpuAddressSpace {
                 mappings.insert(right.offset, right);
             }
         }
-        self.mappings = mappings;
+        self.mappings = std::sync::Arc::new(mappings);
         self.mapping_generation = generation;
         Ok(())
     }
@@ -1773,6 +1775,35 @@ mod tests {
             permissions: MemoryPermissions::READ_WRITE,
             fixed_offset: None,
         }
+    }
+
+    #[test]
+    fn queued_mapping_snapshot_retains_backing_across_unmap_and_remap() {
+        let mut live = address_space();
+        live.initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let (allocation, range) = backing(4096);
+        allocation.write(0, &[0x5a]).unwrap();
+        let mapping = live.map(map_request(range, 1, 4096)).unwrap();
+        let queued = live.clone();
+        live.unmap(mapping.offset()).unwrap();
+        let (_, replacement) = backing(4096);
+        let replacement = live.map(map_request(replacement, 2, 4096)).unwrap();
+        assert_eq!(replacement.offset(), mapping.offset());
+        let read = |space: &MaxwellGpuAddressSpace| {
+            let range = space
+                .resolve_range(mapping.offset(), 1, MemoryPermissions::READ)
+                .unwrap();
+            let mut byte = [0];
+            range.segments()[0]
+                .mapping()
+                .backing()
+                .read(range.segments()[0].backing_offset(), &mut byte)
+                .unwrap();
+            byte[0]
+        };
+        assert_eq!(read(&queued), 0x5a);
+        assert_eq!(read(&live), 0);
     }
 
     #[test]

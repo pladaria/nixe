@@ -157,6 +157,7 @@ impl RuntimeCoordinator {
     /// Drains the bounded ingress without sleeping. Late and duplicate wakeups
     /// are counted and ignored after their generation loses the race.
     pub fn drain_external_events(&mut self) -> Result<CoordinatorDrainReport, CoordinatorError> {
+        let _trace = nixe_trace::Span::new("coordinator.external_events", 0, 0);
         let mut report = CoordinatorDrainReport::default();
         while let Some(event) = self.inbox.try_recv_sequenced()? {
             self.apply_external_event(event, &mut report)?;
@@ -237,7 +238,10 @@ impl RuntimeCoordinator {
             SchedulerCommand::Wake(token)
         };
         match self.scheduler.apply(command) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                nixe_trace::event("scheduler.woken", token.thread.get(), u64::from(cancelled));
+                Ok(true)
+            }
             Err(SchedulerError::StaleWake(_)) => Ok(false),
             Err(error) => Err(error.into()),
         }

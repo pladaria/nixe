@@ -16,16 +16,21 @@ pub(crate) enum Policy {
 }
 
 pub(crate) fn build(abi: HostAbi, policy: Policy) -> Result<Arc<dyn TargetIsa>, Error> {
-    let (optimization, allocator) = match policy {
-        Policy::Lcq => ("none", "single_pass"),
-        Policy::Hcq => ("speed", "backtracking"),
+    let optimization = match policy {
+        Policy::Lcq => "none",
+        Policy::Hcq => "speed",
     };
     let mut flags = settings::builder();
     for (name, value) in [
         ("enable_pinned_reg", "true"),
         ("enable_nixe_abi", "true"),
         ("opt_level", optimization),
-        ("regalloc_algorithm", allocator),
+        // Both tiers must allocate around their incoming register contracts.
+        // The reverse single-pass allocator fixes entry definitions only after
+        // choosing the body's locations, introducing entry shuffles/spills.
+        // LCQ still skips IR optimization and lowers just one captured block;
+        // HCQ optimizes the shared region with the same contract-aware allocator.
+        ("regalloc_algorithm", "backtracking"),
         ("machine_code_cfg_info", "true"),
         // IR verification belongs to development/tests, like the register
         // allocator checker below, rather than every production compilation.

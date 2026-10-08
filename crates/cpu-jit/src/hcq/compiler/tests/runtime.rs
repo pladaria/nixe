@@ -257,11 +257,11 @@ fn hcq_constant_maps_cross_native_links_and_exit_canonically() {
 }
 
 #[test]
-fn hcq_constant_maps_reconstruct_the_prefix_on_native_fault() {
-    let graph = graph(&[(
-        0x1000,
-        &[0xd280_0540, 0x4f07_e7e0, 0xf940_0022, 0xd420_0000],
-    )]);
+fn hcq_constant_maps_reconstruct_the_caller_prefix_on_a_callee_fault() {
+    let graph = graph(&[
+        (0x1000, &[0xd280_0540, 0x4f07_e7e0, 0x94000006, 0xd4200000]),
+        (0x1020, &[0xf9400022, RET]),
+    ]);
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         let (context, _) = emitted(&graph, &[0], abi);
         let code = context.compiled_code().unwrap();
@@ -303,10 +303,11 @@ fn hcq_constant_maps_reconstruct_the_prefix_on_native_fault() {
         }
     ));
     assert_eq!(frame.execution_epoch, 0);
-    assert_eq!(frame.budget.slice_remaining, 98);
-    assert_eq!(state.pc(), 0x1008);
+    assert_eq!(frame.budget.slice_remaining, 97);
+    assert_eq!(state.pc(), 0x1020);
     assert_eq!(state.general_register_storage_mut()[0], 42);
     assert_eq!(state.general_register_storage_mut()[2], 0x1234);
+    assert_eq!(state.general_register_storage_mut()[30], 0x100c);
     assert_eq!(state.vector(0), Some(u128::MAX));
 }
 

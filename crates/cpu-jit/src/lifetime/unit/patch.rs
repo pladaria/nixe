@@ -69,6 +69,8 @@ impl Transition<'_> {
             finished: false,
         };
         process.cache.patch(&permit, writes)?;
+        #[cfg(feature = "jit-profile")]
+        crate::profiling::patch(&code, process.identity, writes);
         permit.finished = true;
         Ok(())
     }

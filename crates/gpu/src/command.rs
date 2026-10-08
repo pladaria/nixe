@@ -617,7 +617,7 @@ pub struct VertexBufferLayout {
     pub buffer: BufferRegion,
     pub array_stride: u64,
     pub step_mode: VertexStepMode,
-    pub attributes: Box<[VertexAttribute]>,
+    pub attributes: Arc<[VertexAttribute]>,
 }
 
 impl VertexBufferLayout {
@@ -646,7 +646,7 @@ impl VertexBufferLayout {
             buffer,
             array_stride,
             step_mode,
-            attributes: attributes.into_boxed_slice(),
+            attributes: attributes.into(),
         })
     }
 }
@@ -710,13 +710,13 @@ pub struct PreparedDraw {
     /// Indexed by fragment output location, not by guest physical target index.
     pub color_outputs: [crate::ColorOutputState; 8],
     pub descriptor_tables: Box<[DescriptorTableId]>,
-    pub vertex_buffers: Box<[VertexBufferLayout]>,
+    pub vertex_buffers: Arc<[VertexBufferLayout]>,
     pub index_buffer: Option<(BufferRegion, IndexType)>,
     pub viewport_transform: Option<ViewportTransform>,
     pub scissor: Option<ScissorRect>,
     pub depth_state: DepthState,
-    accesses: Box<[ResourceAccess]>,
-    dependencies: Box<[ResourceDependency]>,
+    accesses: Arc<[ResourceAccess]>,
+    dependencies: Arc<[ResourceDependency]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -737,49 +737,15 @@ impl PreparedDraw {
     ) -> Result<Self, CommandDescriptionError> {
         let mut shader_locations = BTreeSet::new();
         for layout in &vertex_buffers {
-            for attribute in &layout.attributes {
+            for attribute in layout.attributes.iter() {
                 if !shader_locations.insert(attribute.shader_location) {
                     return Err(CommandDescriptionError::DuplicateVertexShaderLocation);
                 }
             }
         }
-        let mut accesses = vertex_buffers
-            .iter()
-            .map(|layout| {
-                ResourceAccess::new(
-                    layout.buffer.target(),
-                    scope(
-                        PipelineStages::VERTEX_INPUT,
-                        AccessMode::Read,
-                        ResourceUsage::VertexBuffer,
-                    ),
-                )
-            })
-            .collect::<Vec<_>>();
-        if let Some((buffer, _)) = index_buffer {
-            accesses.push(ResourceAccess::new(
-                buffer.target(),
-                scope(
-                    PipelineStages::VERTEX_INPUT,
-                    AccessMode::Read,
-                    ResourceUsage::IndexBuffer,
-                ),
-            ));
-        }
-        let mut dependencies = vec![
-            ResourceDependency::Pipeline(pipeline),
-            ResourceDependency::RenderPass(render_pass),
-        ];
-        extend_unique(
-            &mut dependencies,
-            descriptor_tables
-                .iter()
-                .copied()
-                .map(ResourceDependency::DescriptorTable),
-        );
-        for access in &accesses {
-            push_target_dependency(&mut dependencies, access.target());
-        }
+        let accesses = draw_buffer_accesses(&vertex_buffers, index_buffer);
+        let dependencies =
+            prepared_draw_dependencies(pipeline, render_pass, &descriptor_tables, &accesses);
         Ok(Self {
             pipeline,
             render_pass,
@@ -792,14 +758,64 @@ impl PreparedDraw {
             alpha_test: None,
             color_outputs: [crate::ColorOutputState::REPLACE; 8],
             descriptor_tables: descriptor_tables.into_boxed_slice(),
-            vertex_buffers: vertex_buffers.into_boxed_slice(),
+            vertex_buffers: vertex_buffers.into(),
             index_buffer,
             viewport_transform: None,
             scissor: None,
             depth_state: DepthState::DISABLED,
-            accesses: accesses.into_boxed_slice(),
-            dependencies: dependencies.into_boxed_slice(),
+            accesses: accesses.into(),
+            dependencies: dependencies.into(),
         })
+    }
+
+    /// Replace resource bindings independently of validated pipeline/layout state.
+    /// Rebuild each dependent array once; older submissions keep their owners.
+    #[must_use]
+    pub fn with_bindings(
+        mut self,
+        pipeline: PipelineId,
+        render_pass: RenderPassId,
+        tables: Vec<DescriptorTableId>,
+        vertices: &[BufferRegion],
+        index: Option<(BufferRegion, IndexType)>,
+    ) -> Self {
+        assert_eq!(vertices.len(), self.vertex_buffers.len());
+        let vertices_changed = !self
+            .vertex_buffers
+            .iter()
+            .zip(vertices)
+            .all(|(layout, buffer)| layout.buffer == *buffer);
+        let buffers_changed = vertices_changed || self.index_buffer != index;
+        if !buffers_changed
+            && self.pipeline == pipeline
+            && self.render_pass == render_pass
+            && self.descriptor_tables.as_ref() == tables
+        {
+            return self;
+        }
+        if vertices_changed {
+            for (layout, buffer) in Arc::make_mut(&mut self.vertex_buffers)
+                .iter_mut()
+                .zip(vertices)
+            {
+                layout.buffer = *buffer;
+            }
+        }
+        self.index_buffer = index;
+        self.pipeline = pipeline;
+        self.render_pass = render_pass;
+        self.descriptor_tables = tables.into_boxed_slice();
+        if buffers_changed {
+            self.accesses = draw_buffer_accesses(&self.vertex_buffers, index).into();
+        }
+        self.dependencies = prepared_draw_dependencies(
+            self.pipeline,
+            render_pass,
+            &self.descriptor_tables,
+            &self.accesses,
+        )
+        .into();
+        self
     }
 
     #[must_use]
@@ -828,6 +844,59 @@ impl PreparedDraw {
         self.alpha_test = Some(alpha_test);
         self
     }
+}
+
+fn draw_buffer_accesses(
+    vertices: &[VertexBufferLayout],
+    index: Option<(BufferRegion, IndexType)>,
+) -> Vec<ResourceAccess> {
+    let mut accesses = vertices
+        .iter()
+        .map(|layout| {
+            ResourceAccess::new(
+                layout.buffer.target(),
+                scope(
+                    PipelineStages::VERTEX_INPUT,
+                    AccessMode::Read,
+                    ResourceUsage::VertexBuffer,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Some((buffer, _)) = index {
+        accesses.push(ResourceAccess::new(
+            buffer.target(),
+            scope(
+                PipelineStages::VERTEX_INPUT,
+                AccessMode::Read,
+                ResourceUsage::IndexBuffer,
+            ),
+        ));
+    }
+    accesses
+}
+
+fn prepared_draw_dependencies(
+    pipeline: PipelineId,
+    render_pass: RenderPassId,
+    tables: &[DescriptorTableId],
+    accesses: &[ResourceAccess],
+) -> Vec<ResourceDependency> {
+    let mut dependencies = vec![
+        ResourceDependency::Pipeline(pipeline),
+        ResourceDependency::RenderPass(render_pass),
+    ];
+    extend_unique(
+        &mut dependencies,
+        tables
+            .iter()
+            .copied()
+            .map(ResourceDependency::DescriptorTable),
+    );
+    for access in accesses {
+        push_target_dependency(&mut dependencies, access.target());
+    }
+    dependencies
 }
 
 impl DrawOperation {
@@ -1075,6 +1144,12 @@ impl RenderPassOperation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum GpuCommand {
     Copy(CopyOperation),
+    TransformBuffer(crate::BufferTransform),
+    /// Ordered host-authored bytes, staged at this exact command position.
+    UploadBuffer {
+        destination: BufferRegion,
+        bytes: Arc<[u8]>,
+    },
     /// Ordered host-authored texels, copied through backend staging storage.
     UploadImage {
         destination: ImageRegion,
@@ -1168,6 +1243,32 @@ impl GpuCommand {
     fn accesses(&self) -> Vec<ResourceAccess> {
         match self {
             Self::Copy(copy) => copy_accesses(copy),
+            Self::TransformBuffer(copy) => vec![
+                ResourceAccess::new(
+                    copy.source.target(),
+                    scope(
+                        PipelineStages::COMPUTE_SHADER,
+                        AccessMode::Read,
+                        ResourceUsage::StorageBuffer,
+                    ),
+                ),
+                ResourceAccess::new(
+                    copy.destination.target(),
+                    scope(
+                        PipelineStages::COMPUTE_SHADER,
+                        AccessMode::ReadWrite,
+                        ResourceUsage::StorageBuffer,
+                    ),
+                ),
+            ],
+            Self::UploadBuffer { destination, .. } => vec![ResourceAccess::new(
+                destination.target(),
+                scope(
+                    PipelineStages::COPY,
+                    AccessMode::Write,
+                    ResourceUsage::TransferDestination,
+                ),
+            )],
             Self::UploadImage { destination, .. } => vec![ResourceAccess::new(
                 destination.target(),
                 scope(
@@ -1207,7 +1308,12 @@ impl GpuCommand {
     fn dependencies(&self) -> Vec<ResourceDependency> {
         let mut dependencies = Vec::new();
         match self {
-            Self::Copy(_) | Self::UploadImage { .. } | Self::Resolve(_) | Self::Clear(_) => {
+            Self::Copy(_)
+            | Self::TransformBuffer(_)
+            | Self::UploadBuffer { .. }
+            | Self::UploadImage { .. }
+            | Self::Resolve(_)
+            | Self::Clear(_) => {
                 for access in self.accesses() {
                     push_target_dependency(&mut dependencies, access.target());
                 }
@@ -1254,7 +1360,10 @@ impl GpuCommand {
 
     fn capability_requirements(&self) -> CapabilityRequirements {
         let mut requirements = vec![CapabilityRequirement::Features(match self {
-            Self::Copy(_) | Self::UploadImage { .. } => BackendFeatures::COPY,
+            Self::TransformBuffer(_) => BackendFeatures::COPY.union(BackendFeatures::DISPATCH),
+            Self::Copy(_) | Self::UploadBuffer { .. } | Self::UploadImage { .. } => {
+                BackendFeatures::COPY
+            }
             Self::Resolve(_) => BackendFeatures::RESOLVE,
             Self::Clear(_) => BackendFeatures::CLEAR,
             Self::Draw(draw) if draw.arguments.is_indexed() => {
@@ -2163,6 +2272,100 @@ mod tests {
             ),
             Err(CommandDescriptionError::VertexAttributeExceedsStride)
         );
+    }
+
+    #[test]
+    fn rebinding_index_and_vertex_views_refreshes_accesses_without_mutating_old_draws() {
+        let old = PreparedDraw::new(
+            PipelineId::new(1),
+            RenderPassId::new(2),
+            PrimitiveTopology::Triangles,
+            vec![DescriptorTableId::new(3)],
+            vec![
+                VertexBufferLayout::new(
+                    buffer(4, 0, 64),
+                    16,
+                    VertexStepMode::Vertex,
+                    vec![VertexAttribute {
+                        format: VertexFormat::Float32x4,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
+                )
+                .unwrap(),
+            ],
+            Some((buffer(5, 0, 16), IndexType::Uint16)),
+        )
+        .unwrap();
+        let current = old.clone().with_bindings(
+            PipelineId::new(10),
+            RenderPassId::new(9),
+            vec![DescriptorTableId::new(6)],
+            &[buffer(7, 0, 64)],
+            Some((buffer(8, 0, 32), IndexType::Uint32)),
+        );
+        assert_eq!(
+            old.index_buffer,
+            Some((buffer(5, 0, 16), IndexType::Uint16))
+        );
+        assert_eq!(old.vertex_buffers[0].buffer.buffer, BufferId::new(4));
+        assert_eq!(old.pipeline, PipelineId::new(1));
+        assert!(
+            old.dependencies
+                .contains(&ResourceDependency::Pipeline(PipelineId::new(1)))
+        );
+        assert!(
+            current
+                .dependencies
+                .contains(&ResourceDependency::Pipeline(PipelineId::new(10)))
+        );
+        assert!(
+            !current
+                .dependencies
+                .contains(&ResourceDependency::Pipeline(PipelineId::new(1)))
+        );
+        assert!(Arc::ptr_eq(
+            &old.vertex_buffers[0].attributes,
+            &current.vertex_buffers[0].attributes
+        ));
+        for id in [4, 5] {
+            assert!(
+                old.dependencies
+                    .contains(&ResourceDependency::Buffer(BufferId::new(id)))
+            );
+            assert!(
+                !current
+                    .dependencies
+                    .contains(&ResourceDependency::Buffer(BufferId::new(id)))
+            );
+        }
+        for id in [7, 8] {
+            assert!(
+                current
+                    .dependencies
+                    .contains(&ResourceDependency::Buffer(BufferId::new(id)))
+            );
+        }
+        assert!(
+            !current
+                .dependencies
+                .contains(&ResourceDependency::DescriptorTable(
+                    DescriptorTableId::new(3)
+                ))
+        );
+        assert!(
+            !current
+                .dependencies
+                .contains(&ResourceDependency::RenderPass(RenderPassId::new(2)))
+        );
+        assert!(
+            current
+                .dependencies
+                .contains(&ResourceDependency::RenderPass(RenderPassId::new(9)))
+        );
+        assert_eq!(current.accesses.len(), 2);
+        assert_eq!(current.accesses[0].target(), buffer(7, 0, 64).target());
+        assert_eq!(current.accesses[1].target(), buffer(8, 0, 32).target());
     }
 
     #[test]

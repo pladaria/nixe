@@ -18,6 +18,9 @@ mod texel_fetch;
 #[path = "accelerated/multiple_targets.rs"]
 mod multiple_targets;
 
+#[path = "accelerated/transfer.rs"]
+mod transfer;
+
 #[path = "accelerated/compute.rs"]
 mod compute;
 

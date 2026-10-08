@@ -69,7 +69,7 @@ impl PartialEq for PipelineKey {
                         .draw
                         .vertex_buffers
                         .iter()
-                        .zip(&other.draw.vertex_buffers)
+                        .zip(other.draw.vertex_buffers.iter())
                         .all(|(a, b)| {
                             a.array_stride == b.array_stride
                                 && a.step_mode == b.step_mode
@@ -100,7 +100,7 @@ impl Hash for PipelineKey {
         raster::key(self.draw.triangle_rasterization).hash(h);
         self.draw.color_outputs[0].hash(h);
         self.draw.vertex_buffers.len().hash(h);
-        for layout in &self.draw.vertex_buffers {
+        for layout in self.draw.vertex_buffers.iter() {
             layout.array_stride.hash(h);
             layout.step_mode.hash(h);
             layout.attributes.hash(h);
@@ -471,7 +471,7 @@ impl WgpuBackendDriver {
             };
             let mut buffers = Vec::with_capacity(draw.prepared.vertex_buffers.len());
             let mut offsets = Vec::with_capacity(draw.prepared.vertex_buffers.len());
-            for layout in &draw.prepared.vertex_buffers {
+            for layout in draw.prepared.vertex_buffers.iter() {
                 let handle = dependency_handle(
                     dependencies,
                     ResourceDependency::Buffer(layout.buffer.buffer),

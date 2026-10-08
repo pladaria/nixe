@@ -70,7 +70,7 @@ fn fp_flow_loop_header_keeps_the_first_visit_check_and_the_body_inherits_it() {
     assert!(point(&graph, &analysis, 0).activate);
     assert!(!point(&graph, &analysis, 8).activate);
     assert!(point(&graph, &analysis, 8).active_before);
-    assert_eq!(analysis.backedges[block(&graph, 8)], [true, false]);
+    assert_eq!(analysis.backedges[block(&graph, 8)], [true]);
     let public = Analysis::build(&graph, &[0, block(&graph, 8)]);
     assert!(point(&graph, &public, 8).activate);
 }

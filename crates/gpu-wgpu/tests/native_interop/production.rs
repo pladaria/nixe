@@ -990,7 +990,7 @@ fn check_chain(
                 prepared.color_outputs[0].write_mask = ColorWriteMask::NONE;
             } else if scenario == Resources::SharedVertex {
                 prepared.depth_state.compare = DepthCompareOperation::Never;
-                prepared.vertex_buffers[0].buffer.range =
+                Arc::make_mut(&mut prepared.vertex_buffers)[0].buffer.range =
                     BufferRange::new(16, vertex_size - 16).unwrap();
             } else if scenario == Resources::Builtins {
                 prepared.depth_state.compare = DepthCompareOperation::Never;

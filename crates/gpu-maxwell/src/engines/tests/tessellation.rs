@@ -116,11 +116,11 @@ fn tessellation_shadow_replay_preserves_effective_source_and_channel_isolation()
 fn tessellation_draw_state_invalidates_without_retranslating_guest_code() {
     let mut channel = patch_channel();
     let shader = channel.three_d().shader_state_identity();
-    let initial = channel.three_d().draw_state_identity();
+    let initial = channel.three_d().fixed_draw_identity();
     program_three_d(&mut channel, 0x320, 0x201);
     assert!(initial.matches(channel.three_d()));
     program_three_d(&mut channel, 0x320, 0x211);
-    let mode_changed = channel.three_d().draw_state_identity();
+    let mode_changed = channel.three_d().fixed_draw_identity();
     assert!(!initial.matches(channel.three_d()));
     program_three_d(&mut channel, 0x324, 0x7fc0_0042);
     assert!(!mode_changed.matches(channel.three_d()));

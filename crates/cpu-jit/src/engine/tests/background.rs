@@ -39,18 +39,19 @@ fn enqueue_at(thread: &mut JitThread, worker: &mut NativeWorker, pc: GuestVirtua
     state.set_pc(pc.get());
     thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             worker,
             &mut state,
             PollBudget::new(1, 2).unwrap(),
             &VcpuEventState::default(),
         )
         .unwrap();
-    let observed = thread
+    let mut observed = thread
         .samples
         .seed_snapshot(thread.key(pc).unwrap())
         .unwrap()
         .0;
+    // These ownership fixtures explicitly submit an already hot candidate.
+    observed.observations = 128;
     let started = Instant::now();
     loop {
         let owner = thread.process.background.lock().unwrap();

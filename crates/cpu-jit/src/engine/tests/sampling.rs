@@ -20,7 +20,6 @@ fn guest_migration_keeps_sample_phase_and_heat_with_each_vcpu() {
     let mut vcpus = [first, second];
     let mut state = A64State::default();
     state.set_pc(PC.get());
-    let mut returns = crate::ReturnStack::default();
     let mut worker = NativeWorker::default();
     // The same guest moves between vCPUs. Neither its heat nor its deadline
     // follows it; samples accumulate only on the vCPU that completed the work.
@@ -33,7 +32,6 @@ fn guest_migration_keeps_sample_phase_and_heat_with_each_vcpu() {
     ] {
         let report = vcpus[vcpu]
             .run_slice(
-                &mut returns,
                 &mut worker,
                 &mut state,
                 budget,
@@ -71,7 +69,6 @@ fn resumable_samples_follow_the_later_linked_source_without_recharging_work() {
         let mut worker = NativeWorker::default();
         let (Some(Exit::Native { returned, .. }), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(phase, slice).unwrap(),
@@ -129,7 +126,6 @@ fn resumable_samples_keep_live_fp_and_software_status_across_a_native_loop() {
     let mut worker = NativeWorker::default();
     let (Some(Exit::Native { returned, .. }), budget) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             PollBudget::new(3, 9001).unwrap(),
@@ -172,7 +168,6 @@ fn canonical_sample_keeps_guest_sticky_status_and_restores_caller_fp() {
         budget,
     ) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             PollBudget::new(1, 20).unwrap(),
@@ -220,7 +215,6 @@ fn canonical_sample_attributes_the_later_linked_source_and_actual_edge() {
         state.general_register_storage_mut()[0] = if taken { u64::MAX } else { 0 };
         let (Some(Exit::Native { returned, .. }), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(3, 3).unwrap(),
@@ -271,7 +265,6 @@ fn canonical_pre_sample_has_no_fabricated_successor_or_pending_instruction_charg
         state.general_register_storage_mut()[0] = 99;
         let (_, budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(1, 20).unwrap(),
@@ -303,7 +296,6 @@ fn fault_prefix_samples_once_and_repair_retry_does_not_add_a_sample() {
         state.general_register_storage_mut()[1] = if valid { 0x3800 } else { 0x5000 };
         let (Some(exit), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(1, 20).unwrap(),
@@ -344,7 +336,6 @@ fn forced_control_discards_heat_but_preserves_sample_phase() {
     state.set_pc(PC.get());
     let (Some(Exit::Native { returned, .. }), budget) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             PollBudget::new(1, 20).unwrap(),

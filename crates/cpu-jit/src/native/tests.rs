@@ -12,7 +12,6 @@ mod gateway;
 mod observation;
 mod pic;
 mod published;
-mod rsb;
 
 fn register(class: RegisterClass, index: u8) -> ValueLocation {
     ValueLocation::Register { class, index }
@@ -52,6 +51,7 @@ fn contracts(
         host_fpsr_pending: false,
     };
     let target = EntryContract {
+        discard: Default::default(),
         abi,
         live_in: live,
         bindings: values
@@ -197,10 +197,12 @@ fn unavailable_inputs_fail_and_valid_flag_conversions_emit() {
     );
     target.abi = source.abi;
     target.live_in.integer.x.insert(0);
-    target.bindings = std::sync::Arc::from([ValueBinding {
+    target.bindings = [ValueBinding {
         value: GuestValue::General(0),
         location: integer(0),
-    }]);
+    }]
+    .to_vec()
+    .into();
     assert_eq!(
         emit_fast_transfer(&source, &target),
         Err(TransferError::MissingValue(GuestValue::General(0)))
@@ -209,7 +211,7 @@ fn unavailable_inputs_fail_and_valid_flag_conversions_emit() {
         nzcv: NZCV,
         ..StateSet::default()
     };
-    target.bindings = std::sync::Arc::from([]);
+    target.bindings = [].to_vec().into();
     target.nzcv = NzcvLocation::Packed(integer(0));
     assert_eq!(
         emit_fast_transfer(&source, &target),
@@ -433,6 +435,10 @@ fn invoke_inner(abi: HostAbi, mut bytes: Vec<u8>, frame: &mut NativeFrame<'_>, f
                 bytes: bytes.into_boxed_slice(),
                 alignment: 16,
                 metadata: crate::executable::output::Metadata {
+                    #[cfg(feature = "jit-profile")]
+                    regions: Box::new([]),
+                    #[cfg(feature = "jit-profile")]
+                    profile_body_length: 0,
                     abi,
                     frame_extent: SPILL_BYTES,
                     entries: Box::new([]),

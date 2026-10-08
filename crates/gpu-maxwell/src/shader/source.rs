@@ -106,10 +106,10 @@ impl Hash for MaxwellShaderTranslationSource {
         for input in &self.vertex_input_types {
             input.hash(state);
         }
-        self.staged_writes.len().hash(state);
         for write in &self.staged_writes {
             write.hash(state);
         }
+        self.staged_writes.len().hash(state);
     }
 }
 
@@ -194,11 +194,12 @@ impl Hash for MaxwellShaderTranslationSourceKey<'_> {
         for input in self.vertex_input_types() {
             input.hash(state);
         }
-        let staged_write_count = self.relevant_staged_writes().count();
-        staged_write_count.hash(state);
+        let mut count = 0_usize;
         for write in self.relevant_staged_writes() {
             write.hash(state);
+            count += 1;
         }
+        count.hash(state);
     }
 }
 

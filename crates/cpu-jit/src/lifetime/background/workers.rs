@@ -76,6 +76,7 @@ pub(crate) struct Workers {
     queue: Arc<Queue>,
     process: Arc<Lifetime>,
     threads: Vec<JoinHandle<Result<(), Error>>>,
+    warmup: Option<Arc<crate::warmup::Warmup>>,
 }
 
 impl Workers {
@@ -87,11 +88,13 @@ impl Workers {
         selected: usize,
         process: Arc<Lifetime>,
         compile: impl Fn(&mut Resources, Work<'_>) -> Result<(), CompileError> + Send + Sync + 'static,
+        warmup: Option<crate::warmup::Task>,
     ) -> Result<Option<Self>, Error> {
         Self::start_inner(
             selected,
             process,
             compile,
+            warmup,
             #[cfg(test)]
             None,
         )
@@ -101,6 +104,7 @@ impl Workers {
         selected: usize,
         process: Arc<Lifetime>,
         compile: impl Fn(&mut Resources, Work<'_>) -> Result<(), CompileError> + Send + Sync + 'static,
+        warmup: Option<crate::warmup::Task>,
         #[cfg(test)] fail_spawn: Option<usize>,
     ) -> Result<Option<Self>, Error> {
         let Some(queue) = Queue::new(selected, &process).map_err(fail)? else {
@@ -111,6 +115,7 @@ impl Workers {
         let mut pool = Self {
             queue: Arc::new(queue),
             process,
+            warmup: warmup.as_ref().map(|task| task.profile.clone()),
             threads: Vec::with_capacity(selected),
         };
         {
@@ -121,29 +126,40 @@ impl Workers {
             }
             state.background_queue = Arc::downgrade(&pool.queue);
         }
+        let mut warmup = warmup;
         for (index, mut resources) in resources.into_iter().enumerate() {
             let queue = Arc::clone(&pool.queue);
             let process = Arc::clone(&pool.process);
             let compile = Arc::clone(&compile);
+            let warmup = if index == 0 { warmup.take() } else { None };
             let run = move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    while let Some(job) = queue.wait().map_err(fail)? {
+                    let mut compile_job = |job| -> Result<(), Error> {
                         let Some(work) = process.accept_background(job).map_err(fail)? else {
-                            continue;
+                            return Ok(());
                         };
                         match compile(&mut resources, work) {
                             Ok(()) => {}
                             Err(CompileError::Cancelled | CompileError::Deferred) => {
-                                // Abandonment may leave an unfinished builder.
                                 resources.frontend = FunctionBuilderContext::new();
                             }
                             Err(CompileError::Failed(error)) => return Err(error),
                         }
                         resources.clear();
                         // The completed Work has released its predecessor pins.
-                        // Collect already unlinked units without initiating a
-                        // new stop, including when execution has become idle.
                         process.reclaim_retired().map_err(fail)?;
+                        Ok(())
+                    };
+                    if let Some(task) = warmup {
+                        task.run(&process, || {
+                            if let Some(job) = queue.pop().map_err(fail)? {
+                                compile_job(job)?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    while let Some(job) = queue.wait().map_err(fail)? {
+                        compile_job(job)?;
                     }
                     Ok(())
                 }))
@@ -201,6 +217,9 @@ impl Workers {
     /// Close admission before draining and joining every worker, even if one
     /// failed. Call outside all JIT/memory locks, after dependent GPU teardown.
     pub(crate) fn shutdown(&mut self) -> Result<(), Error> {
+        if let Some(profile) = &self.warmup {
+            profile.cancel();
+        }
         let mut failure = self.queue.close().map(drop).map_err(fail).err();
         for thread in self.threads.drain(..) {
             let result = thread.join().unwrap_or_else(|_| {

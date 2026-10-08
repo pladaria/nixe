@@ -24,6 +24,10 @@ pub(crate) struct Relocation {
 }
 
 pub(crate) struct Metadata {
+    #[cfg(feature = "jit-profile")]
+    pub regions: Box<[crate::profiling::NativeRegion]>,
+    #[cfg(feature = "jit-profile")]
+    pub profile_body_length: u32,
     pub abi: HostAbi,
     pub frame_extent: u32,
     pub entries: Box<[(ir::Block, u32)]>,
@@ -33,8 +37,19 @@ pub(crate) struct Metadata {
     pub relocations: Box<[Relocation]>,
 }
 impl Metadata {
+    fn profile_bytes(&self) -> usize {
+        #[cfg(feature = "jit-profile")]
+        {
+            std::mem::size_of_val(&*self.regions)
+        }
+        #[cfg(not(feature = "jit-profile"))]
+        {
+            0
+        }
+    }
     pub fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + self.profile_bytes()
             + std::mem::size_of_val(&*self.entries)
             + std::mem::size_of_val(&*self.states)
             + std::mem::size_of_val(&*self.faults)
@@ -138,10 +153,29 @@ impl Output {
         {
             return Err(Error::Output("entry label outside emitted code".into()));
         }
+        #[cfg(feature = "jit-profile")]
+        let profile_body_length = bytes.len() as u32;
         Ok(Self {
             bytes,
             alignment: code.buffer.alignment as usize,
             metadata: Metadata {
+                #[cfg(feature = "jit-profile")]
+                profile_body_length,
+                #[cfg(feature = "jit-profile")]
+                regions: if crate::profiling::enabled() {
+                    code.buffer
+                        .get_srclocs_sorted()
+                        .iter()
+                        .filter(|region| !region.loc.is_default())
+                        .map(|region| crate::profiling::NativeRegion {
+                            start: region.start,
+                            end: region.end,
+                            instruction: region.loc.bits(),
+                        })
+                        .collect()
+                } else {
+                    Box::new([])
+                },
                 abi,
                 frame_extent,
                 entries: std::mem::take(&mut code.buffer.nixe_entries).into_boxed_slice(),

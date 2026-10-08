@@ -17,7 +17,7 @@ fn sample(
     // Take a real native boundary sample with a short slice. Native fragments
     // may overshoot that slice, but cannot run an unbounded indirect loop.
     let mut frame = NativeFrame::new(&mut state, PollBudget::new(1, 2).unwrap());
-    let exit = unsafe {
+    let result = unsafe {
         invocation::run(
             samples,
             reader,
@@ -27,14 +27,21 @@ fn sample(
             &mut ExclusiveMonitorState::default(),
             key(pc),
         )
+    };
+    // Concurrent publication may close admission or the native continuation.
+    // A skipped observation is retried by the caller's next real execution.
+    if matches!(
+        result,
+        Err(invocation::Error::Lifetime(lifetime::Error::Closed))
+    ) {
+        return;
     }
-    .unwrap()
-    .unwrap();
+    let exit = result.unwrap().unwrap();
     assert!(matches!(exit, invocation::Exit::Native { .. }));
 }
 
 #[test]
-fn native_four_sample_boundary_replaces_families_and_exports_late_interior_entry() {
+fn native_boundary_waits_for_profitable_heat_then_exports_late_interior_entry() {
     for interior in [false, true] {
         let (process, memory, mut reader) = setup();
         let (root, source, target) = if interior {
@@ -74,33 +81,37 @@ fn native_four_sample_boundary_replaces_families_and_exports_late_interior_entry
         let (finished, done) = mpsc::channel();
         let (started, accepted) = mpsc::channel();
         let (release, wait) = mpsc::channel();
-        let wait = Mutex::new(wait);
-        let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-            let Observation::Reshape {
-                source_block,
-                snapshot,
-            } = work.observation()
-            else {
-                panic!("native boundary must admit a reshape, not a seed");
-            };
-            assert_eq!(source_block, key(root));
-            assert_eq!(
-                snapshot.key.source,
-                InstructionKey::new(key(source)).unwrap()
-            );
-            assert_eq!(
-                snapshot.key.target,
-                InstructionKey::new(key(target)).unwrap()
-            );
-            started.send(()).unwrap();
-            wait.lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap();
-            let result = consumer(resources, work);
-            finished.send(result.is_ok()).unwrap();
-            result
-        })
+        let wait = Mutex::new(Some(wait));
+        let mut workers = Workers::start(
+            1,
+            Arc::clone(&process),
+            move |resources, work| {
+                let Observation::Reshape {
+                    source_block,
+                    snapshot,
+                } = work.observation()
+                else {
+                    panic!("native boundary must admit a reshape, not a seed");
+                };
+                assert_eq!(source_block, key(root));
+                assert_eq!(
+                    snapshot.key.source,
+                    InstructionKey::new(key(source)).unwrap()
+                );
+                assert_eq!(
+                    snapshot.key.target,
+                    InstructionKey::new(key(target)).unwrap()
+                );
+                started.send(()).unwrap();
+                if let Some(wait) = wait.lock().unwrap().take() {
+                    wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                let result = consumer(resources, work);
+                finished.send(result.is_ok()).unwrap();
+                result
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
         let mut samples = Samples::new();
@@ -140,7 +151,19 @@ fn native_four_sample_boundary_replaces_families_and_exports_late_interior_entry
             std::thread::yield_now();
         }
         release.send(()).unwrap();
-        assert!(done.recv_timeout(Duration::from_secs(10)).unwrap());
+        let mut completed = done.recv_timeout(Duration::from_secs(10)).unwrap();
+        while !completed {
+            sample(&mut reader, &memory, &mut samples, root, target);
+            process.try_service_links().unwrap();
+            if let Ok(result) = done.try_recv() {
+                completed = result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "profitable replacement timed out"
+            );
+            std::thread::yield_now();
+        }
         process.try_service_links().unwrap();
         let new = payload(&mut reader, root).unwrap().hcq().unwrap().family;
         assert_ne!(new, old);
@@ -166,7 +189,7 @@ fn native_four_sample_boundary_replaces_families_and_exports_late_interior_entry
 }
 
 #[test]
-fn native_rejected_boundary_stays_linked_and_suppressed_across_vcpus() {
+fn optimized_returns_stay_linked_without_creating_reshape_jobs() {
     let (process, memory, mut reader) = setup();
     promote_at(&process, &memory, &mut reader, 0x2000);
     promote_at(&process, &memory, &mut reader, 0x7000);
@@ -176,51 +199,43 @@ fn native_rejected_boundary_stays_linked_and_suppressed_across_vcpus() {
     let (finished, done) = mpsc::channel();
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
-    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-        observed.fetch_add(1, Ordering::Relaxed);
-        let result = consumer(resources, work);
-        assert!(result.is_ok(), "{result:?}");
-        finished.send(()).unwrap();
-        result
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |resources, work| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            let result = consumer(resources, work);
+            assert!(result.is_ok(), "{result:?}");
+            finished.send(()).unwrap();
+            result
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
-    let mut samples = Samples::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        sample(&mut reader, &memory, &mut samples, 0x7000, 0x2000);
-        if done.try_recv().is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "native negative result timed out"
-        );
-        std::thread::yield_now();
-    }
-    // RET is a real executed boundary, but discovery must not traverse it.
-    // The process-owned negative must also suppress a fresh vCPU's heat table.
+    // External returns do not grow regions into arbitrary callers. Internal
+    // return edges are inferred from captured calls; neither native polls
+    // nor canonical exits should submit an optimizer job for these fallbacks.
     let mut other = process.register().unwrap();
     for reader in [&mut reader, &mut other] {
         let mut samples = Samples::new();
         for _ in 0..12 {
             sample(reader, &memory, &mut samples, 0x7000, 0x2000);
         }
-        assert_eq!(
+        assert!(
             samples
                 .boundary_snapshot(
                     InstructionKey::new(key(0x7000)).unwrap(),
                     InstructionKey::new(key(0x2000)).unwrap()
                 )
-                .unwrap()
-                .1,
-            4
+                .is_none()
         );
         assert_eq!(payload(reader, 0x7000).unwrap(), before);
         run(&process, &memory, reader, 0x7000, 2);
     }
     workers.shutdown().unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert!(done.try_recv().is_err());
     assert!(process.background_failure().is_none());
     assert!(process.try_shutdown().unwrap());
 }

@@ -41,6 +41,42 @@ impl Reader {
 }
 
 impl Lifetime {
+    /// Optional warmup owns no invocation or claim here. Service pending links
+    /// and sleep through foreign maintenance; cancellation bounds worker join
+    /// even when no guest is left to reopen admission.
+    pub(crate) fn wait_for_warmup(
+        &self,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool, Error> {
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            match self.try_service_optional_links() {
+                Err(Error::Shutdown) => return Ok(false),
+                Err(Error::Closed) | Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+            let state = self.lock();
+            state.healthy()?;
+            if state.shutdown {
+                return Ok(false);
+            }
+            if state.phase == super::Phase::Open {
+                return Ok(true);
+            }
+            if state.link_service_ready() {
+                drop(state);
+                continue;
+            }
+            drop(
+                self.changed
+                    .wait_timeout(state, std::time::Duration::from_millis(10))
+                    .map_err(|_| Error::Poisoned)?,
+            );
+        }
+    }
+
     fn claim(&self, key: BlockKey) -> Result<Request<'_>, Error> {
         loop {
             let publication = self.reserve(key)?;

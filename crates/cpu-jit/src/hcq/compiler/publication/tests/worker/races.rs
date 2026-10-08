@@ -3,7 +3,7 @@ use crate::executable::{SOFT_BYTES, Tier};
 use crate::lifetime::background::workers::CompileError;
 use std::time::Instant;
 
-fn enqueue(
+pub(super) fn enqueue(
     process: &Lifetime,
     workers: &Workers,
     reader: &mut Reader,
@@ -33,22 +33,27 @@ fn disjoint_real_reshapes_use_two_workers_without_sharing_compiler_scratch() {
     let (second_release, second_wait) = mpsc::channel();
     let waits = [Mutex::new(first_wait), Mutex::new(second_wait)];
     let (finished, done) = mpsc::channel();
-    let mut workers = Workers::start(2, Arc::clone(&process), move |resources, work| {
-        let root = work.observation().root().0;
-        let index = usize::from(root == key(0x6000));
-        started
-            .send((root, &resources.context as *const _ as usize))
-            .unwrap();
-        waits[index]
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        let result = consumer(resources, work);
-        assert!(result.is_ok(), "{root:?}: {result:?}");
-        finished.send(root).unwrap();
-        result
-    })
+    let mut workers = Workers::start(
+        2,
+        Arc::clone(&process),
+        move |resources, work| {
+            let root = work.observation().root().0;
+            let index = usize::from(root == key(0x6000));
+            started
+                .send((root, &resources.context as *const _ as usize))
+                .unwrap();
+            waits[index]
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let result = consumer(resources, work);
+            assert!(result.is_ok(), "{root:?}: {result:?}");
+            finished.send(root).unwrap();
+            result
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     enqueue(&process, &workers, &mut reader, 0x1000, 0x1004, 0x2000);
@@ -112,33 +117,38 @@ fn running_real_reshape_cancels_on_code_change_or_shutdown_and_defers_on_pressur
         let wait = Mutex::new(wait);
         let (finished, done) = mpsc::channel();
         let calls = AtomicUsize::new(0);
-        let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-            let call = calls.fetch_add(1, Ordering::Relaxed);
-            // Hold actual baseline storage across the interruption. Storage
-            // lifetime cannot make the old input or participant valid again.
-            let baseline = work.lcq(key(0x2000))?.unwrap();
-            if call == 0 {
-                started.send(()).unwrap();
-                wait.lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap();
-            }
-            let result = consumer(resources, work);
-            if call == 0 {
-                match interruption {
-                    Interruption::Pressure => {
-                        assert!(matches!(result, Err(CompileError::Deferred)))
-                    }
-                    _ => assert!(matches!(result, Err(CompileError::Cancelled))),
+        let mut workers = Workers::start(
+            1,
+            Arc::clone(&process),
+            move |resources, work| {
+                let call = calls.fetch_add(1, Ordering::Relaxed);
+                // Hold actual baseline storage across the interruption. Storage
+                // lifetime cannot make the old input or participant valid again.
+                let baseline = work.lcq(key(0x2000))?.unwrap();
+                if call == 0 {
+                    started.send(()).unwrap();
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
                 }
-            } else {
-                assert!(result.is_ok(), "{result:?}");
-            }
-            drop(baseline);
-            finished.send(()).unwrap();
-            result
-        })
+                let result = consumer(resources, work);
+                if call == 0 {
+                    match interruption {
+                        Interruption::Pressure => {
+                            assert!(matches!(result, Err(CompileError::Deferred)))
+                        }
+                        _ => assert!(matches!(result, Err(CompileError::Cancelled))),
+                    }
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
+                }
+                drop(baseline);
+                finished.send(()).unwrap();
+                result
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
         enqueue(&process, &workers, &mut reader, 0x1000, 0x1004, 0x2000);
@@ -216,40 +226,45 @@ fn queued_real_reshape_is_discarded_before_consumer_on_invalidation_or_shutdown(
         let (release, wait) = mpsc::channel();
         let wait = Mutex::new(wait);
         let (finished, done) = mpsc::channel();
-        let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-            let call = called.fetch_add(1, Ordering::Relaxed);
-            if call == 0 {
-                assert_eq!(work.observation().root().0, key(0x6000));
-                started.send(()).unwrap();
-                wait.lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap();
-            } else {
-                assert!(!shutdown);
-                assert_eq!(call, 1);
-                assert_eq!(work.observation().root().0, key(0x1000));
-                // Only the readmitted generation reaches the consumer.
-                assert_eq!(
-                    work.lcq(key(0x2000))?
+        let mut workers = Workers::start(
+            1,
+            Arc::clone(&process),
+            move |resources, work| {
+                let call = called.fetch_add(1, Ordering::Relaxed);
+                if call == 0 {
+                    assert_eq!(work.observation().root().0, key(0x6000));
+                    started.send(()).unwrap();
+                    wait.lock()
                         .unwrap()
-                        .unit
-                        .instructions
-                        .get(0)
-                        .unwrap()
-                        .bits,
-                    0x91000c00
-                );
-            }
-            let result = consumer(resources, work);
-            if shutdown {
-                assert!(matches!(result, Err(CompileError::Cancelled)));
-            } else {
-                assert!(result.is_ok(), "{result:?}");
-            }
-            finished.send(()).unwrap();
-            result
-        })
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                } else {
+                    assert!(!shutdown);
+                    assert_eq!(call, 1);
+                    assert_eq!(work.observation().root().0, key(0x1000));
+                    // Only the readmitted generation reaches the consumer.
+                    assert_eq!(
+                        work.lcq(key(0x2000))?
+                            .unwrap()
+                            .unit
+                            .instructions
+                            .get(0)
+                            .unwrap()
+                            .bits,
+                        0x91000c00
+                    );
+                }
+                let result = consumer(resources, work);
+                if shutdown {
+                    assert!(matches!(result, Err(CompileError::Cancelled)));
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
+                }
+                finished.send(()).unwrap();
+                result
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
         // Occupy the only worker with an independent, valid reshape. The
@@ -304,22 +319,27 @@ fn queued_reshape_pressure_releases_reservations_before_real_worker_retry() {
     // deterministically, without a sleep or a test hook in its dispatch loop.
     assert!(
         process
-            .accept_background(queue.pop().unwrap().unwrap())
+            .accept_background(queue.pop_ready().unwrap().unwrap())
             .unwrap()
             .is_none()
     );
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     drop(pressure);
     drop(queue);
     let memory = Arc::new(memory);
     let consumer = crate::hcq::worker::consumer(host(), 0x10000, Arc::clone(&memory)).unwrap();
     let (finished, done) = mpsc::channel();
-    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-        let result = consumer(resources, work);
-        assert!(result.is_ok(), "{result:?}");
-        finished.send(()).unwrap();
-        result
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |resources, work| {
+            let result = consumer(resources, work);
+            assert!(result.is_ok(), "{result:?}");
+            finished.send(()).unwrap();
+            result
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     enqueue(&process, &workers, &mut reader, 0x1000, 0x1004, 0x2000);

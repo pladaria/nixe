@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn return_stack_moves_with_guest_execution_across_vcpus_and_abort() {
+fn guest_state_moves_across_vcpus_and_abort() {
     for backend in [
         crate::CpuBackendConfig::Interpreter,
         crate::CpuBackendConfig::Jit,
@@ -13,15 +13,6 @@ fn return_stack_moves_with_guest_execution_across_vcpus_and_abort() {
             .build(&plan)
             .unwrap();
         let thread_id = process.main_thread_id();
-        let identity = process
-            .main_thread()
-            .jit_returns
-            .as_deref()
-            .map(std::ptr::from_ref);
-        assert_eq!(
-            identity.is_some(),
-            matches!(backend, crate::CpuBackendConfig::Jit)
-        );
         let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
         for id in [0, 1, 0] {
             let vcpu = nixe_scheduler::VirtualCpuId::new(id);
@@ -36,24 +27,11 @@ fn return_stack_moves_with_guest_execution_across_vcpus_and_abort() {
                 .unwrap();
             // The table cannot retain a second owner while this guest lease runs.
             assert!(process.main_thread().state.is_none());
-            assert!(process.main_thread().jit_returns.is_none());
-            assert_eq!(
-                execution.jit_returns.as_deref().map(std::ptr::from_ref),
-                identity
-            );
             let result = execution.run(&mut worker, &mut cpu);
             let report = process
                 .finish_thread_execution(thread_id, vcpu, execution, result)
                 .unwrap();
             assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
-            assert_eq!(
-                process
-                    .main_thread()
-                    .jit_returns
-                    .as_deref()
-                    .map(std::ptr::from_ref),
-                identity
-            );
         }
         let vcpu = nixe_scheduler::VirtualCpuId::new(1);
         let execution = process
@@ -66,14 +44,6 @@ fn return_stack_moves_with_guest_execution_across_vcpus_and_abort() {
             .unwrap();
         process.abort_thread_execution(thread_id, vcpu, execution);
         assert!(process.main_thread().state.is_some());
-        assert_eq!(
-            process
-                .main_thread()
-                .jit_returns
-                .as_deref()
-                .map(std::ptr::from_ref),
-            identity
-        );
         worker.finish().unwrap();
     }
 }

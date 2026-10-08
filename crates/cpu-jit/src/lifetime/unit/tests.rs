@@ -104,6 +104,10 @@ pub(super) fn input_with_islands(
                 bytes: bytes.into_boxed_slice(),
                 alignment: 16,
                 metadata: Metadata {
+                    #[cfg(feature = "jit-profile")]
+                    regions: Box::new([]),
+                    #[cfg(feature = "jit-profile")]
+                    profile_body_length: 0,
                     abi,
                     frame_extent: TRANSFER_BYTES,
                     entries: Box::new([(ir::Block::from_u32(0), 0)]),
@@ -145,9 +149,10 @@ pub(super) fn input_with_islands(
                 canonical_offset: 0,
                 fast_offset: 0,
                 contract: EntryContract {
+                    discard: Default::default(),
                     live_in: StateSet::default(),
                     abi,
-                    bindings: std::sync::Arc::from([]),
+                    bindings: [].to_vec().into(),
                     nzcv: NzcvLocation::Canonical,
                 },
             })
@@ -169,7 +174,7 @@ pub(super) fn input_with_islands(
                 abi,
                 live: StateSet::default(),
                 dirty_live: StateSet::default(),
-                bindings: std::sync::Arc::from([]),
+                bindings: [].to_vec().into(),
                 nzcv: NzcvLocation::Canonical,
                 host_fpsr_pending: false,
             },
@@ -704,35 +709,38 @@ fn binding_sharing_is_unit_local_and_charged_once_per_allocation() {
             bytes: 8,
         },
     };
-    candidate.entries[0].contract.bindings = Arc::from([binding]);
-    candidate.entries[1].contract.bindings = Arc::from([binding]);
-    candidate.states[0].state.bindings = Arc::from([binding]);
+    candidate.entries[0].contract.bindings = [binding].to_vec().into();
+    candidate.entries[1].contract.bindings = [binding].to_vec().into();
+    candidate.states[0].state.bindings = [binding].to_vec().into();
     let instruction_bytes = size_of_val(&*candidate.instructions);
     let before = candidate.metadata_bytes(instruction_bytes);
     candidate.share_bindings();
     let shared = &candidate.entries[0].contract.bindings;
-    assert!(Arc::ptr_eq(shared, &candidate.entries[1].contract.bindings));
-    assert!(Arc::ptr_eq(shared, &candidate.states[0].state.bindings));
+    assert!(shared.ptr_eq(&candidate.entries[1].contract.bindings));
+    assert!(shared.ptr_eq(&candidate.states[0].state.bindings));
     let after = candidate.metadata_bytes(instruction_bytes);
     assert_eq!(
         before - after,
-        2 * (size_of::<ValueBinding>() + 2 * size_of::<usize>())
+        2 * candidate.entries[0].contract.bindings.allocation_bytes()
     );
     candidate.share_bindings();
     assert_eq!(candidate.metadata_bytes(instruction_bytes), after);
     // Distinct physical locations must not be collapsed on the next pass.
-    Arc::make_mut(&mut candidate.states[0].state.bindings)[0].location = ValueLocation::Spill {
-        offset: TRANSFER_BYTES + 8,
-        bytes: 8,
-    };
+    crate::abi::Bindings::make_mut(&mut candidate.states[0].state.bindings)[0].location =
+        ValueLocation::Spill {
+            offset: TRANSFER_BYTES + 8,
+            bytes: 8,
+        };
     candidate.share_bindings();
-    assert!(!Arc::ptr_eq(
-        &candidate.entries[0].contract.bindings,
-        &candidate.states[0].state.bindings
-    ));
+    assert!(
+        !candidate.entries[0]
+            .contract
+            .bindings
+            .ptr_eq(&candidate.states[0].state.bindings)
+    );
     assert_eq!(
         candidate.metadata_bytes(instruction_bytes),
-        after + size_of::<ValueBinding>() + 2 * size_of::<usize>()
+        after + candidate.entries[0].contract.bindings.allocation_bytes()
     );
 }
 

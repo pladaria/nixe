@@ -292,7 +292,8 @@ fn frozen_publication_survives_unrelated_epochs_cursors_and_directory_publicatio
     let candidate = output(&frozen);
     let version = candidate.identity.version();
     let address = candidate.code.allocation.address();
-    process.request(Reason::LinkPatch).unwrap();
+    process.request(Reason::TierCutover).unwrap();
+    assert_eq!(process.lock().phase, crate::lifetime::Phase::Closing);
     // Cold preparation is allowed even while execution admission is closed.
     let prepared = frozen.prepare(candidate, &cursor).unwrap();
     process.try_service_links().unwrap();

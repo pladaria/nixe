@@ -373,6 +373,10 @@ fn output(abi: HostAbi, bytes: Vec<u8>) -> Output {
         bytes: bytes.into_boxed_slice(),
         alignment: 16,
         metadata: Metadata {
+            #[cfg(feature = "jit-profile")]
+            regions: Box::new([]),
+            #[cfg(feature = "jit-profile")]
+            profile_body_length: 0,
             abi,
             frame_extent: crate::abi::TRANSFER_BYTES,
             entries: Box::new([]),

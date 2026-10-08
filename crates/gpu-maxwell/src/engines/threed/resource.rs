@@ -19,7 +19,7 @@ use nixe_gpu::{
 };
 use nixe_memory::{
     CanonicalBackingRange, CanonicalCpuWriteDependency, CanonicalRangeAccessError,
-    CanonicalRangeError, CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions,
+    CanonicalRangeError, CanonicalWriteBatchError, MemoryPermissions,
 };
 
 use crate::{
@@ -367,16 +367,24 @@ impl MaxwellThreeDResolvedImage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDResolvedResource {
-    Buffer(MaxwellThreeDResolvedBuffer),
-    Image(MaxwellThreeDResolvedImage),
+    Buffer(Arc<MaxwellThreeDResolvedBuffer>),
+    Image(Arc<MaxwellThreeDResolvedImage>),
 }
 
 impl MaxwellThreeDResolvedResource {
     #[must_use]
-    pub const fn role(&self) -> MaxwellThreeDResourceRole {
+    pub fn role(&self) -> MaxwellThreeDResourceRole {
         match self {
             Self::Buffer(value) => value.role,
             Self::Image(value) => value.role,
+        }
+    }
+
+    pub(in crate::engines) fn shares_component(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Buffer(left), Self::Buffer(right)) => Arc::ptr_eq(left, right),
+            (Self::Image(left), Self::Image(right)) => Arc::ptr_eq(left, right),
+            _ => false,
         }
     }
 
@@ -464,22 +472,15 @@ impl MaxwellThreeDDirtySubresources {
 /// Immutable all-or-nothing interpretation of one 3D state snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDResolvedResources {
-    identity: Arc<()>,
     address_space_generation: nixe_memory::MappingGeneration,
     resources: Box<[MaxwellThreeDResolvedResource]>,
     samplers: Box<[MaxwellThreeDResolvedSampler]>,
     aliases: Box<[MaxwellThreeDResourceAlias]>,
     dirty: MaxwellThreeDDirtySubresources,
+    textures: Box<[TextureComponent]>,
 }
 
 impl MaxwellThreeDResolvedResources {
-    pub(in crate::engines) fn identity(&self) -> Arc<()> {
-        Arc::clone(&self.identity)
-    }
-
-    pub(in crate::engines) fn has_identity(&self, identity: &Arc<()>) -> bool {
-        Arc::ptr_eq(&self.identity, identity)
-    }
     #[must_use]
     pub const fn address_space_generation(&self) -> nixe_memory::MappingGeneration {
         self.address_space_generation
@@ -592,7 +593,7 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
     required_roles: &[MaxwellThreeDResourceRole],
-    staged_writes: Option<&CanonicalWriteBatch>,
+    staged_writes: Option<&crate::projection::MemoryProjection>,
     inspect_complete_state: bool,
 ) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
     resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
@@ -609,7 +610,7 @@ fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
     required_roles: &[MaxwellThreeDResourceRole],
-    staged_writes: Option<&CanonicalWriteBatch>,
+    staged_writes: Option<&crate::projection::MemoryProjection>,
     inspect_complete_state: bool,
     retained_backings: Option<&mut MaxwellThreeDRetainedBackingCache>,
 ) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
@@ -620,6 +621,7 @@ fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
         staged_writes,
         inspect_complete_state,
         retained_backings,
+        None,
     )
     .map(|(resources, _)| resources)
 }
@@ -628,9 +630,13 @@ fn resolve_maxwell_three_d_resources_inner(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
     required_roles: &[MaxwellThreeDResourceRole],
-    staged_writes: Option<&CanonicalWriteBatch>,
+    staged_writes: Option<&crate::projection::MemoryProjection>,
     inspect_complete_state: bool,
     retained_backings: Option<&mut MaxwellThreeDRetainedBackingCache>,
+    previous: Option<(
+        &MaxwellThreeDState,
+        &MaxwellThreeDResolvedResourceCacheEntry,
+    )>,
 ) -> Result<
     (
         MaxwellThreeDResolvedResources,
@@ -648,6 +654,7 @@ fn resolve_maxwell_three_d_resources_inner(
         });
     let mut builder =
         ResourceBuilder::new(address_space, sample_mode, staged_writes, retained_backings);
+    builder.previous = previous;
 
     for (index, stream) in state.vertex_input().streams().iter().enumerate() {
         let role = MaxwellThreeDResourceRole::VertexStream(index as u8);
@@ -846,16 +853,33 @@ fn resolve_maxwell_three_d_resources_inner(
 }
 
 struct ResourceBuilder<'a> {
+    previous: Option<(
+        &'a MaxwellThreeDState,
+        &'a MaxwellThreeDResolvedResourceCacheEntry,
+    )>,
     address_space: &'a MaxwellGpuAddressSpace,
-    staged_writes: Option<&'a CanonicalWriteBatch>,
+    staged_writes: Option<&'a crate::projection::MemoryProjection>,
     retained_backings: Option<&'a mut MaxwellThreeDRetainedBackingCache>,
     sample_mode: Option<MaxwellThreeDSampleMode>,
     resources: Vec<MaxwellThreeDResolvedResource>,
     samplers: Vec<MaxwellThreeDResolvedSampler>,
     descriptor_reads: Vec<MaxwellThreeDDescriptorRead>,
+    textures: Vec<TextureComponent>,
 }
 
-#[derive(Debug)]
+// Dependencies are local to a texture interpretation, so an unrelated binding
+// change does not force another descriptor decode or backing reconstruction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TextureComponent {
+    reference: MaxwellThreeDTextureReference,
+    dimension: MaxwellThreeDTextureDimension,
+    needs_sampler: bool,
+    image: usize,
+    sampler: Option<usize>,
+    reads: std::ops::Range<usize>,
+}
+
+#[derive(Clone, Debug)]
 struct MaxwellThreeDDescriptorRead {
     range: CanonicalBackingRange,
     bytes: [u8; 32],
@@ -866,7 +890,7 @@ struct MaxwellThreeDDescriptorRead {
 impl MaxwellThreeDDescriptorRead {
     fn remains_current(
         &self,
-        staged_writes: Option<&CanonicalWriteBatch>,
+        staged_writes: Option<&crate::projection::MemoryProjection>,
     ) -> Result<bool, MaxwellThreeDResourceError> {
         if !self.cpu_writes.remains_current() {
             return Ok(false);
@@ -896,6 +920,7 @@ struct MaxwellThreeDResolvedResourceCacheEntry {
     roles: Box<[MaxwellThreeDResourceRole]>,
     inspect_complete_state: bool,
     resources: Arc<MaxwellThreeDResolvedResources>,
+    components: Box<[MaxwellThreeDResourceStateIdentity]>,
     descriptor_reads: Box<[MaxwellThreeDDescriptorRead]>,
     mapping_generation: Cell<u64>,
     previous: Option<usize>,
@@ -1198,10 +1223,11 @@ impl MaxwellThreeDResolvedResourceCache {
         state: &MaxwellThreeDState,
         address_space: &MaxwellGpuAddressSpace,
         required_roles: &[MaxwellThreeDResourceRole],
-        staged_writes: Option<&CanonicalWriteBatch>,
+        staged_writes: Option<&crate::projection::MemoryProjection>,
         inspect_complete_state: bool,
         limit: usize,
     ) -> Result<Arc<MaxwellThreeDResolvedResources>, MaxwellThreeDResourceError> {
+        let lookup = nixe_trace::Span::new("gpu.resource_lookup", 0, 0);
         if let Some(index) = self.current
             && self.entry_matches(
                 index,
@@ -1213,6 +1239,7 @@ impl MaxwellThreeDResolvedResourceCache {
             )?
         {
             self.touch_entry(index);
+            nixe_trace::event("gpu.resource_hit.current", 0, 1);
             return Ok(Arc::clone(&self.entries[index].resources));
         }
         let key = ResourceResolveKey {
@@ -1237,10 +1264,13 @@ impl MaxwellThreeDResolvedResourceCache {
                 self.touch_entry(index);
                 let resources = Arc::clone(&self.entries[index].resources);
                 self.current = Some(index);
+                nixe_trace::event("gpu.resource_hit.indexed", 0, 1);
                 return Ok(resources);
             }
         }
 
+        drop(lookup);
+        let _rebuild = nixe_trace::Span::new("gpu.resource_rebuild", 0, 0);
         let (resources, descriptor_reads) = resolve_maxwell_three_d_resources_inner(
             state,
             address_space,
@@ -1248,6 +1278,7 @@ impl MaxwellThreeDResolvedResourceCache {
             staged_writes,
             inspect_complete_state,
             Some(&mut self.retained_backings),
+            self.current.map(|index| (state, &self.entries[index])),
         )?;
         let resources = Arc::new(resources);
         if self.entries.len() >= limit {
@@ -1268,6 +1299,11 @@ impl MaxwellThreeDResolvedResourceCache {
             roles: required_roles.into(),
             inspect_complete_state,
             resources: Arc::clone(&resources),
+            components: resources
+                .resources()
+                .iter()
+                .map(|resource| state.resource_state_identity(&[resource.role()], false))
+                .collect(),
             descriptor_reads,
             mapping_generation: Cell::new(address_space.mapping_generation().get()),
             previous: None,
@@ -1348,30 +1384,42 @@ impl MaxwellThreeDResolvedResourceCache {
         state: &MaxwellThreeDState,
         address_space: &MaxwellGpuAddressSpace,
         required_roles: &[MaxwellThreeDResourceRole],
-        staged_writes: Option<&CanonicalWriteBatch>,
+        staged_writes: Option<&crate::projection::MemoryProjection>,
         inspect_complete_state: bool,
     ) -> Result<bool, MaxwellThreeDResourceError> {
         let entry = &self.entries[index];
-        if entry.address_space != address_space.id()
-            || entry.inspect_complete_state != inspect_complete_state
-            || !entry.state.matches(state)
+        let reason = if entry.address_space != address_space.id() {
+            Some("gpu.resource_miss.address_space")
+        } else if entry.inspect_complete_state != inspect_complete_state
             || entry.roles.as_ref() != required_roles
-            || !entry.resources.image_content_dependencies_current()
         {
+            Some("gpu.resource_miss.roles")
+        } else if !entry.state.matches(state) {
+            Some("gpu.resource_miss.state")
+        } else if !entry.resources.image_content_dependencies_current() {
+            Some("gpu.resource_miss.content")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            nixe_trace::event(reason, 0, 1);
             return Ok(false);
         }
         let mapping_generation = address_space.mapping_generation().get();
         if entry.mapping_generation.get() != mapping_generation {
             if entry.resources.validate_mappings(address_space).is_err() {
+                nixe_trace::event("gpu.resource_miss.mapping", 0, 1);
                 return Ok(false);
             }
             entry.mapping_generation.set(mapping_generation);
         }
         for read in &entry.descriptor_reads {
             if !read.remains_current(staged_writes)? {
+                nixe_trace::event("gpu.resource_miss.descriptor", 0, 1);
                 return Ok(false);
             }
         }
+        nixe_trace::event("gpu.resource_hit", 0, 1);
         Ok(true)
     }
 
@@ -1478,10 +1526,11 @@ impl<'a> ResourceBuilder<'a> {
     fn new(
         address_space: &'a MaxwellGpuAddressSpace,
         sample_mode: Option<MaxwellThreeDSampleMode>,
-        staged_writes: Option<&'a CanonicalWriteBatch>,
+        staged_writes: Option<&'a crate::projection::MemoryProjection>,
         retained_backings: Option<&'a mut MaxwellThreeDRetainedBackingCache>,
     ) -> Self {
         Self {
+            previous: None,
             address_space,
             staged_writes,
             retained_backings,
@@ -1489,6 +1538,7 @@ impl<'a> ResourceBuilder<'a> {
             resources: Vec::new(),
             samplers: Vec::new(),
             descriptor_reads: Vec::new(),
+            textures: Vec::new(),
         }
     }
 
@@ -1503,12 +1553,58 @@ impl<'a> ResourceBuilder<'a> {
         }
     }
 
+    fn reuse(&mut self, role: MaxwellThreeDResourceRole) -> bool {
+        let Some((state, previous)) = self.previous else {
+            return false;
+        };
+        let index = self.resources.len();
+        let Some(resource) = previous.resources.resources().get(index) else {
+            return false;
+        };
+        if previous.address_space != self.address_space.id()
+            || resource.role() != role
+            || !previous.components[index].matches(state)
+            || resource.source().segments().iter().any(|segment| {
+                !self
+                    .address_space
+                    .retained_mapping_is_current(segment.mapping())
+            })
+            || matches!(resource, MaxwellThreeDResolvedResource::Image(image) if !image.cpu_writes.remains_current())
+        {
+            return false;
+        }
+        self.resources.push(resource.clone());
+        nixe_trace::event("gpu.resource_component_reused", 0, 1);
+        true
+    }
+
+    fn reusable_resource(
+        &self,
+        role: MaxwellThreeDResourceRole,
+    ) -> Option<&MaxwellThreeDResolvedResource> {
+        let (_, previous) = self.previous?;
+        let resource = previous.resources.resources().get(self.resources.len())?;
+        (previous.address_space == self.address_space.id()
+            && resource.role() == role
+            && resource.source().segments().iter().all(|segment| self.address_space.retained_mapping_is_current(segment.mapping()))
+            && !matches!(resource, MaxwellThreeDResolvedResource::Image(image) if !image.cpu_writes.remains_current()))
+            .then_some(resource)
+    }
+
     fn buffer(
         &mut self,
         role: MaxwellThreeDResourceRole,
         address: MaxwellThreeDUnresolvedAddress,
         size: u64,
     ) -> Result<(), MaxwellThreeDResourceError> {
+        if let Some(resource) = self.reusable_resource(role)
+            && resource.source().offset().get() == address.get()
+            && resource.source().size() == size
+        {
+            self.resources.push(resource.clone());
+            nixe_trace::event("gpu.resource_component_reused", 0, 1);
+            return Ok(());
+        }
         let source = self.resolve(address, size, MemoryPermissions::READ, role)?;
         let retained = self.retained_backing(&source, role)?;
         let allocation_description = retained.allocation_description;
@@ -1517,17 +1613,18 @@ impl<'a> ResourceBuilder<'a> {
         let id = BufferId::new(resource_id(self.resources.len())?);
         let view = BufferView::new(id, description, 0, retained.backing)
             .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        self.resources.push(MaxwellThreeDResolvedResource::Buffer(
-            MaxwellThreeDResolvedBuffer {
-                role,
-                access: MaxwellThreeDResourceAccess::Read,
-                description,
-                allocation_description,
-                view,
-                source,
-                mappings: retained.mappings,
-            },
-        ));
+        self.resources
+            .push(MaxwellThreeDResolvedResource::Buffer(Arc::new(
+                MaxwellThreeDResolvedBuffer {
+                    role,
+                    access: MaxwellThreeDResourceAccess::Read,
+                    description,
+                    allocation_description,
+                    view,
+                    source,
+                    mappings: retained.mappings,
+                },
+            )));
         Ok(())
     }
 
@@ -1605,6 +1702,43 @@ impl<'a> ResourceBuilder<'a> {
         dimension: MaxwellThreeDTextureDimension,
         needs_sampler: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
+        let reads_start = self.descriptor_reads.len();
+        let image = self.resources.len();
+        if let Some((state, previous)) = self.previous
+            && let Some(component) = previous.resources.textures.iter().find(|component| {
+                component.reference == texture_reference
+                    && component.dimension == dimension
+                    && component.needs_sampler == needs_sampler
+                    && component.image == image
+            })
+            && previous.components[image].matches(state)
+            && let Some(resource) =
+                self.reusable_resource(MaxwellThreeDResourceRole::SampledImage {
+                    texture: texture_reference,
+                    dimension,
+                })
+            && previous.descriptor_reads[component.reads.clone()]
+                .iter()
+                .try_fold(true, |current, read| {
+                    Ok::<_, MaxwellThreeDResourceError>(
+                        current && read.remains_current(self.staged_writes)?,
+                    )
+                })?
+        {
+            let resource = resource.clone();
+            let mut component = component.clone();
+            if let Some(sampler) = component.sampler {
+                self.samplers.push(previous.resources.samplers[sampler]);
+                component.sampler = Some(self.samplers.len() - 1);
+            }
+            self.descriptor_reads
+                .extend_from_slice(&previous.descriptor_reads[component.reads.clone()]);
+            component.reads = reads_start..self.descriptor_reads.len();
+            self.resources.push(resource);
+            self.textures.push(component);
+            nixe_trace::event("gpu.texture_component_reused", 0, 1);
+            return Ok(());
+        }
         let raw_handle = self.texture_handle(texture_reference)?;
         // An unprogrammed selector retains the Maxwell class reset mode. Only
         // an explicit false selects the legacy texture-header interpretation;
@@ -1638,12 +1772,47 @@ impl<'a> ResourceBuilder<'a> {
             }
         };
         let tic = self.descriptor_bytes(MaxwellThreeDResourceRole::TextureHeaders, image_index)?;
-        self.sampled_image(texture_reference, dimension, image_index, tic)?;
+        let reusable_image = self.previous.and_then(|(_, previous)| {
+            let component = previous.resources.textures.iter().find(|component| {
+                component.reference == texture_reference
+                    && component.dimension == dimension
+                    && component.image == image
+            })?;
+            (previous.descriptor_reads[component.reads.start + 1].bytes == tic).then_some(())?;
+            self.reusable_resource(MaxwellThreeDResourceRole::SampledImage {
+                texture: texture_reference,
+                dimension,
+            })
+            .cloned()
+        });
+        if let Some(image) = reusable_image {
+            self.resources.push(image);
+            nixe_trace::event("gpu.texture_decode_reused", 0, 1);
+        } else {
+            self.sampled_image(texture_reference, dimension, image_index, tic)?;
+        }
         if let Some(sampler_index) = sampler_index {
             let tsc = self.descriptor_bytes(MaxwellThreeDResourceRole::Samplers, sampler_index)?;
-            self.samplers
-                .push(decode_sampler(texture_reference, sampler_index, tsc)?);
+            let retained = self.previous.and_then(|(_, previous)| {
+                let component = previous.resources.textures.iter().find(|component| {
+                    component.reference == texture_reference && component.needs_sampler
+                })?;
+                (previous.descriptor_reads[component.reads.start + 2].bytes == tsc)
+                    .then_some(previous.resources.samplers[component.sampler?])
+            });
+            self.samplers.push(match retained {
+                Some(sampler) => sampler,
+                None => decode_sampler(texture_reference, sampler_index, tsc)?,
+            });
         }
+        self.textures.push(TextureComponent {
+            reference: texture_reference,
+            dimension,
+            needs_sampler,
+            image,
+            sampler: sampler_index.map(|_| self.samplers.len() - 1),
+            reads: reads_start..self.descriptor_reads.len(),
+        });
         Ok(())
     }
 
@@ -1902,28 +2071,29 @@ impl<'a> ResourceBuilder<'a> {
             )],
         )
         .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        self.resources.push(MaxwellThreeDResolvedResource::Image(
-            MaxwellThreeDResolvedImage {
-                role,
-                access: MaxwellThreeDResourceAccess::Read,
-                description,
-                allocation_description,
-                view,
-                source,
-                mappings: retained.mappings,
-                cpu_writes,
-                guest_layout: MaxwellThreeDPreservedImageLayout {
-                    layout,
-                    pte_kind: actual_kind,
-                    // A TIC cannot establish whether previous render-target
-                    // writes used compression. Require the resident representation
-                    // for compressed color kinds instead of importing opaque bytes.
-                    compression_enabled: !pitch_linear
-                        && actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+        self.resources
+            .push(MaxwellThreeDResolvedResource::Image(Arc::new(
+                MaxwellThreeDResolvedImage {
+                    role,
+                    access: MaxwellThreeDResourceAccess::Read,
+                    description,
+                    allocation_description,
+                    view,
+                    source,
+                    mappings: retained.mappings,
+                    cpu_writes,
+                    guest_layout: MaxwellThreeDPreservedImageLayout {
+                        layout,
+                        pte_kind: actual_kind,
+                        // A TIC cannot establish whether previous render-target
+                        // writes used compression. Require the resident representation
+                        // for compressed color kinds instead of importing opaque bytes.
+                        compression_enabled: !pitch_linear
+                            && actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+                    },
+                    guest_format: MaxwellThreeDGuestImageFormat::Texture(format_word),
                 },
-                guest_format: MaxwellThreeDGuestImageFormat::Texture(format_word),
-            },
-        ));
+            )));
         Ok(())
     }
 
@@ -1934,6 +2104,9 @@ impl<'a> ResourceBuilder<'a> {
         srgb_write: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let role = MaxwellThreeDResourceRole::ColorTarget(index);
+        if self.reuse(role) {
+            return Ok(());
+        }
         let address = unresolved(
             target.address_upper().value(),
             target.address_lower().value(),
@@ -2022,6 +2195,9 @@ impl<'a> ResourceBuilder<'a> {
         target: &MaxwellThreeDDepthStencilTargetState,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let role = MaxwellThreeDResourceRole::DepthStencilTarget;
+        if self.reuse(role) {
+            return Ok(());
+        }
         if target.sparse().value().is_some_and(|value| value & 1 != 0) {
             return Err(MaxwellThreeDResourceError::UnsupportedSparseDepth {
                 source: target
@@ -2291,6 +2467,26 @@ impl<'a> ResourceBuilder<'a> {
         let size = layer_stride
             .checked_mul(u64::from(layer_count))
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+        if let Some(MaxwellThreeDResolvedResource::Image(image)) = self.reusable_resource(role)
+            && image.source.offset().get() == address_value
+            && image.source.size() == size
+            && image.description == description
+            && image.guest_format == guest_format
+            && image.guest_layout.layout == neutral_layout
+            && image.guest_layout.compression_enabled == compression_enabled
+            && image.view.bindings()[0].subresources().base_layer == selected_layer
+            && image_kind_matches(
+                layout,
+                expected_kind,
+                generic_kind_allowed,
+                image.guest_layout.pte_kind,
+            )
+        {
+            self.resources
+                .push(MaxwellThreeDResolvedResource::Image(Arc::clone(image)));
+            nixe_trace::event("gpu.attachment_component_reused", 0, 1);
+            return Ok(());
+        }
         let source = self.resolve(
             resolved_address,
             size,
@@ -2348,28 +2544,29 @@ impl<'a> ResourceBuilder<'a> {
             )],
         )
         .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        self.resources.push(MaxwellThreeDResolvedResource::Image(
-            MaxwellThreeDResolvedImage {
-                role,
-                access: if role == MaxwellThreeDResourceRole::BlitSource {
-                    MaxwellThreeDResourceAccess::Read
-                } else {
-                    MaxwellThreeDResourceAccess::Write
+        self.resources
+            .push(MaxwellThreeDResolvedResource::Image(Arc::new(
+                MaxwellThreeDResolvedImage {
+                    role,
+                    access: if role == MaxwellThreeDResourceRole::BlitSource {
+                        MaxwellThreeDResourceAccess::Read
+                    } else {
+                        MaxwellThreeDResourceAccess::Write
+                    },
+                    description,
+                    allocation_description,
+                    view,
+                    source,
+                    mappings: retained.mappings,
+                    cpu_writes,
+                    guest_layout: MaxwellThreeDPreservedImageLayout {
+                        layout: neutral_layout,
+                        pte_kind: actual_kind,
+                        compression_enabled,
+                    },
+                    guest_format,
                 },
-                description,
-                allocation_description,
-                view,
-                source,
-                mappings: retained.mappings,
-                cpu_writes,
-                guest_layout: MaxwellThreeDPreservedImageLayout {
-                    layout: neutral_layout,
-                    pte_kind: actual_kind,
-                    compression_enabled,
-                },
-                guest_format,
-            },
-        ));
+            )));
         Ok(())
     }
 
@@ -2406,6 +2603,22 @@ impl<'a> ResourceBuilder<'a> {
         ),
         MaxwellThreeDResourceError,
     > {
+        if let Some((_, previous)) = self.previous
+            && self.resources.len() == previous.resources.resources.len()
+            && self
+                .resources
+                .iter()
+                .zip(previous.resources.resources.iter())
+                .all(|(left, right)| left.shares_component(right))
+            && self.samplers.as_slice() == previous.resources.samplers.as_ref()
+        {
+            let mut resources = (*previous.resources).clone();
+            resources.address_space_generation = self.address_space.mapping_generation();
+            resources.textures = self.textures.into_boxed_slice();
+            resources.validate_mappings(self.address_space)?;
+            nixe_trace::event("gpu.resource_composition_reused", 0, 1);
+            return Ok((resources, self.descriptor_reads.into_boxed_slice()));
+        }
         let span_count = self
             .resources
             .iter()
@@ -2469,12 +2682,12 @@ impl<'a> ResourceBuilder<'a> {
             });
         }
         let result = MaxwellThreeDResolvedResources {
-            identity: Arc::new(()),
             address_space_generation: self.address_space.mapping_generation(),
             resources: self.resources.into_boxed_slice(),
             samplers: self.samplers.into_boxed_slice(),
             aliases: aliases.into_boxed_slice(),
             dirty: MaxwellThreeDDirtySubresources::default(),
+            textures: self.textures.into_boxed_slice(),
         };
         result.validate_mappings(self.address_space)?;
         Ok((result, self.descriptor_reads.into_boxed_slice()))
@@ -2709,7 +2922,7 @@ fn image_description(
 fn read_descriptor_bytes(
     range: &CanonicalBackingRange,
     offset: u64,
-    staged_writes: Option<&CanonicalWriteBatch>,
+    staged_writes: Option<&crate::projection::MemoryProjection>,
 ) -> Result<[u8; 32], MaxwellThreeDResourceError> {
     let mut bytes = [0; 32];
     read_backing_bytes(range, offset, &mut bytes, staged_writes)?;
@@ -2720,7 +2933,7 @@ fn read_backing_bytes(
     range: &CanonicalBackingRange,
     offset: u64,
     bytes: &mut [u8],
-    staged_writes: Option<&CanonicalWriteBatch>,
+    staged_writes: Option<&crate::projection::MemoryProjection>,
 ) -> Result<(), MaxwellThreeDResourceError> {
     if let Some(staged_writes) = staged_writes {
         staged_writes
@@ -3093,7 +3306,7 @@ mod tests {
     use std::sync::Arc;
 
     use nixe_gpu::{AddressMode, BlockLinearLayout, FilterMode, ImageMemoryLayout};
-    use nixe_memory::{CanonicalAllocation, CanonicalWriteBatch, MemoryPermissions};
+    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
 
     use crate::{
         MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
@@ -3135,7 +3348,7 @@ mod tests {
         let third = cache
             .resolve(&states[2], &address_space, &[], None, false, 3)
             .unwrap();
-        // Equal revision numbers in independently owned states are distinct.
+        // Equal register values in independently owned states are distinct.
         assert!(!Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&second, &third));
         let repeated = cache
@@ -3362,7 +3575,7 @@ mod tests {
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
-        let mut writes = CanonicalWriteBatch::new();
+        let mut writes = crate::projection::MemoryProjection::default();
         let expected = descriptor_bytes([
             0x58d2_4908,
             0x093d_7000,
@@ -3391,7 +3604,7 @@ mod tests {
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
-        let mut writes = CanonicalWriteBatch::new();
+        let mut writes = crate::projection::MemoryProjection::default();
         writes
             .stage(&range, 0x20, &0xabc0_0008_u32.to_le_bytes())
             .unwrap();
@@ -3749,7 +3962,7 @@ mod tests {
 
         let first = cache.retain(&source, role).unwrap();
         let staged_descriptor = [0x5a; 32];
-        let mut staged_writes = CanonicalWriteBatch::new();
+        let mut staged_writes = crate::projection::MemoryProjection::default();
         staged_writes
             .stage(
                 source.segments()[0].mapping().backing(),

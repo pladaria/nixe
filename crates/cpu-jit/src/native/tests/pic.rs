@@ -14,12 +14,7 @@ fn aarch64_pic_selector_covers_the_full_table() {
         fp: FpSpecialization::Dynamic,
     };
     assert!(set_index(source.site, target) >= 2048);
-    let code = probe::emit(
-        &source,
-        target,
-        ValueLocation::constant(target.pc.get().into()),
-    )
-    .unwrap();
+    let code = probe::emit(&source, ValueLocation::constant(target.pc.get().into())).unwrap();
     // Architectural encoding of UBFX x16,x16,#0,#14 (UBFM immr=0,
     // imms=13), independently assembled for the current 16,384 sets.
     assert!(
@@ -32,20 +27,13 @@ fn aarch64_pic_selector_covers_the_full_table() {
 fn native_pic_rejects_targets_in_reserved_registers_or_transfer_storage() {
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         let (source, _) = canonical::complete(abi);
-        let target = BlockKey {
-            address_space: AddressSpaceId::new(1),
-            pc: GuestVirtualAddress::new(0),
-            profile: CpuProfileId::new(1),
-            platform: TargetPlatform::Switch1,
-            fp: FpSpecialization::Dynamic,
-        };
         for pc in [
             integer(abi.reserved().link_scratch[0]),
             spill(0, 8),
             ValueLocation::constant(1_u128 << 64),
         ] {
             assert_eq!(
-                probe::emit(&source, target, pc),
+                probe::emit(&source, pc),
                 Err(TransferError::InvalidContract(
                     "invalid PIC target location"
                 ))
@@ -56,12 +44,28 @@ fn native_pic_rejects_targets_in_reserved_registers_or_transfer_storage() {
 
 #[test]
 fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
+    exercise_pic(None);
+    for register in 0..10 {
+        exercise_pic(Some(register));
+    }
+}
+
+fn exercise_pic(spare_register: Option<usize>) {
     let _restore = crate::fp_env::tests::RestoreHost::new();
     for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
         for wide in [false, true] {
             for flags in 0..4 {
                 for operand in 0..4 {
                     let (mut source, mut entry) = canonical::complete(abi);
+                    if let Some(register) = spare_register {
+                        // Exercise every allocatable x86 integer register as the
+                        // record base, including R12's mandatory SIB encoding,
+                        // while retaining every architectural guest value.
+                        crate::abi::Bindings::make_mut(&mut source.bindings)[register].location =
+                            spill(3256, 8);
+                        crate::abi::Bindings::make_mut(&mut entry.bindings)[register].location =
+                            spill(3256, 8);
+                    }
                     if flags < 2 {
                         source.nzcv = NzcvLocation::Host {
                             carry_inverted: flags == 1,
@@ -108,7 +112,7 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                         2 => ValueLocation::constant(target.pc.get().into()),
                         _ => vector(0),
                     };
-                    probe::emit(&source, target, pc).unwrap();
+                    probe::emit(&source, pc).unwrap();
                     if !canonical::native(abi) {
                         continue;
                     }
@@ -121,7 +125,7 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                         };
                         let mut bytes = gateway::landing(abi);
                         bytes.extend(emit_canonical_entry(&entry).unwrap());
-                        bytes.extend(probe::emit(&source, target, pc).unwrap());
+                        bytes.extend(probe::emit(&source, pc).unwrap());
                         let miss_offset = bytes.len() as u32;
                         bytes.extend(
                             emit_canonical_exit(
@@ -179,18 +183,13 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                     let mut record = Box::new(Record::new(source.site, target, 0));
                     let mut collision = Box::new(Record::new(source.site, target, 0));
                     collision.source ^= 1 << 40;
-                    for case in 0..14 {
+                    for case in 0..9 {
                         *record = Record::new(source.site, target, 0);
                         match case {
                             4 => record.source ^= 1 << 40,
                             5 => record.state_map ^= 1,
-                            6 => record.platform ^= 1,
-                            7 => record.pc ^= 1 << 40,
-                            8 => record.address_space ^= 1 << 40,
-                            9 => record.profile ^= 1 << 40,
-                            10 => record.fp ^= 1 << 32,
-                            11 => record.fp ^= 1,
-                            12 => record.pc ^= 1, // misaligned, same set selector
+                            6 => record.pc ^= 1 << 40,
+                            7 => record.pc ^= 1, // misaligned, same set selector
                             _ => {}
                         }
                         unsafe {
@@ -199,7 +198,7 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                             if case != 2 {
                                 table.set(slot + usize::from(case == 1), &*record);
                             }
-                            if case == 13 {
+                            if case == 8 {
                                 table.set(slot, &*collision);
                                 table.set(slot + 1, &*record);
                             }
@@ -215,7 +214,7 @@ fn native_pic_executes_both_ways_and_misses_without_changing_guest_state() {
                                     u128::from(target.pc.get()) | (0xabcd_u128 << 64),
                                 );
                             }
-                            let hit = case < 2 || case == 13;
+                            let hit = case < 2 || case == 8;
                             let mut before = state.clone();
                             before.set_pc(if hit { 0x4444 } else { 0x8888 });
                             {

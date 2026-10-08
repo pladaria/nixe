@@ -135,6 +135,15 @@ fn indexed_draw_preserves_bindings_arguments_and_cached_draw_kind() {
                     resource,
                     BackendResourceCreateInfo::Pipeline { .. }
                 )));
+            } else {
+                // The indexed draw accepts a base vertex. Changing only command
+                // kind must still validate the unsupported non-indexed base.
+                let array = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+                let array = &array.operations()[0];
+                assert!(matches!(lower_maxwell_three_d_operation_into_cache(
+                    array.state(), &resources, array.trigger(), Some(&shaders),
+                    FrontendSubmissionId::new(2), vec![], &mut cache),
+                    Err(MaxwellLoweringError::UnsupportedGlobalBaseVertexIndex(value)) if value == base));
             }
         }
     }
@@ -264,4 +273,168 @@ fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
         .is_err()
     );
     assert!(dispatch_method(&mut channel, 0x17e0 / 4, 0).is_err());
+}
+
+#[test]
+fn restored_vertex_bindings_reuse_an_older_exact_resource_plan() {
+    let vertices = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
+    let mut space = resource_address_space();
+    let vertex = map_resource(
+        &mut space,
+        vertices
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        90,
+        0,
+    )
+    .offset()
+    .get();
+    let mut channel = three_d_channel();
+    program_basic_draw_state(&mut channel, vertex);
+    let roles = [MaxwellThreeDResourceRole::VertexStream(0)];
+    let mut cache = super::super::threed::MaxwellThreeDResolvedResourceCache::default();
+    let first = cache
+        .resolve(channel.three_d(), &space, &roles, None, false, 4)
+        .unwrap();
+    let identity = channel.three_d().resource_state_identity(&roles, false);
+    program_three_d(&mut channel, 0x1c08, (vertex + 64) as u32);
+    assert!(!identity.matches(channel.three_d()));
+    let changed = cache
+        .resolve(channel.three_d(), &space, &roles, None, false, 4)
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &changed));
+    program_three_d(&mut channel, 0x1c08, vertex as u32);
+    assert!(identity.matches(channel.three_d()));
+    let restored = cache
+        .resolve(channel.three_d(), &space, &roles, None, false, 4)
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &restored));
+}
+
+#[test]
+fn constant_buffer_identity_tracks_captured_selectors_and_restoration() {
+    let mut channel = three_d_channel();
+    let roles = [MaxwellThreeDResourceRole::ConstantBuffer { group: 2, slot: 3 }];
+    for (method, value) in [(0x2380, 256), (0x2384, 0), (0x2388, 0x4000), (0x2450, 0x31)] {
+        program_three_d(&mut channel, method, value);
+    }
+    let first = channel.three_d().resource_state_identity(&roles, false);
+    program_three_d(&mut channel, 0x2388, 0x8000);
+    assert!(first.matches(channel.three_d())); // Changing the selector does not rebind.
+    program_three_d(&mut channel, 0x2450, 0x31);
+    assert!(!first.matches(channel.three_d())); // The same command captures a new address.
+    program_three_d(&mut channel, 0x2388, 0x4000);
+    program_three_d(&mut channel, 0x2450, 0x31);
+    assert!(first.matches(channel.three_d()));
+    program_three_d(&mut channel, 0x2380, 128);
+    program_three_d(&mut channel, 0x2450, 0x31);
+    assert!(!first.matches(channel.three_d()));
+}
+
+#[test]
+fn unrelated_method_does_not_inherit_the_preceding_state_write_domains() {
+    let mut channel = three_d_channel();
+    program_three_d(&mut channel, 0x1918, 1);
+    let draw = channel.three_d().fixed_draw_identity();
+    let resources = channel
+        .three_d()
+        .resource_state_identity(&[MaxwellThreeDResourceRole::ColorTarget(0)], false);
+    program_three_d(&mut channel, 0x1a24, 123); // DELAY retains only its raw value.
+    assert!(draw.matches(channel.three_d()));
+    assert!(resources.matches(channel.three_d()));
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register(GpuMethodId(0x1a24))
+            .unwrap()
+            .raw(),
+        Some(123)
+    );
+}
+
+#[test]
+fn rebinding_vertex_ranges_preserves_fixed_draw_and_immutable_prior_operations() {
+    let mut space = resource_address_space();
+    let vertices = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
+    let vertex = map_resource(
+        &mut space,
+        vertices
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        90,
+        0,
+    )
+    .offset()
+    .get();
+    let color = map_resource(
+        &mut space,
+        CanonicalAllocation::zeroed(0x10000, 0x1000)
+            .unwrap()
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        92,
+        0xfe,
+    )
+    .offset()
+    .get();
+    let mut channel = three_d_channel();
+    program_basic_draw_state(&mut channel, vertex);
+    program_color_target(&mut channel, 0, color, 0xd5);
+    program_three_d(&mut channel, 0x121c, 1);
+    let (shaders, mut cache) = translated_graphics_shaders();
+    let mut draws: Vec<Arc<nixe_gpu::PreparedDraw>> = Vec::new();
+    for (serial, offset) in [0, 64, 128, 0].into_iter().enumerate() {
+        program_three_d(&mut channel, 0x1c08, (vertex + offset) as u32);
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let captured = &dispatch.operations()[0];
+        let mut roles = Vec::new();
+        captured
+            .trigger()
+            .append_resource_roles(captured.state(), &mut roles);
+        let resources = cache
+            .resolved_resources_mut()
+            .resolve(captured.state(), &space, &roles, None, false, 16)
+            .unwrap();
+        let work = lower_maxwell_three_d_operation_into_cache(
+            captured.state(),
+            &resources,
+            captured.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(serial as u64 + 1),
+            vec![],
+            &mut cache,
+        )
+        .unwrap();
+        let draw = work
+            .submission()
+            .operations()
+            .iter()
+            .find_map(|operation| match operation.command() {
+                GpuCommand::Draw(draw) => Some(draw.prepared.clone()),
+                _ => None,
+            })
+            .unwrap();
+        if serial != 0 {
+            assert!(!work.resource_creations().iter().any(|creation| matches!(
+                creation,
+                BackendResourceCreateInfo::Shader { .. }
+                    | BackendResourceCreateInfo::RenderPass { .. }
+                    | BackendResourceCreateInfo::Pipeline { .. }
+                    | BackendResourceCreateInfo::Image { .. }
+            )));
+            assert_eq!(draw.render_pass, draws[0].render_pass);
+            assert_eq!(draw.topology, draws[0].topology);
+            assert_eq!(
+                draw.vertex_buffers[0].array_stride,
+                draws[0].vertex_buffers[0].array_stride
+            );
+        }
+        draws.push(draw);
+    }
+    assert_ne!(
+        draws[0].vertex_buffers[0].buffer.buffer,
+        draws[1].vertex_buffers[0].buffer.buffer
+    );
+    assert_eq!(draws[0].vertex_buffers[0].buffer.range.size(), 256);
+    assert_eq!(draws[1].vertex_buffers[0].buffer.range.size(), 256 - 64);
 }

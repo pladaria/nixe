@@ -263,7 +263,7 @@ fn contention_closure_and_retired_sources_do_not_add_boundary_heat() {
     let before = samples
         .boundary_snapshot(instruction(0), instruction(4))
         .unwrap();
-    process.request(Reason::LinkPatch).unwrap();
+    process.request(Reason::TierCutover).unwrap();
     process
         .sample_lcq(&unit, &mut samples, Some(edge(4)))
         .unwrap();
@@ -373,13 +373,13 @@ fn boundary_admission_unlocks_state_and_retries_busy_family_at_score_three() {
             score
         );
         if score < 4 {
-            assert!(queue.pop().unwrap().is_none());
+            assert!(queue.pop_ready().unwrap().is_none());
         }
     }
     let work = process
         .accept_background(
             queue
-                .pop()
+                .pop_ready()
                 .unwrap()
                 .expect("fourth sample admits after unlock"),
         )
@@ -405,10 +405,10 @@ fn boundary_admission_unlocks_state_and_retries_busy_family_at_score_three() {
             .1,
         3
     );
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     drop(work);
     process
         .sample_lcq(&baseline, &mut samples, Some(edge(16)))
         .unwrap();
-    assert!(queue.pop().unwrap().is_some());
+    assert!(queue.pop_ready().unwrap().is_some());
 }

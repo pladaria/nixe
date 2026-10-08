@@ -127,7 +127,8 @@ fn running_work_survives_maintenance_but_not_input_replacement() {
         .accept_background(queue.wait().unwrap().unwrap())
         .unwrap()
         .unwrap();
-    process.request(Reason::LinkPatch).unwrap();
+    process.request(Reason::TierCutover).unwrap();
+    assert_eq!(process.lock().phase, crate::lifetime::Phase::Closing);
     old.check().unwrap(); // Closed admission does not invalidate compiler inputs.
     process.try_service_links().unwrap();
     old.check().unwrap();
@@ -167,7 +168,8 @@ fn dequeue_preserves_maintenance_but_rejects_replaced_and_foreign_inputs() {
         if replace {
             publish(&process, &AtomicU64::new(0), &[0], Tier::Lcq);
         } else {
-            process.request(Reason::LinkPatch).unwrap();
+            process.request(Reason::TierCutover).unwrap();
+            assert_eq!(process.lock().phase, crate::lifetime::Phase::Closing);
         }
         let accepted = process.accept_background(job).unwrap();
         assert_eq!(accepted.is_none(), replace);

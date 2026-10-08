@@ -124,6 +124,7 @@ fn full_clear_reclaims_superseded_generations_and_their_page_index_entries() {
             entry.handle,
             driver.resource_record(entry.handle).unwrap(),
             entry.binding,
+            page,
             &mut writes,
         );
         assert_eq!(writes.len(), 1);

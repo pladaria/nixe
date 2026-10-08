@@ -48,7 +48,7 @@ fn shared_negative_suppresses_independent_vcpu_samples_without_jobs_or_cache_gro
                 > 0
         );
     });
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     assert_eq!(process.lock().compilers, 0);
     assert_eq!(process.cache.usage().unwrap().metadata, before.metadata);
     assert_eq!(process.cache.usage().unwrap().committed, before.committed);
@@ -111,7 +111,7 @@ fn sample_eviction_and_new_sequence_do_not_erase_negative_but_root_change_allows
             .unwrap(),
         Outcome::Queued
     );
-    drop(queue.pop().unwrap().unwrap());
+    drop(queue.pop_ready().unwrap().unwrap());
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn suppression_precedes_busy_family_and_full_queue_without_hiding_another_bounda
     );
     let job = pop(&queue);
     assert_eq!(job.snapshot, other);
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn contention_and_pressure_defer_without_destroying_the_negative() {
         Outcome::Suppressed
     );
     assert!(process.lock().units.negatives.get(result).is_some());
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
 }
 
 #[test]
@@ -208,5 +208,5 @@ fn old_endpoint_generation_is_stale_and_new_generation_is_not_suppressed() {
             .unwrap(),
         Outcome::Queued
     );
-    drop(queue.pop().unwrap().unwrap());
+    drop(queue.pop_ready().unwrap().unwrap());
 }

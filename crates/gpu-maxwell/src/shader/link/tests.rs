@@ -167,10 +167,12 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     );
     let first = cache
         .resolve_shader_translation_source(first_source, &address_space)
-        .unwrap();
+        .unwrap()
+        .1;
     let repeated = cache
         .resolve_shader_translation_source(first_source, &address_space)
-        .unwrap();
+        .unwrap()
+        .1;
     assert!(std::sync::Arc::ptr_eq(&repeated, &first));
     assert_eq!(cache.shader_translation_set_count(), 1);
     let state_programs = cache
@@ -197,7 +199,8 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
         prepare_maxwell_shader_translation_source(channel.three_d(), &[]).unwrap();
     let changed_registers = cache
         .resolve_shader_translation_source(changed_register_source, &address_space)
-        .unwrap();
+        .unwrap()
+        .1;
     let changed_register_id = cache
         .stage_shader_translations(&changed_registers)
         .unwrap()
@@ -212,7 +215,8 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
         prepare_maxwell_shader_translation_source(channel.three_d(), &[]).unwrap();
     let restored = cache
         .resolve_shader_translation_source(restored_source, &address_space)
-        .unwrap();
+        .unwrap()
+        .1;
     assert!(std::sync::Arc::ptr_eq(&restored, &first));
     assert_eq!(
         cache
@@ -228,7 +232,8 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
         prepare_maxwell_shader_translation_source(channel.three_d(), &[]).unwrap();
     let after_cpu_write = cache
         .resolve_shader_translation_source(after_cpu_write_source, &address_space)
-        .unwrap();
+        .unwrap()
+        .1;
     assert!(std::sync::Arc::ptr_eq(&after_cpu_write, &first));
     assert_eq!(cache.shader_translation_set_count(), 2);
     let after_cpu_write_id = cache
@@ -244,7 +249,8 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
         prepare_maxwell_shader_translation_source(channel.three_d(), &staged).unwrap();
     let after_staged_write = cache
         .resolve_shader_translation_source(after_staged_write_source, &address_space)
-        .unwrap();
+        .unwrap()
+        .1;
     let after_staged_write_id = cache
         .stage_shader_translations(&after_staged_write)
         .unwrap()
@@ -265,12 +271,14 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
         prepare_maxwell_shader_translation_source(channel.three_d(), &ordered_forward).unwrap();
     let forward = cache
         .resolve_shader_translation_source(forward_source, &address_space)
-        .unwrap();
+        .unwrap()
+        .1;
     let reverse_source =
         prepare_maxwell_shader_translation_source(channel.three_d(), &ordered_reverse).unwrap();
     let reverse = cache
         .resolve_shader_translation_source(reverse_source, &address_space)
-        .unwrap();
+        .unwrap()
+        .1;
     let forward_id = cache.stage_shader_translations(&forward).unwrap().shaders()[0].shader();
     let reverse_id = cache.stage_shader_translations(&reverse).unwrap().shaders()[0].shader();
     assert_ne!(forward_id, reverse_id);

@@ -144,6 +144,7 @@ impl HorizonSvcDispatcher {
                 user_account_switch_locked: self.user_account_switch_locked,
                 save_data: self.save_data.as_ref(),
                 diagnostics: &self.diagnostics,
+                host_work: &self.host_work,
                 caller_thread_id,
             },
         ) {
@@ -161,6 +162,16 @@ impl HorizonSvcDispatcher {
                     .remove(&context.thread().object().thread_id());
                 log::debug!("application applet requested process exit");
                 terminate(ExceptionTerminationScope::Process)
+            }
+            Ok(SyncRequestResult::PendingHostWork(wait)) => {
+                self.pending_wakes.insert(
+                    context.thread().object().thread_id(),
+                    PendingThreadWake {
+                        events: vec![wait.wake_event()],
+                        deadline: None,
+                    },
+                );
+                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
             }
             Ok(SyncRequestResult::PendingGpuSubmission(wait)) => {
                 self.pending_wakes.insert(
@@ -246,6 +257,7 @@ impl HorizonSvcDispatcher {
                 user_account_switch_locked: self.user_account_switch_locked,
                 save_data: self.save_data.as_ref(),
                 diagnostics: &self.diagnostics,
+                host_work: &self.host_work,
                 caller_thread_id,
             },
         ) {
@@ -263,6 +275,16 @@ impl HorizonSvcDispatcher {
                     .remove(&context.thread().object().thread_id());
                 log::debug!("application applet requested process exit");
                 terminate(ExceptionTerminationScope::Process)
+            }
+            Ok(SyncRequestResult::PendingHostWork(wait)) => {
+                self.pending_wakes.insert(
+                    context.thread().object().thread_id(),
+                    PendingThreadWake {
+                        events: vec![wait.wake_event()],
+                        deadline: None,
+                    },
+                );
+                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
             }
             Ok(SyncRequestResult::PendingGpuSubmission(wait)) => {
                 self.pending_wakes.insert(

@@ -63,7 +63,6 @@ fn cold_poll_observes_bound_requests_without_consuming_them() {
         state.set_pc(PC.get());
         let (Some(Exit::Native { returned, .. }), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(1, 100).unwrap(),
@@ -102,7 +101,6 @@ fn bounded_straight_line_work_is_charged_once_with_slice_and_sample_overshoot() 
         state.set_pc(PC.get());
         let (Some(Exit::Native { returned, .. }), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(1, 1).unwrap(),
@@ -134,7 +132,6 @@ fn taken_and_untaken_branches_charge_the_branch_and_preserve_lazy_nzcv() {
             budget,
         ) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(4096, 1).unwrap(),
@@ -172,7 +169,6 @@ fn escaped_fault_charges_only_completed_prefix_and_retry_does_not_double_charge(
         state.general_register_storage_mut()[1] = if valid { 0x3800 } else { 0x5000 };
         let (Some(exit), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(4096, 1).unwrap(),
@@ -224,7 +220,6 @@ fn pre_completion_exits_do_not_charge_the_pending_instruction() {
         state.set_pc(PC.get());
         let (Some(Exit::Native { returned, .. }), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(4096, 10).unwrap(),
@@ -251,13 +246,7 @@ fn exhausted_budget_never_registers_a_worker_or_enters_native_code() {
         let mut budget = PollBudget::new(4096, 1).unwrap();
         budget.reconcile(remaining, false).unwrap();
         assert!(matches!(
-            thread.invoke(
-                &mut crate::ReturnStack::default(),
-                &mut worker,
-                &mut state,
-                budget,
-                &VcpuEventState::default()
-            ),
+            thread.invoke(&mut worker, &mut state, budget, &VcpuEventState::default()),
             Err(invocation::Error::Native(
                 crate::native::NativeReturnError::Budget(crate::abi::BudgetError::ExhaustedSlice)
             ))

@@ -11,6 +11,7 @@ mod error_applet;
 mod graphics;
 mod graphics_event;
 mod hid;
+mod host_work;
 mod ipc;
 mod ipc_result;
 mod ipc_wire;

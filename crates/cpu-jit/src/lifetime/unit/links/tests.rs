@@ -655,6 +655,10 @@ pub(super) fn source_input_for_tier(process: &Lifetime, pc: u64, target: u64, ti
                 bytes: bytes.into_boxed_slice(),
                 alignment: 16,
                 metadata: Metadata {
+                    #[cfg(feature = "jit-profile")]
+                    regions: Box::new([]),
+                    #[cfg(feature = "jit-profile")]
+                    profile_body_length: 0,
                     abi,
                     frame_extent: crate::abi::TRANSFER_BYTES,
                     entries: Box::new([(ir::Block::from_u32(0), 0)]),
@@ -771,7 +775,8 @@ fn duplicate_registration_preserves_one_record_request_and_charge() {
         .complete_with_links_deferred()
         .unwrap();
     assert!(transition.try_reopen().unwrap());
-    assert_ne!(process.pending.load(Ordering::Acquire), 0);
+    assert_eq!(process.pending.load(Ordering::Acquire), 0);
+    assert!(process.optional_links_pending());
     let mut transition = process.try_transition().unwrap().unwrap();
     transition.wait_closed().unwrap();
     transition.unlink_link(handle).unwrap();

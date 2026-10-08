@@ -54,7 +54,7 @@ pub(crate) enum Exit {
     Fallthrough(Target),
     Jump(Target),
     Conditional { fallthrough: Target, taken: Target },
-    // Even a captured callee has no internal edge from this call.
+    // Architectural transfer kind; captured native successors live on Block.
     Call(Option<BlockKey>),
     Indirect,
     Return,
@@ -65,6 +65,19 @@ pub(crate) struct Block {
     pub key: BlockKey,
     pub instructions: Range<usize>,
     pub exit: Exit,
+    /// Guarded destinations for register transfers, or a captured direct callee.
+    /// They share the same SSA/allocation domain as ordinary branch successors.
+    pub dispatch: Vec<Target>,
+}
+
+impl Block {
+    pub fn successors(&self) -> Vec<Target> {
+        match self.exit {
+            Exit::Fallthrough(target) | Exit::Jump(target) => vec![target],
+            Exit::Conditional { fallthrough, taken } => vec![fallthrough, taken],
+            _ => self.dispatch.clone(),
+        }
+    }
 }
 
 pub(crate) struct Graph {
@@ -91,7 +104,7 @@ impl Graph {
 
     /// Samples from direct branches are discovery hints, not dynamic entries.
     /// Use the seed's captured terminal, which may follow several split blocks.
-    pub fn seed_is_indirect(&self) -> bool {
+    pub fn seed_is_dynamic(&self) -> bool {
         let seed = self.blocks[0].key;
         let input = self.inputs.iter().find(|input| input.key == seed).unwrap();
         let unit = &self.units[input.unit];
@@ -106,7 +119,10 @@ impl Graph {
             .is_ok_and(|index| {
                 let word = &self.instructions[index];
                 word.instruction.key == last
-                    && terminal(last.block_key(), &word.decoded) == Some(Exit::Indirect)
+                    && matches!(
+                        terminal(last.block_key(), &word.decoded),
+                        Some(Exit::Indirect | Exit::Call(None))
+                    )
             })
     }
 
@@ -172,6 +188,7 @@ struct Builder {
     seed: BlockKey,
     words: BTreeMap<u64, Instruction>,
     leaders: BTreeSet<u64>,
+    observed: BTreeMap<u64, Vec<BlockKey>>,
 }
 
 impl Builder {
@@ -180,6 +197,7 @@ impl Builder {
             seed,
             words: BTreeMap::new(),
             leaders: BTreeSet::new(),
+            observed: BTreeMap::new(),
         }
     }
 
@@ -188,6 +206,15 @@ impl Builder {
             return Err(Error::StaleCapture);
         }
         self.leaders.insert(key.pc.get());
+        Ok(())
+    }
+
+    fn observe(&mut self, source: BlockKey, target: BlockKey) -> Result<(), Error> {
+        self.leader(target)?;
+        let targets = self.observed.entry(source.pc.get()).or_default();
+        if !targets.contains(&target) && targets.len() < 8 {
+            targets.push(target);
+        }
         Ok(())
     }
 
@@ -255,6 +282,9 @@ impl Builder {
                         self.leaders.insert(no.pc.get());
                         self.leaders.insert(yes.pc.get());
                     }
+                    Exit::Call(Some(target)) => {
+                        self.leaders.insert(target.pc.get());
+                    }
                     _ => {}
                 }
             }
@@ -288,6 +318,7 @@ impl Builder {
                 key,
                 instructions: start..end,
                 exit,
+                dispatch: Vec::new(),
             });
             start = end;
         }
@@ -313,6 +344,95 @@ impl Builder {
                     resolve(taken);
                 }
                 _ => {}
+            }
+        }
+        // A direct call is an ordinary architectural LR definition followed by
+        // an SSA edge. A return is guarded against its actual register value;
+        // public entry, recursion, nonstandard LR and unobserved targets retain
+        // their normal external dispatch fallback.
+        for block in &mut blocks {
+            let last = instructions[block.instructions.end - 1]
+                .instruction
+                .key
+                .block_key();
+            if let Exit::Call(Some(target)) = block.exit {
+                if let Some(&index) = indexes.get(&target) {
+                    block.dispatch.push(Target::Internal(index));
+                }
+            } else if matches!(block.exit, Exit::Indirect | Exit::Return | Exit::Call(None)) {
+                for target in self.observed.get(&last.pc.get()).into_iter().flatten() {
+                    if let Some(&index) = indexes.get(target) {
+                        block.dispatch.push(Target::Internal(index));
+                    }
+                }
+            }
+        }
+        // Discover each callee's returns without descending into nested calls:
+        // the nested call's continuation, not its callee, belongs to this walk.
+        let calls: Vec<_> = blocks
+            .iter()
+            .flat_map(|block| {
+                let pc = instructions[block.instructions.end - 1]
+                    .instruction
+                    .key
+                    .block_key()
+                    .pc;
+                let continuation = self
+                    .seed
+                    .at(GuestVirtualAddress::new(pc.get().wrapping_add(4)))
+                    .and_then(|key| indexes.get(&key))
+                    .copied();
+                block.dispatch.iter().filter_map(move |target| {
+                    if let Target::Internal(callee) = target
+                        && matches!(block.exit, Exit::Call(_))
+                    {
+                        Some((*callee, continuation?))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        for (callee, continuation) in calls {
+            let mut visited = vec![false; blocks.len()];
+            let mut pending = vec![callee];
+            while let Some(index) = pending.pop() {
+                if std::mem::replace(&mut visited[index], true) {
+                    continue;
+                }
+                match blocks[index].exit {
+                    Exit::Return => {
+                        let target = Target::Internal(continuation);
+                        if !blocks[index].dispatch.contains(&target)
+                            && blocks[index].dispatch.len() < 8
+                        {
+                            blocks[index].dispatch.push(target);
+                        }
+                    }
+                    Exit::Call(_) => {
+                        let pc = instructions[blocks[index].instructions.end - 1]
+                            .instruction
+                            .key
+                            .block_key()
+                            .pc;
+                        if let Some(next) = self
+                            .seed
+                            .at(GuestVirtualAddress::new(pc.get().wrapping_add(4)))
+                            .and_then(|key| indexes.get(&key))
+                        {
+                            pending.push(*next);
+                        }
+                    }
+                    _ => pending.extend(blocks[index].successors().into_iter().filter_map(
+                        |target| {
+                            if let Target::Internal(next) = target {
+                                Some(next)
+                            } else {
+                                None
+                            }
+                        },
+                    )),
+                }
             }
         }
         Ok((instructions, blocks))

@@ -9,8 +9,8 @@ fn neutral_memory_contract_has_no_platform_or_execution_dependencies() {
     let dependencies = dependency_names(&contents);
 
     assert!(
-        dependencies.is_empty(),
-        "neutral memory crate must remain dependency-free, found {dependencies:?}"
+        dependencies.iter().all(|name| *name == "nixe-trace"),
+        "neutral memory may depend only on platform-neutral tracing, found {dependencies:?}"
     );
 }
 

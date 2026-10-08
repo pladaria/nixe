@@ -245,6 +245,13 @@ identities!(
     BridgeGeneration
 );
 
+#[cfg(feature = "jit-profile")]
+impl CodeUnitId {
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 impl CodeVersion {
     pub const fn get(self) -> u64 {
         self.0.get()
@@ -589,9 +596,6 @@ pub struct NativeFrame<'a> {
     /// Borrowed stable table for this process/vCPU; null disables native PIC
     /// probes. The registration and its occupied bridge owners outlive entry.
     pub(crate) indirect_pic: *const *const crate::native::pic::Record,
-    /// Exclusively borrowed from the scheduled guest thread, not the vCPU.
-    /// Bare ABI fixtures may leave it null; production invocations bind it.
-    pub(crate) return_stack: *mut crate::ReturnStack,
     /// Acquire-read only at cold polls: process maintenance, vCPU requests,
     /// and pending interrupts. Owners must outlive protected execution. An
     /// isolated invocation with no such owner uses the immutable quiet word.
@@ -603,7 +607,7 @@ pub struct NativeFrame<'a> {
     /// Bare gateway fixtures without a sampling owner leave this absent.
     pub(crate) sample_observer:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, u64, u32) -> u32>,
-    state_borrow: PhantomData<(&'a mut A64State, &'a mut crate::ReturnStack)>,
+    state_borrow: PhantomData<&'a mut A64State>,
 }
 
 /// A completed native load whose physical identity is resolved at the exit,
@@ -686,19 +690,11 @@ impl<'a> NativeFrame<'a> {
             dispatch_resolver: None,
             dispatch_context: std::ptr::null_mut(),
             indirect_pic: std::ptr::null(),
-            return_stack: std::ptr::null_mut(),
             poll_requests: [&QUIET_POLL_REQUEST; 3],
             exclusive_load: PendingExclusiveLoad::default(),
             sample_observer: None,
             state_borrow: PhantomData,
         }
-    }
-
-    /// Both architectural state and predictions remain exclusively borrowed
-    /// until this frame is dropped, including all cold resolver resumptions.
-    pub fn with_return_stack(mut self, returns: &'a mut crate::ReturnStack) -> Self {
-        self.return_stack = returns;
-        self
     }
 
     /// Transfer the last successful native exclusive load to the persistent
@@ -1096,6 +1092,82 @@ pub struct ValueBinding {
     pub location: ValueLocation,
 }
 
+/// Immutable physical bindings indexed by architectural value. Construction
+/// accepts unchecked compiler output; publication validates the full contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Bindings(std::sync::Arc<BindingData>);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BindingData {
+    values: Box<[ValueBinding]>,
+    index: [u8; 68],
+}
+impl std::hash::Hash for Bindings {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // The index is derived, not a second immutable identity to rehash.
+        std::hash::Hash::hash(&self.0.values, state);
+    }
+}
+impl GuestValue {
+    fn ordinal(self) -> Option<usize> {
+        Some(match self {
+            Self::General(n) if n < 31 => usize::from(n),
+            Self::Sp => 31,
+            Self::Vector(n) if n < 32 => 32 + usize::from(n),
+            Self::Fpcr => 64,
+            Self::Fpsr => 65,
+            Self::TpidrEl0 => 66,
+            Self::TpidrroEl0 => 67,
+            _ => return None,
+        })
+    }
+}
+impl From<Vec<ValueBinding>> for Bindings {
+    fn from(values: Vec<ValueBinding>) -> Self {
+        let mut index = [u8::MAX; 68];
+        for (slot, binding) in values.iter().enumerate() {
+            if let (Some(ordinal), Ok(slot)) = (binding.value.ordinal(), u8::try_from(slot)) {
+                index[ordinal] = slot;
+            }
+        }
+        Self(std::sync::Arc::new(BindingData {
+            values: values.into_boxed_slice(),
+            index,
+        }))
+    }
+}
+impl FromIterator<ValueBinding> for Bindings {
+    fn from_iter<T: IntoIterator<Item = ValueBinding>>(iter: T) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+impl std::ops::Deref for Bindings {
+    type Target = [ValueBinding];
+    fn deref(&self) -> &Self::Target {
+        &self.0.values
+    }
+}
+impl Bindings {
+    // Test fixtures edit physical locations, never architectural value identity.
+    #[cfg(test)]
+    pub(crate) fn make_mut(this: &mut Self) -> &mut [ValueBinding] {
+        &mut std::sync::Arc::make_mut(&mut this.0).values
+    }
+    pub fn get_value(&self, value: GuestValue) -> Option<&ValueBinding> {
+        self.0
+            .values
+            .get(usize::from(self.0.index[value.ordinal()?]))
+    }
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        std::mem::size_of::<BindingData>()
+            + std::mem::size_of_val(&*self.0.values)
+            + 2 * std::mem::size_of::<usize>()
+    }
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NzcvLocation {
     /// Canonical NZCV is still authoritative (no dirty lazy producer).
@@ -1112,8 +1184,11 @@ pub enum NzcvLocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryContract {
     pub live_in: StateSet,
+    /// Incoming values overwritten before any read, fault or poll observation
+    /// on every path. A bridge need not preserve their old canonical homes.
+    pub discard: StateSet,
     pub abi: HostAbi,
-    pub bindings: std::sync::Arc<[ValueBinding]>,
+    pub bindings: Bindings,
     pub nzcv: NzcvLocation,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1126,7 +1201,7 @@ pub struct ExitStateMap {
     /// Values whose canonical homes may be stale, including inherited fast-entry
     /// state still needed by this boundary, not just writes performed in this unit.
     pub dirty_live: StateSet,
-    pub bindings: std::sync::Arc<[ValueBinding]>,
+    pub bindings: Bindings,
     pub nzcv: NzcvLocation,
     /// Host status may be pending, including from earlier units. OR it with
     /// mapped/canonical software FPSR only when NativeFrame owns an active
@@ -1138,6 +1213,12 @@ pub struct ExitStateMap {
 /// physical bindings. Boundary emission supplies these from FINAL allocation.
 impl EntryContract {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.discard.without(StateSet::ALL).is_empty() {
+            return Err("fast ingress discard set contains nonarchitectural state");
+        }
+        if !self.live_in.intersection(self.discard).is_empty() {
+            return Err("fast ingress cannot discard a live input");
+        }
         if self.live_in.nzcv != 0 && self.nzcv == NzcvLocation::Canonical {
             return Err("fast ingress needs a physical NZCV contract");
         }
@@ -1547,6 +1628,7 @@ mod tests {
                 },
             };
             let mut entry = EntryContract {
+                discard: Default::default(),
                 live_in: required,
                 abi,
                 bindings: vec![binding].into(),
@@ -1590,7 +1672,7 @@ mod tests {
             abi: HostAbi::X86_64,
             live: required,
             dirty_live: required,
-            bindings: std::sync::Arc::from([]),
+            bindings: [].to_vec().into(),
             nzcv: NzcvLocation::Canonical,
             host_fpsr_pending: true,
         };

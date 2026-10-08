@@ -9,10 +9,11 @@ use nixe_gpu::{
 };
 use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelError, MaxwellChannelPriority,
-    MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError, MaxwellGpfifoSubmitRequest,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellInvalidGpfifoSubmission,
-    MaxwellLoweringCache, MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler,
-    MaxwellZCullMode, decode_gpfifo_submission, lower_maxwell_frontend, resolve_gpfifo_submission,
+    MaxwellFrontendDispatch, MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError,
+    MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel,
+    MaxwellInvalidGpfifoSubmission, MaxwellLoweringCache, MaxwellMemoryManagerId,
+    MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode, decode_gpfifo_submission,
+    lower_maxwell_frontend, resolve_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
@@ -108,7 +109,6 @@ struct NvHostGpuSubmit<'a> {
 struct NvHostGpuSubmissionState<'a> {
     scheduler: &'a mut MaxwellScheduler,
     next_frontend_submission: &'a mut u64,
-    lowering_cache: &'a mut MaxwellLoweringCache,
 }
 
 impl NvHostGpu {
@@ -346,7 +346,7 @@ impl NvHostGpu {
         request: u32,
         input: &[u8],
         additional_input: &[u8],
-    ) -> Result<(Vec<u8>, GpuSubmission), NvDrvCallError> {
+    ) -> Result<(Vec<u8>, PreparedFrontend), NvDrvCallError> {
         let channel = self
             .channels
             .get_mut(&descriptor.fd())
@@ -376,7 +376,6 @@ impl NvHostGpu {
             NvHostGpuSubmissionState {
                 scheduler: &mut self.scheduler,
                 next_frontend_submission: &mut self.next_frontend_submission,
-                lowering_cache: &mut self.lowering_cache,
             },
             resources,
             descriptor,
@@ -413,6 +412,72 @@ impl NvHostGpu {
     #[cfg(test)]
     pub(super) fn pending_submission_count(&self) -> usize {
         self.scheduler.pending_count()
+    }
+}
+
+pub(super) struct PreparedFrontend {
+    descriptor: NvDrvDeviceDescriptor,
+    request: u32,
+    dispatch: MaxwellFrontendDispatch,
+    address_space: MaxwellGpuAddressSpace,
+    reservation: Option<ReservedTimelinePoint>,
+    control: Arc<Mutex<NvHostControl>>,
+    permit: GpuFrontendPermit,
+}
+impl PreparedFrontend {
+    pub(super) fn frontend(&self) -> FrontendSubmissionId {
+        self.dispatch.scheduled().frontend()
+    }
+}
+impl NvHostGpu {
+    pub(super) fn lower(
+        &mut self,
+        prepared: PreparedFrontend,
+    ) -> Result<GpuSubmission, NvDrvCallError> {
+        let PreparedFrontend {
+            descriptor,
+            request,
+            dispatch,
+            address_space,
+            reservation,
+            control,
+            permit,
+        } = prepared;
+        let frontend = dispatch.scheduled().frontend();
+        let _trace = nixe_trace::Span::new("gpu.frontend", frontend.get(), 0);
+        let _cpu = nixe_trace::CpuSpan::new("gpu.frontend_cpu_ns", frontend.get());
+        let channel = self
+            .channels
+            .get_mut(&descriptor.fd())
+            .ok_or_else(|| unsupported_state(descriptor, request))?;
+        let execution = lower_maxwell_frontend(
+            &dispatch,
+            channel,
+            &address_space,
+            frontend,
+            Vec::new(),
+            dispatch.scheduled().completion(),
+            &mut self.lowering_cache,
+        )
+        .map_err(|failure| {
+            unsupported_frontend_boundary(
+                descriptor,
+                request,
+                MaxwellFrontendDispatchBoundary::Frontend {
+                    dispatch: Box::new(dispatch),
+                    failure,
+                },
+            )
+        })?;
+        nixe_trace::event("gpu.frontend_complete", frontend.get(), 0);
+        Ok(GpuSubmission::new(
+            descriptor,
+            request,
+            execution,
+            reservation,
+            control,
+            permit,
+        ))
     }
 }
 
@@ -472,11 +537,10 @@ fn submit_gpfifo(
     request: u32,
     submit: NvHostGpuSubmit<'_>,
     permit: GpuFrontendPermit,
-) -> Result<(Vec<u8>, GpuSubmission), NvDrvCallError> {
+) -> Result<(Vec<u8>, PreparedFrontend), NvDrvCallError> {
     let NvHostGpuSubmissionState {
         scheduler,
         next_frontend_submission,
-        lowering_cache,
     } = state;
     let allocated_entries = channel
         .frontend()
@@ -589,38 +653,21 @@ fn submit_gpfifo(
         .dispatch_next(dependency_reached, dispatch_address_space)
         .map_err(|error| scheduling_error(descriptor, request, error))?
         .ok_or_else(|| unsupported_state(descriptor, request))?;
-    let frontend = dispatch.scheduled().frontend();
-    let execution = match lower_maxwell_frontend(
-        &dispatch,
-        channel,
-        dispatch_address_space,
-        frontend,
-        Vec::new(),
-        dispatch.scheduled().completion(),
-        lowering_cache,
-    ) {
-        Ok(execution) => execution,
-        Err(failure) => {
-            let boundary = MaxwellFrontendDispatchBoundary::Frontend {
-                dispatch: Box::new(dispatch),
-                failure,
-            };
-            return Err(unsupported_frontend_boundary(descriptor, request, boundary));
-        }
-    };
+    nixe_trace::event("gpu.gpfifo", dispatch.scheduled().frontend().get(), 0);
     let expected_completion = dispatch
         .scheduled()
         .completion()
         .map(ReservedTimelinePoint::point);
     let reservation = dispatch.scheduled().completion().cloned();
-    let submission = GpuSubmission::new(
+    let submission = PreparedFrontend {
         descriptor,
         request,
-        execution,
-        reservation.clone(),
-        Arc::clone(resources.control),
+        dispatch,
+        address_space: dispatch_address_space.clone(),
+        reservation: reservation.clone(),
+        control: Arc::clone(resources.control),
         permit,
-    );
+    };
 
     let mut output = submit.response.to_vec();
     if let Some(reservation) = reservation {

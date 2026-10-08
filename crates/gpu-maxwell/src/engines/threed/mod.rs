@@ -429,6 +429,18 @@ macro_rules! methods {
                 action: $action,
             }),+
         ];
+        const METHOD_INDEX: [u16; 0x1000] = {
+            let mut index = [0; 0x1000];
+            let mut entry = 0;
+            while entry < METHODS.len() {
+                let method = METHODS[entry].metadata.method().0 as usize;
+                assert!(method % 4 == 0 && method / 4 < index.len());
+                assert!(index[method / 4] == 0 && entry < u16::MAX as usize);
+                index[method / 4] = entry as u16 + 1;
+                entry += 1;
+            }
+            index
+        };
     };
 }
 
@@ -1358,10 +1370,19 @@ fn preflight_with_shadow(
     let register_changed = candidate
         .raw_register(method.source().method())
         .is_none_or(|register| register.raw() != Some(method.source().argument()));
+    candidate.begin_method();
     let prepared = preflight_register(profile, method, candidate)?;
     if prepared.writes_state {
+        let before = candidate.operation_state().fixed_draw_fingerprint();
         candidate.refresh_semantic_identities(register_changed);
         candidate.record_raw_register(prepared.method.source());
+        if candidate.operation_state().fixed_draw_fingerprint() != before {
+            nixe_trace::event(
+                "gpu.fixed_state_write",
+                u64::from(prepared.method.source().method().0),
+                u64::from(prepared.method.source().argument()),
+            );
+        }
     }
     if apply_shadow_ram {
         candidate
@@ -1377,6 +1398,18 @@ fn preflight_register(
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
+    if let Some((write, method_name, upload)) = preflight_constant_buffer_load(source, candidate)? {
+        candidate.apply(write);
+        let metadata =
+            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
+        let (operation, writes_state) = upload.map_or(state_write(), state_inline_constant_buffer);
+        return Ok(PreparedMethod::new(
+            method,
+            metadata,
+            operation,
+            writes_state,
+        ));
+    }
     if let Some((write, method_name, upload)) =
         inline_to_memory::preflight(source, candidate.operation_state().inline_to_memory())?
     {
@@ -1396,18 +1429,6 @@ fn preflight_register(
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         return Ok(PreparedMethod::new(method, metadata, None, true));
-    }
-    if let Some((write, method_name, upload)) = preflight_constant_buffer_load(source, candidate)? {
-        candidate.apply(write);
-        let metadata =
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let (operation, writes_state) = upload.map_or(state_write(), state_inline_constant_buffer);
-        return Ok(PreparedMethod::new(
-            method,
-            metadata,
-            operation,
-            writes_state,
-        ));
     }
     if let Some((write, method_name)) = preflight_vertex_and_binding_state(source, candidate)? {
         candidate.apply(write);
@@ -1441,9 +1462,14 @@ fn preflight_register(
             writes_state,
         ));
     }
-    let Some(declaration) = METHODS
-        .iter()
-        .find(|declaration| declaration.metadata.method() == source.method())
+    let Some(declaration) = source
+        .method()
+        .0
+        .is_multiple_of(4)
+        .then(|| METHOD_INDEX.get(source.method().0 as usize / 4))
+        .flatten()
+        .and_then(|index| index.checked_sub(1))
+        .map(|index| &METHODS[usize::from(index)])
     else {
         return Err(MaxwellEngineDispatchError::UnknownMethod {
             source,

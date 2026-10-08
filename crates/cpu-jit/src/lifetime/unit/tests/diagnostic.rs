@@ -117,7 +117,7 @@ fn hcq_replacement_diagnostic_reports_successor_size_outside_state() {
         Outcome::Queued
     );
     let work = process
-        .accept_background(queue.pop().unwrap().unwrap())
+        .accept_background(queue.pop_ready().unwrap().unwrap())
         .unwrap()
         .unwrap();
     let frozen = work

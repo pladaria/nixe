@@ -162,3 +162,89 @@ fn selective_bridge_preserves_cycles_missing_inputs_and_partial_flags() {
         }
     }
 }
+
+#[test]
+fn bridge_scratch_removes_borrowing_and_preserves_full_register_fallback() {
+    let abi = HostAbi::X86_64;
+    let (source, _) = contracts(
+        abi,
+        &[
+            (GuestValue::General(0), integer(0), integer(0)),
+            (GuestValue::General(1), spill(2048, 8), spill(2048, 8)),
+        ],
+    );
+    let (_, target) = contracts(abi, &[]);
+    let optimized = emit_chain_transfer(&source, &target).unwrap();
+    let preserving = emit_canonical_writeback(&source).unwrap();
+    assert!(optimized.len() < preserving.len());
+    let mut values = (0..16)
+        .filter(|index| integer(*index).valid(abi, 8))
+        .enumerate()
+        .map(|(i, register)| {
+            (
+                GuestValue::General(i as u8),
+                integer(register),
+                integer(register),
+            )
+        })
+        .collect::<Vec<_>>();
+    values.push((GuestValue::General(19), spill(2048, 8), spill(2048, 8)));
+    let (source, _) = contracts(abi, &values);
+    assert_eq!(
+        emit_chain_transfer(&source, &target).unwrap(),
+        emit_canonical_writeback(&source).unwrap()
+    );
+    if canonical::native(abi) {
+        let mut state = A64State::default();
+        let mut frame = NativeFrame::new(&mut state, PollBudget::new(77, 1000).unwrap());
+        let mut seed = 42;
+        for byte in &mut frame.spill {
+            *byte = MaybeUninit::new((next(&mut seed) >> 32) as u8);
+        }
+        let before = frame
+            .spill
+            .iter()
+            .map(|b| unsafe { b.assume_init() })
+            .collect::<Vec<_>>();
+        invoke(
+            abi,
+            emit_chain_transfer(&source, &target).unwrap(),
+            &mut frame,
+        );
+        for binding in source.bindings.iter() {
+            let GuestValue::General(index) = binding.value else {
+                unreachable!()
+            };
+            assert_eq!(
+                state.general_register_storage_mut()[usize::from(index)].to_le_bytes(),
+                read(&before, binding.location, 8, false).as_slice()
+            );
+        }
+    }
+}
+
+#[test]
+fn already_packed_inherited_flags_need_no_matching_contract_adapter() {
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        for mask in 1..=NZCV {
+            let (mut source, mut target) = contracts(
+                abi,
+                &[
+                    (GuestValue::General(19), integer(3), integer(3)),
+                    (GuestValue::Vector(1), vector(7), vector(7)),
+                ],
+            );
+            source.live.nzcv = mask;
+            source.dirty_live.nzcv = mask;
+            target.live_in.nzcv = mask;
+            target.nzcv = NzcvLocation::Packed(integer(0));
+            for recipe in [
+                LazyFlags::Canonical(integer(0)),
+                LazyFlags::Packed(integer(0)),
+            ] {
+                source.nzcv = NzcvLocation::Deferred(recipe);
+                assert!(emit_chain_transfer(&source, &target).unwrap().is_empty());
+            }
+        }
+    }
+}

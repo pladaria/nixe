@@ -115,7 +115,7 @@ fn canonical_entry_loads_real_state_into_registers_and_spills() {
         for flags_in_rax in [false, true] {
             let (_, mut target) = complete(abi);
             if flags_in_rax {
-                std::sync::Arc::make_mut(&mut target.bindings)[0].location = spill(3248, 8);
+                crate::abi::Bindings::make_mut(&mut target.bindings)[0].location = spill(3248, 8);
                 target.nzcv = NzcvLocation::Packed(integer(0));
             }
             let code = emit_canonical_entry(&target).unwrap();
@@ -236,7 +236,7 @@ fn canonical_writeback_commits_only_dirty_values_and_selected_flag_bits() {
                 nzcv: mask,
                 ..StateSet::default()
             };
-            for (index, binding) in std::sync::Arc::make_mut(&mut source.bindings)
+            for (index, binding) in crate::abi::Bindings::make_mut(&mut source.bindings)
                 .iter_mut()
                 .enumerate()
             {
@@ -313,7 +313,7 @@ fn canonical_adapters_compose_with_a_real_fast_transfer() {
                 .map(|b| b.location)
                 .rev()
                 .collect();
-            for (binding, location) in std::sync::Arc::make_mut(&mut destination.bindings)
+            for (binding, location) in crate::abi::Bindings::make_mut(&mut destination.bindings)
                 .iter_mut()
                 .filter(|b| b.value.bytes() == bytes)
                 .zip(locations)

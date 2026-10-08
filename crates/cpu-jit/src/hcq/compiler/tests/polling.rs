@@ -164,7 +164,7 @@ fn hcq_irreducible_and_multi_entry_checks_match_the_shared_flow_proof() {
                             }
                             _ => unreachable!(),
                         };
-                        let checked = targets.into_iter().zip(analysis.backedges[index]).any(|(t, check)| {
+                        let checked = targets.into_iter().zip(analysis.backedges[index].iter().copied()).any(|(t, check)| {
                             check && matches!(t, Some(Target::Internal(i)) if graph.blocks[i].key.pc.get() == expected.pc())
                         });
                         if checked && completed >= slice {
@@ -275,18 +275,13 @@ unsafe extern "C" fn observe(
 }
 
 #[test]
-fn hcq_internal_sample_callback_preserves_live_ssa_fp_and_precise_failure_state() {
+fn stable_hcq_cycles_preserve_ssa_fp_without_optimizer_callbacks() {
     crate::native::check_host().unwrap();
     let words = [0x1e222800, 0x8b040063, 0xf1000400, 0x54ffffa1]; // FADD; ADD; SUBS; B.NE 0
     let graph = graph(&[(0, &words), (16, &[0xd4200000])]);
     let (process, owner) = published(&graph, &[0], host());
     let entry = owner.entries[0].key;
     let mut reader = process.register().unwrap();
-    let poll_index = owner
-        .states
-        .iter()
-        .position(|s| s.exit.is_some() && s.transfer.is_none())
-        .unwrap();
     for fail in [false, true] {
         let mut observation = Observation {
             fail,
@@ -298,7 +293,7 @@ fn hcq_internal_sample_callback_preserves_live_ssa_fp_and_precise_failure_state(
         actual.set_vector(2, u128::from(0.25f32.to_bits()));
         actual.set_fpsr(1 << 27);
         let mut expected = actual.clone();
-        let iterations = if fail { 1 } else { 2000 };
+        let iterations = 2000;
         for _ in 0..iterations {
             for word in words {
                 nixe_cpu_interpreter::execute_one(
@@ -320,26 +315,14 @@ fn hcq_internal_sample_callback_preserves_live_ssa_fp_and_precise_failure_state(
                 crate::native::enter_protected(frame, std::ptr::null_mut(), address as *const u8)
             }
             .unwrap();
-            assert_eq!(
-                result.reason,
-                if fail {
-                    NativeExitReason::Control
-                } else {
-                    NativeExitReason::Architectural
-                }
-            );
+            assert_eq!(result.reason, NativeExitReason::Architectural);
             assert_eq!(frame.budget.slice_remaining, 10000 - iterations * 4);
             assert_eq!(frame.host_fp.active, 0);
             assert_eq!(frame.host_fp.saved, 0);
             drop(invocation);
         }
         assert_eq!(actual, expected);
-        assert_eq!(observation.calls, if fail { 1 } else { 2 });
-        assert_eq!(observation.version, owner.version.get());
-        assert_eq!(observation.map as usize, poll_index);
-        assert_eq!(observation.destination, 0);
-        assert!(observation.source >= owner.code.allocation.address());
-        assert!(observation.source < owner.code.allocation.address() + owner.code.allocation.len());
+        assert_eq!(observation.calls, 0);
     }
 }
 

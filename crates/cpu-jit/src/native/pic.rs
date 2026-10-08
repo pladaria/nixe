@@ -2,8 +2,7 @@
 //! owner, not an inline copy of its key. Only cold installation/Closed removal
 //! writes the table; a hit needs neither synchronization nor a recency update.
 
-use crate::abi::{BlockKey, ExitSiteKey, FpSpecialization};
-use nixe_cpu::platform::TargetPlatform;
+use crate::abi::{BlockKey, ExitSiteKey};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
@@ -16,6 +15,12 @@ pub(crate) mod probe;
 pub(crate) const SETS: usize = 16_384;
 pub(crate) const WAYS: usize = SETS * 2;
 
+/// A process-local, never-reused CodeVersion plus state-map ordinal identifies
+/// the entire source execution context. Dynamic bridge preparation verifies the
+/// FULL target BlockKey matches that context before publishing a record; native
+/// probes therefore need only the source site and dynamic PC. No hash or short
+/// fingerprint authorizes execution. Closed unlink/strong owners still protect
+/// target reachability and code versions.
 /// Explicit scalar encoding: generated code must not depend on Rust enum or
 /// identity-wrapper layouts. Reachability/version validation is cold; the way's
 /// strong owner and mandatory Closed unlink protect this exact native target.
@@ -24,11 +29,8 @@ pub(crate) const WAYS: usize = SETS * 2;
 pub(crate) struct Record {
     pub source: u64,
     pub state_map: u32,
-    pub platform: u32,
+    _padding: u32,
     pub pc: u64,
-    pub address_space: u64,
-    pub profile: u64,
-    pub fp: u64,
     pub address: usize,
 }
 
@@ -37,24 +39,15 @@ impl Record {
         Self {
             source: source.source.get(),
             state_map: source.state_map,
-            platform: match target.platform {
-                TargetPlatform::Switch1 => 0,
-                TargetPlatform::Switch2 => 1,
-            },
+            _padding: 0,
             pc: target.pc.get(),
-            address_space: target.address_space.get(),
-            profile: target.profile.get(),
-            fp: match target.fp {
-                FpSpecialization::Dynamic => 0,
-                FpSpecialization::Exact(fpcr) => (1_u64 << 32) | u64::from(fpcr),
-            },
             address,
         }
     }
 }
 
 /// Only a set selector, never identity validation. Both ways must compare the
-/// complete source-site and target key; misaligned guest PCs cannot match.
+/// source-site and target PC; misaligned guest PCs cannot match.
 pub(crate) fn set_index(source: ExitSiteKey, target: BlockKey) -> usize {
     ((target.pc.get() >> 2) ^ source.source.get() ^ u64::from(source.state_map)) as usize
         & (SETS - 1)
@@ -109,7 +102,8 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::CodeVersion;
+    use crate::abi::{CodeVersion, FpSpecialization};
+    use nixe_cpu::platform::TargetPlatform;
     use nixe_cpu::profile::CpuProfileId;
     use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
     use std::mem::offset_of;
@@ -132,15 +126,12 @@ mod tests {
 
     #[test]
     fn pic_native_layout_has_two_pointer_ways_and_explicit_scalar_fields() {
-        assert_eq!(size_of::<Record>(), 56);
+        assert_eq!(size_of::<Record>(), 32);
         assert_eq!(offset_of!(Record, source), 0);
         assert_eq!(offset_of!(Record, state_map), 8);
-        assert_eq!(offset_of!(Record, platform), 12);
+        assert_eq!(offset_of!(Record, _padding), 12);
         assert_eq!(offset_of!(Record, pc), 16);
-        assert_eq!(offset_of!(Record, address_space), 24);
-        assert_eq!(offset_of!(Record, profile), 32);
-        assert_eq!(offset_of!(Record, fp), 40);
-        assert_eq!(offset_of!(Record, address), 48);
+        assert_eq!(offset_of!(Record, address), 24);
         assert_eq!(Table::BYTES, 262_144 + 16);
         let table = Table::new();
         for slot in 0..WAYS {
@@ -149,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn pic_native_record_distinguishes_every_source_and_target_key_field() {
+    fn pic_native_record_distinguishes_source_site_and_target_pc() {
         let (source, target) = key();
         let expected = Record::new(source, target, 123);
         for other in [
@@ -164,49 +155,11 @@ mod tests {
         ] {
             assert_ne!(Record::new(other, target, 123), expected);
         }
-        for other in [
-            BlockKey {
-                pc: GuestVirtualAddress::new(target.pc.get() + 4 * SETS as u64),
-                ..target
-            },
-            BlockKey {
-                address_space: AddressSpaceId::new(2),
-                ..target
-            },
-            BlockKey {
-                profile: CpuProfileId::new(2),
-                ..target
-            },
-            BlockKey {
-                platform: TargetPlatform::Switch2,
-                ..target
-            },
-            BlockKey {
-                fp: FpSpecialization::Exact(0),
-                ..target
-            },
-            BlockKey {
-                fp: FpSpecialization::Exact(u32::MAX),
-                ..target
-            },
-        ] {
-            // Deliberately retain the same selector: a hash match alone must
-            // never accept another platform/profile/FP key or colliding PC.
-            assert_eq!(set_index(source, other), set_index(source, target));
-            assert_ne!(Record::new(source, other, 123), expected);
-        }
-        assert_eq!(Record::new(source, target, 123).fp, 0);
-        assert_eq!(
-            Record::new(
-                source,
-                BlockKey {
-                    fp: FpSpecialization::Exact(0),
-                    ..target
-                },
-                123
-            )
-            .fp,
-            1_u64 << 32
-        );
+        let other = BlockKey {
+            pc: GuestVirtualAddress::new(target.pc.get() + 4 * SETS as u64),
+            ..target
+        };
+        assert_ne!(Record::new(source, other, 123), expected);
+        assert_ne!(Record::new(source, target, 456), expected);
     }
 }

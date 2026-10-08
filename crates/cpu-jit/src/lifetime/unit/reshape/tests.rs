@@ -19,7 +19,7 @@ fn assert_suppressed(process: &Lifetime, source: BlockKey, boundary: BoundaryKey
             .unwrap(),
         Outcome::Suppressed
     );
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     assert_eq!(process.cache.usage().unwrap().metadata, before.metadata);
     assert_eq!(process.cache.usage().unwrap().committed, before.committed);
 }
@@ -76,7 +76,7 @@ fn heat(samples: &mut Samples, key: BoundaryKey) -> ReshapeSnapshot {
 }
 
 fn pop(queue: &Queue) -> ReshapeJob {
-    let Some(Job::Reshape(job)) = queue.pop().unwrap() else {
+    let Some(Job::Reshape(job)) = queue.pop_ready().unwrap() else {
         panic!("expected reshape job")
     };
     job
@@ -110,7 +110,7 @@ fn fourth_boundary_sample_admits_zero_one_or_two_versioned_families() {
         for _ in 0..3 {
             assert!(samples.boundary(key, true).is_none());
         }
-        assert!(queue.pop().unwrap().is_none());
+        assert!(queue.pop_ready().unwrap().is_none());
         let snapshot = samples.boundary(key, true).unwrap();
         assert_eq!(
             process
@@ -270,7 +270,7 @@ fn queue_fullness_releases_both_family_claims_and_keeps_score_three() {
             .1,
         3
     );
-    drop(queue.pop().unwrap());
+    drop(queue.pop_ready().unwrap());
     let snapshot = samples.boundary(snapshot.key, true).unwrap();
     assert_eq!(
         process
@@ -400,7 +400,7 @@ fn invalid_logical_source_versions_ownership_and_context_do_not_create_work() {
         Outcome::Stale
     );
     assert_eq!(process.lock().keys.len(), count);
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
 }
 
 #[test]
@@ -478,7 +478,7 @@ fn a_lost_second_token_rolls_back_the_first_queued_transition() {
             .unwrap()
             .pinned()
     );
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     let mut samples = Samples::new();
     let current = heat(&mut samples, boundary(&process, 0, 0, 4));
     assert_eq!(
@@ -531,5 +531,5 @@ fn concurrent_vcpus_cannot_enqueue_two_jobs_for_a_shared_family() {
             .all(|result| matches!(result, Outcome::Queued | Outcome::Deferred))
     );
     assert_eq!(pop(&queue).snapshot, snapshot);
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
 }

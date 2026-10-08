@@ -95,12 +95,16 @@ enum GpuWorkExecution {
     Prepared(MaxwellSubmissionExecutionPlan),
     Backend {
         execution: Box<MaxwellBackendExecution>,
-        pending: Option<PendingSegment>,
+        pending: VecDeque<PendingSegment>,
     },
 }
 
+const MAX_PENDING_SEGMENTS: usize = 8;
+
 struct PendingSegment {
     token: BackendSubmissionToken,
+    blocks_execution: bool,
+    completion_writes: Vec<nixe_gpu_maxwell::MaxwellCompletionWrite>,
 }
 
 #[derive(Debug)]
@@ -409,6 +413,7 @@ impl NvDrvGpuExecutor {
             mut permit,
         } = submission;
         let frontend = execution.frontend();
+        nixe_trace::event("gpu.enqueue", frontend.get(), 0);
         self.require_healthy()?;
         let release_preflight_after_submission =
             execution.requires_backend() && !execution.has_deferred_canonical_writes();
@@ -500,7 +505,8 @@ impl NvDrvGpuExecutor {
     pub(super) fn request_presentable_image(
         &self,
         request: PresentationImageRequest,
-    ) -> Result<mpsc::Receiver<Result<ResidentImage, Box<str>>>, GpuExecutorFailure> {
+        reply: mpsc::SyncSender<Result<ResidentImage, Box<str>>>,
+    ) -> Result<(), GpuExecutorFailure> {
         self.require_healthy()?;
         let sender = self
             .sender
@@ -511,7 +517,6 @@ impl NvDrvGpuExecutor {
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU executor is torn down".into(),
             })?;
-        let (reply, result) = mpsc::sync_channel(1);
         sender
             .send(GpuExecutorMessage::PresentImage { request, reply })
             .map_err(|_| {
@@ -520,7 +525,7 @@ impl NvDrvGpuExecutor {
                     detail: "GPU backend owner stopped before exporting a resident image".into(),
                 })
             })?;
-        Ok(result)
+        Ok(())
     }
 
     fn failure(&self) -> Option<GpuExecutorFailure> {
@@ -589,12 +594,15 @@ fn run_gpu_owner(
             if works.is_empty() {
                 return Ok(());
             }
+            let _trace = nixe_trace::Span::new("gpu.owner_completion_cycle", 0, works.len() as u64);
+            let wait_trace = nixe_trace::Span::new("gpu.wait_completion", 0, 0);
             let completion = backend
                 .as_deref_mut()
                 .ok_or_else(|| owner_failure(&works, "GPU backend is unavailable"))?
                 .wait_for_completion()
                 .map_err(|error| owner_failure(&works, error.to_string()))?
                 .ok_or_else(|| owner_failure(&works, "GPU runtime lost its pending submission"))?;
+            drop(wait_trace);
             complete_backend_segment(&mut works, backend, completion, false)?;
             continue;
         }
@@ -606,12 +614,15 @@ fn run_gpu_owner(
             || !works.back().is_none_or(work_allows_following)
             || progress_requested && works.iter().any(work_has_pending_segment);
         if must_wait {
+            let _trace = nixe_trace::Span::new("gpu.owner_completion_cycle", 0, works.len() as u64);
+            let wait_trace = nixe_trace::Span::new("gpu.wait_completion", 0, 0);
             let completion = backend
                 .as_deref_mut()
                 .ok_or_else(|| owner_failure(&works, "GPU backend is unavailable"))?
                 .wait_for_completion()
                 .map_err(|error| owner_failure(&works, error.to_string()))?
                 .ok_or_else(|| owner_failure(&works, "GPU runtime lost its pending submission"))?;
+            drop(wait_trace);
             complete_backend_segment(&mut works, backend, completion, true)?;
             continue;
         }
@@ -665,12 +676,14 @@ fn drain_backend_completions(
     continue_work: bool,
 ) -> Result<(), GpuExecutorFailure> {
     loop {
+        let poll_trace = nixe_trace::Span::new("gpu.poll_completion", 0, 0);
         let completion = match backend.as_deref_mut() {
             Some(backend) => backend
                 .poll_completion()
                 .map_err(|error| owner_failure(works, error.to_string()))?,
             None => None,
         };
+        drop(poll_trace);
         let Some(completion) = completion else {
             break;
         };
@@ -685,6 +698,7 @@ fn complete_backend_segment(
     completion: BackendExecutionCompletion,
     continue_work: bool,
 ) -> Result<(), GpuExecutorFailure> {
+    let _trace = nixe_trace::Span::new("gpu.process_completion", completion.frontend().get(), 0);
     let index = works
         .iter()
         .position(work_has_pending_segment)
@@ -699,17 +713,55 @@ fn complete_backend_segment(
     else {
         unreachable!("located work has a pending backend segment")
     };
-    let pending = pending
-        .take()
+    let completed_segment = pending
+        .pop_front()
         .expect("located work retains its pending backend segment");
-    if pending.token != completion.submission() || execution.frontend() != completion.frontend() {
+    if completed_segment.token != completion.submission()
+        || execution.frontend() != completion.frontend()
+    {
         return Err(GpuExecutorFailure {
             frontend: execution.frontend(),
             detail: "backend completion timeline returned a different segment".into(),
         });
     }
-    execution.complete_segment();
-    if continue_work && let Some(work) = advance_backend_work(work, backend)? {
+    if continue_work {
+        for write in completed_segment.completion_writes {
+            write
+                .publish(
+                    nixe_gpu_maxwell::maxwell_gpu_timestamp(work.clock.scheduler_time_ns()),
+                    &mut |_, request| {
+                        backend
+                            .as_deref_mut()
+                            .ok_or_else(|| {
+                                nixe_memory::VisibilityCoordinatorError::new(
+                                    "GPU owner has no backend",
+                                )
+                            })?
+                            .make_cpu_visible(request)
+                            .map_err(|e| {
+                                nixe_memory::VisibilityCoordinatorError::new(e.to_string())
+                            })
+                    },
+                )
+                .map_err(|error| GpuExecutorFailure {
+                    frontend: execution.frontend(),
+                    detail: error.to_string().into(),
+                })?;
+        }
+    }
+    if completed_segment.blocks_execution {
+        execution.complete_segment();
+    }
+    let can_advance = completed_segment.blocks_execution
+        || pending
+            .back()
+            .is_none_or(|segment| !segment.blocks_execution);
+    let retains_pending = !pending.is_empty();
+    if continue_work && can_advance {
+        if let Some(work) = advance_backend_work(work, backend)? {
+            works.insert(index, work);
+        }
+    } else if continue_work || retains_pending {
         works.insert(index, work);
     }
     Ok(())
@@ -748,7 +800,7 @@ fn start_ready_work(
                 })?;
             work.execution = Some(GpuWorkExecution::Backend {
                 execution: Box::new(execution),
-                pending: None,
+                pending: VecDeque::new(),
             });
             let work = advance_backend_work(work, backend)?.ok_or_else(|| GpuExecutorFailure {
                 frontend,
@@ -766,6 +818,15 @@ fn start_ready_work(
             let completed = execute_maxwell_software_initialization(
                 plan,
                 nixe_gpu_maxwell::maxwell_gpu_timestamp(work.clock.scheduler_time_ns()),
+                &mut |_, request| {
+                    backend
+                        .as_deref_mut()
+                        .ok_or_else(|| {
+                            nixe_memory::VisibilityCoordinatorError::new("GPU owner has no backend")
+                        })?
+                        .make_cpu_visible(request)
+                        .map_err(|e| nixe_memory::VisibilityCoordinatorError::new(e.to_string()))
+                },
             )
             .map_err(|error| GpuExecutorFailure {
                 frontend,
@@ -781,48 +842,69 @@ fn advance_backend_work(
     mut work: GpuWork,
     backend: &mut Option<Box<dyn NeutralBackendRuntime>>,
 ) -> Result<Option<GpuWork>, GpuExecutorFailure> {
-    let GpuWorkExecution::Backend { execution, pending } = work
-        .execution
-        .as_mut()
-        .expect("queued GPU work retains execution state")
-    else {
-        unreachable!("only backend work can advance")
-    };
-    let frontend = execution.frontend();
-    match execution
-        .next_segment(nixe_gpu_maxwell::maxwell_gpu_timestamp(
-            work.clock.scheduler_time_ns(),
-        ))
-        .map_err(|error| GpuExecutorFailure {
-            frontend,
-            detail: error.to_string().into(),
-        })? {
-        Some(segment) => {
-            let backend = backend.as_deref_mut().ok_or_else(|| GpuExecutorFailure {
-                frontend,
-                detail: "submission requires an accelerated GPU backend".into(),
-            })?;
-            let final_segment = segment.submission().is_final_segment();
-            let token = backend
-                .submit(
-                    segment.creations(),
-                    segment.invalidations(),
-                    segment.submission(),
-                )
-                .map_err(|error| GpuExecutorFailure {
-                    frontend,
-                    detail: error.to_string().into(),
-                })?;
-            *pending = Some(PendingSegment { token });
-            if final_segment {
-                work.permit.release_after_submission();
-            }
-            Ok(Some(work))
+    loop {
+        let GpuWorkExecution::Backend { execution, pending } = work
+            .execution
+            .as_mut()
+            .expect("queued GPU work retains execution state")
+        else {
+            unreachable!("only backend work can advance")
+        };
+        if pending.len() == MAX_PENDING_SEGMENTS {
+            return Ok(Some(work));
         }
-        None => {
-            let completed = execution.completion();
-            publish_guest_completion(work, completed, completed)?;
-            Ok(None)
+        let frontend = execution.frontend();
+        match execution
+            .next_segment(
+                nixe_gpu_maxwell::maxwell_gpu_timestamp(work.clock.scheduler_time_ns()),
+                &mut |_, request| {
+                    backend
+                        .as_deref_mut()
+                        .ok_or_else(|| {
+                            nixe_memory::VisibilityCoordinatorError::new("GPU owner has no backend")
+                        })?
+                        .make_cpu_visible(request)
+                        .map_err(|e| nixe_memory::VisibilityCoordinatorError::new(e.to_string()))
+                },
+            )
+            .map_err(|error| GpuExecutorFailure {
+                frontend,
+                detail: error.to_string().into(),
+            })? {
+            Some(mut segment) => {
+                let backend = backend.as_deref_mut().ok_or_else(|| GpuExecutorFailure {
+                    frontend,
+                    detail: "submission requires an accelerated GPU backend".into(),
+                })?;
+                let final_segment = segment.submission().is_final_segment();
+                let token = backend
+                    .submit(
+                        segment.creations(),
+                        segment.invalidations(),
+                        segment.submission(),
+                    )
+                    .map_err(|error| GpuExecutorFailure {
+                        frontend,
+                        detail: error.to_string().into(),
+                    })?;
+                let blocks_execution = segment.requires_completion();
+                pending.push_back(PendingSegment {
+                    token,
+                    blocks_execution,
+                    completion_writes: segment.take_completion_writes(),
+                });
+                if final_segment {
+                    work.permit.release_after_submission();
+                }
+                if blocks_execution {
+                    return Ok(Some(work));
+                }
+            }
+            None => {
+                let completed = execution.completion();
+                publish_guest_completion(work, completed, completed)?;
+                return Ok(None);
+            }
         }
     }
 }
@@ -863,17 +945,12 @@ fn publish_guest_completion(
                 detail: format!("guest completion publication failed: {error:?}").into(),
             })?;
     }
+    nixe_trace::event("gpu.guest_complete", frontend.get(), 0);
     Ok(())
 }
 
 fn work_has_pending_segment(work: &GpuWork) -> bool {
-    matches!(
-        work.execution,
-        Some(GpuWorkExecution::Backend {
-            pending: Some(_),
-            ..
-        })
-    )
+    matches!(work.execution.as_ref(), Some(GpuWorkExecution::Backend { pending, .. }) if !pending.is_empty())
 }
 
 fn work_allows_following(work: &GpuWork) -> bool {

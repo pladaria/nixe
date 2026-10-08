@@ -11,7 +11,7 @@ use super::global_memory;
 use super::translate::translate_shader_binary;
 use crate::{MaxwellGpuAddressSpace, MaxwellShaderStage};
 use nixe_gpu::{ShaderBackendModule, ShaderOperation, ShaderRegister, VerifiedShaderIr};
-use nixe_memory::{CanonicalCpuWriteDependency, CanonicalWriteBatch};
+use nixe_memory::CanonicalCpuWriteDependency;
 use std::collections::BTreeMap;
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -27,7 +27,7 @@ pub(crate) struct MaxwellComputeProgram {
 
 pub(crate) fn translate_compute_program(
     address_space: &MaxwellGpuAddressSpace,
-    staged_writes: &CanonicalWriteBatch,
+    staged_writes: &crate::projection::MemoryProjection,
     address: u64,
     register_count: u8,
     workgroup_size: [u32; 3],
@@ -70,7 +70,7 @@ impl MaxwellComputeProgram {
     pub(crate) fn source_is_current(
         &self,
         address_space: &MaxwellGpuAddressSpace,
-        writes: &CanonicalWriteBatch,
+        writes: &crate::projection::MemoryProjection,
     ) -> bool {
         let binary = &self.binary;
         if !binary

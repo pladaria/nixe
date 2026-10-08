@@ -261,7 +261,10 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
                 },
             )
             .unwrap(),
-        IpcResponse::Data(nro[..0x20].to_vec())
+        IpcResponse::StorageRead {
+            offset: 0,
+            size: 0x20
+        }
     );
     assert_eq!(
         process.dispatch_ipc(
@@ -428,7 +431,10 @@ fn launched_nro_overlay_does_not_require_a_host_sd_card_directory() {
                 },
             )
             .unwrap(),
-        IpcResponse::Data(b"NRO0".to_vec())
+        IpcResponse::StorageRead {
+            offset: 0x10,
+            size: 4
+        }
     );
 }
 
@@ -451,13 +457,16 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
             ExecutionStop::BudgetExhausted => {}
             ExecutionStop::SupervisorCall { .. } => {
                 let outcome = process
-                    .route_supervisor_call(&report.stop, &mut dispatcher)
+                    .route_horizon_supervisor_call(&report.stop, &mut dispatcher)
                     .unwrap();
                 match outcome {
                     ExceptionHandlingResult::Resumed => {
                         if dispatcher.video_system().active_layer_count() > 0 {
                             break;
                         }
+                    }
+                    ExceptionHandlingResult::Suspended => {
+                        process.wait_for_thread_ready(process.main_thread_id());
                     }
                     _ => panic!(
                         "libnx SVC failed at {stop}: {outcome:?}",

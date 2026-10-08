@@ -99,7 +99,6 @@ fn later_unit_completion_retains_its_root_and_rejects_a_replaced_source() {
         state.set_fpsr(1 << 27);
         let (exit, mut budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(3, 2).unwrap(),

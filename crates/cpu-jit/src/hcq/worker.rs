@@ -19,6 +19,8 @@ use crate::{
 use nixe_cpu::memory::ExecutionMemory;
 use std::sync::Arc;
 
+mod policy;
+
 pub(crate) fn consumer(
     abi: HostAbi,
     arena_size: usize,
@@ -41,6 +43,25 @@ pub(crate) fn consumer(
             return publication::record_unchanged(&frozen, &*memory)
                 .map(|_| ())
                 .map_err(failure);
+        }
+        let (words, entries, count) = frozen.predecessor_size();
+        let required = policy::required_samples(
+            frozen.graph(),
+            words,
+            entries,
+            count,
+            frozen.entries().len(),
+        );
+        let observations = match work.observation() {
+            Observation::Seed(seed) => seed.observations,
+            Observation::Reshape { snapshot, .. } => snapshot.observations,
+        };
+        if observations < required {
+            let _trace =
+                nixe_trace::Span::new("cpu.hcq.defer_profit", observations as u64, required as u64);
+            // This is not a structural negative: further executions can make
+            // this exact candidate worthwhile without changing any code bytes.
+            return Err(CompileError::Deferred);
         }
         let result = compiler.publish(
             &mut resources.context,

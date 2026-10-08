@@ -132,16 +132,7 @@ pub(super) fn run_to(
     state.general_register_storage_mut()[2] = 0x5000;
     state.general_register_storage_mut()[3] = 0x1000;
     state.general_register_storage_mut()[30] = 0x2000;
-    let mut returns = crate::ReturnStack::default();
-    if pc == 0x7000 {
-        // Model the guest-thread continuation retained from an earlier call.
-        // RET must consume the prediction, not merely use indirect dispatch.
-        returns.entries[0] = key(0x2000).into();
-        returns.head = 1;
-        returns.depth = 1;
-    }
-    let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap())
-        .with_return_stack(&mut returns);
+    let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
     let exit = unsafe {
         invocation::run(
             &mut Samples::new(),
@@ -161,7 +152,6 @@ pub(super) fn run_to(
     assert_eq!(guest.pc.get(), stop.0);
     assert_eq!(guest.kind, EdgeKind::Breakpoint(stop.1));
     assert_eq!(state.general_register_storage_mut()[0], expected);
-    assert_eq!(returns.depth, 0);
     process.try_service_links().unwrap();
 }
 

@@ -315,6 +315,7 @@ fn entry(
     operands: &[(GuestValue, usize)],
 ) -> EntryContract {
     let entry = EntryContract {
+        discard: Default::default(),
         abi,
         live_in: live(operands),
         bindings: map.bindings(operands).unwrap(),

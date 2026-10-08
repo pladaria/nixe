@@ -423,7 +423,7 @@ fn zero_bandwidth_clear_masks_preserve_independent_state_without_gpu_work() {
     let targets = channel.three_d().render_targets();
     assert_eq!(targets.color_zero_bandwidth_clear().value(), None);
     assert_eq!(targets.depth_zero_bandwidth_clear().value(), None);
-    let draw_identity = channel.three_d().draw_state_identity();
+    let draw_identity = channel.three_d().fixed_draw_identity();
     let resource_identity = channel.three_d().resource_state_identity(
         &[
             MaxwellThreeDResourceRole::ColorTarget(0),

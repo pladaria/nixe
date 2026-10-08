@@ -26,6 +26,7 @@ pub(super) struct Entry {
     pub label: ir::Block,
     pub target: usize,
     pub id: u64,
+    pub discard: crate::analysis::StateSet,
 }
 
 pub(super) struct Ssa {
@@ -76,6 +77,8 @@ impl Ssa {
             .iter()
             .enumerate()
             .map(|(id, &target)| {
+                let contract = &analysis.entries[id];
+                let discard = analysis.discard[id];
                 let id = ENTRY_ID_BASE + id as u64;
                 let block = &blocks[target];
                 let label = builder.create_block();
@@ -92,6 +95,10 @@ impl Ssa {
                     .collect();
                 let signature = builder.import_signature(signature);
                 let inst = builder.ins().nixe_entry(signature, id as i64);
+                builder.func.nixe_entry_constraints.insert(
+                    id,
+                    contract.constraints(&block.operands, block.flags.is_some()),
+                );
                 let args: Vec<_> = builder
                     .func
                     .dfg
@@ -101,7 +108,12 @@ impl Ssa {
                     .map(ir::BlockArg::from)
                     .collect();
                 builder.ins().jump(block.label, &args);
-                Entry { label, target, id }
+                Entry {
+                    label,
+                    target,
+                    id,
+                    discard,
+                }
             })
             .collect();
         Self { blocks, entries }

@@ -87,7 +87,6 @@ fn stopping_inside_a_cold_completion_prevents_native_continuation() {
     state.set_pc(PC.get());
     let error = thread
         .run_slice(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             100,
@@ -128,7 +127,6 @@ fn background_worker_failure_reaches_vcpu_and_process_apis_with_original_detail(
         warmup.set_pc(PC.get());
         thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut warmup,
                 PollBudget::new(1, 2).unwrap(),
@@ -137,13 +135,18 @@ fn background_worker_failure_reaches_vcpu_and_process_apis_with_original_detail(
             .unwrap();
         let observed = thread.samples.seed_snapshot(key).unwrap().0;
         let (started, wait) = std::sync::mpsc::channel();
-        let mut pool = Workers::start(2, Arc::clone(&process.lifetime), move |_, _| {
-            started.send(()).unwrap();
-            if panic {
-                panic!("backend failed at test IR instruction 17");
-            }
-            Err(Error::internal("backend failed at test IR instruction 17").into())
-        })
+        let mut pool = Workers::start(
+            2,
+            Arc::clone(&process.lifetime),
+            move |_, _| {
+                started.send(()).unwrap();
+                if panic {
+                    panic!("backend failed at test IR instruction 17");
+                }
+                Err(Error::internal("backend failed at test IR instruction 17").into())
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
         let mut samples = Samples::new();
@@ -181,7 +184,6 @@ fn background_worker_failure_reaches_vcpu_and_process_apis_with_original_detail(
         let before = state.register_context();
         let fault = thread
             .run_slice(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 100,
@@ -220,7 +222,6 @@ fn background_failure_during_completion_preserves_completed_instruction_and_prog
     state.set_pc(PC.get());
     let fault = thread
         .run_slice(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             100,

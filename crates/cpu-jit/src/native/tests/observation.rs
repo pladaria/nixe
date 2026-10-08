@@ -9,7 +9,7 @@ fn sampling_callback_emits_one_shared_register_restore() {
         let destination = integer(0);
         let restore = emit(&source, destination).unwrap().restore;
         let (code, continuations) =
-            super::super::observation::emit_callback(&source, destination, false).unwrap();
+            super::super::observation::emit_callback(&source, destination).unwrap();
         assert!(!restore.is_empty());
         assert_eq!(
             code.windows(restore.len())
@@ -116,8 +116,10 @@ fn observation_survives_real_system_call_without_canonical_roundtrip() {
                     });
                 }
                 3 => {
-                    std::sync::Arc::make_mut(&mut source.bindings)[0].location = spill(3304, 8);
-                    std::sync::Arc::make_mut(&mut entry.bindings)[0].location = spill(3304, 8);
+                    crate::abi::Bindings::make_mut(&mut source.bindings)[0].location =
+                        spill(3304, 8);
+                    crate::abi::Bindings::make_mut(&mut entry.bindings)[0].location =
+                        spill(3304, 8);
                     source.nzcv = NzcvLocation::Packed(integer(0));
                     entry.nzcv = source.nzcv.clone();
                 }

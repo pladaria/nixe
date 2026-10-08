@@ -5,6 +5,7 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+nixe-trace.workspace = true
 sdl3.workspace = true
 nixe-audio.workspace = true
 ctrlc.workspace = true
@@ -29,4 +30,6 @@ nixe-video.workspace = true
 nixe-video-winit.workspace = true
 
 [features]
+jit-profile = ["nixe-cpu-jit/jit-profile"]
+frame-trace = ["nixe-trace/capture"]
 performance-counters = ["nixe-gpu/performance-counters"]

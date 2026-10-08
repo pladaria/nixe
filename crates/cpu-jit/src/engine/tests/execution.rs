@@ -21,7 +21,7 @@ fn state() -> A64State {
 }
 
 #[test]
-fn target_first_publication_installs_real_static_exits_without_explicit_link_registration() {
+fn target_first_publication_queues_real_static_exits_for_canonical_batch_service() {
     // Exercise B, BL and both outcomes of CBZ. Both successors are resident
     // before publishing the source; no test explicitly requests/registers links.
     for (branch, x0, taken) in [
@@ -58,12 +58,12 @@ fn target_first_publication_installs_real_static_exits_without_explicit_link_reg
                 source = Some(unit);
             }
         }
+        process.lifetime.make_links_due();
         let mut state = state();
         state.set_pc(PC.get() + 4);
         state.general_register_storage_mut()[0] = x0;
         let report = thread
             .run_slice(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 64,
@@ -157,7 +157,6 @@ fn source_first_demand_links_only_the_executed_conditional_destination() {
         state.general_register_storage_mut()[1] = 0;
         let report = thread
             .run_slice(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 64,
@@ -178,6 +177,7 @@ fn source_first_demand_links_only_the_executed_conditional_destination() {
             state.general_register_storage_mut()[1],
             if x0 == 0 { 0 } else { 2 }
         );
+        assert!(process.lifetime.try_service_links().unwrap());
         // Inspect the actual published source, without retaining a compiler
         // claim or explicitly registering/installing any link.
         let source = process.lifetime.snapshot(source_handle).unwrap();
@@ -212,7 +212,7 @@ fn source_first_demand_links_only_the_executed_conditional_destination() {
 }
 
 #[test]
-fn slice_services_pending_links_on_closed_admission_and_deferred_control_exit() {
+fn slice_services_closed_admission_and_due_deferred_links() {
     for (deferred, svc) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut worker = NativeWorker::default();
         // The entry used by setup is separate. Publish the real source/target
@@ -290,19 +290,13 @@ fn slice_services_pending_links_on_closed_admission_and_deferred_control_exit() 
             thread.sample_remaining = 1;
         }
         drop(transition);
+        process.lifetime.make_links_due();
         let events = VcpuEventState::default();
         let mut state = state();
         for expected in [1, 2] {
             state.set_pc(PC.get() + 4);
             let report = thread
-                .run_slice(
-                    &mut crate::ReturnStack::default(),
-                    &mut worker,
-                    &mut state,
-                    64,
-                    &Timer,
-                    &events,
-                )
+                .run_slice(&mut worker, &mut state, 64, &Timer, &events)
                 .unwrap();
             if svc {
                 assert!(matches!(report.stop,
@@ -365,7 +359,6 @@ fn recognized_unsupported_catalog_preserves_identity_and_pre_state_on_both_platf
             let before = state.clone();
             let report = thread
                 .run_slice(
-                    &mut crate::ReturnStack::default(),
                     &mut worker,
                     &mut state,
                     100,
@@ -408,14 +401,7 @@ fn empty_slice_control_and_events_stop_before_native_registration_or_demand() {
         (10, CpuExit::PendingEvent { mask: 5 }),
     ] {
         let report = thread
-            .run_slice(
-                &mut crate::ReturnStack::default(),
-                &mut worker,
-                &mut state,
-                limit,
-                &Timer,
-                &events,
-            )
+            .run_slice(&mut worker, &mut state, limit, &Timer, &events)
             .unwrap();
         assert_eq!(report.stop, expected);
         assert_eq!(report.progress, 0);
@@ -424,14 +410,7 @@ fn empty_slice_control_and_events_stop_before_native_registration_or_demand() {
         assert_eq!(worker::signal_stack(), previous_stack);
     }
     let error = thread
-        .run_slice(
-            &mut crate::ReturnStack::default(),
-            &mut worker,
-            &mut state,
-            u64::MAX,
-            &Timer,
-            &events,
-        )
+        .run_slice(&mut worker, &mut state, u64::MAX, &Timer, &events)
         .unwrap_err();
     assert_eq!(error.kind, CpuFaultKind::InvalidRequest);
     assert_eq!(error.progress, 0);
@@ -451,7 +430,6 @@ fn slice_demands_call_return_and_system_continuations_then_executes_exit_stub() 
     let mut state = state();
     let report = thread
         .run_slice(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             100,
@@ -479,7 +457,6 @@ fn backedges_obey_small_slices_and_preserve_sample_phase_between_runs() {
     for (limit, progress, value, phase) in [(3, 4, 2, 4093), (1, 2, 3, 4091)] {
         let report = thread
             .run_slice(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 limit,
@@ -503,14 +480,7 @@ fn exhausted_prefix_finishes_only_its_cold_instruction_before_yielding() {
     let mut state = state();
     let events = VcpuEventState::default();
     let report = thread
-        .run_slice(
-            &mut crate::ReturnStack::default(),
-            &mut worker,
-            &mut state,
-            1,
-            &Timer,
-            &events,
-        )
+        .run_slice(&mut worker, &mut state, 1, &Timer, &events)
         .unwrap();
     assert_eq!(report.stop, CpuExit::BudgetExhausted);
     assert_eq!(report.progress, 2);
@@ -518,14 +488,7 @@ fn exhausted_prefix_finishes_only_its_cold_instruction_before_yielding() {
     assert_eq!(state.general_register_storage_mut()[0], 17);
     assert_eq!(state.general_register_storage_mut()[1], 0);
     let report = thread
-        .run_slice(
-            &mut crate::ReturnStack::default(),
-            &mut worker,
-            &mut state,
-            1,
-            &Timer,
-            &events,
-        )
+        .run_slice(&mut worker, &mut state, 1, &Timer, &events)
         .unwrap();
     assert!(matches!(
         report.stop,
@@ -565,14 +528,7 @@ fn control_posted_by_completion_prevents_the_next_native_entry_and_preserves_eve
         (CpuExit::PendingEvent { mask: 2 }, 0),
     ] {
         let report = thread
-            .run_slice(
-                &mut crate::ReturnStack::default(),
-                &mut worker,
-                &mut state,
-                100,
-                &timer,
-                &events,
-            )
+            .run_slice(&mut worker, &mut state, 100, &timer, &events)
             .unwrap();
         assert_eq!(report.stop, expected);
         assert_eq!(report.progress, progress);
@@ -590,14 +546,7 @@ fn slice_reports_precise_fetch_and_data_faults_with_completed_prefix_only() {
     let mut state = state();
     state.general_register_storage_mut()[1] = 0x5000;
     let report = thread
-        .run_slice(
-            &mut crate::ReturnStack::default(),
-            &mut worker,
-            &mut state,
-            100,
-            &Timer,
-            &events,
-        )
+        .run_slice(&mut worker, &mut state, 100, &Timer, &events)
         .unwrap();
     assert!(
         matches!(report.stop, CpuExit::DataFault { source, fault } if source.pc.get() == PC.get() + 4 && fault.address.get() == 0x5000)
@@ -611,14 +560,7 @@ fn slice_reports_precise_fetch_and_data_faults_with_completed_prefix_only() {
     ] {
         state.set_pc(pc);
         let report = thread
-            .run_slice(
-                &mut crate::ReturnStack::default(),
-                &mut worker,
-                &mut state,
-                100,
-                &Timer,
-                &events,
-            )
+            .run_slice(&mut worker, &mut state, 100, &Timer, &events)
             .unwrap();
         assert!(
             matches!(report.stop, CpuExit::FetchFault { fault } if fault.address.get() == pc && fault.reason == reason)
@@ -645,7 +587,6 @@ fn invalidation_notification_acknowledges_canonical_state_then_demands_replaced_
     let mut state = state();
     let report = thread
         .run_slice(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             10,
@@ -677,14 +618,7 @@ fn closed_admission_yields_without_acknowledging_maintenance_and_shutdown_is_ter
     let before = state.clone();
     let events = VcpuEventState::default();
     let report = thread
-        .run_slice(
-            &mut crate::ReturnStack::default(),
-            &mut worker,
-            &mut state,
-            1,
-            &Timer,
-            &events,
-        )
+        .run_slice(&mut worker, &mut state, 1, &Timer, &events)
         .unwrap();
     assert_eq!(report.stop, CpuExit::Safepoint);
     assert_eq!(report.progress, 0);
@@ -700,16 +634,110 @@ fn closed_admission_yields_without_acknowledging_maintenance_and_shutdown_is_ter
         .request(lifetime::Reason::Shutdown)
         .unwrap();
     let error = thread
-        .run_slice(
-            &mut crate::ReturnStack::default(),
-            &mut worker,
-            &mut state,
-            1,
-            &Timer,
-            &events,
-        )
+        .run_slice(&mut worker, &mut state, 1, &Timer, &events)
         .unwrap_err();
     assert_eq!(error.kind, CpuFaultKind::Unavailable);
     assert_eq!(error.progress, 0);
     assert_eq!(state, before);
+}
+
+#[test]
+fn first_indirect_demand_carries_the_actual_predecessor_contract() {
+    use crate::abi::GuestValue;
+    let mut thread = budget::setup(
+        &[
+            0xd4200000, 0x91000673, 0xd61f0040, // ADD X19,X19,#1; BR X2
+            0xd503201f, 0xd61f0060, // NOP; BR X3 (does not read X19)
+            0x91000660, 0xd40000e1, // ADD X0,X19,#1; SVC #7
+        ],
+        false,
+    );
+    let source_key = thread.key(PC.checked_add(4).unwrap()).unwrap();
+    let process = thread.process.clone();
+    let Request::Owner(claim) = thread.reader.claim(source_key).unwrap() else {
+        panic!()
+    };
+    let source = thread
+        .compiler
+        .publish(
+            Compilation::capture(claim, &*process.memory).unwrap(),
+            &process.lifetime,
+            process.lifetime.executable_cache(),
+            &*process.memory,
+        )
+        .unwrap();
+    let mut state = state();
+    state.set_pc(PC.get() + 4);
+    state.general_register_storage_mut()[19] = 41;
+    state.general_register_storage_mut()[2] = PC.get() + 12;
+    state.general_register_storage_mut()[3] = PC.get() + 20;
+    let report = thread
+        .run_slice(
+            &mut NativeWorker::default(),
+            &mut state,
+            64,
+            &Timer,
+            &VcpuEventState::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        report.stop,
+        CpuExit::SupervisorCall { immediate: 7, .. }
+    ));
+    assert_eq!(report.progress, 6);
+    assert_eq!(state.general_register_storage_mut()[0], 43);
+    let source = process.lifetime.snapshot(source).unwrap();
+    let location = source.states[0]
+        .state
+        .bindings
+        .get_value(GuestValue::General(19))
+        .unwrap()
+        .location;
+    let target = thread.key(PC.checked_add(12).unwrap()).unwrap();
+    let mut frame = NativeFrame::new(&mut state, PollBudget::new(4096, 100).unwrap());
+    let mut invocation = unsafe { thread.reader.admit(&mut frame, target) }
+        .unwrap()
+        .unwrap();
+    let address = invocation.payload().preferred().unwrap().fast.get();
+    let (_, lookup) = invocation.frame_and_faults();
+    let unit = lookup.unit(address).unwrap();
+    let contract = &unit.entries[0].contract;
+    assert!(
+        contract.live_in.integer.x.contains(19),
+        "the unexecuted target had no static/PIC incoming association to consult"
+    );
+    assert_eq!(
+        contract
+            .bindings
+            .get_value(GuestValue::General(19))
+            .unwrap()
+            .location,
+        location
+    );
+}
+
+#[test]
+fn first_indirect_faulting_overwrite_preserves_the_predecessor_value() {
+    let mut thread = budget::setup(
+        &[0x91000400, 0xd61f0040, 0xf9400020, 0xd40000e1], // ADD X0,#1; BR X2; LDR X0,[X1]; SVC
+        false,
+    );
+    let mut state = state();
+    state.general_register_storage_mut()[0] = 100;
+    state.general_register_storage_mut()[1] = 0x6000;
+    state.general_register_storage_mut()[2] = PC.get() + 8;
+    let report = thread
+        .run_slice(
+            &mut NativeWorker::default(),
+            &mut state,
+            64,
+            &Timer,
+            &VcpuEventState::default(),
+        )
+        .unwrap();
+    assert!(matches!(report.stop, CpuExit::DataFault { source, fault }
+        if source.pc.get() == PC.get() + 8 && fault.address.get() == 0x6000));
+    assert_eq!(report.progress, 2);
+    assert_eq!(state.general_register_storage_mut()[0], 101);
+    assert_eq!(state.pc(), PC.get() + 8);
 }

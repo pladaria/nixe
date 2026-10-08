@@ -10,6 +10,7 @@ mod execution;
 mod frontend;
 mod gpfifo;
 mod profile;
+mod projection;
 mod pushbuffer;
 mod scheduler;
 mod shader;
@@ -174,7 +175,7 @@ pub use engines::{
 };
 pub use execution::{
     MaxwellBackendExecution, MaxwellBackendExecutionError, MaxwellBackendSegment,
-    MaxwellSoftwareInitializationError, MaxwellSubmissionExecutionError,
+    MaxwellCompletionWrite, MaxwellSoftwareInitializationError, MaxwellSubmissionExecutionError,
     MaxwellSubmissionExecutionPlan, MaxwellSubmissionExecutionStep,
     execute_maxwell_software_initialization,
 };

@@ -251,6 +251,19 @@ fn dispatch_scheduled_next(
     (execution.lease.thread, handling)
 }
 
+fn dispatch_host_work(
+    process: &mut ScheduledProcess,
+    dispatcher: &mut HorizonSvcDispatcher,
+) -> ExceptionHandlingResult<HorizonSvcFault> {
+    loop {
+        let (thread, handling) = dispatch_scheduled_next(process, dispatcher);
+        if handling != ExceptionHandlingResult::Suspended {
+            return handling;
+        }
+        process.wait_for_thread_ready(thread);
+    }
+}
+
 fn set_address_arguments(state: &mut A64State, address: u64, kind: u32, value: i32, fourth: u64) {
     state.write_x(x(0), address);
     state.write_w(x(1), kind);
@@ -5457,7 +5470,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
             write_guest_bytes(&process, tls, &convert);
             state(&mut process).write_w(x(0), fsp);
             assert_eq!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_host_work(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
             );
         }
@@ -5477,7 +5490,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
         write_guest_bytes(&process, tls, &open);
         state(&mut process).write_w(x(0), fsp);
         assert_eq!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_host_work(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         );
         let filesystem = read_guest_u32(
@@ -5498,7 +5511,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
         write_guest_bytes(&process, tls, &query);
         state(&mut process).write_w(x(0), target);
         assert_eq!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_host_work(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         );
         assert_eq!(
@@ -5542,7 +5555,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
             write_guest_bytes(&process, tls, &delete);
             state(&mut process).write_w(x(0), target);
             assert_eq!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_host_work(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
             );
             assert_eq!(
@@ -5582,7 +5595,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     write_guest_bytes(&process, tls, &convert);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
@@ -5600,7 +5613,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     write_guest_bytes(&process, tls, &set_process);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
@@ -5616,7 +5629,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     write_guest_bytes(&process, tls, &open_primary);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     let filesystem_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
@@ -5636,7 +5649,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     write_guest_bytes(&process, tls, &open_file);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     let file_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
@@ -5656,7 +5669,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     write_guest_bytes(&process, tls, &read_file);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(
@@ -5683,7 +5696,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     write_guest_bytes(&process, tls, &open_directory);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     let directory_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
@@ -5700,7 +5713,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     write_guest_bytes(&process, tls, &read_directory);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(read_guest_u32(&process, tls.checked_add(48).unwrap()), 1);
@@ -5738,7 +5751,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
 
     state(&mut process).write_x(x(1), HEAP_SIZE);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(
@@ -5754,7 +5767,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     write_guest_bytes(&process, tls, &convert);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
@@ -5772,7 +5785,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     write_guest_bytes(&process, tls, &set_process);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
 
@@ -5787,7 +5800,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     write_guest_bytes(&process, tls, &open_storage);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     let storage_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
@@ -5804,7 +5817,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     write_guest_bytes(&process, tls, &get_size);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(
@@ -5831,7 +5844,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     write_guest_bytes(&process, tls, &read_storage);
     state(&mut process).write_w(x(0), filesystem_session);
     assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_host_work(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(

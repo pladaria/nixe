@@ -15,6 +15,7 @@ pub(crate) struct Patch {
     completed: u16,
     probe_bytes: usize,
     poll_targets: Option<[usize; 2]>,
+    observe: bool,
 }
 
 pub(crate) fn prepare(
@@ -52,34 +53,16 @@ pub(crate) fn prepare(
             pending.guest.kind,
             EdgeKind::Indirect | EdgeKind::Call | EdgeKind::Return
         );
-    let operation = match pending.guest.kind {
-        EdgeKind::Call => crate::native::rsb::emit_push(
-            &state,
-            key.at(GuestVirtualAddress::new(
-                pending.guest.pc.get().wrapping_add(4),
-            ))
-            .unwrap(),
-        )
-        .map_err(fail)?,
-        EdgeKind::Return => {
-            crate::native::rsb::emit_return_update(&state, key, pc).map_err(fail)?
-        }
-        _ => Vec::new(),
-    };
     let (mut adapter, mut poll_targets) = if map.poll.is_some() {
-        let (code, targets) =
-            crate::native::emit_polled_exit(&state, pc, &operation, indirect).map_err(fail)?;
+        let (code, targets) = crate::native::emit_polled_exit(&state, pc).map_err(fail)?;
         (code, Some(targets))
     } else {
-        let mut adapter = operation.clone();
-        adapter.extend(
-            if pending.static_target.is_some() || indirect {
-                crate::native::emit_dispatch_fallback(&state, pc, uncharged)
-            } else {
-                emit_canonical_exit(&state, pc, pending.reason, uncharged)
-            }
-            .map_err(fail)?,
-        );
+        let adapter = if pending.static_target.is_some() || indirect {
+            crate::native::emit_dispatch_fallback(&state, pc, uncharged)
+        } else {
+            emit_canonical_exit(&state, pc, pending.reason, uncharged)
+        }
+        .map_err(fail)?;
         (adapter, None)
     };
     let probe_bytes = if indirect {
@@ -88,13 +71,9 @@ pub(crate) fn prepare(
                 "native indirect probe has no charged terminal checkpoint",
             ));
         }
-        let mut probe = if pending.guest.kind == EdgeKind::Return {
-            crate::native::rsb::emit_return_probe(&state, key, pc).map_err(fail)?
-        } else {
-            let mut probe = operation.clone();
-            probe.extend(crate::native::pic::probe::emit(&state, key, pc).map_err(fail)?);
-            probe
-        };
+        // RET uses its architectural target just like BR/BLR. The PIC checks
+        // the source contract and destination PC before entering owned code.
+        let mut probe = crate::native::pic::probe::emit(&state, pc).map_err(fail)?;
         let length = probe.len();
         poll_targets = poll_targets.map(|offsets| offsets.map(|offset| length + offset));
         probe.append(&mut adapter);
@@ -120,6 +99,7 @@ pub(crate) fn prepare(
             completed,
             probe_bytes,
             poll_targets,
+            observe: pending.guest.kind != EdgeKind::Return,
         },
         StateRecord {
             native_offset: map.offset,
@@ -140,6 +120,7 @@ impl Patch {
             completed,
             probe_bytes,
             poll_targets,
+            observe,
         } = self;
         let destination = append(bytes, &adapter);
         map.patch_exit(bytes, 0, destination as u64).map_err(fail)?;
@@ -157,6 +138,7 @@ impl Patch {
                     (destination + slice) as u32,
                     (destination + control) as u32,
                 ],
+                observe,
             )?;
             map.patch_poll(bytes, 0, start as u64).map_err(fail)?;
         }
@@ -181,24 +163,31 @@ pub(crate) fn append_poll(
     state: &ExitStateMap,
     pc: ValueLocation,
     targets: [u32; 3],
+    observe: bool,
 ) -> Result<usize, Error> {
     let [resume, slice, control] = targets;
     let (poll, branches) = crate::native::emit_poll(state);
     let start = append(bytes, &poll);
     let mut branch = map.clone();
     branch.poll = None;
-    // Unlike terminal transfers, an internal check can have live optimizer
-    // temporaries outside the architectural map. Preserve all volatiles.
-    let (observe, continuations) =
-        crate::native::observation::emit_callback(state, pc, map.poll.is_none()).map_err(fail)?;
-    let sample = append(bytes, &observe);
-    for (offset, target) in continuations.into_iter().zip([resume, control]) {
-        branch.offset = sample as u32 + offset;
-        branch
-            .patch_exit(bytes, 0, u64::from(target))
-            .map_err(fail)?;
-    }
-    for (offset, target) in branches.into_iter().zip([sample as u32, slice, control]) {
+    let sample = if observe {
+        let (callback, continuations) =
+            crate::native::observation::emit_callback(state, pc).map_err(fail)?;
+        let sample = append(bytes, &callback) as u32;
+        for (offset, target) in continuations.into_iter().zip([resume, control]) {
+            branch.offset = sample + offset;
+            branch
+                .patch_exit(bytes, 0, u64::from(target))
+                .map_err(fail)?;
+        }
+        sample
+    } else {
+        // Internal cycles and external return fallbacks need no growth
+        // observation. Keep the native control/slice poll and resume
+        // directly, preserving every mapped register and the FP environment.
+        resume
+    };
+    for (offset, target) in branches.into_iter().zip([sample, slice, control]) {
         branch.offset = start as u32 + offset;
         branch
             .patch_exit(bytes, 0, u64::from(target))

@@ -36,12 +36,15 @@ fn emitted(graph: &Graph, entries: &[usize], abi: HostAbi) -> (Context, Body) {
         .unwrap();
     let code = context.compiled_code().unwrap();
     for (index, exit) in body.exits.iter().enumerate() {
-        let map = code
+        let Some(map) = code
             .buffer
             .nixe_states
             .iter()
             .find(|map| !map.entry && map.id == index as u64 + 1)
-            .unwrap();
+        else {
+            // Inlining a call can prove a guarded return fallback unreachable.
+            continue;
+        };
         let allocated = AllocatedBoundary::new(abi, code, map).unwrap();
         exit.state
             .allocate(abi, CodeVersion::new(1).unwrap(), index as u32, &allocated)
@@ -345,3 +348,77 @@ fn hcq_body_failed_memory_lowering_does_not_leave_a_partial_function() {
         .is_ok()
     );
 }
+
+#[test]
+fn hot_region_contract_preserves_incoming_registers_through_its_body() {
+    use crate::abi::{
+        ExitSiteKey, ExitStateMap, NzcvLocation, RegisterClass, ValueBinding, ValueLocation,
+    };
+    use crate::analysis::StateSet;
+    use crate::frontend::entry::Plan;
+    for abi in [HostAbi::X86_64, HostAbi::Aarch64] {
+        let mut live = StateSet::default();
+        live.integer.x.insert(19);
+        live.vector.insert(1);
+        let source = ExitStateMap {
+            site: ExitSiteKey {
+                source: CodeVersion::new(1).unwrap(),
+                state_map: 0,
+            },
+            abi,
+            live,
+            dirty_live: live,
+            bindings: vec![
+                ValueBinding {
+                    value: GuestValue::General(19),
+                    location: ValueLocation::Register {
+                        class: RegisterClass::Integer,
+                        index: 3,
+                    },
+                },
+                ValueBinding {
+                    value: GuestValue::Vector(1),
+                    location: ValueLocation::Register {
+                        class: RegisterClass::Vector,
+                        index: 7,
+                    },
+                },
+            ]
+            .into(),
+            nzcv: NzcvLocation::Canonical,
+            host_fpsr_pending: false,
+        };
+        let graph = graph(&[(0, &[0xd503201f, 0x14000008])]);
+        let analysis = Analysis::with_contracts(&graph, &[0], vec![Plan::from_exit(&source)]);
+        let compiler = backend::Compiler::new(abi, 0x10000).unwrap();
+        let mut context = Context::new();
+        let body = compiler
+            .emit(
+                &mut context,
+                &mut FunctionBuilderContext::new(),
+                &graph,
+                &analysis,
+                &[0],
+            )
+            .unwrap();
+        let staged = compiler
+            .finish(&mut context, body, &graph, CodeVersion::new(2).unwrap())
+            .unwrap();
+        let entry = &staged.entries[0].contract;
+        assert_eq!(entry.live_in, live);
+        assert!(
+            crate::native::emit_chain_transfer(&source, entry)
+                .unwrap()
+                .is_empty()
+        );
+        let exit = &staged.states[0].state;
+        for binding in &*source.bindings {
+            assert_eq!(
+                exit.bindings.get_value(binding.value).unwrap().location,
+                binding.location
+            );
+        }
+    }
+}
+
+mod calls;

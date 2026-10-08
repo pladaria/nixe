@@ -85,6 +85,7 @@ struct NvDrvClientState {
     gpu_address_spaces: Arc<Mutex<BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>>>,
     next_gpu_channel_id: u64,
     nvhost_gpu: Arc<Mutex<NvHostGpu>>,
+    frontend_gate: Arc<crate::host_work::WorkGate>,
     nvhost_control: Arc<Mutex<NvHostControl>>,
     nvhost_control_gpu: BTreeMap<NvDrvFileDescriptor, NvHostControlGpuEvents>,
     nvmap: NvMapObjects,
@@ -165,6 +166,7 @@ impl NvDrvSession {
                 gpu_address_spaces: Arc::new(Mutex::new(BTreeMap::new())),
                 next_gpu_channel_id: 1,
                 nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::new(cache_configuration))),
+                frontend_gate: Arc::default(),
                 nvhost_control: Arc::new(Mutex::new(NvHostControl::default())),
                 nvhost_control_gpu: BTreeMap::new(),
                 nvmap: NvMapObjects::default(),
@@ -178,21 +180,24 @@ impl NvDrvSession {
         &self,
         request: PresentationImageRequest,
     ) -> Result<std::sync::mpsc::Receiver<Result<ResidentImage, Box<str>>>, Box<str>> {
-        let backend = self
+        let state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .gpu_backend
-            .as_ref()
-            .cloned();
-        backend.map_or_else(
-            || Err("GPU backend is unavailable for resident presentation".into()),
-            |backend| {
-                backend
-                    .request_presentable_image(request)
-                    .map_err(|error| error.to_string().into_boxed_str())
-            },
-        )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let backend = state.gpu_backend.as_ref().cloned().ok_or_else(|| {
+            Box::<str>::from("GPU backend is unavailable for resident presentation")
+        })?;
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        state.frontend_gate.after_current(move || {
+            if let Err(error) = backend.request_presentable_image(request, reply.clone()) {
+                let _ = reply.send(Err(error.to_string().into_boxed_str()));
+            }
+        });
+        Ok(result)
+    }
+
+    pub(crate) fn frontend_wait(&self) -> Option<crate::host_work::PendingHostWork> {
+        self.state.lock().unwrap().frontend_gate.wait()
     }
 
     pub(crate) fn dump_status(&self) {
@@ -418,8 +423,13 @@ impl NvDrvSession {
             },
         )? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
+            NvDrvIoctlOutcome::Frontend(work) => {
+                (work.run)()?;
+                Ok((work.response.output, work.response.driver_result))
+            }
             NvDrvIoctlOutcome::PendingSyncpointWait(_)
-            | NvDrvIoctlOutcome::PendingSubmission(_) => {
+            | NvDrvIoctlOutcome::PendingSubmission(_)
+            | NvDrvIoctlOutcome::PendingFrontend(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
             }
         }
@@ -466,8 +476,13 @@ impl NvDrvSession {
             },
         )? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
+            NvDrvIoctlOutcome::Frontend(work) => {
+                (work.run)()?;
+                Ok((work.response.output, work.response.driver_result))
+            }
             NvDrvIoctlOutcome::PendingSyncpointWait(_)
-            | NvDrvIoctlOutcome::PendingSubmission(_) => {
+            | NvDrvIoctlOutcome::PendingSubmission(_)
+            | NvDrvIoctlOutcome::PendingFrontend(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
             }
         }
@@ -497,8 +512,13 @@ impl NvDrvSession {
             },
         })? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
+            NvDrvIoctlOutcome::Frontend(work) => {
+                (work.run)()?;
+                Ok((work.response.output, work.response.driver_result))
+            }
             NvDrvIoctlOutcome::PendingSyncpointWait(_)
-            | NvDrvIoctlOutcome::PendingSubmission(_) => {
+            | NvDrvIoctlOutcome::PendingSubmission(_)
+            | NvDrvIoctlOutcome::PendingFrontend(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
             }
         }
@@ -580,6 +600,23 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let descriptor = state.devices.get(&fd).copied();
+        // Only state mutations sharing frontend ownership wait for lowering.
+        // Timeline queries/waits can arm while that owner is working. A following
+        // submit also waits for the previous frontend owner before reserving state.
+        if descriptor.is_some_and(|descriptor| {
+            !matches!(
+                descriptor.kind(),
+                NvDrvDeviceKind::HostControl | NvDrvDeviceKind::HostControlGpu
+            )
+        }) && let Some(wait) = state.frontend_gate.wait()
+        {
+            nixe_trace::event(
+                "gpu.frontend_state_wait",
+                caller.thread_id,
+                u64::from(request),
+            );
+            return Ok(NvDrvIoctlOutcome::PendingFrontend(wait));
+        }
         let backend_failure = state
             .gpu_backend
             .as_ref()
@@ -773,6 +810,11 @@ impl NvDrvSession {
                 let permit = match permit {
                     GpuSubmissionAdmission::Ready(permit) => permit,
                     GpuSubmissionAdmission::Pending(wait) => {
+                        nixe_trace::event(
+                            "gpu.frontend_admission_wait",
+                            caller.thread_id,
+                            u64::from(request),
+                        );
                         return Ok(NvDrvIoctlOutcome::PendingSubmission(wait));
                     }
                 };
@@ -781,9 +823,9 @@ impl NvDrvSession {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .bound_address_space(descriptor.fd());
                 let result = {
-                    // Frontend lowering only borrows the mapping table. Keep
-                    // it stable through lowering instead of cloning every
-                    // mapping and reservation for each submission/retry.
+                    // Capture a retained mapping-table snapshot while its
+                    // identity is stable. Lowering consumes it on the frontend
+                    // owner after these locks have been released.
                     let address_spaces = address_spaces
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -817,14 +859,34 @@ impl NvDrvSession {
                     }
                     Err(NvDrvCallError::Unsupported(operation)) => return Err(operation),
                 };
-                let (output, submission) = result;
-                backend.enqueue(submission, caller.clock).map_err(|error| {
-                    nvhost_gpu::queued_execution_error(descriptor, request, error)
-                })?;
-                Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
-                    additional_output: Vec::new(),
-                    output,
-                    driver_result: NV_SUCCESS,
+                let (output, prepared) = result;
+                let guard = self.state.lock().unwrap().frontend_gate.begin();
+                let clock = caller.clock.clone();
+                Ok(NvDrvIoctlOutcome::Frontend(ioctl::FrontendWork {
+                    frontend: prepared.frontend(),
+                    response: NvDrvIoctlResponse {
+                        additional_output: Vec::new(),
+                        output,
+                        driver_result: NV_SUCCESS,
+                    },
+                    guard,
+                    run: Box::new(move || {
+                        let submission = gpu
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .lower(prepared);
+                        let submission = match submission {
+                            Ok(submission) => submission,
+                            Err(NvDrvCallError::Unsupported(operation)) => return Err(operation),
+                            Err(NvDrvCallError::GuestResult(_)) => {
+                                unreachable!("retained frontend work cannot return a driver status")
+                            }
+                        };
+                        backend.enqueue(submission, &clock).map_err(|error| {
+                            nvhost_gpu::queued_execution_error(descriptor, request, error)
+                        })?;
+                        Ok(())
+                    }),
                 }))
             }
             Ok(LockedIoctlOutcome::Standard(NvHostCtrlIoctlOutcome::Complete(output))) => {
@@ -1001,6 +1063,8 @@ impl NvDrvSession {
     }
 
     pub(crate) fn teardown(&self) -> NvDrvTeardownReport {
+        let gate = self.state.lock().unwrap().frontend_gate.clone();
+        gate.finish();
         let (report, channel_syncpoints, backend) = {
             let mut state = self
                 .state

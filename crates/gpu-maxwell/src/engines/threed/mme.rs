@@ -2,6 +2,9 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+mod instructions;
+use instructions::{InstructionPage, InstructionRam, PAGE_WORDS};
+
 use nixe_gpu::GpuMethodId;
 
 use crate::MaxwellMethodSource;
@@ -254,11 +257,12 @@ struct MaxwellThreeDMmeInterpreter<'a, H> {
     carry: bool,
     instructions: u32,
     emitted_methods: u32,
+    page: Option<(u32, &'a InstructionPage)>,
 }
 
 #[derive(Clone)]
 pub(super) struct MaxwellThreeDMmeProgram {
-    instructions: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>>,
+    instructions: Arc<InstructionRam>,
     start_addresses: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>>,
 }
 
@@ -302,6 +306,7 @@ impl MaxwellThreeDMmeProgram {
             carry: false,
             instructions: 0,
             emitted_methods: 0,
+            page: None,
         };
         interpreter.registers[1] = parameters[0];
         while interpreter.step(false)? {}
@@ -331,12 +336,18 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
             ));
         }
         let address = MaxwellThreeDMmeRamAddress::new(self.pc);
-        let raw = self
-            .program
-            .instructions
-            .get(&address.raw())
-            .and_then(MaxwellThreeDRegister::value)
-            .map(|instruction| instruction.raw())
+        let page_index = self.pc / PAGE_WORDS as u32;
+        if self.page.is_none_or(|(index, _)| index != page_index) {
+            self.page = self
+                .program
+                .instructions
+                .page(page_index)
+                .map(|page| (page_index, page));
+        }
+        let instruction = self
+            .page
+            .and_then(|(_, page)| page[self.pc as usize % PAGE_WORDS].as_ref())
+            .map(|instruction| instruction.decoded)
             .ok_or_else(|| {
                 Self::execution_error(MaxwellThreeDMmeExecutionError::MissingInstruction {
                     address,
@@ -353,26 +364,26 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
             self.pc = delayed_pc;
         }
 
-        let operation = (raw & 7) as u8;
+        let operation = instruction.operation;
         if operation == 7 {
             if is_delay_slot {
                 return Err(Self::execution_error(
                     MaxwellThreeDMmeExecutionError::BranchInDelaySlot { address },
                 ));
             }
-            let value = self.register((raw >> 11) & 7);
-            let taken = if raw & (1 << 4) == 0 {
+            let value = self.register(u32::from(instruction.src_a));
+            let taken = if !instruction.branch_not_zero {
                 value == 0
             } else {
                 value != 0
             };
             if taken {
-                let target = add_signed_18(base, signed_immediate(raw)).ok_or_else(|| {
+                let target = add_signed_18(base, instruction.immediate).ok_or_else(|| {
                     Self::execution_error(MaxwellThreeDMmeExecutionError::ProgramCounterOverflow {
                         address,
                     })
                 })?;
-                if raw & (1 << 5) != 0 {
+                if instruction.branch_annul {
                     self.pc = target;
                     return Ok(true);
                 }
@@ -380,20 +391,24 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
                 return self.step(true);
             }
         } else {
-            let src_a = self.register((raw >> 11) & 7);
-            let src_b = self.register((raw >> 14) & 7);
+            let src_a = self.register(u32::from(instruction.src_a));
+            let src_b = self.register(u32::from(instruction.src_b));
             let result = match operation {
-                0 => self.alu(address, ((raw >> 17) & 0x1f) as u8, src_a, src_b)?,
-                1 => src_a.wrapping_add_signed(signed_immediate(raw)),
+                0 => self.alu(address, instruction.alu, src_a, src_b)?,
+                1 => src_a.wrapping_add_signed(instruction.immediate),
                 2 => {
-                    let mask = bitfield_mask(raw);
-                    let source = (src_b >> ((raw >> 17) & 0x1f)) & mask;
-                    (src_a & !(mask << ((raw >> 27) & 0x1f))) | (source << ((raw >> 27) & 0x1f))
+                    let mask = instruction.mask;
+                    let source = (src_b >> u32::from(instruction.shift)) & mask;
+                    (src_a & !(mask << u32::from(instruction.destination_shift)))
+                        | (source << u32::from(instruction.destination_shift))
                 }
-                3 => ((src_b >> (src_a & 0x1f)) & bitfield_mask(raw)) << ((raw >> 27) & 0x1f),
-                4 => ((src_b >> ((raw >> 17) & 0x1f)) & bitfield_mask(raw)) << (src_a & 0x1f),
+                3 => {
+                    ((src_b >> (src_a & 0x1f)) & instruction.mask)
+                        << u32::from(instruction.destination_shift)
+                }
+                4 => ((src_b >> u32::from(instruction.shift)) & instruction.mask) << (src_a & 0x1f),
                 5 => {
-                    let method = src_a.wrapping_add_signed(signed_immediate(raw));
+                    let method = src_a.wrapping_add_signed(instruction.immediate);
                     if method > MME_METHOD_DWORD_MASK {
                         return Err(Self::execution_error(
                             MaxwellThreeDMmeExecutionError::RegisterReadUnavailable {
@@ -411,10 +426,14 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
                     ));
                 }
             };
-            self.process_result(((raw >> 4) & 7) as u8, ((raw >> 8) & 7) as usize, result)?;
+            self.process_result(
+                instruction.result_operation,
+                usize::from(instruction.destination),
+                result,
+            )?;
         }
 
-        if raw & (1 << 7) != 0 && !is_delay_slot {
+        if instruction.exit && !is_delay_slot {
             self.step(true)?;
             return Ok(false);
         }
@@ -555,20 +574,12 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
     }
 }
 
-const fn signed_immediate(raw: u32) -> i32 {
-    (raw as i32) >> 14
-}
-
 const fn add_signed_18(base: u32, immediate: i32) -> Option<u32> {
     if immediate >= 0 {
         base.checked_add(immediate as u32)
     } else {
         base.checked_sub(immediate.unsigned_abs())
     }
-}
-
-const fn bitfield_mask(raw: u32) -> u32 {
-    (1_u32 << ((raw >> 22) & 0x1f)).wrapping_sub(1)
 }
 
 /// Complete captured MME program state for one `MAXWELL_B` channel.
@@ -580,13 +591,13 @@ const fn bitfield_mask(raw: u32) -> u32 {
 pub struct MaxwellThreeDMmeState {
     instruction_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_instruction_address: Option<MaxwellThreeDMmeRamAddress>,
-    instructions: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>>,
+    instructions: Arc<InstructionRam>,
     start_address_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_start_address_index: Option<MaxwellThreeDMmeRamAddress>,
     start_addresses: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>>,
     shadow_ram_control: MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl>,
     mutable_method_control: MaxwellThreeDRegister<MaxwellThreeDMutableMethodControl>,
-    shadow_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
+    shadow_registers: super::state::registers::Registers,
     shadow_scratch: BTreeMap<u8, MaxwellThreeDRegister<u32>>,
 }
 
@@ -605,7 +616,7 @@ impl Default for MaxwellThreeDMmeState {
         Self {
             instruction_pointer: MaxwellThreeDRegister::default(),
             next_instruction_address: None,
-            instructions: Arc::new(BTreeMap::new()),
+            instructions: Arc::new(InstructionRam::default()),
             start_address_pointer: MaxwellThreeDRegister::default(),
             next_start_address_index: None,
             start_addresses: Arc::new(BTreeMap::new()),
@@ -614,7 +625,7 @@ impl Default for MaxwellThreeDMmeState {
                 Some(MaxwellThreeDMmeShadowRamControl::MethodTrack),
             ),
             mutable_method_control: MaxwellThreeDRegister::default(),
-            shadow_registers: BTreeMap::new(),
+            shadow_registers: super::state::registers::Registers::default(),
             shadow_scratch: BTreeMap::new(),
         }
     }
@@ -848,4 +859,79 @@ pub enum MaxwellThreeDMmeStateWrite {
         value: u32,
         source: MaxwellMethodSource,
     },
+}
+
+#[cfg(test)]
+mod decoded_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Host(RefCell<Vec<u16>>);
+    impl MaxwellThreeDMmeHost for Host {
+        type Error = ();
+        fn read_register(&self, method: u16) -> Result<u32, ()> {
+            self.0.borrow_mut().push(method);
+            Ok(42)
+        }
+        fn emit_method(&mut self, _: u16, _: u32) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+    fn word(raw: u32) -> MaxwellThreeDRegister<MaxwellThreeDMmeInstruction> {
+        MaxwellThreeDRegister::verified_reset(raw, Some(MaxwellThreeDMmeInstruction::new(raw)))
+    }
+
+    #[test]
+    fn decoded_programs_cross_pages_and_keep_their_uploaded_version() {
+        for start in [15, 0x1234_ffff, u32::MAX - 2] {
+            let mut instructions = InstructionRam::default();
+            let read = |method: u32| (method << 14) | 5 | (1 << 4) | (1 << 7);
+            instructions.insert(start, word(read(0xd00)));
+            instructions.insert(start + 1, word(0x11)); // Exit delay slot.
+            let mut program = MaxwellThreeDMmeProgram {
+                instructions: Arc::new(instructions),
+                start_addresses: Arc::new(BTreeMap::from([(
+                    0,
+                    MaxwellThreeDRegister::verified_reset(
+                        start,
+                        Some(MaxwellThreeDMmeRamAddress::new(start)),
+                    ),
+                )])),
+            };
+            let old = program.clone();
+            Arc::make_mut(&mut program.instructions).insert(start, word(read(0xd01)));
+            assert_eq!(program.instructions.len(), 2);
+            for (snapshot, expected) in [(&old, 0xd00), (&program, 0xd01)] {
+                let mut host = Host::default();
+                assert!(snapshot.execute(0, &[0], &mut host).is_ok());
+                assert_eq!(*host.0.borrow(), [expected]);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_words_and_invalid_opcodes_fail_when_executed() {
+        let mut ram = InstructionRam::default();
+        ram.insert(15, word(0x91)); // Exit with an absent delay slot on the next page.
+        ram.insert(100, word(6)); // Invalid opcode must not fail at upload.
+        let mut program = MaxwellThreeDMmeProgram {
+            instructions: Arc::new(ram),
+            start_addresses: Arc::new(BTreeMap::from([(
+                0,
+                MaxwellThreeDRegister::verified_reset(
+                    15,
+                    Some(MaxwellThreeDMmeRamAddress::new(15)),
+                ),
+            )])),
+        };
+        assert!(matches!(program.execute(0, &[0], &mut Host::default()),
+            Err(MaxwellThreeDMmeRunError::Execution(MaxwellThreeDMmeExecutionError::MissingInstruction { address })) if address.raw() == 16));
+        Arc::make_mut(&mut program.start_addresses).insert(
+            0,
+            MaxwellThreeDRegister::verified_reset(100, Some(MaxwellThreeDMmeRamAddress::new(100))),
+        );
+        assert!(matches!(program.execute(0, &[0], &mut Host::default()),
+            Err(MaxwellThreeDMmeRunError::Execution(MaxwellThreeDMmeExecutionError::InvalidOperation { address, operation: 6 })) if address.raw() == 100));
+    }
 }

@@ -53,6 +53,7 @@ impl CpuBackend {
         cpu: ProcessCpuContext,
         memory: Arc<ExecutionMemory>,
         end_exclusive: GuestVirtualAddress,
+        warmup: Option<nixe_cpu_jit::WarmupConfig>,
     ) -> Result<Self, CpuFault> {
         match selection {
             CpuBackendConfig::Interpreter => {
@@ -66,7 +67,7 @@ impl CpuBackend {
                 })?;
                 Ok(Self::Interpreter(process))
             }
-            CpuBackendConfig::Jit => JitProcess::new(cpu, memory)
+            CpuBackendConfig::Jit => JitProcess::with_warmup(cpu, memory, warmup)
                 .map(Arc::new)
                 .map(Self::Jit)
                 .map_err(|error| runtime_fault(cpu, CpuFaultKind::Unavailable, error.to_string())),
@@ -125,7 +126,6 @@ impl CpuThread {
         &mut self,
         worker: &mut nixe_cpu_direct_memory::NativeWorker,
         request: RunRequest<'_>,
-        returns: Option<&mut nixe_cpu_jit::ReturnStack>,
     ) -> Result<ExecutionReport, CpuFault> {
         match self {
             Self::Interpreter(thread) => {
@@ -155,7 +155,6 @@ impl CpuThread {
                 // native entry. Never carry a caller lease into its cold loop.
                 drop(request.memory_lease);
                 thread.run_slice(
-                    returns.expect("a scheduled JIT guest owns its return stack"),
                     worker,
                     request.state,
                     request.instruction_budget,
@@ -352,11 +351,12 @@ impl TransitionSafepoints {
     }
 
     fn request(&self) {
-        for control in self
+        for (vcpu, control) in self
             .lock_controls()
-            .values()
-            .filter(|control| control.execution_active())
+            .iter()
+            .filter(|(_, control)| control.execution_active())
         {
+            nixe_trace::event("vcpu.preempt.memory_transition", u64::from(vcpu.get()), 0);
             control.request(ControlRequest::Preempt);
         }
     }
@@ -396,6 +396,7 @@ pub(crate) struct ProcessExecutionConfiguration {
     pub(crate) timer_frequency: u64,
     pub(crate) cpu: ProcessCpuContext,
     pub(crate) address_space_end: GuestVirtualAddress,
+    pub(crate) warmup: Option<nixe_cpu_jit::WarmupConfig>,
 }
 
 impl ProcessExecutionControl {
@@ -410,8 +411,15 @@ impl ProcessExecutionControl {
             timer_frequency,
             cpu,
             address_space_end,
+            warmup,
         } = configuration;
-        let backend = CpuBackend::new(selection, cpu, Arc::clone(&memory), address_space_end)?;
+        let backend = CpuBackend::new(
+            selection,
+            cpu,
+            Arc::clone(&memory),
+            address_space_end,
+            warmup,
+        )?;
         let transition_safepoints = Arc::new(TransitionSafepoints::default());
         let weak_safepoints = Arc::downgrade(&transition_safepoints);
         memory.set_transition_notifier(Some(Arc::new(move || {
@@ -438,9 +446,6 @@ impl ProcessExecutionControl {
         self.backend.name()
     }
 
-    pub(crate) fn new_return_stack(&self) -> Option<Box<nixe_cpu_jit::ReturnStack>> {
-        matches!(self.backend, CpuBackend::Jit(_)).then(Box::default)
-    }
     pub(crate) const fn process_id(&self) -> CpuProcessId {
         self.process_id
     }
@@ -628,7 +633,6 @@ struct RuntimeTimer<'a> {
 
 pub(crate) struct VcpuExecutionState {
     pub(crate) thread: ThreadCpuState,
-    pub(crate) jit_returns: Option<Box<nixe_cpu_jit::ReturnStack>>,
     pub(crate) cpu: ProcessCpuContext,
     pub(crate) memory: Arc<ExecutionMemory>,
     pub(crate) virtual_clock: VirtualClock,
@@ -684,7 +688,6 @@ impl VcpuExecutionState {
                     timer: &timer,
                     events: self.events.clone(),
                 },
-                self.jit_returns.as_deref_mut(),
             )
             .map_err(|fault| ProcessExecutionError::Cpu { fault })
     }

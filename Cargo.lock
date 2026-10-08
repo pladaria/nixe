@@ -888,6 +888,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1161,6 +1167,7 @@ dependencies = [
 name = "nixe-audio"
 version = "0.1.0"
 dependencies = [
+ "nixe-trace",
  "sdl3",
  "sdl3-sys",
  "serde",
@@ -1188,6 +1195,7 @@ dependencies = [
  "nixe-memory",
  "nixe-runtime",
  "nixe-scheduler",
+ "nixe-trace",
  "nixe-video",
  "nixe-video-winit",
  "sdl3",
@@ -1246,6 +1254,9 @@ dependencies = [
  "nixe-cpu-direct-memory",
  "nixe-cpu-interpreter",
  "nixe-memory",
+ "nixe-trace",
+ "sha2",
+ "tempfile",
  "wasmtime-internal-jit-icache-coherence",
 ]
 
@@ -1256,6 +1267,7 @@ dependencies = [
  "half",
  "naga",
  "nixe-memory",
+ "nixe-trace",
  "rspirv",
  "twox-hash",
 ]
@@ -1279,6 +1291,7 @@ dependencies = [
  "nixe-gpu",
  "nixe-gpu-wgpu",
  "nixe-memory",
+ "nixe-trace",
  "pollster",
  "wgpu",
 ]
@@ -1292,6 +1305,7 @@ dependencies = [
  "log",
  "nixe-gpu",
  "nixe-memory",
+ "nixe-trace",
  "pollster",
  "sha2",
  "tempfile",
@@ -1316,6 +1330,7 @@ dependencies = [
  "nixe-memory",
  "nixe-runtime",
  "nixe-scheduler",
+ "nixe-trace",
  "nixe-video",
  "sha2",
  "tempfile",
@@ -1376,6 +1391,7 @@ name = "nixe-memory"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "nixe-trace",
 ]
 
 [[package]]
@@ -1394,6 +1410,7 @@ dependencies = [
  "nixe-loader-title",
  "nixe-memory",
  "nixe-scheduler",
+ "nixe-trace",
  "sha2",
  "tempfile",
 ]
@@ -1401,6 +1418,14 @@ dependencies = [
 [[package]]
 name = "nixe-scheduler"
 version = "0.1.0"
+
+[[package]]
+name = "nixe-trace"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+]
 
 [[package]]
 name = "nixe-video"
@@ -1420,6 +1445,7 @@ dependencies = [
  "nixe-gpu",
  "nixe-gpu-wgpu",
  "nixe-input",
+ "nixe-trace",
  "nixe-video",
  "png",
  "pollster",
@@ -2277,6 +2303,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -3385,6 +3424,12 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"

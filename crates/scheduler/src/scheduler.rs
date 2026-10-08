@@ -245,6 +245,16 @@ impl SchedulerState {
             .filter_map(|(id, slot)| slot.lease.is_none().then_some(*id))
     }
 
+    /// Traverse idle cores without allocating a snapshot before each dispatch.
+    /// Selection may change leases between calls; the ordered cursor visits
+    /// each configured core at most once in the current scheduling pass.
+    pub fn next_idle_vcpu(&self, after: Option<VirtualCpuId>) -> Option<VirtualCpuId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.vcpus
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .find_map(|(id, slot)| slot.lease.is_none().then_some(*id))
+    }
+
     pub fn active_leases(&self) -> impl Iterator<Item = Lease> + '_ {
         self.vcpus.values().filter_map(|slot| slot.lease)
     }
@@ -855,6 +865,48 @@ mod tests {
             ideal_vcpu: Some(VirtualCpuId::new(0)),
             affinity: scheduler.profile().all_cores(),
         }
+    }
+
+    #[test]
+    fn idle_cursor_visits_sparse_cores_once_across_lease_changes() {
+        let profile = MachineSchedulerProfile::new(
+            [2, 7, 19]
+                .into_iter()
+                .map(|id| VirtualCpuDescriptor::new(VirtualCpuId::new(id), 0))
+                .collect(),
+            PriorityRange::new(0, 63).unwrap(),
+            100,
+        )
+        .unwrap();
+        let mut scheduler = SchedulerState::new(profile);
+        let mut thread = config(&scheduler, 1, 10);
+        thread.ideal_vcpu = Some(VirtualCpuId::new(7));
+        scheduler.apply(SchedulerCommand::Register(thread)).unwrap();
+        scheduler
+            .apply(SchedulerCommand::MakeReady(GuestThreadId::new(1)))
+            .unwrap();
+        assert_eq!(scheduler.next_idle_vcpu(None), Some(VirtualCpuId::new(2)));
+        let SchedulerDecision::Selected(Some(lease)) = scheduler
+            .apply(SchedulerCommand::Select(VirtualCpuId::new(7)))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            scheduler.next_idle_vcpu(Some(VirtualCpuId::new(2))),
+            Some(VirtualCpuId::new(19))
+        );
+        scheduler
+            .apply(SchedulerCommand::Complete {
+                lease,
+                outcome: Completion::Preempted,
+            })
+            .unwrap();
+        assert_eq!(
+            scheduler.next_idle_vcpu(Some(VirtualCpuId::new(2))),
+            Some(VirtualCpuId::new(7))
+        );
+        assert_eq!(scheduler.next_idle_vcpu(Some(VirtualCpuId::new(19))), None);
     }
 
     #[test]

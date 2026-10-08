@@ -1,5 +1,4 @@
 use super::*;
-use crate::{ReturnStack, rsb::Continuation};
 
 #[test]
 fn subtraction_flags_cross_tiers_static_pic_and_return_links() {
@@ -26,12 +25,6 @@ fn subtraction_flags_cross_tiers_static_pic_and_return_links() {
                 let (mut reader, memory) =
                     fixture(&graph, &[0], &[(lcq_pc, lcq_words), (0x1040, &target)]);
                 let mut worker = WorkerFaultContext::register().unwrap();
-                let mut prediction = ReturnStack::default();
-                if branch == 0xd65f_03c0 {
-                    prediction.entries[0] = Continuation::from(key(0x1020));
-                    prediction.head = 1;
-                    prediction.depth = 1;
-                }
                 for (lhs, rhs) in [
                     (0, 1),
                     (42, 42),
@@ -62,10 +55,8 @@ fn subtraction_flags_cross_tiers_static_pic_and_return_links() {
                             )
                             .unwrap();
                         }
-                        let mut returns = prediction.clone();
                         let mut frame =
-                            NativeFrame::new(&mut missing, PollBudget::new(4096, 100).unwrap())
-                                .with_return_stack(&mut returns);
+                            NativeFrame::new(&mut missing, PollBudget::new(4096, 100).unwrap());
                         let mut admitted = unsafe { reader.admit(&mut frame, key(0x1000)) }
                             .unwrap()
                             .unwrap();
@@ -82,7 +73,6 @@ fn subtraction_flags_cross_tiers_static_pic_and_return_links() {
                         assert_eq!(admitted.frame().budget.slice_remaining, 98);
                         drop(admitted);
                         assert_eq!(missing, prefix);
-                        assert_eq!(returns.depth, u32::from(branch == 0xd63f_00e0));
                     }
                     for word in source
                         .into_iter()
@@ -99,10 +89,8 @@ fn subtraction_flags_cross_tiers_static_pic_and_return_links() {
                     // The first indirect invocation resolves a real miss and
                     // installs the PIC. Check its state too, not just the hit.
                     let mut cold = initial.clone();
-                    let mut returns = prediction.clone();
                     let mut frame =
-                        NativeFrame::new(&mut cold, PollBudget::new(4096, 100).unwrap())
-                            .with_return_stack(&mut returns);
+                        NativeFrame::new(&mut cold, PollBudget::new(4096, 100).unwrap());
                     let exit = unsafe {
                         invocation::run(
                             &mut Samples::new(),
@@ -122,20 +110,17 @@ fn subtraction_flags_cross_tiers_static_pic_and_return_links() {
                     assert_eq!(returned.reason, NativeExitReason::Architectural);
                     assert_eq!(frame.budget.slice_remaining, 93);
                     assert_eq!(cold, expected);
-                    assert_eq!(returns.depth, u32::from(branch == 0xd63f_00e0));
 
                     for sample in [4096, 1] {
                         let mut state = initial.clone();
-                        let mut returns = prediction.clone();
                         let mut frame =
-                            NativeFrame::new(&mut state, PollBudget::new(sample, 100).unwrap())
-                                .with_return_stack(&mut returns);
+                            NativeFrame::new(&mut state, PollBudget::new(sample, 100).unwrap());
                         let mut admitted = unsafe { reader.admit(&mut frame, key(0x1000)) }
                             .unwrap()
                             .unwrap();
                         let address = admitted.payload().preferred().unwrap().canonical.get();
                         // No resolver, no faultable memory, no Rust dispatch:
-                        // a broken static/PIC/RSB link cannot hide behind fallback.
+                        // a broken static/PIC link cannot hide behind fallback.
                         let returned = unsafe {
                             crate::native::enter_protected(
                                 admitted.frame(),
@@ -151,7 +136,6 @@ fn subtraction_flags_cross_tiers_static_pic_and_return_links() {
                             state, expected,
                             "HCQ source={hcq_source}, wide={wide}, branch={branch:x}, sample={sample}"
                         );
-                        assert_eq!(returns.depth, u32::from(branch == 0xd63f_00e0));
                     }
                 }
             }

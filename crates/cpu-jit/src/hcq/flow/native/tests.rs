@@ -200,3 +200,131 @@ fn native_inputs_leave_fpsr_invocation_owned_and_read_only_homes_clean() {
         assert!(!point.live_before.fpsr && !point.live_after.fpsr);
     }
 }
+
+#[test]
+fn carried_contract_reaches_faults_joins_and_loop_observations() {
+    use crate::abi::{
+        CodeVersion, ExitSiteKey, ExitStateMap, GuestValue, HostAbi, NzcvLocation, RegisterClass,
+        ValueBinding, ValueLocation,
+    };
+    use crate::frontend::entry::Plan;
+    let dirty = x(&[19]);
+    let source = ExitStateMap {
+        site: ExitSiteKey {
+            source: CodeVersion::new(1).unwrap(),
+            state_map: 0,
+        },
+        abi: HostAbi::X86_64,
+        live: dirty,
+        dirty_live: dirty,
+        bindings: vec![ValueBinding {
+            value: GuestValue::General(19),
+            location: ValueLocation::Register {
+                class: RegisterClass::Integer,
+                index: 3,
+            },
+        }]
+        .into(),
+        nzcv: NzcvLocation::Canonical,
+        host_fpsr_pending: false,
+    };
+    // One public path supplies stale X19, the other enters at the join. A
+    // fault and a loop checkpoint must observe the value on either path.
+    let graph = graph(&[
+        (0, &[NOP, 0x14000001]),
+        (8, &[0xf9400040, 0x35ffffe0]),
+        (16, &[RET]),
+    ]);
+    let join = block(&graph, 8);
+    let analysis = Analysis::with_contracts(
+        &graph,
+        &[0, join],
+        vec![Plan::from_exit(&source), Plan::default()],
+    );
+    for &index in &[0, join, block(&graph, 16)] {
+        assert!(analysis.native.blocks[index].live_in.integer.x.contains(19));
+    }
+    for point in &analysis.native.instructions {
+        assert!(point.dirty_before.integer.x.contains(19));
+        assert!(point.live_before.integer.x.contains(19));
+    }
+}
+
+#[test]
+fn discard_contract_requires_overwrite_on_every_path_before_faults_or_cycle_polls() {
+    for (taken, expected) in [
+        (vec![0xd2800040, 0x14000001], true),  // both arms overwrite X0
+        (vec![NOP, 0x14000001], false),        // bypass keeps old X0
+        (vec![0xf9400040, 0x14000001], false), // load can fault before overwrite
+        (vec![0x14000000], false),             // cycle poll observes old X0
+    ] {
+        let graph = graph(&[
+            (0, &[0x54000080]),
+            (4, &[0xd2800020, 0x14000004]),
+            (16, &taken),
+            (24, &[RET]),
+        ]);
+        let analysis = Analysis::build(&graph, &[0]);
+        assert_eq!(
+            analysis.discard[0].integer.x.contains(0),
+            expected,
+            "{taken:x?}"
+        );
+    }
+}
+
+#[test]
+fn carried_contract_does_not_force_unused_old_versions_through_overwrites() {
+    use crate::abi::{
+        CodeVersion, ExitSiteKey, ExitStateMap, GuestValue, HostAbi, NzcvLocation, RegisterClass,
+        ValueBinding, ValueLocation,
+    };
+    use crate::frontend::entry::Plan;
+    let source = ExitStateMap {
+        site: ExitSiteKey {
+            source: CodeVersion::new(1).unwrap(),
+            state_map: 0,
+        },
+        abi: HostAbi::X86_64,
+        live: x(&[0]),
+        dirty_live: x(&[0]),
+        bindings: vec![ValueBinding {
+            value: GuestValue::General(0),
+            location: ValueLocation::Register {
+                class: RegisterClass::Integer,
+                index: 3,
+            },
+        }]
+        .into(),
+        nzcv: NzcvLocation::Canonical,
+        host_fpsr_pending: false,
+    };
+    for (word, input, discard) in [
+        (0xf9400040, false, false), // LDR X0,[X2]: old value stays in its canonical home on a fault.
+        (0xd2800020, false, true),  // MOV X0,#1: old value is never observed.
+        (0x91000400, true, false),  // ADD X0,X0,#1: semantic input still uses the contract.
+        (NOP, true, false),         // Unchanged value passes through the region.
+    ] {
+        let graph = graph(&[(0, &[word, RET])]);
+        let analysis = Analysis::with_contracts(&graph, &[0], vec![Plan::from_exit(&source)]);
+        assert_eq!(
+            analysis.native.blocks[0].live_in.integer.x.contains(0),
+            input,
+            "{word:x}"
+        );
+        assert_eq!(
+            analysis.native.instructions[0]
+                .dirty_before
+                .integer
+                .x
+                .contains(0),
+            input,
+            "{word:x}"
+        );
+        assert_eq!(
+            analysis.discard[0].integer.x.contains(0),
+            discard,
+            "{word:x}"
+        );
+    }
+}

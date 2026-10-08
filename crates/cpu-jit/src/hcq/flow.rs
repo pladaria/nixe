@@ -15,20 +15,33 @@ mod flags;
 pub(crate) use flags::FlagFlow;
 
 pub(crate) struct Analysis {
+    /// Frozen physical preferences, in public entry order.
+    pub entries: Vec<crate::frontend::entry::Plan>,
+    pub discard: Vec<StateSet>,
     pub native: NativeFlow,
     pub fp: FpFlow,
     pub flags: FlagFlow,
     /// Edge ordinals: fallthrough then taken for a conditional, otherwise zero.
     /// Only DFS backedges, not every edge to a lower guest address.
-    pub backedges: Vec<[bool; 2]>,
+    pub backedges: Vec<Vec<bool>>,
 }
 
 impl Analysis {
+    #[cfg(test)]
     pub(crate) fn build(graph: &Graph, entries: &[usize]) -> Self {
+        Self::with_contracts(graph, entries, vec![Default::default(); entries.len()])
+    }
+
+    pub(crate) fn with_contracts(
+        graph: &Graph,
+        entries: &[usize],
+        contracts: Vec<crate::frontend::entry::Plan>,
+    ) -> Self {
+        assert_eq!(contracts.len(), entries.len());
         let targets: Vec<_> = graph
             .blocks
             .iter()
-            .map(|block| successors(&block.exit))
+            .map(|block| block.successors().into_iter().map(Some).collect::<Vec<_>>())
             .collect();
         let backedges = backedges(&targets, entries);
         let mut effects: Vec<_> = graph
@@ -86,14 +99,17 @@ impl Analysis {
         let internal: Vec<_> = targets
             .iter()
             .map(|targets| {
-                let mut result = ([0; 2], 0);
-                for target in targets.iter().flatten() {
-                    if let Target::Internal(index) = target {
-                        result.0[result.1] = *index;
-                        result.1 += 1;
-                    }
-                }
-                result
+                targets
+                    .iter()
+                    .flatten()
+                    .filter_map(|target| {
+                        if let Target::Internal(index) = target {
+                            Some(*index)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
         let flow: Vec<_> = summaries
@@ -107,10 +123,14 @@ impl Analysis {
                     || targets[index]
                         .iter()
                         .any(|target| matches!(target, Some(Target::External(_))))
+                    || matches!(
+                        graph.blocks[index].exit,
+                        Exit::Indirect | Exit::Return | Exit::Call(None)
+                    )
                     || backedges[index].iter().any(|&edge| edge);
                 FlowBlock {
                     effects,
-                    successors: &internal[index].0[..internal[index].1],
+                    successors: &internal[index],
                     exit_live: if observable_exit {
                         StateSet::ALL
                     } else {
@@ -119,10 +139,22 @@ impl Analysis {
                 }
             })
             .collect();
-        let native = NativeFlow::build(graph, entries, &effects, &flow);
+        let architectural = analysis::liveness(&flow);
+        let discard: Vec<_> = entries
+            .iter()
+            .map(|&entry| StateSet::ALL.without(architectural[entry].live_in))
+            .collect();
+        let contracts: Vec<_> = contracts
+            .into_iter()
+            .zip(&discard)
+            .map(|(plan, &discard)| plan.without(discard))
+            .collect();
+        let native = NativeFlow::build(graph, entries, &contracts, &effects, &flow);
         let fp = FpFlow::build(graph, entries, &flow);
         let flags = FlagFlow::build(graph, entries, &flow, &native);
         Self {
+            entries: contracts,
+            discard,
             native,
             fp,
             flags,
@@ -131,19 +163,14 @@ impl Analysis {
     }
 }
 
-fn successors(exit: &Exit) -> [Option<Target>; 2] {
-    match *exit {
-        Exit::Fallthrough(target) | Exit::Jump(target) => [Some(target), None],
-        Exit::Conditional { fallthrough, taken } => [Some(fallthrough), Some(taken)],
-        _ => [None; 2],
-    }
-}
-
 /// Iterative deterministic DFS, including irreducible cycles and disconnected
 /// sampled components. Removing its grey-target edges leaves an acyclic graph.
 /// The emitter must use these exact cycle checks when it consumes this analysis.
-fn backedges(targets: &[[Option<Target>; 2]], entries: &[usize]) -> Vec<[bool; 2]> {
-    let mut result = vec![[false; 2]; targets.len()];
+fn backedges<T: AsRef<[Option<Target>]>>(targets: &[T], entries: &[usize]) -> Vec<Vec<bool>> {
+    let mut result: Vec<_> = targets
+        .iter()
+        .map(|targets| vec![false; targets.as_ref().len()])
+        .collect();
     let mut color = vec![0_u8; targets.len()];
     let mut stack = Vec::with_capacity(targets.len());
     for root in entries.iter().copied().chain(0..targets.len()) {
@@ -153,14 +180,14 @@ fn backedges(targets: &[[Option<Target>; 2]], entries: &[usize]) -> Vec<[bool; 2
         color[root] = 1;
         stack.push((root, 0));
         while let Some((node, edge)) = stack.last_mut() {
-            if *edge == 2 {
+            if *edge == targets[*node].as_ref().len() {
                 color[*node] = 2;
                 stack.pop();
                 continue;
             }
             let ordinal = *edge;
             *edge += 1;
-            let Some(Target::Internal(target)) = targets[*node][ordinal] else {
+            let Some(Target::Internal(target)) = targets[*node].as_ref()[ordinal] else {
                 continue;
             };
             match color[target] {

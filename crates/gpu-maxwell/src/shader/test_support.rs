@@ -18,7 +18,7 @@ use crate::{
     MaxwellThreeDState, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
 };
 use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress, MappingGeneration, VerifiedShaderIr};
-use nixe_memory::{CanonicalAllocation, CanonicalWriteBatch, MemoryPermissions};
+use nixe_memory::{CanonicalAllocation, MemoryPermissions};
 use std::collections::BTreeMap;
 
 pub(super) fn translate_maxwell_shader_programs(
@@ -108,7 +108,7 @@ pub(super) fn translated_fixture_with_register_count(
         .collect::<Vec<_>>();
     bytes.extend(code_words.iter().flat_map(|word| word.to_le_bytes()));
     allocation.write(0, &bytes).unwrap();
-    let writes = CanonicalWriteBatch::new();
+    let writes = crate::projection::MemoryProjection::default();
     let memory = MaxwellShaderMemoryView::new(&address_space, &writes);
     let binary = read_shader_binary(&memory, stage, address).unwrap();
     validate_program_header(stage, binary.header()).unwrap();

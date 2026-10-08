@@ -416,8 +416,14 @@ async fn initialize_backend_async(
 }
 
 fn requested_device_features(adapter_features: wgpu::Features) -> wgpu::Features {
+    let timing = if nixe_trace::capture_compiled() {
+        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+    } else {
+        wgpu::Features::empty()
+    };
     adapter_features
-        & (wgpu::Features::FLOAT32_FILTERABLE
+        & (timing
+            | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::PIPELINE_CACHE
             | wgpu::Features::IMMEDIATES
             | wgpu::Features::TEXTURE_COMPRESSION_BC)

@@ -4,7 +4,6 @@
 use crate::abi::{BlockKey, FamilyVersion, HcqFamilyId, InstructionKey, ReachabilityVersion};
 use crate::lifetime::unit::EdgeKind;
 use nixe_memory::GuestVirtualAddress;
-use std::hash::{BuildHasher, RandomState};
 
 const SEED_SETS: usize = 256;
 const BOUNDARY_SETS: usize = 64;
@@ -25,6 +24,7 @@ pub(crate) struct Successor {
 /// Owned queue input, never a pointer into the sampling table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AdmissionSnapshot {
+    pub observations: u16,
     pub key: BlockKey,
     pub version: ReachabilityVersion,
     pub sequence: u64,
@@ -36,6 +36,8 @@ pub(crate) struct AdmissionSnapshot {
 struct Seed {
     snapshot: AdmissionSnapshot,
     score: u8,
+    retry: u8,
+    interval: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -57,6 +59,7 @@ pub(crate) struct BoundaryKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReshapeSnapshot {
+    pub observations: u16,
     pub key: BoundaryKey,
     pub sequence: u64,
 }
@@ -65,13 +68,22 @@ pub(crate) struct ReshapeSnapshot {
 struct Boundary {
     snapshot: ReshapeSnapshot,
     score: u8,
+    retry: u8,
+    interval: u8,
 }
 
 pub(crate) struct Samples {
     seeds: Box<[[Option<Seed>; 4]]>,
     boundaries: Box<[[Option<Boundary>; 2]]>,
-    hash: RandomState,
     sequence: u64,
+    quiet: [Option<Quiet>; 64],
+}
+
+#[derive(Clone, Copy)]
+struct Quiet {
+    key: (u64, u64, u64),
+    remaining: u8,
+    interval: u8,
 }
 
 impl Samples {
@@ -108,9 +120,36 @@ impl Samples {
         Self {
             seeds: vec![[None; 4]; SEED_SETS].into_boxed_slice(),
             boundaries: vec![[None; 2]; BOUNDARY_SETS].into_boxed_slice(),
-            hash: RandomState::new(),
             sequence: 0,
+            quiet: [None; 64],
         }
+    }
+
+    /// This cache only suppresses optimizer observations, never execution or
+    /// control polls. Exact source versions and destinations avoid stale hits;
+    /// bounded revisits discover changed target ownership within 16 samples.
+    pub(crate) fn observe_transfer(&mut self, key: (u64, u64, u64)) -> bool {
+        let index = placement(key.0 ^ key.1 ^ key.2.rotate_left(23)) & 63;
+        let Some(quiet) = self.quiet[index].as_mut().filter(|entry| entry.key == key) else {
+            return true;
+        };
+        if quiet.remaining == 0 {
+            return true;
+        }
+        quiet.remaining -= 1;
+        false
+    }
+
+    pub(crate) fn settle_transfer(&mut self, key: (u64, u64, u64)) {
+        let index = placement(key.0 ^ key.1 ^ key.2.rotate_left(23)) & 63;
+        let interval = self.quiet[index]
+            .filter(|entry| entry.key == key)
+            .map_or(2, |entry| (entry.interval * 2).min(16));
+        self.quiet[index] = Some(Quiet {
+            key,
+            remaining: interval - 1,
+            interval,
+        });
     }
 
     fn next_sequence(&mut self) -> u64 {
@@ -126,13 +165,14 @@ impl Samples {
     }
 
     fn seed_set(&self, key: BlockKey) -> usize {
-        self.hash.hash_one(key) as usize & (SEED_SETS - 1)
+        placement(key.pc.get()) & (SEED_SETS - 1)
     }
 
     fn boundary_set(&self, key: BoundaryKey) -> usize {
         // Versions do not affect placement: an endpoint/owner version change
         // replaces old heat for these same full execution-context endpoints.
-        self.hash.hash_one((key.source, key.target)) as usize & (BOUNDARY_SETS - 1)
+        placement(key.source.block_key().pc.get() ^ key.target.block_key().pc.get().rotate_left(23))
+            & (BOUNDARY_SETS - 1)
     }
 
     /// `admission_enabled` stays false with zero workers and until the real
@@ -156,10 +196,18 @@ impl Samples {
             *seed = Seed::new(key, version);
         }
         seed.score = (seed.score + 1).min(8);
+        seed.snapshot.observations = seed.snapshot.observations.saturating_add(1);
         seed.snapshot.sequence = sequence;
         seed.snapshot.last_edge = edge;
         if let Some(target) = edge.and_then(|edge| key.at(edge.destination)) {
             let slots = &mut seed.snapshot.successors;
+            let existing = slots
+                .iter()
+                .any(|entry| entry.is_some_and(|entry| entry.target == target));
+            if !existing {
+                seed.retry = 0;
+                seed.interval = 1;
+            }
             let slot = slots
                 .iter()
                 .position(|entry| entry.is_some_and(|entry| entry.target == target))
@@ -173,7 +221,8 @@ impl Samples {
                 sequence,
             });
         }
-        (admission_enabled && seed.score == 8).then_some(seed.snapshot)
+        (admission_enabled && seed.score == 8 && due(&mut seed.retry, &mut seed.interval))
+            .then_some(seed.snapshot)
     }
 
     pub fn boundary(
@@ -194,15 +243,29 @@ impl Samples {
             })
             .unwrap_or_else(|| victim(ways, |entry| (entry.score, entry.snapshot.sequence)));
         let entry = ways[way].get_or_insert(Boundary {
-            snapshot: ReshapeSnapshot { key, sequence },
+            snapshot: ReshapeSnapshot {
+                key,
+                sequence,
+                observations: 0,
+            },
             score: 0,
+            retry: 0,
+            interval: 1,
         });
         if entry.snapshot.key != key {
             entry.score = 0;
+            entry.retry = 0;
+            entry.interval = 1;
+            entry.snapshot.observations = 0;
         }
-        entry.snapshot = ReshapeSnapshot { key, sequence };
+        entry.snapshot = ReshapeSnapshot {
+            key,
+            sequence,
+            observations: entry.snapshot.observations.saturating_add(1),
+        };
         entry.score = (entry.score + 1).min(4);
-        (admission_enabled && entry.score == 4).then_some(entry.snapshot)
+        (admission_enabled && entry.score == 4 && due(&mut entry.retry, &mut entry.interval))
+            .then_some(entry.snapshot)
     }
 
     pub fn defer_seed(&mut self, snapshot: AdmissionSnapshot) {
@@ -210,6 +273,8 @@ impl Samples {
         for seed in self.seeds[set].iter_mut().flatten() {
             if seed.snapshot == snapshot {
                 seed.score = 7;
+                seed.retry = 0;
+                seed.interval = 1;
                 break;
             }
         }
@@ -220,6 +285,8 @@ impl Samples {
         for boundary in self.boundaries[set].iter_mut().flatten() {
             if boundary.snapshot == snapshot {
                 boundary.score = 3;
+                boundary.retry = 0;
+                boundary.interval = 1;
                 break;
             }
         }
@@ -230,6 +297,7 @@ impl Seed {
     fn new(key: BlockKey, version: ReachabilityVersion) -> Self {
         Self {
             snapshot: AdmissionSnapshot {
+                observations: 0,
                 key,
                 version,
                 sequence: 0,
@@ -237,8 +305,31 @@ impl Seed {
                 successors: [None; 4],
             },
             score: 0,
+            retry: 0,
+            interval: 1,
         }
     }
+}
+
+// Placement is not identity. Fixed-size tables always compare the complete
+// execution key and versions, including collisions across execution contexts.
+fn placement(mut pc: u64) -> usize {
+    pc ^= pc >> 33;
+    pc = pc.wrapping_mul(0xff51afd7ed558ccd);
+    (pc ^ (pc >> 33)) as usize
+}
+
+// Stable observations retry at 1, 2, 4, 8, then 16 sample deadlines. New
+// successors, ownership/reachability changes and queue deferral reset this
+// delay. No permanent negative entry can hide a newly demanded frontier.
+fn due(retry: &mut u8, interval: &mut u8) -> bool {
+    if *retry != 0 {
+        *retry -= 1;
+        return false;
+    }
+    *retry = interval.saturating_sub(1);
+    *interval = interval.saturating_mul(2).min(16);
+    true
 }
 
 fn victim<T>(slots: &[Option<T>], rank: impl Fn(&T) -> (u8, u64)) -> usize {

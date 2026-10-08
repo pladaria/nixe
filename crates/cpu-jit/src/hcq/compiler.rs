@@ -74,6 +74,7 @@ impl Body {
                     &allocated,
                     &block.operands,
                     block.flags.as_ref().map(|_| block.flag_mask),
+                    entry.discard,
                 )?;
                 Ok(stage::Ingress {
                     key: graph.blocks[entry.target].key,
@@ -157,9 +158,15 @@ fn lower(
 ) -> Result<Body, Error> {
     let ssa = Ssa::new(&mut translator.builder, graph, analysis, entries);
     let mut polls = Vec::new();
+    #[cfg(feature = "jit-profile")]
+    let profiling = crate::profiling::enabled();
     for (index, block) in graph.blocks.iter().enumerate() {
         let first = block.instructions.start;
         let last = block.instructions.end - 1;
+        #[cfg(feature = "jit-profile")]
+        if profiling {
+            translator.builder.set_srcloc(ir::SourceLoc::default());
+        }
         translator.builder.switch_to_block(ssa.blocks[index].label);
         translator.values = ssa.blocks[index].values(&translator.builder);
         translator.fp_active = analysis.fp.instructions[first].active_before;
@@ -173,9 +180,18 @@ fn lower(
         });
         let mut terminated = false;
         for ordinal in block.instructions.clone() {
+            #[cfg(feature = "jit-profile")]
+            if profiling {
+                translator
+                    .builder
+                    .set_srcloc(ir::SourceLoc::new(ordinal as u32 + 1));
+            }
             translator.instruction_prefix = u16::try_from(ordinal - first).map_err(fail)?;
             translator.instruction_index = u16::try_from(ordinal).map_err(fail)?;
-            if ordinal == last && matches!(block.exit, Exit::Jump(_) | Exit::Conditional { .. }) {
+            if ordinal == last
+                && (matches!(block.exit, Exit::Jump(_) | Exit::Conditional { .. })
+                    || !block.dispatch.is_empty())
+            {
                 break;
             }
             let word = &graph.instructions[ordinal];
@@ -201,6 +217,12 @@ fn lower(
         if terminated {
             continue;
         }
+        #[cfg(feature = "jit-profile")]
+        if profiling {
+            translator
+                .builder
+                .set_srcloc(ir::SourceLoc::new(last as u32 + 1));
+        }
         // Commit this executed block once, before either successor. Ordinary
         // internal edges remain SSA branches: no deadline check or state map.
         // PRE observations above still own only their uncharged local prefix.
@@ -209,6 +231,18 @@ fn lower(
             .ins()
             .nixe_charge(block.instructions.len() as i64);
         let pc = graph.instructions[last].instruction.key.block_key().pc;
+        if !block.dispatch.is_empty() {
+            native_dispatch(
+                &mut translator,
+                &ssa,
+                &mut polls,
+                graph,
+                analysis,
+                index,
+                &flags,
+            )?;
+            continue;
+        }
         match block.exit {
             Exit::Fallthrough(target) | Exit::Jump(target) => {
                 if analysis.backedges[index][0] {
@@ -286,6 +320,87 @@ fn lower(
         fp_activations: translator.fp_activations,
         polls,
     })
+}
+
+/// Captured calls/returns share body SSA, register allocation and lazy flags.
+/// Register destinations are always guarded; arbitrary guest LR values never
+/// turn into invented control-flow edges. The fallback retains normal PIC/link
+/// ownership and precise state. Read BLR's target before defining LR.
+/// https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions
+#[allow(clippy::too_many_arguments)]
+fn native_dispatch(
+    translator: &mut Translator<'_>,
+    ssa: &Ssa,
+    polls: &mut Vec<poll::Pending>,
+    graph: &Graph,
+    analysis: &Analysis,
+    index: usize,
+    flags: &LazyFlags<ir::Value>,
+) -> Result<(), Error> {
+    let block = &graph.blocks[index];
+    let last = &graph.instructions[block.instructions.end - 1];
+    let pc = last.instruction.key.block_key().pc;
+    let DecodeResult::Decoded(decoded) = &last.decoded else {
+        unreachable!()
+    };
+    let A64Instruction::Control(instruction) =
+        a64::normalize(&decoded.instruction, decoded.encoding)
+    else {
+        unreachable!()
+    };
+    let kind = match block.exit {
+        Exit::Call(_) => EdgeKind::Call,
+        Exit::Return => EdgeKind::Return,
+        Exit::Indirect => EdgeKind::Indirect,
+        _ => return Err(Error::internal("native dispatch on an ordinary branch")),
+    };
+    let dynamic = if matches!(block.exit, Exit::Call(Some(_))) {
+        None
+    } else {
+        Some(translator.read_register(instruction.operands().rn, false)?)
+    };
+    if kind == EdgeKind::Call {
+        let lr = translator
+            .builder
+            .ins()
+            .iconst(types::I64, pc.get().wrapping_add(4) as i64);
+        translator.write_register(30, lr);
+    }
+    for (ordinal, &target) in block.dispatch.iter().enumerate() {
+        if let Some(destination) = dynamic {
+            let Target::Internal(next) = target else {
+                unreachable!()
+            };
+            let matches = translator.builder.ins().icmp_imm_s(
+                ir::condcodes::IntCC::Equal,
+                destination,
+                graph.blocks[next].key.pc.get() as i64,
+            );
+            let yes = translator.builder.create_block();
+            let no = translator.builder.create_block();
+            translator.builder.ins().brif(matches, yes, &[], no, &[]);
+            translator.builder.switch_to_block(yes);
+            if analysis.backedges[index][ordinal] {
+                poll::emit(translator, polls, graph, index, target, kind, flags)?;
+            }
+            transfer(translator, ssa, target, pc, kind, flags)?;
+            translator.builder.switch_to_block(no);
+        } else {
+            if analysis.backedges[index][ordinal] {
+                poll::emit(translator, polls, graph, index, target, kind, flags)?;
+            }
+            return transfer(translator, ssa, target, pc, kind, flags);
+        }
+    }
+    translator.exit(
+        pc,
+        crate::frontend::ExitTarget::Dynamic(dynamic.unwrap()),
+        kind,
+        NativeExitReason::Dispatch,
+        flags,
+    )?;
+    translator.exits.last_mut().unwrap().completed = 0;
+    Ok(())
 }
 
 fn branch(

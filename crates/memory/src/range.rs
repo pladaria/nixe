@@ -26,6 +26,14 @@ pub struct CanonicalBackingSegment {
 }
 
 impl CanonicalBackingSegment {
+    /// Materializes this retained page directly through its device owner.
+    pub fn ensure_cpu_visible_with(
+        &self,
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<(), crate::VisibilityError> {
+        self.backing.ensure_cpu_visible_with(resolve)
+    }
+
     pub(crate) const fn backing(&self) -> &CanonicalBackingPage {
         &self.backing
     }
@@ -125,7 +133,9 @@ pub struct CanonicalBackingRange {
 
 #[derive(Debug)]
 struct CanonicalRangeLayout {
+    page_bounds: (CanonicalPageId, CanonicalPageId),
     segments: Box<[CanonicalBackingSegment]>,
+    ends: Box<[u64]>,
     // Indices retain first-occurrence order without duplicating page authority.
     pages: Box<[usize]>,
     // Stable identity order is also the lock order for multi-store transitions.
@@ -311,43 +321,24 @@ impl CanonicalCpuWriteDependency {
             return Err(CanonicalRangeAccessError::IncompleteRange);
         }
         let execution_stores = execution_stores.into_values().collect::<Vec<_>>();
-        // An initially unarmed page needs the engine handshake before waiting
-        // for execution leases. Treat this inspection only as a hint: a CPU
-        // write can disarm tracking before admission closes, so check again
-        // under exclusion and retry with the mutation handshake if necessary.
-        let mut arm_tracking = pages.values().try_fold(false, |needed, page| {
-            Ok::<_, CanonicalRangeAccessError>(
-                needed
-                    || page
-                        .needs_cpu_dirty_tracking()
-                        .map_err(CanonicalRangeAccessError::Backing)?,
-            )
-        })?;
-        let _transitions = loop {
+        let pages = pages.into_values().collect::<Vec<_>>();
+        let mut armed = crate::backing::CpuTrackingCapture::try_lock(&pages)
+            .map_err(CanonicalRangeAccessError::Backing)?;
+        let _transitions = if armed.is_some() {
+            nixe_trace::event("memory.capture.already_armed", 0, pages.len() as u64);
+            Vec::new()
+        } else {
+            // Protection changes still require immediate engine and memory
+            // quiescence. Never hold page locks while acquiring these gates.
             let mut transitions = execution_stores
                 .iter()
-                .map(|store| store.execution_gate().acquire_capture(arm_tracking))
+                .map(|store| store.execution_gate().acquire_capture(true))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(CanonicalRangeAccessError::Mutation)?;
-            let needs_tracking = pages.values().try_fold(false, |needed, page| {
-                Ok::<_, CanonicalRangeAccessError>(
-                    needed
-                        || page
-                            .needs_cpu_dirty_tracking()
-                            .map_err(CanonicalRangeAccessError::Backing)?,
-                )
-            })?;
-            if !arm_tracking && needs_tracking {
-                drop(transitions);
-                arm_tracking = true;
-                continue;
+            for transition in &mut transitions {
+                transition.commit();
             }
-            if arm_tracking {
-                for transition in &mut transitions {
-                    transition.commit();
-                }
-            }
-            break transitions;
+            transitions
         };
         let group_count = pages.len().div_ceil(CPU_WRITE_GROUP_PAGES);
         // Consumers of identical retained topology share one page observer,
@@ -366,7 +357,8 @@ impl CanonicalCpuWriteDependency {
         let (summary, shared) = if let Some(summary) = existing {
             (summary, true)
         } else {
-            let coverage = PageCoverage::from_sorted(pages.keys().copied());
+            let coverage =
+                PageCoverage::from_sorted(pages.iter().map(CanonicalBackingPage::identity));
             let mut interner = CPU_SUMMARIES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -388,23 +380,38 @@ impl CanonicalCpuWriteDependency {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&summary);
         }
-        let pages = pages
-            .into_values()
+        let captured_pages = pages
+            .iter()
             .enumerate()
             .map(|(index, page)| {
-                let observed_epoch = if shared {
+                let observed_epoch = if let Some(armed) = &mut armed {
+                    Ok(armed.observe(
+                        index,
+                        (!shared).then_some((&summary, index / CPU_WRITE_GROUP_PAGES)),
+                    ))
+                } else if shared {
                     page.arm_cpu_dirty_observer_quiescent()
                 } else {
                     page.observe_cpu_write_summary(&summary, index / CPU_WRITE_GROUP_PAGES)
                 }
                 .map_err(CanonicalRangeAccessError::Backing)?;
                 Ok(CpuWriteDependencyPage {
-                    page,
+                    page: page.clone(),
                     observed_epoch: AtomicU64::new(observed_epoch),
                 })
             })
             .collect::<Result<Vec<_>, CanonicalRangeAccessError>>()?
             .into_boxed_slice();
+        // Sample the shared epochs while the page locks/exclusion still hold.
+        // Sampling after unlock could acknowledge a racing first CPU write.
+        let observed_summary = AtomicU64::new(summary.epoch.load(Ordering::Acquire));
+        let observed_groups = summary
+            .groups
+            .iter()
+            .map(|epoch| AtomicU64::new(epoch.load(Ordering::Acquire)))
+            .collect();
+        drop(armed);
+        let pages = captured_pages;
         Ok(Self {
             inner: Arc::new(CanonicalCpuWriteDependencyInner {
                 domains,
@@ -413,12 +420,8 @@ impl CanonicalCpuWriteDependency {
                     streaming: BTreeMap::new(),
                 }),
                 pages,
-                observed_summary: AtomicU64::new(summary.epoch.load(Ordering::Acquire)),
-                observed_groups: summary
-                    .groups
-                    .iter()
-                    .map(|epoch| AtomicU64::new(epoch.load(Ordering::Acquire)))
-                    .collect(),
+                observed_summary,
+                observed_groups,
                 summary,
                 streaming_pages: AtomicU64::new(0),
                 clean_since_snapshot: AtomicBool::new(false),
@@ -987,10 +990,12 @@ impl CanonicalBackingRange {
             return Err(CanonicalRangeError::Empty);
         }
         let mut size = 0_u64;
+        let mut ends = Vec::with_capacity(segments.len());
         for segment in &segments {
             size = size
                 .checked_add(segment.size)
                 .ok_or(CanonicalRangeError::RangeOverflow)?;
+            ends.push(size);
         }
         let mut seen_pages = BTreeSet::new();
         let mut pages = Vec::new();
@@ -1019,7 +1024,9 @@ impl CanonicalBackingRange {
             .collect();
         Ok(Self {
             layout: Arc::new(CanonicalRangeLayout {
+                page_bounds: (*seen_pages.first().unwrap(), *seen_pages.last().unwrap()),
                 segments: segments.into(),
+                ends: ends.into(),
                 pages: pages.into(),
                 stores,
                 owner: Mutex::new(None),
@@ -1050,6 +1057,52 @@ impl CanonicalBackingRange {
         &self.layout.segments
     }
 
+    /// Conservative bounds on physical page identities, independent of logical
+    /// order and aliases. Useful for rejecting disjoint indexed page sets;
+    /// membership inside these bounds still requires exact segment matching.
+    #[must_use]
+    pub fn page_identity_bounds(&self) -> (CanonicalPageId, CanonicalPageId) {
+        self.layout.page_bounds
+    }
+
+    /// Visits the exact page fragments in a checked logical subrange without
+    /// allocating or scanning the allocation prefix. Offsets are page-relative.
+    pub fn subrange_segments(
+        &self,
+        offset: u64,
+        size: u64,
+    ) -> Result<impl Iterator<Item = (&CanonicalBackingSegment, u64, u64)>, CanonicalRangeError>
+    {
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalRangeError::RangeOverflow)?;
+        if size == 0 || end > self.size {
+            return Err(CanonicalRangeError::InvalidSubrange);
+        }
+        let first = self.layout.ends.partition_point(|end| *end <= offset);
+        Ok(self.layout.segments[first..]
+            .iter()
+            .enumerate()
+            .map(move |(relative, segment)| {
+                let index = first + relative;
+                let base = if index == 0 {
+                    0
+                } else {
+                    self.layout.ends[index - 1]
+                };
+                (base, segment)
+            })
+            .take_while(move |(base, _)| *base < end)
+            .map(move |(base, segment)| {
+                let start = offset.max(base);
+                (
+                    segment,
+                    segment.offset + start - base,
+                    end.min(base + segment.size) - start,
+                )
+            }))
+    }
+
     /// Retains a checked logical subrange with the same canonical page identity.
     pub fn snapshot_subrange(&self, offset: u64, size: u64) -> Result<Self, CanonicalRangeError> {
         let mut captured = Vec::new();
@@ -1068,46 +1121,36 @@ impl CanonicalBackingRange {
         size: u64,
         output: &mut Vec<CanonicalBackingSegment>,
     ) -> Result<(), CanonicalRangeError> {
-        let end = offset
-            .checked_add(size)
-            .ok_or(CanonicalRangeError::RangeOverflow)?;
-        if size == 0 || end > self.size {
-            return Err(CanonicalRangeError::InvalidSubrange);
-        }
+        let fragments = self.subrange_segments(offset, size)?;
         let original_len = output.len();
-        let mut logical_start = 0_u64;
-        let result = (|| {
-            for segment in self.layout.segments.iter() {
-                let logical_end = logical_start
-                    .checked_add(segment.size)
-                    .ok_or(CanonicalRangeError::RangeOverflow)?;
-                let capture_start = offset.max(logical_start);
-                let capture_end = end.min(logical_end);
-                if capture_start < capture_end {
-                    let within_segment = capture_start - logical_start;
-                    let page_offset = segment
-                        .offset
-                        .checked_add(within_segment)
-                        .ok_or(CanonicalRangeError::SegmentOverflow)?;
-                    output.push(CanonicalBackingSegment::snapshot(
-                        segment.backing.clone(),
-                        page_offset,
-                        capture_end - capture_start,
-                        segment.permissions,
-                        segment.mapping_generation,
-                    )?);
-                }
-                logical_start = logical_end;
-                if logical_start >= end {
-                    break;
+        for (segment, page_offset, size) in fragments {
+            match CanonicalBackingSegment::snapshot(
+                segment.backing.clone(),
+                page_offset,
+                size,
+                segment.permissions,
+                segment.mapping_generation,
+            ) {
+                Ok(segment) => output.push(segment),
+                Err(error) => {
+                    output.truncate(original_len);
+                    return Err(error);
                 }
             }
-            Ok(())
-        })();
-        if result.is_err() {
-            output.truncate(original_len);
         }
-        result
+        Ok(())
+    }
+
+    /// Materialize retained pages through an owner-supplied resolver. Device
+    /// owners must resolve inline rather than enqueue work to themselves.
+    pub fn ensure_cpu_visible_with(
+        &self,
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<(), crate::VisibilityError> {
+        for page in self.pages() {
+            page.ensure_cpu_visible_with(resolve)?;
+        }
+        Ok(())
     }
 
     /// Copies a checked logical subrange from retained canonical storage.
@@ -1575,6 +1618,31 @@ mod tests {
         NonCpuDeviceId, VisibilityCoordinatorError,
     };
 
+    #[test]
+    fn physical_page_bounds_ignore_logical_order_and_repeated_aliases() {
+        let allocation = CanonicalAllocation::zeroed(3 * 4096, 4096).unwrap();
+        let original = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let segments = original.segments();
+        let aliased = CanonicalBackingRange::new(vec![
+            segments[2].clone(),
+            segments[0].clone(),
+            segments[2].clone(),
+        ])
+        .unwrap();
+        let bounds = aliased.page_identity_bounds();
+        assert_eq!(bounds, original.page_identity_bounds());
+        assert_eq!(bounds, (segments[0].page(), segments[2].page()));
+        assert!(bounds.0 < segments[1].page() && segments[1].page() < bounds.1);
+        assert!(
+            !aliased
+                .segments()
+                .iter()
+                .any(|segment| segment.page() == segments[1].page())
+        );
+    }
+
     struct UnexpectedCpuVisibility;
 
     impl VisibilityCoordinator for UnexpectedCpuVisibility {
@@ -1592,6 +1660,39 @@ mod tests {
         ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
             panic!("a clean CPU-write snapshot must not request GPU materialization")
         }
+    }
+
+    #[test]
+    fn owner_materializes_unique_pages_inline_without_reentering_its_requester() {
+        let allocation = CanonicalAllocation::zeroed(8192, 4096).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(1),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        range
+            .prepare_device_access(declaration, coordinator.clone())
+            .unwrap();
+        range
+            .publish_device_write(declaration, coordinator)
+            .unwrap();
+        let mut requests = Vec::new();
+        range
+            .ensure_cpu_visible_with(&mut |_, request| {
+                requests.push(request.page);
+                Ok(vec![0x5a; request.size].into_boxed_slice())
+            })
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0], requests[1]);
+        let mut bytes = vec![0; 8192];
+        range.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, vec![0x5a; 8192]);
     }
 
     #[test]
@@ -1756,6 +1857,50 @@ mod tests {
             Err(CanonicalRangeError::InvalidSubrange)
         );
         assert_eq!(appended, original);
+    }
+
+    #[test]
+    fn indexed_subranges_preserve_partial_reordered_and_repeated_pages() {
+        let bytes = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = bytes.backing_range(MemoryPermissions::READ_WRITE).unwrap();
+        let segment = |page: usize, offset, size| {
+            CanonicalBackingSegment::new(
+                range.segments()[page].backing().clone(),
+                offset,
+                size,
+                MemoryPermissions::READ_WRITE,
+                MappingGeneration::INITIAL,
+            )
+            .unwrap()
+        };
+        let fragmented = CanonicalBackingRange::new(vec![
+            segment(1, 40, 3),
+            segment(0, 20, 5),
+            segment(1, 70, 2),
+        ])
+        .unwrap();
+        let fragments: Vec<_> = fragmented
+            .subrange_segments(2, 7)
+            .unwrap()
+            .map(|(s, offset, size)| (s.page(), offset, size))
+            .collect();
+        assert_eq!(
+            fragments,
+            vec![
+                (range.segments()[1].page(), 42, 1),
+                (range.segments()[0].page(), 20, 5),
+                (range.segments()[1].page(), 70, 1)
+            ]
+        );
+        let boundary: Vec<_> = fragmented
+            .subrange_segments(3, 5)
+            .unwrap()
+            .map(|(s, offset, size)| (s.page(), offset, size))
+            .collect();
+        assert_eq!(boundary, vec![(range.segments()[0].page(), 20, 5)]);
+        assert!(fragmented.subrange_segments(10, 1).is_err());
+        assert!(fragmented.subrange_segments(u64::MAX, 2).is_err());
+        assert!(fragmented.subrange_segments(0, 0).is_err());
     }
 
     #[test]
@@ -2275,6 +2420,62 @@ mod tests {
             );
         }
         drop(active);
+    }
+
+    #[test]
+    fn already_armed_capture_runs_during_execution_and_observes_the_next_write() {
+        use std::{sync::mpsc, time::Duration};
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let first = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let gate = range.segments()[0].backing().store().execution_gate();
+        let epoch = gate.epoch();
+        let active = gate.acquire_shared();
+        let alias = range.snapshot_subrange(0x800, 0x1000).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(CanonicalCpuWriteDependency::capture(&alias).unwrap())
+                .unwrap();
+        });
+        let captured = rx.recv_timeout(Duration::from_secs(5));
+        drop(active); // Also release a failed implementation before joining.
+        worker.join().unwrap();
+        let captured = captured.expect("armed metadata must not wait for CPU quiescence");
+        assert_eq!(gate.epoch(), epoch);
+        assert!(first.remains_current() && captured.remains_current());
+        allocation.write(0x1000, &[0x5a]).unwrap();
+        assert!(!first.remains_current() && !captured.remains_current());
+    }
+
+    #[test]
+    fn unarmed_capture_still_requests_prompt_execution_quiescence() {
+        use std::{sync::mpsc, time::Duration};
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let gate = range.segments()[0].backing().store().execution_gate();
+        let active = gate.acquire_shared();
+        let (notify_tx, notify_rx) = mpsc::channel();
+        gate.set_transition_notifier(Some(Arc::new(move || {
+            notify_tx.send(()).unwrap();
+        })));
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(CanonicalCpuWriteDependency::capture(&range).unwrap())
+                .unwrap();
+        });
+        notify_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(rx.try_recv().is_err());
+        drop(active);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .remains_current()
+        );
+        worker.join().unwrap();
     }
 
     #[test]

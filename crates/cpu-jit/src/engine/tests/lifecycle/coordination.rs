@@ -52,7 +52,6 @@ fn unaffected_chains_cannot_bypass_memory_holds_for_linking_or_shutdown() {
             let before = state.clone();
             assert!(matches!(
                 thread.invoke(
-                    &mut ReturnStack::default(),
                     &mut NativeWorker::default(),
                     &mut state,
                     PollBudget::new(4096, 64).unwrap(),
@@ -96,7 +95,6 @@ fn unaffected_chains_cannot_bypass_memory_holds_for_linking_or_shutdown() {
                 for offset in [0, 16] {
                     let mut state = initial(offset);
                     let (returned, budget) = fallback::without_resolver(
-                        &mut ReturnStack::default(),
                         thread,
                         &mut state,
                         PollBudget::new(1, 64).unwrap(),

@@ -23,6 +23,63 @@ fn edge(pc: u64) -> Option<ObservedEdge> {
     })
 }
 
+#[test]
+fn stable_transfer_observations_back_off_and_revisit_within_a_fixed_bound() {
+    let mut samples = Samples::new();
+    let key = (1, 0x1000, 0x2000);
+    for expected in [1, 3, 7, 15, 15] {
+        assert!(samples.observe_transfer(key));
+        samples.settle_transfer(key);
+        for _ in 0..expected {
+            assert!(!samples.observe_transfer(key));
+        }
+    }
+    assert!(samples.observe_transfer(key));
+    samples.settle_transfer(key);
+    assert!(samples.observe_transfer((2, key.1, key.2)));
+    assert!(samples.observe_transfer((key.0, key.1, 0x3000)));
+    // Active candidates never enter the quiet cache merely for repeating.
+    for _ in 0..256 {
+        assert!(samples.observe_transfer((9, 16, 32)));
+    }
+}
+
+#[test]
+fn profitability_evidence_accumulates_beyond_admission_and_resets_with_identity() {
+    let mut samples = Samples::new();
+    for _ in 0..200 {
+        samples.seed(key(0), version(1), None, false);
+    }
+    assert_eq!(samples.seed_snapshot(key(0)).unwrap().0.observations, 200);
+    samples.seed(key(0), version(2), None, false);
+    assert_eq!(samples.seed_snapshot(key(0)).unwrap().0.observations, 1);
+    let old = boundary(0);
+    for _ in 0..200 {
+        samples.boundary(old, false);
+    }
+    assert_eq!(
+        samples
+            .boundary_snapshot(old.source, old.target)
+            .unwrap()
+            .0
+            .observations,
+        200
+    );
+    let changed = BoundaryKey {
+        target_version: version(2),
+        ..old
+    };
+    samples.boundary(changed, false);
+    assert_eq!(
+        samples
+            .boundary_snapshot(old.source, old.target)
+            .unwrap()
+            .0
+            .observations,
+        1
+    );
+}
+
 fn boundary(pc: u64) -> BoundaryKey {
     BoundaryKey {
         source: InstructionKey::new(key(pc)).unwrap(),
@@ -296,4 +353,35 @@ fn overflow_clears_both_tables_and_restarts_at_one_on_either_path() {
         assert_eq!(seeds_ptr, samples.seeds.as_ptr());
         assert_eq!(boundaries_ptr, samples.boundaries.as_ptr());
     }
+}
+
+#[test]
+fn stable_observations_back_off_but_new_frontiers_and_versions_do_not() {
+    let mut samples = Samples::new();
+    for _ in 0..8 {
+        samples.seed(key(0), version(1), edge(4), true);
+    }
+    let attempts = (0..256)
+        .filter(|_| samples.seed(key(0), version(1), edge(4), true).is_some())
+        .count();
+    assert!(attempts < 25, "{attempts}");
+    assert!(samples.seed(key(0), version(1), edge(8), true).is_some());
+    assert!(samples.seed(key(0), version(2), edge(8), true).is_none());
+    for _ in 0..4 {
+        samples.boundary(boundary(0), true);
+    }
+    let attempts = (0..256)
+        .filter(|_| samples.boundary(boundary(0), true).is_some())
+        .count();
+    assert!(attempts < 25, "{attempts}");
+    let changed = BoundaryKey {
+        target_version: version(2),
+        ..boundary(0)
+    };
+    for _ in 0..3 {
+        assert!(samples.boundary(changed, true).is_none());
+    }
+    let snapshot = samples.boundary(changed, true).unwrap();
+    samples.defer_boundary(snapshot);
+    assert!(samples.boundary(changed, true).is_some());
 }

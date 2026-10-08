@@ -18,27 +18,32 @@ fn real_worker_backend_limit_preserves_participants_and_does_not_reject_seed() {
         let consumer = crate::hcq::worker::consumer(host(), 0x10000, Arc::clone(&memory)).unwrap();
         let (finished, done) = mpsc::channel();
         let calls = AtomicUsize::new(0);
-        let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-            let call = calls.fetch_add(1, Ordering::Relaxed);
-            let result = if call == 0 {
-                // Legal individual slots, but their aggregate exceeds the
-                // fixed frame. The real backend emits ImplLimitExceeded.
-                with_extra_slots(8192, || consumer(resources, work))
-            } else {
-                assert_eq!(call, 1);
-                consumer(resources, work)
-            };
-            assert!(result.is_ok(), "{result:?}");
-            assert!(resources.context.compiled_code().is_none());
-            assert!(resources.context.func.layout.blocks().next().is_none());
-            assert!(resources.context.func.nixe_exit_costs.is_empty());
-            finished.send(call).unwrap();
-            result
-        })
+        let mut workers = Workers::start(
+            1,
+            Arc::clone(&process),
+            move |resources, work| {
+                let call = calls.fetch_add(1, Ordering::Relaxed);
+                let result = if call == 0 {
+                    // Legal individual slots, but their aggregate exceeds the
+                    // fixed frame. The real backend emits ImplLimitExceeded.
+                    with_extra_slots(8192, || consumer(resources, work))
+                } else {
+                    assert_eq!(call, 1);
+                    consumer(resources, work)
+                };
+                assert!(result.is_ok(), "{result:?}");
+                assert!(resources.context.compiled_code().is_none());
+                assert!(resources.context.func.layout.blocks().next().is_none());
+                assert!(resources.context.func.nixe_exit_costs.is_empty());
+                finished.send(call).unwrap();
+                result
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
         assert_eq!(
-            admit_to(
+            admit_when_available(
                 &process,
                 workers.queue(),
                 &mut reader,
@@ -57,7 +62,7 @@ fn real_worker_backend_limit_preserves_participants_and_does_not_reject_seed() {
             assert_eq!(payload(&mut reader, pc).unwrap(), original);
         }
         assert_eq!(
-            admit_to(
+            admit_when_available(
                 &process,
                 workers.queue(),
                 &mut reader,
@@ -73,6 +78,7 @@ fn real_worker_backend_limit_preserves_participants_and_does_not_reject_seed() {
         // ingress into the still-live participants. Reuse this same worker.
         let pc = if participants == 0 { 0x1000 } else { 0x3000 };
         let snapshot = AdmissionSnapshot {
+            observations: 128,
             key: key(pc),
             version: payload(&mut reader, pc).unwrap().reachability(),
             sequence: 8,
@@ -112,24 +118,29 @@ fn real_worker_unsupported_backend_shape_is_a_failure_not_a_reshape_negative() {
     let (process, memory, mut reader) = setup();
     let consumer = crate::hcq::worker::consumer(host(), 0x10000, Arc::new(memory)).unwrap();
     let (finished, done) = mpsc::channel();
-    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-        // An individually illegal slot yields Unsupported, not the aggregate
-        // implementation limit exercised above. Do not fabricate a backend error.
-        let result = with_extra_slots(cranelift_codegen::nixe::FRAME_BYTES + 1, || {
-            consumer(resources, work)
-        });
-        let Err(CompileError::Failed(error)) = &result else {
-            panic!("backend failure must remain visible: {result:?}");
-        };
-        assert!(error.to_string().contains("Unsupported"));
-        assert!(resources.context.func.layout.blocks().next().is_none());
-        finished.send(()).unwrap();
-        result
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |resources, work| {
+            // An individually illegal slot yields Unsupported, not the aggregate
+            // implementation limit exercised above. Do not fabricate a backend error.
+            let result = with_extra_slots(cranelift_codegen::nixe::FRAME_BYTES + 1, || {
+                consumer(resources, work)
+            });
+            let Err(CompileError::Failed(error)) = &result else {
+                panic!("backend failure must remain visible: {result:?}");
+            };
+            assert!(error.to_string().contains("Unsupported"));
+            assert!(resources.context.func.layout.blocks().next().is_none());
+            finished.send(()).unwrap();
+            result
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     assert_eq!(
-        admit_to(
+        admit_when_available(
             &process,
             workers.queue(),
             &mut reader,
@@ -149,4 +160,25 @@ fn real_worker_unsupported_backend_shape_is_a_failure_not_a_reshape_negative() {
             .to_string()
             .contains("Unsupported")
     );
+}
+
+// A new worker can briefly hold lifecycle/cache locks even before its first
+// queued job. Nonblocking admission defers in that case; this fixture tests the
+// backend rejection, not that unrelated scheduling race.
+fn admit_when_available(
+    process: &Lifetime,
+    queue: &crate::lifetime::background::Queue,
+    reader: &mut Reader,
+    root: u64,
+    source: u64,
+    target: u64,
+) -> Outcome {
+    let start = std::time::Instant::now();
+    loop {
+        let outcome = admit_to(process, queue, reader, root, source, target);
+        if outcome != Outcome::Deferred || start.elapsed() >= Duration::from_secs(10) {
+            return outcome;
+        }
+        std::thread::yield_now();
+    }
 }

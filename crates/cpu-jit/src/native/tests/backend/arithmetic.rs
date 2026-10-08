@@ -64,6 +64,7 @@ fn arithmetic_recipes_use_final_ssa_operand_locations() {
                             .filter(|(value, _)| *value != GuestValue::General(3))
                             .collect();
                         let ingress = EntryContract {
+                            discard: Default::default(),
                             abi,
                             live_in: live(&live_inputs),
                             bindings: input.bindings(&live_inputs).unwrap(),

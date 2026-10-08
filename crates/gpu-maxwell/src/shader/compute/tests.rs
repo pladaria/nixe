@@ -27,7 +27,7 @@ fn headerless_program_uses_qmd_geometry_and_shared_instruction_decoder() {
         .unwrap();
     let module = translate_compute_program(
         &address_space,
-        &CanonicalWriteBatch::new(),
+        &crate::projection::MemoryProjection::default(),
         address,
         2,
         [32, 2, 3],
@@ -107,7 +107,7 @@ fn headerless_code_reads_canonical_staged_bytes_through_a_gpu_va_alias() {
         .offset()
         .get();
     assert_ne!(address, alias);
-    let mut writes = CanonicalWriteBatch::new();
+    let mut writes = crate::projection::MemoryProjection::default();
     writes
         .stage(
             &backing,
@@ -132,7 +132,7 @@ fn compute_rejects_conditional_exit_instead_of_truncating_the_program() {
     assert!(matches!(
         translate_compute_program(
             &address_space,
-            &CanonicalWriteBatch::new(),
+            &crate::projection::MemoryProjection::default(),
             address,
             1,
             [32, 1, 1]
@@ -216,7 +216,7 @@ pub(super) fn sinewave_kernel() -> MaxwellComputeProgram {
     allocation.write(0, &bytes(&words)).unwrap();
     translate_compute_program(
         &address_space,
-        &CanonicalWriteBatch::new(),
+        &crate::projection::MemoryProjection::default(),
         address,
         11,
         [32, 1, 1],

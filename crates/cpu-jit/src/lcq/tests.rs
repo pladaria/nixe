@@ -454,3 +454,58 @@ fn device_owned_code_reconciles_outside_capture_locks_then_restarts() {
         End::FetchFault
     );
 }
+
+#[test]
+fn restarted_capture_reuses_only_the_final_exact_instruction_bits() {
+    use nixe_cpu::error::InstructionFetchFault;
+    use nixe_cpu::memory::{CodePageSpan, FetchedCode, InstructionMemory};
+    struct Restart(SyntheticMemory);
+    impl InstructionMemory for Restart {
+        fn code_page_span(
+            &self,
+            space: AddressSpaceId,
+            pc: GuestVirtualAddress,
+        ) -> Result<CodePageSpan, InstructionFetchFault> {
+            self.0.code_page_span(space, pc)
+        }
+        fn fetch32(
+            &self,
+            space: AddressSpaceId,
+            pc: GuestVirtualAddress,
+        ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
+            self.0.fetch32(space, pc)
+        }
+    }
+    impl ExecutableMemory for Restart {
+        fn capture_instructions(
+            &self,
+            space: AddressSpaceId,
+            pc: GuestVirtualAddress,
+            limit: NonZeroU16,
+            stop: &dyn Fn(GuestVirtualAddress, u32) -> bool,
+        ) -> InstructionImage {
+            // Model abandoned passes, including a longer prefix and a changed
+            // first word, before returning the final memory-authorized image.
+            assert!(!stop(pc, NOP));
+            assert!(!stop(pc.checked_add(4).unwrap(), NOP));
+            assert!(stop(pc.checked_add(8).unwrap(), 0xd65f03c0));
+            self.0.capture_instructions(space, pc, limit, stop)
+        }
+        fn image_is_current(&self, image: &InstructionImage) -> bool {
+            self.0.image_is_current(image)
+        }
+    }
+    let mut memory = memory(1);
+    assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 0, &0x14000000u32.to_le_bytes()));
+    let fragment = Fragment::capture(&Restart(memory), key(0)).unwrap();
+    assert_eq!(fragment.instructions.len(), 1);
+    assert_eq!(fragment.image.words()[0].bits, 0x14000000);
+    assert_eq!(
+        fragment.instructions[0],
+        decode::decode(
+            key(0).platform,
+            LocationDescriptor::new(key(0).pc, key(0).profile),
+            0x14000000u32.into()
+        )
+    );
+}

@@ -3,6 +3,7 @@ use crate::lifetime::unit::tests::{key, process, publish};
 
 pub(super) fn snapshot(process: &Lifetime, pc: u64) -> AdmissionSnapshot {
     AdmissionSnapshot {
+        observations: 128,
         key: key(pc),
         version: process.reserve(key(pc)).unwrap().reachability,
         sequence: 8,
@@ -30,6 +31,75 @@ fn retire(process: &Lifetime, unit: unit::UnitHandle) {
 }
 
 #[test]
+fn discovery_batch_has_one_deadline_and_collects_new_demands() {
+    use crate::lifetime::unit::tests::publish_words;
+    let (process, queue, mut samples) = setup(0);
+    publish_words(&process, 0, &[0x14000004]); // B 16
+    process
+        .admit_seed(&queue, &mut samples, snapshot(&process, 0))
+        .unwrap();
+    let deadline = queue.pending.lock().unwrap().ready.unwrap();
+    // Discover after the window, not from the incomplete enqueue-time graph.
+    publish_words(&process, 16, &[0xd503201f, 0xd65f03c0]);
+    let job = {
+        let mut pending = queue.pending.lock().unwrap();
+        assert!(pending.pop(deadline - DISCOVERY_BATCH).is_none());
+        assert_eq!(pending.jobs.len(), 1);
+        pending.pop(deadline).unwrap()
+    };
+    let work = process.accept_background(job).unwrap().unwrap();
+    assert_eq!(
+        crate::hcq::Graph::discover(&work)
+            .unwrap()
+            .instructions
+            .len(),
+        3
+    );
+    drop(work);
+    assert!(queue.pending.lock().unwrap().ready.is_none());
+}
+
+#[test]
+fn later_arrivals_do_not_extend_batch_or_prevent_shutdown() {
+    let (process, queue, mut samples) = setup(2);
+    process
+        .admit_seed(&queue, &mut samples, snapshot(&process, 0))
+        .unwrap();
+    let deadline = queue.pending.lock().unwrap().ready.unwrap();
+    process
+        .admit_seed(&queue, &mut samples, snapshot(&process, 4))
+        .unwrap();
+    assert_eq!(queue.pending.lock().unwrap().ready, Some(deadline));
+    drop(queue.close().unwrap());
+    assert!(queue.wait().unwrap().is_none());
+    assert!(process.try_shutdown().unwrap());
+}
+
+#[test]
+fn queued_seed_coalesces_new_successors_without_renewing_its_deadline() {
+    let (process, queue, mut samples) = setup(1);
+    let first = snapshot(&process, 0);
+    process.admit_seed(&queue, &mut samples, first).unwrap();
+    let deadline = queue.pending.lock().unwrap().ready;
+    let mut newer = first;
+    newer.observations += 8;
+    newer.successors[0] = Some(crate::sampling::Successor {
+        target: key(16),
+        count: 8,
+        sequence: 16,
+    });
+    assert_eq!(
+        process.admit_seed(&queue, &mut samples, newer).unwrap(),
+        Outcome::Duplicate
+    );
+    assert_eq!(queue.pending.lock().unwrap().ready, deadline);
+    let job = queue.pop_ready().unwrap().unwrap().seed();
+    assert_eq!(job.snapshot, newer);
+    drop(job);
+    assert!(process.try_shutdown().unwrap());
+}
+
+#[test]
 fn eighth_seed_sample_enqueues_one_immutable_exact_version() {
     let (process, queue, mut samples) = setup(1);
     let initial = snapshot(&process, 0);
@@ -40,7 +110,7 @@ fn eighth_seed_sample_enqueues_one_immutable_exact_version() {
                 .is_none()
         );
     }
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     let observed = samples
         .seed(initial.key, initial.version, None, true)
         .unwrap();
@@ -53,7 +123,7 @@ fn eighth_seed_sample_enqueues_one_immutable_exact_version() {
         Outcome::Duplicate
     );
     samples.seed(initial.key, initial.version, None, true);
-    let mut job = queue.pop().unwrap().unwrap().seed();
+    let mut job = queue.pop_ready().unwrap().unwrap().seed();
     assert_eq!(job.snapshot, observed);
     assert_eq!(job.process, process.identity);
     assert_eq!(
@@ -93,7 +163,7 @@ fn registry_and_queue_contention_defer_without_waiting_and_retry_only_on_new_sam
         assert_eq!(samples.seed_snapshot(initial.key).unwrap().1, 7);
         drop(queue_guard);
         drop(registry_guard);
-        assert!(queue.pop().unwrap().is_none());
+        assert!(queue.pop_ready().unwrap().is_none());
     }
     let observed = samples
         .seed(initial.key, initial.version, None, true)
@@ -130,7 +200,7 @@ fn full_queue_does_not_grow_and_releases_only_its_failed_reservation() {
     assert_eq!(pending.jobs.len(), 8);
     assert_eq!(pending.jobs.capacity(), capacity);
     drop(pending);
-    drop(queue.pop().unwrap());
+    drop(queue.pop_ready().unwrap());
     let next = samples.seed(next.key, next.version, None, true).unwrap();
     assert_eq!(
         process.admit_seed(&queue, &mut samples, next).unwrap(),
@@ -151,16 +221,16 @@ fn process_queue_removes_seven_newest_then_one_oldest_across_empty_periods() {
         );
     }
     for expected in [60, 56, 52, 48, 44, 40, 36, 0, 32, 28, 24, 20, 16, 12, 8, 4] {
-        let job = queue.pop().unwrap().unwrap().seed();
+        let job = queue.pop_ready().unwrap().unwrap().seed();
         assert_eq!(job.snapshot.key.pc.get(), expected);
     }
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     assert_eq!(queue.pending.lock().unwrap().removals, 0);
     process
         .admit_seed(&queue, &mut samples, snapshot(&process, 0))
         .unwrap();
-    drop(queue.pop().unwrap());
-    assert!(queue.pop().unwrap().is_none());
+    drop(queue.pop_ready().unwrap());
+    assert!(queue.pop_ready().unwrap().is_none());
     assert_eq!(queue.pending.lock().unwrap().removals, 1);
 }
 
@@ -183,7 +253,7 @@ fn maintenance_preserves_reservation_and_stale_rollback_cannot_erase_replacement
         process.admit_seed(&queue, &mut samples, observed).unwrap(),
         Outcome::Queued
     );
-    let current = queue.pop().unwrap().unwrap().seed();
+    let current = queue.pop_ready().unwrap().unwrap().seed();
     assert_ne!(
         old.reservation.word & !PHASE_MASK,
         current.reservation.word & !PHASE_MASK
@@ -223,7 +293,7 @@ fn rejection_survives_reopen_but_not_reachability_replacement() {
     let (process, queue, mut samples) = setup(1);
     let observed = snapshot(&process, 0);
     process.admit_seed(&queue, &mut samples, observed).unwrap();
-    let mut job = queue.pop().unwrap().unwrap().seed();
+    let mut job = queue.pop_ready().unwrap().unwrap().seed();
     assert!(job.reservation.transition(RUNNING));
     assert!(job.reservation.reject());
     process.request(Reason::LinkPatch).unwrap();
@@ -286,7 +356,7 @@ fn close_drains_pins_and_prevents_insertion_from_the_reservation_gap() {
     let reserved = process.reserve_seed(second).unwrap().ok().unwrap();
     let drained = queue.close().unwrap();
     assert_eq!(drained.len(), 1);
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     assert_eq!(queue.enqueue(reserved).unwrap(), Outcome::Stale);
     drop(drained);
     assert!(
@@ -314,7 +384,7 @@ fn zero_workers_allocate_no_queue_and_token_exhaustion_fails_explicitly() {
         Err(error)
     );
     assert_eq!(process.lock().failure, Some(error));
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
 }
 
 #[test]
@@ -350,13 +420,13 @@ fn concurrent_vcpus_share_the_dispatch_reservation_not_their_sample_tables() {
         outcome,
         Outcome::Queued | Outcome::Deferred | Outcome::Duplicate
     )));
-    let job = queue.pop().unwrap().unwrap().seed();
+    let job = queue.pop_ready().unwrap().unwrap().seed();
     assert_eq!(job.snapshot, observed);
     assert_eq!(
         job.reservation.cell.0.load(Ordering::Acquire),
         job.reservation.word
     );
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
 }
 
 #[test]
@@ -470,7 +540,7 @@ fn reshape_contention_rolls_back_without_waiting_for_registry_or_queue() {
         );
         drop(queue_guard);
         drop(registry_guard);
-        assert!(queue.pop().unwrap().is_none());
+        assert!(queue.pop_ready().unwrap().is_none());
         snapshot = samples.boundary(snapshot.key, true).unwrap();
     }
     assert_eq!(
@@ -486,7 +556,7 @@ fn zero_family_reshape_does_not_erase_or_inherit_normal_seed_rejection() {
     let (process, queue, mut samples) = setup(2);
     let seed = snapshot(&process, 0);
     process.admit_seed(&queue, &mut samples, seed).unwrap();
-    let mut job = queue.pop().unwrap().unwrap().seed();
+    let mut job = queue.pop_ready().unwrap().unwrap().seed();
     assert!(job.reservation.transition(RUNNING));
     assert!(job.reservation.reject());
     let shape = observed_boundary(&process, &mut samples);
@@ -500,7 +570,7 @@ fn zero_family_reshape_does_not_erase_or_inherit_normal_seed_rejection() {
         process.admit_seed(&queue, &mut samples, seed).unwrap(),
         Outcome::Duplicate
     );
-    drop(queue.pop().unwrap());
+    drop(queue.pop_ready().unwrap());
     assert_eq!(
         process.admit_seed(&queue, &mut samples, seed).unwrap(),
         Outcome::Duplicate

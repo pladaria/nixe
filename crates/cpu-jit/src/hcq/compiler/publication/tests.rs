@@ -111,6 +111,7 @@ fn work_at<'a>(process: &'a Lifetime, reader: &mut Reader, pc: u64) -> Work<'a> 
         .payload()
         .reachability();
     let snapshot = AdmissionSnapshot {
+        observations: 128,
         key: key(pc),
         version,
         sequence: 8,
@@ -122,7 +123,7 @@ fn work_at<'a>(process: &'a Lifetime, reader: &mut Reader, pc: u64) -> Work<'a> 
         .admit_seed(&queue, &mut Samples::new(), snapshot)
         .unwrap();
     process
-        .accept_background(queue.pop().unwrap().unwrap())
+        .accept_background(queue.pop_ready().unwrap().unwrap())
         .unwrap()
         .unwrap()
 }

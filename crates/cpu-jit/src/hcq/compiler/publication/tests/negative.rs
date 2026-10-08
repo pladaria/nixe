@@ -43,7 +43,7 @@ fn real_backend_limit_records_reshape_negative_without_poisoning_seed() {
         if !expected {
             let (queue, outcome) = admit(&process, &mut reader, 0x1000, 0x1004, 0x2000);
             assert_eq!(outcome, Outcome::Suppressed);
-            assert!(queue.pop().unwrap().is_none());
+            assert!(queue.pop_ready().unwrap().is_none());
             continue;
         }
         let work = reshape(&process, &mut reader, 0x1000, 0x1004, 0x2000);
@@ -138,7 +138,7 @@ pub(super) fn reshape<'a>(
     let (queue, outcome) = admit(process, reader, root, source_pc, target_pc);
     assert_eq!(outcome, Outcome::Queued);
     process
-        .accept_background(queue.pop().unwrap().unwrap())
+        .accept_background(queue.pop_ready().unwrap().unwrap())
         .unwrap()
         .unwrap()
 }
@@ -191,8 +191,11 @@ pub(super) fn admit_to(
     for _ in 0..4 {
         snapshot = samples.boundary(boundary, true);
     }
+    let mut snapshot = snapshot.unwrap();
+    // Exercise publication/lifetime after profitability has enough evidence.
+    snapshot.observations = 128;
     process
-        .admit_reshape(queue, &mut samples, key(root), snapshot.unwrap())
+        .admit_reshape(queue, &mut samples, key(root), snapshot)
         .unwrap()
 }
 
@@ -203,7 +206,7 @@ fn no_op_result_uses_real_memory_capture_and_does_not_emit_native_code() {
         if !expected {
             let (queue, outcome) = admit(&process, &mut reader, 0x1000, 0x1004, 0x2000);
             assert_eq!(outcome, Outcome::Suppressed);
-            assert!(queue.pop().unwrap().is_none());
+            assert!(queue.pop_ready().unwrap().is_none());
             continue;
         }
         let work = reshape(&process, &mut reader, 0x1000, 0x1004, 0x2000);
@@ -259,9 +262,9 @@ fn no_op_result_rejects_changed_code_during_final_memory_validation() {
 #[test]
 fn structural_capture_includes_disconnected_input_and_returns_pin_charge() {
     let (process, memory, mut reader) = setup();
-    let work = reshape(&process, &mut reader, 0x7000, 0x7000, 0x2000);
+    let work = reshape(&process, &mut reader, 0x5000, 0x5000, 0x2000);
     let Err(crate::hcq::DiscoveryError::Structural(result)) = Graph::discover(&work) else {
-        panic!("return boundary must be disconnected")
+        panic!("architectural boundary must be disconnected")
     };
     assert_eq!(result.inspected(), 2);
     let observed = Observed {
@@ -274,7 +277,7 @@ fn structural_capture_includes_disconnected_input_and_returns_pin_charge() {
     let image = Image::capture_structural(&result, &observed).unwrap();
     let mut runs = observed.runs.lock().unwrap().clone();
     runs.sort_unstable();
-    assert_eq!(runs, [(0x2000, 2), (0x7000, 1)]);
+    assert_eq!(runs, [(0x2000, 2), (0x5000, 1)]);
     let after = process.executable_cache().usage().unwrap();
     assert_eq!(after.committed, before.committed);
     assert_eq!(after.metadata, before.metadata);
@@ -292,9 +295,9 @@ fn structural_capture_includes_disconnected_input_and_returns_pin_charge() {
 #[test]
 fn structural_capture_rejects_discarded_input_mutation_during_validation() {
     let (process, memory, mut reader) = setup();
-    let work = reshape(&process, &mut reader, 0x7000, 0x7000, 0x2000);
+    let work = reshape(&process, &mut reader, 0x5000, 0x5000, 0x2000);
     let Err(crate::hcq::DiscoveryError::Structural(result)) = Graph::discover(&work) else {
-        panic!("return boundary must be disconnected")
+        panic!("architectural boundary must be disconnected")
     };
     let change = || {
         memory
@@ -324,12 +327,12 @@ fn disconnected_installation_uses_real_memory_without_backend_or_executable_allo
     let (process, memory, mut reader) = setup();
     for expected in [true, false] {
         if !expected {
-            let (queue, outcome) = admit(&process, &mut reader, 0x7000, 0x7000, 0x2000);
+            let (queue, outcome) = admit(&process, &mut reader, 0x5000, 0x5000, 0x2000);
             assert_eq!(outcome, Outcome::Suppressed);
-            assert!(queue.pop().unwrap().is_none());
+            assert!(queue.pop_ready().unwrap().is_none());
             continue;
         }
-        let work = reshape(&process, &mut reader, 0x7000, 0x7000, 0x2000);
+        let work = reshape(&process, &mut reader, 0x5000, 0x5000, 0x2000);
         let Err(crate::hcq::DiscoveryError::Structural(result)) = Graph::discover(&work) else {
             panic!()
         };
@@ -345,7 +348,7 @@ fn disconnected_installation_uses_real_memory_without_backend_or_executable_allo
 #[test]
 fn structural_installation_rejects_code_mutation_after_preparing_record() {
     let (process, memory, mut reader) = setup();
-    let work = reshape(&process, &mut reader, 0x7000, 0x7000, 0x2000);
+    let work = reshape(&process, &mut reader, 0x5000, 0x5000, 0x2000);
     let Err(crate::hcq::DiscoveryError::Structural(result)) = Graph::discover(&work) else {
         panic!()
     };

@@ -1,11 +1,10 @@
 //! Save-data filesystem opening and application identity validation.
-use super::super::response::{encode_semantic_response, semantic_error};
+use super::super::response::{encode_semantic_child, semantic_error};
 use crate::ipc_wire::io::has_ipc_descriptors;
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
 use crate::ipc_wire::{IpcWireError, UnsupportedServiceOperation};
 use crate::{
-    HorizonIpcObject, HorizonIpcResult, HostDirectoryFileSystem, IpcResponse, IpcSession,
-    SaveDataSystem, SemanticIpcObject,
+    HorizonIpcResult, HostDirectoryFileSystem, IpcSession, SaveDataSystem, SemanticIpcObject,
 };
 use nixe_runtime::ExceptionProcessContext;
 
@@ -15,6 +14,7 @@ pub(in crate::ipc_wire::services) fn open_save_data(
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
     saves: Option<&SaveDataSystem>,
+    async_reply: &crate::host_work::AsyncReply<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     // Space ID followed by an aligned 0x40-byte SaveDataAttribute.
     // https://switchbrew.org/wiki/Filesystem_services#OpenSaveDataFileSystem
@@ -61,30 +61,33 @@ pub(in crate::ipc_wire::services) fn open_save_data(
             ));
         }
     };
-    let volume = match saves.open(kind, user) {
-        Ok(volume) => volume,
-        Err(error) => {
-            let result = if error.kind() == std::io::ErrorKind::NotFound {
-                HorizonIpcResult::FS_PATH_NOT_FOUND
-            } else {
-                log::error!("opening save data failed: {error}");
-                HorizonIpcResult::FS_UNEXPECTED
-            };
-            return semantic_error(request.token, Some(session), result);
-        }
-    };
-    let object =
-        SemanticIpcObject::HostDirectoryFileSystem(HostDirectoryFileSystem::from_save(volume));
-    let handle = process
-        .handles_mut()
-        .insert(HorizonIpcObject::SemanticObject(object))
-        .map_err(|_| IpcWireError::Internal("save-data child handle allocation failed"))?;
-    encode_semantic_response(
+    let saves = saves.clone();
+    let session = session.clone();
+    let token = request.token;
+    async_reply.submit_prepared(
         process,
-        Some(session),
-        None,
-        request,
-        hipc,
-        IpcResponse::Handle(handle),
-    )
+        move || {
+            let _trace = nixe_trace::Span::new("storage.open_save", 0, 0);
+            Ok(saves
+                .open(kind, user)
+                .map(|volume| {
+                    SemanticIpcObject::HostDirectoryFileSystem(HostDirectoryFileSystem::from_save(
+                        volume,
+                    ))
+                })
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        HorizonIpcResult::FS_PATH_NOT_FOUND
+                    } else {
+                        log::error!("opening save data failed: {error}");
+                        HorizonIpcResult::FS_UNEXPECTED
+                    }
+                }))
+        },
+        move |process, result| match result {
+            Ok(object) => encode_semantic_child(process, Some(&session), token, object),
+            Err(result) => semantic_error(token, Some(&session), result),
+        },
+    )?;
+    unreachable!("accepted save open suspends its caller")
 }

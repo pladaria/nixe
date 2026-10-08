@@ -27,11 +27,14 @@ impl FamilyOwners {
         }
     }
 
+    // Hash the immutable PC once; full instruction/context equality remains
+    // authoritative on every collision, including specializations of one PC.
     pub fn get(&self, instruction: InstructionKey) -> Option<Owner> {
         self.entries
-            .find(self.hash.hash_one(instruction), |entry| {
-                entry.instruction == instruction
-            })
+            .find(
+                self.hash.hash_one(instruction.block_key().pc.get()),
+                |entry| entry.instruction == instruction,
+            )
             .map(|entry| entry.family)
     }
 
@@ -40,22 +43,21 @@ impl FamilyOwners {
         // Capacity was reserved before publication; no runtime sampling path
         // inserts entries or grows this table.
         debug_assert!(self.entries.len() < self.entries.capacity());
-        self.entries
-            .insert_unique(self.hash.hash_one(entry.instruction), entry, |entry| {
-                self.hash.hash_one(entry.instruction)
-            });
+        self.entries.insert_unique(
+            self.hash.hash_one(entry.instruction.block_key().pc.get()),
+            entry,
+            |entry| self.hash.hash_one(entry.instruction.block_key().pc.get()),
+        );
     }
 
     pub fn publish(&mut self, instruction: InstructionKey, family: Owner) {
         // The publisher has validated either no owner or its exact reserved
         // predecessor. Update shared words in place: deleting/reinserting them
         // could leave hash-table tombstones and force growth under JIT state.
-        if let Some(entry) = self
-            .entries
-            .find_mut(self.hash.hash_one(instruction), |entry| {
-                entry.instruction == instruction
-            })
-        {
+        if let Some(entry) = self.entries.find_mut(
+            self.hash.hash_one(instruction.block_key().pc.get()),
+            |entry| entry.instruction == instruction,
+        ) {
             entry.family = family;
             return;
         }
@@ -72,12 +74,10 @@ impl FamilyOwners {
     }
 
     pub fn remove(&mut self, instruction: InstructionKey, family: Owner) -> bool {
-        if let Ok(entry) = self
-            .entries
-            .find_entry(self.hash.hash_one(instruction), |entry| {
-                entry.instruction == instruction && entry.family == family
-            })
-        {
+        if let Ok(entry) = self.entries.find_entry(
+            self.hash.hash_one(instruction.block_key().pc.get()),
+            |entry| entry.instruction == instruction && entry.family == family,
+        ) {
             entry.remove();
             true
         } else {

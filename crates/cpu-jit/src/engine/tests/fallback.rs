@@ -64,7 +64,6 @@ fn fixture(words: &[u32], targets: &[u64]) -> (JitThread, UnitHandle) {
 // destination proves a native PIC hit rather than another resolver success.
 // These fixtures contain no faultable guest memory instructions.
 pub(super) fn without_resolver(
-    returns: &mut crate::ReturnStack,
     thread: &mut JitThread,
     state: &mut A64State,
     budget: PollBudget,
@@ -77,7 +76,7 @@ pub(super) fn without_resolver(
         .memory
         .direct_address_space_view(SPACE)
         .unwrap();
-    let mut frame = NativeFrame::new(state, budget).with_return_stack(returns);
+    let mut frame = NativeFrame::new(state, budget);
     frame.poll_requests[1] = thread.control.pending_word_address() as *const _;
     frame.poll_requests[2] = events.pending_interrupts_address() as *const _;
     let mut invocation = unsafe { thread.reader.admit(&mut frame, key) }
@@ -108,18 +107,9 @@ fn indirect_pic_resolves_br_blr_ret_then_hits_without_a_rust_resolver() {
         initial.set_pc(PC.get() + 4);
         initial.general_register_storage_mut()[2] = PC.get() + 12;
         initial.general_register_storage_mut()[30] = PC.get() + 12;
-        let mut prediction = crate::ReturnStack::default();
-        if branch == 0xd65f03c0 {
-            prediction.entries[0] =
-                crate::rsb::Continuation::from(thread.key(PC.checked_add(12).unwrap()).unwrap());
-            prediction.head = 1;
-            prediction.depth = 1;
-        }
-        let mut returns = prediction.clone();
         let mut cold = initial.clone();
         let (Some(invocation::Exit::Native { guest, .. }), budget) = thread
             .invoke(
-                &mut returns,
                 &mut NativeWorker::default(),
                 &mut cold,
                 PollBudget::new(4096, 64).unwrap(),
@@ -132,15 +122,12 @@ fn indirect_pic_resolves_br_blr_ret_then_hits_without_a_rust_resolver() {
         assert_eq!(guest.kind, EdgeKind::SupervisorCall(7));
         assert_eq!(budget.slice_remaining, 62);
         assert_eq!(cold.general_register_storage_mut()[0], 1);
-        assert_eq!(returns.depth, u32::from(branch == 0xd63f0040));
         assert_eq!(
             cold.general_register_storage_mut()[30],
             PC.get() + if branch == 0xd63f0040 { 8 } else { 12 }
         );
         let mut hot = initial.clone();
-        returns = prediction.clone();
         let (returned, budget) = without_resolver(
-            &mut returns,
             &mut thread,
             &mut hot,
             PollBudget::new(4096, 64).unwrap(),
@@ -149,14 +136,11 @@ fn indirect_pic_resolves_br_blr_ret_then_hits_without_a_rust_resolver() {
         assert_eq!(returned.reason, NativeExitReason::Architectural);
         assert_eq!(budget.slice_remaining, 62);
         assert_eq!(hot, cold);
-        assert_eq!(returns.depth, u32::from(branch == 0xd63f0040));
 
         // Even a populated PIC must not run the destination after source work
         // consumes the slice. The poll's exhausted path skips the whole probe.
         let mut exhausted = initial.clone();
-        returns = prediction.clone();
         let (returned, budget) = without_resolver(
-            &mut returns,
             &mut thread,
             &mut exhausted,
             PollBudget::new(1, 1).unwrap(),
@@ -166,14 +150,11 @@ fn indirect_pic_resolves_br_blr_ret_then_hits_without_a_rust_resolver() {
         assert_eq!(budget.slice_remaining, 0);
         assert_eq!(exhausted.pc(), PC.get() + 12);
         assert_eq!(exhausted.general_register_storage_mut()[0], 0);
-        assert_eq!(returns.depth, u32::from(branch == 0xd63f0040));
 
         let events = VcpuEventState::default();
         events.post_interrupts(4);
         let mut interrupted = initial;
-        returns = prediction;
         let (returned, budget) = without_resolver(
-            &mut returns,
             &mut thread,
             &mut interrupted,
             PollBudget::new(1, 64).unwrap(),
@@ -183,7 +164,6 @@ fn indirect_pic_resolves_br_blr_ret_then_hits_without_a_rust_resolver() {
         assert_eq!(budget.slice_remaining, 63);
         assert_eq!(interrupted.general_register_storage_mut()[0], 0);
         assert_eq!(events.take_pending_interrupts(), 4);
-        assert_eq!(returns.depth, u32::from(branch == 0xd63f0040));
         assert!(thread.process.lifetime.try_shutdown().unwrap());
     }
 }
@@ -249,13 +229,7 @@ fn indirect_pic_native_collisions_alternate_without_hit_recency() {
                 }),
                 budget,
             ) = thread
-                .invoke(
-                    &mut crate::ReturnStack::default(),
-                    &mut NativeWorker::default(),
-                    &mut state,
-                    budget,
-                    &events,
-                )
+                .invoke(&mut NativeWorker::default(), &mut state, budget, &events)
                 .unwrap()
             else {
                 panic!("expected resident indirect destination")
@@ -263,13 +237,7 @@ fn indirect_pic_native_collisions_alternate_without_hit_recency() {
             assert_eq!(guest.kind, EdgeKind::SupervisorCall(7));
             (returned, budget)
         } else {
-            without_resolver(
-                &mut crate::ReturnStack::default(),
-                thread,
-                &mut state,
-                budget,
-                &events,
-            )
+            without_resolver(thread, &mut state, budget, &events)
         };
         assert_eq!(
             returned.reason,
@@ -359,7 +327,6 @@ fn indirect_pic_production_vcpus_share_a_bridge_and_survive_owner_removal() {
         let mut state = initial.clone();
         let (Some(invocation::Exit::Native { guest, .. }), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut NativeWorker::default(),
                 &mut state,
                 PollBudget::new(4096, 64).unwrap(),
@@ -387,7 +354,6 @@ fn indirect_pic_production_vcpus_share_a_bridge_and_survive_owner_removal() {
         }
         let mut hot = initial.clone();
         let (returned, budget) = without_resolver(
-            &mut crate::ReturnStack::default(),
             thread,
             &mut hot,
             PollBudget::new(4096, 64).unwrap(),
@@ -401,7 +367,6 @@ fn indirect_pic_production_vcpus_share_a_bridge_and_survive_owner_removal() {
     assert_eq!(Some(record(&mut second)), shared);
     let mut hot = initial;
     let (returned, _) = without_resolver(
-        &mut crate::ReturnStack::default(),
         &mut second,
         &mut hot,
         PollBudget::new(4096, 64).unwrap(),
@@ -439,7 +404,6 @@ fn indirect_pic_missing_and_misaligned_targets_remain_canonical() {
             budget,
         ) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut NativeWorker::default(),
                 &mut state,
                 PollBudget::new(4096, 64).unwrap(),
@@ -478,7 +442,6 @@ fn indirect_pic_bridge_preserves_dirty_homes_lazy_flags_and_sample_resume() {
         let mut cold = initial.clone();
         let (Some(invocation::Exit::Native { guest, .. }), budget) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut NativeWorker::default(),
                 &mut cold,
                 PollBudget::new(4096, 64).unwrap(),
@@ -505,7 +468,6 @@ fn indirect_pic_bridge_preserves_dirty_homes_lazy_flags_and_sample_resume() {
         );
         let mut hot = initial;
         let (returned, budget) = without_resolver(
-            &mut crate::ReturnStack::default(),
             &mut thread,
             &mut hot,
             PollBudget::new(1, 64).unwrap(),
@@ -554,7 +516,6 @@ fn indirect_pic_cannot_reenter_a_retired_target_and_relearns_its_replacement() {
     let mut state = initial.clone();
     let _ = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut NativeWorker::default(),
             &mut state,
             PollBudget::new(4096, 64).unwrap(),
@@ -572,7 +533,6 @@ fn indirect_pic_cannot_reenter_a_retired_target_and_relearns_its_replacement() {
     }
     let mut state = initial.clone();
     let (returned, budget) = without_resolver(
-        &mut crate::ReturnStack::default(),
         &mut thread,
         &mut state,
         PollBudget::new(4096, 64).unwrap(),
@@ -589,7 +549,6 @@ fn indirect_pic_cannot_reenter_a_retired_target_and_relearns_its_replacement() {
     let mut cold = initial.clone();
     let _ = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut NativeWorker::default(),
             &mut cold,
             PollBudget::new(4096, 64).unwrap(),
@@ -598,7 +557,6 @@ fn indirect_pic_cannot_reenter_a_retired_target_and_relearns_its_replacement() {
         .unwrap();
     let mut hot = initial;
     let (returned, _) = without_resolver(
-        &mut crate::ReturnStack::default(),
         &mut thread,
         &mut hot,
         PollBudget::new(4096, 64).unwrap(),
@@ -619,7 +577,6 @@ fn indirect_pic_self_loop_is_bounded_by_native_polls_without_stack_growth() {
     let mut cold = initial.clone();
     let (Some(invocation::Exit::Native { returned, .. }), budget) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut NativeWorker::default(),
             &mut cold,
             PollBudget::new(3, 100_000).unwrap(),
@@ -634,7 +591,6 @@ fn indirect_pic_self_loop_is_bounded_by_native_polls_without_stack_growth() {
     assert_eq!(cold, initial);
     let mut hot = initial.clone();
     let (returned, hot_budget) = without_resolver(
-        &mut crate::ReturnStack::default(),
         &mut thread,
         &mut hot,
         PollBudget::new(3, 100_000).unwrap(),
@@ -672,7 +628,6 @@ fn static_fallback_resolves_resident_b_bl_and_conditional_targets_in_one_invocat
             budget,
         ) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut NativeWorker::default(),
                 &mut state,
                 PollBudget::new(4096, 64).unwrap(),
@@ -720,7 +675,6 @@ fn static_fallback_loop_preserves_lazy_flags_and_poll_balances() {
     state.general_register_storage_mut()[0] = 5;
     let (Some(invocation::Exit::Native { guest, .. }), budget) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut NativeWorker::default(),
             &mut state,
             PollBudget::new(3, 100).unwrap(),
@@ -757,7 +711,6 @@ fn static_fallback_preserves_guest_fp_status_and_restores_the_caller() {
     let caller = crate::fp_env::tests::distinct_caller();
     let (Some(invocation::Exit::Native { guest, .. }), budget) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut NativeWorker::default(),
             &mut state,
             PollBudget::new(4096, 100).unwrap(),
@@ -798,7 +751,6 @@ fn static_fallback_target_fault_keeps_the_source_prefix_and_target_attribution()
         budget,
     ) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut NativeWorker::default(),
             &mut state,
             PollBudget::new(4096, 100).unwrap(),
@@ -836,7 +788,6 @@ fn static_fallback_miss_budget_and_control_do_not_execute_the_successor() {
             budget,
         ) = thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut NativeWorker::default(),
                 &mut state,
                 PollBudget::new(4096, if mode == 1 { 1 } else { 64 }).unwrap(),

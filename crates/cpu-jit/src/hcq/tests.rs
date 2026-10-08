@@ -95,13 +95,17 @@ fn absent_successors_remain_external_without_invented_words() {
 }
 
 #[test]
-fn calls_and_returns_never_become_internal_edges() {
-    let (_, blocks) = graph(0, &[(0, &[0x94000002]), (4, &[RET]), (8, &[0xd63f0000])]);
+fn captured_calls_and_guarded_returns_share_internal_edges() {
+    let (_, blocks) = graph(0, &[(0, &[0x94000002]), (4, &[RET]), (8, &[NOP, RET])]);
     assert_eq!(blocks[0].exit, Exit::Call(Some(key(8))));
+    assert_eq!(blocks[0].dispatch, [Target::Internal(2)]);
     assert_eq!(blocks[1].exit, Exit::Return);
-    assert_eq!(blocks[2].exit, Exit::Call(None));
+    assert!(blocks[1].dispatch.is_empty());
+    assert_eq!(blocks[2].exit, Exit::Return);
+    assert_eq!(blocks[2].dispatch, [Target::Internal(1)]);
     let (_, blocks) = graph(0, &[(0, &[0xd61f0000])]);
     assert_eq!(blocks[0].exit, Exit::Indirect);
+    assert!(blocks[0].dispatch.is_empty());
 }
 
 #[test]

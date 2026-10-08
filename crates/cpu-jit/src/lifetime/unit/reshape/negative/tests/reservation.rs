@@ -15,7 +15,7 @@ fn queued(process: &Lifetime, queue: &Queue, pc: u64) -> Job {
             .unwrap(),
         Outcome::Queued
     );
-    queue.pop().unwrap().unwrap()
+    queue.pop_ready().unwrap().unwrap()
 }
 
 #[test]
@@ -164,7 +164,7 @@ fn seed_acceptance_never_allocates_reshape_result_storage() {
     );
     let before = process.cache.usage().unwrap().metadata;
     let work = process
-        .accept_background(queue.pop().unwrap().unwrap())
+        .accept_background(queue.pop_ready().unwrap().unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(process.cache.usage().unwrap().metadata, before);

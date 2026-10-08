@@ -1,5 +1,4 @@
-//! Register preservation for a resumable sampling callback: mapped values at
-//! external transfers, all volatile registers for internal SSA continuations.
+//! Register preservation for a resumable external-transfer sampling callback.
 //! Emission allocates; the generated saves/restores do not. No canonical state,
 //! backend spill, SP, pinned register or FP environment is changed here.
 
@@ -35,14 +34,6 @@ pub(crate) fn emit(
     source: &ExitStateMap,
     destination: ValueLocation,
 ) -> Result<Preservation, TransferError> {
-    preservation(source, destination, false)
-}
-
-fn preservation(
-    source: &ExitStateMap,
-    destination: ValueLocation,
-    all_volatile: bool,
-) -> Result<Preservation, TransferError> {
     source.validate().map_err(TransferError::InvalidContract)?;
     if !destination.valid(source.abi, 8) {
         return Err(TransferError::InvalidContract(
@@ -51,18 +42,6 @@ fn preservation(
     }
     let mut integer = [0u8; 32];
     let mut vector = [0u8; 32];
-    if all_volatile {
-        // Internal SSA may keep optimizer-created temporaries not represented
-        // by any guest binding. Save the complete volatile bank on this cold
-        // callback, without constraining allocation or spilling on the hot path.
-        let registers = if source.abi == HostAbi::X86_64 {
-            16
-        } else {
-            32
-        };
-        integer[..registers].fill(8);
-        vector[..registers].fill(16);
-    }
     let mut retain = |location, bytes: u8| {
         if let ValueLocation::Register { class, index } = location {
             let widths = match class {
@@ -124,19 +103,13 @@ fn preservation(
 /// restored its borrowed registers. The callback runs under the same epoch and
 /// mapping lease; it cannot reenter native code. Return local patches for the
 /// already-charged hot continuation and the canonical failure exit.
-/// Internal SSA checks preserve all volatile registers, including optimizer
-/// temporaries absent from the guest map; external transfers need only the map.
+/// Only external transfers observe candidates; internal SSA polls resume natively.
 pub(crate) fn emit_callback(
     source: &ExitStateMap,
     destination: ValueLocation,
-    internal: bool,
 ) -> Result<(Vec<u8>, [u32; 2]), TransferError> {
     let host_flags = source.flags_to_preserve(crate::analysis::NZCV) != 0;
-    let preservation = if internal {
-        preservation(source, destination, true)?
-    } else {
-        emit(source, destination)?
-    };
+    let preservation = emit(source, destination)?;
     let mut e = Emitter::new(source.abi);
     e.code.extend(preservation.save);
     let scratch = source.abi.reserved().link_scratch[0];

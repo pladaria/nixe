@@ -245,7 +245,7 @@ impl NativePipeline {
                     VertexStepMode::Instance => vk::VertexInputRate::INSTANCE,
                 },
             });
-            for attribute in &layout.attributes {
+            for attribute in layout.attributes.iter() {
                 let f = match attribute.format {
                     VertexFormat::Float32 => vk::Format::R32_SFLOAT,
                     VertexFormat::Float32x2 => vk::Format::R32G32_SFLOAT,

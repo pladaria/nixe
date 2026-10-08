@@ -1,19 +1,15 @@
 //! Encoding for responses produced by the typed filesystem and add-on backends.
 
-use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::ExceptionProcessContext;
 
 use super::super::IpcWireError;
 use super::super::buffer::one_receive_buffer;
-use super::super::io::{
-    cmif_error, encode_domain_response, validate_writable_ram_range, write_bytes,
-    write_descriptor_bytes,
-};
+use super::super::io::{cmif_error, encode_domain_response, write_descriptor_bytes};
 use super::super::message::{CmifRequest, CmifResponse, HipcRequest};
 use super::fsp::abi::{FS_DIRECTORY_ENTRY_FILE, FS_DIRECTORY_ENTRY_SIZE, FS_MAX_PATH};
 use crate::{
     DirectoryEntryKind, HorizonIpcObject, HorizonIpcResult, IpcResponse, IpcResultCode, IpcService,
-    IpcSession, ReadOnlyStorage, SemanticIpcObject,
+    IpcSession, SemanticIpcObject,
 };
 
 const STORAGE_READ_BUFFER_BYTES: usize = 4 * 1024 * 1024;
@@ -25,6 +21,7 @@ pub(super) fn encode_semantic_response(
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
     response: IpcResponse,
+    async_reply: Option<&crate::host_work::AsyncReply<'_>>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let is_domain = domain_session.is_some_and(IpcSession::is_domain);
     match response {
@@ -33,19 +30,7 @@ pub(super) fn encode_semantic_response(
             name_length_max,
             path_length_max,
         } => {
-            // FsFileSystemAttribute: optional UTF-8 limits start at 0x28;
-            // UTF-16-specific limits remain absent for this UTF-8 backend.
-            // https://github.com/switchbrew/libnx/blob/master/nx/include/switch/services/fs.h#L302-L332
-            let mut data = [0; 0xc0];
-            data[..4].fill(1);
-            for (offset, value) in [
-                (0x28, name_length_max),
-                (0x2c, name_length_max),
-                (0x30, path_length_max),
-                (0x34, path_length_max),
-            ] {
-                data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-            }
+            let data = file_system_attribute_data(name_length_max, path_length_max);
             semantic_success(request.token, is_domain, &data, &[], &[], None)
         }
         IpcResponse::EntryType(kind) => {
@@ -102,16 +87,7 @@ pub(super) fn encode_semantic_response(
                         "semantic dispatch returned a non-semantic child handle",
                     ));
                 };
-                let Some(object_id) =
-                    domain_session.and_then(|session| session.insert_object(object))
-                else {
-                    return semantic_error(
-                        request.token,
-                        domain_session,
-                        HorizonIpcResult::CMIF_OUT_OF_DOMAIN_ENTRIES,
-                    );
-                };
-                semantic_success(request.token, true, &[], &[], &[object_id], None)
+                encode_semantic_child(process, domain_session, request.token, object)
             } else {
                 semantic_success(request.token, false, &[], &[], &[], Some(handle))
             }
@@ -132,30 +108,81 @@ pub(super) fn encode_semantic_response(
         }
         IpcResponse::StorageRead { offset, size } => {
             let descriptor = one_receive_buffer(hipc)?;
-            let Some(SemanticIpcObject::ReadOnlyStorage(storage)) = target_object else {
-                return Err(IpcWireError::Internal(
-                    "storage read response did not originate from IStorage",
-                ));
+            let (storage, file_read) = match target_object {
+                Some(SemanticIpcObject::ReadOnlyStorage(storage)) => {
+                    (storage.storage().clone(), false)
+                }
+                Some(SemanticIpcObject::ReadOnlyFile(file)) => (file.storage().clone(), true),
+                _ => {
+                    return Err(IpcWireError::Internal(
+                        "storage read response lacks a retained source",
+                    ));
+                }
             };
-            match write_storage_read(
-                process,
-                storage,
-                descriptor.address,
-                descriptor.size,
-                offset,
-                size,
-            ) {
-                Ok(()) => semantic_success(request.token, is_domain, &[], &[], &[], None),
-                Err(StorageReadError::Source) => semantic_error(
-                    request.token,
-                    domain_session,
-                    HorizonIpcResult::from_semantic(
-                        IpcService::FileSystem,
-                        IpcResultCode::STORAGE_FAILURE,
-                    ),
-                ),
-                Err(StorageReadError::Wire(error)) => Err(error),
+            let async_reply = async_reply.ok_or(IpcWireError::Internal(
+                "storage read lacks asynchronous reply ownership",
+            ))?;
+            if size as u64 > descriptor.size {
+                return Err(IpcWireError::Malformed(
+                    "storage response exceeds its output descriptor",
+                ));
             }
+            let destination = if size == 0 {
+                None
+            } else {
+                Some(crate::host_work::retain_output(
+                    process,
+                    descriptor.address,
+                    size as u64,
+                )?)
+            };
+            let count = (size as u64).to_le_bytes();
+            let success = semantic_success(
+                request.token,
+                is_domain,
+                if file_read { &count } else { &[] },
+                &[],
+                &[],
+                None,
+            )?
+            .0;
+            let failure = semantic_error(
+                request.token,
+                domain_session,
+                HorizonIpcResult::from_semantic(
+                    IpcService::FileSystem,
+                    IpcResultCode::STORAGE_FAILURE,
+                ),
+            )?
+            .0;
+            async_reply.submit(process, move |cancelled| {
+                let _trace = nixe_trace::Span::new("storage.read", offset, size as u64);
+                let mut buffer = vec![0; size.min(STORAGE_READ_BUFFER_BYTES)];
+                let mut transferred = 0;
+                while transferred < size {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(Vec::new());
+                    }
+                    let count = (size - transferred).min(buffer.len());
+                    if storage
+                        .read_at(offset + transferred as u64, &mut buffer[..count])
+                        .is_err()
+                    {
+                        return Ok(failure);
+                    }
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(Vec::new());
+                    }
+                    crate::host_work::write_retained(
+                        destination.as_ref().unwrap(),
+                        transferred as u64,
+                        &buffer[..count],
+                    )?;
+                    transferred += count;
+                }
+                Ok(success)
+            })?;
+            unreachable!("accepted host work always suspends its caller")
         }
         IpcResponse::DirectoryEntries(entries) => {
             let descriptor = one_receive_buffer(hipc)?;
@@ -221,72 +248,21 @@ pub(super) fn encode_semantic_response(
     }
 }
 
-enum StorageReadError {
-    Source,
-    Wire(IpcWireError),
-}
-
-impl From<IpcWireError> for StorageReadError {
-    fn from(error: IpcWireError) -> Self {
-        Self::Wire(error)
+pub(super) fn file_system_attribute_data(name_length_max: u32, path_length_max: u32) -> [u8; 0xc0] {
+    // FsFileSystemAttribute: optional UTF-8 limits start at 0x28;
+    // UTF-16-specific limits remain absent for this UTF-8 backend.
+    // https://github.com/switchbrew/libnx/blob/master/nx/include/switch/services/fs.h#L302-L332
+    let mut data = [0; 0xc0];
+    data[..4].fill(1);
+    for (offset, value) in [
+        (0x28, name_length_max),
+        (0x2c, name_length_max),
+        (0x30, path_length_max),
+        (0x34, path_length_max),
+    ] {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
-}
-
-fn write_storage_read(
-    process: &ExceptionProcessContext<'_>,
-    storage: &ReadOnlyStorage,
-    guest_address: u64,
-    descriptor_size: u64,
-    storage_offset: u64,
-    size: usize,
-) -> Result<(), StorageReadError> {
-    if u64::try_from(size)
-        .ok()
-        .is_none_or(|size| size > descriptor_size)
-    {
-        return Err(
-            IpcWireError::Malformed("storage response exceeds its output descriptor").into(),
-        );
-    }
-
-    let guest_address = GuestVirtualAddress::new(guest_address);
-    validate_writable_ram_range(process, guest_address, size)?;
-    if size == 0 {
-        return Ok(());
-    }
-
-    // IStorage transfers can be hundreds of MiB. Keep host memory bounded and
-    // copy each source chunk directly into the already validated guest range.
-    let buffer_size = size.min(STORAGE_READ_BUFFER_BYTES);
-    let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(buffer_size)
-        .map_err(|_| IpcWireError::HostResourceExhausted("allocating the storage read buffer"))?;
-    buffer.resize(buffer_size, 0);
-
-    let mut transferred = 0_usize;
-    while transferred < size {
-        let chunk_size = (size - transferred).min(buffer.len());
-        let source_offset = storage_offset
-            .checked_add(
-                u64::try_from(transferred)
-                    .map_err(|_| IpcWireError::Internal("storage read offset overflows"))?,
-            )
-            .ok_or(IpcWireError::Internal("storage read offset overflows"))?;
-        storage
-            .storage()
-            .read_at(source_offset, &mut buffer[..chunk_size])
-            .map_err(|_| StorageReadError::Source)?;
-        let destination = guest_address
-            .checked_add(
-                u64::try_from(transferred)
-                    .map_err(|_| IpcWireError::Internal("storage read address overflows"))?,
-            )
-            .ok_or(IpcWireError::Internal("storage read address overflows"))?;
-        write_bytes(process, destination, &buffer[..chunk_size])?;
-        transferred += chunk_size;
-    }
-    Ok(())
+    data
 }
 
 pub(in crate::ipc_wire) fn semantic_success(
@@ -324,5 +300,39 @@ pub(super) fn semantic_error(
         Ok((encode_domain_response(token, result, &[], &[], &[])?, None))
     } else {
         cmif_error(token, result)
+    }
+}
+
+/// Publish a prepared child using the coordinator's process/domain authority.
+pub(super) fn encode_semantic_child(
+    process: &mut ExceptionProcessContext<'_>,
+    session: Option<&IpcSession>,
+    token: u32,
+    object: SemanticIpcObject,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if let Some(session) = session.filter(|session| session.is_domain()) {
+        let Some(id) = session.insert_object(object) else {
+            return semantic_error(
+                token,
+                Some(session),
+                HorizonIpcResult::CMIF_OUT_OF_DOMAIN_ENTRIES,
+            );
+        };
+        semantic_success(token, true, &[], &[], &[id], None)
+    } else {
+        match process
+            .handles_mut()
+            .insert(HorizonIpcObject::SemanticObject(object))
+        {
+            Ok(handle) => semantic_success(token, false, &[], &[], &[], Some(handle)),
+            Err(_) => semantic_error(
+                token,
+                session,
+                HorizonIpcResult::from_semantic(
+                    IpcService::FileSystem,
+                    IpcResultCode::RESOURCE_LIMIT,
+                ),
+            ),
+        }
     }
 }

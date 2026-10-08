@@ -233,7 +233,7 @@ fn flag_flow_irreducible_and_unrooted_cycles_have_stable_total_contracts() {
         Some(LazyFlags::Packed(()))
     );
     for (index, node) in graph.blocks.iter().enumerate() {
-        for target in successors(&node.exit).iter().flatten() {
+        for target in &node.successors() {
             if let Target::Internal(target) = target {
                 let source = &analysis.flags.blocks[index].output;
                 let destination = &analysis.flags.blocks[*target].input;

@@ -6,7 +6,7 @@ use MaxwellThreeDFixedFunctionRegister as R;
 use MaxwellThreeDFixedFunctionValue as V;
 use nixe_gpu::{CullMode, FrontFace};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct DrawRasterState {
     pub front_face: FrontFace,
     pub cull_mode: CullMode,
@@ -325,7 +325,7 @@ mod tests {
             );
         }
         let shader_identity = channel.three_d().shader_state_identity();
-        let draw_identity = channel.three_d().draw_state_identity();
+        let draw_identity = channel.three_d().fixed_draw_identity();
         program_three_d(&mut channel, 0x13b0, 2_f32.to_bits());
         assert!(shader_identity.matches(channel.three_d()));
         assert!(!draw_identity.matches(channel.three_d()));

@@ -54,13 +54,16 @@ fn policy_reserves_two_logical_cpus_and_caps_at_four_workers() {
 fn zero_workers_create_no_pool_or_consumer_and_invalid_count_fails() {
     let (process, _, _) = setup(1);
     assert!(
-        Workers::start(0, Arc::clone(&process), |_, _| panic!(
-            "zero worker consumer"
-        ))
+        Workers::start(
+            0,
+            Arc::clone(&process),
+            |_, _| panic!("zero worker consumer"),
+            None
+        )
         .unwrap()
         .is_none()
     );
-    assert!(Workers::start(5, process, |_, _| panic!("invalid worker consumer")).is_err());
+    assert!(Workers::start(5, process, |_, _| panic!("invalid worker consumer"), None).is_err());
 }
 
 #[test]
@@ -76,55 +79,60 @@ fn fixed_workers_have_private_reusable_compiler_and_decoder_storage() {
         ))
         .unwrap()
         .frontend_config();
-    let mut workers = Workers::start(2, Arc::clone(&process), move |resources, work| {
-        assert!(resources.context.func.layout.entry_block().is_none());
-        assert!(resources.decoded.is_empty());
-        assert!(resources.decoded.capacity() >= MAX_INSTRUCTIONS);
-        let Observation::Seed(observed) = work.observation() else {
-            panic!("expected seed")
-        };
-        let input = work.lcq(observed.key).map_err(fail)?.unwrap();
-        for instruction in input.unit.instructions.iter() {
-            let key = instruction.key.block_key();
-            resources.decoded.push(nixe_cpu::decode::decode(
-                key.platform,
-                nixe_cpu::location::LocationDescriptor::new(key.pc, key.profile),
-                instruction.bits.into(),
-            ));
-        }
-        // Exercise reusable Cranelift frontend state, not a pretend HCQ backend.
-        resources
-            .context
-            .func
-            .signature
-            .returns
-            .push(AbiParam::new(types::I64));
-        let mut builder =
-            FunctionBuilder::new(&mut resources.context.func, &mut resources.frontend);
-        let block = builder.create_block();
-        builder.switch_to_block(block);
-        builder.seal_block(block);
-        let value = builder
-            .ins()
-            .iconst(types::I64, observed.key.pc.get() as i64);
-        builder.ins().return_(&[value]);
-        builder.finalize(config);
-        events
-            .send((
-                observed.key,
-                &resources.context as *const Context as usize,
-                resources.decoded.as_ptr() as usize,
-                std::thread::current().id(),
-            ))
-            .unwrap();
-        if observed.key.pc.get() < 8 {
-            wait.lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(10))
+    let mut workers = Workers::start(
+        2,
+        Arc::clone(&process),
+        move |resources, work| {
+            assert!(resources.context.func.layout.entry_block().is_none());
+            assert!(resources.decoded.is_empty());
+            assert!(resources.decoded.capacity() >= MAX_INSTRUCTIONS);
+            let Observation::Seed(observed) = work.observation() else {
+                panic!("expected seed")
+            };
+            let input = work.lcq(observed.key).map_err(fail)?.unwrap();
+            for instruction in input.unit.instructions.iter() {
+                let key = instruction.key.block_key();
+                resources.decoded.push(nixe_cpu::decode::decode(
+                    key.platform,
+                    nixe_cpu::location::LocationDescriptor::new(key.pc, key.profile),
+                    instruction.bits.into(),
+                ));
+            }
+            // Exercise reusable Cranelift frontend state, not a pretend HCQ backend.
+            resources
+                .context
+                .func
+                .signature
+                .returns
+                .push(AbiParam::new(types::I64));
+            let mut builder =
+                FunctionBuilder::new(&mut resources.context.func, &mut resources.frontend);
+            let block = builder.create_block();
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+            let value = builder
+                .ins()
+                .iconst(types::I64, observed.key.pc.get() as i64);
+            builder.ins().return_(&[value]);
+            builder.finalize(config);
+            events
+                .send((
+                    observed.key,
+                    &resources.context as *const Context as usize,
+                    resources.decoded.as_ptr() as usize,
+                    std::thread::current().id(),
+                ))
                 .unwrap();
-        }
-        Ok(())
-    })
+            if observed.key.pc.get() < 8 {
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+            Ok(())
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     for pc in [0, 4] {
@@ -159,15 +167,20 @@ fn shutdown_drains_pending_jobs_and_waits_for_the_running_owner() {
     let (events, receiver) = mpsc::channel();
     let (release, wait) = mpsc::channel();
     let wait = Mutex::new(wait);
-    let workers = Workers::start(1, Arc::clone(&process), move |_, work| {
-        assert!(work.lcq(key(0)).map_err(fail)?.is_some());
-        events.send(()).unwrap();
-        wait.lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        Ok(())
-    })
+    let workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |_, work| {
+            assert!(work.lcq(key(0)).map_err(fail)?.is_some());
+            events.send(()).unwrap();
+            wait.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            Ok(())
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     enqueue(&process, &workers, &mut samples, 0);
@@ -193,13 +206,18 @@ fn worker_errors_and_panics_close_admission_and_are_returned_by_join() {
     for panic in [false, true] {
         let (process, _, mut samples) = setup(1);
         let (events, receiver) = mpsc::channel();
-        let mut workers = Workers::start(2, Arc::clone(&process), move |_, _work| {
-            events.send(()).unwrap();
-            if panic {
-                panic!("injected compiler panic");
-            }
-            Err(Error::internal("injected compiler failure").into())
-        })
+        let mut workers = Workers::start(
+            2,
+            Arc::clone(&process),
+            move |_, _work| {
+                events.send(()).unwrap();
+                if panic {
+                    panic!("injected compiler panic");
+                }
+                Err(Error::internal("injected compiler failure").into())
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
         enqueue(&process, &workers, &mut samples, 0);
@@ -219,7 +237,7 @@ fn worker_errors_and_panics_close_admission_and_are_returned_by_join() {
 #[test]
 fn poisoned_queue_cleanup_still_drains_and_joins_sleeping_workers() {
     let (process, _, _) = setup(1);
-    let mut workers = Workers::start(2, Arc::clone(&process), |_, _| panic!("no job"))
+    let mut workers = Workers::start(2, Arc::clone(&process), |_, _| panic!("no job"), None)
         .unwrap()
         .unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -247,6 +265,7 @@ fn partial_startup_releases_threads_queue_storage_and_consumer_captures() {
                 let _keep = &captured;
                 panic!("no job during startup");
             },
+            None,
             Some(index),
         )
         .err()
@@ -267,7 +286,7 @@ fn partial_startup_releases_threads_queue_storage_and_consumer_captures() {
         assert!(process.lock().background_queue.upgrade().is_none());
         process.lock().healthy().unwrap();
     }
-    let pool = Workers::start(1, Arc::clone(&process), |_, _| panic!("no jobs"))
+    let pool = Workers::start(1, Arc::clone(&process), |_, _| panic!("no jobs"), None)
         .unwrap()
         .unwrap();
     drop(pool);
@@ -277,12 +296,17 @@ fn partial_startup_releases_threads_queue_storage_and_consumer_captures() {
 #[test]
 fn duplicate_pool_registration_cannot_replace_or_close_the_existing_queue() {
     let (process, _, _) = setup(1);
-    let mut first = Workers::start(1, Arc::clone(&process), |_, _| panic!("no job"))
+    let mut first = Workers::start(1, Arc::clone(&process), |_, _| panic!("no job"), None)
         .unwrap()
         .unwrap();
-    let error = Workers::start(1, Arc::clone(&process), |_, _| panic!("duplicate consumer"))
-        .err()
-        .unwrap();
+    let error = Workers::start(
+        1,
+        Arc::clone(&process),
+        |_, _| panic!("duplicate consumer"),
+        None,
+    )
+    .err()
+    .unwrap();
     assert!(error.to_string().contains("already registered"));
     assert!(Arc::ptr_eq(
         &process.lock().background_queue.upgrade().unwrap(),
@@ -301,17 +325,22 @@ fn process_shutdown_cancels_running_work_drains_jobs_and_blocks_late_enqueue() {
         let (started, running) = mpsc::channel();
         let (release, wait) = mpsc::channel();
         let wait = Mutex::new(wait);
-        let mut workers = Workers::start(1, Arc::clone(&process), move |_, work| {
-            let source = work.lcq(key(0)).map_err(fail)?.unwrap();
-            started.send(()).unwrap();
-            wait.lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap();
-            assert_eq!(work.check(), Err(lifetime::Error::StalePublication));
-            assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
-            Ok(())
-        })
+        let mut workers = Workers::start(
+            1,
+            Arc::clone(&process),
+            move |_, work| {
+                let source = work.lcq(key(0)).map_err(fail)?.unwrap();
+                started.send(()).unwrap();
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                assert_eq!(work.check(), Err(lifetime::Error::StalePublication));
+                assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
+                Ok(())
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
         enqueue(&process, &workers, &mut samples, 0);
@@ -351,7 +380,15 @@ fn terminal_process_rejects_startup_without_retaining_resources() {
     let (process, _, _) = setup(1);
     process.request_shutdown().unwrap();
     let before = process.cache.usage().unwrap().metadata;
-    assert!(Workers::start(2, Arc::clone(&process), |_, _| panic!("closed consumer")).is_err());
+    assert!(
+        Workers::start(
+            2,
+            Arc::clone(&process),
+            |_, _| panic!("closed consumer"),
+            None
+        )
+        .is_err()
+    );
     assert!(process.lock().background_queue.upgrade().is_none());
     assert_eq!(process.cache.usage().unwrap().metadata, before);
 }
@@ -359,7 +396,7 @@ fn terminal_process_rejects_startup_without_retaining_resources() {
 #[test]
 fn failed_process_stop_still_wakes_registered_sleepers() {
     let (process, _, _) = setup(1);
-    let mut workers = Workers::start(2, Arc::clone(&process), |_, _| panic!("no jobs"))
+    let mut workers = Workers::start(2, Arc::clone(&process), |_, _| panic!("no jobs"), None)
         .unwrap()
         .unwrap();
     process.fail(&mut process.lock(), lifetime::Error::CacheFailed);
@@ -374,7 +411,7 @@ fn failed_process_stop_still_wakes_registered_sleepers() {
 #[test]
 fn first_worker_diagnostic_survives_peer_failure_and_repeated_join() {
     let (process, _, _) = setup(1);
-    let mut workers = Workers::start(2, Arc::clone(&process), |_, _| panic!("no jobs"))
+    let mut workers = Workers::start(2, Arc::clone(&process), |_, _| panic!("no jobs"), None)
         .unwrap()
         .unwrap();
     let original = Error::internal("original compiler error");
@@ -394,7 +431,7 @@ fn first_worker_diagnostic_survives_peer_failure_and_repeated_join() {
 #[test]
 fn worker_diagnostic_cannot_replace_an_earlier_lifecycle_failure() {
     let (process, _, _) = setup(1);
-    let mut workers = Workers::start(1, Arc::clone(&process), |_, _| panic!("no jobs"))
+    let mut workers = Workers::start(1, Arc::clone(&process), |_, _| panic!("no jobs"), None)
         .unwrap()
         .unwrap();
     process.fail(&mut process.lock(), lifetime::Error::CacheFailed);
@@ -410,4 +447,35 @@ fn worker_diagnostic_cannot_replace_an_earlier_lifecycle_failure() {
         "JIT executable cache has failed"
     );
     workers.shutdown().unwrap();
+}
+
+#[test]
+fn failed_pool_start_cancels_pending_warmup_before_joining() {
+    let (process, _, _) = setup(1);
+    let directory = tempfile::tempdir().unwrap();
+    let profile = crate::warmup::Warmup::load(
+        nixe_cpu::profile::ProcessCpuContext::new(
+            nixe_cpu::platform::TargetPlatform::Switch1,
+            nixe_memory::AddressSpaceId::new(1),
+        ),
+        crate::WarmupConfig {
+            directory: directory.path().to_owned(),
+            modules: vec![],
+        },
+    )
+    .unwrap();
+    let task = crate::warmup::Task {
+        profile,
+        memory: Arc::new(nixe_cpu::memory::ExecutionMemory::new()),
+        cpu: nixe_cpu::profile::ProcessCpuContext::new(
+            nixe_cpu::platform::TargetPlatform::Switch1,
+            nixe_memory::AddressSpaceId::new(1),
+        ),
+        arena_size: 0x10000,
+    };
+    let started = Instant::now();
+    assert!(
+        Workers::start_inner(2, process, |_, _| panic!("no HCQ job"), Some(task), Some(1)).is_err()
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

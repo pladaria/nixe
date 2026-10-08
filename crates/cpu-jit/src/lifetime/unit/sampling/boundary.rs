@@ -23,6 +23,20 @@ impl Lifetime {
         samples: &mut Samples,
         edge: ObservedEdge,
     ) -> Result<(), Error> {
+        // Grow from a hot caller into its callee, never from a shared callee
+        // into every caller that returns through it. Captured call sites infer
+        // guarded internal return continuations during graph construction.
+        if edge.kind == EdgeKind::Return {
+            return Ok(());
+        }
+        let observation = (
+            unit.version.get(),
+            instruction.block_key().pc.get(),
+            edge.destination.get(),
+        );
+        if !samples.observe_transfer(observation) {
+            return Ok(());
+        }
         let Some(mut state) = self.sample_state()? else {
             return Ok(());
         };
@@ -102,6 +116,7 @@ impl Lifetime {
                 && target.payload.hcq().is_some()
                 && source_family == target.family
             {
+                samples.settle_transfer(observation);
                 return Ok(());
             }
             if unit.tier == Tier::Hcq || source_family.is_some() || target.family.is_some() {
@@ -119,8 +134,10 @@ impl Lifetime {
                 drop(state);
                 if let Some(snapshot) = samples.boundary(boundary, queue.is_some())
                     && let Some(queue) = queue
+                    && self.admit_reshape(&queue, samples, block, snapshot)?
+                        == crate::lifetime::background::Outcome::Suppressed
                 {
-                    self.admit_reshape(&queue, samples, block, snapshot)?;
+                    samples.settle_transfer(observation);
                 }
                 return Ok(());
             }

@@ -47,20 +47,23 @@ fn queue_deduplicates_priorities_and_never_accepts_foreign_execution_keys() {
 }
 
 #[test]
-fn sample_filter_does_not_follow_calls_returns_or_semantic_boundaries() {
-    for exit in [
-        Exit::Call(Some(key(4))),
-        Exit::Call(None),
-        Exit::Return,
-        Exit::Boundary(End::Architectural),
-    ] {
-        assert!(!permits_sample(&exit, key(4)));
-        let mut queue = Worklist::new(key(0));
-        queue.successors(&exit);
-        assert_eq!(queue.pop(), Some(key(0)));
-        assert_eq!(queue.pop(), None);
+fn sample_filter_follows_calls_but_not_external_returns_or_semantic_boundaries() {
+    for exit in [Exit::Call(Some(key(4))), Exit::Call(None), Exit::Indirect] {
+        assert!(permits_sample(&exit, key(4)));
     }
-    assert!(permits_sample(&Exit::Indirect, key(4)));
+    assert!(!permits_sample(&Exit::Return, key(4)));
+    assert!(!permits_sample(&Exit::Call(Some(key(4))), key(8)));
+    assert!(!permits_sample(&Exit::Boundary(End::Architectural), key(4)));
+    let mut queue = Worklist::new(key(0));
+    queue.successors(&Exit::Call(Some(key(4))));
+    assert_eq!(queue.pop(), Some(key(0)));
+    assert_eq!(queue.pop(), None);
+    queue.sample(Successor {
+        target: key(4),
+        count: 8,
+        sequence: 1,
+    });
+    assert_eq!(queue.pop(), Some(key(4)));
     assert!(permits_sample(
         &Exit::Jump(Target::External(key(4))),
         key(4)

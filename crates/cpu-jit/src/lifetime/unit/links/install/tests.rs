@@ -87,13 +87,15 @@ fn optional_static_bridges_preserve_the_fallback_at_both_cache_limits() {
 fn target_binding(input: &mut Input) {
     use crate::abi::{GuestValue, RegisterClass, ValueBinding};
     input.entries[0].contract.live_in.integer.x.insert(0);
-    input.entries[0].contract.bindings = std::sync::Arc::from([ValueBinding {
+    input.entries[0].contract.bindings = [ValueBinding {
         value: GuestValue::General(0),
         location: ValueLocation::Register {
             class: RegisterClass::Integer,
             index: 0,
         },
-    }]);
+    }]
+    .to_vec()
+    .into();
 }
 
 fn nonempty_target(process: &Lifetime, cursor: &AtomicU64) -> UnitHandle {
@@ -591,6 +593,10 @@ fn retirement_and_shutdown_release_nonempty_bridges_without_retaining_dead_roots
                         bytes: vec![0; bridge_bytes].into_boxed_slice(),
                         alignment: 16,
                         metadata: Metadata {
+                            #[cfg(feature = "jit-profile")]
+                            regions: Box::new([]),
+                            #[cfg(feature = "jit-profile")]
+                            profile_body_length: 0,
                             abi: if cfg!(target_arch = "x86_64") {
                                 HostAbi::X86_64
                             } else {
@@ -698,6 +704,10 @@ fn nonempty_transfer_storage_is_owned_until_unlink_and_then_reused() {
                 bytes: vec![0; bytes].into_boxed_slice(),
                 alignment: 16,
                 metadata: Metadata {
+                    #[cfg(feature = "jit-profile")]
+                    regions: Box::new([]),
+                    #[cfg(feature = "jit-profile")]
+                    profile_body_length: 0,
                     abi,
                     frame_extent: crate::abi::TRANSFER_BYTES,
                     entries: Box::new([]),
@@ -780,10 +790,12 @@ fn far_installed_target(with_bridge: bool) {
         // this synthetic System-ABI chain can execute the owned bridge too.
         input.states[0].state.live.integer.x.insert(0);
         input.states[0].state.dirty_live.integer.x.insert(0);
-        input.states[0].state.bindings = std::sync::Arc::from([crate::abi::ValueBinding {
+        input.states[0].state.bindings = [crate::abi::ValueBinding {
             value: crate::abi::GuestValue::General(0),
             location: ValueLocation::constant(9),
-        }]);
+        }]
+        .to_vec()
+        .into();
     }
     let src = process
         .prepare_unit(&[process.reserve(key(0)).unwrap()], input, &cursor)
@@ -801,6 +813,10 @@ fn far_installed_target(with_bridge: bool) {
                     bytes: vec![0; bytes].into_boxed_slice(),
                     alignment: 16,
                     metadata: Metadata {
+                        #[cfg(feature = "jit-profile")]
+                        regions: Box::new([]),
+                        #[cfg(feature = "jit-profile")]
+                        profile_body_length: 0,
                         abi: HostAbi::Aarch64,
                         frame_extent: crate::abi::TRANSFER_BYTES,
                         entries: Box::new([]),
@@ -831,6 +847,10 @@ fn far_installed_target(with_bridge: bool) {
                         bytes: Box::new([0; 16]),
                         alignment: SEGMENT_BYTES,
                         metadata: Metadata {
+                            #[cfg(feature = "jit-profile")]
+                            regions: Box::new([]),
+                            #[cfg(feature = "jit-profile")]
+                            profile_body_length: 0,
                             abi: HostAbi::Aarch64,
                             frame_extent: crate::abi::TRANSFER_BYTES,
                             entries: Box::new([]),

@@ -60,7 +60,7 @@ fn native_pipeline_key_excludes_dynamic_levels_bindings_and_viewport() {
         inner: [3_f32.to_bits(); 2],
         defined: 63,
     };
-    b.vertex_buffers[0].buffer = BufferRegion {
+    Arc::make_mut(&mut b.vertex_buffers)[0].buffer = BufferRegion {
         buffer: BufferId::new(2),
         range: BufferRange::new(128, 64).unwrap(),
     };
@@ -266,7 +266,7 @@ fn native_pipeline_key_includes_static_state_and_full_shader_identity() {
     b.tessellation.as_mut().unwrap().input_control_points = 3;
     assert!(a != key(b));
     let mut b = prepared();
-    b.vertex_buffers[0].array_stride = 32;
+    Arc::make_mut(&mut b.vertex_buffers)[0].array_stride = 32;
     assert!(a != key(b));
     let mut b = prepared();
     b.depth_state = DepthState::new(true, true, DepthCompareOperation::Less);

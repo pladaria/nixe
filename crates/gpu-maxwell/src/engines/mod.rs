@@ -1042,3 +1042,5 @@ fn dispatch_class_method(
         }),
     }
 }
+
+pub(crate) use memory_copy::ProjectedCopyByte;

@@ -40,7 +40,7 @@ fn resource_cache_does_not_alias_equal_revision_counters_from_different_channels
             .resource_state_identity(&roles, false)
             .matches(second_state)
     );
-    assert!(!first_state.draw_state_identity().matches(second_state));
+    assert!(!first_state.fixed_draw_identity().matches(second_state));
     assert!(!first_state.shader_state_identity().matches(second_state));
     let snapshot = first_state.clone();
     assert!(
@@ -48,7 +48,7 @@ fn resource_cache_does_not_alias_equal_revision_counters_from_different_channels
             .resource_state_identity(&roles, false)
             .matches(&snapshot)
     );
-    assert!(first_state.draw_state_identity().matches(&snapshot));
+    assert!(first_state.fixed_draw_identity().matches(&snapshot));
     assert!(first_state.shader_state_identity().matches(&snapshot));
     let mut cache = MaxwellLoweringCache::default();
     let first = cache
@@ -4142,7 +4142,7 @@ fn render_target_discard_is_a_validated_non_destructive_hint() {
     program_three_d(&mut channel, 0x0fe0, 5);
     program_three_d(&mut channel, 0x0fe4, 0x0800_0000);
     let before = channel.clone();
-    let draw = channel.three_d().draw_state_identity();
+    let draw = channel.three_d().fixed_draw_identity();
     let shaders = channel.three_d().shader_state_identity();
     let resources = channel
         .three_d()
@@ -5079,4 +5079,434 @@ fn srgb_write_selects_linear_or_srgb_color_attachment_views() {
         }
     }
     assert!(dispatch_method(&mut channel, 0x15b8 / 4, 2).is_err());
+}
+
+#[test]
+fn incremental_bindings_retain_unaffected_components_and_recompute_aliases() {
+    let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let mut address_space = resource_address_space();
+    let mapping = map_resource(
+        &mut address_space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        180,
+        0,
+    );
+    let address = mapping.offset().get();
+    let alias = map_resource(
+        &mut address_space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        180,
+        0,
+    )
+    .offset()
+    .get();
+    let mut channel = three_d_channel();
+    for (slot, offset) in [(0, 0), (1, 0x1000)] {
+        for (method, argument) in [
+            (0x2380, 0x100),
+            (0x2384, (address >> 32) as u32),
+            (0x2388, (address + offset) as u32),
+            (0x2410, (slot << 4) | 1),
+        ] {
+            program_three_d(&mut channel, method, argument);
+        }
+    }
+    let roles = [
+        MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 },
+        MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 1 },
+    ];
+    let mut cache = MaxwellLoweringCache::default();
+    let first = cache
+        .resolved_resources_mut()
+        .resolve(channel.three_d(), &address_space, &roles, None, false, 8)
+        .unwrap();
+    assert!(first.aliases().is_empty());
+    // Moving only slot 1 onto a physical alias must reuse slot 0 and rebuild
+    // the alias relationship, while the first in-flight snapshot stays intact.
+    program_three_d(&mut channel, 0x2388, alias as u32);
+    program_three_d(&mut channel, 0x2410, 0x11);
+    let second = cache
+        .resolved_resources_mut()
+        .resolve(channel.three_d(), &address_space, &roles, None, false, 8)
+        .unwrap();
+    let buffer = |resource: &MaxwellThreeDResolvedResource| match resource {
+        MaxwellThreeDResolvedResource::Buffer(buffer) => std::sync::Arc::as_ptr(buffer),
+        _ => panic!("expected buffer"),
+    };
+    assert_eq!(
+        buffer(&first.resources()[0]),
+        buffer(&second.resources()[0])
+    );
+    assert_ne!(
+        buffer(&first.resources()[1]),
+        buffer(&second.resources()[1])
+    );
+    assert_eq!(second.aliases().len(), 1);
+    assert!(first.aliases().is_empty());
+    allocation.write(0, &[0x7b]).unwrap();
+    let third = cache
+        .resolved_resources_mut()
+        .resolve(channel.three_d(), &address_space, &roles, None, false, 8)
+        .unwrap();
+    // Buffer content is independent of its binding interpretation.
+    assert!(std::sync::Arc::ptr_eq(&second, &third));
+    address_space.unmap(mapping.offset()).unwrap();
+    assert!(
+        cache
+            .resolved_resources_mut()
+            .resolve(channel.three_d(), &address_space, &roles, None, false, 8)
+            .is_err()
+    );
+}
+
+#[test]
+fn direct_register_pages_preserve_unset_and_last_write_provenance() {
+    let mut channel = three_d_channel();
+    assert!(
+        channel
+            .three_d_mut()
+            .raw_register(nixe_gpu::GpuMethodId(0x238c))
+            .is_none()
+    );
+    for value in [4, 4, 12] {
+        let dispatch = dispatch_method(&mut channel, 0x238c / 4, value).unwrap();
+        let raw = channel
+            .three_d_mut()
+            .raw_register(nixe_gpu::GpuMethodId(0x238c))
+            .unwrap();
+        assert_eq!(raw.raw(), Some(value));
+        assert_eq!(raw.source(), Some(dispatch.methods()[0].method().source()));
+    }
+    assert!(
+        channel
+            .three_d_mut()
+            .raw_register(nixe_gpu::GpuMethodId(0x4000))
+            .is_none()
+    );
+}
+
+#[test]
+fn constant_buffer_rebinding_shares_fixed_draw_components_and_refreshes_dependencies() {
+    use nixe_gpu::{DescriptorKind, PipelineStages, ResourceUsage};
+    use std::sync::Arc;
+    let mut space = resource_address_space();
+    let memory = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let address = map_resource(
+        &mut space,
+        memory.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+        181,
+        0xfe,
+    )
+    .offset()
+    .get();
+    let mut channel = three_d_channel();
+    program_basic_draw_state(&mut channel, address);
+    program_color_target(&mut channel, 0, address + 0x2000, 0xd5);
+    program_three_d(&mut channel, 0x121c, 1);
+    let (base, mut cache) = translated_graphics_shaders();
+    let role = MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 };
+    let shaders = MaxwellThreeDTranslatedShaders::new(
+        base.shaders().to_vec(),
+        vec![
+            MaxwellThreeDShaderResourceUse::new(
+                role,
+                0,
+                DescriptorKind::Buffer,
+                PipelineStages::VERTEX_SHADER,
+                Some(ResourceUsage::UniformBuffer),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let capabilities =
+        lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
+    let mut draws = Vec::new();
+    for (serial, offset) in [(1, 0x1000), (2, 0x1100)] {
+        for (method, value) in [
+            (0x2380, 0x100),
+            (0x2384, (address >> 32) as u32),
+            (0x2388, (address + offset) as u32),
+            (0x2410, 1),
+        ] {
+            program_three_d(&mut channel, method, value);
+        }
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let operation = &dispatch.operations()[0];
+        let resources = cache
+            .resolved_resources_mut()
+            .resolve(
+                operation.state(),
+                &space,
+                &[
+                    MaxwellThreeDResourceRole::VertexStream(0),
+                    role,
+                    MaxwellThreeDResourceRole::ColorTarget(0),
+                ],
+                None,
+                false,
+                8,
+            )
+            .unwrap();
+        let work = lower_maxwell_three_d_operation(
+            operation.state(),
+            &resources,
+            operation.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(serial),
+            vec![],
+            &capabilities,
+            &mut cache,
+        )
+        .unwrap();
+        let draw = work
+            .submission()
+            .operations()
+            .iter()
+            .find_map(|op| match op.command() {
+                GpuCommand::Draw(draw) => Some(Arc::clone(&draw.prepared)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(draws.last().is_none_or(
+            |old: &Arc<nixe_gpu::PreparedDraw>| old.descriptor_tables != draw.descriptor_tables
+        ));
+        draws.push(draw);
+    }
+    assert!(Arc::ptr_eq(
+        &draws[0].vertex_buffers,
+        &draws[1].vertex_buffers
+    ));
+    assert_eq!(draws[0].pipeline, draws[1].pipeline);
+    // A consuming fixed-state change must invalidate the template.
+    program_three_d(&mut channel, 0x1918, 1);
+    let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+    let op = &dispatch.operations()[0];
+    let resources = cache
+        .resolved_resources_mut()
+        .resolve(
+            op.state(),
+            &space,
+            &[
+                MaxwellThreeDResourceRole::VertexStream(0),
+                role,
+                MaxwellThreeDResourceRole::ColorTarget(0),
+            ],
+            None,
+            false,
+            8,
+        )
+        .unwrap();
+    let work = lower_maxwell_three_d_operation(
+        op.state(),
+        &resources,
+        op.trigger(),
+        Some(&shaders),
+        FrontendSubmissionId::new(3),
+        vec![],
+        &capabilities,
+        &mut cache,
+    )
+    .unwrap();
+    let draw = work
+        .submission()
+        .operations()
+        .iter()
+        .find_map(|op| match op.command() {
+            GpuCommand::Draw(draw) => Some(&draw.prepared),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!Arc::ptr_eq(&draws[1].vertex_buffers, &draw.vertex_buffers));
+}
+
+#[test]
+fn streaming_vertex_rebinding_retains_formats_and_refreshes_inflight_dependencies() {
+    use nixe_gpu::{DescriptorKind, PipelineStages, ResourceUsage};
+    use std::sync::Arc;
+    let mut space = resource_address_space();
+    let memory = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let address = map_resource(
+        &mut space,
+        memory.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+        181,
+        0xfe,
+    )
+    .offset()
+    .get();
+    let mut channel = three_d_channel();
+    program_basic_draw_state(&mut channel, address);
+    program_color_target(&mut channel, 0, address + 0x2000, 0xd5);
+    program_three_d(&mut channel, 0x121c, 1);
+    let (base, mut cache) = translated_graphics_shaders();
+    let role = MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 };
+    let shaders = MaxwellThreeDTranslatedShaders::new(
+        base.shaders().to_vec(),
+        vec![
+            MaxwellThreeDShaderResourceUse::new(
+                role,
+                0,
+                DescriptorKind::Buffer,
+                PipelineStages::VERTEX_SHADER,
+                Some(ResourceUsage::UniformBuffer),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let capabilities =
+        lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
+    let mut draws = Vec::new();
+    for (serial, offset) in [(1, 0x1000), (2, 0x1100), (3, 0x1200), (4, 0x1300)] {
+        // Transient format resets must not invalidate restored final values.
+        let identity = channel.three_d().fixed_draw_identity();
+        program_three_d(&mut channel, 0x1160, 0x3820_0040);
+        program_three_d(&mut channel, 0x1160, 0x3820_0000);
+        assert!(identity.matches(channel.three_d()));
+        // A -> B -> A draws must recover the earlier stable template.
+        program_three_d(&mut channel, 0x1918, u32::from(serial == 3));
+        for (method, value) in [
+            (0x2380, 0x100),
+            (0x2384, (address >> 32) as u32),
+            (0x2388, (address + offset) as u32),
+            (0x2410, 1),
+        ] {
+            program_three_d(&mut channel, method, value);
+        }
+        for (method, value) in [
+            (0x1c08, (address + offset + 0x3000) as u32),
+            (0x1f04, (address + offset + 0x30ff) as u32),
+        ] {
+            program_three_d(&mut channel, method, value);
+        }
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let operation = &dispatch.operations()[0];
+        let resources = cache
+            .resolved_resources_mut()
+            .resolve(
+                operation.state(),
+                &space,
+                &[
+                    MaxwellThreeDResourceRole::VertexStream(0),
+                    role,
+                    MaxwellThreeDResourceRole::ColorTarget(0),
+                ],
+                None,
+                false,
+                8,
+            )
+            .unwrap();
+        let work = lower_maxwell_three_d_operation(
+            operation.state(),
+            &resources,
+            operation.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(serial),
+            vec![],
+            &capabilities,
+            &mut cache,
+        )
+        .unwrap();
+        let draw = work
+            .submission()
+            .operations()
+            .iter()
+            .find_map(|op| match op.command() {
+                GpuCommand::Draw(draw) => Some(Arc::clone(&draw.prepared)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(draws.last().is_none_or(
+            |old: &Arc<nixe_gpu::PreparedDraw>| old.descriptor_tables != draw.descriptor_tables
+        ));
+        draws.push(draw);
+    }
+    assert!(!Arc::ptr_eq(
+        &draws[0].vertex_buffers,
+        &draws[1].vertex_buffers
+    ));
+    assert!(Arc::ptr_eq(
+        &draws[0].vertex_buffers[0].attributes,
+        &draws[1].vertex_buffers[0].attributes
+    ));
+    assert!(!Arc::ptr_eq(
+        &draws[0].vertex_buffers[0].attributes,
+        &draws[2].vertex_buffers[0].attributes
+    ));
+    assert!(Arc::ptr_eq(
+        &draws[0].vertex_buffers[0].attributes,
+        &draws[3].vertex_buffers[0].attributes
+    ));
+    let old = draws[0].vertex_buffers[0].buffer.buffer;
+    let new = draws[1].vertex_buffers[0].buffer.buffer;
+    assert_ne!(old, new);
+    let dependencies = |draw: &Arc<nixe_gpu::PreparedDraw>| {
+        nixe_gpu::GpuOperation::new(
+            GpuCommand::Draw(
+                nixe_gpu::DrawOperation::new(
+                    draw.clone(),
+                    nixe_gpu::DrawArguments::NonIndexed {
+                        first_vertex: 0,
+                        vertex_count: 3,
+                        first_instance: 0,
+                        instance_count: 1,
+                    },
+                )
+                .unwrap(),
+            ),
+            [],
+            [],
+            nixe_gpu::CapabilityRequirements::none(),
+        )
+        .dependencies()
+        .to_vec()
+    };
+    assert!(dependencies(&draws[0]).contains(&nixe_gpu::ResourceDependency::Buffer(old)));
+    assert!(!dependencies(&draws[1]).contains(&nixe_gpu::ResourceDependency::Buffer(old)));
+    assert!(dependencies(&draws[1]).contains(&nixe_gpu::ResourceDependency::Buffer(new)));
+    assert_eq!(draws[0].pipeline, draws[1].pipeline);
+    // A consuming fixed-state change must invalidate the template.
+    program_three_d(&mut channel, 0x1918, 1);
+    let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+    let op = &dispatch.operations()[0];
+    let resources = cache
+        .resolved_resources_mut()
+        .resolve(
+            op.state(),
+            &space,
+            &[
+                MaxwellThreeDResourceRole::VertexStream(0),
+                role,
+                MaxwellThreeDResourceRole::ColorTarget(0),
+            ],
+            None,
+            false,
+            8,
+        )
+        .unwrap();
+    let work = lower_maxwell_three_d_operation(
+        op.state(),
+        &resources,
+        op.trigger(),
+        Some(&shaders),
+        FrontendSubmissionId::new(3),
+        vec![],
+        &capabilities,
+        &mut cache,
+    )
+    .unwrap();
+    let draw = work
+        .submission()
+        .operations()
+        .iter()
+        .find_map(|op| match op.command() {
+            GpuCommand::Draw(draw) => Some(&draw.prepared),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!Arc::ptr_eq(&draws[1].vertex_buffers, &draw.vertex_buffers));
 }

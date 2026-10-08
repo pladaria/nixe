@@ -174,7 +174,7 @@ pub(super) fn validate_limits(
             "native vertex layout exceeds physical binding/attribute limits",
         ));
     }
-    for layout in layouts {
+    for layout in layouts.iter() {
         if layout.array_stride > u64::from(g.vertex_input_binding_stride)
             || layout.attributes.iter().any(|a| {
                 a.offset > u64::from(g.vertex_input_attribute_offset)
@@ -191,7 +191,7 @@ pub(super) fn validate_limits(
             && (input.scalar_type() != nixe_gpu::ShaderScalarType::Float32
                 || !layouts
                     .iter()
-                    .flat_map(|l| &l.attributes)
+                    .flat_map(|l| l.attributes.iter())
                     .any(|a| a.shader_location == u32::from(location)))
         {
             return Err(unsupported(
@@ -235,7 +235,7 @@ pub(super) fn validate_vertex_range(
     // Indexed vertex addresses are fetched by hardware, not scanned/read back on
     // the CPU. The caller requires robust access and a fully backed host range.
     let last = range.map(|(first, count)| u64::from(first) + u64::from(count) - 1);
-    for attribute in &layout.attributes {
+    for attribute in layout.attributes.iter() {
         let bytes = match attribute.format {
             VertexFormat::Float32 => 4,
             VertexFormat::Float32x2 => 8,

@@ -1,3 +1,4 @@
+mod display;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -184,14 +185,23 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     let process_started = Instant::now();
+    let warmup_profile = cpu_configuration.warmup_profile;
     let cpu_backend = select_cpu_backend(cpu_configuration)?;
     let trace_interpreter = matches!(cpu_backend, CpuBackendConfig::Interpreter)
         && log::log_enabled!(log::Level::Trace);
-    let process_builder = ProcessBuilder::new()
+    let mut process_builder = ProcessBuilder::new()
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config())
         .with_cpu_backend(cpu_backend);
+    if warmup_profile
+        && let Some(directory) = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+    {
+        process_builder =
+            process_builder.with_jit_warmup_directory(directory.join("nixe").join("cpu"));
+    }
     let process = process_builder
         .build(&plan)
         .map_err(|error| error.to_string())?;
@@ -461,6 +471,7 @@ mod backend_selection_tests {
         let configured = CpuConfig {
             backend: CpuBackendSelection::Interpreter,
             parallel_vcpus: true,
+            warmup_profile: false,
         };
 
         assert_eq!(
@@ -481,6 +492,7 @@ mod backend_selection_tests {
         let interpreter = select_cpu_backend(CpuConfig {
             backend: CpuBackendSelection::Interpreter,
             parallel_vcpus: true,
+            warmup_profile: false,
         })
         .unwrap();
         assert!(matches!(interpreter, CpuBackendConfig::Interpreter));
@@ -580,12 +592,28 @@ fn execute_worker(
         coordinator: &mut coordinator,
         process_id,
     };
+    let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
+        horizon_environment.operation_mode,
+        horizon_environment.time,
+        horizon_environment.settings,
+        execution_video,
+    )
+    .with_diagnostics(horizon_environment.diagnostics)
+    .with_audio_backend(audio_backend)
+    .with_vibration_output(host_input.vibration.clone());
+    if let Some(save_data) = horizon_environment.save_data {
+        dispatcher = dispatcher.with_save_data(save_data);
+    }
+    if let Some(locked) = horizon_environment.user_account_switch_locked {
+        dispatcher = dispatcher.with_user_account_switch_lock(locked);
+    }
+    if let Some(language) = horizon_environment.application_language {
+        dispatcher = dispatcher.with_application_language(language);
+    }
     let mut execution = execute(
         &mut scheduled,
-        horizon_environment,
-        execution_video,
+        &mut dispatcher,
         &mut host_input,
-        audio_backend,
         trace_interpreter,
     );
     log::debug!(
@@ -598,6 +626,9 @@ fn execute_worker(
             Err(original) => format!("{original}; cannot quiesce CPU workers: {error}"),
         });
     }
+    // Join/cancel frontend and storage jobs while CPU admission and canonical
+    // mappings still exist, then drain the backend before removing the process.
+    drop(dispatcher);
     // Stop and join GPU work while its
     // canonical memory transitions can still use the JIT coordinator. Removing
     // the process closes native admission and would reject those transitions.
@@ -689,33 +720,14 @@ struct ScheduledProcess<'a> {
 
 fn execute(
     scheduled: &mut ScheduledProcess<'_>,
-    horizon_environment: HorizonEnvironment,
-    video_system: VideoSystem,
+    dispatcher: &mut HorizonSvcDispatcher,
     host_input: &mut HostInputReaders,
-    audio_backend: Arc<dyn nixe_audio::AudioBackend>,
     trace_interpreter: bool,
 ) -> Result<ExecutionSummary, String> {
     let coordinator = &mut *scheduled.coordinator;
     let process_id = scheduled.process_id;
-    let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
-        horizon_environment.operation_mode,
-        horizon_environment.time,
-        horizon_environment.settings,
-        video_system,
-    )
-    .with_diagnostics(horizon_environment.diagnostics)
-    .with_audio_backend(audio_backend)
-    .with_vibration_output(host_input.vibration.clone());
-    if let Some(save_data) = horizon_environment.save_data {
-        dispatcher = dispatcher.with_save_data(save_data);
-    }
-    if let Some(locked) = horizon_environment.user_account_switch_locked {
-        dispatcher = dispatcher.with_user_account_switch_lock(locked);
-    }
-    if let Some(language) = horizon_environment.application_language {
-        dispatcher = dispatcher.with_application_language(language);
-    }
     let execution_started = Instant::now();
+    let display_clock = display::DisplayClock::start(dispatcher.video_system(), execution_started)?;
     let execution_rate_enabled = log::log_enabled!(log::Level::Info);
     let mut execution_completions = 0_u64;
     let mut last_rate_completions = 0_u64;
@@ -737,12 +749,15 @@ fn execute(
             {
                 return Err("host stop could not terminate the guest process cleanly".to_owned());
             }
-            return Ok(execution_summary(&dispatcher, rejected.len()));
+            return Ok(execution_summary(dispatcher, rejected.len()));
         }
         let elapsed = execution_started.elapsed();
-        dispatcher
-            .advance_video(elapsed)
-            .map_err(|error| error.to_string())?;
+        display_clock.require_healthy()?;
+        dispatcher.require_graphics_healthy().map_err(|error| {
+            dump_maxwell_pushbuffer_on_ipc_fault(&error);
+            error.to_string()
+        })?;
+        let input_trace = nixe_trace::Span::new("host.input", 0, 0);
         if let Some(sample) = host_input
             .controller
             .take_latest()
@@ -785,26 +800,24 @@ fn execute(
                 .map_err(|error| format!("cannot publish Horizon touch-screen state: {error}"))?;
             last_input_sample = Some(sample.captured_at);
         }
-        let executions: Vec<_> = match coordinator.execution_mode() {
-            VcpuExecutionMode::Deterministic => coordinator
-                .run_next_adaptive()
-                .map(|execution| execution.into_iter().collect()),
-            VcpuExecutionMode::Parallel => coordinator
-                .run_parallel_adaptive()
-                .map(|execution| execution.into_iter().collect()),
+        drop(input_trace);
+        let scheduler_trace = nixe_trace::Span::new("coordinator.reconcile", 0, 0);
+        let execution = match coordinator.execution_mode() {
+            VcpuExecutionMode::Deterministic => coordinator.run_next_adaptive(),
+            VcpuExecutionMode::Parallel => coordinator.run_parallel_adaptive(),
         }
         .map_err(|error| error.to_string())?;
-        if executions.is_empty() {
-            let host_wait = host_service_wait_duration(
-                execution_started.elapsed(),
-                dispatcher.next_video_deadline(),
-            );
+        drop(scheduler_trace);
+        if execution.is_none() {
+            let host_wait = Duration::from_millis(100);
+            let _trace = nixe_trace::Span::new("coordinator.idle", 0, host_wait.as_nanos() as u64);
             coordinator
                 .wait_for_external_event_for(host_wait)
                 .map_err(|error| error.to_string())?;
+            nixe_trace::event("coordinator.wake", 0, 0);
             continue;
         }
-        for execution in executions {
+        if let Some(execution) = execution {
             let report = execution.report;
             if execution_rate_enabled {
                 execution_completions = execution_completions.wrapping_add(1);
@@ -882,7 +895,7 @@ fn execute(
                             if coordinator.process(process_id).is_some_and(|process| {
                                 process.lifecycle() == nixe_scheduler::ProcessLifecycle::Exited
                             }) {
-                                return Ok(execution_summary(&dispatcher, rejected.len()));
+                                return Ok(execution_summary(dispatcher, rejected.len()));
                             }
                         }
                         ExceptionHandlingResult::Suspended => {}
@@ -893,7 +906,7 @@ fn execute(
                     }
                 }
                 ExecutionStop::LoaderReturn { .. } => {
-                    return Ok(execution_summary(&dispatcher, rejected.len()));
+                    return Ok(execution_summary(dispatcher, rejected.len()));
                 }
                 stop => return Err(execution_stop_error(stop, &report)),
             }
@@ -905,6 +918,10 @@ fn dump_maxwell_pushbuffer_on_fault(fault: &HorizonSvcFault) {
     let HorizonSvcFault::Ipc { fault, .. } = fault else {
         return;
     };
+    dump_maxwell_pushbuffer_on_ipc_fault(fault);
+}
+
+fn dump_maxwell_pushbuffer_on_ipc_fault(fault: &nixe_horizon::HorizonIpcFault) {
     let Some(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { boundary, .. }) =
         fault.unsupported_nvdrv()
     else {
@@ -992,10 +1009,6 @@ fn report_input_change(
         None => log::warn!("no matching first-gamepad input profile; player one is disconnected"),
     }
     *active = next;
-}
-
-fn host_service_wait_duration(now: Duration, next_video_deadline: Duration) -> Duration {
-    next_video_deadline.saturating_sub(now)
 }
 
 fn button_transitions(
@@ -1223,22 +1236,6 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<RunnableProcess>();
-    }
-
-    #[test]
-    fn host_service_wait_is_bounded_by_the_next_video_deadline() {
-        assert_eq!(
-            host_service_wait_duration(Duration::from_millis(7), Duration::from_millis(12)),
-            Duration::from_millis(5)
-        );
-        assert_eq!(
-            host_service_wait_duration(Duration::from_millis(12), Duration::from_millis(12)),
-            Duration::ZERO
-        );
-        assert_eq!(
-            host_service_wait_duration(Duration::from_millis(13), Duration::from_millis(12)),
-            Duration::ZERO
-        );
     }
 
     #[test]

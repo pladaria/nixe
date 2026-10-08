@@ -226,6 +226,7 @@ pub struct VideoSystem {
 
 #[derive(Clone, Copy, Debug)]
 struct ReleasedSlot {
+    sequence: u64,
     binder_id: i32,
     slot: i32,
 }
@@ -238,6 +239,11 @@ struct ResidentSlotLease {
 
 impl Drop for ResidentSlotLease {
     fn drop(&mut self) {
+        nixe_trace::event(
+            "frame.release",
+            self.released.sequence,
+            self.released.slot as u64,
+        );
         self.released_slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -613,7 +619,19 @@ impl VideoSystem {
                     "QueueBuffer reservation lost slot ownership",
                 ));
             }
+            let sequence = state.next_frame_sequence;
+            state.next_frame_sequence = sequence.checked_add(1).expect("frame sequence exhausted");
+            nixe_trace::event("frame.queued", sequence, binder_id as u64);
+            for fence in &request.input.acquire_fences {
+                nixe_trace::event(
+                    "frame.acquire_fence",
+                    sequence,
+                    (u64::from(fence.point.syncpoint().get()) << 32)
+                        | u64::from(fence.point.value().get()),
+                );
+            }
             state.pending_frames.push_back(PendingFrame {
+                sequence,
                 binder_id,
                 slot: request.slot,
                 acquire_fences: request.input.acquire_fences,
@@ -649,9 +667,11 @@ impl VideoSystem {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _trace = nixe_trace::Span::new("display.advance", 0, 0);
         self.drain_released_slots(&mut state);
         let ticks = state.display_clock.advance(elapsed);
         if ticks.crossed != 0 {
+            nixe_trace::event("display.deadline", ticks.latest_sequence, ticks.crossed);
             state.vsync_event.signal();
         }
         for _ in 0..ticks.crossed {
@@ -682,8 +702,9 @@ impl VideoSystem {
             };
             let pending = state.pending_frames.pop_front().unwrap();
             if let Some(presentation) = pending.presentation {
-                let sequence = state.next_frame_sequence;
-                state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
+                let sequence = pending.sequence;
+                nixe_trace::event("frame.acquire_ready", sequence, 0);
+                nixe_trace::event("frame.latched", sequence, ticks.latest_sequence);
                 let frame = Arc::new(PresentationFrame::new(
                     image.expect("a ready presentation owns its resident image"),
                     presentation.crop,
@@ -692,6 +713,7 @@ impl VideoSystem {
                     Arc::new(ResidentSlotLease {
                         released_slots: Arc::clone(&self.released_slots),
                         released: ReleasedSlot {
+                            sequence,
                             binder_id: pending.binder_id,
                             slot: pending.slot,
                         },
@@ -846,6 +868,7 @@ pub(crate) struct BinderTransaction {
 
 #[derive(Debug)]
 struct PendingFrame {
+    sequence: u64,
     binder_id: i32,
     slot: i32,
     acquire_fences: Box<[NvFence]>,
@@ -1830,6 +1853,7 @@ mod tests {
                 .unwrap()
                 .pending_frames
                 .push_back(PendingFrame {
+                    sequence: 1,
                     binder_id: 1,
                     slot: 0,
                     acquire_fences: Box::default(),

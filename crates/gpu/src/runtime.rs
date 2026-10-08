@@ -242,6 +242,11 @@ impl<D: BackendDriver> BackendRuntime<D> {
             .pending
             .pop_front()
             .expect("checked pending submission remains at the front");
+        nixe_trace::event(
+            "gpu.device_complete",
+            pending.frontend.get(),
+            pending.visibility.get(),
+        );
         self.backend
             .release_submission(pending.token)
             .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?;
@@ -287,6 +292,11 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
                 return Err(BackendRuntimeError::UnknownResource(*dependency));
             }
         }
+        let _trace = nixe_trace::Span::new(
+            "gpu.backend_submit",
+            submission.id().get(),
+            u64::from(submission.segment().get()),
+        );
         let raw_point = self.next_visibility;
         self.next_visibility = self
             .next_visibility

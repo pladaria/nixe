@@ -16,7 +16,7 @@ mod completion;
 mod execution;
 mod fallback;
 mod lifecycle;
-mod rsb;
+mod returns;
 mod sampling;
 mod shutdown;
 mod worker;
@@ -44,7 +44,6 @@ fn breakpoint(thread: &mut JitThread, worker: &mut NativeWorker, immediate: u16)
     state.set_pc(PC.get());
     let (Some(invocation::Exit::Native { guest, .. }), budget) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             worker,
             &mut state,
             PollBudget::new(4096, 10).unwrap(),
@@ -69,7 +68,6 @@ fn demanded_kernel_executes_native_code_and_recompiles_after_bound_memory_mutati
     state.set_pc(PC.get());
     let (exit, budget) = thread
         .invoke(
-            &mut crate::ReturnStack::default(),
             &mut worker,
             &mut state,
             PollBudget::new(4096, 10).unwrap(),
@@ -93,7 +91,6 @@ fn demanded_kernel_executes_native_code_and_recompiles_after_bound_memory_mutati
     assert!(
         thread
             .invoke(
-                &mut crate::ReturnStack::default(),
                 &mut worker,
                 &mut state,
                 PollBudget::new(4096, 10).unwrap(),
@@ -121,44 +118,6 @@ fn vcpus_share_published_code_but_register_fault_stacks_on_the_executing_worker(
         .join()
         .unwrap();
     breakpoint(&mut first, &mut worker, 1);
-}
-
-#[test]
-fn guest_return_predictions_survive_native_slices_and_vcpu_migration() {
-    let process = Arc::new(JitProcess::new(cpu(), memory(DirectBackendPolicy::Required)).unwrap());
-    let mut first = JitThread::new(process.clone()).unwrap();
-    let mut second = JitThread::new(process.clone()).unwrap();
-    assert!(matches!(first.demand(PC).unwrap(), Demand::Ready));
-    let key = first.key(PC.checked_add(64).unwrap()).unwrap();
-    let mut returns = crate::ReturnStack {
-        entries: [crate::rsb::Continuation::from(key); crate::rsb::CAPACITY],
-        head: 0,
-        depth: 16,
-    };
-    let original = returns.clone();
-    let mut worker = NativeWorker::default();
-    for index in [0, 1, 0] {
-        let thread = if index == 0 { &mut first } else { &mut second };
-        let mut state = A64State::default();
-        state.set_pc(PC.get()); // NOP; BRK, neither modifies the return stack.
-        let (Some(invocation::Exit::Native { guest, .. }), budget) = thread
-            .invoke(
-                &mut returns,
-                &mut worker,
-                &mut state,
-                PollBudget::new(4096, 10).unwrap(),
-                &VcpuEventState::default(),
-            )
-            .unwrap()
-        else {
-            panic!("expected native breakpoint")
-        };
-        assert_eq!(guest.kind, EdgeKind::Breakpoint(1));
-        assert_eq!(budget.slice_remaining, 9);
-        assert_eq!(returns, original);
-    }
-    assert!(process.lifetime.try_shutdown().unwrap());
-    assert_eq!(returns, original); // Scalar guest keys own no native storage.
 }
 
 #[test]

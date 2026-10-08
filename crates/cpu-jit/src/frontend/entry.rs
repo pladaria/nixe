@@ -4,11 +4,15 @@ use super::*;
 use crate::abi::EntryContract;
 use cranelift_codegen::nixe::Location;
 
+mod plan;
+pub(crate) use plan::Plan;
+
 pub(crate) fn contract(
     abi: HostAbi,
     allocated: &AllocatedBoundary<'_>,
     inputs: &[GuestValue],
     flags: Option<u8>,
+    discard: StateSet,
 ) -> Result<EntryContract, Error> {
     let map = allocated.map;
     if !map.entry || map.values.len() != inputs.len() + usize::from(flags.is_some()) {
@@ -41,6 +45,7 @@ pub(crate) fn contract(
     let entry = EntryContract {
         abi,
         live_in: live,
+        discard,
         bindings: allocated.bindings(&operands).map_err(fail)?,
         nzcv,
     };

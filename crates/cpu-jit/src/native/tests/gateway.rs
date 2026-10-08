@@ -119,8 +119,7 @@ fn polled_exits_share_writeback_and_preserve_each_cold_entry_contract() {
                 spill(2048, 8),
                 ValueLocation::constant(0x123456789abcdef0),
             ] {
-                let (shared, _) =
-                    super::super::canonical::emit_polled_exit(&source, pc, &[], false).unwrap();
+                let (shared, _) = super::super::canonical::emit_polled_exit(&source, pc).unwrap();
                 let dispatch =
                     super::super::canonical::emit_dispatch_fallback(&source, pc, 0).unwrap();
                 let exit = emit_canonical_exit(&source, pc, NativeExitReason::Control, 0).unwrap();
@@ -139,8 +138,7 @@ fn polled_exits_share_writeback_and_preserve_each_cold_entry_contract() {
                                 state_map: 0,
                             };
                             let (shared, [_, control]) =
-                                super::super::canonical::emit_polled_exit(&source, pc, &[], false)
-                                    .unwrap();
+                                super::super::canonical::emit_polled_exit(&source, pc).unwrap();
                             let mut bytes = landing(abi);
                             bytes.extend(emit_canonical_entry(&entry).unwrap());
                             // Initialize the explicit spill PC even when this complete

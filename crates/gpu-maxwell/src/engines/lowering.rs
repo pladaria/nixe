@@ -300,9 +300,8 @@ impl MaxwellThreeDShaderResourceUse {
 /// fabricated shader or an empty pipeline.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDTranslatedShaders {
-    identity: Arc<()>,
-    shaders: Box<[MaxwellThreeDTranslatedShader]>,
-    resources: Box<[MaxwellThreeDShaderResourceUse]>,
+    shaders: Arc<[MaxwellThreeDTranslatedShader]>,
+    resources: Arc<[MaxwellThreeDShaderResourceUse]>,
 }
 
 impl MaxwellThreeDTranslatedShaders {
@@ -328,9 +327,8 @@ impl MaxwellThreeDTranslatedShaders {
             }
         }
         Ok(Self {
-            identity: Arc::new(()),
-            shaders: shaders.into_boxed_slice(),
-            resources: resources.into_boxed_slice(),
+            shaders: shaders.into(),
+            resources: resources.into(),
         })
     }
     #[must_use]
@@ -340,14 +338,6 @@ impl MaxwellThreeDTranslatedShaders {
     #[must_use]
     pub fn resources(&self) -> &[MaxwellThreeDShaderResourceUse] {
         &self.resources
-    }
-
-    fn identity(&self) -> Arc<()> {
-        Arc::clone(&self.identity)
-    }
-
-    fn has_identity(&self, identity: &Arc<()>) -> bool {
-        Arc::ptr_eq(&self.identity, identity)
     }
 }
 
@@ -495,6 +485,138 @@ impl ViewKey {
 }
 
 impl MaxwellLoweringCache {
+    /// Retains physical identity for resource versions used by ordered transfers.
+    /// Capture new views before cache eviction can remove their records.
+    pub(crate) fn resident_resources(
+        &self,
+        creations: Option<&[BackendResourceCreateInfo]>,
+    ) -> Vec<crate::execution::residency::ResidentResource> {
+        self.views
+            .iter()
+            .filter(|record| {
+                creations.is_none_or(|creations| {
+                    creations
+                        .iter()
+                        .any(|creation| creation.dependency() == record.dependency)
+                })
+            })
+            .map(|record| crate::execution::residency::ResidentResource {
+                dependency: record.dependency,
+                backings: (0..record.key.backing_count())
+                    .map(|index| {
+                        record
+                            .key
+                            .backing(index)
+                            .expect("bounded backing index")
+                            .clone()
+                    })
+                    .collect(),
+                buffer_offset: match record.key {
+                    ViewKey::Buffer { buffer_offset, .. } => Some(buffer_offset),
+                    _ => None,
+                },
+            })
+            .collect()
+    }
+
+    pub(crate) fn resident_image_copy(
+        &self,
+        operation: crate::MaxwellMemoryCopyOperation,
+        source: &crate::MaxwellResolvedRange,
+        destination: &crate::MaxwellResolvedRange,
+    ) -> Option<nixe_gpu::CopyOperation> {
+        if operation.has_remap() {
+            return None;
+        }
+        let region = |target: &crate::MaxwellResolvedRange, transfer_layout| {
+            let [segment] = target.segments() else {
+                return None;
+            };
+            self.views.iter().find_map(|record| {
+                if record.materialization != ViewMaterialization::Direct {
+                    return None;
+                }
+                let ViewKey::Image {
+                    description,
+                    bindings,
+                    ..
+                } = &record.key
+                else {
+                    return None;
+                };
+                let ResourceDependency::Image(image) = record.dependency else {
+                    return None;
+                };
+                let [(subresources, layout, backing)] = bindings.as_ref() else {
+                    return None;
+                };
+                if description.samples() != nixe_gpu::SampleCount::One
+                    || subresources.layer_count != 1
+                    || description.extent().depth != 1
+                    || backing.allocation().get() != segment.mapping().allocation().get()
+                    || backing.allocation_offset() != segment.backing_offset()
+                    || backing.size() != target.size()
+                {
+                    return None;
+                }
+                let row = description.extent().width.checked_mul(u32::from(
+                    description
+                        .format()
+                        .plane_bytes_per_texel(subresources.plane)?,
+                ))?;
+                if operation.width != row || operation.height != description.extent().height {
+                    return None;
+                }
+                let matches = match (transfer_layout, layout) {
+                    (
+                        super::memory_copy::MaxwellMemoryCopyLayout::Pitch { pitch },
+                        nixe_gpu::ImageMemoryLayout::PitchLinear { row_pitch, .. },
+                    ) => u64::from(pitch) == *row_pitch,
+                    (
+                        super::memory_copy::MaxwellMemoryCopyLayout::BlockLinear {
+                            surface_width,
+                            x: 0,
+                            y: 0,
+                            block_height_log2,
+                            ..
+                        },
+                        nixe_gpu::ImageMemoryLayout::BlockLinear(layout),
+                    ) => surface_width == row && block_height_log2 == layout.block_height_log2,
+                    _ => false,
+                };
+                matches.then_some((
+                    ImageRegion {
+                        image,
+                        subresources: *subresources,
+                        origin: ImageOrigin { x: 0, y: 0, z: 0 },
+                        extent: description.extent(),
+                    },
+                    description.format(),
+                ))
+            })
+        };
+        let (source_region, format) = region(source, operation.source_layout)?;
+        let (destination_region, destination_format) =
+            region(destination, operation.destination_layout)?;
+        if format != destination_format || source_region.image == destination_region.image {
+            return None;
+        }
+        let source_backing = crate::projection::canonical(source).ok()?;
+        let destination_backing = crate::projection::canonical(destination).ok()?;
+        if source_backing.segments().iter().any(|a| {
+            destination_backing
+                .segments()
+                .iter()
+                .any(|b| a.page() == b.page())
+        }) {
+            return None;
+        }
+        Some(nixe_gpu::CopyOperation::ImageToImage {
+            source: source_region,
+            destination: destination_region,
+        })
+    }
+
     pub(crate) fn inline_image_word(
         &self,
         target: &crate::MaxwellResolvedRange,
@@ -679,24 +801,26 @@ fn inline_block_linear_position(offset: u64, width: u32, block_height_log2: u8) 
 
 fn same_canonical_backing(left: &nixe_gpu::BackingView, right: &nixe_gpu::BackingView) -> bool {
     nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::CanonicalBackingComparisons, 1);
+    if left.range().shares_layout(right.range()) {
+        return true;
+    }
     // Reject distinct byte coverage using the compressed span index before
     // comparing potentially thousands of retained page segments. The ordered
     // segment comparison below still distinguishes differently ordered aliases.
     if left.canonical_spans() != right.canonical_spans() {
         return false;
     }
-    left.range() == right.range()
-        || (left.range().segments().len() == right.range().segments().len()
-            && left
-                .range()
-                .segments()
-                .iter()
-                .zip(right.range().segments())
-                .all(|(left, right)| {
-                    left.page() == right.page()
-                        && left.offset() == right.offset()
-                        && left.size() == right.size()
-                }))
+    left.range().segments().len() == right.range().segments().len()
+        && left
+            .range()
+            .segments()
+            .iter()
+            .zip(right.range().segments())
+            .all(|(left, right)| {
+                left.page() == right.page()
+                    && left.offset() == right.offset()
+                    && left.size() == right.size()
+            })
 }
 
 /// Exact neutral descriptions and layouts are checked by the caller. Color
@@ -831,12 +955,29 @@ struct DescriptorRecord {
     id: DescriptorTableId,
 }
 
+// Resource rebinding does not change these fixed-state checks. Incremental
+// register contents include consuming configuration; memory/alias checks remain below.
+#[derive(Clone, Debug)]
+struct DrawValidationRecord {
+    indexed: bool,
+    state: super::threed::state::MaxwellThreeDFixedDrawIdentity,
+    raster: raster::DrawRasterState,
+    tessellation: Option<nixe_gpu::TessellationState>,
+}
+
 #[derive(Debug)]
 struct PreparedDrawRecord {
     indexed: bool,
-    state: super::threed::state::MaxwellThreeDDrawStateIdentity,
-    resources: Arc<()>,
-    shaders: Arc<()>,
+    state: super::threed::state::MaxwellThreeDFixedDrawIdentity,
+    components: Box<[MaxwellThreeDResolvedResource]>,
+    samplers: Box<[super::threed::MaxwellThreeDResolvedSampler]>,
+    bindings: Box<[Option<ResourceDependency>]>,
+    sampler_bindings: Box<[(MaxwellThreeDResourceRole, ResourceDependency)]>,
+    consumed: Arc<[usize]>,
+    vertex_streams: Arc<[u8]>,
+    shader_accesses: Arc<[ResourceAccess]>,
+    shader_dependencies: Arc<[ResourceDependency]>,
+    shaders: MaxwellThreeDTranslatedShaders,
     operations: [GpuOperation; 3],
     dirty_images: Arc<[usize]>,
     sampled_aliases: Box<[ResourceDependency]>,
@@ -846,20 +987,24 @@ impl PreparedDrawRecord {
     fn matches(
         &self,
         state: &MaxwellThreeDState,
-        resources: &MaxwellThreeDResolvedResources,
         shaders: &MaxwellThreeDTranslatedShaders,
         indexed: bool,
     ) -> bool {
         self.indexed == indexed
+            && state.vertex_input().primitive().active_begin().is_some()
             && self.state.matches(state)
-            && resources.has_identity(&self.resources)
-            && shaders.has_identity(&self.shaders)
+            && shaders == &self.shaders
     }
 
     fn operations(
         &self,
         arguments: DrawArguments,
     ) -> Result<[GpuOperation; 3], MaxwellLoweringError> {
+        if let GpuCommand::Draw(draw) = self.operations[1].command()
+            && draw.prepared.triangle_rasterization == TriangleRasterization::FillRectangle
+        {
+            validate_fill_rectangle_arguments(draw.prepared.topology, arguments)?;
+        }
         Ok([
             self.operations[0].clone(),
             self.operations[1]
@@ -869,6 +1014,18 @@ impl PreparedDrawRecord {
         ])
     }
 }
+
+/// Stable validation/layout plus the latest immutable binding snapshot.
+/// Retirement drops the snapshot while retaining the reusable fixed plan.
+#[derive(Debug)]
+struct DrawPlan {
+    validation: DrawValidationRecord,
+    shaders: MaxwellThreeDTranslatedShaders,
+    vertex_streams: Arc<[u8]>,
+    draw: Arc<PreparedDraw>,
+    prepared: Option<Arc<PreparedDrawRecord>>,
+}
+const MAX_CACHED_DRAW_PLANS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SamplerRecord {
@@ -1024,7 +1181,9 @@ pub struct MaxwellLoweringCache {
     compute_shaders: FingerprintCache<compute::ComputeShaderRecord>,
     render_passes: Vec<RenderPassRecord>,
     descriptors: Vec<DescriptorRecord>,
-    prepared_draw: Option<PreparedDrawRecord>,
+    prepared_draw: Option<Arc<PreparedDrawRecord>>,
+    draw_plans: std::collections::VecDeque<DrawPlan>,
+    validated_draw: Option<DrawValidationRecord>,
     samplers: Vec<SamplerRecord>,
     shader_translation_sets: FingerprintCache<ShaderTranslationSetRecord>,
     shader_translation_sources: FingerprintCache<ShaderTranslationSourceRecord>,
@@ -1061,6 +1220,8 @@ impl MaxwellLoweringCache {
             render_passes: Vec::new(),
             descriptors: Vec::new(),
             prepared_draw: None,
+            draw_plans: std::collections::VecDeque::new(),
+            validated_draw: None,
             samplers: Vec::new(),
             shader_translation_sets: FingerprintCache::default(),
             shader_translation_sources: FingerprintCache::default(),
@@ -1170,7 +1331,13 @@ impl MaxwellLoweringCache {
         &mut self,
         source: MaxwellShaderTranslationSourceKey<'_>,
         address_space: &crate::MaxwellGpuAddressSpace,
-    ) -> Result<Arc<[MaxwellTranslatedShaderProgram]>, MaxwellShaderTranslationError> {
+    ) -> Result<
+        (
+            MaxwellShaderTranslationInputs,
+            Arc<[MaxwellTranslatedShaderProgram]>,
+        ),
+        MaxwellShaderTranslationError,
+    > {
         let source_fingerprint = source.fingerprint();
         if let Some(record) = self.shader_translation_sources.get(source_fingerprint) {
             #[cfg(debug_assertions)]
@@ -1179,7 +1346,7 @@ impl MaxwellLoweringCache {
                 "XXH3-128 collision or incomplete shader-source cache key"
             );
             if record.inputs.source_is_current(address_space) {
-                return Ok(Arc::clone(&record.programs));
+                return Ok((record.inputs.clone(), Arc::clone(&record.programs)));
             }
         }
 
@@ -1195,7 +1362,7 @@ impl MaxwellLoweringCache {
             ShaderTranslationSourceRecord {
                 #[cfg(debug_assertions)]
                 source,
-                inputs,
+                inputs: inputs.clone(),
                 programs: Arc::clone(&programs),
             },
         );
@@ -1203,7 +1370,7 @@ impl MaxwellLoweringCache {
             let (evicted, _) = self.shader_translation_sources.remove_lru();
             log::debug!("Maxwell shader source cache evicted LRU set: fingerprint={evicted:032x}");
         }
-        Ok(programs)
+        Ok((inputs, programs))
     }
 
     /// Reuses the shader set directly from the retained semantic state before
@@ -1224,14 +1391,7 @@ impl MaxwellLoweringCache {
         }
 
         let source = prepare_maxwell_shader_translation_source(state, staged_writes)?;
-        let fingerprint = source.fingerprint();
-        let programs = self.resolve_shader_translation_source(source, address_space)?;
-        let inputs = self
-            .shader_translation_sources
-            .get(fingerprint)
-            .expect("resolved shader source was retained")
-            .inputs
-            .clone();
+        let (inputs, programs) = self.resolve_shader_translation_source(source, address_space)?;
         self.shader_state = Some(ShaderStateRecord {
             state: state.shader_state_identity(),
             inputs,
@@ -1433,6 +1593,16 @@ impl MaxwellLoweringCache {
             }) {
                 self.prepared_draw = None;
             }
+            for template in &mut self.draw_plans {
+                if template
+                    .shaders
+                    .shaders
+                    .iter()
+                    .any(|shader| shader.shader == retired.id)
+                {
+                    template.prepared = None;
+                }
+            }
             self.retired_resources
                 .push(ResourceDependency::Shader(retired.id));
         }
@@ -1477,6 +1647,7 @@ impl MaxwellLoweringCache {
 
 /// Committed frontend record retained independently from backend handles.
 pub struct MaxwellLoweredWork {
+    pub(crate) resident_resources: Box<[crate::execution::residency::ResidentResource]>,
     creations: Box<[BackendResourceCreateInfo]>,
     invalidations: Box<[ResourceDependency]>,
     submission: OperationSubmission,
@@ -1484,6 +1655,9 @@ pub struct MaxwellLoweredWork {
 }
 
 impl MaxwellLoweredWork {
+    pub(crate) fn take_resource_creations(&mut self) -> Box<[BackendResourceCreateInfo]> {
+        std::mem::take(&mut self.creations)
+    }
     #[must_use]
     pub fn resource_creations(&self) -> &[BackendResourceCreateInfo] {
         &self.creations
@@ -1556,393 +1730,441 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         && let Some(shaders) = translated_shaders
     {
         let arguments = draw_arguments(state, trigger)?;
+        let lookup = nixe_trace::Span::new("gpu.prepared_draw_lookup", 0, 0);
         let prepared = cache
             .prepared_draw
             .as_ref()
-            .filter(|prepared| {
-                prepared.matches(state, resources, shaders, trigger.is_indexed())
-                    && prepared.sampled_aliases.iter().all(|dependency| {
-                        cache
-                            .views
-                            .iter()
-                            .find(|record| record.dependency == *dependency)
-                            .is_some_and(|record| sampled_alias::copy_is_current(record, cache))
-                    })
-            })
-            .map(|prepared| {
-                Ok::<_, MaxwellLoweringError>((
-                    prepared.operations(arguments)?,
-                    Arc::clone(&prepared.dirty_images),
-                ))
-            })
-            .transpose()?;
-        if let Some((commands, dirty_images)) = prepared {
+            .filter(|record| record.matches(state, shaders, trigger.is_indexed()))
+            .cloned()
+            .or_else(|| {
+                cache
+                    .draw_plans
+                    .iter()
+                    .rev()
+                    .filter_map(|template| template.prepared.as_ref())
+                    .find(|record| record.matches(state, shaders, trigger.is_indexed()))
+                    .cloned()
+            });
+        drop(lookup);
+        if let Some(prepared) = prepared
+            && let Some(work) = refresh_draw_bindings(resources, arguments, &prepared, cache)?
+        {
+            let dirty_images = Arc::clone(&work.record.dirty_images);
+            let commands = work.record.operations(arguments)?;
             for index in dirty_images.iter() {
-                let image = resolved_image(resources, *index)?;
-                record_image_write(image, cache);
+                record_image_write(resolved_image(resources, *index)?, cache);
             }
-            let invalidations = std::mem::take(&mut cache.retired_resources);
+            for template in &mut cache.draw_plans {
+                if template.validation.indexed == trigger.is_indexed()
+                    && template.validation.state.matches(state)
+                    && template.shaders == *shaders
+                {
+                    if let GpuCommand::Draw(draw) = work.record.operations[1].command() {
+                        template.draw = Arc::clone(&draw.prepared);
+                    }
+                    template.prepared = Some(Arc::clone(&work.record));
+                    break;
+                }
+            }
+            cache.prepared_draw = Some(work.record);
             return finish_lowered_work(
                 cache,
                 submission,
                 predecessors,
-                Vec::new(),
-                invalidations,
+                work.creations,
+                work.invalidations,
                 commands,
                 dirty_images,
             );
         }
     }
-    let mut raster_state = None;
-    let tessellation = if trigger.is_draw() {
-        super::threed::tessellation::draw_state(state)?
+
+    let _rebuild = trigger
+        .is_draw()
+        .then(|| nixe_trace::Span::new("gpu.draw_rebuild", 0, 0));
+    let retained_validation = trigger
+        .is_draw()
+        .then_some(cache.validated_draw.as_ref())
+        .flatten()
+        .filter(|validation| {
+            validation.indexed == trigger.is_indexed() && validation.state.matches(state)
+        })
+        .or_else(|| {
+            if !trigger.is_draw() {
+                return None;
+            }
+            cache
+                .draw_plans
+                .iter()
+                .rev()
+                .map(|t| &t.validation)
+                .find(|v| v.indexed == trigger.is_indexed() && v.state.matches(state))
+        });
+    let (raster_state, tessellation) = if let Some(validation) = retained_validation {
+        nixe_trace::event("gpu.draw_validation_hit", 0, 1);
+        (Some(validation.raster), validation.tessellation)
     } else {
-        None
-    };
-    if let Some(mode) = state.render_enable().execution_mode()
-        && mode != MaxwellThreeDRenderEnableMode::Enabled
-    {
-        return Err(MaxwellLoweringError::UnsupportedRenderEnableMode(mode));
-    }
-    if state
-        .render_enable()
-        .conditional_load_constant_buffer()
-        .value()
-        == Some(&MaxwellThreeDConditionalLoadConstantBuffer::Enabled)
-    {
-        return Err(MaxwellLoweringError::UnsupportedConditionalLoadConstantBufferSemantics);
-    }
-    if trigger.is_draw()
-        && let Some(MaxwellThreeDFixedFunctionValue::ShadeMode(MaxwellThreeDShadeMode::Flat)) =
-            state
-                .fixed_function()
-                .register(MaxwellThreeDFixedFunctionRegister::ShadeMode)
-                .value()
-    {
-        // Smooth preserves the interpolation selected by translated shader
-        // inputs and therefore needs no fixed-function override. Flat shading
-        // changes the primitive-wide source value and remains a typed boundary
-        // until T10 represents that override explicitly.
-        return Err(MaxwellLoweringError::UnsupportedShadeModeSemantics(
-            MaxwellThreeDShadeMode::Flat,
-        ));
-    }
-    if trigger.is_draw()
-        && state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::ProvokingVertex)
+        let mut raster_state = None;
+        let tessellation = if trigger.is_draw() {
+            super::threed::tessellation::draw_state(state)?
+        } else {
+            None
+        };
+        if let Some(mode) = state.render_enable().execution_mode()
+            && mode != MaxwellThreeDRenderEnableMode::Enabled
+        {
+            return Err(MaxwellLoweringError::UnsupportedRenderEnableMode(mode));
+        }
+        if state
+            .render_enable()
+            .conditional_load_constant_buffer()
             .value()
-            == Some(&MaxwellThreeDFixedFunctionValue::ProvokingVertex(
-                MaxwellThreeDProvokingVertex::First,
-            ))
-    {
-        return Err(MaxwellLoweringError::UnsupportedProvokingVertexSemantics(
-            MaxwellThreeDProvokingVertex::First,
-        ));
-    }
-    if trigger.is_draw()
-        && state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::TwoSidedLightEnable)
-            .value()
-            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
-    {
-        return Err(MaxwellLoweringError::UnsupportedTwoSidedLightSemantics);
-    }
-    // SET_COLOR_CLAMP applies to legacy vertex COLOR/BCOLOR attributes,
-    // not generic varyings or fragment outputs. Their SPH maps/attribute
-    // transfers are rejected explicitly by the shader translator until that
-    // interface is implemented, so no supported draw consumes this clamp.
-    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/gallium/drivers/nouveau/nvc0/nvc0_state.c#L231-L233
-    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/gallium/drivers/nouveau/nvc0/nvc0_program.c#L53-L54
-    if trigger.is_draw()
-        && let Some(MaxwellThreeDFixedFunctionValue::PixelShaderSaturate(value)) = state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::PixelShaderSaturate)
-            .value()
-        && let Some(output) = value.first_enabled_output()
-    {
-        return Err(
-            MaxwellLoweringError::UnsupportedPixelShaderSaturateSemantics {
-                output,
-                range: value
-                    .clamp_range(output)
-                    .expect("enabled output is within the eight-output register"),
-            },
-        );
-    }
-    if trigger.is_draw() && state.shader_bindings().has_enabled_pipeline() {
-        let local_memory = state.shader_execution().shader_local_memory();
-        if local_memory.region_is_partially_programmed() {
-            return Err(MaxwellLoweringError::IncompleteDraw(
-                "SET_SHADER_LOCAL_MEMORY_A-D",
+            == Some(&MaxwellThreeDConditionalLoadConstantBuffer::Enabled)
+        {
+            return Err(MaxwellLoweringError::UnsupportedConditionalLoadConstantBufferSemantics);
+        }
+        if trigger.is_draw()
+            && let Some(MaxwellThreeDFixedFunctionValue::ShadeMode(MaxwellThreeDShadeMode::Flat)) =
+                state
+                    .fixed_function()
+                    .register(MaxwellThreeDFixedFunctionRegister::ShadeMode)
+                    .value()
+        {
+            // Smooth preserves the interpolation selected by translated shader
+            // inputs and therefore needs no fixed-function override. Flat shading
+            // changes the primitive-wide source value and remains a typed boundary
+            // until T10 represents that override explicitly.
+            return Err(MaxwellLoweringError::UnsupportedShadeModeSemantics(
+                MaxwellThreeDShadeMode::Flat,
             ));
         }
-        if let Some(default_size_per_warp) = local_memory
-            .default_size_per_warp()
-            .value()
-            .copied()
-            .filter(|size| size.bytes() != 0)
+        if trigger.is_draw()
+            && state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::ProvokingVertex)
+                .value()
+                == Some(&MaxwellThreeDFixedFunctionValue::ProvokingVertex(
+                    MaxwellThreeDProvokingVertex::First,
+                ))
         {
-            if local_memory.address().is_none() || local_memory.size().is_none() {
+            return Err(MaxwellLoweringError::UnsupportedProvokingVertexSemantics(
+                MaxwellThreeDProvokingVertex::First,
+            ));
+        }
+        if trigger.is_draw()
+            && state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::TwoSidedLightEnable)
+                .value()
+                == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+        {
+            return Err(MaxwellLoweringError::UnsupportedTwoSidedLightSemantics);
+        }
+        // SET_COLOR_CLAMP applies to legacy vertex COLOR/BCOLOR attributes,
+        // not generic varyings or fragment outputs. Their SPH maps/attribute
+        // transfers are rejected explicitly by the shader translator until that
+        // interface is implemented, so no supported draw consumes this clamp.
+        // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/gallium/drivers/nouveau/nvc0/nvc0_state.c#L231-L233
+        // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/gallium/drivers/nouveau/nvc0/nvc0_program.c#L53-L54
+        if trigger.is_draw()
+            && let Some(MaxwellThreeDFixedFunctionValue::PixelShaderSaturate(value)) = state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::PixelShaderSaturate)
+                .value()
+            && let Some(output) = value.first_enabled_output()
+        {
+            return Err(
+                MaxwellLoweringError::UnsupportedPixelShaderSaturateSemantics {
+                    output,
+                    range: value
+                        .clamp_range(output)
+                        .expect("enabled output is within the eight-output register"),
+                },
+            );
+        }
+        if trigger.is_draw() && state.shader_bindings().has_enabled_pipeline() {
+            let local_memory = state.shader_execution().shader_local_memory();
+            if local_memory.region_is_partially_programmed() {
                 return Err(MaxwellLoweringError::IncompleteDraw(
                     "SET_SHADER_LOCAL_MEMORY_A-D",
                 ));
             }
-            return Err(
-                MaxwellLoweringError::UnsupportedShaderLocalMemorySemantics {
-                    default_size_per_warp,
-                },
-            );
-        }
-    }
-    if trigger.is_draw()
-        && state.color_reduction().enable().value()
-            == Some(&MaxwellThreeDColorReductionThresholdsEnable::Enabled)
-    {
-        // NVIDIA exposes a dedicated activation method, so merely programming
-        // a threshold is not enough to make it effective. Once explicitly
-        // enabled, however, the current neutral pipeline cannot represent the
-        // reduction decision and must stop before cache/backend effects.
-        return Err(MaxwellLoweringError::UnsupportedColorReductionSemantics);
-    }
-    if trigger.is_draw() && state.constant_color_rendering().enabled().value() == Some(&true) {
-        return Err(MaxwellLoweringError::UnsupportedConstantColorRenderingSemantics);
-    }
-    if trigger.is_draw()
-        && state.shader_execution().api_mandated_early_z().value()
-            == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled)
-    {
-        return Err(MaxwellLoweringError::UnsupportedApiMandatedEarlyZSemantics);
-    }
-    if trigger.is_draw()
-        && state.coverage().post_ps_initial_coverage().value() == Some(&true)
-        && state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::AlphaTestEnable)
-            .value()
-            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
-    {
-        // The host implements alpha test through shader discard. Its
-        // interaction with a pre-PS initial mask needs explicit lowering.
-        return Err(MaxwellLoweringError::UnsupportedPostPsInitialCoverageSemantics);
-    }
-    if trigger.is_draw()
-        && state.coverage().post_z_pixel_shader_imask().value()
-            == Some(&MaxwellThreeDPostZPixelShaderImask::Enabled)
-    {
-        return Err(MaxwellLoweringError::UnsupportedPostZPixelShaderImaskSemantics);
-    }
-    if trigger.is_draw()
-        && let Some(value) = state
-            .shader_execution()
-            .pixel_shader_interlock_control()
-            .value()
-            .copied()
-            .filter(|value| value.conflict_detection_enabled())
-    {
-        return Err(MaxwellLoweringError::UnsupportedPixelShaderInterlockSemantics(value));
-    }
-    if !trigger.is_indexed()
-        && trigger.is_draw()
-        && let Some(base_vertex) = state
-            .vertex_input()
-            .assembly()
-            .global_base_vertex_index()
-            .value()
-            .copied()
-            .filter(|value| *value != 0)
-    {
-        // The neutral non-indexed draw currently has one first-vertex value,
-        // which controls both vertex-buffer addressing and the shader-visible
-        // vertex index. Maxwell's global base changes only the latter; mapping
-        // it to first_vertex would therefore silently fetch different data.
-        return Err(MaxwellLoweringError::UnsupportedGlobalBaseVertexIndex(
-            base_vertex,
-        ));
-    }
-    if !trigger.is_indexed()
-        && trigger.is_draw()
-        && let Some(base) = state
-            .vertex_input()
-            .assembly()
-            .vertex_id_base()
-            .value()
-            .copied()
-            .filter(|value| *value != 0)
-    {
-        // A zero base preserves the existing shader-visible index. Nonzero
-        // bases need a separate shader-ID adjustment, not first_vertex (which
-        // would also change vertex-buffer fetches). Keep this register in the
-        // prepared-draw semantic revision so a cached draw cannot bypass it.
-        return Err(MaxwellLoweringError::UnsupportedVertexIdBase(base));
-    }
-    if trigger.is_draw()
-        && state.coverage().csaa_enable().value() == Some(&MaxwellThreeDCsaaEnable::Enabled)
-    {
-        return Err(MaxwellLoweringError::UnsupportedCsaaSemantics);
-    }
-    // Dither footprint is only configuration while alpha-to-coverage is off.
-    // Neither coverage generation (including dithering) nor alpha-to-one is
-    // represented by the current neutral pipeline. Reject their activation,
-    // including after a cached draw, rather than ignoring a stored selector.
-    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
-    if trigger.is_draw()
-        && let Some(MaxwellThreeDFixedFunctionValue::AlphaControl {
-            alpha_to_coverage,
-            alpha_to_one,
-        }) = state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::AlphaToCoverageEnable)
-            .value()
-        && (*alpha_to_coverage || *alpha_to_one)
-    {
-        return Err(MaxwellLoweringError::UnsupportedAntiAliasAlphaControl {
-            alpha_to_coverage: *alpha_to_coverage,
-            alpha_to_one: *alpha_to_one,
-        });
-    }
-    if trigger.is_draw()
-        && let Some(value) = state
-            .coverage()
-            .coverage_to_color()
-            .value()
-            .copied()
-            .filter(|value| value.enabled())
-    {
-        return Err(MaxwellLoweringError::UnsupportedCoverageToColorSemantics(
-            value,
-        ));
-    }
-    if trigger.is_draw()
-        && let Some(value) = state
-            .coverage()
-            .alpha_to_coverage_override()
-            .value()
-            .copied()
-            .filter(|value| value.raw() != 0)
-    {
-        return Err(MaxwellLoweringError::UnsupportedAlphaToCoverageOverrideSemantics(value));
-    }
-    if trigger.is_draw()
-        && state.coverage().tir_mode().value() == Some(&MaxwellThreeDTirMode::RasterNTargetM)
-    {
-        return Err(MaxwellLoweringError::UnsupportedTirSemantics {
-            control: state.coverage().tir_control().value().copied(),
-        });
-    }
-    if trigger.is_draw()
-        && let Some(value) = state
-            .coverage()
-            .hybrid_anti_alias_control()
-            .value()
-            .copied()
-            .filter(|value| !value.is_single_pass_per_fragment())
-    {
-        return Err(MaxwellLoweringError::UnsupportedHybridAntiAliasSemantics(
-            value,
-        ));
-    }
-    if trigger.is_draw() {
-        multisample::validate(state)?;
-    }
-    if trigger.is_draw() {
-        draw_viewport_transform(state)?;
-    }
-    if trigger.is_draw()
-        && state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable)
-            .value()
-            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
-    {
-        return Err(MaxwellLoweringError::UnsupportedWindowClipSemantics);
-    }
-    if trigger.is_draw()
-        && state
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable)
-            .value()
-            == Some(&MaxwellThreeDFixedFunctionValue::ClipIdTestEnable(
-                MaxwellThreeDClipIdTestEnable::Enabled,
-            ))
-    {
-        return Err(MaxwellLoweringError::UnsupportedClipIdTestSemantics);
-    }
-    if trigger.is_draw() {
-        if state.viewport().pixel_center().value()
-            == Some(&MaxwellThreeDViewportPixelCenter::Integers)
-        {
-            return Err(
-                MaxwellLoweringError::UnsupportedViewportPixelCenterSemantics(
-                    MaxwellThreeDViewportPixelCenter::Integers,
-                ),
-            );
-        }
-        if let Some(mode) = state
-            .raster()
-            .fill_via_triangle()
-            .value()
-            .copied()
-            .filter(|mode| *mode == MaxwellThreeDFillViaTriangleMode::FillAll)
-        {
-            return Err(MaxwellLoweringError::UnsupportedFillViaTriangleSemantics(
-                mode,
-            ));
-        }
-        if state.raster().conservative_raster().value()
-            == Some(&MaxwellThreeDConservativeRasterEnable::Enabled)
-        {
-            return Err(MaxwellLoweringError::UnsupportedConservativeRasterSemantics);
-        }
-        if state.shader_bindings().has_enabled_pipeline()
-            && state
-                .shader_bindings()
-                .program_region()
-                .is_partially_programmed()
-        {
-            return Err(MaxwellLoweringError::IncompleteDraw(
-                "SET_PROGRAM_REGION_A/B",
-            ));
-        }
-        if state.generated_primitive() == Some(super::threed::state::GeneratedPrimitive::Points) {
-            if let Some(value) = state
-                .raster()
-                .attribute_point_size()
+            if let Some(default_size_per_warp) = local_memory
+                .default_size_per_warp()
                 .value()
                 .copied()
-                .filter(|value| value.enabled())
+                .filter(|size| size.bytes() != 0)
             {
+                if local_memory.address().is_none() || local_memory.size().is_none() {
+                    return Err(MaxwellLoweringError::IncompleteDraw(
+                        "SET_SHADER_LOCAL_MEMORY_A-D",
+                    ));
+                }
                 return Err(
-                    MaxwellLoweringError::UnsupportedAttributePointSizeSemantics {
-                        slot: value.slot(),
+                    MaxwellLoweringError::UnsupportedShaderLocalMemorySemantics {
+                        default_size_per_warp,
                     },
                 );
             }
-            if state.raster().point_sprite_enable().value() == Some(&true) {
-                return Err(MaxwellLoweringError::UnsupportedPointSpriteSemantics);
-            }
-            if state.raster().anti_aliased_point_enable().value() == Some(&true) {
-                return Err(MaxwellLoweringError::UnsupportedAntiAliasedPointSemantics);
-            }
-            if let Some(select) = state
-                .raster()
-                .point_sprite_select()
+        }
+        if trigger.is_draw()
+            && state.color_reduction().enable().value()
+                == Some(&MaxwellThreeDColorReductionThresholdsEnable::Enabled)
+        {
+            // NVIDIA exposes a dedicated activation method, so merely programming
+            // a threshold is not enough to make it effective. Once explicitly
+            // enabled, however, the current neutral pipeline cannot represent the
+            // reduction decision and must stop before cache/backend effects.
+            return Err(MaxwellLoweringError::UnsupportedColorReductionSemantics);
+        }
+        if trigger.is_draw() && state.constant_color_rendering().enabled().value() == Some(&true) {
+            return Err(MaxwellLoweringError::UnsupportedConstantColorRenderingSemantics);
+        }
+        if trigger.is_draw()
+            && state.shader_execution().api_mandated_early_z().value()
+                == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled)
+        {
+            return Err(MaxwellLoweringError::UnsupportedApiMandatedEarlyZSemantics);
+        }
+        if trigger.is_draw()
+            && state.coverage().post_ps_initial_coverage().value() == Some(&true)
+            && state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::AlphaTestEnable)
+                .value()
+                == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+        {
+            // The host implements alpha test through shader discard. Its
+            // interaction with a pre-PS initial mask needs explicit lowering.
+            return Err(MaxwellLoweringError::UnsupportedPostPsInitialCoverageSemantics);
+        }
+        if trigger.is_draw()
+            && state.coverage().post_z_pixel_shader_imask().value()
+                == Some(&MaxwellThreeDPostZPixelShaderImask::Enabled)
+        {
+            return Err(MaxwellLoweringError::UnsupportedPostZPixelShaderImaskSemantics);
+        }
+        if trigger.is_draw()
+            && let Some(value) = state
+                .shader_execution()
+                .pixel_shader_interlock_control()
                 .value()
                 .copied()
-                .filter(|select| select.affects_point_coordinates())
+                .filter(|value| value.conflict_detection_enabled())
+        {
+            return Err(MaxwellLoweringError::UnsupportedPixelShaderInterlockSemantics(value));
+        }
+        if !trigger.is_indexed()
+            && trigger.is_draw()
+            && let Some(base_vertex) = state
+                .vertex_input()
+                .assembly()
+                .global_base_vertex_index()
+                .value()
+                .copied()
+                .filter(|value| *value != 0)
+        {
+            // The neutral non-indexed draw currently has one first-vertex value,
+            // which controls both vertex-buffer addressing and the shader-visible
+            // vertex index. Maxwell's global base changes only the latter; mapping
+            // it to first_vertex would therefore silently fetch different data.
+            return Err(MaxwellLoweringError::UnsupportedGlobalBaseVertexIndex(
+                base_vertex,
+            ));
+        }
+        if !trigger.is_indexed()
+            && trigger.is_draw()
+            && let Some(base) = state
+                .vertex_input()
+                .assembly()
+                .vertex_id_base()
+                .value()
+                .copied()
+                .filter(|value| *value != 0)
+        {
+            // A zero base preserves the existing shader-visible index. Nonzero
+            // bases need a separate shader-ID adjustment, not first_vertex (which
+            // would also change vertex-buffer fetches). Keep this register in the
+            // prepared-draw semantic revision so a cached draw cannot bypass it.
+            return Err(MaxwellLoweringError::UnsupportedVertexIdBase(base));
+        }
+        if trigger.is_draw()
+            && state.coverage().csaa_enable().value() == Some(&MaxwellThreeDCsaaEnable::Enabled)
+        {
+            return Err(MaxwellLoweringError::UnsupportedCsaaSemantics);
+        }
+        // Dither footprint is only configuration while alpha-to-coverage is off.
+        // Neither coverage generation (including dithering) nor alpha-to-one is
+        // represented by the current neutral pipeline. Reject their activation,
+        // including after a cached draw, rather than ignoring a stored selector.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+        if trigger.is_draw()
+            && let Some(MaxwellThreeDFixedFunctionValue::AlphaControl {
+                alpha_to_coverage,
+                alpha_to_one,
+            }) = state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::AlphaToCoverageEnable)
+                .value()
+            && (*alpha_to_coverage || *alpha_to_one)
+        {
+            return Err(MaxwellLoweringError::UnsupportedAntiAliasAlphaControl {
+                alpha_to_coverage: *alpha_to_coverage,
+                alpha_to_one: *alpha_to_one,
+            });
+        }
+        if trigger.is_draw()
+            && let Some(value) = state
+                .coverage()
+                .coverage_to_color()
+                .value()
+                .copied()
+                .filter(|value| value.enabled())
+        {
+            return Err(MaxwellLoweringError::UnsupportedCoverageToColorSemantics(
+                value,
+            ));
+        }
+        if trigger.is_draw()
+            && let Some(value) = state
+                .coverage()
+                .alpha_to_coverage_override()
+                .value()
+                .copied()
+                .filter(|value| value.raw() != 0)
+        {
+            return Err(MaxwellLoweringError::UnsupportedAlphaToCoverageOverrideSemantics(value));
+        }
+        if trigger.is_draw()
+            && state.coverage().tir_mode().value() == Some(&MaxwellThreeDTirMode::RasterNTargetM)
+        {
+            return Err(MaxwellLoweringError::UnsupportedTirSemantics {
+                control: state.coverage().tir_control().value().copied(),
+            });
+        }
+        if trigger.is_draw()
+            && let Some(value) = state
+                .coverage()
+                .hybrid_anti_alias_control()
+                .value()
+                .copied()
+                .filter(|value| !value.is_single_pass_per_fragment())
+        {
+            return Err(MaxwellLoweringError::UnsupportedHybridAntiAliasSemantics(
+                value,
+            ));
+        }
+        if trigger.is_draw() {
+            multisample::validate(state)?;
+        }
+        if trigger.is_draw() {
+            draw_viewport_transform(state)?;
+        }
+        if trigger.is_draw()
+            && state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable)
+                .value()
+                == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+        {
+            return Err(MaxwellLoweringError::UnsupportedWindowClipSemantics);
+        }
+        if trigger.is_draw()
+            && state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable)
+                .value()
+                == Some(&MaxwellThreeDFixedFunctionValue::ClipIdTestEnable(
+                    MaxwellThreeDClipIdTestEnable::Enabled,
+                ))
+        {
+            return Err(MaxwellLoweringError::UnsupportedClipIdTestSemantics);
+        }
+        if trigger.is_draw() {
+            if state.viewport().pixel_center().value()
+                == Some(&MaxwellThreeDViewportPixelCenter::Integers)
             {
                 return Err(
-                    MaxwellLoweringError::UnsupportedPointSpriteCoordinatesSemantics(select),
+                    MaxwellLoweringError::UnsupportedViewportPixelCenterSemantics(
+                        MaxwellThreeDViewportPixelCenter::Integers,
+                    ),
                 );
             }
-            if let Some(mode) = state.raster().point_center_mode().value().copied() {
-                return Err(MaxwellLoweringError::UnsupportedPointCenterSemantics(mode));
+            if let Some(mode) = state
+                .raster()
+                .fill_via_triangle()
+                .value()
+                .copied()
+                .filter(|mode| *mode == MaxwellThreeDFillViaTriangleMode::FillAll)
+            {
+                return Err(MaxwellLoweringError::UnsupportedFillViaTriangleSemantics(
+                    mode,
+                ));
             }
+            if state.raster().conservative_raster().value()
+                == Some(&MaxwellThreeDConservativeRasterEnable::Enabled)
+            {
+                return Err(MaxwellLoweringError::UnsupportedConservativeRasterSemantics);
+            }
+            if state.shader_bindings().has_enabled_pipeline()
+                && state
+                    .shader_bindings()
+                    .program_region()
+                    .is_partially_programmed()
+            {
+                return Err(MaxwellLoweringError::IncompleteDraw(
+                    "SET_PROGRAM_REGION_A/B",
+                ));
+            }
+            if state.generated_primitive() == Some(super::threed::state::GeneratedPrimitive::Points)
+            {
+                if let Some(value) = state
+                    .raster()
+                    .attribute_point_size()
+                    .value()
+                    .copied()
+                    .filter(|value| value.enabled())
+                {
+                    return Err(
+                        MaxwellLoweringError::UnsupportedAttributePointSizeSemantics {
+                            slot: value.slot(),
+                        },
+                    );
+                }
+                if state.raster().point_sprite_enable().value() == Some(&true) {
+                    return Err(MaxwellLoweringError::UnsupportedPointSpriteSemantics);
+                }
+                if state.raster().anti_aliased_point_enable().value() == Some(&true) {
+                    return Err(MaxwellLoweringError::UnsupportedAntiAliasedPointSemantics);
+                }
+                if let Some(select) = state
+                    .raster()
+                    .point_sprite_select()
+                    .value()
+                    .copied()
+                    .filter(|select| select.affects_point_coordinates())
+                {
+                    return Err(
+                        MaxwellLoweringError::UnsupportedPointSpriteCoordinatesSemantics(select),
+                    );
+                }
+                if let Some(mode) = state.raster().point_center_mode().value().copied() {
+                    return Err(MaxwellLoweringError::UnsupportedPointCenterSemantics(mode));
+                }
+            }
+            validate_direct_line_rasterization_state(state)?;
+            raster_state = Some(raster::draw_state(state)?);
         }
-        validate_direct_line_rasterization_state(state)?;
-        raster_state = Some(raster::draw_state(state)?);
-    }
+        if let Some(raster) = raster_state {
+            cache.validated_draw = Some(DrawValidationRecord {
+                indexed: trigger.is_indexed(),
+                state: state.fixed_draw_identity(),
+                raster,
+                tessellation,
+            });
+        }
+        (raster_state, tessellation)
+    };
     if let MaxwellThreeDOperationTrigger::ClearSurface { source } = trigger
         && state.render_targets().clear().last_surface().source() != Some(source)
     {
@@ -2037,6 +2259,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     let resource_bindings = prepare_resources(
         resources,
         &resource_indices,
+        vec![None; resources.resources().len()],
         cache,
         &mut creations,
         &mut invalidations,
@@ -2093,6 +2316,9 @@ fn finish_lowered_work(
 ) -> Result<MaxwellLoweredWork, MaxwellLoweringError> {
     let copies = std::mem::take(&mut cache.image_alias_copies);
     let operations = sequence_with_transitions(copies.into_iter().chain(commands), cache)?;
+    let resident_resources = cache
+        .resident_resources(Some(&creations))
+        .into_boxed_slice();
     trim_read_only_buffer_views(cache, &operations, &mut invalidations);
     let submission = OperationSubmission::new(submission, predecessors, operations)
         .map_err(MaxwellLoweringError::Command)?;
@@ -2101,6 +2327,7 @@ fn finish_lowered_work(
         .checked_add(1)
         .ok_or(MaxwellLoweringError::ResourceExhausted)?;
     Ok(MaxwellLoweredWork {
+        resident_resources,
         creations: creations.into_boxed_slice(),
         invalidations: invalidations.into_boxed_slice(),
         submission,
@@ -3112,11 +3339,11 @@ fn draw_viewport_transform(
 fn prepare_resources(
     resources: &MaxwellThreeDResolvedResources,
     indices: &[usize],
+    mut result: Vec<Option<ResourceDependency>>,
     cache: &mut MaxwellLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
     invalidations: &mut Vec<ResourceDependency>,
 ) -> Result<Vec<Option<ResourceDependency>>, MaxwellLoweringError> {
-    let mut result = vec![None; resources.resources().len()];
     for index in indices {
         let resource = resources
             .resources()
@@ -3299,16 +3526,35 @@ fn retire_overlapping_views(
         })
         .map(|record| record.dependency)
         .collect::<Vec<_>>();
-    retire_view_dependencies(&invalidated, cache, invalidations);
+    retire_resource_dependencies(&invalidated, cache, invalidations);
 }
 
-fn retire_view_dependencies(
+fn retire_resource_dependencies(
     invalidated: &[ResourceDependency],
     cache: &mut MaxwellLoweringCache,
     invalidations: &mut Vec<ResourceDependency>,
 ) {
-    if !invalidated.is_empty() {
+    if cache.prepared_draw.as_ref().is_some_and(|draw| {
+        draw.operations.iter().any(|operation| {
+            operation
+                .dependencies()
+                .iter()
+                .any(|d| invalidated.contains(d))
+        })
+    }) {
         cache.prepared_draw = None;
+    }
+    for template in &mut cache.draw_plans {
+        if template.prepared.as_ref().is_some_and(|draw| {
+            draw.operations.iter().any(|operation| {
+                operation
+                    .dependencies()
+                    .iter()
+                    .any(|dependency| invalidated.contains(dependency))
+            })
+        }) {
+            template.prepared = None;
+        }
     }
     cache
         .views
@@ -3329,6 +3575,28 @@ fn retire_view_dependencies(
         })
         .map(|record| ResourceDependency::DescriptorTable(record.id))
         .collect::<Vec<_>>();
+    if cache.prepared_draw.as_ref().is_some_and(|draw| {
+        draw.operations.iter().any(|operation| {
+            operation
+                .dependencies()
+                .iter()
+                .any(|d| invalidated_descriptors.contains(d))
+        })
+    }) {
+        cache.prepared_draw = None;
+    }
+    for plan in &mut cache.draw_plans {
+        if plan.prepared.as_ref().is_some_and(|draw| {
+            draw.operations.iter().any(|operation| {
+                operation
+                    .dependencies()
+                    .iter()
+                    .any(|dependency| invalidated_descriptors.contains(dependency))
+            })
+        }) {
+            plan.prepared = None;
+        }
+    }
     cache.descriptors.retain(|record| {
         !invalidated_descriptors.contains(&ResourceDependency::DescriptorTable(record.id))
     });
@@ -3395,7 +3663,7 @@ fn trim_read_only_buffer_views(
         .take(count - limit)
         .map(|(_, dependency)| dependency)
         .collect::<Vec<_>>();
-    retire_view_dependencies(&retired, cache, invalidations);
+    retire_resource_dependencies(&retired, cache, invalidations);
 }
 
 fn binding_at(
@@ -3440,25 +3708,7 @@ fn prepare_samplers(
         cache
             .samplers
             .retain(|record| record.sampler.role() != sampler.role());
-        let retired_descriptors = cache
-            .descriptors
-            .iter()
-            .filter(|record| {
-                record
-                    .dependencies
-                    .iter()
-                    .any(|dependency| retired.contains(dependency))
-            })
-            .map(|record| ResourceDependency::DescriptorTable(record.id))
-            .collect::<Vec<_>>();
-        cache.descriptors.retain(|record| {
-            !retired_descriptors.contains(&ResourceDependency::DescriptorTable(record.id))
-        });
-        for dependency in retired.into_iter().chain(retired_descriptors) {
-            if !invalidations.contains(&dependency) {
-                invalidations.push(dependency);
-            }
-        }
+        retire_resource_dependencies(&retired, cache, invalidations);
         let id = SamplerId::new(take_identity(cache)?);
         creations.push(BackendResourceCreateInfo::Sampler {
             id,
@@ -3786,50 +4036,63 @@ fn lower_draw(
     cache: &mut MaxwellLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
 ) -> Result<(Vec<GpuOperation>, Arc<[usize]>), MaxwellLoweringError> {
-    validate_shader_stages(state, shaders)?;
-    for translated in &shaders.shaders {
-        let record = cache
-            .shader_translations
-            .get(translated.cache_fingerprint)
-            .ok_or(MaxwellLoweringError::InvalidTranslatedShaders)?;
-        #[cfg(debug_assertions)]
-        assert_eq!(
-            record.id, translated.shader,
-            "XXH3-128 collision or inconsistent translated shader identity"
-        );
-        if record.module.stage() != translated.stage {
-            return Err(MaxwellLoweringError::InvalidTranslatedShaders);
-        }
-        if translated.stage == ShaderStage::Vertex {
-            validate_vertex_attribute_skip_masks(state, record.module.ir().ir())?;
-        }
-        if translated.stage == ShaderStage::Fragment
-            && lower_left_window_origin(state)
-            && record.module.ir().ir().inputs().iter().any(|input| {
-                input.location() == nixe_gpu::ShaderIoLocation::Position && input.component() == 1
-            })
-        {
-            return Err(MaxwellLoweringError::UnsupportedWindowOriginFragmentPosition);
-        }
-        if let Some(tessellation) = tessellation {
-            super::threed::tessellation::validate_default_level_inputs(
-                tessellation.control,
-                record.module.ir().ir(),
-            )?;
-        }
-        if !record.published {
-            creations.push(BackendResourceCreateInfo::Shader {
-                id: record.id,
-                description: ShaderDescription {
-                    stage: translated.stage,
-                },
-                module: record.module.clone(),
-            });
-            cache
+    let template_index = cache.draw_plans.iter().position(|template| {
+        template.validation.indexed == matches!(arguments, DrawArguments::Indexed { .. })
+            && state.vertex_input().primitive().active_begin().is_some()
+            && template.validation.state.matches(state)
+            && template.shaders == *shaders
+    });
+    let retained_template = template_index.and_then(|index| cache.draw_plans.remove(index));
+    let retained_draw = retained_template
+        .as_ref()
+        .map(|template| Arc::clone(&template.draw));
+    if retained_draw.is_none() {
+        validate_shader_stages(state, shaders)?;
+        for translated in shaders.shaders.iter() {
+            let record = cache
                 .shader_translations
-                .get_mut(translated.cache_fingerprint)
-                .expect("validated shader translation fingerprint exists")
-                .published = true;
+                .get(translated.cache_fingerprint)
+                .ok_or(MaxwellLoweringError::InvalidTranslatedShaders)?;
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                record.id, translated.shader,
+                "XXH3-128 collision or inconsistent translated shader identity"
+            );
+            if record.module.stage() != translated.stage {
+                return Err(MaxwellLoweringError::InvalidTranslatedShaders);
+            }
+            if translated.stage == ShaderStage::Vertex {
+                validate_vertex_attribute_skip_masks(state, record.module.ir().ir())?;
+            }
+            if translated.stage == ShaderStage::Fragment
+                && lower_left_window_origin(state)
+                && record.module.ir().ir().inputs().iter().any(|input| {
+                    input.location() == nixe_gpu::ShaderIoLocation::Position
+                        && input.component() == 1
+                })
+            {
+                return Err(MaxwellLoweringError::UnsupportedWindowOriginFragmentPosition);
+            }
+            if let Some(tessellation) = tessellation {
+                super::threed::tessellation::validate_default_level_inputs(
+                    tessellation.control,
+                    record.module.ir().ir(),
+                )?;
+            }
+            if !record.published {
+                creations.push(BackendResourceCreateInfo::Shader {
+                    id: record.id,
+                    description: ShaderDescription {
+                        stage: translated.stage,
+                    },
+                    module: record.module.clone(),
+                });
+                cache
+                    .shader_translations
+                    .get_mut(translated.cache_fingerprint)
+                    .expect("validated shader translation fingerprint exists")
+                    .published = true;
+            }
         }
     }
     let topology = primitive_topology(
@@ -3841,117 +4104,109 @@ fn lower_draw(
             .ok_or(MaxwellLoweringError::IncompleteDraw("BEGIN"))?,
     )?;
     let mut vertex_buffers = Vec::new();
-    for index in consumed_vertex_streams(state).map(usize::from) {
-        let stream = &state.vertex_input().streams()[index];
-        let Some(stream_format) = stream.format().value().filter(|value| value.enabled()) else {
-            continue;
-        };
-        let attributes = state
-            .vertex_input()
-            .attributes()
-            .iter()
-            .enumerate()
-            .filter_map(|(location, attribute)| {
-                attribute
-                    .value()
-                    .filter(|attribute| {
-                        attribute.enabled()
-                            && usize::from(attribute.stream()) == index
-                            && state.vertex_input().attribute_skip_mask(location as u8) != 15
-                    })
-                    .map(|attribute| (location, *attribute))
-            })
-            .map(|(location, attribute)| {
-                Ok(VertexAttribute {
-                    format: neutral_vertex_format(location as u8, attribute)?,
-                    offset: u64::from(attribute.offset()),
-                    shader_location: location as u32,
-                })
-            })
-            .collect::<Result<Vec<_>, MaxwellLoweringError>>()?;
-        if attributes.is_empty() {
-            continue;
-        }
-        let resource = resource_index(
-            resources,
-            MaxwellThreeDResourceRole::VertexStream(index as u8),
-        )?;
-        let buffer = resolved_buffer(resources, resource)?;
-        let region = BufferRegion {
-            buffer: buffer_dependency(binding_at(resources, bindings, resource)?)?,
-            range: BufferRange::new(0, buffer.description().size()).map_err(|_| {
-                MaxwellLoweringError::InvalidResolvedView {
-                    role: buffer.role(),
-                }
-            })?,
-        };
-        let instanced = stream.instanced().value().copied().unwrap_or(false);
-        let frequency = stream.frequency().value().copied().unwrap_or(1);
-        if instanced && frequency != 1 {
-            return Err(MaxwellLoweringError::UnsupportedVertexInstanceDivisor {
-                stream: index as u8,
-                divisor: frequency,
-            });
-        }
-        vertex_buffers.push(
-            VertexBufferLayout::new(
-                region,
-                u64::from(stream_format.stride()),
-                if instanced {
-                    VertexStepMode::Instance
-                } else {
-                    VertexStepMode::Vertex
-                },
-                attributes,
-            )
-            .map_err(MaxwellLoweringError::Command)?,
-        );
-    }
-    let triangle_rasterization = match state
-        .raster()
-        .fill_via_triangle()
-        .value()
-        .copied()
-        .unwrap_or(MaxwellThreeDFillViaTriangleMode::Disabled)
-    {
-        MaxwellThreeDFillViaTriangleMode::Disabled => raster.triangles,
-        MaxwellThreeDFillViaTriangleMode::FillBoundingBox => {
-            let DrawArguments::NonIndexed {
-                first_vertex,
-                vertex_count,
-                ..
-            } = arguments
+    let mut vertex_streams = Vec::new();
+    if retained_draw.is_none() {
+        for index in consumed_vertex_streams(state).map(usize::from) {
+            let stream = &state.vertex_input().streams()[index];
+            let Some(stream_format) = stream.format().value().filter(|value| value.enabled())
             else {
-                return Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(
-                    "indexed rectangle expansion",
-                ));
+                continue;
             };
-            if topology != PrimitiveTopology::Triangles {
-                return Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(
-                    "primitive topology is not a triangle list",
-                ));
-            }
-            if !first_vertex.is_multiple_of(3) || !vertex_count.is_multiple_of(3) {
-                return Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(
-                    "vertex range is not aligned to complete triangles",
-                ));
-            }
-            if vertex_buffers
+            let attributes = state
+                .vertex_input()
+                .attributes()
                 .iter()
-                .any(|layout| layout.step_mode == VertexStepMode::Vertex)
-            {
-                return Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(
-                    "per-vertex attributes require vertex-pulling expansion",
+                .enumerate()
+                .filter_map(|(location, attribute)| {
+                    attribute
+                        .value()
+                        .filter(|attribute| {
+                            attribute.enabled()
+                                && usize::from(attribute.stream()) == index
+                                && state.vertex_input().attribute_skip_mask(location as u8) != 15
+                        })
+                        .map(|attribute| (location, *attribute))
+                })
+                .map(|(location, attribute)| {
+                    Ok(VertexAttribute {
+                        format: neutral_vertex_format(location as u8, attribute)?,
+                        offset: u64::from(attribute.offset()),
+                        shader_location: location as u32,
+                    })
+                })
+                .collect::<Result<Vec<_>, MaxwellLoweringError>>()?;
+            if attributes.is_empty() {
+                continue;
+            }
+            let resource = resource_index(
+                resources,
+                MaxwellThreeDResourceRole::VertexStream(index as u8),
+            )?;
+            let buffer = resolved_buffer(resources, resource)?;
+            let region = BufferRegion {
+                buffer: buffer_dependency(binding_at(resources, bindings, resource)?)?,
+                range: BufferRange::new(0, buffer.description().size()).map_err(|_| {
+                    MaxwellLoweringError::InvalidResolvedView {
+                        role: buffer.role(),
+                    }
+                })?,
+            };
+            let instanced = stream.instanced().value().copied().unwrap_or(false);
+            let frequency = stream.frequency().value().copied().unwrap_or(1);
+            if instanced && frequency != 1 {
+                return Err(MaxwellLoweringError::UnsupportedVertexInstanceDivisor {
+                    stream: index as u8,
+                    divisor: frequency,
+                });
+            }
+            vertex_streams.push(index as u8);
+            vertex_buffers.push(
+                VertexBufferLayout::new(
+                    region,
+                    u64::from(stream_format.stride()),
+                    if instanced {
+                        VertexStepMode::Instance
+                    } else {
+                        VertexStepMode::Vertex
+                    },
+                    attributes,
+                )
+                .map_err(MaxwellLoweringError::Command)?,
+            );
+        }
+    }
+    let triangle_rasterization = if let Some(draw) = &retained_draw {
+        draw.triangle_rasterization
+    } else {
+        match state
+            .raster()
+            .fill_via_triangle()
+            .value()
+            .copied()
+            .unwrap_or(MaxwellThreeDFillViaTriangleMode::Disabled)
+        {
+            MaxwellThreeDFillViaTriangleMode::Disabled => raster.triangles,
+            MaxwellThreeDFillViaTriangleMode::FillBoundingBox => {
+                if vertex_buffers
+                    .iter()
+                    .any(|layout| layout.step_mode == VertexStepMode::Vertex)
+                {
+                    return Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(
+                        "per-vertex attributes require vertex-pulling expansion",
+                    ));
+                }
+                TriangleRasterization::FillRectangle
+            }
+            MaxwellThreeDFillViaTriangleMode::FillAll => {
+                return Err(MaxwellLoweringError::UnsupportedFillViaTriangleSemantics(
+                    MaxwellThreeDFillViaTriangleMode::FillAll,
                 ));
             }
-            TriangleRasterization::FillRectangle
-        }
-        MaxwellThreeDFillViaTriangleMode::FillAll => {
-            return Err(MaxwellLoweringError::UnsupportedFillViaTriangleSemantics(
-                MaxwellThreeDFillViaTriangleMode::FillAll,
-            ));
         }
     };
+    if triangle_rasterization == TriangleRasterization::FillRectangle {
+        validate_fill_rectangle_arguments(topology, arguments)?;
+    }
     let attachments = attachment_records(resources, bindings, attachment_selection)?;
     if attachments.is_empty() {
         return Err(MaxwellLoweringError::IncompleteDraw("render target"));
@@ -4049,13 +4304,177 @@ fn lower_draw(
         id
     };
 
+    let (shader_accesses, shader_dependencies) =
+        draw_shader_dependencies(resources, bindings, sampler_bindings, shaders)?;
+    let draw = if let Some(draw) = retained_draw {
+        nixe_trace::event("gpu.draw_fixed_components_reused", 0, 1);
+        vertex_streams.extend_from_slice(&retained_template.as_ref().unwrap().vertex_streams);
+        let regions = vertex_streams
+            .iter()
+            .map(|stream| {
+                let index =
+                    resource_index(resources, MaxwellThreeDResourceRole::VertexStream(*stream))?;
+                let buffer = resolved_buffer(resources, index)?;
+                Ok(BufferRegion {
+                    buffer: buffer_dependency(binding_at(resources, bindings, index)?)?,
+                    range: BufferRange::new(0, buffer.description().size()).map_err(|_| {
+                        MaxwellLoweringError::InvalidResolvedView {
+                            role: buffer.role(),
+                        }
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, MaxwellLoweringError>>()?;
+        let mut refreshed = (*draw).clone().with_bindings(
+            pipeline,
+            render_pass,
+            descriptor_tables,
+            &regions,
+            index_buffer,
+        );
+        refreshed.scissor = Some(draw_scissor(state, resources, attachment_selection)?);
+        refreshed
+    } else {
+        let mut draw = PreparedDraw::new(
+            pipeline,
+            render_pass,
+            topology,
+            descriptor_tables,
+            vertex_buffers,
+            index_buffer,
+        )
+        .map_err(MaxwellLoweringError::Command)?;
+        draw = draw.with_triangle_rasterization(triangle_rasterization);
+        if state.generated_primitive() == Some(super::threed::state::GeneratedPrimitive::Lines)
+            && state.line().anti_aliased_line_enable().value()
+                == Some(&MaxwellThreeDAntiAliasedLineEnable::Enabled)
+        {
+            draw.line_rasterization = Some(raster::smooth_line(state)?);
+        }
+        draw.front_face = raster.front_face;
+        draw.cull_mode = raster.cull_mode;
+        draw.scissor = Some(draw_scissor(state, resources, attachment_selection)?);
+        draw.tessellation = tessellation;
+        draw.color_outputs = attachment_selection.color_outputs;
+        if let Some(alpha_test) = draw_alpha_test_state(state)? {
+            draw = draw.with_alpha_test(alpha_test);
+        }
+        if let Some(viewport_transform) = draw_viewport_transform(state)? {
+            draw = draw.with_viewport_transform(viewport_transform);
+        }
+        if attachment_selection.depth_stencil.is_some() {
+            draw = draw.with_depth_state(draw_depth_state(state)?);
+        }
+        draw
+    };
+    let draw = Arc::new(draw);
+    let shader_accesses: Arc<[ResourceAccess]> = shader_accesses.into();
+    let shader_dependencies: Arc<[ResourceDependency]> = shader_dependencies.into();
+    let operations = [
+        GpuOperation::new(
+            GpuCommand::RenderPass(
+                RenderPassOperation::begin(draw.render_pass, render_pass_description, attachments)
+                    .map_err(MaxwellLoweringError::Command)?,
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        ),
+        GpuOperation::new(
+            GpuCommand::Draw(
+                DrawOperation::new(Arc::clone(&draw), arguments)
+                    .map_err(MaxwellLoweringError::Command)?,
+            ),
+            shader_accesses.iter().copied(),
+            shader_dependencies.iter().copied(),
+            CapabilityRequirements::new(
+                shaders
+                    .shaders
+                    .iter()
+                    .map(|shader| nixe_gpu::CapabilityRequirement::ShaderStage(shader.stage)),
+            ),
+        ),
+        GpuOperation::new(
+            GpuCommand::RenderPass(RenderPassOperation::end(draw.render_pass)),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        ),
+    ];
+    let record = Arc::new(PreparedDrawRecord {
+        indexed: matches!(arguments, DrawArguments::Indexed { .. }),
+        state: state.fixed_draw_identity(),
+        components: resources.resources().into(),
+        samplers: resources.samplers().into(),
+        bindings: bindings.into(),
+        sampler_bindings: sampler_bindings.into(),
+        consumed: required_indices.into(),
+        vertex_streams: vertex_streams.clone().into(),
+        shader_accesses,
+        shader_dependencies,
+        shaders: shaders.clone(),
+        operations,
+        dirty_images: attachment_selection.attachment_indices().into(),
+        sampled_aliases: bindings
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|dependency| {
+                cache.views.iter().any(|record| {
+                    record.dependency == *dependency
+                        && matches!(
+                            record.materialization,
+                            ViewMaterialization::CopiedColor { .. }
+                        )
+                })
+            })
+            .collect(),
+    });
+    let operations = record.operations(arguments)?;
+    let dirty = Arc::clone(&record.dirty_images);
+    let template = if let Some(mut template) = retained_template {
+        template.draw = draw;
+        template.prepared = Some(Arc::clone(&record));
+        template
+    } else {
+        DrawPlan {
+            validation: DrawValidationRecord {
+                indexed: matches!(arguments, DrawArguments::Indexed { .. }),
+                state: state.fixed_draw_identity(),
+                raster,
+                tessellation,
+            },
+            shaders: shaders.clone(),
+            vertex_streams: vertex_streams.into(),
+            prepared: Some(Arc::clone(&record)),
+            draw,
+        }
+    };
+    let limit = cache
+        .configuration
+        .pipeline_entries()
+        .min(MAX_CACHED_DRAW_PLANS);
+    if cache.draw_plans.len() >= limit {
+        cache.draw_plans.pop_front();
+    }
+    cache.draw_plans.push_back(template);
+    cache.prepared_draw = Some(record);
+    Ok((operations.into(), dirty))
+}
+
+fn draw_shader_dependencies(
+    resources: &MaxwellThreeDResolvedResources,
+    bindings: &[Option<ResourceDependency>],
+    sampler_bindings: &[(MaxwellThreeDResourceRole, ResourceDependency)],
+    shaders: &MaxwellThreeDTranslatedShaders,
+) -> Result<(Vec<ResourceAccess>, Vec<ResourceDependency>), MaxwellLoweringError> {
     let mut shader_accesses = Vec::new();
     let mut shader_dependencies = shaders
         .shaders
         .iter()
         .map(|shader| ResourceDependency::Shader(shader.shader))
         .collect::<Vec<_>>();
-    for resource_use in &shaders.resources {
+    for resource_use in shaders.resources.iter() {
         let dependency =
             shader_resource_dependency(resources, bindings, sampler_bindings, resource_use.role)?;
         if !shader_dependencies.contains(&dependency) {
@@ -4088,94 +4507,228 @@ fn lower_draw(
             })?,
         ));
     }
-    let mut draw = PreparedDraw::new(
-        pipeline,
-        render_pass,
-        topology,
-        descriptor_tables,
-        vertex_buffers,
-        index_buffer,
-    )
-    .map_err(MaxwellLoweringError::Command)?;
-    draw = draw.with_triangle_rasterization(triangle_rasterization);
-    if state.generated_primitive() == Some(super::threed::state::GeneratedPrimitive::Lines)
-        && state.line().anti_aliased_line_enable().value()
-            == Some(&MaxwellThreeDAntiAliasedLineEnable::Enabled)
-    {
-        draw.line_rasterization = Some(raster::smooth_line(state)?);
-    }
-    draw.front_face = raster.front_face;
-    draw.cull_mode = raster.cull_mode;
-    draw.scissor = Some(draw_scissor(state, resources, attachment_selection)?);
-    draw.tessellation = tessellation;
-    draw.color_outputs = attachment_selection.color_outputs;
-    if let Some(alpha_test) = draw_alpha_test_state(state)? {
-        draw = draw.with_alpha_test(alpha_test);
-    }
-    if let Some(viewport_transform) = draw_viewport_transform(state)? {
-        draw = draw.with_viewport_transform(viewport_transform);
-    }
-    if attachment_selection.depth_stencil.is_some() {
-        draw = draw.with_depth_state(draw_depth_state(state)?);
-    }
-    let draw = Arc::new(draw);
-    let operations = [
-        GpuOperation::new(
-            GpuCommand::RenderPass(
-                RenderPassOperation::begin(draw.render_pass, render_pass_description, attachments)
-                    .map_err(MaxwellLoweringError::Command)?,
-            ),
-            [],
-            [],
-            CapabilityRequirements::none(),
-        ),
-        GpuOperation::new(
-            GpuCommand::Draw(
-                DrawOperation::new(Arc::clone(&draw), arguments)
-                    .map_err(MaxwellLoweringError::Command)?,
-            ),
-            shader_accesses,
-            shader_dependencies,
-            CapabilityRequirements::new(
-                shaders
-                    .shaders
-                    .iter()
-                    .map(|shader| nixe_gpu::CapabilityRequirement::ShaderStage(shader.stage)),
-            ),
-        ),
-        GpuOperation::new(
-            GpuCommand::RenderPass(RenderPassOperation::end(draw.render_pass)),
-            [],
-            [],
-            CapabilityRequirements::none(),
-        ),
-    ];
-    let record = PreparedDrawRecord {
-        indexed: matches!(arguments, DrawArguments::Indexed { .. }),
-        state: state.draw_state_identity(),
-        resources: resources.identity(),
-        shaders: shaders.identity(),
-        operations,
-        dirty_images: attachment_selection.attachment_indices().into(),
-        sampled_aliases: bindings
+    Ok((shader_accesses, shader_dependencies))
+}
+
+struct RefreshedDraw {
+    record: Arc<PreparedDrawRecord>,
+    creations: Vec<BackendResourceCreateInfo>,
+    invalidations: Vec<ResourceDependency>,
+}
+
+/// A stable draw plan owns layout and shader validation. Buffer views, sampled
+/// images and samplers can be rebound independently. Sampled images still pass
+/// normal materialization/alias preparation; changed attachments consume the
+/// render-pass format and take the full attachment path. Operations stay immutable.
+fn refresh_draw_bindings(
+    resources: &MaxwellThreeDResolvedResources,
+    arguments: DrawArguments,
+    prepared: &Arc<PreparedDrawRecord>,
+    cache: &mut MaxwellLoweringCache,
+) -> Result<Option<RefreshedDraw>, MaxwellLoweringError> {
+    if resources.resources().len() != prepared.components.len()
+        || resources
+            .resources()
             .iter()
-            .flatten()
-            .copied()
-            .filter(|dependency| {
-                cache.views.iter().any(|record| {
-                    record.dependency == *dependency
-                        && matches!(
-                            record.materialization,
-                            ViewMaterialization::CopiedColor { .. }
-                        )
+            .zip(&prepared.components)
+            .any(|(new, old)| new.role() != old.role())
+    {
+        nixe_trace::event("gpu.draw_miss.resource_roles", 0, 1);
+        return Ok(None);
+    }
+    let mut changed = Vec::new();
+    for &index in prepared.consumed.iter() {
+        if !resources.resources()[index].shares_component(&prepared.components[index]) {
+            if let MaxwellThreeDResolvedResource::Image(image) = &resources.resources()[index]
+                && !matches!(image.role(), MaxwellThreeDResourceRole::SampledImage { .. })
+            {
+                nixe_trace::event("gpu.draw_miss.attachment", 0, 1);
+                return Ok(None);
+            }
+            changed.push(index);
+        }
+    }
+    if !prepared.sampled_aliases.iter().all(|dependency| {
+        cache
+            .views
+            .iter()
+            .find(|record| record.dependency == *dependency)
+            .is_some_and(|record| sampled_alias::copy_is_current(record, cache))
+    }) {
+        nixe_trace::event("gpu.draw_miss.sampled_alias", 0, 1);
+        return Ok(None);
+    }
+    let samplers_changed = prepared.samplers.as_ref() != resources.samplers();
+    if changed.is_empty() && !samplers_changed {
+        nixe_trace::event("gpu.prepared_draw_hit", 0, 1);
+        return Ok(Some(RefreshedDraw {
+            record: Arc::clone(prepared),
+            creations: Vec::new(),
+            invalidations: std::mem::take(&mut cache.retired_resources),
+        }));
+    }
+    let _refresh = nixe_trace::Span::new("gpu.draw_binding_refresh", 0, changed.len() as u64);
+    reject_draw_aliases(resources, &prepared.consumed, &prepared.dirty_images)?;
+    let mut creations = Vec::new();
+    let mut invalidations = std::mem::take(&mut cache.retired_resources);
+    let mut bindings = prepared.bindings.to_vec();
+    for &index in &changed {
+        bindings[index] = None;
+    }
+    let bindings = prepare_resources(
+        resources,
+        &changed,
+        bindings,
+        cache,
+        &mut creations,
+        &mut invalidations,
+    )?;
+    let sampler_bindings = if samplers_changed {
+        prepare_samplers(resources, cache, &mut creations, &mut invalidations)?
+    } else {
+        prepared.sampler_bindings.to_vec()
+    };
+    let GpuCommand::Draw(old) = prepared.operations[1].command() else {
+        unreachable!()
+    };
+    let regions = prepared
+        .vertex_streams
+        .iter()
+        .map(|&stream| {
+            let index = resource_index(resources, MaxwellThreeDResourceRole::VertexStream(stream))?;
+            draw_buffer_region(resources, &bindings, index)
+        })
+        .collect::<Result<Vec<_>, MaxwellLoweringError>>()?;
+    let index_buffer = old
+        .prepared
+        .index_buffer
+        .map(|(_, format)| {
+            let index = resource_index(resources, MaxwellThreeDResourceRole::IndexBuffer)?;
+            Ok::<_, MaxwellLoweringError>((
+                draw_buffer_region(resources, &bindings, index)?,
+                format,
+            ))
+        })
+        .transpose()?;
+    let shader_changed = prepared
+        .shaders
+        .resources
+        .iter()
+        .any(|resource| match resource.role {
+            MaxwellThreeDResourceRole::Sampler(_) => samplers_changed,
+            role => changed
+                .iter()
+                .any(|&index| resources.resources()[index].role() == role),
+        });
+    let (tables, accesses, dependencies) = if shader_changed {
+        let descriptors = prepared
+            .shaders
+            .resources
+            .iter()
+            .map(|resource| {
+                Ok(DescriptorTableBinding {
+                    binding: resource.binding,
+                    resource: shader_resource_dependency(
+                        resources,
+                        &bindings,
+                        &sampler_bindings,
+                        resource.role,
+                    )?,
                 })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, MaxwellLoweringError>>()?;
+        let tables = prepare_descriptors(
+            descriptors,
+            prepared
+                .shaders
+                .resources
+                .iter()
+                .map(|resource| resource.kind)
+                .collect(),
+            cache,
+            &mut creations,
+        )?;
+        let (accesses, dependencies) =
+            draw_shader_dependencies(resources, &bindings, &sampler_bindings, &prepared.shaders)?;
+        (tables, Arc::from(accesses), Arc::from(dependencies))
+    } else {
+        (
+            old.prepared.descriptor_tables.to_vec(),
+            Arc::clone(&prepared.shader_accesses),
+            Arc::clone(&prepared.shader_dependencies),
+        )
     };
-    let operations = record.operations(arguments)?;
-    let dirty = Arc::clone(&record.dirty_images);
-    cache.prepared_draw = Some(record);
-    Ok((operations.into(), dirty))
+    let draw = Arc::new((*old.prepared).clone().with_bindings(
+        old.prepared.pipeline,
+        old.prepared.render_pass,
+        tables,
+        &regions,
+        index_buffer,
+    ));
+    let operation = GpuOperation::new(
+        GpuCommand::Draw(
+            DrawOperation::new(draw, arguments).map_err(MaxwellLoweringError::Command)?,
+        ),
+        accesses.iter().copied(),
+        dependencies.iter().copied(),
+        prepared.operations[1].capability_requirements().clone(),
+    );
+    let sampled_aliases = bindings
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|dependency| {
+            cache.views.iter().any(|record| {
+                record.dependency == *dependency
+                    && matches!(
+                        record.materialization,
+                        ViewMaterialization::CopiedColor { .. }
+                    )
+            })
+        })
+        .collect();
+    let record = Arc::new(PreparedDrawRecord {
+        indexed: prepared.indexed,
+        state: prepared.state.clone(),
+        components: resources.resources().into(),
+        samplers: resources.samplers().into(),
+        bindings: bindings.into(),
+        sampler_bindings: sampler_bindings.into(),
+        consumed: Arc::clone(&prepared.consumed),
+        vertex_streams: Arc::clone(&prepared.vertex_streams),
+        shaders: prepared.shaders.clone(),
+        shader_accesses: accesses,
+        shader_dependencies: dependencies,
+        operations: [
+            prepared.operations[0].clone(),
+            operation,
+            prepared.operations[2].clone(),
+        ],
+        dirty_images: Arc::clone(&prepared.dirty_images),
+        sampled_aliases,
+    });
+    nixe_trace::event("gpu.draw_bindings_refreshed", 0, changed.len() as u64);
+    Ok(Some(RefreshedDraw {
+        record,
+        creations,
+        invalidations,
+    }))
+}
+
+fn draw_buffer_region(
+    resources: &MaxwellThreeDResolvedResources,
+    bindings: &[Option<ResourceDependency>],
+    index: usize,
+) -> Result<BufferRegion, MaxwellLoweringError> {
+    let buffer = resolved_buffer(resources, index)?;
+    Ok(BufferRegion {
+        buffer: buffer_dependency(binding_at(resources, bindings, index)?)?,
+        range: BufferRange::new(0, buffer.description().size()).map_err(|_| {
+            MaxwellLoweringError::InvalidResolvedView {
+                role: buffer.role(),
+            }
+        })?,
+    })
 }
 
 fn prepare_descriptors(
@@ -4376,6 +4929,34 @@ fn primitive_topology(
 fn neutral_first_instance(base: u32, relative: u32) -> Result<u32, MaxwellLoweringError> {
     base.checked_add(relative)
         .ok_or(MaxwellLoweringError::InstanceIndexOverflow { base, relative })
+}
+
+// These checks consume changing arguments, so both cached paths repeat them.
+fn validate_fill_rectangle_arguments(
+    topology: PrimitiveTopology,
+    arguments: DrawArguments,
+) -> Result<(), MaxwellLoweringError> {
+    let DrawArguments::NonIndexed {
+        first_vertex,
+        vertex_count,
+        ..
+    } = arguments
+    else {
+        return Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(
+            "indexed rectangle expansion",
+        ));
+    };
+    if topology != PrimitiveTopology::Triangles {
+        return Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(
+            "primitive topology is not a triangle list",
+        ));
+    }
+    if !first_vertex.is_multiple_of(3) || !vertex_count.is_multiple_of(3) {
+        return Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(
+            "vertex range is not aligned to complete triangles",
+        ));
+    }
+    Ok(())
 }
 
 fn draw_arguments(
@@ -5560,6 +6141,156 @@ mod tests {
         depth_stencil_attachment_required, neutral_depth_compare, neutral_first_instance,
         neutral_vertex_format, primitive_topology,
     };
+
+    #[test]
+    fn cached_rectangle_draw_revalidates_each_vertex_range() {
+        use super::*;
+        let state = MaxwellThreeDState::default();
+        let draw = Arc::new(
+            PreparedDraw::new(
+                PipelineId::new(1),
+                RenderPassId::new(2),
+                PrimitiveTopology::Triangles,
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap()
+            .with_triangle_rasterization(TriangleRasterization::FillRectangle),
+        );
+        let arguments = |first_vertex, vertex_count| DrawArguments::NonIndexed {
+            first_vertex,
+            vertex_count,
+            first_instance: 0,
+            instance_count: 1,
+        };
+        let operation = GpuOperation::new(
+            GpuCommand::Draw(DrawOperation::new(draw, arguments(0, 3)).unwrap()),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        );
+        let cached = PreparedDrawRecord {
+            indexed: false,
+            state: state.fixed_draw_identity(),
+            components: Box::new([]),
+            samplers: Box::new([]),
+            bindings: Box::new([]),
+            sampler_bindings: Box::new([]),
+            consumed: Arc::from([]),
+            vertex_streams: Arc::from([]),
+            shader_accesses: Arc::from([]),
+            shader_dependencies: Arc::from([]),
+            shaders: crate::engines::tests::translated_graphics_shaders().0,
+            operations: [operation.clone(), operation.clone(), operation],
+            dirty_images: Arc::from([]),
+            sampled_aliases: Box::new([]),
+        };
+        assert!(cached.operations(arguments(3, 6)).is_ok());
+        for invalid in [arguments(1, 3), arguments(0, 4)] {
+            assert!(matches!(
+                cached.operations(invalid),
+                Err(MaxwellLoweringError::UnsupportedFillRectangleDraw(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn view_retirement_invalidates_only_draws_consuming_that_dependency() {
+        use super::*;
+        let state = MaxwellThreeDState::default();
+        let buffer = BufferId::new(11);
+        let draw = Arc::new(
+            PreparedDraw::new(
+                PipelineId::new(1),
+                RenderPassId::new(2),
+                PrimitiveTopology::Triangles,
+                vec![],
+                vec![],
+                Some((
+                    BufferRegion {
+                        buffer,
+                        range: BufferRange::new(0, 64).unwrap(),
+                    },
+                    nixe_gpu::IndexType::Uint16,
+                )),
+            )
+            .unwrap(),
+        );
+        let operation = GpuOperation::new(
+            GpuCommand::Draw(
+                DrawOperation::new(
+                    draw,
+                    DrawArguments::Indexed {
+                        first_index: 0,
+                        index_count: 3,
+                        vertex_offset: 0,
+                        first_instance: 0,
+                        instance_count: 1,
+                    },
+                )
+                .unwrap(),
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        );
+        let record = Arc::new(PreparedDrawRecord {
+            indexed: true,
+            state: state.fixed_draw_identity(),
+            components: Box::new([]),
+            samplers: Box::new([]),
+            bindings: Box::new([]),
+            sampler_bindings: Box::new([]),
+            consumed: Arc::from([]),
+            vertex_streams: Arc::from([]),
+            shader_accesses: Arc::from([]),
+            shader_dependencies: Arc::from([]),
+            shaders: crate::engines::tests::translated_graphics_shaders().0,
+            operations: [operation.clone(), operation.clone(), operation],
+            dirty_images: Arc::from([]),
+            sampled_aliases: Box::new([]),
+        });
+        let mut cache = MaxwellLoweringCache {
+            prepared_draw: Some(record.clone()),
+            ..Default::default()
+        };
+        let GpuCommand::Draw(draw) = record.operations[0].command() else {
+            unreachable!()
+        };
+        cache.draw_plans.push_back(DrawPlan {
+            validation: DrawValidationRecord {
+                indexed: true,
+                state: state.fixed_draw_identity(),
+                raster: raster::DrawRasterState {
+                    front_face: nixe_gpu::FrontFace::CounterClockwise,
+                    cull_mode: nixe_gpu::CullMode::None,
+                    triangles: TriangleRasterization::Fill,
+                },
+                tessellation: None,
+            },
+            shaders: record.shaders.clone(),
+            vertex_streams: Arc::from([]),
+            draw: Arc::clone(&draw.prepared),
+            prepared: Some(Arc::clone(&record)),
+        });
+        let mut retired = Vec::new();
+        retire_resource_dependencies(
+            &[ResourceDependency::Buffer(BufferId::new(99))],
+            &mut cache,
+            &mut retired,
+        );
+        assert!(Arc::ptr_eq(cache.prepared_draw.as_ref().unwrap(), &record));
+        assert!(cache.draw_plans[0].prepared.is_some());
+        retire_resource_dependencies(
+            &[ResourceDependency::Buffer(buffer)],
+            &mut cache,
+            &mut retired,
+        );
+        assert!(cache.prepared_draw.is_none());
+        assert!(cache.draw_plans[0].prepared.is_none());
+        assert_eq!(cache.draw_plans.len(), 1); // Fixed validation survives retirement.
+    }
 
     #[test]
     fn consumed_vertex_streams_deduplicate_attributes_and_cover_stream_31() {

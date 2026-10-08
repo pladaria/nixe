@@ -17,7 +17,7 @@ fn pressure_defers_seed_and_reshape_and_discards_already_queued_work() {
         process.admit_seed(&queue, &mut samples, seed).unwrap(),
         Outcome::Queued
     );
-    let pending = queue.pop().unwrap().unwrap();
+    let pending = queue.pop_ready().unwrap().unwrap();
     let charge = process
         .cache
         .charge_metadata(
@@ -45,14 +45,14 @@ fn pressure_defers_seed_and_reshape_and_discards_already_queued_work() {
     );
     assert!(process.accept_background(pending).unwrap().is_none());
     assert_eq!(process.lock().compilers, 0);
-    assert!(queue.pop().unwrap().is_none());
+    assert!(queue.pop_ready().unwrap().is_none());
     drop(charge);
     assert_eq!(
         process.admit_seed(&queue, &mut samples, seed).unwrap(),
         Outcome::Queued
     );
     let work = process
-        .accept_background(queue.pop().unwrap().unwrap())
+        .accept_background(queue.pop_ready().unwrap().unwrap())
         .unwrap()
         .unwrap();
     assert!(work.lcq(key(0)).unwrap().is_some());
@@ -67,33 +67,38 @@ fn pressure_cancels_running_work_without_rejection_and_resets_unfinished_fronten
     let wait = Mutex::new(wait);
     let (finished, done) = mpsc::channel();
     let calls = AtomicUsize::new(0);
-    let mut workers = Workers::start(1, Arc::clone(&process), move |resources, work| {
-        let call = calls.fetch_add(1, Ordering::Relaxed);
-        let source = work.lcq(key(0))?.unwrap();
-        // Deliberately abandon a non-finalized builder on the first attempt.
-        {
-            let mut builder =
-                FunctionBuilder::new(&mut resources.context.func, &mut resources.frontend);
-            let block = builder.create_block();
-            builder.switch_to_block(block);
-            builder.ins().iconst(types::I64, 42);
-        }
-        if call == 0 {
-            started.send(()).unwrap();
-            wait.lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap();
-        }
-        let result = work.check();
-        assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
-        drop(source);
-        drop(work);
-        finished.send((call, result)).unwrap();
-        result?;
-        // Test-only abandonment also exercises resetting a second builder.
-        Err(CompileError::Cancelled)
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |resources, work| {
+            let call = calls.fetch_add(1, Ordering::Relaxed);
+            let source = work.lcq(key(0))?.unwrap();
+            // Deliberately abandon a non-finalized builder on the first attempt.
+            {
+                let mut builder =
+                    FunctionBuilder::new(&mut resources.context.func, &mut resources.frontend);
+                let block = builder.create_block();
+                builder.switch_to_block(block);
+                builder.ins().iconst(types::I64, 42);
+            }
+            if call == 0 {
+                started.send(()).unwrap();
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+            let result = work.check();
+            assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
+            drop(source);
+            drop(work);
+            finished.send((call, result)).unwrap();
+            result?;
+            // Test-only abandonment also exercises resetting a second builder.
+            Err(CompileError::Cancelled)
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     enqueue(&process, &workers, &mut samples, 0);
@@ -128,28 +133,33 @@ fn replaced_running_job_cannot_clear_new_running_reservation() {
     let (release_new, new_wait) = mpsc::channel();
     let waits = [Mutex::new(old_wait), Mutex::new(new_wait)];
     let calls = AtomicUsize::new(0);
-    let mut workers = Workers::start(2, Arc::clone(&process), move |_, work| {
-        let call = calls.fetch_add(1, Ordering::Relaxed);
-        let source = work.lcq(key(0))?.unwrap();
-        events.send((call, false)).unwrap();
-        waits[call]
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        let result = work.check();
-        assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
-        drop(source);
-        drop(work);
-        events.send((call, true)).unwrap();
-        if call == 0 {
-            assert_eq!(result, Err(lifetime::Error::StalePublication));
-        } else {
-            assert_eq!(result, Ok(()));
-        }
-        result?;
-        Ok(())
-    })
+    let mut workers = Workers::start(
+        2,
+        Arc::clone(&process),
+        move |_, work| {
+            let call = calls.fetch_add(1, Ordering::Relaxed);
+            let source = work.lcq(key(0))?.unwrap();
+            events.send((call, false)).unwrap();
+            waits[call]
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let result = work.check();
+            assert_eq!(source.unit.instructions.get(0).unwrap().bits, 0xd503201f);
+            drop(source);
+            drop(work);
+            events.send((call, true)).unwrap();
+            if call == 0 {
+                assert_eq!(result, Err(lifetime::Error::StalePublication));
+            } else {
+                assert_eq!(result, Ok(()));
+            }
+            result?;
+            Ok(())
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     enqueue(&process, &workers, &mut samples, 0);
@@ -195,17 +205,22 @@ fn hcq_pressure_retires_reserved_families_without_waiting_for_reshape_compilatio
     let (started, ready) = mpsc::channel();
     let (release, wait) = mpsc::channel();
     let wait = Mutex::new(wait);
-    let mut workers = Workers::start(1, Arc::clone(&process), move |_, work| {
-        let source = work.lcq(key(0))?.unwrap();
-        started.send(()).unwrap();
-        wait.lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        assert_eq!(source.unit.tier, Tier::Lcq);
-        work.check()?;
-        panic!("retired reshape must be stale");
-    })
+    let mut workers = Workers::start(
+        1,
+        Arc::clone(&process),
+        move |_, work| {
+            let source = work.lcq(key(0))?.unwrap();
+            started.send(()).unwrap();
+            wait.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(source.unit.tier, Tier::Lcq);
+            work.check()?;
+            panic!("retired reshape must be stale");
+        },
+        None,
+    )
     .unwrap()
     .unwrap();
     let start = Instant::now();

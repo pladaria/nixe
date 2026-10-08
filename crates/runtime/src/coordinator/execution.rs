@@ -17,17 +17,7 @@ impl RuntimeCoordinator {
     pub fn run_parallel_adaptive(
         &mut self,
     ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
-        let execution = self.run_parallel_with_budget(None)?;
-        if let Some(execution) = &execution {
-            self.parallel_budgets
-                .get_mut(&execution.lease.vcpu)
-                .unwrap()
-                .observe(matches!(
-                    execution.report.stop,
-                    ExecutionStop::BudgetExhausted
-                ));
-        }
-        Ok(execution)
+        self.run_parallel_with_budget(None)
     }
 
     /// Executes at most one deterministic slice and returns its scheduler lease.
@@ -66,7 +56,7 @@ impl RuntimeCoordinator {
         } else {
             instruction_budget
         };
-        self.dispatch_worker(lease, instruction_budget)?;
+        self.dispatch_worker(lease, instruction_budget, false)?;
         self.receive_worker(lease).map(Some)
     }
 
@@ -89,10 +79,12 @@ impl RuntimeCoordinator {
         if let Some(execution) = self.completed_executions.pop_front() {
             return Ok(Some(execution));
         }
+        let selection_trace = nixe_trace::Span::new("coordinator.select", 0, 0);
         self.wake_due_deadlines()?;
         loop {
-            let idle: Vec<_> = self.scheduler.idle_vcpus().collect();
-            for vcpu in idle {
+            let mut previous = None;
+            while let Some(vcpu) = self.scheduler.next_idle_vcpu(previous) {
+                previous = Some(vcpu);
                 let SchedulerDecision::Selected(lease) =
                     self.scheduler.apply(SchedulerCommand::Select(vcpu))?
                 else {
@@ -101,7 +93,7 @@ impl RuntimeCoordinator {
                 if let Some(lease) = lease {
                     let budget =
                         instruction_budget.unwrap_or_else(|| self.parallel_budgets[&vcpu].current);
-                    self.dispatch_worker(lease, budget)?;
+                    self.dispatch_worker(lease, budget, instruction_budget.is_none())?;
                 }
             }
             if self.scheduler.active_leases().next().is_some() {
@@ -111,10 +103,13 @@ impl RuntimeCoordinator {
                 return Ok(None);
             }
         }
-        let result = self
-            .workers
-            .receive_any()
-            .map_err(CoordinatorError::Worker)?;
+        drop(selection_trace);
+        let result = {
+            let _wait = nixe_trace::Span::new("coordinator.worker_wait", 0, 0);
+            self.workers
+                .receive_any()
+                .map_err(CoordinatorError::Worker)?
+        };
         let lease = self
             .scheduler
             .active_leases()
@@ -173,7 +168,13 @@ impl RuntimeCoordinator {
         &mut self,
         lease: Lease,
         instruction_budget: u64,
+        adaptive: bool,
     ) -> Result<(), CoordinatorError> {
+        let _trace = nixe_trace::Span::new(
+            "coordinator.dispatch",
+            lease.thread.get(),
+            lease.vcpu.get() as u64,
+        );
         self.record_dispatch(lease, instruction_budget);
 
         let events = self
@@ -209,10 +210,22 @@ impl RuntimeCoordinator {
             process: lease.process,
             cpu_process: process.cpu_process_id(),
         };
+        nixe_trace::event(
+            "vcpu.dispatched",
+            lease.thread.get(),
+            lease.vcpu.get() as u64,
+        );
         if let Err(failure) = self.workers.dispatch(WorkerRequest {
             lease,
             cpu_thread,
             execution,
+            quantum: if !adaptive {
+                QuantumPolicy::Explicit
+            } else if self.virtual_clock.mode() == crate::VirtualClockMode::Realtime {
+                QuantumPolicy::TimedAdaptive
+            } else {
+                QuantumPolicy::InstructionAdaptive
+            },
         }) {
             self.processes
                 .get_mut(&lease.process)
@@ -247,6 +260,16 @@ impl RuntimeCoordinator {
         expected: Lease,
         worker_result: worker::WorkerResult,
     ) -> Result<CoordinatorExecution, CoordinatorError> {
+        let _trace = nixe_trace::Span::new(
+            "coordinator.complete",
+            expected.thread.get(),
+            expected.vcpu.get() as u64,
+        );
+        nixe_trace::event(
+            "vcpu.collected",
+            expected.thread.get(),
+            expected.vcpu.get() as u64,
+        );
         if worker_result.lease != expected {
             self.processes
                 .get_mut(&expected.process)
@@ -257,6 +280,18 @@ impl RuntimeCoordinator {
                 expected,
                 received: worker_result.lease,
             }));
+        }
+        if let Ok(report) = &worker_result.outcome {
+            let budget = self.parallel_budgets.get_mut(&expected.vcpu).unwrap();
+            let exhausted = matches!(report.stop, ExecutionStop::BudgetExhausted);
+            match worker_result.quantum {
+                // An SVC is not evidence that this core needs a smaller quantum.
+                QuantumPolicy::TimedAdaptive if exhausted => {
+                    budget.observe_elapsed(report.progress, worker_result.elapsed);
+                }
+                QuantumPolicy::InstructionAdaptive => budget.observe(exhausted),
+                _ => {}
+            }
         }
         let result = match worker_result.outcome {
             Ok(report) => Ok(report),

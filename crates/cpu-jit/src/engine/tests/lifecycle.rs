@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ReturnStack, abi::NativeExitReason, lifetime::unit::UnitHandle};
+use crate::{abi::NativeExitReason, lifetime::unit::UnitHandle};
 
 const TARGET: GuestVirtualAddress = GuestVirtualAddress::new(0x2000);
 const ALIAS: GuestVirtualAddress = GuestVirtualAddress::new(0x4000);
@@ -84,7 +84,6 @@ fn warm(thread: &mut JitThread, offset: u64, increment: u64) {
     let mut state = initial(offset);
     let (Some(invocation::Exit::Native { guest, .. }), budget) = thread
         .invoke(
-            &mut ReturnStack::default(),
             &mut NativeWorker::default(),
             &mut state,
             PollBudget::new(4096, 64).unwrap(),
@@ -98,9 +97,7 @@ fn warm(thread: &mut JitThread, offset: u64, increment: u64) {
     assert_eq!(budget.slice_remaining, 61);
     assert_eq!(state.general_register_storage_mut()[0], increment);
     let mut hot = initial(offset);
-    let mut returns = ReturnStack::default();
     let (returned, budget) = fallback::without_resolver(
-        &mut returns,
         thread,
         &mut hot,
         PollBudget::new(1, 64).unwrap(),
@@ -109,7 +106,6 @@ fn warm(thread: &mut JitThread, offset: u64, increment: u64) {
     assert_eq!(returned.reason, NativeExitReason::Architectural);
     assert_eq!(budget.slice_remaining, 61);
     assert_eq!(hot, state);
-    assert_eq!(returns.depth, 0);
 }
 
 #[test]
@@ -156,9 +152,7 @@ fn alias_write_and_permission_change_cut_static_and_all_vcpu_pic_roots() {
         for thread in [&mut first, &mut second] {
             for offset in [0, 16] {
                 let mut state = initial(offset);
-                let mut returns = ReturnStack::default();
                 let (returned, budget) = fallback::without_resolver(
-                    &mut returns,
                     thread,
                     &mut state,
                     PollBudget::new(4096, 64).unwrap(),
@@ -168,7 +162,6 @@ fn alias_write_and_permission_change_cut_static_and_all_vcpu_pic_roots() {
                 assert_eq!(budget.slice_remaining, 63);
                 assert_eq!(state.pc(), TARGET.get());
                 assert_eq!(state.general_register_storage_mut()[0], 0);
-                assert_eq!(returns.depth, 1); // Unlink retained the BL push.
             }
         }
         if permission_change {
@@ -238,7 +231,6 @@ fn later_unit_fault_epoch_delays_mixed_root_unlink_and_alias_visibility() {
         state.general_register_storage_mut()[1] = 0x3000;
         let (Some(invocation::Exit::Native { guest, .. }), _) = thread
             .invoke(
-                &mut ReturnStack::default(),
                 &mut NativeWorker::default(),
                 &mut state,
                 PollBudget::new(4096, 64).unwrap(),

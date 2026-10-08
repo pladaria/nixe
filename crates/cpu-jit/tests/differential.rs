@@ -61,7 +61,6 @@ fn concrete_interpreter_and_jit_match_at_an_architectural_boundary() {
         .unwrap();
     let jit_report = jit
         .run_slice(
-            &mut nixe_cpu_jit::ReturnStack::default(),
             &mut nixe_cpu_direct_memory::NativeWorker::default(),
             &mut jit_state,
             2,
@@ -136,7 +135,6 @@ fn switch_1_pointer_authentication_hint_family_is_differentially_nop() {
         .unwrap();
     let jit_report = jit
         .run_slice(
-            &mut nixe_cpu_jit::ReturnStack::default(),
             &mut nixe_cpu_direct_memory::NativeWorker::default(),
             &mut jit_state,
             interpreter_budget,

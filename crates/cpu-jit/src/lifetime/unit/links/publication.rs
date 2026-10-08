@@ -323,7 +323,14 @@ mod tests {
             assert_ne!(previous, next);
             {
                 let state = process.lock();
-                assert_eq!(state.phase, crate::lifetime::Phase::Closing);
+                assert_eq!(
+                    state.phase,
+                    if tier == Tier::Lcq {
+                        crate::lifetime::Phase::Closing
+                    } else {
+                        crate::lifetime::Phase::Open
+                    }
+                );
                 assert!(state.units.links.records.get(previous.0).is_none());
                 assert!(state.units.records.get(old.0).unwrap().incoming.is_none());
                 let record = state.units.links.records.get(next.0).unwrap();
@@ -446,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_registers_existing_and_self_targets_before_reopening_admission() {
+    fn publication_registers_existing_and_self_targets_without_closing_admission() {
         for self_edge in [false, true] {
             let process = process();
             let cursor = AtomicU64::new(0);
@@ -462,7 +469,7 @@ mod tests {
             let source = prepared.publish().unwrap();
             let link = {
                 let state = process.lock();
-                assert_eq!(state.phase, crate::lifetime::Phase::Closing);
+                assert_eq!(state.phase, crate::lifetime::Phase::Open);
                 let record = state.units.records.get(source.0).unwrap();
                 let handle = record.static_sites[0].link.unwrap();
                 assert_eq!(record.outgoing, Some(handle));
@@ -477,7 +484,8 @@ mod tests {
                 );
                 handle
             };
-            assert!(matches!(process.reserve(key(8)), Err(Error::Closed)));
+            assert!(process.reserve(key(8)).is_ok());
+            assert_eq!(process.control_word().load(Ordering::Acquire), 0);
             assert!(process.try_service_links().unwrap());
             assert!(
                 process
@@ -520,7 +528,7 @@ mod tests {
         assert_eq!(first.len(), 49);
         {
             let state = process.lock();
-            assert_eq!(state.phase, crate::lifetime::Phase::Closing);
+            assert_eq!(state.phase, crate::lifetime::Phase::Open);
             for source in sources.iter().copied().chain([target]) {
                 let handle = state.units.records.get(source.0).unwrap().static_sites[0]
                     .link
