@@ -9,7 +9,14 @@ fn wgpu_backend_depends_on_neutral_gpu_and_memory_contracts_only() {
     let dependencies = dependency_names(&contents);
     assert_eq!(
         dependencies,
-        ["log", "nixe-gpu", "nixe-memory", "pollster", "wgpu"]
+        [
+            "log",
+            "nixe-gpu",
+            "nixe-memory",
+            "pollster",
+            "rustc-hash",
+            "wgpu"
+        ]
     );
     for prohibited in [
         "nixe-cpu",

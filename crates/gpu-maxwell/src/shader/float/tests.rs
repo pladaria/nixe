@@ -350,6 +350,86 @@ fn captured_fadd_ftz_reads_the_expected_constant_buffer_word() {
 }
 
 #[test]
+fn fadd32i_preserves_full_immediate_bits_and_uses_its_modifier_fields() {
+    let mut header = [0; 20];
+    header[0] = 0x0002_5462;
+    header[18] = 1;
+    let cases = [
+        (
+            0x088b_d343_9587_0000,
+            1.0_f32,
+            1.0 + f32::from_bits(0xbd34_3958),
+        ),
+        // FTZ flushes both the input subnormal and result, as in short FADD.
+        (0x0880_0000_0017_0000, 0.0, 0.0),
+    ];
+    let mut fixtures = cases.to_vec();
+    for modifiers in [
+        0,
+        1 << 53,
+        1 << 54,
+        1 << 56,
+        1 << 57,
+        (1 << 54) | (1 << 56) | (1 << 57) | (1 << 53),
+    ] {
+        let mut left = -1.25_f32;
+        let mut right = -f32::from_bits(0x3eaa_aaab);
+        let encoding = 0x0800_0000_0007_0000 | (u64::from(right.to_bits()) << 20) | modifiers;
+        if modifiers & (1 << 54) != 0 {
+            left = left.abs();
+        }
+        if modifiers & (1 << 56) != 0 {
+            left = -left;
+        }
+        if modifiers & (1 << 57) != 0 {
+            right = right.abs();
+        }
+        if modifiers & (1 << 53) != 0 {
+            right = -right;
+        }
+        fixtures.push((encoding, -1.25, left + right));
+    }
+    for (encoding, input, expected) in fixtures {
+        assert!(is_float_add(encoding));
+        let translated = translated_fixture(
+            MaxwellShaderStage::Pixel,
+            header,
+            &[
+                0,
+                0x0100_0000_0007_f000 | (u64::from(input.to_bits()) << 20),
+                encoding,
+                0xe300_0000_0007_000f,
+            ],
+        );
+        let result = nixe_gpu::evaluate_shader_ir(
+            &translated,
+            &nixe_gpu::ShaderEvaluationInputs::default(),
+            32,
+        )
+        .unwrap();
+        assert_eq!(
+            result.output_bits(nixe_gpu::ShaderIoLocation::Color(0), 0),
+            Some(expected.to_bits()),
+            "encoding={encoding:016x}"
+        );
+        validate_wgsl(&nixe_gpu::lower_shader_ir_to_wgsl(&translated).unwrap());
+    }
+    assert!(matches!(
+        decode_float_add(
+            MaxwellShaderStage::Pixel,
+            0x98,
+            0x088b_d343_9587_0000 | (1 << 52),
+            4,
+            &mut 4,
+        ),
+        Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            detail: "FADD condition-code output",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn fadd_register_and_compact_immediate_forms_decode() {
     let mut temporary = 4;
     let register = decode_float_add(

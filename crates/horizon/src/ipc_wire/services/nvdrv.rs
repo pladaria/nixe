@@ -201,7 +201,19 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                 // emulator operation. In particular, asynchronous syncpoint
                 // waits return Timeout while arming their completion event.
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/fence.c
-                log::debug!(
+                // EventWait/EventWaitAsync report Timeout immediately when the
+                // syncpoint is not reached yet; completion is signalled through
+                // the registered event. This is routine fence synchronization,
+                // including zero-timeout polls, rather than an expired wait.
+                let level = if response.driver_result == crate::nvdrv::NV_TIMEOUT
+                    && matches!(ioctl, 0xc010_001d | 0xc010_001e)
+                {
+                    log::Level::Trace
+                } else {
+                    log::Level::Debug
+                };
+                log::log!(
+                    level,
                     "nvdrv ioctl returned a non-success driver status: fd={fd:#010x} request={ioctl:#010x} result={:#x}{} input-size={} input-prefix={:02x?}",
                     response.driver_result,
                     if response.driver_result == crate::nvdrv::NV_TIMEOUT {

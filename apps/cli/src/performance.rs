@@ -16,7 +16,9 @@ impl Capture {
         let Some(path) = std::env::var_os("NIXE_PERFORMANCE_COUNTERS") else {
             return Ok(None);
         };
+        let page_report = std::path::PathBuf::from(&path).with_extension("memory.csv");
         let mut output = BufWriter::new(File::create(path)?);
+        nixe_memory::metrics::start_page_tracking();
         let (stop, receiver) = mpsc::channel();
         let counters = || {
             let mut values = nixe_memory::metrics::snapshot();
@@ -50,7 +52,8 @@ impl Capture {
                 }
                 writeln!(output)?;
                 if stop {
-                    return output.flush();
+                    output.flush()?;
+                    return nixe_memory::metrics::write_page_tracking(&page_report);
                 }
             }
         });

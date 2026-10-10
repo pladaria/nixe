@@ -4186,7 +4186,15 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
         if let Some(guard) = predicate_guard(instruction.predicate) {
             visit_operation_destinations(&instruction.operation, |destination| {
                 if !definitions.registers.contains(&destination) {
-                    *definitions.guarded.entry(destination).or_default() |= 1 << guard;
+                    let guards = definitions.guarded.entry(destination).or_default();
+                    *guards |= 1 << guard;
+                    // Writes under P and !P cover every lane if P has not
+                    // changed. Predicate writes invalidate these guard facts.
+                    let complementary = 3 << (guard & !1);
+                    if *guards & complementary == complementary {
+                        definitions.registers.insert(destination);
+                        definitions.guarded.remove(&destination);
+                    }
                 }
             });
         }
@@ -5068,6 +5076,112 @@ mod tests {
         assert!(module.source().contains("predicates[0] ="));
         assert!(module.source().contains("if (predicates[0])"));
         naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
+    fn complementary_predicated_writes_define_a_register_until_the_predicate_changes() {
+        let source = |offset| ShaderSourceLocation::new(offset);
+        let register = |index| ShaderRegister::new(index);
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Float32,
+            None,
+        )
+        .unwrap();
+        let set_predicate = |offset, right| {
+            ShaderInstruction::new(
+                source(offset),
+                ShaderPredicate::Always,
+                ShaderOperation::SetPredicateFloat32 {
+                    destination: 1,
+                    left: register(0),
+                    right: register(right),
+                    comparison: ShaderFloatComparison::OrderedEqual,
+                    accumulator: ShaderPredicate::Always,
+                    set_operation: ShaderPredicateSetOperation::And,
+                    flush_denormals_to_zero: false,
+                },
+            )
+        };
+        for selector in [0.0_f32, 1.0] {
+            for rewrite_predicate in [false, true] {
+                let mut instructions = vec![];
+                for (index, bits) in [selector.to_bits(), 0].into_iter().enumerate() {
+                    instructions.push(ShaderInstruction::new(
+                        source(index as u32 * 8),
+                        ShaderPredicate::Always,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: register(index as u16),
+                            bits,
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ));
+                }
+                instructions.push(set_predicate(16, 1));
+                for (inverted, bits) in [(false, 0x3e80_0000), (true, 0xbe80_0000)] {
+                    if inverted && rewrite_predicate {
+                        // P1 now compares R0 with itself. For selector=1 the
+                        // first write was skipped and the second is skipped too.
+                        instructions.push(set_predicate(28, 0));
+                    }
+                    instructions.push(ShaderInstruction::new(
+                        source(if inverted { 32 } else { 24 }),
+                        ShaderPredicate::Register {
+                            register: 1,
+                            inverted,
+                        },
+                        ShaderOperation::MoveImmediate32 {
+                            destination: register(2),
+                            bits,
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ));
+                }
+                instructions.push(ShaderInstruction::new(
+                    source(40),
+                    ShaderPredicate::Always,
+                    ShaderOperation::StoreOutput {
+                        sources: vec![register(2)].into_boxed_slice(),
+                        location: ShaderIoLocation::Position,
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ));
+                instructions.push(ShaderInstruction::new(
+                    source(48),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ));
+                let verified = VerifiedShaderIr::verify(ShaderIr::new(
+                    ShaderStage::Vertex,
+                    vec![],
+                    vec![output],
+                    vec![],
+                    instructions,
+                ));
+                if rewrite_predicate {
+                    assert!(
+                        matches!(verified, Err(ShaderVerificationError::UndefinedRegister {
+                        source: at, register: reg,
+                    }) if at == source(40) && reg == register(2))
+                    );
+                } else {
+                    let verified = verified.unwrap();
+                    let result =
+                        evaluate_shader_ir(&verified, &ShaderEvaluationInputs::default(), 32)
+                            .unwrap();
+                    assert_eq!(
+                        result.output_bits(ShaderIoLocation::Position, 0),
+                        Some(if selector == 0.0 {
+                            0x3e80_0000
+                        } else {
+                            0xbe80_0000
+                        })
+                    );
+                }
+            }
+        }
     }
 
     #[test]

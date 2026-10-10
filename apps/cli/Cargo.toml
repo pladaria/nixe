@@ -30,4 +30,4 @@ nixe-video.workspace = true
 nixe-video-winit.workspace = true
 
 [features]
-performance-counters = ["nixe-gpu/performance-counters", "nixe-horizon/performance-counters", "nixe-cpu-jit/performance-counters", "nixe-audio/performance-counters", "nixe-video-winit/performance-counters"]
+performance-counters = ["nixe-gpu/performance-counters", "nixe-gpu-wgpu/performance-counters", "nixe-horizon/performance-counters", "nixe-cpu-jit/performance-counters", "nixe-audio/performance-counters", "nixe-video-winit/performance-counters"]

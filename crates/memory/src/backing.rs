@@ -311,6 +311,10 @@ pub(crate) fn publish_device_pages(
         .apply()
         .map_err(|error| VisibilityError::HostMemory(error.to_string().into()))?;
     for (index, (page, _, owner)) in pages.iter().enumerate() {
+        crate::metrics::record_page(
+            page.identity(),
+            crate::metrics::Counter::DeviceWritePublications,
+        );
         page.set_visibility(
             &mut states[index],
             PageVisibility::GpuNewer {
@@ -416,6 +420,10 @@ pub(crate) fn prepare_device_pages(
             // Read-only device use never changes canonical bytes. Under this
             // exclusive lease it only needs the final read-only protection;
             // temporary no-access mappings are reserved for device writers.
+            crate::metrics::record_page(
+                page.identity(),
+                crate::metrics::Counter::DeviceReadPreparations,
+            );
             page.set_visibility(state, PageVisibility::Clean)?;
         }
         let mut restored = DirectProtectionBatch::default();
@@ -472,41 +480,56 @@ pub(crate) fn prepare_protected_device_reads(
     }
     for (index, (page, _)) in pages.iter().enumerate() {
         if matches!(states[index].visibility, PageVisibility::CpuNewer) {
+            crate::metrics::record_page(
+                page.identity(),
+                crate::metrics::Counter::DeviceReadPreparations,
+            );
             page.set_visibility(&mut states[index], PageVisibility::Clean)?;
         }
     }
     Ok(true)
 }
 
-/// Captures an already protected page set without stopping native readers.
-/// Hold shared execution admission; page locks order checked stores, observer
+/// Captures CPU-write epochs and registers one summary for a distinct, ordered
+/// page set. `establish_protection` requires exclusive execution admission;
+/// otherwise every page must already be protected. Page locks order stores, observer
 /// registration and the summary baseline. Select/publish a summary only after
 /// locking every covered page, so another capture cannot reuse it before its
 /// observers are registered. All captured epochs are sampled before unlock.
-pub(crate) fn observe_protected_cpu_pages(
+pub(crate) fn observe_cpu_pages(
     pages: &[CanonicalBackingPage],
     select_summary: &mut impl FnMut() -> (Arc<crate::range::CpuWriteSummary>, bool),
+    establish_protection: bool,
 ) -> Result<Option<crate::range::CpuWriteObservation>, CanonicalPageError> {
     let mut states = pages
         .iter()
         .map(CanonicalBackingPage::lock_state)
         .collect::<Vec<_>>();
-    for state in &states {
-        match state.visibility {
-            PageVisibility::Invalid => {
-                return Err(CanonicalPageError::Visibility(
-                    VisibilityError::InvalidState,
-                ));
+    if establish_protection {
+        for (page, state) in pages.iter().zip(&states) {
+            if !state.cpu_dirty_observer_armed {
+                crate::metrics::record_page(page.identity(), crate::metrics::Counter::ObserverArms);
             }
-            PageVisibility::Conflicting => {
-                return Err(CanonicalPageError::Visibility(
-                    VisibilityError::ConflictingAccess,
-                ));
-            }
-            _ => {}
         }
-        if !state.cpu_dirty_observer_armed {
-            return Ok(None);
+        arm_cpu_page_states(&mut states)?;
+    } else {
+        for state in &states {
+            match state.visibility {
+                PageVisibility::Invalid => {
+                    return Err(CanonicalPageError::Visibility(
+                        VisibilityError::InvalidState,
+                    ));
+                }
+                PageVisibility::Conflicting => {
+                    return Err(CanonicalPageError::Visibility(
+                        VisibilityError::ConflictingAccess,
+                    ));
+                }
+                _ => {}
+            }
+            if !state.cpu_dirty_observer_armed {
+                return Ok(None);
+            }
         }
     }
     let (summary, shared) = select_summary();
@@ -528,6 +551,72 @@ pub(crate) fn observe_protected_cpu_pages(
     Ok(Some(crate::range::CpuWriteObservation::new(
         summary, epochs,
     )))
+}
+
+/// Rearms a distinct page set in CanonicalPageId order while its execution
+/// gates are held exclusively. Tracking changes need no byte materialization.
+pub(crate) fn arm_cpu_pages_quiescent<'a>(
+    pages: impl IntoIterator<Item = &'a CanonicalBackingPage>,
+) -> Result<Vec<u64>, CanonicalPageError> {
+    let pages = pages.into_iter().collect::<Vec<_>>();
+    debug_assert!(
+        pages
+            .windows(2)
+            .all(|pair| pair[0].identity() < pair[1].identity())
+    );
+    let mut states = pages
+        .iter()
+        .map(|page| page.lock_state())
+        .collect::<Vec<_>>();
+    for (page, state) in pages.iter().zip(&states) {
+        if !state.cpu_dirty_observer_armed {
+            crate::metrics::record_page(page.identity(), crate::metrics::Counter::ObserverArms);
+        }
+    }
+    arm_cpu_page_states(&mut states)?;
+    Ok(pages.iter().map(|page| page.cpu_dirty_epoch()).collect())
+}
+
+fn arm_cpu_page_states(
+    states: &mut [std::sync::MutexGuard<'_, CanonicalPageState>],
+) -> Result<(), CanonicalPageError> {
+    let mut protections = DirectProtectionBatch::default();
+    for state in states.iter_mut() {
+        match state.visibility {
+            PageVisibility::Clean | PageVisibility::CpuNewer | PageVisibility::GpuNewer { .. } => {}
+            PageVisibility::Conflicting => {
+                return Err(CanonicalPageError::Visibility(
+                    VisibilityError::ConflictingAccess,
+                ));
+            }
+            PageVisibility::Invalid => {
+                return Err(CanonicalPageError::Visibility(
+                    VisibilityError::InvalidState,
+                ));
+            }
+        }
+        if !state.cpu_dirty_observer_armed {
+            let visible = matches!(
+                state.visibility,
+                PageVisibility::Clean | PageVisibility::CpuNewer
+            );
+            protections.collect(state, |alias| match (visible, alias.maximum_protection) {
+                (false, _) => DirectProtection::None,
+                (true, DirectProtection::ReadWrite) => DirectProtection::Read,
+                (true, protection) => protection,
+            });
+        }
+    }
+    // Keep CPU execution excluded and all affected page states locked until
+    // exact alias protections have been coalesced and applied. Publish observer
+    // flags only after success; a failed host transition remains an error.
+    protections.apply().map_err(|error| {
+        CanonicalPageError::Visibility(VisibilityError::HostMemory(error.to_string().into()))
+    })?;
+    for state in states {
+        state.cpu_dirty_observer_armed = true;
+    }
+    Ok(())
 }
 
 /// A retained canonical RAM page.
@@ -627,9 +716,11 @@ impl CanonicalBackingPage {
                 generation: AtomicU64::new(generation.get()),
                 cpu_dirty_epoch: AtomicU64::new(0),
                 executable_invalidations: OnceLock::new(),
-                visibility_clean: AtomicBool::new(true),
+                // No device representation exists yet. CPU RAM is writable
+                // until an actual consumer arms tracking or takes ownership.
+                visibility_clean: AtomicBool::new(false),
                 state: Mutex::new(CanonicalPageState {
-                    visibility: PageVisibility::Clean,
+                    visibility: PageVisibility::CpuNewer,
                     visibility_epoch: 0,
                     cpu_dirty_observer_armed: false,
                     cpu_dirty_summaries: Vec::new(),
@@ -664,9 +755,11 @@ impl CanonicalBackingPage {
                 generation: AtomicU64::new(generation.get()),
                 cpu_dirty_epoch: AtomicU64::new(0),
                 executable_invalidations: OnceLock::new(),
-                visibility_clean: AtomicBool::new(true),
+                // No device representation exists yet. CPU RAM is writable
+                // until an actual consumer arms tracking or takes ownership.
+                visibility_clean: AtomicBool::new(false),
                 state: Mutex::new(CanonicalPageState {
-                    visibility: PageVisibility::Clean,
+                    visibility: PageVisibility::CpuNewer,
                     visibility_epoch: 0,
                     cpu_dirty_observer_armed: false,
                     cpu_dirty_summaries: Vec::new(),
@@ -723,14 +816,6 @@ impl CanonicalBackingPage {
         self.inner.cpu_dirty_epoch.load(Ordering::Acquire)
     }
 
-    /// Establishes a read-only CPU-write baseline while the backing store's
-    /// execution gate is held exclusively by the caller.
-    pub(crate) fn arm_cpu_dirty_observer_quiescent(&self) -> Result<u64, CanonicalPageError> {
-        self.ensure_backing()?;
-        let mut state = self.lock_state();
-        self.arm_cpu_dirty_observer_locked(&mut state)
-    }
-
     pub(crate) fn needs_cpu_dirty_tracking(&self) -> Result<bool, CanonicalPageError> {
         let state = self.lock_state();
         match state.visibility {
@@ -765,50 +850,6 @@ impl CanonicalBackingPage {
         });
     }
 
-    pub(crate) fn observe_cpu_write_summary(
-        &self,
-        summary: &Arc<crate::range::CpuWriteSummary>,
-        group: usize,
-    ) -> Result<u64, CanonicalPageError> {
-        let mut state = self.lock_state();
-        state
-            .cpu_dirty_summaries
-            .retain(|(existing, _)| existing.strong_count() != 0);
-        state
-            .cpu_dirty_summaries
-            .push((Arc::downgrade(summary), group));
-        self.arm_cpu_dirty_observer_locked(&mut state)
-    }
-
-    fn arm_cpu_dirty_observer_locked(
-        &self,
-        state: &mut CanonicalPageState,
-    ) -> Result<u64, CanonicalPageError> {
-        match state.visibility {
-            PageVisibility::Clean | PageVisibility::CpuNewer | PageVisibility::GpuNewer { .. } => {}
-            PageVisibility::Conflicting => {
-                return Err(CanonicalPageError::Visibility(
-                    VisibilityError::ConflictingAccess,
-                ));
-            }
-            PageVisibility::Invalid => {
-                return Err(CanonicalPageError::Visibility(
-                    VisibilityError::InvalidState,
-                ));
-            }
-        }
-        if !state.cpu_dirty_observer_armed {
-            state.cpu_dirty_observer_armed = true;
-            if let Err(error) = self.publish_direct_alias_protection(state) {
-                state.cpu_dirty_observer_armed = false;
-                return Err(CanonicalPageError::Visibility(VisibilityError::HostMemory(
-                    error.to_string().into_boxed_str(),
-                )));
-            }
-        }
-        Ok(self.cpu_dirty_epoch())
-    }
-
     /// Materializes and retains the canonical shared-file view used by direct
     /// guest-address aliases. This does not grant CPU access or change page
     /// visibility.
@@ -835,6 +876,10 @@ impl CanonicalBackingPage {
             ));
         }
         let mut state = self.lock_state();
+        crate::metrics::record_page(
+            self.identity(),
+            crate::metrics::Counter::DirectAliasRegistrations,
+        );
         state.direct_aliases.insert(
             (arena.identity(), guest_address),
             CanonicalDirectAlias {
@@ -857,6 +902,20 @@ impl CanonicalBackingPage {
     /// store which faulted. The page becomes CPU-visible and dirty before any
     /// writable alias is republished.
     pub fn resolve_direct_write_fault(&self) -> Result<bool, CanonicalPageError> {
+        #[cfg(feature = "performance-counters")]
+        {
+            use crate::metrics::Counter;
+            let state = self.lock_state();
+            let counter = match (&state.visibility, state.cpu_dirty_observer_armed) {
+                (PageVisibility::Clean, false) => Counter::WriteFaultCleanUnobserved,
+                (PageVisibility::Clean, true) => Counter::WriteFaultCleanObserved,
+                (PageVisibility::CpuNewer, false) => Counter::WriteFaultCpuUnobserved,
+                (PageVisibility::CpuNewer, true) => Counter::WriteFaultCpuObserved,
+                (PageVisibility::GpuNewer { .. }, _) => Counter::WriteFaultDeviceOwned,
+                _ => Counter::WriteFaultInvalid,
+            };
+            crate::metrics::record_page(self.identity(), counter);
+        }
         self.prepare_cpu_write()?;
         Ok(true)
     }
@@ -1073,6 +1132,7 @@ impl CanonicalBackingPage {
             if !arm_observer {
                 return Ok(None);
             }
+            crate::metrics::record_page(self.identity(), crate::metrics::Counter::ObserverArms);
             state.cpu_dirty_observer_armed = true;
             if let Err(error) = self.publish_direct_alias_protection(&mut state) {
                 state.cpu_dirty_observer_armed = false;
@@ -1315,6 +1375,7 @@ impl CanonicalBackingPage {
                     CanonicalPageError::Visibility(error) => error,
                     _ => unreachable!("CPU dirty publication has no other failure mode"),
                 })?;
+            crate::metrics::record_page(self.identity(), crate::metrics::Counter::CpuReadbacks);
             self.publish_visibility(&mut state, PageVisibility::Clean)?;
             return Ok(());
         }
@@ -2061,7 +2122,7 @@ impl CanonicalWriteBatch {
 
     /// Publishes every staged byte mutation and advances each page once.
     pub fn commit(self) -> Result<(), CanonicalWriteBatchError> {
-        self.commit_inner(false, || Ok(()))
+        self.commit_inner(false)
     }
 
     /// Publishes ordered device writes onto the latest CPU-visible page.
@@ -2069,24 +2130,10 @@ impl CanonicalWriteBatch {
     /// bytes survive, and an overlapping device write follows command order.
     /// Unlike a checked host transaction, this has no stale-page rollback.
     pub fn commit_ordered(self) -> Result<(), CanonicalWriteBatchError> {
-        self.commit_inner(true, || Ok(()))
+        self.commit_inner(true)
     }
 
-    /// Validate a virtual owner's retained translation after quiescence, before
-    /// publishing bytes. Ordinary retained physical ranges need no retranslation.
-    /// The callback must not recursively acquire a backing store's execution gate.
-    pub fn commit_checked(
-        self,
-        validate: impl FnOnce() -> Result<(), CanonicalWriteBatchError>,
-    ) -> Result<(), CanonicalWriteBatchError> {
-        self.commit_inner(false, validate)
-    }
-
-    fn commit_inner(
-        self,
-        ordered: bool,
-        validate: impl FnOnce() -> Result<(), CanonicalWriteBatchError>,
-    ) -> Result<(), CanonicalWriteBatchError> {
+    fn commit_inner(self, ordered: bool) -> Result<(), CanonicalWriteBatchError> {
         struct Write {
             expected_generation: ContentGeneration,
             expected_visibility_epoch: u64,
@@ -2107,7 +2154,6 @@ impl CanonicalWriteBatch {
             .values()
             .map(ExecutionGate::acquire_exclusive)
             .collect::<Vec<_>>();
-        validate()?;
 
         // Reserve each stream once, in stable order, only after the engine has
         // drained. A reservation owns the log mutex and cannot span rendezvous.
@@ -2873,6 +2919,11 @@ mod tests {
             NonCpuDeviceId::new(1),
             crate::DeviceVisibilityPoint::new(1),
             crate::DeviceVisibilityPoint::new(1),
+        )
+        .unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, write)],
+            coordinator.clone(),
         )
         .unwrap();
         memory.pages()[1].lock_state().visibility_epoch = u64::MAX;

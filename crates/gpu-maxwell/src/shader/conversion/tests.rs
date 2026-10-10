@@ -72,6 +72,42 @@ fn captured_f2f_floor_ftz_reaches_verified_ir_and_wgsl() {
 }
 
 #[test]
+fn f2f_absolute_register_and_constant_sources_are_recognized_and_evaluated() {
+    let mut header = [0; 20];
+    header[0] = 0x0002_5462;
+    header[18] = 1;
+    for encoding in [0x5caa_1480_0047_0a0a, 0x4caa_1480_0007_0a0a] {
+        assert!(is_float_to_float(encoding));
+        let translated = translated_fixture_with_register_count(
+            MaxwellShaderStage::Pixel,
+            header,
+            &[
+                0,
+                0x0100_0000_0007_f004 | (u64::from((-1.75_f32).to_bits()) << 20),
+                encoding,
+                0x5c98_0780_00a7_0000,
+                0,
+                0xe300_0000_0007_000f,
+                0,
+                0,
+            ],
+            16,
+        );
+        let inputs = nixe_gpu::ShaderEvaluationInputs::default().with_constant_buffer_bits(
+            0,
+            0,
+            (-1.75_f32).to_bits(),
+        );
+        let result = nixe_gpu::evaluate_shader_ir(&translated, &inputs, 32).unwrap();
+        assert_eq!(
+            result.output_bits(nixe_gpu::ShaderIoLocation::Color(0), 0),
+            Some(1.0_f32.to_bits())
+        );
+        validate_wgsl(&lower_shader_ir_to_wgsl(&translated).unwrap());
+    }
+}
+
+#[test]
 fn captured_f2i_u16_nearest_ftz_reaches_verified_ir_and_wgsl() {
     let mut header = [0_u32; 20];
     header[0] = 0x0006_0461;

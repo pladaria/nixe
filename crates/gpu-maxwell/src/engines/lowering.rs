@@ -16,6 +16,8 @@ mod multisample;
 mod raster;
 mod resolve;
 mod sampled_alias;
+#[cfg(test)]
+mod sampler_cache_tests;
 
 use std::{
     cell::Cell,
@@ -35,9 +37,9 @@ use nixe_gpu::{
     OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PipelineStages,
     PreparedDraw, PrimitiveTopology, RenderAttachment, RenderPassDescription, RenderPassId,
     RenderPassOperation, ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage,
-    SamplerId, ShaderDescription, ShaderId, ShaderResourceKind, ShaderStage, TriangleRasterization,
-    VertexAttribute, VertexBufferLayout, VertexComponentCount, VertexComponentWidth, VertexFormat,
-    VertexStepMode, ViewportTransform,
+    SamplerDescription, SamplerId, ShaderDescription, ShaderId, ShaderResourceKind, ShaderStage,
+    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
+    VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use nixe_memory::{CanonicalCpuWriteDependency, CanonicalWriteBatch};
 
@@ -870,10 +872,11 @@ impl PreparedDrawRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct SamplerRecord {
-    sampler: super::threed::MaxwellThreeDResolvedSampler,
+    description: SamplerDescription,
     id: SamplerId,
+    last_used: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1146,9 +1149,18 @@ impl MaxwellLoweringCache {
         }
 
         log::debug!("Maxwell shader translation cache miss: fingerprint={fingerprint:032x}");
-
+        #[cfg(feature = "performance-counters")]
+        let started = std::time::Instant::now();
         let programs: Arc<[MaxwellTranslatedShaderProgram]> =
             translate_prepared_maxwell_shader_programs(&inputs)?.into();
+        #[cfg(feature = "performance-counters")]
+        {
+            nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::ShaderTranslationMisses, 1);
+            nixe_gpu::metrics::record(
+                nixe_gpu::metrics::Counter::ShaderTranslationNanoseconds,
+                started.elapsed().as_nanos() as u64,
+            );
+        }
         self.shader_translation_sets.push(
             fingerprint,
             ShaderTranslationSetRecord {
@@ -2049,7 +2061,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         &mut creations,
         &mut invalidations,
     )?;
-    let sampler_bindings = prepare_samplers(resources, cache, &mut creations, &mut invalidations)?;
+    let sampler_bindings = prepare_samplers(resources, cache, &mut creations)?;
     let (commands, dirty_images) = match trigger {
         MaxwellThreeDOperationTrigger::ClearSurface { source: _ } => {
             let lowered = lower_clear(state, resources, &resource_bindings)?;
@@ -2102,6 +2114,7 @@ fn finish_lowered_work(
     let copies = std::mem::take(&mut cache.image_alias_copies);
     let operations = sequence_with_transitions(copies.into_iter().chain(commands), cache)?;
     trim_read_only_buffer_views(cache, &operations, &mut invalidations);
+    trim_samplers(cache, &operations, &mut invalidations);
     let submission = OperationSubmission::new(submission, predecessors, operations)
         .map_err(MaxwellLoweringError::Command)?;
     cache.revision = cache
@@ -3342,6 +3355,19 @@ fn retire_view_dependencies(
             .iter()
             .any(|dependency| dependency_matches_target(*dependency, *target))
     });
+    retire_descriptors_for_resources(invalidated, cache, invalidations);
+    for dependency in invalidated.iter().copied() {
+        if !invalidations.contains(&dependency) {
+            invalidations.push(dependency);
+        }
+    }
+}
+
+fn retire_descriptors_for_resources(
+    invalidated: &[ResourceDependency],
+    cache: &mut MaxwellLoweringCache,
+    invalidations: &mut Vec<ResourceDependency>,
+) {
     let invalidated_descriptors = cache
         .descriptors
         .iter()
@@ -3356,12 +3382,15 @@ fn retire_view_dependencies(
     cache.descriptors.retain(|record| {
         !invalidated_descriptors.contains(&ResourceDependency::DescriptorTable(record.id))
     });
-    for dependency in invalidated_descriptors {
-        if !invalidations.contains(&dependency) {
-            invalidations.push(dependency);
-        }
+    if cache.prepared_draw.as_ref().is_some_and(|prepared| {
+        prepared.operations[1]
+            .dependencies()
+            .iter()
+            .any(|dependency| invalidated_descriptors.contains(dependency))
+    }) {
+        cache.prepared_draw = None;
     }
-    for dependency in invalidated.iter().copied() {
+    for dependency in invalidated_descriptors {
         if !invalidations.contains(&dependency) {
             invalidations.push(dependency);
         }
@@ -3446,60 +3475,85 @@ fn prepare_samplers(
     resources: &MaxwellThreeDResolvedResources,
     cache: &mut MaxwellLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
-    invalidations: &mut Vec<ResourceDependency>,
 ) -> Result<Vec<(MaxwellThreeDResourceRole, ResourceDependency)>, MaxwellLoweringError> {
-    let mut result = Vec::with_capacity(resources.samplers().len());
-    for sampler in resources.samplers().iter().copied() {
-        if let Some(record) = cache
-            .samplers
-            .iter()
-            .find(|record| record.sampler == sampler)
-            .copied()
-        {
-            result.push((sampler.role(), ResourceDependency::Sampler(record.id)));
-            continue;
-        }
-        let retired = cache
-            .samplers
-            .iter()
-            .filter(|record| record.sampler.role() == sampler.role())
-            .map(|record| ResourceDependency::Sampler(record.id))
-            .collect::<Vec<_>>();
-        cache
-            .samplers
-            .retain(|record| record.sampler.role() != sampler.role());
-        let retired_descriptors = cache
-            .descriptors
-            .iter()
-            .filter(|record| {
-                record
-                    .dependencies
-                    .iter()
-                    .any(|dependency| retired.contains(dependency))
-            })
-            .map(|record| ResourceDependency::DescriptorTable(record.id))
-            .collect::<Vec<_>>();
-        cache.descriptors.retain(|record| {
-            !retired_descriptors.contains(&ResourceDependency::DescriptorTable(record.id))
-        });
-        for dependency in retired.into_iter().chain(retired_descriptors) {
-            if !invalidations.contains(&dependency) {
-                invalidations.push(dependency);
-            }
-        }
-        let id = SamplerId::new(take_identity(cache)?);
-        creations.push(BackendResourceCreateInfo::Sampler {
-            id,
-            description: sampler.description().map_err(|_| {
-                MaxwellLoweringError::InvalidResolvedView {
-                    role: sampler.role(),
-                }
-            })?,
-        });
-        cache.samplers.push(SamplerRecord { sampler, id });
-        result.push((sampler.role(), ResourceDependency::Sampler(id)));
+    resources
+        .samplers()
+        .iter()
+        .map(|sampler| {
+            let description =
+                sampler
+                    .description()
+                    .map_err(|_| MaxwellLoweringError::InvalidResolvedView {
+                        role: sampler.role(),
+                    })?;
+            let id = prepare_sampler(description, cache, creations)?;
+            Ok((sampler.role(), ResourceDependency::Sampler(id)))
+        })
+        .collect()
+}
+
+fn prepare_sampler(
+    description: SamplerDescription,
+    cache: &mut MaxwellLoweringCache,
+    creations: &mut Vec<BackendResourceCreateInfo>,
+) -> Result<SamplerId, MaxwellLoweringError> {
+    // A binding position selects an immutable sampler; changing that position
+    // does not invalidate the previously selected state or its descriptor tables.
+    // Share the effective state across texture references and retain alternatives.
+    if let Some(record) = cache
+        .samplers
+        .iter_mut()
+        .find(|record| record.description == description)
+    {
+        record.last_used = cache.revision.saturating_add(1);
+        return Ok(record.id);
     }
-    Ok(result)
+    let id = SamplerId::new(take_identity(cache)?);
+    creations.push(BackendResourceCreateInfo::Sampler { id, description });
+    cache.samplers.push(SamplerRecord {
+        description,
+        id,
+        last_used: cache.revision.saturating_add(1),
+    });
+    Ok(id)
+}
+
+fn trim_samplers(
+    cache: &mut MaxwellLoweringCache,
+    operations: &[GpuOperation],
+    invalidations: &mut Vec<ResourceDependency>,
+) {
+    let limit = cache.resource_cache_limit();
+    if cache.samplers.len() <= limit {
+        return;
+    }
+    let mut protected = operations
+        .iter()
+        .flat_map(GpuOperation::dependencies)
+        .copied()
+        .collect::<Vec<_>>();
+    for descriptor in &cache.descriptors {
+        if protected.contains(&ResourceDependency::DescriptorTable(descriptor.id)) {
+            protected.extend_from_slice(&descriptor.dependencies);
+        }
+    }
+    let mut candidates = cache
+        .samplers
+        .iter()
+        .filter(|record| !protected.contains(&ResourceDependency::Sampler(record.id)))
+        .map(|record| (record.last_used, ResourceDependency::Sampler(record.id)))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
+    let retired = candidates
+        .into_iter()
+        .take(cache.samplers.len() - limit)
+        .map(|(_, dependency)| dependency)
+        .collect::<Vec<_>>();
+    cache
+        .samplers
+        .retain(|record| !retired.contains(&ResourceDependency::Sampler(record.id)));
+    retire_descriptors_for_resources(&retired, cache, invalidations);
+    invalidations.extend(retired);
 }
 
 fn shader_resource_dependency(

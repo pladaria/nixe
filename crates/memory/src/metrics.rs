@@ -32,11 +32,25 @@ pub enum Counter {
     BackingPeakStoreOffset,
     BackingReservedBytes,
     BackingMappedBytes,
+    // Sampled at direct write-fault resolver entry; another worker may
+    // already have repaired a captured native fault.
+    WriteFaultCleanUnobserved,
+    WriteFaultCleanObserved,
+    WriteFaultCpuUnobserved,
+    WriteFaultCpuObserved,
+    WriteFaultDeviceOwned,
+    WriteFaultInvalid,
+    ObserverArms,
+    // CPU-to-Clean preparation for either read-only or writable device use.
+    DeviceReadPreparations,
+    DeviceWritePublications,
+    CpuReadbacks,
+    DirectAliasRegistrations,
 }
 
 #[cfg(feature = "performance-counters")]
-static COUNTERS: [std::sync::atomic::AtomicU64; 29] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 29];
+static COUNTERS: [std::sync::atomic::AtomicU64; 40] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 40];
 
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
@@ -79,6 +93,17 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "BackingPeakStoreOffset",
         "BackingReservedBytes",
         "BackingMappedBytes",
+        "WriteFaultCleanUnobserved",
+        "WriteFaultCleanObserved",
+        "WriteFaultCpuUnobserved",
+        "WriteFaultCpuObserved",
+        "WriteFaultDeviceOwned",
+        "WriteFaultInvalid",
+        "ObserverArms",
+        "DeviceReadPreparations",
+        "DeviceWritePublications",
+        "CpuReadbacks",
+        "DirectAliasRegistrations",
     ];
     NAMES
         .iter()
@@ -129,4 +154,62 @@ pub(crate) fn allocate_backing(bytes: u64, end: u64) {
 #[cfg(feature = "performance-counters")]
 pub(crate) fn subtract(counter: Counter, bytes: u64) {
     COUNTERS[counter as usize].fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+// Detailed page attribution is enabled only by the diagnostic CLI capture.
+// It is never allocated or consulted in normal builds.
+#[cfg(feature = "performance-counters")]
+type PageTracking = std::collections::BTreeMap<crate::CanonicalPageId, [u64; 11]>;
+#[cfg(feature = "performance-counters")]
+static PAGE_TRACKING: std::sync::Mutex<Option<PageTracking>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "performance-counters")]
+pub fn start_page_tracking() {
+    *PAGE_TRACKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(std::collections::BTreeMap::new());
+}
+
+#[inline]
+pub(crate) fn record_page(page: crate::CanonicalPageId, counter: Counter) {
+    record(counter, 1);
+    #[cfg(feature = "performance-counters")]
+    if let Some(pages) = PAGE_TRACKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        pages.entry(page).or_insert([0; 11])
+            [counter as usize - Counter::WriteFaultCleanUnobserved as usize] += 1;
+    }
+    #[cfg(not(feature = "performance-counters"))]
+    let _ = page;
+}
+
+#[cfg(feature = "performance-counters")]
+pub fn write_page_tracking(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut output = std::io::BufWriter::new(std::fs::File::create(path)?);
+    write!(output, "page")?;
+    for (name, _) in snapshot()
+        .into_iter()
+        .skip(Counter::WriteFaultCleanUnobserved as usize)
+    {
+        write!(output, ",{name}")?;
+    }
+    writeln!(output)?;
+    let mut tracking = PAGE_TRACKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(pages) = tracking.take() {
+        for (page, counts) in pages {
+            write!(output, "{page}")?;
+            for count in counts {
+                write!(output, ",{count}")?;
+            }
+            writeln!(output)?;
+        }
+    }
+    output.flush()
 }

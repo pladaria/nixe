@@ -1267,7 +1267,7 @@ pub(crate) struct WgpuBackendDriver {
     upload_staging: StagingBelt,
     upload_bytes: u64,
     upload_canonical: Vec<u8>,
-    upload_linear: Vec<u8>,
+    upload_rgb565: Vec<u8>,
     vertex_pull_binding_key: Vec<(u32, BackendResourceHandle)>,
     draw_bind_groups: Vec<Vec<BindGroup>>,
     compute_bind_groups: Vec<BindGroup>,
@@ -1351,7 +1351,7 @@ impl WgpuBackendDriver {
             upload_staging,
             upload_bytes: 0,
             upload_canonical: Vec::new(),
-            upload_linear: Vec::new(),
+            upload_rgb565: Vec::new(),
             vertex_pull_binding_key: Vec::new(),
             draw_bind_groups: Vec::new(),
             compute_bind_groups: Vec::new(),
@@ -1453,7 +1453,7 @@ impl WgpuBackendDriver {
         self.readback_pool.clear();
         self.upload_staging = StagingBelt::new(self.device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         self.upload_canonical = Vec::new();
-        self.upload_linear = Vec::new();
+        self.upload_rgb565 = Vec::new();
         self.vertex_pull_binding_key = Vec::new();
         self.draw_bind_groups = Vec::new();
         self.compute_bind_groups = Vec::new();
@@ -1673,6 +1673,8 @@ impl WgpuBackendDriver {
                 alignment: plan.alignment,
             })
             .collect::<Vec<_>>();
+        #[cfg(feature = "performance-counters")]
+        let snapshot_started = std::time::Instant::now();
         let snapshots = CanonicalCpuWriteDependency::snapshot_batch_with_resolver(
             &requests,
             &mut |coordinator, request| {
@@ -1686,6 +1688,11 @@ impl WgpuBackendDriver {
             },
         )
         .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+        #[cfg(feature = "performance-counters")]
+        nixe_gpu::metrics::record(
+            nixe_gpu::metrics::Counter::InputSnapshotNanoseconds,
+            snapshot_started.elapsed().as_nanos() as u64,
+        );
         let mut inputs = plans
             .into_iter()
             .zip(snapshots)
@@ -1986,44 +1993,6 @@ impl WgpuBackendDriver {
                         .ok_or_else(|| unsupported("image upload row size"))?,
                     wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
                 )?;
-                self.upload_linear
-                    .resize(row_pitch as usize * region.height as usize, 0);
-                for row in 0..region.height {
-                    let width_bytes = region.width as usize * bytes_per_block;
-                    let mut copied = 0;
-                    while copied < width_bytes {
-                        let x = u64::from(region.x) * bytes_per_block as u64 + copied as u64;
-                        let y = region.y + row;
-                        let (offset, count) = match domain.layout {
-                            ImageMemoryLayout::PitchLinear { row_pitch, .. } => (
-                                usize_from_u64(
-                                    u64::from(y) * row_pitch + x,
-                                    "image upload source",
-                                )?,
-                                width_bytes,
-                            ),
-                            ImageMemoryLayout::BlockLinear(layout) => (
-                                block_linear_byte_offset(
-                                    layout,
-                                    (u64::from(columns) * bytes_per_block as u64).div_ceil(64),
-                                    1 << layout.block_height_log2,
-                                    0,
-                                    y,
-                                    x,
-                                )?,
-                                (16 - x as usize % 16).min(width_bytes - copied),
-                            ),
-                        };
-                        let source = snapshot_bytes(&canonical, offset, count)?;
-                        let destination = row as usize * row_pitch as usize + copied;
-                        self.upload_linear[destination..destination + count]
-                            .copy_from_slice(source);
-                        copied += count;
-                    }
-                }
-                if description.format() == ImageFormat::Rgb565Unorm {
-                    expand_rgb565_rows(&mut self.upload_linear, region.width, row_pitch);
-                }
                 nixe_gpu::metrics::record(
                     nixe_gpu::metrics::Counter::ImageLinearizedBytes,
                     u64::from(region.width) * u64::from(region.height) * bytes_per_block as u64,
@@ -2032,7 +2001,29 @@ impl WgpuBackendDriver {
                     nixe_gpu::metrics::Counter::ImageUploadedBytes,
                     u64::from(region.width) * u64::from(region.height) * host_block_bytes as u64,
                 );
-                let linear = std::mem::take(&mut self.upload_linear);
+                // RGB565 expansion reads its packed pixels backwards in CPU
+                // storage; write-combining staging mappings are write-only.
+                let mut rgb565 = std::mem::take(&mut self.upload_rgb565);
+                if description.format() == ImageFormat::Rgb565Unorm {
+                    #[cfg(feature = "performance-counters")]
+                    let expansion_started = std::time::Instant::now();
+                    rgb565.resize(row_pitch as usize * region.height as usize, 0);
+                    linearize_snapshot_region(
+                        &canonical,
+                        rgb565.as_mut_slice().into(),
+                        domain.layout,
+                        region,
+                        columns,
+                        bytes_per_block,
+                        row_pitch,
+                    )?;
+                    expand_rgb565_rows(&mut rgb565, region.width, row_pitch);
+                    #[cfg(feature = "performance-counters")]
+                    nixe_gpu::metrics::record(
+                        nixe_gpu::metrics::Counter::ImageLinearizationNanoseconds,
+                        expansion_started.elapsed().as_nanos() as u64,
+                    );
+                }
                 self.stage_texture_upload(
                     encoder,
                     TexelCopyTextureInfo {
@@ -2045,7 +2036,7 @@ impl WgpuBackendDriver {
                         },
                         aspect: TextureAspect::All,
                     },
-                    &linear,
+                    row_pitch as usize * region.height as usize,
                     TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(row_pitch),
@@ -2056,8 +2047,24 @@ impl WgpuBackendDriver {
                         height: region.height * block_height,
                         depth_or_array_layers: 1,
                     },
+                    |mut linear| {
+                        if description.format() == ImageFormat::Rgb565Unorm {
+                            linear.copy_from_slice(&rgb565);
+                            Ok(())
+                        } else {
+                            linearize_snapshot_region(
+                                &canonical,
+                                linear,
+                                domain.layout,
+                                region,
+                                columns,
+                                bytes_per_block,
+                                row_pitch,
+                            )
+                        }
+                    },
                 )?;
-                self.upload_linear = linear;
+                self.upload_rgb565 = rgb565;
             }
             // CPU visibility has materialized any GPU-owned dirty pages before
             // upload. Untouched device regions retain their readback authority.
@@ -2143,7 +2150,7 @@ impl WgpuBackendDriver {
                             },
                             aspect: TextureAspect::All,
                         },
-                        bytes,
+                        bytes.len(),
                         TexelCopyBufferLayout {
                             offset: 0,
                             bytes_per_row: None,
@@ -2153,6 +2160,10 @@ impl WgpuBackendDriver {
                             width: destination.extent.width,
                             height: 1,
                             depth_or_array_layers: 1,
+                        },
+                        |mut mapped| {
+                            mapped.copy_from_slice(bytes);
+                            Ok(())
                         },
                     )?;
                 }
@@ -2253,21 +2264,34 @@ impl WgpuBackendDriver {
         &mut self,
         encoder: &mut CommandEncoder,
         target: TexelCopyTextureInfo<'_>,
-        bytes: &[u8],
+        size: usize,
         layout: TexelCopyBufferLayout,
         extent: Extent3d,
+        fill: impl FnOnce(wgpu::WriteOnly<'_, [u8]>) -> Result<(), BackendDriverError>,
     ) -> Result<(), BackendDriverError> {
-        let size = u64::try_from(bytes.len()).map_err(|_| unsupported("image upload size"))?;
+        #[cfg(feature = "performance-counters")]
+        let linearization_started = std::time::Instant::now();
+        let size = u64::try_from(size).map_err(|_| unsupported("image upload size"))?;
         self.reserve_upload_bytes(size)?;
         let size = BufferSize::new(size).ok_or_else(|| unsupported("empty image upload"))?;
         let staging = self.upload_staging.allocate(
             size,
             BufferSize::new(256).expect("WGPU texture-copy alignment is non-zero"),
         );
-        staging
+        // Convert directly into WGPU's mapped upload storage, avoiding an
+        // intermediate linear image allocation and another complete image copy.
+        let mut mapped = staging
             .get_mapped_range_mut()
-            .map_err(|error| BackendDriverError::failure(error.to_string()))?
-            .copy_from_slice(bytes);
+            .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+        fill(mapped.slice(..))?;
+        #[cfg(feature = "performance-counters")]
+        nixe_gpu::metrics::record(
+            nixe_gpu::metrics::Counter::ImageLinearizationNanoseconds,
+            linearization_started.elapsed().as_nanos() as u64,
+        );
+        #[cfg(feature = "performance-counters")]
+        let staging_started = std::time::Instant::now();
+        drop(mapped);
         encoder.copy_buffer_to_texture(
             TexelCopyBufferInfo {
                 buffer: staging.buffer(),
@@ -2278,6 +2302,11 @@ impl WgpuBackendDriver {
             },
             target,
             extent,
+        );
+        #[cfg(feature = "performance-counters")]
+        nixe_gpu::metrics::record(
+            nixe_gpu::metrics::Counter::ImageTransferStagingNanoseconds,
+            staging_started.elapsed().as_nanos() as u64,
         );
         Ok(())
     }
@@ -3487,6 +3516,8 @@ impl WgpuBackendDriver {
         log::debug!(
             "WGPU pipeline cache miss; compiling host pipeline: neutral={pipeline_handle} fingerprint={fingerprint:032x}"
         );
+        #[cfg(feature = "performance-counters")]
+        let compilation_started = std::time::Instant::now();
         let (_, vertex, vertex_ir) =
             self.shader_for_stage(dependencies, operation, ShaderStage::Vertex)?;
         let (_, fragment, fragment_ir) =
@@ -3700,6 +3731,14 @@ impl WgpuBackendDriver {
             });
         self.capture_error_scope(scope)?;
         let serial = self.next_pipeline_serial;
+        #[cfg(feature = "performance-counters")]
+        {
+            nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostPipelineCompilations, 1);
+            nixe_gpu::metrics::record(
+                nixe_gpu::metrics::Counter::HostPipelineCompilationNanoseconds,
+                compilation_started.elapsed().as_nanos() as u64,
+            );
+        }
         self.next_pipeline_serial = self.next_pipeline_serial.checked_add(1).ok_or_else(|| {
             BackendDriverError::failure("wgpu compiled-pipeline identity exhausted")
         })?;
@@ -6151,20 +6190,124 @@ fn dirty_image_regions(
     Ok(regions)
 }
 
+/// Copies a dirty rectangle of format blocks from immutable canonical snapshots.
+/// Whole 64-byte by 8-row GOBs need one address calculation and snapshot lookup,
+/// then fixed-size copies; cropped edges and fragmented snapshots retain checked
+/// 16-byte microtiles. The addressing reference is beside block_linear_byte_offset.
+fn linearize_snapshot_region(
+    snapshots: &nixe_memory::CanonicalByteSnapshots,
+    mut output: wgpu::WriteOnly<'_, [u8]>,
+    layout: ImageMemoryLayout,
+    region: ImageUploadRegion,
+    columns: u32,
+    bytes_per_block: usize,
+    host_row_pitch: u32,
+) -> Result<(), BackendDriverError> {
+    let first_x = u64::from(region.x) * bytes_per_block as u64;
+    let width_bytes = region.width as usize * bytes_per_block;
+    let row_pitch = host_row_pitch as usize;
+    let ImageMemoryLayout::BlockLinear(blocks) = layout else {
+        let ImageMemoryLayout::PitchLinear {
+            row_pitch: source_pitch,
+            ..
+        } = layout
+        else {
+            unreachable!("the block-linear layout was handled above")
+        };
+        for row in 0..region.height {
+            let offset = usize_from_u64(
+                u64::from(region.y + row) * source_pitch + first_x,
+                "image upload source",
+            )?;
+            let destination = row as usize * row_pitch;
+            output
+                .slice(destination..destination + width_bytes)
+                .copy_from_slice(snapshot_bytes(snapshots, offset, width_bytes)?);
+        }
+        return Ok(());
+    };
+    let end_x = first_x + width_bytes as u64;
+    let end_y = region.y + region.height;
+    let width_in_gobs = (u64::from(columns) * bytes_per_block as u64).div_ceil(64);
+    let block_height_gobs = 1 << blocks.block_height_log2;
+    for gob_y in (region.y / 8 * 8..end_y).step_by(8) {
+        for gob_x in (first_x / 64 * 64..end_x).step_by(64) {
+            if gob_y >= region.y && end_y - gob_y >= 8 && gob_x >= first_x && end_x - gob_x >= 64 {
+                let offset = block_linear_byte_offset(
+                    blocks,
+                    width_in_gobs,
+                    block_height_gobs,
+                    0,
+                    gob_y,
+                    gob_x,
+                )?;
+                if let Some(gob) = snapshot_bytes_if_present(snapshots, offset, 512) {
+                    for row in 0..8_usize {
+                        let destination = (gob_y as usize + row - region.y as usize) * row_pitch
+                            + (gob_x - first_x) as usize;
+                        let mut target = output.slice(destination..destination + 64);
+                        let base = (row / 2) * 64 + (row % 2) * 16;
+                        target.slice(..16).copy_from_slice(&gob[base..base + 16]);
+                        target
+                            .slice(16..32)
+                            .copy_from_slice(&gob[base + 32..base + 48]);
+                        target
+                            .slice(32..48)
+                            .copy_from_slice(&gob[base + 256..base + 272]);
+                        target
+                            .slice(48..64)
+                            .copy_from_slice(&gob[base + 288..base + 304]);
+                    }
+                    continue;
+                }
+            }
+            // A snapshot need not include unused GOB bytes. Resolve only the
+            // microtiles intersecting this rectangle when the full GOB is absent.
+            for y in gob_y.max(region.y)..gob_y.saturating_add(8).min(end_y) {
+                let mut x = gob_x.max(first_x);
+                let limit = (gob_x + 64).min(end_x);
+                while x < limit {
+                    let count = (16 - x as usize % 16).min((limit - x) as usize);
+                    let offset = block_linear_byte_offset(
+                        blocks,
+                        width_in_gobs,
+                        block_height_gobs,
+                        0,
+                        y,
+                        x,
+                    )?;
+                    let destination = (y - region.y) as usize * row_pitch + (x - first_x) as usize;
+                    output
+                        .slice(destination..destination + count)
+                        .copy_from_slice(snapshot_bytes(snapshots, offset, count)?);
+                    x += count as u64;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_bytes(
     snapshots: &nixe_memory::CanonicalByteSnapshots,
     offset: usize,
     size: usize,
 ) -> Result<&[u8], BackendDriverError> {
+    snapshot_bytes_if_present(snapshots, offset, size)
+        .ok_or_else(|| unsupported("image upload block is outside its snapshot"))
+}
+
+fn snapshot_bytes_if_present(
+    snapshots: &nixe_memory::CanonicalByteSnapshots,
+    offset: usize,
+    size: usize,
+) -> Option<&[u8]> {
     let index = snapshots.partition_point(|(start, _)| *start <= offset as u64);
     let (start, bytes) = index
         .checked_sub(1)
-        .and_then(|index| snapshots.get(index))
-        .ok_or_else(|| unsupported("image upload source is outside its snapshot"))?;
+        .and_then(|index| snapshots.get(index))?;
     let start = offset - *start as usize;
-    bytes
-        .get(start..start + size)
-        .ok_or_else(|| unsupported("image upload block exceeds its snapshot"))
+    bytes.get(start..start.checked_add(size)?)
 }
 
 #[cfg(test)]
@@ -7092,6 +7235,136 @@ mod tests {
         assert_eq!(
             linearize_canonical_image(&canonical, layout, shape).unwrap(),
             host
+        );
+    }
+
+    #[test]
+    fn snapshot_gob_copy_matches_reference_with_crops_padding_and_fragmented_storage() {
+        let canonical = (0..0x80000_usize)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add((i >> 9) as u8))
+            .collect::<Vec<_>>();
+        let snapshots = [canonical.len(), 512, 256].map(|chunk_size| {
+            canonical
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(i, chunk)| ((i * chunk_size) as u64, chunk.to_vec().into_boxed_slice()))
+                .collect::<nixe_memory::CanonicalByteSnapshots>()
+        });
+        for height_log2 in [0, 2, 5] {
+            let layouts = [
+                ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                    block_width_log2: 0,
+                    block_height_log2: height_log2,
+                    block_depth_log2: 0,
+                    layer_stride: 0x80000,
+                }),
+                ImageMemoryLayout::PitchLinear {
+                    row_pitch: 2048,
+                    layer_stride: 0x80000,
+                },
+            ];
+            for layout in layouts {
+                for columns in [19, 65] {
+                    for bytes_per_block in [1, 2, 4, 8, 16] {
+                        let full_pitch = (columns * bytes_per_block as u32).next_multiple_of(256);
+                        let expected = linearize_canonical_image(
+                            &canonical,
+                            layout,
+                            ImageCopyShape {
+                                width: columns,
+                                height: 17,
+                                layers: 1,
+                                bytes_per_texel: bytes_per_block,
+                                host_row_pitch: full_pitch,
+                            },
+                        )
+                        .unwrap();
+                        for region in [
+                            super::ImageUploadRegion {
+                                x: 0,
+                                y: 0,
+                                width: columns,
+                                height: 17,
+                            },
+                            super::ImageUploadRegion {
+                                x: 1,
+                                y: 1,
+                                width: columns - 2,
+                                height: 15,
+                            },
+                        ] {
+                            let width_bytes = region.width as usize * bytes_per_block;
+                            let pitch = (width_bytes as u32).next_multiple_of(256);
+                            // Pitch-linear uploads retain their complete-row
+                            // snapshot contract; fragmented GOBs use microtiles.
+                            let snapshot_count =
+                                if matches!(layout, ImageMemoryLayout::PitchLinear { .. }) {
+                                    1
+                                } else {
+                                    snapshots.len()
+                                };
+                            for snapshot in &snapshots[..snapshot_count] {
+                                let mut actual =
+                                    vec![0xa5; pitch as usize * region.height as usize];
+                                super::linearize_snapshot_region(
+                                    snapshot,
+                                    actual.as_mut_slice().into(),
+                                    layout,
+                                    region,
+                                    columns,
+                                    bytes_per_block,
+                                    pitch,
+                                )
+                                .unwrap();
+                                for row in 0..region.height as usize {
+                                    let source = (row + region.y as usize) * full_pitch as usize
+                                        + region.x as usize * bytes_per_block;
+                                    let target = row * pitch as usize;
+                                    assert_eq!(
+                                        &actual[target..target + width_bytes],
+                                        &expected[source..source + width_bytes],
+                                        "layout={layout:?}, region={region:?}, bytes={bytes_per_block}, row={row}"
+                                    );
+                                    assert!(
+                                        actual[target + width_bytes..target + pitch as usize]
+                                            .iter()
+                                            .all(|b| *b == 0xa5)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_gob_copy_rejects_missing_microtiles() {
+        let region = super::ImageUploadRegion {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 8,
+        };
+        let layout = ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            layer_stride: 512,
+        });
+        let snapshots = vec![(0, vec![0x11; 16].into_boxed_slice())];
+        assert!(
+            super::linearize_snapshot_region(
+                &snapshots,
+                (&mut [0; 512][..]).into(),
+                layout,
+                region,
+                16,
+                4,
+                64,
+            )
+            .is_err()
         );
     }
 

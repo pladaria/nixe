@@ -429,10 +429,22 @@ pub(super) fn translate_shader_binary(
                     );
                     break 'instruction;
                 } else if is_constant_buffer_load(encoding) {
-                    let decoded =
-                        decode_constant_buffer_load(stage, offset, encoding, register_count)?;
+                    let decoded = decode_constant_buffer_load(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
                     constant_buffer_bindings.insert(decoded.constant_buffer_binding);
-                    instructions.push(ShaderInstruction::new(source, predicate, decoded.operation));
+                    // All words of one LDC share its predicate; none may write
+                    // an architectural destination when that predicate is false.
+                    instructions.extend(
+                        decoded
+                            .operations
+                            .into_iter()
+                            .map(|operation| ShaderInstruction::new(source, predicate, operation)),
+                    );
                     break 'instruction;
                 } else if is_texture_access_simplified(encoding) {
                     if stage == MaxwellShaderStage::Compute {

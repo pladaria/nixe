@@ -13,7 +13,8 @@ pub(super) const fn is_integer_to_float(encoding: u64) -> bool {
 
 pub(super) const fn is_float_to_float(encoding: u64) -> bool {
     let opcode = (encoding >> 48) as u16;
-    matches!(opcode, 0x5ca8 | 0x4ca8) || opcode & 0xfeff == 0x38a8
+    // Bit 49 is the register/constant source's absolute-value modifier.
+    matches!(opcode & 0xfffd, 0x5ca8 | 0x4ca8) || opcode & 0xfeff == 0x38a8
 }
 
 pub(super) const fn is_float_to_integer(encoding: u64) -> bool {
@@ -237,7 +238,7 @@ pub(super) fn decode_float_to_float(
 
     let opcode = (encoding >> 48) as u16;
     let mut operations = Vec::with_capacity(4);
-    let (source, constant_buffer_binding) = if opcode == 0x5ca8 {
+    let (source, constant_buffer_binding) = if opcode & 0xfffd == 0x5ca8 {
         let source = ((encoding >> 20) & 0xff) as u8;
         (
             prepare_float_register_source(
@@ -253,7 +254,7 @@ pub(super) fn decode_float_to_float(
             )?,
             None,
         )
-    } else if opcode == 0x4ca8 {
+    } else if opcode & 0xfffd == 0x4ca8 {
         let temporary = allocate_shader_temporary(
             stage,
             offset,

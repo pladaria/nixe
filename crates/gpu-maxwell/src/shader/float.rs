@@ -28,7 +28,10 @@ pub(super) const fn is_float_fused_multiply_add(encoding: u64) -> bool {
 
 pub(super) const fn is_float_add(encoding: u64) -> bool {
     let opcode = (encoding >> 48) as u16;
-    opcode & 0xfff8 == 0x5c58 || opcode & 0xfff8 == 0x4c58 || opcode & 0xfefa == 0x3858
+    opcode & 0xfff8 == 0x5c58
+        || opcode & 0xfff8 == 0x4c58
+        || opcode & 0xfefa == 0x3858
+        || encoding >> 58 == 0x2
 }
 
 pub(super) const fn is_float_set_predicate(encoding: u64) -> bool {
@@ -334,7 +337,11 @@ pub(super) fn decode_float_add(
     register_count: u8,
     next_temporary: &mut u16,
 ) -> Result<DecodedFloatAdd, MaxwellShaderTranslationError> {
-    if encoding & (1 << 47) != 0 {
+    // FADD32I carries all immediate bits at 20..51; modifiers move above it.
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L481-L535
+    // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp (emitFADD)
+    let full_immediate = encoding >> 58 == 0x2;
+    if encoding & (1 << if full_immediate { 52 } else { 47 }) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
@@ -344,21 +351,26 @@ pub(super) fn decode_float_add(
     }
     let destination = (encoding & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-    let saturate = encoding & (1 << 50) != 0;
-    let rounding = match (encoding >> 39) & 0x3 {
+    let saturate = !full_immediate && encoding & (1 << 50) != 0;
+    let rounding = match if full_immediate {
+        0
+    } else {
+        (encoding >> 39) & 0x3
+    } {
         0 => ShaderRoundingMode::NearestEven,
         1 => ShaderRoundingMode::TowardNegative,
         2 => ShaderRoundingMode::TowardPositive,
         3 => ShaderRoundingMode::TowardZero,
         _ => unreachable!(),
     };
+    let ftz = encoding & (1 << if full_immediate { 55 } else { 44 }) != 0;
     let float_control = ShaderFloatControl::new(
         rounding,
         ShaderNanMode::Propagate,
-        encoding & (1 << 44) != 0,
+        ftz,
         // FADD.FTZ also flushes subnormal inputs, not only the rounded sum.
         // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add
-        encoding & (1 << 44) != 0,
+        ftz,
         saturate,
     );
     let opcode = (encoding >> 48) as u16;
@@ -368,8 +380,8 @@ pub(super) fn decode_float_add(
         offset,
         encoding,
         ((encoding >> 8) & 0xff) as u8,
-        encoding & (1 << 46) != 0,
-        encoding & (1 << 48) != 0,
+        encoding & (1 << if full_immediate { 54 } else { 46 }) != 0,
+        encoding & (1 << if full_immediate { 56 } else { 48 }) != 0,
         register_count,
         next_temporary,
         &mut operations,
@@ -397,7 +409,24 @@ pub(super) fn decode_float_add(
             "FADD temporary register overflow",
             next_temporary,
         )?;
-        if opcode & 0xfff8 == 0x4c58 {
+        if full_immediate {
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination: temporary,
+                bits: (encoding >> 20) as u32,
+                scalar_type: ShaderScalarType::Float32,
+            });
+            let modified = apply_float_source_modifiers(
+                stage,
+                offset,
+                encoding,
+                temporary,
+                encoding & (1 << 57) != 0,
+                encoding & (1 << 53) != 0,
+                next_temporary,
+                &mut operations,
+            )?;
+            (modified, None)
+        } else if opcode & 0xfff8 == 0x4c58 {
             let binding = ((encoding >> 34) & 0x1f) as u8;
             let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
             operations.push(ShaderOperation::LoadConstantBuffer32 {

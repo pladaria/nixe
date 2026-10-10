@@ -15,9 +15,9 @@ use std::{
 use nixe_memory::{
     AddressSpaceId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
-    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, CanonicalWriteBatch,
-    ContentGeneration, CpuMemoryBackend, DirectAddressSpaceView, DirectArena, DirectBackendPolicy,
-    DirectMapRequest, DirectProtectRequest, DirectProtection, ExecutionGate, ExecutionSharedGuard,
+    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, ContentGeneration,
+    CpuMemoryBackend, DirectAddressSpaceView, DirectArena, DirectBackendPolicy, DirectMapRequest,
+    DirectProtectRequest, DirectProtection, ExecutionGate, ExecutionSharedGuard,
     GuestPhysicalPageId, GuestVirtualAddress, HostMappedBacking, MappingGeneration,
     MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationKind,
     MemoryInvalidationLog, MemoryInvalidationOrigin, MemoryInvalidationSource,
@@ -1888,6 +1888,20 @@ impl ExecutionMemory {
         address: GuestVirtualAddress,
         bytes: &[u8],
     ) -> Result<(), DataAccessFault> {
+        self.write_mapped_ram(address_space, address, bytes, false)
+    }
+
+    // Kernel producers and checked process writes use the same byte publication.
+    // Hold exclusion and the mapping lock through validation and the copy; there
+    // is no optimistic whole-page snapshot or temporary write observer to leave
+    // behind on IPC, input and other CPU-only buffers.
+    fn write_mapped_ram(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        bytes: &[u8],
+        require_write_permission: bool,
+    ) -> Result<(), DataAccessFault> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -1924,6 +1938,16 @@ impl ExecutionMemory {
                             DataAccessFaultReason::Unmapped,
                         )
                     })?;
+                if require_write_permission
+                    && !mapping.permissions.contains(MemoryPermissions::WRITE)
+                {
+                    return Err(DataAccessFault::new(
+                        address_space,
+                        virtual_address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::WritePermissionDenied,
+                    ));
+                }
                 let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
                 else {
                     return Err(DataAccessFault::new(
@@ -1957,14 +1981,6 @@ impl ExecutionMemory {
                 if let std::collections::btree_map::Entry::Vacant(entry) =
                     pending_generations.entry(mapping.physical_slot)
                 {
-                    backing.prepare_cpu_write().map_err(|reason| {
-                        DataAccessFault::new(
-                            address_space,
-                            virtual_address,
-                            DataAccessKind::Write,
-                            DataAccessFaultReason::HostBacking(reason.to_string().into()),
-                        )
-                    })?;
                     let current = backing.content_generation();
                     let next = current.next().map_err(|_| {
                         DataAccessFault::new(
@@ -2016,6 +2032,22 @@ impl ExecutionMemory {
                         DataAccessFaultReason::HostBacking(reason.to_string().into()),
                     )
                 })?;
+
+            // Validate every mapping and generation, and reserve invalidations,
+            // before changing any bytes or invalidating CPU-write observers.
+            for physical_slot in pending_generations.keys().copied() {
+                let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(physical_slot) else {
+                    unreachable!("host write RAM range was validated")
+                };
+                backing.prepare_cpu_write().map_err(|reason| {
+                    DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                    )
+                })?;
+            }
 
             let mut copied = 0;
             let mut written_slots = BTreeSet::new();
@@ -3381,67 +3413,7 @@ impl ProcessMemory for ExecutionMemory {
         address: GuestVirtualAddress,
         bytes: &[u8],
     ) -> Result<(), DataAccessFault> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let size = u64::try_from(bytes.len()).map_err(|_| {
-            DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::AddressOverflow,
-            )
-        })?;
-        loop {
-            let range = self
-                .translate_canonical_range(address_space, address, size, MemoryPermissions::WRITE)
-                .map_err(|error| bulk_translation_fault(error, DataAccessKind::Write))?;
-            let mut batch = CanonicalWriteBatch::new();
-            let result = batch.stage(&range, 0, bytes).and_then(|()| {
-                batch.commit_checked(|| {
-                    // Translation preceded the rendezvous. A remap while waiting
-                    // must not redirect this virtual write to retained old backing.
-                    let inner = self.lock_inner();
-                    let mut cursor = address;
-                    for (index, segment) in range.segments().iter().enumerate() {
-                        let current = inner.mapping_at(address_space, cursor);
-                        if !current.is_some_and(|mapping| {
-                            mapping.mapping_generation == segment.mapping_generation()
-                                && mapping.permissions.contains(MemoryPermissions::WRITE)
-                                && matches!(inner.page(mapping.physical_slot),
-                                    Some(ExecutionPhysicalPage::Ram(backing))
-                                        if backing.identity() == segment.page())
-                        }) {
-                            return Err(nixe_memory::CanonicalWriteBatchError::ConcurrentMutation);
-                        }
-                        if index + 1 < range.segments().len() {
-                            cursor = cursor
-                                .checked_add(segment.size())
-                                .expect("translated range cannot overflow");
-                        }
-                    }
-                    Ok(())
-                })
-            });
-            match result {
-                Ok(()) => return Ok(()),
-                Err(nixe_memory::CanonicalWriteBatchError::ConcurrentMutation) => continue,
-                Err(error) => {
-                    let reason = match error {
-                        nixe_memory::CanonicalWriteBatchError::GenerationExhausted(_) => {
-                            DataAccessFaultReason::ContentGenerationExhausted
-                        }
-                        error => DataAccessFaultReason::HostBacking(error.to_string().into()),
-                    };
-                    return Err(DataAccessFault::new(
-                        address_space,
-                        address,
-                        DataAccessKind::Write,
-                        reason,
-                    ));
-                }
-            }
-        }
+        self.write_mapped_ram(address_space, address, bytes, true)
     }
 
     fn resize_zeroed_mapping(
@@ -4366,6 +4338,219 @@ mod tests {
     }
 
     #[test]
+    fn process_writes_do_not_leave_transient_observers_on_cpu_only_ram() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(81);
+        let first = GuestVirtualAddress::new(0x1000);
+        let second = GuestVirtualAddress::new(0x2000);
+        for (address, id) in [(first, 1), (second, 2)] {
+            let page = GuestPhysicalPageId::new(id);
+            assert!(memory.add_ram_page(page));
+            assert!(memory.map_page(space, address, page, MemoryPermissions::READ_WRITE));
+        }
+        memory
+            .bind_cpu_memory_backend(space, 0x5000, DirectBackendPolicy::Required)
+            .unwrap();
+        let range = memory
+            .translate_canonical_range(space, first, 0x2000, MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let view = memory.direct_address_space_view(space).unwrap();
+        for round in 0..8 {
+            for address in [first, second] {
+                assert_eq!(
+                    memory.direct_protection_at(space, address),
+                    Some(DirectProtection::ReadWrite)
+                );
+            }
+            let lease = memory.acquire_execution_lease();
+            unsafe {
+                ((view.base + first.get() as usize + 5) as *mut u8).write(round);
+            }
+            drop(lease);
+            memory
+                .write_bytes(space, GuestVirtualAddress::new(0x1ffe), &[1, 2, 3, round])
+                .unwrap();
+            assert_eq!(
+                {
+                    let inner = memory.lock_inner();
+                    let mapping = inner.mapping_at(space, first).unwrap();
+                    let Some(ExecutionPhysicalPage::Ram(backing)) =
+                        inner.page(mapping.physical_slot)
+                    else {
+                        unreachable!()
+                    };
+                    backing.content_generation().get()
+                },
+                u64::from(round) + 1
+            );
+        }
+        let observer = nixe_memory::CanonicalCpuWriteDependency::capture(&range).unwrap();
+        assert!(observer.remains_current());
+        memory
+            .write_bytes(space, GuestVirtualAddress::new(0x1ffe), &[7, 8, 9, 10])
+            .unwrap();
+        assert!(!observer.remains_current());
+        let snapshots = observer.snapshot_dirty_pages(&range, 1).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(&snapshots[0].1[0xffe..0x1002], &[7, 8, 9, 10]);
+        assert_eq!(snapshots[0].1[5], 7);
+        assert!(observer.remains_current());
+        for address in [first, second] {
+            assert_eq!(
+                memory.direct_protection_at(space, address),
+                Some(DirectProtection::Read)
+            );
+        }
+    }
+
+    #[test]
+    fn process_write_retranslates_after_gpu_readback_remaps_destination() {
+        struct RemapOnReadback {
+            memory: std::sync::Weak<ExecutionMemory>,
+            permissions: MemoryPermissions,
+        }
+        impl VisibilityCoordinator for RemapOnReadback {
+            fn cache_cpu_page(
+                &self,
+                _: DeviceVisibilityRequest,
+                _: &[u8],
+            ) -> Result<(), VisibilityCoordinatorError> {
+                Ok(())
+            }
+            fn make_cpu_visible(
+                &self,
+                _: CpuVisibilityRequest,
+            ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+                let memory = self.memory.upgrade().unwrap();
+                assert!(memory.inner.try_lock().is_ok());
+                let space = AddressSpaceId::new(82);
+                let target = GuestVirtualAddress::new(0x1000);
+                memory
+                    .resize_zeroed_mapping(
+                        space,
+                        target,
+                        0x1000,
+                        0,
+                        MemoryPermissions::READ_WRITE,
+                        MemoryMappingPurpose::Heap,
+                    )
+                    .unwrap();
+                memory
+                    .resize_zeroed_mapping(
+                        space,
+                        target,
+                        0,
+                        0x1000,
+                        self.permissions,
+                        MemoryMappingPurpose::Heap,
+                    )
+                    .unwrap();
+                Ok(vec![0xa5; 0x1000].into_boxed_slice())
+            }
+        }
+        for permissions in [MemoryPermissions::READ_WRITE, MemoryPermissions::READ] {
+            let memory = Arc::new(ExecutionMemory::new());
+            let space = AddressSpaceId::new(82);
+            let target = GuestVirtualAddress::new(0x1000);
+            memory
+                .resize_zeroed_mapping(
+                    space,
+                    target,
+                    0,
+                    0x1000,
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Heap,
+                )
+                .unwrap();
+            let old = memory
+                .translate_canonical_range(space, target, 0x1000, MemoryPermissions::READ)
+                .unwrap();
+            let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(RemapOnReadback {
+                memory: Arc::downgrade(&memory),
+                permissions,
+            });
+            let write = DeviceAccessDeclaration::write(
+                NonCpuDeviceId::new(1),
+                DeviceVisibilityPoint::new(1),
+                DeviceVisibilityPoint::new(2),
+            )
+            .unwrap();
+            CanonicalBackingRange::prepare_resident_device_accesses(
+                [(&old, write)],
+                coordinator.clone(),
+            )
+            .unwrap();
+            CanonicalBackingRange::publish_device_writes([(&old, write)], coordinator).unwrap();
+            let result = memory.write_bytes(space, GuestVirtualAddress::new(0x100d), &[0x77]);
+            if permissions.contains(MemoryPermissions::WRITE) {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result.unwrap_err().reason,
+                    DataAccessFaultReason::WritePermissionDenied
+                );
+            }
+            let mut byte = [0];
+            memory
+                .read_bytes(space, GuestVirtualAddress::new(0x100d), &mut byte)
+                .unwrap();
+            assert_eq!(
+                byte,
+                [if permissions.contains(MemoryPermissions::WRITE) {
+                    0x77
+                } else {
+                    0
+                }]
+            );
+            old.read(13, &mut byte).unwrap();
+            assert_eq!(
+                byte,
+                [0xa5],
+                "a virtual write must not target retained old backing"
+            );
+        }
+    }
+
+    #[test]
+    fn process_write_versions_one_physical_page_once_across_virtual_aliases() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(83);
+        let physical = GuestPhysicalPageId::new(1);
+        assert!(memory.add_ram_page(physical));
+        for address in [0x1000, 0x2000] {
+            assert!(memory.map_page(
+                space,
+                GuestVirtualAddress::new(address),
+                physical,
+                MemoryPermissions::READ_WRITE
+            ));
+        }
+        let mut bytes = vec![0x11; 0x2000];
+        bytes[0x1000..].fill(0x22);
+        memory
+            .write_bytes(space, GuestVirtualAddress::new(0x1000), &bytes)
+            .unwrap();
+        let backing = {
+            let inner = memory.lock_inner();
+            let Some(ExecutionPhysicalPage::Ram(backing)) =
+                inner.page(inner.slots_by_id[&physical])
+            else {
+                unreachable!()
+            };
+            backing.clone()
+        };
+        assert_eq!(
+            backing.content_generation(),
+            ContentGeneration::INITIAL.next().unwrap()
+        );
+        let mut observed = vec![0; 0x2000];
+        memory
+            .read_bytes(space, GuestVirtualAddress::new(0x1000), &mut observed)
+            .unwrap();
+        assert!(observed.iter().all(|byte| *byte == 0x22));
+    }
+
+    #[test]
     fn mapped_ram_write_is_atomic_across_a_read_only_page() {
         let memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(9);
@@ -5017,7 +5202,7 @@ mod tests {
             (
                 0x2000,
                 MemoryPermissions::READ_WRITE,
-                DirectProtection::Read,
+                DirectProtection::ReadWrite,
             ),
             (0x3000, MemoryPermissions::NONE, DirectProtection::None),
             (
@@ -5299,7 +5484,7 @@ mod tests {
         );
         assert_eq!(
             memory.direct_protection_at(space, first),
-            Some(DirectProtection::Read)
+            Some(DirectProtection::ReadWrite)
         );
         assert_eq!(
             memory.direct_protection_at(space, second),
@@ -5396,7 +5581,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             memory.direct_protection_at(space, start),
-            Some(DirectProtection::Read)
+            Some(DirectProtection::ReadWrite)
         );
 
         memory
@@ -5411,7 +5596,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             memory.direct_protection_at(space, start),
-            Some(DirectProtection::Read)
+            Some(DirectProtection::ReadWrite)
         );
         assert_eq!(
             memory.direct_protection_at(space, start.wrapping_offset(SYNTHETIC_PAGE_SIZE as i64)),
@@ -5455,7 +5640,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             memory.direct_protection_at(space, start),
-            Some(DirectProtection::Read)
+            Some(DirectProtection::ReadWrite)
         );
 
         memory
@@ -5469,7 +5654,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             memory.direct_protection_at(space, start),
-            Some(DirectProtection::Read)
+            Some(DirectProtection::ReadWrite)
         );
 
         assert_eq!(
