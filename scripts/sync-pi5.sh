@@ -17,9 +17,8 @@ if (( $# > 1 )); then
 fi
 
 nixe_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-wasmtime_root=${WASMTIME_ROOT:-"$(dirname -- "$nixe_root")/wasmtime"}
 test -f "$nixe_root/Cargo.toml"
-test -f "$wasmtime_root/cranelift/codegen/Cargo.toml"
+test -f "$nixe_root/vendor/dynarmic/CMakeLists.txt"
 test -d "$nixe_root/keys"
 
 # Exclusions also protect receiver files: do not add --delete-excluded.
@@ -42,7 +41,7 @@ common=(--include='.env*.example' "${common[@]}")
 
 if (( ${#dry_run[@]} == 0 )); then
     ssh -o BatchMode=yes pi5 \
-        'mkdir -p projects/nixe projects/wasmtime && install -d -m 700 projects/nixe/keys'
+        'mkdir -p projects/nixe && install -d -m 700 projects/nixe/keys'
 fi
 
 rsync "${common[@]}" "${dry_run[@]}" \
@@ -53,14 +52,6 @@ rsync "${common[@]}" "${dry_run[@]}" \
     --exclude='/docker/reference-*' \
     --exclude=/fuzz/artifacts/ --exclude=/fuzz/corpus/ \
     "$nixe_root/" pi5:projects/nixe/
-
-rsync "${common[@]}" "${dry_run[@]}" \
-    --exclude=/.cargo/ --exclude=/docs/_build/ --exclude=/docs/book/ \
-    --exclude=/examples/build/ --exclude=/crates/c-api/build/ \
-    --exclude=/artifacts/ --exclude=/report/ --exclude=/miri-wast/ \
-    --exclude=/publish/ --exclude=/vendor/ \
-    --exclude=/cranelift/isle/veri/cache/ --exclude='cranelift.dbg*' \
-    "$wasmtime_root/" pi5:projects/wasmtime/
 
 # Explicitly requested private data: no deletion or filename/content logging.
 rsync --recursive --times --perms --compress --stats \

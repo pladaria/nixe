@@ -28,17 +28,13 @@ pub use access::{
 pub use backing::{
     CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalBackingStore,
     CanonicalCpuAccess, CanonicalPageError, CanonicalWriteBatch, CanonicalWriteBatchError,
-    ExecutableObservation, ExecutableRead,
 };
 pub use direct::{
     CpuMemoryBackend, DIRECT_PAGE_SIZE, DirectAddressSpaceView, DirectArena, DirectBackendPolicy,
     DirectHostCapabilities, DirectMapRequest, DirectMemoryError, DirectProtectRequest,
     DirectProtection,
 };
-pub use execution_gate::{
-    ExecutionGate, ExecutionMutation, ExecutionMutationError, ExecutionMutationGuard,
-    ExecutionMutationObserver, ExecutionSharedGuard, ExecutionTransitionGuard,
-};
+pub use execution_gate::{ExecutionGate, ExecutionSharedGuard, ExecutionTransitionGuard};
 pub use host_mapped::{HostMappedBacking, HostMappedError};
 pub use invalidation::{
     MEMORY_INVALIDATION_CAPACITY, MemoryInvalidation, MemoryInvalidationCursor,
@@ -49,7 +45,7 @@ pub use range::{
     CanonicalBackingRange, CanonicalBackingSegment, CanonicalByteSnapshots,
     CanonicalCpuWriteDependency, CanonicalRangeAccessError, CanonicalRangeError,
     CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
-    CpuWriteSnapshotSelection,
+    CpuWriteSnapshotRequest, CpuWriteSnapshotSelection,
 };
 pub use visibility::{
     CpuVisibilityRequest, CpuVisibilityResolver, DeviceVisibilityRequest, VisibilityCoordinator,

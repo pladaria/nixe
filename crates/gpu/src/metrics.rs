@@ -16,11 +16,22 @@ pub enum Counter {
     AliasComparisons,
     AliasInputSpans,
     CanonicalBackingComparisons,
+    BufferReadbackBytes,
+    ImageReadbackBytes,
+    DeviceReadbackCopies,
+    BackendSubmissions,
+    BackendSubmissionNanoseconds,
+    BackendCompletionWaits,
+    BackendCompletionWaitNanoseconds,
+    FrontendSubmissions,
+    FrontendLoweringNanoseconds,
+    InlineWriteSegmentBreaks,
+    HostQueueSubmissions,
 }
 
 #[cfg(feature = "performance-counters")]
-static COUNTERS: [std::sync::atomic::AtomicU64; 13] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+static COUNTERS: [std::sync::atomic::AtomicU64; 24] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 24];
 
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
@@ -47,6 +58,17 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "AliasComparisons",
         "AliasInputSpans",
         "CanonicalBackingComparisons",
+        "BufferReadbackBytes",
+        "ImageReadbackBytes",
+        "DeviceReadbackCopies",
+        "BackendSubmissions",
+        "BackendSubmissionNanoseconds",
+        "BackendCompletionWaits",
+        "BackendCompletionWaitNanoseconds",
+        "FrontendSubmissions",
+        "FrontendLoweringNanoseconds",
+        "InlineWriteSegmentBreaks",
+        "HostQueueSubmissions",
     ];
     NAMES
         .iter()

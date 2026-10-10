@@ -2,32 +2,41 @@
 
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread::{self, JoinHandle};
 
 use nixe_gpu::{
     BackendExecutionCompletion, BackendSubmissionToken, BackendVisibilityRequester,
-    FrontendSubmissionId, NeutralBackendRuntime, PresentationImageRequest, ReservedTimelinePoint,
-    ResidentImage,
+    FrontendSubmissionId, GpuCacheConfiguration, NeutralBackendRuntime, PresentationImageRequest,
+    ReservedTimelinePoint, ResidentImage,
 };
 use nixe_gpu_maxwell::{
-    MaxwellBackendExecution, MaxwellSubmissionExecutionPlan,
-    execute_maxwell_software_initialization,
+    MaxwellBackendExecution, MaxwellFrontendDispatch, MaxwellFrontendDispatchBoundary,
+    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellLoweringCache,
+    MaxwellSubmissionExecutionStep, stream_maxwell_frontend,
 };
 use nixe_memory::{CpuVisibilityRequest, VisibilityCoordinatorError};
 
 use super::nvhost_ctrl::NvHostControl;
 use super::{NvDrvDeviceDescriptor, NvDrvValidationReason};
 
-/// Includes the submission executing on the backend owner. The channel buffer
-/// holds the remaining permits, so queued plus active work never exceeds this
-/// limit.
+/// Counts queued deliveries, frontend preparation and pending backend work
+/// together. Both worker queues share these permits and cannot exceed the bound.
 const MAX_GPU_SUBMISSIONS_IN_FLIGHT: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct GpuExecutorFailure {
     frontend: FrontendSubmissionId,
     detail: Box<str>,
+    pub(super) boundary: Option<(
+        NvDrvDeviceDescriptor,
+        u32,
+        Box<MaxwellFrontendDispatchBoundary>,
+    )>,
 }
 
 impl GpuExecutorFailure {
@@ -56,7 +65,8 @@ struct GpuWork {
     clock: nixe_runtime::VirtualClock,
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
-    execution: Option<GpuWorkExecution>,
+    execution: Box<MaxwellBackendExecution>,
+    pending: VecDeque<PendingSegment>,
     reservation: Option<ReservedTimelinePoint>,
     control: Arc<Mutex<NvHostControl>>,
     permit: GpuFrontendPermit,
@@ -65,17 +75,25 @@ struct GpuWork {
 pub(super) struct GpuSubmission {
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
-    execution: MaxwellSubmissionExecutionPlan,
+    dispatch: MaxwellFrontendDispatch,
+    channel: Arc<Mutex<MaxwellGpuChannel>>,
+    address_space: MaxwellGpuAddressSpace,
     reservation: Option<ReservedTimelinePoint>,
     control: Arc<Mutex<NvHostControl>>,
     permit: GpuFrontendPermit,
 }
 
 impl GpuSubmission {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "retained frontend delivery and its guest ABI ownership"
+    )]
     pub(super) fn new(
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
-        execution: MaxwellSubmissionExecutionPlan,
+        dispatch: MaxwellFrontendDispatch,
+        channel: Arc<Mutex<MaxwellGpuChannel>>,
+        address_space: MaxwellGpuAddressSpace,
         reservation: Option<ReservedTimelinePoint>,
         control: Arc<Mutex<NvHostControl>>,
         permit: GpuFrontendPermit,
@@ -83,7 +101,9 @@ impl GpuSubmission {
         Self {
             descriptor,
             request,
-            execution,
+            dispatch,
+            channel,
+            address_space,
             reservation,
             control,
             permit,
@@ -91,17 +111,31 @@ impl GpuSubmission {
     }
 }
 
-enum GpuWorkExecution {
-    Prepared(MaxwellSubmissionExecutionPlan),
-    Backend {
-        execution: Box<MaxwellBackendExecution>,
-        pending: Option<PendingSegment>,
+struct GpuFrontendWork {
+    submission: GpuSubmission,
+    clock: nixe_runtime::VirtualClock,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retained deliveries are bounded by shared permits"
+)]
+enum GpuFrontendMessage {
+    Submission(GpuFrontendWork),
+    PresentImage {
+        request: PresentationImageRequest,
+        reply: mpsc::SyncSender<Result<ResidentImage, Box<str>>>,
     },
 }
 
 struct PendingSegment {
     token: BackendSubmissionToken,
+    resume_execution: bool,
 }
+
+// Bound accepted segments even for a large frontend delivery. A full batch
+// drains before allowing another canonical update, retaining all queue tokens.
+const MAX_GPU_SEGMENTS_IN_FLIGHT: usize = 64;
 
 #[derive(Debug)]
 struct GpuWorkBudget {
@@ -276,6 +310,11 @@ impl Drop for GpuFrontendPermit {
 )]
 enum GpuExecutorMessage {
     Submission(GpuWork),
+    Append {
+        frontend: FrontendSubmissionId,
+        steps: Vec<MaxwellSubmissionExecutionStep>,
+        sealed: bool,
+    },
     Wake,
     CpuVisibility {
         request: CpuVisibilityRequest,
@@ -314,8 +353,11 @@ impl BackendVisibilityRequester for GpuVisibilityRequester {
     }
 }
 
-/// Handle to the one thread which owns and drives the neutral backend.
+/// Bounded frontend and backend workers owned by one GPU session.
 pub(super) struct NvDrvGpuExecutor {
+    frontend_sender: Mutex<Option<mpsc::SyncSender<GpuFrontendMessage>>>,
+    frontend_worker: Mutex<Option<JoinHandle<()>>>,
+    frontend_stopped: Arc<AtomicBool>,
     sender: Mutex<Option<mpsc::SyncSender<GpuExecutorMessage>>>,
     failure: Arc<Mutex<Option<GpuExecutorFailure>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -338,7 +380,10 @@ impl std::fmt::Debug for NvDrvGpuExecutor {
 }
 
 impl NvDrvGpuExecutor {
-    pub(super) fn new(mut backend: Option<Box<dyn NeutralBackendRuntime>>) -> Self {
+    pub(super) fn new(
+        mut backend: Option<Box<dyn NeutralBackendRuntime>>,
+        configuration: GpuCacheConfiguration,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(MAX_GPU_SUBMISSIONS_IN_FLIGHT);
         let failure = Arc::new(Mutex::new(None));
         let budget = Arc::new(GpuWorkBudget::default());
@@ -361,14 +406,18 @@ impl NvDrvGpuExecutor {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some(GpuExecutorFailure {
+                            boundary: None,
                             frontend: FrontendSubmissionId::new(0),
                             detail,
                         });
                 } else {
-                    if let Err(failure) = run_gpu_owner(receiver, &mut backend, &worker_budget) {
-                        *worker_failure
+                    if let Err(error) = run_gpu_owner(receiver, &mut backend, &worker_budget) {
+                        let mut failure = worker_failure
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(failure);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if failure.is_none() {
+                            *failure = Some(error);
+                        }
                     }
                 }
                 worker_budget.stop();
@@ -380,6 +429,7 @@ impl NvDrvGpuExecutor {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if failure.is_none() {
                         *failure = Some(GpuExecutorFailure {
+                            boundary: None,
                             frontend: FrontendSubmissionId::new(0),
                             detail: format!("neutral backend teardown failed: {error}").into(),
                         });
@@ -387,7 +437,64 @@ impl NvDrvGpuExecutor {
                 }
             })
             .expect("failed to create the dedicated GPU backend owner");
+        let (frontend_sender, frontend_receiver) =
+            mpsc::sync_channel::<GpuFrontendMessage>(MAX_GPU_SUBMISSIONS_IN_FLIGHT);
+        let frontend_stopped = Arc::new(AtomicBool::new(false));
+        let frontend_stop = Arc::clone(&frontend_stopped);
+        let frontend_failure = Arc::clone(&failure);
+        let frontend_budget = Arc::clone(&budget);
+        let backend_sender = sender.clone();
+        let frontend_worker = thread::Builder::new()
+            .name("nixe-gpu-frontend".into())
+            .spawn(move || {
+                // Eden queues command deliveries outside the CPU scheduler.
+                // Keep lowering separate from the backend owner so demanded
+                // readbacks can be serviced while frontend preparation waits.
+                // https://github.com/eden-emulator/mirror/blob/master/src/video_core/gpu_thread.cpp
+                let mut cache = MaxwellLoweringCache::new(configuration);
+                while let Ok(message) = frontend_receiver.recv() {
+                    if frontend_stop.load(Ordering::Acquire) || frontend_budget.is_stopped() {
+                        if let GpuFrontendMessage::PresentImage { reply, .. } = message {
+                            let _ = reply.send(Err("GPU frontend owner is shutting down".into()));
+                        }
+                        continue;
+                    }
+                    let frontend = match &message {
+                        GpuFrontendMessage::Submission(work) => {
+                            work.submission.dispatch.scheduled().frontend()
+                        }
+                        GpuFrontendMessage::PresentImage { .. } => FrontendSubmissionId::new(0),
+                    };
+                    let result = match message {
+                        GpuFrontendMessage::Submission(work) => {
+                            stream_gpu_work(work, &mut cache, &backend_sender)
+                        }
+                        GpuFrontendMessage::PresentImage { request, reply } => backend_sender
+                            .send(GpuExecutorMessage::PresentImage { request, reply })
+                            .map_err(|_| GpuExecutorFailure {
+                                frontend,
+                                detail: "GPU backend owner stopped before presentation".into(),
+                                boundary: None,
+                            }),
+                    };
+                    if let Err(error) = result {
+                        let mut failure = frontend_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if failure.is_none() {
+                            *failure = Some(error);
+                        }
+                        frontend_budget.stop();
+                        let _ = wake_gpu_owner(&backend_sender);
+                        break;
+                    }
+                }
+            })
+            .expect("failed to create the dedicated GPU frontend owner");
         Self {
+            frontend_sender: Mutex::new(Some(frontend_sender)),
+            frontend_worker: Mutex::new(Some(frontend_worker)),
+            frontend_stopped,
             sender: Mutex::new(Some(sender)),
             failure,
             worker: Mutex::new(Some(worker)),
@@ -400,34 +507,10 @@ impl NvDrvGpuExecutor {
         submission: GpuSubmission,
         clock: &nixe_runtime::VirtualClock,
     ) -> Result<(), GpuExecutorFailure> {
-        let GpuSubmission {
-            descriptor,
-            request,
-            execution,
-            reservation,
-            control,
-            mut permit,
-        } = submission;
-        let frontend = execution.frontend();
+        let frontend = submission.dispatch.scheduled().frontend();
         self.require_healthy()?;
-        let release_preflight_after_submission =
-            execution.requires_backend() && !execution.has_deferred_canonical_writes();
-        permit.set_release_after_submission(release_preflight_after_submission);
-
-        // The permit retains the ordered frontend boundary through queue
-        // admission, so another ioctl cannot lower past this submission.
-        self.require_healthy()?;
-        let work = GpuWork {
-            clock: clock.clone(),
-            descriptor,
-            request,
-            execution: Some(GpuWorkExecution::Prepared(execution)),
-            reservation,
-            control,
-            permit,
-        };
         let sender = self
-            .sender
+            .frontend_sender
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
@@ -435,17 +518,21 @@ impl NvDrvGpuExecutor {
             return Err(GpuExecutorFailure {
                 frontend,
                 detail: "GPU executor is torn down".into(),
+                boundary: None,
             });
         };
         sender
-            .send(GpuExecutorMessage::Submission(work))
+            .send(GpuFrontendMessage::Submission(GpuFrontendWork {
+                submission,
+                clock: clock.clone(),
+            }))
             .map_err(|_| {
                 self.failure().unwrap_or(GpuExecutorFailure {
                     frontend,
-                    detail: "GPU backend owner stopped before accepting work".into(),
+                    detail: "GPU frontend owner stopped before accepting work".into(),
+                    boundary: None,
                 })
-            })?;
-        Ok(())
+            })
     }
 
     /// Reserves bounded queue capacity and the ordered frontend boundary
@@ -454,6 +541,7 @@ impl NvDrvGpuExecutor {
         self.require_healthy()?;
         self.budget.reserve().ok_or_else(|| {
             self.failure().unwrap_or(GpuExecutorFailure {
+                boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU executor stopped before ordered frontend lowering".into(),
             })
@@ -471,6 +559,7 @@ impl NvDrvGpuExecutor {
         self.require_healthy()?;
         let Some(wake) = self.budget.request_progress() else {
             return Err(self.failure().unwrap_or(GpuExecutorFailure {
+                boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU executor is torn down".into(),
             }));
@@ -484,6 +573,7 @@ impl NvDrvGpuExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or_else(|| GpuExecutorFailure {
+                boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU executor is torn down".into(),
             })?;
@@ -491,6 +581,7 @@ impl NvDrvGpuExecutor {
             Ok(())
         } else {
             Err(self.failure().unwrap_or(GpuExecutorFailure {
+                boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU backend owner stopped before progress was requested".into(),
             }))
@@ -503,19 +594,21 @@ impl NvDrvGpuExecutor {
     ) -> Result<mpsc::Receiver<Result<ResidentImage, Box<str>>>, GpuExecutorFailure> {
         self.require_healthy()?;
         let sender = self
-            .sender
+            .frontend_sender
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or_else(|| GpuExecutorFailure {
+                boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU executor is torn down".into(),
             })?;
         let (reply, result) = mpsc::sync_channel(1);
         sender
-            .send(GpuExecutorMessage::PresentImage { request, reply })
+            .send(GpuFrontendMessage::PresentImage { request, reply })
             .map_err(|_| {
                 self.failure().unwrap_or(GpuExecutorFailure {
+                    boundary: None,
                     frontend: FrontendSubmissionId::new(0),
                     detail: "GPU backend owner stopped before exporting a resident image".into(),
                 })
@@ -531,6 +624,32 @@ impl NvDrvGpuExecutor {
     }
 
     pub(super) fn teardown(&self) -> Result<(), GpuExecutorFailure> {
+        self.frontend_stopped.store(true, Ordering::Release);
+        self.frontend_sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Keep the backend owner alive until a running frontend has finished:
+        // its canonical reads may demand GPU visibility during shutdown.
+        if let Some(worker) = self
+            .frontend_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            && worker.join().is_err()
+        {
+            let mut failure = self
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if failure.is_none() {
+                *failure = Some(GpuExecutorFailure {
+                    frontend: FrontendSubmissionId::new(0),
+                    detail: "GPU frontend owner panicked".into(),
+                    boundary: None,
+                });
+            }
+        }
         self.budget.stop();
         if let Some(sender) = self
             .sender
@@ -555,6 +674,7 @@ impl NvDrvGpuExecutor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if failure.is_none() {
                 *failure = Some(GpuExecutorFailure {
+                    boundary: None,
                     frontend: FrontendSubmissionId::new(0),
                     detail: "GPU backend owner panicked".into(),
                 });
@@ -568,6 +688,85 @@ impl Drop for NvDrvGpuExecutor {
     fn drop(&mut self) {
         let _ = self.teardown();
     }
+}
+
+fn stream_gpu_work(
+    work: GpuFrontendWork,
+    cache: &mut MaxwellLoweringCache,
+    sender: &mpsc::SyncSender<GpuExecutorMessage>,
+) -> Result<(), GpuExecutorFailure> {
+    let GpuFrontendWork { submission, clock } = work;
+    let GpuSubmission {
+        descriptor,
+        request,
+        dispatch,
+        channel,
+        address_space,
+        reservation,
+        control,
+        permit,
+    } = submission;
+    let frontend = dispatch.scheduled().frontend();
+    let completion = reservation.as_ref().map(ReservedTimelinePoint::point);
+    sender
+        .send(GpuExecutorMessage::Submission(GpuWork {
+            clock,
+            descriptor,
+            request,
+            execution: Box::new(MaxwellBackendExecution::begin(frontend, completion)),
+            pending: VecDeque::new(),
+            reservation,
+            control,
+            permit,
+        }))
+        .map_err(|_| GpuExecutorFailure {
+            frontend,
+            detail: "GPU backend owner stopped before frontend delivery".into(),
+            boundary: None,
+        })?;
+    let tail = {
+        let mut channel = channel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream_maxwell_frontend(
+            &dispatch,
+            &mut channel,
+            &address_space,
+            cache,
+            &mut |steps| {
+                sender
+                    .send(GpuExecutorMessage::Append {
+                        frontend,
+                        steps,
+                        sealed: false,
+                    })
+                    .map_err(|_| "GPU backend owner stopped before command prefix".into())
+            },
+        )
+    }
+    .map_err(|failure| GpuExecutorFailure {
+        frontend,
+        detail: failure.to_string().into(),
+        boundary: Some((
+            descriptor,
+            request,
+            Box::new(MaxwellFrontendDispatchBoundary::Frontend {
+                dispatch: Box::new(dispatch),
+                failure,
+            }),
+        )),
+    })?;
+    sender
+        .send(GpuExecutorMessage::Append {
+            frontend,
+            steps: tail.into_steps().into_vec(),
+            sealed: true,
+        })
+        .map_err(|_| GpuExecutorFailure {
+            frontend,
+            detail: "GPU backend owner stopped before the validated command tail".into(),
+            boundary: None,
+        })
 }
 
 fn run_gpu_owner(
@@ -602,9 +801,14 @@ fn run_gpu_owner(
         start_ready_work(&mut works, backend)?;
 
         let progress_requested = budget.take_progress_request();
-        let must_wait = works.len() == MAX_GPU_SUBMISSIONS_IN_FLIGHT
-            || !works.back().is_none_or(work_allows_following)
-            || progress_requested && works.iter().any(work_has_pending_segment);
+        let pending = works.iter().any(work_has_pending_segment);
+        let must_wait = pending
+            && (works.len() == MAX_GPU_SUBMISSIONS_IN_FLIGHT
+                || works.back().is_some_and(|work| {
+                    (work.execution.awaiting_completion() || work.execution.is_finished())
+                        && !work_allows_following(work)
+                })
+                || progress_requested);
         if must_wait {
             let completion = backend
                 .as_deref_mut()
@@ -621,7 +825,27 @@ fn run_gpu_owner(
             Ok(GpuExecutorMessage::Submission(work)) if !budget.is_stopped() => {
                 works.push_back(work);
             }
-            Ok(GpuExecutorMessage::Submission(_)) | Ok(GpuExecutorMessage::Wake) => {}
+            Ok(GpuExecutorMessage::Append {
+                frontend,
+                steps,
+                sealed,
+            }) if !budget.is_stopped() => {
+                let work = works
+                    .iter_mut()
+                    .find(|work| work.execution.frontend() == frontend)
+                    .ok_or_else(|| GpuExecutorFailure {
+                        frontend,
+                        detail: "frontend appended commands to an unknown delivery".into(),
+                        boundary: None,
+                    })?;
+                work.execution.append_steps(steps);
+                if sealed {
+                    work.execution.seal();
+                }
+            }
+            Ok(GpuExecutorMessage::Submission(_))
+            | Ok(GpuExecutorMessage::Append { .. })
+            | Ok(GpuExecutorMessage::Wake) => {}
             Ok(GpuExecutorMessage::CpuVisibility { request, reply }) => {
                 let result = if budget.is_stopped() {
                     Err("GPU backend owner is shutting down".into())
@@ -692,23 +916,25 @@ fn complete_backend_segment(
     let mut work = works
         .remove(index)
         .expect("located GPU work remains in the queue");
-    let GpuWorkExecution::Backend { execution, pending } = work
-        .execution
-        .as_mut()
-        .expect("queued GPU work retains execution state")
-    else {
-        unreachable!("located work has a pending backend segment")
-    };
-    let pending = pending
-        .take()
+    let execution = &mut work.execution;
+    let pending = &mut work.pending;
+    let completed = pending
+        .pop_front()
         .expect("located work retains its pending backend segment");
-    if pending.token != completion.submission() || execution.frontend() != completion.frontend() {
+    if completed.token != completion.submission() || execution.frontend() != completion.frontend() {
         return Err(GpuExecutorFailure {
+            boundary: None,
             frontend: execution.frontend(),
             detail: "backend completion timeline returned a different segment".into(),
         });
     }
-    execution.complete_segment();
+    if !completed.resume_execution {
+        if continue_work || !pending.is_empty() {
+            works.insert(index, work);
+        }
+        return Ok(());
+    }
+    execution.resume_segment();
     if continue_work && let Some(work) = advance_backend_work(work, backend)? {
         works.insert(index, work);
     }
@@ -724,54 +950,16 @@ fn start_ready_work(
         if index != 0 && !work_allows_following(&works[index - 1]) {
             break;
         }
-        if !matches!(works[index].execution, Some(GpuWorkExecution::Prepared(_))) {
+        if works[index].execution.awaiting_completion() {
             index += 1;
             continue;
         }
-        let mut work = works
+        let work = works
             .remove(index)
             .expect("indexed GPU work remains in the queue");
-        let state = work
-            .execution
-            .take()
-            .expect("queued GPU work retains execution state");
-        let plan = match state {
-            GpuWorkExecution::Prepared(plan) => plan,
-            GpuWorkExecution::Backend { .. } => unreachable!("checked work remains ready"),
-        };
-        let frontend = plan.frontend();
-        if plan.requires_backend() {
-            let execution =
-                MaxwellBackendExecution::new(plan).map_err(|error| GpuExecutorFailure {
-                    frontend,
-                    detail: error.to_string().into(),
-                })?;
-            work.execution = Some(GpuWorkExecution::Backend {
-                execution: Box::new(execution),
-                pending: None,
-            });
-            let work = advance_backend_work(work, backend)?.ok_or_else(|| GpuExecutorFailure {
-                frontend,
-                detail: "accelerated Maxwell work produced no backend segment".into(),
-            })?;
+        if let Some(work) = advance_backend_work(work, backend)? {
             works.insert(index, work);
             index += 1;
-        } else {
-            if index != 0 {
-                work.execution = Some(GpuWorkExecution::Prepared(plan));
-                works.insert(index, work);
-                break;
-            }
-            let expected = plan.completion();
-            let completed = execute_maxwell_software_initialization(
-                plan,
-                nixe_gpu_maxwell::maxwell_gpu_timestamp(work.clock.scheduler_time_ns()),
-            )
-            .map_err(|error| GpuExecutorFailure {
-                frontend,
-                detail: error.to_string().into(),
-            })?;
-            publish_guest_completion(work, completed, expected)?;
         }
     }
     Ok(())
@@ -781,48 +969,63 @@ fn advance_backend_work(
     mut work: GpuWork,
     backend: &mut Option<Box<dyn NeutralBackendRuntime>>,
 ) -> Result<Option<GpuWork>, GpuExecutorFailure> {
-    let GpuWorkExecution::Backend { execution, pending } = work
-        .execution
-        .as_mut()
-        .expect("queued GPU work retains execution state")
-    else {
-        unreachable!("only backend work can advance")
-    };
-    let frontend = execution.frontend();
-    match execution
-        .next_segment(nixe_gpu_maxwell::maxwell_gpu_timestamp(
-            work.clock.scheduler_time_ns(),
-        ))
-        .map_err(|error| GpuExecutorFailure {
-            frontend,
-            detail: error.to_string().into(),
-        })? {
-        Some(segment) => {
-            let backend = backend.as_deref_mut().ok_or_else(|| GpuExecutorFailure {
+    loop {
+        let execution = &mut work.execution;
+        let pending = &mut work.pending;
+        let frontend = execution.frontend();
+        match execution
+            .next_segment(nixe_gpu_maxwell::maxwell_gpu_timestamp(
+                work.clock.scheduler_time_ns(),
+            ))
+            .map_err(|error| GpuExecutorFailure {
+                boundary: None,
                 frontend,
-                detail: "submission requires an accelerated GPU backend".into(),
-            })?;
-            let final_segment = segment.submission().is_final_segment();
-            let token = backend
-                .submit(
-                    segment.creations(),
-                    segment.invalidations(),
-                    segment.submission(),
-                )
-                .map_err(|error| GpuExecutorFailure {
+                detail: error.to_string().into(),
+            })? {
+            Some(segment) => {
+                let backend = backend.as_deref_mut().ok_or_else(|| GpuExecutorFailure {
+                    boundary: None,
                     frontend,
-                    detail: error.to_string().into(),
+                    detail: "submission requires an accelerated GPU backend".into(),
                 })?;
-            *pending = Some(PendingSegment { token });
-            if final_segment {
-                work.permit.release_after_submission();
+                let final_segment = segment.submission().is_final_segment();
+                let token = backend
+                    .submit(
+                        segment.creations(),
+                        segment.invalidations(),
+                        segment.submission(),
+                    )
+                    .map_err(|error| GpuExecutorFailure {
+                        boundary: None,
+                        frontend,
+                        detail: error.to_string().into(),
+                    })?;
+                let resume_without_wait = pending.len() + 1 < MAX_GPU_SEGMENTS_IN_FLIGHT
+                    && execution.can_continue_after_submission();
+                pending.push_back(PendingSegment {
+                    token,
+                    resume_execution: !resume_without_wait,
+                });
+                if final_segment {
+                    if execution.can_prepare_following() {
+                        work.permit.set_release_after_submission(true);
+                    }
+                    work.permit.release_after_submission();
+                }
+                if resume_without_wait {
+                    execution.resume_segment();
+                    continue;
+                }
+                return Ok(Some(work));
             }
-            Ok(Some(work))
-        }
-        None => {
-            let completed = execution.completion();
-            publish_guest_completion(work, completed, completed)?;
-            Ok(None)
+            None => {
+                if !execution.is_finished() || !pending.is_empty() {
+                    return Ok(Some(work));
+                }
+                let completed = execution.completion();
+                publish_guest_completion(work, completed, completed)?;
+                return Ok(None);
+            }
         }
     }
 }
@@ -832,14 +1035,7 @@ fn publish_guest_completion(
     completed: Option<nixe_gpu::GuestTimelinePoint>,
     expected: Option<nixe_gpu::GuestTimelinePoint>,
 ) -> Result<(), GpuExecutorFailure> {
-    let frontend = match work
-        .execution
-        .as_ref()
-        .expect("completed GPU work retains execution state")
-    {
-        GpuWorkExecution::Prepared(plan) => plan.frontend(),
-        GpuWorkExecution::Backend { execution, .. } => execution.frontend(),
-    };
+    let frontend = work.execution.frontend();
     let GpuWork {
         descriptor,
         request,
@@ -849,6 +1045,7 @@ fn publish_guest_completion(
     } = work;
     if completed != expected || reservation.as_ref().map(ReservedTimelinePoint::point) != expected {
         return Err(GpuExecutorFailure {
+            boundary: None,
             frontend,
             detail: "GPU work completion does not match its reserved timeline point".into(),
         });
@@ -859,6 +1056,7 @@ fn publish_guest_completion(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .complete_channel_submission(descriptor, request, &reservation)
             .map_err(|error| GpuExecutorFailure {
+                boundary: None,
                 frontend,
                 detail: format!("guest completion publication failed: {error:?}").into(),
             })?;
@@ -867,13 +1065,7 @@ fn publish_guest_completion(
 }
 
 fn work_has_pending_segment(work: &GpuWork) -> bool {
-    matches!(
-        work.execution,
-        Some(GpuWorkExecution::Backend {
-            pending: Some(_),
-            ..
-        })
-    )
+    !work.pending.is_empty()
 }
 
 fn work_allows_following(work: &GpuWork) -> bool {
@@ -882,16 +1074,10 @@ fn work_allows_following(work: &GpuWork) -> bool {
 
 fn owner_failure(works: &VecDeque<GpuWork>, detail: impl Into<Box<str>>) -> GpuExecutorFailure {
     let frontend = works.front().map_or(FrontendSubmissionId::new(0), |work| {
-        match work
-            .execution
-            .as_ref()
-            .expect("queued GPU work retains execution state")
-        {
-            GpuWorkExecution::Prepared(plan) => plan.frontend(),
-            GpuWorkExecution::Backend { execution, .. } => execution.frontend(),
-        }
+        work.execution.frontend()
     });
     GpuExecutorFailure {
+        boundary: None,
         frontend,
         detail: detail.into(),
     }
@@ -971,6 +1157,121 @@ mod tests {
     }
 
     #[test]
+    fn presentation_cannot_overtake_a_frontend_delivery() {
+        use super::super::{
+            NvDrvDescriptorOwner, NvDrvDeviceKind, NvDrvFileDescriptor, NvDrvPermissionProfile,
+            NvDrvSessionId,
+        };
+        use nixe_gpu::{BackingView, GpuAllocationId, ImageMemoryLayout, PresentationImageFormat};
+        use nixe_gpu_maxwell::{
+            MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellChannelId,
+            MaxwellChannelOwner, MaxwellGpfifoSubmitRequest, MaxwellScheduler,
+            SWITCH_1_GM20B_PROFILE, decode_gpfifo_submission, resolve_gpfifo_submission,
+        };
+        use nixe_memory::{CanonicalAllocation, CanonicalCpuWriteDependency, MemoryPermissions};
+
+        let mut address_space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        address_space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        channel.bind_address_space(address_space.id()).unwrap();
+        let decoded = decode_gpfifo_submission(
+            SWITCH_1_GM20B_PROFILE,
+            8,
+            MaxwellGpfifoSubmitRequest {
+                entry_count: 0,
+                flags: 4,
+                fence_id: 0,
+                fence_value: 0,
+            },
+            &[],
+        )
+        .unwrap();
+        let retained = resolve_gpfifo_submission(
+            &channel,
+            FrontendSubmissionId::new(1),
+            decoded,
+            &address_space,
+        )
+        .unwrap();
+        let mut scheduler = MaxwellScheduler::default();
+        scheduler.enqueue(&channel, retained, None, None).unwrap();
+        let dispatch = scheduler
+            .dispatch_next(true, &address_space)
+            .unwrap()
+            .unwrap();
+        let channel = Arc::new(Mutex::new(channel));
+        // Model a frontend which has not consumed its accepted source yet.
+        let lock = channel.lock().unwrap();
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let backing = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let cpu_writes = CanonicalCpuWriteDependency::capture(&backing).unwrap();
+        let image = PresentationImageRequest {
+            allow_canonical_import: false,
+            backing: BackingView::new(
+                GpuAllocationId::new(1),
+                nixe_gpu::GpuAllocationDescription::new(0x1000, 0x1000).unwrap(),
+                0,
+                backing,
+            )
+            .unwrap(),
+            width: 1,
+            height: 1,
+            format: PresentationImageFormat::Rgba8,
+            layout: ImageMemoryLayout::PitchLinear {
+                row_pitch: 4,
+                layer_stride: 4,
+            },
+            row_pitch: 4,
+            cpu_writes,
+        };
+        let executor = NvDrvGpuExecutor::new(None, GpuCacheConfiguration::default());
+        let GpuSubmissionAdmission::Ready(permit) = executor.reserve_submission().unwrap() else {
+            panic!()
+        };
+        let descriptor = NvDrvDeviceDescriptor::open(
+            NvDrvFileDescriptor::new(1),
+            NvDrvDeviceKind::HostGpu,
+            NvDrvDescriptorOwner::new(NvDrvSessionId::ROOT, 1),
+            NvDrvPermissionProfile::Application,
+        );
+        executor
+            .enqueue(
+                GpuSubmission::new(
+                    descriptor,
+                    0xc018_481b,
+                    dispatch,
+                    Arc::clone(&channel),
+                    address_space,
+                    None,
+                    Arc::new(Mutex::new(NvHostControl::default())),
+                    permit,
+                ),
+                &nixe_runtime::VirtualClock::default(),
+            )
+            .unwrap();
+        let presented = executor.request_presentable_image(image).unwrap();
+        let early = presented.recv_timeout(std::time::Duration::from_millis(100));
+        drop(lock);
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        // Empty work fails at the frontend boundary. Its queued presentation
+        // must never reach the backend or create a false resident producer.
+        assert!(matches!(
+            presented.recv_timeout(std::time::Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(executor.teardown().unwrap_err().boundary.is_some());
+    }
+
+    #[test]
     fn cpu_visibility_is_serviced_by_the_backend_owner() {
         let requester = Arc::new(Mutex::new(None));
         let capabilities = BackendCapabilities::new(
@@ -985,10 +1286,13 @@ mod tests {
                 max_compute_workgroups: [0; 3],
             },
         );
-        let executor = NvDrvGpuExecutor::new(Some(Box::new(VisibilityRuntime {
-            capabilities,
-            requester: Arc::clone(&requester),
-        })));
+        let executor = NvDrvGpuExecutor::new(
+            Some(Box::new(VisibilityRuntime {
+                capabilities,
+                requester: Arc::clone(&requester),
+            })),
+            GpuCacheConfiguration::default(),
+        );
         let requester = requester
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

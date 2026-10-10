@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use nixe_cpu::execution::CpuProcessId;
-use nixe_scheduler::{Lease, ProcessId, VirtualCpuId};
+use nixe_scheduler::{GuestThreadId, Lease, ProcessId, VirtualCpuId};
 
 use crate::process::execution::{CpuThread, CpuThreadTeardownState, VcpuExecutionState};
 use crate::{ExecutionReport, ProcessExecutionError};
@@ -23,6 +23,22 @@ pub(super) struct WorkerRequest {
 pub(super) struct WorkerCpuThreadKey {
     pub(super) process: ProcessId,
     pub(super) cpu_process: CpuProcessId,
+}
+
+struct WorkerCpuThread {
+    cpu: CpuThread,
+    guest: Option<GuestThreadId>,
+}
+
+impl WorkerCpuThread {
+    fn select_guest(&mut self, guest: GuestThreadId) {
+        if self.guest != Some(guest) {
+            // Exclusive reservations belong to execution on this guest thread,
+            // not to the register snapshot or the next occupant of this core.
+            self.cpu.clear_local_exclusive_reservation();
+            self.guest = Some(guest);
+        }
+    }
 }
 
 pub(super) struct WorkerResult {
@@ -358,7 +374,10 @@ fn worker_main(
             WorkerCommand::Install { key, thread, reply } => {
                 let result = match cpu_threads.entry(key) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(thread);
+                        entry.insert(WorkerCpuThread {
+                            cpu: thread,
+                            guest: None,
+                        });
                         Ok(())
                     }
                     std::collections::btree_map::Entry::Occupied(_) => Err(thread),
@@ -380,6 +399,7 @@ fn worker_main(
                     preparation.prepare(
                         cpu_threads
                             .get_mut(key)
+                            .map(|thread| &mut thread.cpu)
                             .expect("a collected CPU thread key remains installed"),
                     )
                 });
@@ -393,7 +413,7 @@ fn worker_main(
             }
             WorkerCommand::ClearLocalExclusive { key, reply } => {
                 let found = if let Some(thread) = cpu_threads.get_mut(&key) {
-                    thread.clear_local_exclusive_reservation();
+                    thread.cpu.clear_local_exclusive_reservation();
                     true
                 } else {
                     false
@@ -410,7 +430,8 @@ fn worker_main(
                     process: request.cpu_thread.cpu_process,
                 },
             )?;
-            request.execution.run(&mut native_worker, thread)
+            thread.select_guest(request.lease.thread);
+            request.execution.run(&mut native_worker, &mut thread.cpu)
         };
         let outcome = if let Some(permit) = &global_permit {
             let _permit = permit
@@ -441,5 +462,130 @@ fn catch_worker_panic(
     match catch_unwind(AssertUnwindSafe(run)) {
         Ok(result) => result.map_err(WorkerRunFailure::Execution),
         Err(_) => Err(WorkerRunFailure::Worker(WorkerFailure::BackendPanicked)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_cpu::{
+        execution::{ArchitecturalTimer, TimerSnapshot, VcpuEventState},
+        memory::{CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions},
+        platform::TargetPlatform,
+        profile::ProcessCpuContext,
+        state::a64::{A64GeneralRegister, A64Register},
+    };
+    use nixe_cpu_jit::{JitProcess, JitRunRequest, JitThread, ThreadState};
+    use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
+
+    struct FixedTimer;
+    impl ArchitecturalTimer for FixedTimer {
+        fn snapshot(&self) -> TimerSnapshot {
+            TimerSnapshot {
+                counter: 0,
+                frequency: 19_200_000,
+            }
+        }
+    }
+    fn x(index: u8) -> A64Register {
+        A64Register::General(A64GeneralRegister::new(index).unwrap())
+    }
+
+    #[test]
+    fn guest_switch_clears_exclusives_but_same_guest_resume_preserves_them() {
+        let space = AddressSpaceId::new(1);
+        let mut memory = ExecutionMemory::new();
+        for id in [1, 2] {
+            assert!(memory.add_ram_page(GuestPhysicalPageId::new(id)));
+        }
+        // LDXR X3,[X1]; B store; STXR W4,X3,[X1]; SVC. Stop the first
+        // block on its budget: Dynarmic itself clears exclusives at SVC.
+        let code = [0xc85f7c23_u32, 0x14000001, 0xc8047c23, 0xd4000001];
+        memory
+            .initialize_ram(
+                GuestPhysicalPageId::new(1),
+                0,
+                &code
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert!(memory.map_page(
+            space,
+            GuestVirtualAddress::new(0x1000),
+            GuestPhysicalPageId::new(1),
+            MemoryPermissions::READ_EXECUTE
+        ));
+        assert!(memory.map_page(
+            space,
+            GuestVirtualAddress::new(0x2000),
+            GuestPhysicalPageId::new(2),
+            MemoryPermissions::READ_WRITE
+        ));
+        memory
+            .bind_cpu_memory_backend(space, 0x10000, nixe_memory::DirectBackendPolicy::Required)
+            .unwrap();
+        let memory = Arc::new(memory);
+        let process = Arc::new(
+            JitProcess::new(
+                ProcessCpuContext::for_platform(TargetPlatform::Switch1, space),
+                memory.clone(),
+                19_200_000,
+            )
+            .unwrap(),
+        );
+        let mut core = WorkerCpuThread {
+            cpu: CpuThread::Jit(Box::new(JitThread::new(process).unwrap())),
+            guest: None,
+        };
+        let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
+        let mut state = ThreadState::default();
+        state.write_x(x(1), 0x2000);
+        let mut run = |core: &mut WorkerCpuThread, guest, pc, value| {
+            core.select_guest(GuestThreadId::new(guest));
+            state.set_pc(pc);
+            state.write_x(x(3), value);
+            let CpuThread::Jit(jit) = &mut core.cpu else {
+                unreachable!()
+            };
+            let report = jit
+                .run_slice(
+                    &mut worker,
+                    JitRunRequest {
+                        state: &mut state,
+                        instruction_budget: 2,
+                        timer: &FixedTimer,
+                        events: &VcpuEventState::default(),
+                        capture_context: true,
+                    },
+                )
+                .unwrap();
+            if pc == 0x1000 {
+                assert_eq!(report.stop, nixe_cpu::execution::CpuExit::BudgetExhausted);
+            } else {
+                assert!(matches!(
+                    report.stop,
+                    nixe_cpu::execution::CpuExit::SupervisorCall { .. }
+                ));
+            }
+            state.read_x(x(4))
+        };
+        run(&mut core, 1, 0x1000, 0);
+        assert_eq!(run(&mut core, 2, 0x1008, 7), 1);
+        run(&mut core, 2, 0x1000, 0);
+        assert_eq!(run(&mut core, 2, 0x1008, 7), 0);
+        assert_eq!(
+            memory
+                .read(
+                    space,
+                    GuestVirtualAddress::new(0x2000),
+                    MemoryAccess::normal(MemoryAccessSize::Doubleword)
+                )
+                .unwrap()
+                .value
+                .bits(),
+            7
+        );
     }
 }

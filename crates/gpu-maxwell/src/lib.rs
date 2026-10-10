@@ -174,14 +174,13 @@ pub use engines::{
 };
 pub use execution::{
     MaxwellBackendExecution, MaxwellBackendExecutionError, MaxwellBackendSegment,
-    MaxwellSoftwareInitializationError, MaxwellSubmissionExecutionError,
+    MaxwellCanonicalExecutionError, MaxwellSubmissionExecutionError,
     MaxwellSubmissionExecutionPlan, MaxwellSubmissionExecutionStep,
-    execute_maxwell_software_initialization,
 };
 
 pub use frontend::{
     MAXWELL_FRONTEND_DIAGNOSTIC_WORDS, MaxwellFrontendDiagnostic, MaxwellFrontendDispatchError,
-    diagnose_maxwell_frontend, lower_maxwell_frontend, lower_maxwell_pushbuffer,
+    diagnose_maxwell_frontend, lower_maxwell_pushbuffer, stream_maxwell_frontend,
 };
 pub use gpfifo::{
     MAXWELL_GPFIFO_CAPTURE_SOURCES, MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellDecodedGpfifoSubmission,

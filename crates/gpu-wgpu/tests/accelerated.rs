@@ -9,6 +9,12 @@ mod compressed_textures;
 #[path = "accelerated/resource_lifetime.rs"]
 mod resource_lifetime;
 
+#[path = "accelerated/cpu_overlap.rs"]
+mod cpu_overlap;
+
+#[path = "accelerated/segmented_uploads.rs"]
+mod segmented_uploads;
+
 #[path = "accelerated/multisample.rs"]
 mod multisample;
 
@@ -1296,6 +1302,87 @@ fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
     let mut bytes = [0; 64];
     destination_backing.range().read(0, &mut bytes).unwrap();
     assert_eq!(bytes, [0x3c; 64]);
+}
+
+#[test]
+fn many_buffer_domains_upload_before_cache_eviction() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(0x14),
+        NonCpuDeviceId::new(0x14),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let source_page = initialized_page(&[0x3c; 1024]);
+    let destination_page = initialized_page(&[0; 1024]);
+    let description = GpuAllocationDescription::new(1024, 4).unwrap();
+    let source_allocation = GpuAllocationId::new(3);
+    let destination_allocation = GpuAllocationId::new(4);
+    let source_backing = backing(source_allocation, description, &source_page);
+    let destination_backing = backing(destination_allocation, description, &destination_page);
+    let source = BufferId::new(3);
+    let destination = BufferId::new(4);
+    let creations = [source_allocation, destination_allocation]
+        .into_iter()
+        .map(|id| BackendResourceCreateInfo::Allocation { id, description })
+        .chain(
+            [
+                (source, source_backing.clone()),
+                (destination, destination_backing.clone()),
+            ]
+            .into_iter()
+            .map(|(id, backing)| BackendResourceCreateInfo::Buffer {
+                id,
+                description: BufferDescription::new(1024).unwrap(),
+                view: Some(
+                    BufferView::new(id, BufferDescription::new(1024).unwrap(), 0, backing).unwrap(),
+                ),
+            }),
+        )
+        .collect::<Vec<_>>();
+    // Distinct, nonadjacent domains exceed the retained-domain cache limit.
+    // Every earlier observation must survive until its host copy is encoded.
+    let submission = OperationSubmission::new(
+        FrontendSubmissionId::new(4),
+        vec![],
+        (0..65)
+            .map(|index| {
+                let range = BufferRange::new(index * 8, 4).unwrap();
+                GpuOperation::new(
+                    GpuCommand::Copy(
+                        CopyOperation::buffer_to_buffer(
+                            BufferRegion {
+                                buffer: source,
+                                range,
+                            },
+                            BufferRegion {
+                                buffer: destination,
+                                range,
+                            },
+                        )
+                        .unwrap(),
+                    ),
+                    [],
+                    [],
+                    CapabilityRequirements::none(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    runtime
+        .runtime()
+        .submit(&creations, &[], &submission)
+        .unwrap();
+    let mut bytes = [0; 1024];
+    destination_backing.range().read(0, &mut bytes).unwrap();
+    for index in 0..65 {
+        assert_eq!(&bytes[index * 8..index * 8 + 4], &[0x3c; 4]);
+        assert_eq!(&bytes[index * 8 + 4..index * 8 + 8], &[0; 4]);
+    }
+    assert_eq!(&bytes[520..], &[0; 504]);
 }
 
 #[test]

@@ -237,7 +237,7 @@ impl MaxwellResolvedComputeLaunch {
             for segment in range.segments() {
                 let end = copied + segment.size() as usize;
                 writes
-                    .read_staged(
+                    .read_overlay(
                         segment.mapping().backing(),
                         segment.backing_offset(),
                         &mut bytes[copied..end],
@@ -313,11 +313,11 @@ pub(crate) fn resolve_compute_launch(
     for segment in range.segments() {
         let end = copied + segment.size() as usize;
         let output = &mut bytes[copied..end];
-        // read_staged also reads the unstaged bytes. A separate backing read
+        // read_overlay also reads the unstaged bytes. A separate backing read
         // would duplicate work and could materialize contents fully overwritten
         // by the pending upload.
         writes
-            .read_staged(
+            .read_overlay(
                 segment.mapping().backing(),
                 segment.backing_offset(),
                 output,

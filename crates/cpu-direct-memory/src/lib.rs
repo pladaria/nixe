@@ -1,7 +1,7 @@
 //! Linux native-fault runtime shared by CPU execution frontends.
 //!
 //! The signal handler performs only bounded slot lookup, fixed-stub attribution,
-//! context capture, and register redirection. Epoch-owned JIT attribution and
+//! context capture, and register redirection. JIT fault attribution and
 //! emulator policy run after `sigreturn` on a preallocated dispatcher stack.
 
 #![cfg(target_os = "linux")]
@@ -68,7 +68,7 @@ struct NativeFaultRegion {
 }
 
 /// Immutable attribution for fixed native memory stubs, published as a whole
-/// before a worker becomes active. JIT code uses its own epoch-owned directory.
+/// before a worker becomes active. Dynarmic resolves its own live code-cache metadata outside the handler.
 /// Signal-context lookup only reads this table: no locks, allocations or
 /// incremental publication, and no retained retired code.
 struct NativeFaultRegistry {
@@ -132,6 +132,7 @@ fn validate_region(region: &NativeFaultRegion) -> Result<(), FaultRuntimeError> 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum FaultDisposition {
+    /// Retry the captured instruction after repairing its memory access.
     Retry = 0,
     Escape = 1,
     Fatal = 2,
@@ -139,6 +140,9 @@ pub enum FaultDisposition {
     FatalUnattributed = 3,
     /// The dispatcher caught a panic; unwinding must not cross native assembly.
     FatalPanic = 4,
+    /// Continue through the JIT callback installed by `call_on_resume`.
+    /// This completes the access instead of retrying the captured instruction.
+    Resume = 5,
 }
 
 pub type FaultDispatcher =
@@ -583,7 +587,9 @@ impl WorkerFaultContext {
     /// PCs with a fatal disposition, never infer attribution from an arena
     /// address alone. `FatalUnattributed` identifies this diagnostic precisely.
     /// It must not use `CapturedFault::site`, unwind, or return `Retry` without
-    /// repairing the captured access. `Escape` skips gateway Rust frames: those
+    /// repairing the captured access. To complete the access through a JIT
+    /// callback, return the disposition from `CapturedFault::call_on_resume`.
+    /// `Escape` skips gateway Rust frames: those
     /// frames must own no destructors, and the caller must restore FP and guest
     /// state explicitly before announcing quiescence.
     /// `caller_fp` is the owner's saved host [control, status]: x86 MXCSR split
@@ -1314,9 +1320,10 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
     // to acquire the exclusive execution gate while its caller holds a shared
     // native-execution lease.
     let slot = unsafe { &*slot };
-    // Epoch-owned mappings are monotonic during a retry. Repeating the same
-    // native PC and failing byte after a claimed repair is fatal BEFORE asking
-    // policy to repair again. Fixed stubs retain their existing retry bound.
+    // A pending native retry at the same PC and failing byte after a claimed
+    // repair is fatal BEFORE asking policy to repair again. JIT callback
+    // continuations complete the access and leave no pending retry. Fixed
+    // stubs retain their existing retry bound.
     if slot.registry.load(Ordering::Relaxed).is_null()
         && slot.retry_count.load(Ordering::Relaxed) != 0
         && slot.retry_pc.load(Ordering::Relaxed) == slot.native_pc.load(Ordering::Relaxed)
@@ -1336,21 +1343,27 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
     };
     let disposition = unsafe { dispatcher(slot.opaque.load(Ordering::Relaxed), &mut fault) };
     match disposition {
-        FaultDisposition::Retry => {
-            let native_pc = slot.native_pc.load(Ordering::Relaxed);
-            let fault_address = slot.fault_address.load(Ordering::Relaxed);
-            let repeated = slot.retry_pc.load(Ordering::Relaxed) == native_pc
-                && slot.retry_address.load(Ordering::Relaxed) == fault_address;
-            let attempts = if repeated {
-                slot.retry_count.fetch_add(1, Ordering::Relaxed) + 1
+        FaultDisposition::Retry | FaultDisposition::Resume => {
+            if disposition == FaultDisposition::Retry {
+                let native_pc = slot.native_pc.load(Ordering::Relaxed);
+                let fault_address = slot.fault_address.load(Ordering::Relaxed);
+                let repeated = slot.retry_pc.load(Ordering::Relaxed) == native_pc
+                    && slot.retry_address.load(Ordering::Relaxed) == fault_address;
+                let attempts = if repeated {
+                    slot.retry_count.fetch_add(1, Ordering::Relaxed) + 1
+                } else {
+                    slot.retry_pc.store(native_pc, Ordering::Relaxed);
+                    slot.retry_address.store(fault_address, Ordering::Relaxed);
+                    slot.retry_count.store(1, Ordering::Relaxed);
+                    1
+                };
+                if attempts > MAX_UNCHANGED_RETRIES {
+                    fatal::terminate(slot, fatal::Reason::RetryLimit);
+                }
             } else {
-                slot.retry_pc.store(native_pc, Ordering::Relaxed);
-                slot.retry_address.store(fault_address, Ordering::Relaxed);
-                slot.retry_count.store(1, Ordering::Relaxed);
-                1
-            };
-            if attempts > MAX_UNCHANGED_RETRIES {
-                fatal::terminate(slot, fatal::Reason::RetryLimit);
+                // The callback resumes after the completed access. A later
+                // fault at the same PC/address can be another loop iteration.
+                slot.retry_count.store(0, Ordering::Relaxed);
             }
             #[cfg(target_arch = "x86_64")]
             {
@@ -2215,7 +2228,7 @@ mod tests {
     }
 
     impl VisibilityCoordinator for DeviceWriteback {
-        fn make_device_visible(
+        fn cache_cpu_page(
             &self,
             _request: DeviceVisibilityRequest,
             _canonical_bytes: &[u8],
@@ -3044,12 +3057,16 @@ mod tests {
             DeviceVisibilityPoint::new(12),
         )
         .unwrap();
-        range
-            .prepare_device_access(declaration, Arc::clone(&coordinator))
-            .unwrap();
-        range
-            .publish_device_write(declaration, Arc::clone(&coordinator))
-            .unwrap();
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        nixe_memory::CanonicalBackingRange::publish_device_writes(
+            [(&range, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
         assert!(matches!(
             range.segments()[0].visibility_state(),
             VisibilityState::GpuNewer { .. }

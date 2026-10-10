@@ -29,18 +29,23 @@ pub(super) fn draw_color_outputs(
     // SINGLE_ROP_CONTROL broadcasts SET_BLEND(0); otherwise SET_BLEND(target)
     // still controls each target even when all targets use common equations.
     // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2446-L2454
-    let single_rop =
-        *fixed
-            .single_rop_control()
-            .value()
-            .ok_or(MaxwellLoweringError::IncompleteBlendState {
-                target: None,
-                field: "SET_SINGLE_ROP_CONTROL",
-            })?
-            == MaxwellThreeDSingleRopControl::Enabled;
     for (slot, target) in attachments.color_targets().enumerate() {
         let selected = per_target.then_some(target);
-        let enable_target = if single_rop { 0 } else { target };
+        // Both selector values choose SET_BLEND(0) for target zero. The selector
+        // is only consumed when a different physical target participates.
+        let enable_target = if target == 0 {
+            0
+        } else {
+            match fixed.single_rop_control().value().ok_or(
+                MaxwellLoweringError::IncompleteBlendState {
+                    target: None,
+                    field: "SET_SINGLE_ROP_CONTROL",
+                },
+            )? {
+                MaxwellThreeDSingleRopControl::Enabled => 0,
+                MaxwellThreeDSingleRopControl::Disabled => target,
+            }
+        };
         let enabled = fixed.blend_enable()[usize::from(enable_target)]
             .value()
             .copied()

@@ -320,11 +320,6 @@ impl DecoderTable {
     pub const fn index_shift(&self) -> u8 {
         self.index_shift
     }
-
-    #[must_use]
-    pub fn candidate_count(&self, encoding: u32) -> usize {
-        self.buckets[((encoding >> self.index_shift) & 0xff) as usize].len()
-    }
 }
 
 const fn extract_operands(pattern: &InstructionPattern, bits: u32) -> DecodedOperands {

@@ -237,7 +237,7 @@ impl ProcessBuilder {
         };
 
         let entry = GuestVirtualAddress::new(modules[entry_module].entry_address());
-        let mut state = ThreadCpuState::default();
+        let mut state = GuestCpuState::default();
         initialize_thread(
             &mut state,
             entry,
@@ -254,8 +254,6 @@ impl ProcessBuilder {
             object: main_thread_object,
             exit: None,
             state: Some(state),
-            jit_returns: matches!(self.cpu_backend, execution::CpuBackendConfig::Jit)
-                .then(Box::<nixe_cpu_jit::ReturnStack>::default),
             handle: main_thread_handle,
             stack_bottom,
             stack_top,
@@ -635,7 +633,7 @@ fn install_homebrew_loader_return(
 }
 
 pub(super) fn initialize_thread(
-    state: &mut ThreadCpuState,
+    state: &mut GuestCpuState,
     entry: GuestVirtualAddress,
     stack_top: GuestVirtualAddress,
     tls_base: GuestVirtualAddress,
@@ -667,7 +665,7 @@ pub(super) fn initialize_thread(
 }
 
 pub(super) fn initialize_created_thread(
-    state: &mut ThreadCpuState,
+    state: &mut GuestCpuState,
     request: &ThreadCreateRequest,
     tls_base: GuestVirtualAddress,
 ) -> Result<(), ProcessBuildError> {

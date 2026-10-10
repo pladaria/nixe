@@ -2615,12 +2615,10 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
         })
     ));
     program_three_d(&mut channel, 0x12e4, 0);
+    // Physical target zero selects SET_BLEND(0) with either selector value.
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellLoweringError::IncompleteBlendState {
-            target: None,
-            field: "SET_SINGLE_ROP_CONTROL"
-        })
+        Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
     program_three_d(&mut channel, 0x135c, 0);
     assert!(matches!(

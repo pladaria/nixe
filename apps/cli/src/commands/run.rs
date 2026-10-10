@@ -1204,7 +1204,7 @@ mod tests {
                 svc_calls: 0,
                 rejected_svc_kinds: 0,
             }),
-            Err("HCQ Cranelift: invalid checkpoint".to_owned()),
+            Err("Dynarmic: invalid native state".to_owned()),
         ] {
             let failed = execution.is_err();
             let error = finish_execution(WorkerResult {
@@ -1214,7 +1214,7 @@ mod tests {
             })
             .unwrap_err();
             assert!(error.contains("cannot remove process during teardown: backend failure"));
-            assert_eq!(error.contains("HCQ Cranelift: invalid checkpoint"), failed);
+            assert_eq!(error.contains("Dynarmic: invalid native state"), failed);
         }
     }
 

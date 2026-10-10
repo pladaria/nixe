@@ -10,6 +10,15 @@ fn prepare_slice(
     bytes: &CanonicalAllocation,
     offset: u64,
 ) -> ResourceDependency {
+    prepare_slice_access(cache, bytes, offset, false)
+}
+
+fn prepare_slice_access(
+    cache: &mut MaxwellLoweringCache,
+    bytes: &CanonicalAllocation,
+    offset: u64,
+    writable: bool,
+) -> ResourceDependency {
     let allocation = GpuAllocationDescription::new(0x1000, 1).unwrap();
     let canonical = bytes.backing_range(MemoryPermissions::READ_WRITE).unwrap();
     let backing = BackingView::new(
@@ -24,12 +33,38 @@ fn prepare_slice(
         allocation,
         backing,
         Arc::from([]),
+        writable,
         cache,
         &mut Vec::new(),
         &mut Vec::new(),
         std::iter::empty(),
     )
     .unwrap()
+}
+
+#[test]
+fn overlapping_read_only_slices_reuse_views_but_writes_reconcile_aliases() {
+    let bytes = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+    let mut cache = MaxwellLoweringCache::default();
+    let first = prepare_slice(&mut cache, &bytes, 0);
+    let overlapping = prepare_slice(&mut cache, &bytes, 8);
+    assert_eq!(cache.views.len(), 2);
+    assert_eq!(prepare_slice(&mut cache, &bytes, 0), first);
+    assert_eq!(prepare_slice(&mut cache, &bytes, 8), overlapping);
+
+    finish(&mut cache, vec![copy(first, overlapping)]);
+    let read = prepare_slice(&mut cache, &bytes, 16);
+    assert!(cache.views.iter().any(|view| view.dependency == first));
+    assert!(cache.views.iter().any(|view| view.dependency == read));
+    assert!(
+        !cache
+            .views
+            .iter()
+            .any(|view| view.dependency == overlapping)
+    );
+    let write = prepare_slice_access(&mut cache, &bytes, 8, true);
+    assert_eq!(cache.views.len(), 1);
+    assert_eq!(cache.views[0].dependency, write);
 }
 
 fn region(dependency: ResourceDependency) -> BufferRegion {
@@ -159,4 +194,41 @@ fn buffer_slice_cache_remains_bounded_over_repeated_deliveries() {
         assert!(!work.invalidations.contains(&source));
         assert!(!work.invalidations.contains(&written));
     }
+}
+
+#[test]
+fn read_only_ring_eviction_leaves_room_without_exceeding_the_cache_budget() {
+    let bytes = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let mut cache = MaxwellLoweringCache::new(GpuCacheConfiguration::new(32, 16, 1, 1, 1).unwrap());
+    let mut current = prepare_slice(&mut cache, &bytes, 0);
+    let destination = prepare_slice_access(&mut cache, &bytes, 0xf00, true);
+    for offset in (16..=256).step_by(16) {
+        current = prepare_slice(&mut cache, &bytes, offset);
+    }
+    let work = finish(&mut cache, vec![copy(current, destination)]);
+    assert_eq!(work.invalidations.len(), 2);
+    assert_eq!(
+        cache
+            .views
+            .iter()
+            .filter(|view| view.write_revision == 0)
+            .count(),
+        15
+    );
+    let next = prepare_slice(&mut cache, &bytes, 272);
+    assert!(
+        finish(&mut cache, vec![copy(next, destination)])
+            .invalidations
+            .is_empty()
+    );
+    let next = prepare_slice(&mut cache, &bytes, 288);
+    let work = finish(&mut cache, vec![copy(next, destination)]);
+    assert_eq!(work.invalidations.len(), 2);
+    assert!(cache.views.iter().any(|view| view.dependency == next));
+    assert!(
+        cache
+            .views
+            .iter()
+            .any(|view| view.dependency == destination)
+    );
 }

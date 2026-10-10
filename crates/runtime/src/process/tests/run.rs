@@ -1,84 +1,6 @@
 use super::*;
 
 #[test]
-fn return_stack_moves_with_guest_execution_across_vcpus_and_abort() {
-    for backend in [
-        crate::CpuBackendConfig::Interpreter,
-        crate::CpuBackendConfig::Jit,
-    ] {
-        let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::default()
-            .with_cpu_backend(backend.clone())
-            .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
-            .build(&plan)
-            .unwrap();
-        let thread_id = process.main_thread_id();
-        let identity = process
-            .main_thread()
-            .jit_returns
-            .as_deref()
-            .map(std::ptr::from_ref);
-        assert_eq!(
-            identity.is_some(),
-            matches!(backend, crate::CpuBackendConfig::Jit)
-        );
-        let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
-        for id in [0, 1, 0] {
-            let vcpu = nixe_scheduler::VirtualCpuId::new(id);
-            let mut cpu = process.create_worker_cpu_thread(vcpu).unwrap();
-            let mut execution = process
-                .begin_thread_execution(
-                    thread_id,
-                    vcpu,
-                    0,
-                    nixe_cpu::execution::VcpuEventState::default(),
-                )
-                .unwrap();
-            // The table cannot retain a second owner while this guest lease runs.
-            assert!(process.main_thread().state.is_none());
-            assert!(process.main_thread().jit_returns.is_none());
-            assert_eq!(
-                execution.jit_returns.as_deref().map(std::ptr::from_ref),
-                identity
-            );
-            let result = execution.run(&mut worker, &mut cpu);
-            let report = process
-                .finish_thread_execution(thread_id, vcpu, execution, result)
-                .unwrap();
-            assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
-            assert_eq!(
-                process
-                    .main_thread()
-                    .jit_returns
-                    .as_deref()
-                    .map(std::ptr::from_ref),
-                identity
-            );
-        }
-        let vcpu = nixe_scheduler::VirtualCpuId::new(1);
-        let execution = process
-            .begin_thread_execution(
-                thread_id,
-                vcpu,
-                0,
-                nixe_cpu::execution::VcpuEventState::default(),
-            )
-            .unwrap();
-        process.abort_thread_execution(thread_id, vcpu, execution);
-        assert!(process.main_thread().state.is_some());
-        assert_eq!(
-            process
-                .main_thread()
-                .jit_returns
-                .as_deref()
-                .map(std::ptr::from_ref),
-            identity
-        );
-        worker.finish().unwrap();
-    }
-}
-
-#[test]
 fn loader_stub_executes_before_runtime_termination_on_both_backends() {
     for backend in [
         crate::CpuBackendConfig::Interpreter,
@@ -235,7 +157,7 @@ fn loader_stub_recognition_requires_the_thread_address_and_exit_svc() {
 }
 
 #[test]
-fn production_lcq_uses_block_budgets_recompiles_mutated_code_and_retires() {
+fn production_jit_uses_block_budgets_recompiles_mutated_code_and_retires() {
     let (_directory, plan) = plan();
     let mut process = ProcessBuilder::default()
         .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)

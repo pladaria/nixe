@@ -8,7 +8,8 @@ use crate::pushbuffer::packet::SubmissionWords;
 use crate::{
     MaxwellDecodedPushbuffer, MaxwellEngineDispatchError, MaxwellFrontendDispatch,
     MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellLoweringCache, MaxwellPushbufferDecodeError,
-    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan, decode_maxwell_pushbuffer,
+    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan,
+    MaxwellSubmissionExecutionStep, decode_maxwell_pushbuffer,
 };
 use nixe_gpu::{FrontendSubmissionId, ReservedTimelinePoint};
 
@@ -45,6 +46,7 @@ impl MaxwellFrontendDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellFrontendDispatchError {
     EmptySubmission,
+    Delivery(Box<str>),
     PacketDecode(MaxwellPushbufferDecodeError),
     EngineDispatch(Box<MaxwellEngineDispatchError>),
     Execution(Box<MaxwellSubmissionExecutionError>),
@@ -54,6 +56,7 @@ impl Display for MaxwellFrontendDispatchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptySubmission => formatter.write_str("empty Maxwell submission"),
+            Self::Delivery(error) => write!(formatter, "frontend prefix delivery failed: {error}"),
             Self::PacketDecode(error) => write!(formatter, "packet decode failed: {error}"),
             Self::EngineDispatch(error) => write!(formatter, "engine dispatch failed: {error}"),
             Self::Execution(error) => write!(formatter, "frontend lowering failed: {error}"),
@@ -65,17 +68,15 @@ impl std::error::Error for MaxwellFrontendDispatchError {}
 
 /// Decodes, dispatches, and lowers a retained submission exactly once.
 ///
-/// Each packet is lowered before the next packet mutates channel state. Only
-/// the completed neutral plan survives this function; packet objects and their
-/// temporary trigger snapshots do not cross the frontend boundary.
-pub fn lower_maxwell_frontend(
+/// Delivers bounded lowered prefixes while subsequent packets are prepared.
+/// The returned tail has passed completion-signal validation; only then may
+/// its backend consumer seal the frontend delivery and publish its fence.
+pub fn stream_maxwell_frontend(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
     address_space: &MaxwellGpuAddressSpace,
-    frontend: FrontendSubmissionId,
-    predecessors: Vec<FrontendSubmissionId>,
-    completion: Option<&ReservedTimelinePoint>,
     cache: &mut MaxwellLoweringCache,
+    consume: &mut impl FnMut(Vec<MaxwellSubmissionExecutionStep>) -> Result<(), Box<str>>,
 ) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
     let submission = dispatch.scheduled().submission();
     let decoded = decode_maxwell_pushbuffer(SubmissionWords::new(submission, address_space))
@@ -83,15 +84,17 @@ pub fn lower_maxwell_frontend(
     if decoded.packets().is_empty() {
         return Err(MaxwellFrontendDispatchError::EmptySubmission);
     }
-    let mut planner =
-        MaxwellSubmissionPlanner::new(address_space, frontend, predecessors, completion, cache);
-    // FENCE_GET is fulfilled by the driver after all user commands, not by
-    // requiring the pushbuffer to contain its own syncpoint increments.
-    // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp#L338-L350
+    let mut planner = MaxwellSubmissionPlanner::new(
+        address_space,
+        dispatch.scheduled().frontend(),
+        Vec::new(),
+        dispatch.scheduled().completion(),
+        cache,
+    );
     if submission.decoded().mode().fence_get() {
         planner.set_driver_completion_increments(2);
     }
-    lower_packets(&decoded, channel, planner)
+    lower_packets_streamed(&decoded, channel, planner, consume)
 }
 
 /// Applies and lowers an already decoded pushbuffer through the current
@@ -116,8 +119,24 @@ pub fn lower_maxwell_pushbuffer(
 fn lower_packets(
     decoded: &MaxwellDecodedPushbuffer,
     channel: &mut MaxwellGpuChannel,
-    mut planner: MaxwellSubmissionPlanner<'_>,
+    planner: MaxwellSubmissionPlanner<'_>,
 ) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
+    let mut prefix = Vec::new();
+    let tail = lower_packets_streamed(decoded, channel, planner, &mut |steps| {
+        prefix.extend(steps);
+        Ok(())
+    })?;
+    Ok(tail.prepend_steps(prefix))
+}
+
+fn lower_packets_streamed(
+    decoded: &MaxwellDecodedPushbuffer,
+    channel: &mut MaxwellGpuChannel,
+    mut planner: MaxwellSubmissionPlanner<'_>,
+    consume: &mut impl FnMut(Vec<MaxwellSubmissionExecutionStep>) -> Result<(), Box<str>>,
+) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
+    #[cfg(feature = "performance-counters")]
+    let started = std::time::Instant::now();
     let frontend = planner.frontend();
     let (mut mme_methods, mut mme_parameters) = planner.take_mme_scratch();
     for packet in decoded.packets() {
@@ -128,21 +147,36 @@ fn lower_packets(
             None,
             &mut mme_methods,
             &mut mme_parameters,
-            &mut |event| planner.push_event(event),
+            &mut |event| {
+                planner
+                    .push_event(event)
+                    .map_err(|error| MaxwellFrontendDispatchError::Execution(Box::new(error)))?;
+                if let Some(steps) = planner.take_ready_steps() {
+                    consume(steps).map_err(MaxwellFrontendDispatchError::Delivery)?;
+                }
+                Ok(())
+            },
         )
         .map_err(|error| match error {
             MaxwellEngineStreamError::Dispatch(error) => {
                 MaxwellFrontendDispatchError::EngineDispatch(error)
             }
-            MaxwellEngineStreamError::Consumer(error) => {
-                MaxwellFrontendDispatchError::Execution(Box::new(error))
-            }
+            MaxwellEngineStreamError::Consumer(error) => error,
         })?;
     }
     planner.recycle_mme_scratch(mme_methods, mme_parameters);
-    planner
+    let plan = planner
         .finish()
-        .map_err(|error| MaxwellFrontendDispatchError::Execution(Box::new(error)))
+        .map_err(|error| MaxwellFrontendDispatchError::Execution(Box::new(error)))?;
+    #[cfg(feature = "performance-counters")]
+    {
+        nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::FrontendSubmissions, 1);
+        nixe_gpu::metrics::record(
+            nixe_gpu::metrics::Counter::FrontendLoweringNanoseconds,
+            started.elapsed().as_nanos() as u64,
+        );
+    }
+    Ok(plan)
 }
 
 /// Reconstructs a bounded raw command prefix from sources already retained by

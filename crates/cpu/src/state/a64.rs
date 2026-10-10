@@ -79,101 +79,43 @@ impl Nzcv {
 
 /// Canonical A64 register state for one guest thread.
 ///
-/// Engines exchange this value through the canonical field-level contract. A
-/// native engine must not treat its Rust layout as a generated-code ABI or a
-/// save-state format.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Its checked C layout is the synchronous native interchange payload defined
+/// in cpu-jit/native/state.h. It is not a generated-code or save-state format.
+/// Native engines borrow this save area only for complete context transfers.
+/// A resident engine can retain architectural authority in its own storage;
+/// it cannot retain a pointer to this movable Rust value.
+#[repr(C)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct A64State {
     x: [u64; GENERAL_REGISTER_COUNT],
     sp: u64,
     pc: u64,
-    nzcv: Nzcv,
-    vector: [u128; VECTOR_REGISTER_COUNT],
-    fpcr: u32,
-    fpsr: u32,
+    vector: [[u64; 2]; VECTOR_REGISTER_COUNT],
     tpidr_el0: u64,
     tpidrro_el0: u64,
+    nzcv: Nzcv,
+    fpcr: u32,
+    fpsr: u32,
 }
 
-impl Default for A64State {
-    fn default() -> Self {
-        Self {
-            x: [0; GENERAL_REGISTER_COUNT],
-            sp: 0,
-            pc: 0,
-            nzcv: Nzcv::default(),
-            vector: [0; VECTOR_REGISTER_COUNT],
-            fpcr: 0,
-            fpsr: 0,
-            tpidr_el0: 0,
-            tpidrro_el0: 0,
-        }
-    }
-}
+// Check the actual canonical storage, rather than a temporary FFI copy.
+// Vectors use fixed-width lanes: [bits 63:0, bits 127:64], independent of u128
+// alignment. Keep these assertions in agreement with cpu-jit/native/state.h.
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<A64State>() == 808 && align_of::<A64State>() == 8);
+    assert!(offset_of!(A64State, x) == 0);
+    assert!(offset_of!(A64State, sp) == 248);
+    assert!(offset_of!(A64State, pc) == 256);
+    assert!(offset_of!(A64State, vector) == 264);
+    assert!(offset_of!(A64State, tpidr_el0) == 776);
+    assert!(offset_of!(A64State, tpidrro_el0) == 784);
+    assert!(offset_of!(A64State, nzcv) == 792);
+    assert!(offset_of!(A64State, fpcr) == 796);
+    assert!(offset_of!(A64State, fpsr) == 800);
+};
 
 impl A64State {
-    /// Returns the canonical general-register storage for an execution engine.
-    ///
-    /// The returned slice is the architectural state itself, not a native
-    /// frame copy. An engine may retain raw pointers derived from it only while
-    /// it holds exclusive access to this state.
-    #[must_use]
-    pub fn general_register_storage_mut(&mut self) -> &mut [u64; GENERAL_REGISTER_COUNT] {
-        &mut self.x
-    }
-
-    /// Returns the canonical stack-pointer storage for an execution engine.
-    #[must_use]
-    pub fn stack_pointer_storage_mut(&mut self) -> &mut u64 {
-        &mut self.sp
-    }
-
-    /// Returns the canonical program-counter storage for an execution engine.
-    #[must_use]
-    pub fn program_counter_storage_mut(&mut self) -> &mut u64 {
-        &mut self.pc
-    }
-
-    /// Returns the canonical packed-flag storage for an execution engine.
-    #[must_use]
-    pub fn nzcv_storage_mut(&mut self) -> &mut Nzcv {
-        &mut self.nzcv
-    }
-
-    /// Returns the canonical SIMD/floating-point register storage for an execution engine.
-    ///
-    /// Each entry is the complete 128-bit architectural V register. An engine
-    /// may retain raw pointers derived from this storage only while it holds
-    /// exclusive access to this state.
-    #[must_use]
-    pub fn vector_register_storage_mut(&mut self) -> &mut [u128; VECTOR_REGISTER_COUNT] {
-        &mut self.vector
-    }
-
-    /// Returns the canonical floating-point control storage for an execution engine.
-    #[must_use]
-    pub fn fpcr_storage_mut(&mut self) -> &mut u32 {
-        &mut self.fpcr
-    }
-
-    /// Returns the canonical floating-point status storage for an execution engine.
-    #[must_use]
-    pub fn fpsr_storage_mut(&mut self) -> &mut u32 {
-        &mut self.fpsr
-    }
-
-    /// Returns the writable user thread-pointer storage for an execution engine.
-    #[must_use]
-    pub fn tpidr_el0_storage_mut(&mut self) -> &mut u64 {
-        &mut self.tpidr_el0
-    }
-
-    /// Returns the runtime-owned read-only thread-pointer storage for an execution engine.
-    #[must_use]
-    pub fn tpidrro_el0_storage_mut(&mut self) -> &mut u64 {
-        &mut self.tpidrro_el0
-    }
-
     /// Copies the general-purpose register and flag subset used by bounded
     /// runtime diagnostics. SIMD and thread-pointer state are intentionally
     /// excluded from the compact context.
@@ -240,14 +182,16 @@ impl A64State {
 
     #[must_use]
     pub fn vector(&self, index: u8) -> Option<u128> {
-        self.vector.get(usize::from(index)).copied()
+        self.vector
+            .get(usize::from(index))
+            .map(|lanes| u128::from(lanes[0]) | (u128::from(lanes[1]) << 64))
     }
 
     pub fn set_vector(&mut self, index: u8, value: u128) -> bool {
         let Some(register) = self.vector.get_mut(usize::from(index)) else {
             return false;
         };
-        *register = value;
+        *register = [value as u64, (value >> 64) as u64];
         true
     }
 

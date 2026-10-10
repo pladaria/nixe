@@ -8,3 +8,6 @@ license.workspace = true
 sdl3.workspace = true
 sdl3-sys.workspace = true
 serde.workspace = true
+
+[features]
+performance-counters = []

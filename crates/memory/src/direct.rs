@@ -170,8 +170,8 @@ pub struct DirectProtectRequest {
 }
 
 struct DirectMappedPage {
-    fd: i32,
-    backing_offset: u64,
+    // OS aliases are consumers too: release only after replacing their mapping.
+    backing: HostMappedBacking,
     protection: DirectProtection,
 }
 
@@ -375,8 +375,7 @@ impl DirectArena {
                 state.pages.insert(
                     request.guest_address,
                     DirectMappedPage {
-                        fd: request.backing.fd(),
-                        backing_offset: request.backing.offset(),
+                        backing: request.backing.clone(),
                         protection: request.protection,
                     },
                 );
@@ -422,8 +421,8 @@ impl DirectArena {
             for request in requests {
                 match state.pages.get(&request.guest_address) {
                     Some(current)
-                        if current.fd == request.backing.fd()
-                            && current.backing_offset == request.backing.offset() =>
+                        if current.backing.fd() == request.backing.fd()
+                            && current.backing.offset() == request.backing.offset() =>
                     {
                         if current.protection != request.protection {
                             protected.push(DirectProtectRequest {
@@ -481,8 +480,8 @@ impl DirectArena {
             for request in requests {
                 match state.pages.get(&request.guest_address) {
                     Some(current)
-                        if current.fd == request.backing.fd()
-                            && current.backing_offset == request.backing.offset() =>
+                        if current.backing.fd() == request.backing.fd()
+                            && current.backing.offset() == request.backing.offset() =>
                     {
                         if current.protection != request.protection {
                             protected.push(DirectProtectRequest {
@@ -514,7 +513,7 @@ impl DirectArena {
             .lock_state()
             .pages
             .get(&guest_address)
-            .map(|page| (page.fd, page.backing_offset, page.protection));
+            .map(|page| (page.backing.fd(), page.backing.offset(), page.protection));
         match (current, desired) {
             (None, None) => Ok(()),
             (Some(_), None) => self.replace_with_none(&[DirectProtectRequest {
@@ -662,6 +661,8 @@ impl DirectArena {
         protection: DirectProtection,
     ) -> Result<(), DirectMemoryError> {
         let destination = self.host_pointer(guest_address)?;
+        crate::metrics::record(crate::metrics::Counter::DirectProtectionCalls, 1);
+        crate::metrics::record(crate::metrics::Counter::DirectProtectionBytes, size as u64);
         if unsafe { libc::mprotect(destination.cast(), size, protection.native()) } != 0 {
             return self.host_failure("direct range mprotect failed");
         }

@@ -9,6 +9,7 @@ sdl3.workspace = true
 nixe-audio.workspace = true
 ctrlc.workspace = true
 log.workspace = true
+mimalloc.workspace = true
 sha2.workspace = true
 nixe-config.workspace = true
 nixe-cpu.workspace = true
@@ -29,4 +30,4 @@ nixe-video.workspace = true
 nixe-video-winit.workspace = true
 
 [features]
-performance-counters = ["nixe-gpu/performance-counters"]
+performance-counters = ["nixe-gpu/performance-counters", "nixe-horizon/performance-counters", "nixe-cpu-jit/performance-counters", "nixe-audio/performance-counters", "nixe-video-winit/performance-counters"]

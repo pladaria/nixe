@@ -11,3 +11,7 @@ libc = "0.2"
 
 [features]
 performance-counters = []
+
+[[example]]
+name = "transition_batch"
+required-features = ["performance-counters"]

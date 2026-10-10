@@ -429,6 +429,19 @@ macro_rules! methods {
                 action: $action,
             }),+
         ];
+        static METHODS_BY_DWORD: [Option<MethodDeclaration>; 4096] = {
+            let mut table = [None; 4096];
+            let mut index = 0;
+            while index < METHODS.len() {
+                let declaration = METHODS[index];
+                let method = declaration.metadata.method().0 as usize;
+                assert!(method % 4 == 0 && method / 4 < table.len());
+                assert!(table[method / 4].is_none());
+                table[method / 4] = Some(declaration);
+                index += 1;
+            }
+            table
+        };
     };
 }
 
@@ -1441,9 +1454,10 @@ fn preflight_register(
             writes_state,
         ));
     }
-    let Some(declaration) = METHODS
-        .iter()
-        .find(|declaration| declaration.metadata.method() == source.method())
+    let Some(declaration) = (source.method().0 & 3 == 0)
+        .then(|| METHODS_BY_DWORD.get((source.method().0 / 4) as usize))
+        .flatten()
+        .and_then(Option::as_ref)
     else {
         return Err(MaxwellEngineDispatchError::UnknownMethod {
             source,

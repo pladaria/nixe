@@ -1,5 +1,8 @@
 //! Platform-neutral PCM ownership and consumption, with a host playback backend.
 
+#[cfg(feature = "performance-counters")]
+pub mod metrics;
+
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -123,6 +126,8 @@ impl AudioFeed {
                 released = true;
             }
         }
+        #[cfg(feature = "performance-counters")]
+        metrics::rendered(capacity, written);
         state.played_frames = state
             .played_frames
             .saturating_add((written / self.format.layout.channels()) as u64);

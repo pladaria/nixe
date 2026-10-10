@@ -1,6 +1,6 @@
 //! Reverse index of immutable resource bindings by canonical page.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use nixe_gpu::{BackendResourceCreateInfo, BackendResourceHandle};
 use nixe_memory::{CanonicalBackingRange, CanonicalPageId};

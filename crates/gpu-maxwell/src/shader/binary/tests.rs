@@ -1,6 +1,6 @@
 use super::super::error::MaxwellShaderTranslationError;
 use super::super::test_support::{
-    mapped_memory, preflight_maxwell_shader_translation, program_three_d,
+    canonical_shader_writes, mapped_memory, preflight_maxwell_shader_translation, program_three_d,
 };
 use super::*;
 use crate::{
@@ -15,12 +15,8 @@ fn shader_memory_view_overlays_ordered_submission_writes_without_publication() {
     allocation
         .write(0, &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80])
         .unwrap();
-    let writes = [
-        MaxwellStagedShaderWrite::new(address + 2, 0xaabb_ccdd),
-        MaxwellStagedShaderWrite::new(address + 4, 0x1122_3344),
-    ];
-    let writes =
-        canonical_shader_writes(&address_space, &writes, MaxwellShaderStage::Vertex).unwrap();
+    let writes = [(address + 2, 0xaabb_ccdd), (address + 4, 0x1122_3344)];
+    let writes = canonical_shader_writes(&address_space, &writes);
     let bytes = MaxwellShaderMemoryView::new(&address_space, &writes)
         .read(MaxwellShaderStage::Vertex, address, 8)
         .unwrap()
@@ -170,11 +166,11 @@ fn staged_header_and_code_reach_the_precise_first_instruction_boundary() {
     let instruction = 0xf123_0000_0007_0000_u64;
     let exit = 0xe300_0000_0007_000f_u64;
     let writes = [
-        MaxwellStagedShaderWrite::new(address, 0x0002_0461),
-        MaxwellStagedShaderWrite::new(address + 88, instruction as u32),
-        MaxwellStagedShaderWrite::new(address + 92, (instruction >> 32) as u32),
-        MaxwellStagedShaderWrite::new(address + 104, exit as u32),
-        MaxwellStagedShaderWrite::new(address + 108, (exit >> 32) as u32),
+        (address, 0x0002_0461),
+        (address + 88, instruction as u32),
+        (address + 92, (instruction >> 32) as u32),
+        (address + 104, exit as u32),
+        (address + 108, (exit >> 32) as u32),
     ];
     assert_eq!(
         preflight_maxwell_shader_translation(channel.three_d(), &address_space, &writes),
@@ -185,4 +181,48 @@ fn staged_header_and_code_reach_the_precise_first_instruction_boundary() {
             encoding: instruction,
         })
     );
+}
+
+#[test]
+fn shader_confirmation_distinguishes_neighboring_writes_from_changed_code() {
+    let (allocation, space, address) = mapped_memory();
+    let mut bytes = vec![0; MAXWELL_SHADER_PROGRAM_HEADER_SIZE];
+    bytes[..4].copy_from_slice(&0x0002_0461_u32.to_le_bytes());
+    for word in [0_u64, 0xe300_0000_0000_0000, 0, 0] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    allocation.write(0, &bytes).unwrap();
+    let writes = CanonicalWriteBatch::new();
+    let memory = MaxwellShaderMemoryView::new(&space, &writes);
+    let binary = read_shader_binary(&memory, MaxwellShaderStage::Vertex, address).unwrap();
+    allocation.write(0x800, &[0x42]).unwrap();
+    assert!(
+        binary
+            .source_cpu_writes
+            .iter()
+            .any(|dependency| !dependency.remains_current())
+    );
+    assert!(
+        confirm_shader_read(
+            &memory,
+            binary.stage(),
+            address,
+            binary.metadata,
+            &binary.bundles
+        )
+        .is_ok()
+    );
+    allocation
+        .write(MAXWELL_SHADER_PROGRAM_HEADER_SIZE + 16, &[0x43])
+        .unwrap();
+    assert!(matches!(
+        confirm_shader_read(
+            &memory,
+            binary.stage(),
+            address,
+            binary.metadata,
+            &binary.bundles
+        ),
+        Err(MaxwellShaderTranslationError::SourceChangedDuringRead { .. })
+    ));
 }

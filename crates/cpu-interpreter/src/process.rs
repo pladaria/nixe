@@ -317,7 +317,7 @@ fn instruction_fault(
         kind,
         progress,
         message: message.to_string().into(),
-        context: Box::new(state.register_context()),
+        context: Some(Box::new(state.register_context())),
     }
 }
 
@@ -327,6 +327,6 @@ fn backend_fault(message: impl ToString) -> CpuFault {
         kind: CpuFaultKind::Internal,
         progress: 0,
         message: message.to_string().into(),
-        context: Box::new(A64State::default().register_context()),
+        context: None,
     }
 }

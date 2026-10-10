@@ -241,8 +241,58 @@ pub(super) enum MaxwellThreeDMmeRunError<E> {
     Host(E),
 }
 
+// Guest instruction addresses remain sparse 32-bit values. Page storage
+// bounds allocation by captured words rather than by the highest address and
+// lets the interpreter reuse a direct window across sequential instructions
+// and branches within the page. The distinct-word coverage limit is unchanged.
+const MME_INSTRUCTION_PAGE_WORDS: usize = 64;
+type MmeInstructionPage = Box<[Option<MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>]>;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MmeInstructionRam {
+    pages: BTreeMap<u32, MmeInstructionPage>,
+    count: usize,
+}
+
+impl MmeInstructionRam {
+    fn page(
+        &self,
+        address: u32,
+    ) -> Option<&[Option<MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>]> {
+        self.pages
+            .get(&(address / MME_INSTRUCTION_PAGE_WORDS as u32))
+            .map(AsRef::as_ref)
+    }
+
+    fn get(&self, address: &u32) -> Option<&MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>> {
+        self.page(*address)?[*address as usize % MME_INSTRUCTION_PAGE_WORDS].as_ref()
+    }
+
+    fn insert(
+        &mut self,
+        address: u32,
+        register: MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>,
+    ) {
+        let page = self
+            .pages
+            .entry(address / MME_INSTRUCTION_PAGE_WORDS as u32)
+            .or_insert_with(|| vec![None; MME_INSTRUCTION_PAGE_WORDS].into_boxed_slice());
+        let slot = &mut page[address as usize % MME_INSTRUCTION_PAGE_WORDS];
+        if slot.is_none() {
+            self.count += 1;
+        }
+        *slot = Some(register);
+    }
+
+    const fn len(&self) -> usize {
+        self.count
+    }
+}
+
 struct MaxwellThreeDMmeInterpreter<'a, H> {
     program: &'a MaxwellThreeDMmeProgram,
+    instruction_page: Option<&'a [Option<MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>]>,
+    instruction_page_index: u32,
     host: &'a mut H,
     parameters: &'a [u32],
     registers: [u32; MME_REGISTER_COUNT],
@@ -258,7 +308,7 @@ struct MaxwellThreeDMmeInterpreter<'a, H> {
 
 #[derive(Clone)]
 pub(super) struct MaxwellThreeDMmeProgram {
-    instructions: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>>,
+    instructions: Arc<MmeInstructionRam>,
     start_addresses: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>>,
 }
 
@@ -291,6 +341,8 @@ impl MaxwellThreeDMmeProgram {
         }
         let mut interpreter = MaxwellThreeDMmeInterpreter {
             program: self,
+            instruction_page: None,
+            instruction_page_index: 0,
             host,
             parameters,
             registers: [0; MME_REGISTER_COUNT],
@@ -331,10 +383,15 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
             ));
         }
         let address = MaxwellThreeDMmeRamAddress::new(self.pc);
+        let page_index = self.pc / MME_INSTRUCTION_PAGE_WORDS as u32;
+        if self.instruction_page.is_none() || self.instruction_page_index != page_index {
+            let program = self.program;
+            self.instruction_page = program.instructions.page(self.pc);
+            self.instruction_page_index = page_index;
+        }
         let raw = self
-            .program
-            .instructions
-            .get(&address.raw())
+            .instruction_page
+            .and_then(|page| page[self.pc as usize % MME_INSTRUCTION_PAGE_WORDS].as_ref())
             .and_then(MaxwellThreeDRegister::value)
             .map(|instruction| instruction.raw())
             .ok_or_else(|| {
@@ -580,7 +637,7 @@ const fn bitfield_mask(raw: u32) -> u32 {
 pub struct MaxwellThreeDMmeState {
     instruction_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_instruction_address: Option<MaxwellThreeDMmeRamAddress>,
-    instructions: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>>,
+    instructions: Arc<MmeInstructionRam>,
     start_address_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_start_address_index: Option<MaxwellThreeDMmeRamAddress>,
     start_addresses: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>>,
@@ -605,7 +662,7 @@ impl Default for MaxwellThreeDMmeState {
         Self {
             instruction_pointer: MaxwellThreeDRegister::default(),
             next_instruction_address: None,
-            instructions: Arc::new(BTreeMap::new()),
+            instructions: Arc::new(MmeInstructionRam::default()),
             start_address_pointer: MaxwellThreeDRegister::default(),
             next_start_address_index: None,
             start_addresses: Arc::new(BTreeMap::new()),

@@ -136,10 +136,10 @@ impl NativeCache {
     pub(super) fn new(capabilities: Option<crate::VulkanNativeCapabilities>) -> Self {
         Self {
             capabilities,
-            pipelines: HashMap::new(),
-            frames: HashMap::new(),
+            pipelines: HashMap::default(),
+            frames: HashMap::default(),
             current: None,
-            bindings: HashMap::new(),
+            bindings: HashMap::default(),
             binding_count: 0,
             binding_key: Vec::new(),
             driver_cache: None,

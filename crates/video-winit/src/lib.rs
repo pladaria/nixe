@@ -1,5 +1,8 @@
 //! `winit` window and shared-device `wgpu` presenter for Nixe frames.
 
+#[cfg(feature = "performance-counters")]
+pub mod metrics;
+
 mod screenshot;
 
 use std::collections::BTreeMap;
@@ -590,6 +593,10 @@ impl Presenter {
             let _queue_access = self.queue_access.lock();
             submission = self.queue.submit([encoder.finish()]);
             self.queue.present(surface_texture);
+        }
+        #[cfg(feature = "performance-counters")]
+        if self.pending_frame.is_some() {
+            metrics::presented();
         }
         self.pending_frame = None;
         if let Some(capture) = capture {

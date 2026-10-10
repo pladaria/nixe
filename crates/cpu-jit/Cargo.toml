@@ -5,17 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-cranelift-codegen = { git = "https://github.com/pladaria/wasmtime", branch = "nixe", default-features = false, features = ["host-arch", "std"] }
-cranelift-frontend = { git = "https://github.com/pladaria/wasmtime", branch = "nixe" }
-cranelift-native = { git = "https://github.com/pladaria/wasmtime", branch = "nixe" }
-libc = "0.2"
-log.workspace = true
-hashbrown = { version = "0.16", default-features = false }
-wasmtime-internal-jit-icache-coherence = { git = "https://github.com/pladaria/wasmtime", branch = "nixe" }
 nixe-cpu.workspace = true
-nixe-cpu-direct-memory.workspace = true
 nixe-memory.workspace = true
-
-[dev-dependencies]
-cranelift-codegen = { git = "https://github.com/pladaria/wasmtime", branch = "nixe", default-features = false, features = ["x86", "arm64"] }
+nixe-cpu-direct-memory.workspace = true
 nixe-cpu-interpreter.workspace = true
+
+[features]
+performance-counters = ["nixe-memory/performance-counters"]
+
+[build-dependencies]
+cmake = "0.1"
+
+[[example]]
+name = "memory_access"
+required-features = ["performance-counters"]

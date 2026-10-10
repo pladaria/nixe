@@ -6,16 +6,17 @@ use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::GuestCpuState;
 use nixe_cpu::execution::{
     ArchitecturalTimer, ControlRequest, CpuControl, CpuFault, CpuFaultKind, CpuProcessId,
-    CpuThreadId, MemoryBinding, RunRequest, TimerSnapshot, VcpuEventState,
+    CpuThreadId, MemoryBinding, TimerSnapshot, VcpuEventState,
 };
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::ExecutionMemory;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
 use nixe_cpu_interpreter::{InterpreterProcess, InterpreterRunRequest, InterpreterThread};
-use nixe_cpu_jit::{JitProcess, JitThread};
+use nixe_cpu_jit::{JitProcess, JitRunRequest, JitThread};
 use nixe_memory::{GuestVirtualAddress, MemoryInvalidationSource};
 
 use crate::{ExceptionTerminationScope, GuestBreakPayload, VirtualClock};
@@ -53,6 +54,7 @@ impl CpuBackend {
         cpu: ProcessCpuContext,
         memory: Arc<ExecutionMemory>,
         end_exclusive: GuestVirtualAddress,
+        timer_frequency: u64,
     ) -> Result<Self, CpuFault> {
         match selection {
             CpuBackendConfig::Interpreter => {
@@ -66,7 +68,7 @@ impl CpuBackend {
                 })?;
                 Ok(Self::Interpreter(process))
             }
-            CpuBackendConfig::Jit => JitProcess::new(cpu, memory)
+            CpuBackendConfig::Jit => JitProcess::new(cpu, memory, timer_frequency)
                 .map(Arc::new)
                 .map(Self::Jit)
                 .map_err(|error| runtime_fault(cpu, CpuFaultKind::Unavailable, error.to_string())),
@@ -79,7 +81,7 @@ impl CpuBackend {
             Self::Jit(process) => JitThread::new(Arc::clone(process))
                 .map(Box::new)
                 .map(CpuThread::Jit)
-                .map_err(|error| jit_boundary_fault(error, &ThreadCpuState::default())),
+                .map_err(|error| jit_boundary_fault(error, None)),
         }
     }
 
@@ -88,7 +90,7 @@ impl CpuBackend {
             Self::Interpreter(process) => process.request_stop(),
             Self::Jit(process) => process
                 .request_stop()
-                .map_err(|error| jit_boundary_fault(error, &ThreadCpuState::default())),
+                .map_err(|error| jit_boundary_fault(error, None)),
         }
     }
 
@@ -99,9 +101,9 @@ impl CpuBackend {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(jit_boundary_fault(
                     "JIT shutdown still has outstanding execution or compilation owners",
-                    &ThreadCpuState::default(),
+                    None,
                 )),
-                Err(error) => Err(jit_boundary_fault(error, &ThreadCpuState::default())),
+                Err(error) => Err(jit_boundary_fault(error, None)),
             },
         }
     }
@@ -116,66 +118,21 @@ impl CpuBackend {
 
 pub(crate) enum CpuThread {
     Interpreter(InterpreterThread),
-    // Keep the Cranelift compiler out of every scheduler command's inline size.
+    // Keep the native engine out of every scheduler command's inline size.
     Jit(Box<JitThread>),
 }
 
 impl CpuThread {
-    pub(crate) fn run_slice(
-        &mut self,
-        worker: &mut nixe_cpu_direct_memory::NativeWorker,
-        request: RunRequest<'_>,
-        returns: Option<&mut nixe_cpu_jit::ReturnStack>,
-    ) -> Result<ExecutionReport, CpuFault> {
-        match self {
-            Self::Interpreter(thread) => {
-                let RunRequest {
-                    memory,
-                    memory_lease,
-                    state,
-                    instruction_budget,
-                    timer,
-                    events,
-                    ..
-                } = request;
-                thread.run_slice(
-                    worker,
-                    InterpreterRunRequest {
-                        memory,
-                        memory_lease,
-                        state,
-                        instruction_budget,
-                        timer,
-                        events,
-                    },
-                )
-            }
-            Self::Jit(thread) => {
-                // The JIT takes its own short-lived leases around capture and
-                // native entry. Never carry a caller lease into its cold loop.
-                drop(request.memory_lease);
-                thread.run_slice(
-                    returns.expect("a scheduled JIT guest owns its return stack"),
-                    worker,
-                    request.state,
-                    request.instruction_budget,
-                    request.timer,
-                    &request.events,
-                )
-            }
-        }
-    }
-
     pub(crate) fn synchronize_address_space(
         &mut self,
         binding: MemoryBinding<'_>,
-        state: &ThreadCpuState,
+        state: &GuestCpuState,
     ) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(thread) => thread.synchronize_address_space(binding),
             Self::Jit(thread) => thread
                 .synchronize_address_space(binding)
-                .map_err(|error| jit_boundary_fault(error, state)),
+                .map_err(|error| jit_boundary_fault(error, Some(state))),
         }
     }
 
@@ -190,14 +147,20 @@ impl CpuThread {
     pub(crate) fn prepare_shutdown(
         &mut self,
         binding: MemoryBinding<'_>,
-        state: &ThreadCpuState,
+        state: Option<&ThreadCpuState>,
     ) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(thread) => thread.prepare_shutdown(binding),
             Self::Jit(thread) => {
                 thread
                     .synchronize_address_space(binding)
-                    .map_err(|error| jit_boundary_fault(error, state))?;
+                    .map_err(|error| CpuFault {
+                        backend: "dynarmic",
+                        kind: CpuFaultKind::Internal,
+                        progress: 0,
+                        message: error.to_string().into(),
+                        context: state.map(|state| Box::new(state.register_context())),
+                    })?;
                 thread.clear_local_exclusive_reservation();
                 Ok(())
             }
@@ -327,6 +290,7 @@ pub(crate) struct ProcessExecutionControl {
     backend: CpuBackend,
     process_id: CpuProcessId,
     controls: BTreeMap<nixe_scheduler::VirtualCpuId, CpuControl>,
+    pub(super) residents: BTreeMap<nixe_scheduler::VirtualCpuId, nixe_scheduler::GuestThreadId>,
     cpu: ProcessCpuContext,
     virtual_clock: VirtualClock,
     architectural_timer_frequency: u64,
@@ -372,12 +336,12 @@ pub(crate) struct CpuThreadTeardownState {
     memory: Arc<ExecutionMemory>,
     cpu: ProcessCpuContext,
     address_space_end: GuestVirtualAddress,
-    state: ThreadCpuState,
+    state: Option<Box<ThreadCpuState>>,
 }
 
 impl CpuThreadTeardownState {
     pub(crate) fn prepare(&self, thread: &mut CpuThread) -> Result<(), CpuFault> {
-        thread.prepare_shutdown(self.binding(), &self.state)
+        thread.prepare_shutdown(self.binding(), self.state.as_deref())
     }
 
     fn binding(&self) -> MemoryBinding<'_> {
@@ -411,7 +375,13 @@ impl ProcessExecutionControl {
             cpu,
             address_space_end,
         } = configuration;
-        let backend = CpuBackend::new(selection, cpu, Arc::clone(&memory), address_space_end)?;
+        let backend = CpuBackend::new(
+            selection,
+            cpu,
+            Arc::clone(&memory),
+            address_space_end,
+            timer_frequency,
+        )?;
         let transition_safepoints = Arc::new(TransitionSafepoints::default());
         let weak_safepoints = Arc::downgrade(&transition_safepoints);
         memory.set_transition_notifier(Some(Arc::new(move || {
@@ -423,6 +393,7 @@ impl ProcessExecutionControl {
             backend,
             process_id,
             controls: BTreeMap::new(),
+            residents: BTreeMap::new(),
             cpu,
             virtual_clock,
             architectural_timer_frequency: timer_frequency,
@@ -438,9 +409,6 @@ impl ProcessExecutionControl {
         self.backend.name()
     }
 
-    pub(crate) fn new_return_stack(&self) -> Option<Box<nixe_cpu_jit::ReturnStack>> {
-        matches!(self.backend, CpuBackend::Jit(_)).then(Box::default)
-    }
     pub(crate) const fn process_id(&self) -> CpuProcessId {
         self.process_id
     }
@@ -538,7 +506,7 @@ impl ProcessExecutionControl {
     pub(crate) fn cpu_thread_teardown_state(
         &self,
         memory: Arc<ExecutionMemory>,
-        state: ThreadCpuState,
+        state: Option<Box<ThreadCpuState>>,
     ) -> CpuThreadTeardownState {
         CpuThreadTeardownState {
             memory,
@@ -597,13 +565,13 @@ impl crate::exception_dispatch::MemoryMutationControl for ProcessExecutionContro
     }
 }
 
-fn jit_boundary_fault(message: impl ToString, state: &ThreadCpuState) -> CpuFault {
+fn jit_boundary_fault(message: impl ToString, state: Option<&GuestCpuState>) -> CpuFault {
     CpuFault {
         backend: "jit",
         kind: CpuFaultKind::Internal,
         progress: 0,
         message: message.to_string().into_boxed_str(),
-        context: Box::new(state.register_context()),
+        context: state.map(|state| Box::new(state.register_context())),
     }
 }
 
@@ -617,7 +585,7 @@ fn runtime_fault(
         kind,
         progress: 0,
         message: message.into(),
-        context: Box::new(ThreadCpuState::default().register_context()),
+        context: None,
     }
 }
 
@@ -627,14 +595,14 @@ struct RuntimeTimer<'a> {
 }
 
 pub(crate) struct VcpuExecutionState {
-    pub(crate) thread: ThreadCpuState,
-    pub(crate) jit_returns: Option<Box<nixe_cpu_jit::ReturnStack>>,
+    pub(crate) thread: GuestCpuState,
     pub(crate) cpu: ProcessCpuContext,
     pub(crate) memory: Arc<ExecutionMemory>,
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) architectural_timer_frequency: u64,
     pub(crate) address_space_end: GuestVirtualAddress,
     pub(crate) instruction_budget: u64,
+    pub(crate) capture_context: bool,
     pub(crate) events: VcpuEventState,
 }
 
@@ -672,21 +640,33 @@ impl VcpuExecutionState {
         };
         let control = thread.control();
         let _execution = control.enter_execution();
-        thread
-            .run_slice(
+        let result = match thread {
+            CpuThread::Interpreter(interpreter) => interpreter.run_slice(
                 worker,
-                RunRequest {
-                    cpu: self.cpu,
+                InterpreterRunRequest {
                     memory: self.memory.as_ref(),
                     memory_lease,
-                    state: &mut self.thread,
+                    state: self.thread.saved_mut(),
                     instruction_budget: self.instruction_budget,
                     timer: &timer,
                     events: self.events.clone(),
                 },
-                self.jit_returns.as_deref_mut(),
-            )
-            .map_err(|fault| ProcessExecutionError::Cpu { fault })
+            ),
+            CpuThread::Jit(jit) => {
+                drop(memory_lease);
+                jit.run_slice(
+                    worker,
+                    JitRunRequest {
+                        state: &mut self.thread,
+                        instruction_budget: self.instruction_budget,
+                        timer: &timer,
+                        events: &self.events,
+                        capture_context: self.capture_context,
+                    },
+                )
+            }
+        };
+        result.map_err(|fault| ProcessExecutionError::Cpu { fault })
     }
 }
 
@@ -707,9 +687,9 @@ impl ArchitecturalTimer for RuntimeTimer<'_> {
 
 pub(crate) fn current_location(
     cpu: ProcessCpuContext,
-    state: &ThreadCpuState,
+    state: &GuestCpuState,
 ) -> LocationDescriptor {
-    nixe_cpu::location::current_location(cpu, state)
+    LocationDescriptor::new(GuestVirtualAddress::new(state.pc()), cpu.profile_id())
 }
 
 #[cfg(test)]

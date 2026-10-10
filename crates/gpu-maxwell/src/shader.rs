@@ -23,7 +23,6 @@ mod tessellation;
 mod texture;
 mod translate;
 
-pub(crate) use binary::MaxwellStagedShaderWrite;
 pub use binary::{MAXWELL_SHADER_PROGRAM_HEADER_SIZE, MAXWELL_SHADER_READ_LIMIT};
 pub(crate) use compute::{MaxwellComputeProgram, translate_compute_program};
 pub use error::MaxwellShaderTranslationError;

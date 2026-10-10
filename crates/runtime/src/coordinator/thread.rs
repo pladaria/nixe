@@ -105,10 +105,13 @@ impl RuntimeCoordinator {
             .processes
             .get(&process_id)
             .ok_or(ThreadOperationError::Internal)?;
-        process
-            .thread(id)
-            .map(|thread| thread.state().clone())
-            .ok_or(ThreadOperationError::Internal)
+        let thread = process.thread(id).ok_or(ThreadOperationError::Internal)?;
+        thread
+            .state
+            .as_ref()
+            .filter(|state| state.is_available())
+            .map(|state| state.snapshot())
+            .ok_or(ThreadOperationError::InvalidState)
     }
 
     pub fn set_thread_priority(

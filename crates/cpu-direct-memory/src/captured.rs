@@ -1,9 +1,9 @@
-//! Read-only Linux signal image. Never read the dispatcher's live registers.
+//! Captured Linux signal image. Never read the dispatcher's live registers.
 //! Linux UAPI layouts (also available in the installed asm/sigcontext.h):
 //! https://github.com/torvalds/linux/blob/master/arch/arm64/include/uapi/asm/sigcontext.h
 //! https://github.com/torvalds/linux/blob/master/arch/x86/include/uapi/asm/sigcontext.h
 
-use super::{FaultSlot, NativeFaultSite};
+use super::{FaultDisposition, FaultSlot, NativeFaultSite};
 use std::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
 
 /// Borrowed during dispatch or after escape, never across worker-slot reuse.
@@ -20,6 +20,39 @@ impl CapturedFault<'_> {
             .load(Ordering::Relaxed)
     }
 
+    /// Resume in an attributed JIT memory fallback using its native call ABI.
+    /// The dispatcher runs outside the signal handler. This is a handled access,
+    /// not another attempt at the faulting instruction. Return this disposition
+    /// from the dispatcher so the runtime clears retry tracking.
+    ///
+    /// # Safety
+    /// `entry` and `return_pc` must come from the owning live JIT's fault metadata.
+    /// On x86 the suspended generated-code stack must permit an eight-byte push.
+    #[must_use]
+    pub unsafe fn call_on_resume(&mut self, entry: usize, return_pc: usize) -> FaultDisposition {
+        let slot = unsafe { self.slot.as_ref() };
+        #[cfg(target_arch = "x86_64")]
+        {
+            let resume = unsafe { &mut *slot.resume.get() };
+            resume.rsp -= 8;
+            unsafe { (resume.rsp as *mut usize).write(return_pc) };
+            resume.pc = entry;
+            // The retry trampoline restores RFLAGS before loading resume.rsp.
+            // Its temporary push must be below the synthetic return address.
+            unsafe {
+                (*(*slot.context.get()).as_mut_ptr()).uc_mcontext.gregs[libc::REG_RSP as usize] =
+                    resume.rsp as libc::greg_t;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = return_pc;
+            let context = unsafe { &mut (*(*slot.context.get()).as_mut_ptr()).uc_mcontext };
+            context.pc = entry as u64;
+        }
+        FaultDisposition::Resume
+    }
+
     pub fn fault_address(&self) -> usize {
         unsafe { self.slot.as_ref() }
             .fault_address
@@ -27,7 +60,7 @@ impl CapturedFault<'_> {
     }
 
     /// Fixed-stub/legacy dispatch only. After escape the registry may have been
-    /// dropped; the execution owner must attribute native_pc under its epoch.
+    /// dropped; the execution owner must attribute native_pc against its live code cache.
     pub fn site(&self) -> &NativeFaultSite {
         self.site
             .expect("site is only available during attributed dispatch")

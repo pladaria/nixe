@@ -1,6 +1,8 @@
 //! Persistent `wgpu` resource ownership, command lowering, and coherence.
 
-use std::collections::HashMap;
+// These tables index host resource identities, not externally supplied strings.
+// Full key equality is still checked after the inexpensive bucket hash.
+use rustc_hash::FxHashMap as HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -315,8 +317,24 @@ struct ImageContentDomain {
     backing: nixe_memory::CanonicalBackingRange,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+enum InputSnapshotKey {
+    Buffer(BackendResourceHandle, nixe_gpu::BufferRange),
+    Image(BackendResourceHandle, usize),
+}
+
+struct InputSnapshot {
+    key: InputSnapshotKey,
+    dependency: CanonicalCpuWriteDependency,
+    range: nixe_memory::CanonicalBackingRange,
+    selection: CpuWriteSnapshotSelection,
+    alignment: u64,
+}
+
+type InputSnapshots = HashMap<InputSnapshotKey, nixe_memory::CanonicalByteSnapshots>;
+
 struct HostSubmission {
-    index: wgpu::SubmissionIndex,
+    index: Option<wgpu::SubmissionIndex>,
     completed: bool,
     #[cfg(not(target_os = "macos"))]
     native: Vec<native_draw::RetainedDraw>,
@@ -409,7 +427,7 @@ impl ResourceContent {
             initialized: vec![false; cpu_writes.len()],
             cpu_writes,
             image_domains,
-            buffer_domains: HashMap::new(),
+            buffer_domains: HashMap::default(),
             buffer_initialized: Vec::new(),
             device_writes: Vec::new(),
         }))
@@ -1239,6 +1257,8 @@ pub(crate) struct WgpuBackendDriver {
     partial_clear_pipelines: HashMap<PartialClearPipelineKey, RenderPipeline>,
     partial_clear_parameters: PartialClearParameters,
     submissions: HashMap<BackendSubmissionToken, HostSubmission>,
+    queued_commands: Vec<wgpu::CommandBuffer>,
+    queued_submissions: Vec<BackendSubmissionToken>,
     completion_sender: std::sync::mpsc::Sender<BackendSubmissionToken>,
     completion_receiver: std::sync::mpsc::Receiver<BackendSubmissionToken>,
     next_use: u64,
@@ -1313,14 +1333,16 @@ impl WgpuBackendDriver {
             queue_access,
             visibility,
             resources: Vec::new(),
-            retired_resources: HashMap::new(),
+            retired_resources: HashMap::default(),
             page_resources: PageResources::default(),
-            presentation_images: HashMap::new(),
-            presentation_imports: HashMap::new(),
+            presentation_images: HashMap::default(),
+            presentation_imports: HashMap::default(),
             presentation_import_pipeline: None,
-            partial_clear_pipelines: HashMap::new(),
+            partial_clear_pipelines: HashMap::default(),
             partial_clear_parameters,
-            submissions: HashMap::new(),
+            submissions: HashMap::default(),
+            queued_commands: Vec::new(),
+            queued_submissions: Vec::new(),
             completion_sender,
             completion_receiver,
             next_use: 1,
@@ -1386,6 +1408,35 @@ impl WgpuBackendDriver {
         }
     }
 
+    fn flush_queued_commands(&mut self) {
+        if self.queued_submissions.is_empty() {
+            return;
+        }
+        // Uploads for adjacent command buffers share mapped belt chunks. Close
+        // them once for this batch, then remap only after all its uses are
+        // submitted. Each copy retains its own offset and captured bytes.
+        self.upload_staging.finish();
+        let index = {
+            let _queue_access = self.queue_access.lock();
+            self.queue.submit(std::mem::take(&mut self.queued_commands))
+        };
+        self.upload_staging.recall();
+        nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostQueueSubmissions, 1);
+        let tokens = std::mem::take(&mut self.queued_submissions);
+        for token in &tokens {
+            self.submissions
+                .get_mut(token)
+                .expect("queued host submission remains retained")
+                .index = Some(index.clone());
+        }
+        let completed = self.completion_sender.clone();
+        self.queue.on_submitted_work_done(move || {
+            for token in tokens {
+                let _ = completed.send(token);
+            }
+        });
+    }
+
     fn clear_owned_state(&mut self) {
         #[cfg(not(target_os = "macos"))]
         self.native.clear();
@@ -1397,6 +1448,8 @@ impl WgpuBackendDriver {
         self.presentation_import_pipeline = None;
         self.partial_clear_pipelines.clear();
         self.submissions.clear();
+        self.queued_commands.clear();
+        self.queued_submissions.clear();
         self.readback_pool.clear();
         self.upload_staging = StagingBelt::new(self.device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         self.upload_canonical = Vec::new();
@@ -1516,6 +1569,133 @@ impl WgpuBackendDriver {
         encoder: &mut CommandEncoder,
     ) -> Result<(), BackendDriverError> {
         let submission = accepted.submission();
+        let mut plans = Vec::<InputSnapshot>::new();
+        let mut keys = HashMap::<InputSnapshotKey, usize>::default();
+        for access in submission.access_plan().accesses() {
+            if !access.mode().reads() {
+                continue;
+            }
+            let handle = dependencies.indexed(access.dependency_index());
+            let mut requested = Vec::new();
+            match access.target() {
+                nixe_gpu::AccessTarget::Buffer { range, .. } => {
+                    if let Some(plan) = self.prepare_buffer_snapshot(handle, range)? {
+                        requested.push(plan);
+                    }
+                }
+                nixe_gpu::AccessTarget::Image { subresources, .. } => {
+                    let first = &submission.operations()[access.first_operation()];
+                    let record = self.resource_record(handle)?;
+                    let Resource::Image {
+                        description,
+                        view: Some(_),
+                        ..
+                    } = record.host.as_ref().ok_or_else(|| missing(handle))?
+                    else {
+                        continue;
+                    };
+                    let overwrite =
+                        if let GpuCommand::Clear(ClearOperation::Image { target, .. }) =
+                            first.command()
+                        {
+                            image_region_is_full(*description, *target)?
+                        } else {
+                            false
+                        };
+                    let content = record
+                        .content
+                        .as_ref()
+                        .expect("backed image has content state");
+                    for (index, domain) in content.image_domains.iter().enumerate() {
+                        if !image_subresources_overlap(domain.subresources, subresources) {
+                            continue;
+                        }
+                        nixe_gpu::metrics::record(
+                            nixe_gpu::metrics::Counter::ImageRequestedBytes,
+                            domain.backing.size(),
+                        );
+                        let dependency = &content.cpu_writes[index];
+                        if (overwrite || content.initialized[index]) && dependency.remains_current()
+                        {
+                            continue;
+                        }
+                        let bytes_per_block = description
+                            .format()
+                            .plane_bytes_per_block(domain.subresources.plane)
+                            .ok_or_else(|| unsupported("image plane format"))?
+                            as u64;
+                        let alignment = match domain.layout {
+                            ImageMemoryLayout::PitchLinear { row_pitch, .. }
+                                if !row_pitch.is_multiple_of(bytes_per_block) =>
+                            {
+                                row_pitch
+                            }
+                            _ => 16,
+                        };
+                        requested.push(InputSnapshot {
+                            key: InputSnapshotKey::Image(handle, index),
+                            dependency: dependency.clone(),
+                            range: domain.backing.clone(),
+                            alignment,
+                            selection: if overwrite {
+                                CpuWriteSnapshotSelection::Rearm
+                            } else if content.initialized[index] {
+                                CpuWriteSnapshotSelection::DirtyPages
+                            } else {
+                                CpuWriteSnapshotSelection::All
+                            },
+                        });
+                    }
+                }
+                nixe_gpu::AccessTarget::Queries { .. } => {}
+            }
+            for plan in requested {
+                if let Some(&index) = keys.get(&plan.key) {
+                    // A required prior read cannot be erased by another view's
+                    // overwrite-only observation within this boundary.
+                    if plans[index].selection == CpuWriteSnapshotSelection::Rearm
+                        && plan.selection != CpuWriteSnapshotSelection::Rearm
+                    {
+                        plans[index] = plan;
+                    }
+                } else {
+                    keys.insert(plan.key, plans.len());
+                    plans.push(plan);
+                }
+            }
+        }
+        let requests = plans
+            .iter()
+            .map(|plan| nixe_memory::CpuWriteSnapshotRequest {
+                dependency: &plan.dependency,
+                range: &plan.range,
+                selection: plan.selection,
+                alignment: plan.alignment,
+            })
+            .collect::<Vec<_>>();
+        let snapshots = CanonicalCpuWriteDependency::snapshot_batch_with_resolver(
+            &requests,
+            &mut |coordinator, request| {
+                if request.device == self.visibility.device() {
+                    self.materialize_cpu_page(request, true).map_err(|error| {
+                        nixe_memory::VisibilityCoordinatorError::new(error.to_string())
+                    })
+                } else {
+                    coordinator.make_cpu_visible(request)
+                }
+            },
+        )
+        .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+        let mut inputs = plans
+            .into_iter()
+            .zip(snapshots)
+            .filter_map(|(plan, bytes)| {
+                (plan.selection != CpuWriteSnapshotSelection::Rearm).then_some((plan.key, bytes))
+            })
+            .collect::<InputSnapshots>();
+        if inputs.is_empty() {
+            return Ok(());
+        }
         for access in submission.access_plan().accesses() {
             if !access.mode().reads() {
                 continue;
@@ -1523,49 +1703,43 @@ impl WgpuBackendDriver {
             let handle = dependencies.indexed(access.dependency_index());
             match access.target() {
                 nixe_gpu::AccessTarget::Buffer { range, .. } => {
-                    self.upload_buffer(handle, range, encoder)?
+                    self.upload_buffer(handle, range, encoder, &mut inputs)?
                 }
                 nixe_gpu::AccessTarget::Image { subresources, .. } => {
-                    let first = &submission.operations()[access.first_operation()];
-                    let overwrite =
-                        if let GpuCommand::Clear(ClearOperation::Image { target, .. }) =
-                            first.command()
-                        {
-                            let Resource::Image { description, .. } = self.resource(handle)? else {
-                                return Err(kind_mismatch(handle));
-                            };
-                            image_region_is_full(*description, *target)?
-                        } else {
-                            false
-                        };
-                    self.upload_image(handle, subresources, overwrite, encoder)?;
+                    self.upload_image(handle, subresources, encoder, &mut inputs)?
                 }
                 nixe_gpu::AccessTarget::Queries { .. } => {}
+            }
+        }
+        // Domain eviction must happen after every planned upload has consumed
+        // its observation; clearing during collection strands earlier requests.
+        for handle in dependencies.values().copied() {
+            if let Some(content) = self.resource_record_mut(handle)?.content.as_mut()
+                && content.buffer_domains.len() > 64
+            {
+                content.buffer_domains.clear();
             }
         }
         Ok(())
     }
 
-    fn upload_buffer(
+    fn prepare_buffer_snapshot(
         &mut self,
         handle: BackendResourceHandle,
         requested: nixe_gpu::BufferRange,
-        encoder: &mut CommandEncoder,
-    ) -> Result<(), BackendDriverError> {
-        let (buffer, logical_size, view) = {
+    ) -> Result<Option<InputSnapshot>, BackendDriverError> {
+        let view = {
             let record = self.resource_record(handle)?;
-            let BackendResourceCreateInfo::Buffer { description, .. } = &record.immutable else {
+            let BackendResourceCreateInfo::Buffer { .. } = &record.immutable else {
                 return Err(kind_mismatch(handle));
             };
             let Resource::Buffer {
-                buffer,
-                view: Some(view),
-                ..
+                view: Some(view), ..
             } = record.host.as_ref().ok_or_else(|| missing(handle))?
             else {
-                return Ok(());
+                return Ok(None);
             };
-            (buffer.clone(), description.size(), view.clone())
+            view.clone()
         };
         // Host buffer copies require word alignment. Retain the checked domain
         // once; subsequent submissions reuse its topology and dirty summary.
@@ -1604,22 +1778,59 @@ impl WgpuBackendDriver {
                 .content
                 .as_mut()
                 .expect("backed buffer has content state");
-            if content.buffer_domains.len() >= 64 {
-                content.buffer_domains.clear();
-            }
             content.buffer_domains.insert(requested, domain.clone());
             domain
         };
-        let snapshots = self.snapshot_input(
-            &domain.cpu_writes,
-            &domain.backing,
-            if domain.initialized {
+        if domain.initialized && domain.cpu_writes.remains_current() {
+            return Ok(None);
+        }
+        Ok(Some(InputSnapshot {
+            key: InputSnapshotKey::Buffer(handle, requested),
+            dependency: domain.cpu_writes,
+            range: domain.backing,
+            selection: if domain.initialized {
                 CpuWriteSnapshotSelection::DirtyPages
             } else {
                 CpuWriteSnapshotSelection::All
             },
-            4,
-        )?;
+            alignment: 4,
+        }))
+    }
+
+    fn upload_buffer(
+        &mut self,
+        handle: BackendResourceHandle,
+        requested: nixe_gpu::BufferRange,
+        encoder: &mut CommandEncoder,
+        inputs: &mut InputSnapshots,
+    ) -> Result<(), BackendDriverError> {
+        let (buffer, logical_size, view) = {
+            let record = self.resource_record(handle)?;
+            let BackendResourceCreateInfo::Buffer { description, .. } = &record.immutable else {
+                return Err(kind_mismatch(handle));
+            };
+            let Resource::Buffer {
+                buffer,
+                view: Some(view),
+                ..
+            } = record.host.as_ref().ok_or_else(|| missing(handle))?
+            else {
+                return Ok(());
+            };
+            (buffer.clone(), description.size(), view.clone())
+        };
+        // Host buffer copies require word alignment. Retain the checked domain
+        // once; subsequent submissions reuse its topology and dirty summary.
+        let start = requested.offset() / 4 * 4;
+        let end = align_u64(requested.end(), 4)?.min(view.buffer_offset() + view.size());
+        if start < view.buffer_offset() {
+            return Err(unsupported("buffer copy alignment precedes its backing"));
+        }
+        let requested = nixe_gpu::BufferRange::new(start, end - start)
+            .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+        let snapshots = inputs
+            .remove(&InputSnapshotKey::Buffer(handle, requested))
+            .unwrap_or_default();
         if snapshots.is_empty() {
             return Ok(());
         }
@@ -1705,8 +1916,8 @@ impl WgpuBackendDriver {
         &mut self,
         handle: BackendResourceHandle,
         subresources: ImageSubresourceRange,
-        overwrite: bool,
         encoder: &mut CommandEncoder,
+        inputs: &mut InputSnapshots,
     ) -> Result<(), BackendDriverError> {
         let (texture, description, domain_count) = {
             let record = self.resource_record(handle)?;
@@ -1731,65 +1942,25 @@ impl WgpuBackendDriver {
             )
         };
         for index in 0..domain_count {
-            let (domain, initialized, dependency) = {
-                let content = self
-                    .resource_record(handle)?
-                    .content
-                    .as_ref()
-                    .expect("backed image retains content state");
-                let domain = &content.image_domains[index];
-                if !image_subresources_overlap(domain.subresources, subresources) {
-                    continue;
-                }
-                nixe_gpu::metrics::record(
-                    nixe_gpu::metrics::Counter::ImageRequestedBytes,
-                    domain.backing.size(),
-                );
-                if !overwrite
-                    && content.initialized[index]
-                    && content.cpu_writes[index].remains_current()
-                {
-                    continue;
-                }
-                (
-                    domain.clone(),
-                    content.initialized[index],
-                    content.cpu_writes[index].clone(),
-                )
+            let domain = &self
+                .resource_record(handle)?
+                .content
+                .as_ref()
+                .expect("backed image retains content state")
+                .image_domains[index];
+            if !image_subresources_overlap(domain.subresources, subresources) {
+                continue;
+            }
+            let Some(canonical) = inputs.remove(&InputSnapshotKey::Image(handle, index)) else {
+                continue;
             };
+            let domain = domain.clone();
             let bytes_per_block = usize::from(
                 description
                     .format()
                     .plane_bytes_per_block(domain.subresources.plane)
                     .ok_or_else(|| unsupported("image plane format"))?,
             );
-            if overwrite {
-                if !dependency.remains_current() {
-                    dependency
-                        .rearm()
-                        .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-                }
-                continue;
-            }
-            let canonical = self.snapshot_input(
-                &dependency,
-                &domain.backing,
-                if initialized {
-                    CpuWriteSnapshotSelection::DirtyPages
-                } else {
-                    CpuWriteSnapshotSelection::All
-                },
-                match domain.layout {
-                    ImageMemoryLayout::PitchLinear { row_pitch, .. } => {
-                        if row_pitch.is_multiple_of(bytes_per_block as u64) {
-                            16
-                        } else {
-                            row_pitch
-                        }
-                    }
-                    ImageMemoryLayout::BlockLinear(_) => 16,
-                },
-            )?;
             nixe_gpu::metrics::record(
                 nixe_gpu::metrics::Counter::ImageSnapshottedBytes,
                 canonical.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
@@ -3558,7 +3729,7 @@ impl WgpuBackendDriver {
                 pipeline,
                 serial,
                 last_used: cache_use,
-                vertex_pull_bind_groups: HashMap::new(),
+                vertex_pull_bind_groups: HashMap::default(),
             },
             pipeline_variant_capacity,
         );
@@ -3674,6 +3845,8 @@ impl WgpuBackendDriver {
             staging_offset: usize_from_u64(source - aligned_source, "staging writeback offset")?,
             size: usize_from_u64(writeback.range.size, "buffer writeback size")?,
         });
+        nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::BufferReadbackBytes, copy_size);
+        nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::DeviceReadbackCopies, 1);
         Ok(())
     }
 
@@ -3766,6 +3939,8 @@ impl WgpuBackendDriver {
             height: block_rows,
             depth_or_layers: layers,
         });
+        nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::ImageReadbackBytes, size);
+        nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::DeviceReadbackCopies, 1);
         Ok(())
     }
 
@@ -4406,7 +4581,7 @@ impl WgpuBackendDriver {
                     }),
                     description: *description,
                     view: view.clone(),
-                    attachment_views: HashMap::new(),
+                    attachment_views: HashMap::default(),
                     #[cfg(not(target_os = "macos"))]
                     native_initialized: false,
                 }
@@ -4433,14 +4608,14 @@ impl WgpuBackendDriver {
             BackendResourceCreateInfo::Pipeline { description, .. } => Resource::Pipeline {
                 description: *description,
                 render: RenderPipelineCache::default(),
-                compute: HashMap::new(),
+                compute: HashMap::default(),
             },
             BackendResourceCreateInfo::DescriptorTable { bindings, .. } => {
                 Resource::DescriptorTable {
                     bindings: bindings.clone(),
                     #[cfg(not(target_os = "macos"))]
                     native_indices: None,
-                    bind_groups: HashMap::new(),
+                    bind_groups: HashMap::default(),
                 }
             }
             BackendResourceCreateInfo::RenderPass { .. } => Resource::RenderPass,
@@ -4563,6 +4738,7 @@ impl WgpuBackendDriver {
         request: CpuVisibilityRequest,
         retain_mirror: bool,
     ) -> Result<Box<[u8]>, BackendDriverError> {
+        self.flush_queued_commands();
         let mut demanded = Vec::new();
         for candidate in self.page_resources.get(request.page) {
             let record = self.resource_record(candidate.handle)?;
@@ -4854,37 +5030,9 @@ impl BackendDriver for WgpuBackendDriver {
             #[cfg(not(target_os = "macos"))]
             native,
         } = self.encode_submission(accepted, dependencies, encoder)?;
-        self.upload_staging.finish_and_recall_on_submit(&encoder);
-        let submission_index = {
-            let _queue_access = self.queue_access.lock();
-            self.queue.submit(
-                segments
-                    .into_iter()
-                    .chain(std::iter::once(encoder.finish())),
-            )
-        };
-        let token = accepted.token();
-        self.submissions.insert(
-            token,
-            HostSubmission {
-                index: submission_index,
-                completed: false,
-                #[cfg(not(target_os = "macos"))]
-                native,
-            },
-        );
-        let completed = self.completion_sender.clone();
-        self.queue.on_submitted_work_done(move || {
-            let _ = completed.send(token);
-        });
-        for handle in dependencies.values() {
-            if let Ok(record) = self.resource_record_mut(*handle) {
-                record.last_use = Some(ResourceUse {
-                    serial: use_serial,
-                    submission: token,
-                });
-            }
-        }
+        // Finish fallible write tracking and superseded-resource bookkeeping
+        // before host acceptance. An error after queue.submit would otherwise
+        // make the neutral backend treat accepted GPU work as rejected.
         for access in accepted.submission().access_plan().accesses() {
             if !access.mode().writes() {
                 continue;
@@ -4909,6 +5057,35 @@ impl BackendDriver for WgpuBackendDriver {
                 self.reclaim_cleared_retired_images(handle, *target)?;
             }
         }
+        // Keep each snapshot's transfer and draw ordered, but deliver adjacent
+        // accepted segments together. A final segment, wait or readback
+        // flushes the batch; guest fences still report real GPU completion.
+        self.queued_commands.extend(segments);
+        self.queued_commands.push(encoder.finish());
+        let token = accepted.token();
+        self.submissions.insert(
+            token,
+            HostSubmission {
+                index: None,
+                completed: false,
+                #[cfg(not(target_os = "macos"))]
+                native,
+            },
+        );
+        self.queued_submissions.push(token);
+        for handle in dependencies.values() {
+            if let Ok(record) = self.resource_record_mut(*handle) {
+                record.last_use = Some(ResourceUse {
+                    serial: use_serial,
+                    submission: token,
+                });
+            }
+        }
+        // Start the GPU while the owner is still encoding the next snapshots.
+        // Waiting until a whole frame is encoded would serialize both stages.
+        if accepted.submission().is_final_segment() || self.queued_submissions.len() >= 8 {
+            self.flush_queued_commands();
+        }
         Ok(())
     }
 
@@ -4917,6 +5094,26 @@ impl BackendDriver for WgpuBackendDriver {
         submission: BackendSubmissionToken,
     ) -> Result<bool, BackendDriverError> {
         self.require_device()?;
+        self.drain_completions();
+        if self
+            .submissions
+            .get(&submission)
+            .is_some_and(|submission| submission.completed)
+        {
+            // One real queue callback completes the whole bounded batch.
+            // Its remaining tokens need no additional driver polls.
+            return Ok(true);
+        }
+        if self
+            .submissions
+            .get(&submission)
+            .is_some_and(|submission| submission.index.is_none())
+        {
+            // Polling is observational: an accepted snapshot still waiting
+            // in the bounded batch cannot have completed. Explicit waits,
+            // readbacks, presentation and final segments flush that tail.
+            return Ok(false);
+        }
         self.device
             .poll(wgpu::PollType::Poll)
             .map_err(|error| BackendDriverError::device_lost(error.to_string()))?;
@@ -4933,10 +5130,11 @@ impl BackendDriver for WgpuBackendDriver {
         submission: BackendSubmissionToken,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
+        self.flush_queued_commands();
         let index = self
             .submissions
             .get(&submission)
-            .map(|submission| submission.index.clone())
+            .and_then(|submission| submission.index.clone())
             .ok_or_else(|| BackendDriverError::failure("unknown wgpu submission token"))?;
         let status = self
             .device
@@ -4995,6 +5193,7 @@ impl BackendDriver for WgpuBackendDriver {
         &mut self,
         request: PresentationImageRequest,
     ) -> Result<ResidentImage, BackendDriverError> {
+        self.flush_queued_commands();
         self.acquire_presentable(request)
     }
 
@@ -5002,6 +5201,7 @@ impl BackendDriver for WgpuBackendDriver {
         if self.torn_down {
             return Ok(());
         }
+        self.flush_queued_commands();
         #[cfg(not(target_os = "macos"))]
         self.wait_native_uses()?;
         let cache_result = self.persist_pipeline_cache();
@@ -5913,7 +6113,7 @@ fn dirty_image_regions(
     }
     let mut regions: Vec<ImageUploadRegion> = Vec::new();
     let mut previous: std::collections::HashMap<(u32, u32), usize> =
-        std::collections::HashMap::new();
+        std::collections::HashMap::default();
     for (y, mut intervals) in spans {
         intervals.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::new();
@@ -5926,7 +6126,7 @@ fn dirty_image_regions(
                 merged.push((start, end));
             }
         }
-        let mut current = std::collections::HashMap::new();
+        let mut current = std::collections::HashMap::default();
         for (start, end) in merged {
             let key = (start as u32, (end - start) as u32);
             let index = if let Some(index) = previous.get(&key).copied()
@@ -6235,7 +6435,7 @@ mod resource_lifetime_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap as HashMap;
 
     use nixe_gpu::{
         BackendInstanceId, BackendResourceHandle, BackendResourceKind, BlockLinearLayout, BufferId,
@@ -6258,7 +6458,9 @@ mod tests {
 
     #[test]
     fn bounded_backend_caches_select_the_least_recently_used_entry() {
-        let records = HashMap::from([(11_u32, 40_u64), (22, 10), (33, 30)]);
+        let records = [(11_u32, 40_u64), (22, 10), (33, 30)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
 
         assert_eq!(least_recent_key(&records, |last_used| *last_used), Some(22));
     }
@@ -6326,7 +6528,7 @@ mod tests {
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
-        range.invalidate_visibility().unwrap();
+        nixe_memory::CanonicalBackingRange::invalidate_visibility_ranges([&range]).unwrap();
         let expected = nixe_memory::CanonicalRangeAccessError::Backing(
             nixe_memory::CanonicalPageError::Visibility(nixe_memory::VisibilityError::InvalidState),
         );

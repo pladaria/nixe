@@ -8,7 +8,7 @@ use nixe_cpu::memory::{
     CpuMemory, MemoryAccess, MemoryAccessSize, MemoryAttributes, MemoryMappingPurpose,
     MemoryPermissions, MemoryValue, ProcessMemory,
 };
-use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State};
+use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_horizon::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, GuestLogLevel, HorizonDiagnostics,
     HorizonIpcFault, HorizonIpcObject, HorizonIpcResult, HorizonKernelResult, HorizonProcess,
@@ -192,7 +192,7 @@ fn x(index: u8) -> A64Register {
     A64Register::General(A64GeneralRegister::new(index).unwrap())
 }
 
-fn state(process: &mut RunnableProcess) -> &mut A64State {
+fn state(process: &mut RunnableProcess) -> &mut nixe_runtime::GuestCpuState {
     process.main_thread_mut().state_mut()
 }
 
@@ -251,7 +251,13 @@ fn dispatch_scheduled_next(
     (execution.lease.thread, handling)
 }
 
-fn set_address_arguments(state: &mut A64State, address: u64, kind: u32, value: i32, fourth: u64) {
+fn set_address_arguments(
+    state: &mut nixe_runtime::GuestCpuState,
+    address: u64,
+    kind: u32,
+    value: i32,
+    fourth: u64,
+) {
     state.write_x(x(0), address);
     state.write_w(x(1), kind);
     state.write_w(x(2), value as u32);

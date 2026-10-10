@@ -65,6 +65,7 @@ pub(super) fn prepare_buffer(
     allocation_description: GpuAllocationDescription,
     backing: BackingView,
     mappings: Arc<[MaxwellThreeDMappingReference]>,
+    writable: bool,
     cache: &mut MaxwellLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
     invalidations: &mut Vec<ResourceDependency>,
@@ -106,7 +107,7 @@ pub(super) fn prepare_buffer(
             });
         }
     }
-    retire_overlapping_views(&key, retained, cache, invalidations);
+    retire_overlapping_views(&key, writable, retained, cache, invalidations);
     let id = BufferId::new(take_identity(cache)?);
     let view = BufferView::new(id, description, 0, backing)
         .map_err(|e| MaxwellLoweringError::BufferBacking(e.to_string()))?;

@@ -14,9 +14,13 @@ log.workspace = true
 nixe-gpu.workspace = true
 nixe-memory.workspace = true
 pollster.workspace = true
+rustc-hash.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+nixe-cpu.workspace = true
+nixe-cpu-direct-memory.workspace = true
+nixe-cpu-jit.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]

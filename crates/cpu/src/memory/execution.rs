@@ -9,7 +9,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
     marker::PhantomData,
-    sync::atomic::AtomicU64,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
@@ -18,12 +17,10 @@ use nixe_memory::{
     CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
     CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, CanonicalWriteBatch,
     ContentGeneration, CpuMemoryBackend, DirectAddressSpaceView, DirectArena, DirectBackendPolicy,
-    DirectMapRequest, DirectProtectRequest, DirectProtection, ExecutionGate,
-    ExecutionMutationError, ExecutionMutationGuard, ExecutionMutationObserver,
-    ExecutionSharedGuard, GuestPhysicalPageId, GuestVirtualAddress, HostMappedBacking,
-    MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError,
-    MemoryInvalidationKind, MemoryInvalidationLog, MemoryInvalidationOrigin,
-    MemoryInvalidationSource,
+    DirectMapRequest, DirectProtectRequest, DirectProtection, ExecutionGate, ExecutionSharedGuard,
+    GuestPhysicalPageId, GuestVirtualAddress, HostMappedBacking, MappingGeneration,
+    MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationKind,
+    MemoryInvalidationLog, MemoryInvalidationOrigin, MemoryInvalidationSource,
 };
 
 use crate::{
@@ -38,15 +35,14 @@ use super::common::{
     virtual_page, writable_executable,
 };
 use super::{
-    AtomicMemoryResult, AtomicRmwKind, CodeDependencies, CodePageDependency, CodePageSpan,
-    CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, DataReadResult,
-    DataWriteResult, DirectFaultResolution, FetchedCode, InstructionMemory, MemoryAccess,
-    MemoryAccessClass, MemoryAliasError, MemoryAliasErrorReason, MemoryAliasRequest,
-    MemoryAlignment, MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason,
-    MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
-    MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory,
-    SYNTHETIC_PAGE_SIZE, SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo,
-    SyntheticMmio, SyntheticRamPage,
+    AtomicMemoryResult, AtomicRmwKind, CpuMemory, DataAccessFault, DataAccessFaultReason,
+    DataAccessKind, DataReadResult, DataWriteResult, DirectFaultResolution, FetchedInstruction,
+    InstructionMemory, MemoryAccess, MemoryAccessClass, MemoryAliasError, MemoryAliasErrorReason,
+    MemoryAliasRequest, MemoryAlignment, MemoryAttributes, MemoryMappingError,
+    MemoryMappingErrorReason, MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions,
+    MemoryProtectionError, MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind,
+    MemoryValue, ProcessMemory, SYNTHETIC_PAGE_SIZE, SyntheticInstallError, SyntheticInstallStage,
+    SyntheticMappingInfo, SyntheticMmio, SyntheticRamPage,
 };
 
 const LEAF_BITS: u32 = 9;
@@ -849,6 +845,15 @@ pub struct ExecutionMemory {
     execution_gate: ExecutionGate,
 }
 
+/// A native callback must leave its execution lease before a device can wait.
+pub enum NativeMemoryAccess {
+    Ram,
+    CheckedRam,
+    Device,
+    Visibility(CanonicalBackingPage),
+    Fatal(Box<str>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MappingEpoch(u64);
 
@@ -881,6 +886,12 @@ impl ExecutionMemoryLease<'_> {
     }
 }
 
+/// A native CAS either completed or needs visibility outside its execution lease.
+pub enum NativeAtomicResult {
+    Complete(bool),
+    Visibility(CanonicalBackingPage),
+}
+
 /// Failure to construct or publish one immutable process memory backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CpuMemoryBackendError(Box<str>);
@@ -906,6 +917,236 @@ impl Default for ExecutionMemory {
 }
 
 impl ExecutionMemory {
+    /// Completes non-zeroing data-cache maintenance under the caller's native
+    /// execution lease when canonical RAM is already CPU-visible. CPU stores
+    /// update that backing directly; no emulated dirty cache line remains to
+    /// clean. False defers mapping faults, devices and GPU visibility to the
+    /// checked maintenance path after the lease has been released.
+    /// https://developer.arm.com/documentation/ddi0601/latest/AArch64-Instructions/DC-CVAC--Data-or-unified-Cache-line-Clean-by-VA-to-PoC
+    pub fn try_native_data_cache_maintenance(
+        &self,
+        space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> bool {
+        let inner = self.lock_inner();
+        let Some(mapping) = inner.mapping_at(space, address) else {
+            return false;
+        };
+        let Some(ExecutionPhysicalPage::Ram(page)) = inner.page(mapping.physical_slot) else {
+            return false;
+        };
+        matches!(
+            page.visibility_state(),
+            nixe_memory::VisibilityState::Clean | nixe_memory::VisibilityState::CpuNewer
+        )
+    }
+
+    /// Resolves a complete callback access under an existing execution lease.
+    /// No visibility callback or guest operation is performed. Classification
+    /// and direct repair share their complete mapping validation.
+    #[inline]
+    pub fn resolve_native_access(
+        &self,
+        space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        kind: DataAccessKind,
+    ) -> Result<NativeMemoryAccess, DataAccessFault> {
+        let inner = self.lock_inner();
+        if let Some(error) = &inner.direct_failure {
+            return Ok(NativeMemoryAccess::Fatal(error.clone()));
+        }
+        let resolved = resolve_access(&inner, space, address, access, kind)?;
+        if access.class == super::MemoryAccessClass::Atomic {
+            resolve_access(&inner, space, address, access, DataAccessKind::Read)?;
+        }
+        if resolved.region == MemoryRegionKind::Device {
+            return Ok(NativeMemoryAccess::Device);
+        }
+        for mapping in [Some(resolved.first), resolved.second]
+            .into_iter()
+            .flatten()
+        {
+            let Some(ExecutionPhysicalPage::Ram(page)) = inner.page(mapping.physical_slot) else {
+                unreachable!("resolved RAM retains its backing")
+            };
+            if matches!(
+                page.visibility_state(),
+                nixe_memory::VisibilityState::GpuNewer { .. }
+            ) {
+                return Ok(NativeMemoryAccess::Visibility(page.clone()));
+            }
+        }
+        drop(inner);
+        match self.repair_resolved_direct_access(space, address, kind, resolved) {
+            DirectFaultResolution::Retry => Ok(NativeMemoryAccess::Ram),
+            DirectFaultResolution::Cold => Ok(NativeMemoryAccess::CheckedRam),
+            DirectFaultResolution::Fault(fault) => Err(fault),
+            DirectFaultResolution::Fatal(message) => Ok(NativeMemoryAccess::Fatal(message)),
+        }
+    }
+
+    /// Resolves and executes a CAS under the caller's native execution lease.
+    /// Classification shares the transaction's mapping lookup instead of adding
+    /// a second lookup to every exclusive store. No GPU wait happens here.
+    #[inline]
+    pub fn try_native_compare_exchange(
+        &self,
+        space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        expected: MemoryValue,
+        replacement: MemoryValue,
+    ) -> Result<NativeAtomicResult, DataAccessFault> {
+        if expected.size() != access.size || replacement.size() != access.size {
+            return Err(DataAccessFault::new(
+                space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ValueSizeMismatch,
+            ));
+        }
+        let backing = self.resolve_atomic_backing(space, address, access)?;
+        let Some(observed) = backing
+            .try_atomic_load(page_offset(address), access.size.bytes())
+            .map_err(|reason| {
+                DataAccessFault::new(
+                    space,
+                    address,
+                    DataAccessKind::Read,
+                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                )
+            })?
+        else {
+            return Ok(NativeAtomicResult::Visibility(backing));
+        };
+        Self::atomic_transaction_from_observed(
+            &backing,
+            space,
+            address,
+            access,
+            observed,
+            |previous| {
+                if previous == expected {
+                    (replacement, true)
+                } else {
+                    (previous, false)
+                }
+            },
+        )
+        .map(|result| NativeAtomicResult::Complete(result.stored))
+    }
+
+    fn repair_resolved_direct_access(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        kind: DataAccessKind,
+        resolved: ResolvedDataAccess<ExecutionMapping>,
+    ) -> DirectFaultResolution {
+        // Check the complete subaccess before changing protection: report a
+        // second-page guest fault at its first failing byte. At most two pages
+        // are touched by a supported native access.
+        let pages = [
+            Some((address, resolved.first)),
+            resolved.second.map(|mapping| {
+                (
+                    address.checked_add(resolved.first_bytes as u64).unwrap(),
+                    mapping,
+                )
+            }),
+        ];
+        for (address, mapping) in pages.into_iter().flatten() {
+            match repair_direct_page(self, address_space, address, kind, mapping) {
+                DirectFaultResolution::Retry => {}
+                other => return other,
+            }
+        }
+        DirectFaultResolution::Retry
+    }
+
+    /// Translation can read ahead. A GPU-owned instruction page is unavailable
+    /// until the executed NoExecuteFault is resolved outside native execution.
+    pub fn try_fetch32(
+        &self,
+        space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Result<Option<FetchedInstruction>, InstructionFetchFault> {
+        self.fetch32_impl(space, address, false)
+    }
+
+    fn fetch32_impl(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        blocking: bool,
+    ) -> Result<Option<FetchedInstruction>, InstructionFetchFault> {
+        if !address.is_aligned_to(4) {
+            return Err(InstructionFetchFault::new(
+                address_space,
+                address,
+                InstructionFetchFaultReason::Misaligned,
+            ));
+        }
+        loop {
+            let inner = self.lock_inner();
+            let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
+                InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::Unmapped,
+                )
+            })?;
+            if !mapping.permissions.contains(MemoryPermissions::EXECUTE) {
+                return Err(InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::ExecutePermissionDenied,
+                ));
+            }
+            let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
+            else {
+                return Err(InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::Memory("executable mapping is not RAM".into()),
+                ));
+            };
+            let fail = |reason: CanonicalPageError| {
+                InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::Memory(reason.to_string().into()),
+                )
+            };
+            if !backing.observe_executable_content(Arc::clone(&self.invalidations)) {
+                return Err(InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::Memory(
+                        "canonical page belongs to a different invalidation source".into(),
+                    ),
+                ));
+            }
+            let Some(page) = backing.try_cpu_access().map_err(fail)? else {
+                if !blocking {
+                    return Ok(None);
+                }
+                let backing = backing.clone();
+                drop(inner);
+                backing.prepare_cpu_access().map_err(fail)?;
+                // A visibility callback can remap the address. Translate again.
+                continue;
+            };
+            let mut bytes = [0; 4];
+            page.read(page_offset(address), &mut bytes).map_err(fail)?;
+            return Ok(Some(FetchedInstruction {
+                bits: u32::from_le_bytes(bytes),
+                physical_page: mapping.physical_page,
+            }));
+        }
+    }
+
     /// Reserves retained kernel-object storage in this process's canonical
     /// ownership domain, including its execution/mutation rendezvous.
     pub fn allocate_shared_backing(
@@ -986,9 +1227,7 @@ impl ExecutionMemory {
             start,
             size: backing.size() as u64,
         };
-        let mut mutation = self
-            .begin_mapping_mutation(&[kind])
-            .map_err(|cause| error(MemoryMappingErrorReason::ExecutionMutation(cause)))?;
+        let mut mutation = self.execution_gate.acquire_exclusive();
         let mut inner = self.lock_inner();
         for page in range.first..range.end {
             if inner.mappings.get(address_space, page).is_some() {
@@ -1048,9 +1287,7 @@ impl ExecutionMemory {
             start,
             size: backing.size() as u64,
         };
-        let mut mutation = self
-            .begin_mapping_mutation(&[kind])
-            .map_err(|cause| error(MemoryMappingErrorReason::ExecutionMutation(cause)))?;
+        let mut mutation = self.execution_gate.acquire_exclusive();
         let mut inner = self.lock_inner();
         for (virtual_page, page) in (range.first..range.end).zip(backing.pages()) {
             if !inner.mapping_at(address_space, page_address(virtual_page)).is_some_and(|mapping| {
@@ -1118,25 +1355,38 @@ impl ExecutionMemory {
         }
     }
 
+    /// Appends current virtual page ranges for physical pages in one address
+    /// space, using the same alias index maintained by mapping transactions.
+    /// Consumers combining these with historical mapping records must retain
+    /// an execution lease until their derived view has been synchronized.
+    pub fn append_mapped_alias_ranges(
+        &self,
+        address_space: AddressSpaceId,
+        pages: &[GuestPhysicalPageId],
+        ranges: &mut Vec<(GuestVirtualAddress, usize)>,
+    ) {
+        if pages.is_empty() {
+            return;
+        }
+        let inner = self.lock_inner();
+        for page in pages {
+            let Some(&slot) = inner.slots_by_id.get(page) else {
+                continue;
+            };
+            let aliases = &inner.physical_slots[slot].as_ref().unwrap().aliases;
+            ranges.extend(
+                aliases
+                    .range((address_space, 0)..=(address_space, u64::MAX))
+                    .map(|&(_, page)| (page_address(page), SYNTHETIC_PAGE_SIZE)),
+            );
+        }
+    }
+
     /// Connects external ownership transitions to the runtime's bounded CPU
     /// safepoint request. The callback is cold and is invoked only when an
     /// exclusive transition finds an active execution slice.
     pub fn set_transition_notifier(&self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
         self.execution_gate.set_transition_notifier(notifier);
-    }
-
-    /// Bind the engine's memory mutation handshake before sharing memory with
-    /// execution workers. Mapping, device visibility, canonical batches, trusted
-    /// host overwrites, RAM initialization and instruction-cache invalidation
-    /// participate, as do tracking transitions. Already-armed instruction
-    /// capture is read-only. Callers must leave their own execution lease/JIT
-    /// reader before requesting a rendezvous. The gate enforces idle, single
-    /// binding even when the memory owner is already retained in an Arc.
-    pub fn set_mutation_observer(
-        &self,
-        observer: Arc<dyn ExecutionMutationObserver>,
-    ) -> Result<(), ExecutionMutationError> {
-        self.execution_gate.set_mutation_observer(observer)
     }
 
     /// Returns the mapping epoch visible to newly acquired execution leases.
@@ -1150,13 +1400,6 @@ impl ExecutionMemory {
     #[must_use]
     pub fn mapping_mutation_pending(&self) -> bool {
         self.execution_gate.transition_pending()
-    }
-
-    fn begin_mapping_mutation(
-        &self,
-        changes: &[MemoryInvalidationKind],
-    ) -> Result<ExecutionMutationGuard<'_>, ExecutionMutationError> {
-        self.execution_gate.acquire_mutation(changes)
     }
 
     /// Selects and eagerly publishes the immutable backend for one address
@@ -1567,9 +1810,9 @@ impl ExecutionMemory {
         page: GuestPhysicalPageId,
         offset: usize,
         bytes: &[u8],
-    ) -> Result<(), ExecutionMutationError> {
+    ) -> Result<(), CpuMemoryBackendError> {
         let failure = |detail: &str| {
-            ExecutionMutationError(format!("RAM initialization of {page:?}: {detail}").into())
+            CpuMemoryBackendError::new(format!("RAM initialization of {page:?}: {detail}"))
         };
         let (backing, executable) = {
             let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
@@ -1596,15 +1839,7 @@ impl ExecutionMemory {
             backing
                 .prepare_cpu_access()
                 .map_err(|error| failure(&error.to_string()))?;
-            let _mutation = self.execution_gate.acquire_write(|| {
-                executable
-                    .into_iter()
-                    .map(|first| MemoryInvalidationKind::ExecutableContent {
-                        first,
-                        second: None,
-                    })
-                    .collect()
-            })?;
+            let _mutation = self.execution_gate.acquire_exclusive();
             if matches!(
                 backing.visibility_state(),
                 nixe_memory::VisibilityState::GpuNewer { .. }
@@ -1673,40 +1908,7 @@ impl ExecutionMemory {
             )
         })?;
         'retry: loop {
-            let transition = self
-                .execution_gate
-                .acquire_write(|| {
-                    // Capture admission is closed before resolving physical targets;
-                    // release the mapping lock before the engine rendezvous.
-                    let inner = self.lock_inner();
-                    let mut pages = BTreeSet::new();
-                    let mut cursor = address.get();
-                    while cursor < end {
-                        let current = GuestVirtualAddress::new(cursor);
-                        if let Some(mapping) = inner.mapping_at(address_space, current)
-                            && let Some(page) = inner.executable_content_page(mapping.physical_slot)
-                        {
-                            pages.insert(page);
-                        }
-                        cursor += (SYNTHETIC_PAGE_SIZE - page_offset(current))
-                            .min((end - cursor) as usize) as u64;
-                    }
-                    pages
-                        .into_iter()
-                        .map(|first| MemoryInvalidationKind::ExecutableContent {
-                            first,
-                            second: None,
-                        })
-                        .collect()
-                })
-                .map_err(|error| {
-                    DataAccessFault::new(
-                        address_space,
-                        address,
-                        DataAccessKind::Write,
-                        DataAccessFaultReason::HostBacking(error.to_string().into()),
-                    )
-                })?;
+            let transition = self.execution_gate.acquire_exclusive();
             let inner = self.lock_inner();
             let mut cursor = address.get();
             let mut pending_generations = BTreeMap::new();
@@ -1911,71 +2113,6 @@ impl ExecutionMemory {
         true
     }
 
-    fn fetch<const N: usize>(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<([u8; N], CodeDependencies), InstructionFetchFault> {
-        if !address.is_aligned_to(4) {
-            return Err(InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::Misaligned,
-            ));
-        }
-        let inner = self.lock_inner();
-        let end_offset = page_offset(address) + N;
-        // A64 instructions are four-byte aligned and cannot cross this page.
-        debug_assert!(end_offset <= SYNTHETIC_PAGE_SIZE);
-        let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
-            InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::Unmapped,
-            )
-        })?;
-        if !mapping.permissions.contains(MemoryPermissions::EXECUTE) {
-            return Err(InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::ExecutePermissionDenied,
-            ));
-        }
-        let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot) else {
-            return Err(InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::Memory("executable mapping is not RAM".into()),
-            ));
-        };
-        if !backing.observe_executable_content(Arc::clone(&self.invalidations)) {
-            return Err(InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::Memory(
-                    "canonical page belongs to a different invalidation source".into(),
-                ),
-            ));
-        }
-        let mut bytes = [0; N];
-        backing
-            .read(page_offset(address), &mut bytes)
-            .map_err(|reason| {
-                InstructionFetchFault::new(
-                    address_space,
-                    address,
-                    InstructionFetchFaultReason::Memory(reason.to_string().into()),
-                )
-            })?;
-        Ok((
-            bytes,
-            CodeDependencies::one(CodePageDependency {
-                page: mapping.physical_page,
-                mapping_generation: mapping.mapping_generation,
-            }),
-        ))
-    }
-
     fn atomic_transaction(
         &self,
         address_space: AddressSpaceId,
@@ -1983,6 +2120,16 @@ impl ExecutionMemory {
         access: MemoryAccess,
         operation: impl Fn(MemoryValue) -> (MemoryValue, bool),
     ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        let backing = self.resolve_atomic_backing(address_space, address, access)?;
+        Self::atomic_transaction_on_backing(&backing, address_space, address, access, operation)
+    }
+
+    fn resolve_atomic_backing(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+    ) -> Result<CanonicalBackingPage, DataAccessFault> {
         if access.class != MemoryAccessClass::Atomic || access.alignment != MemoryAlignment::Natural
         {
             return Err(DataAccessFault::new(
@@ -2018,7 +2165,7 @@ impl ExecutionMemory {
             };
             backing.clone()
         };
-        Self::atomic_transaction_on_backing(&backing, address_space, address, access, operation)
+        Ok(backing)
     }
 
     // Resolve once, then retain that physical allocation throughout retries.
@@ -2032,7 +2179,7 @@ impl ExecutionMemory {
     ) -> Result<AtomicMemoryResult, DataAccessFault> {
         let offset = page_offset(address);
         let byte_count = access.size.bytes();
-        let mut observed_bits = backing.atomic_load(offset, byte_count).map_err(|reason| {
+        let observed_bits = backing.atomic_load(offset, byte_count).map_err(|reason| {
             DataAccessFault::new(
                 address_space,
                 address,
@@ -2040,6 +2187,26 @@ impl ExecutionMemory {
                 DataAccessFaultReason::HostBacking(reason.to_string().into()),
             )
         })?;
+        Self::atomic_transaction_from_observed(
+            backing,
+            address_space,
+            address,
+            access,
+            observed_bits,
+            operation,
+        )
+    }
+
+    fn atomic_transaction_from_observed(
+        backing: &CanonicalBackingPage,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        mut observed_bits: u128,
+        operation: impl Fn(MemoryValue) -> (MemoryValue, bool),
+    ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        let offset = page_offset(address);
+        let byte_count = access.size.bytes();
         loop {
             let previous = MemoryValue::from_bits(access.size, observed_bits);
             let (replacement, stored) = operation(previous);
@@ -2152,10 +2319,6 @@ impl MemoryInvalidationSource for ExecutionMemory {
         self.invalidations.cursor()
     }
 
-    fn invalidation_signal(&self) -> &AtomicU64 {
-        self.invalidations.cursor_signal()
-    }
-
     fn read_invalidations_since(
         &self,
         after: MemoryInvalidationCursor,
@@ -2165,209 +2328,14 @@ impl MemoryInvalidationSource for ExecutionMemory {
     }
 }
 
-impl super::ExecutableMemory for ExecutionMemory {
-    fn capture_instructions(
-        &self,
-        space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        limit: std::num::NonZeroU16,
-        stop: &dyn Fn(GuestVirtualAddress, u32) -> bool,
-    ) -> super::InstructionImage {
-        use super::capture::{Page, Stamp, copy_words};
-        use nixe_memory::ExecutableRead;
-        let mut arm_tracking = false;
-        loop {
-            // The gate excludes raw native writers; the mapping lock excludes
-            // checked ordinary writes and fixes every physical alias. Checked
-            // atomics share each read_executable byte/stamp lock; later writes
-            // are detected by image revalidation, not by the mapping mutex.
-            // Tracking rearm additionally drains the bound engine's fault
-            // readers before changing protection; no code bytes are invalidated.
-            // Neither survives the bounded copy into compiler-owned storage.
-            let mut guard = match self.execution_gate.acquire_capture(arm_tracking) {
-                Ok(guard) => guard,
-                Err(error) => {
-                    return super::InstructionImage {
-                        space,
-                        start,
-                        words: Box::new([]),
-                        fault: Some(InstructionFetchFault::new(
-                            space,
-                            start,
-                            InstructionFetchFaultReason::Memory(error.to_string().into()),
-                        )),
-                        pages: Vec::new(),
-                        cursor: self.invalidation_cursor(),
-                        owner: self.invalidations.clone(),
-                    };
-                }
-            };
-            let inner = self.lock_inner();
-            let mut pages = Vec::new();
-            let mut reconcile = None;
-            let mut needs_tracking = false;
-            let (words, fault) = copy_words(start, limit, stop, |pc| {
-                let fail = |reason| InstructionFetchFault::new(space, pc, reason);
-                if !pc.is_aligned_to(4) {
-                    return Err(fail(InstructionFetchFaultReason::Misaligned));
-                }
-                let mapping = inner
-                    .mapping_at(space, pc)
-                    .ok_or_else(|| fail(InstructionFetchFaultReason::Unmapped))?;
-                if !mapping.permissions.contains(MemoryPermissions::EXECUTE) {
-                    return Err(fail(InstructionFetchFaultReason::ExecutePermissionDenied));
-                }
-                let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
-                else {
-                    return Err(fail(InstructionFetchFaultReason::Memory(
-                        "executable mapping is not RAM".into(),
-                    )));
-                };
-                if !backing.observe_executable_content(self.invalidations.clone()) {
-                    return Err(fail(InstructionFetchFaultReason::Memory(
-                        "executable page belongs to another invalidation source".into(),
-                    )));
-                }
-                let mut bytes = [0; 4];
-                let observation = backing
-                    .read_executable(&guard, page_offset(pc), &mut bytes)
-                    .map_err(|error| {
-                        fail(InstructionFetchFaultReason::Memory(
-                            error.to_string().into(),
-                        ))
-                    })?;
-                let observation = match observation {
-                    ExecutableRead::Copied(observation) => observation,
-                    ExecutableRead::NeedsTracking => {
-                        needs_tracking = true;
-                        return Err(fail(InstructionFetchFaultReason::Memory(
-                            "executable page requires tracking rendezvous".into(),
-                        )));
-                    }
-                    ExecutableRead::NeedsReconciliation => {
-                        reconcile = Some(backing.clone());
-                        return Err(fail(InstructionFetchFaultReason::Memory(
-                            "executable page requires device reconciliation".into(),
-                        )));
-                    }
-                };
-                let dependency = CodePageDependency {
-                    page: mapping.physical_page,
-                    mapping_generation: mapping.mapping_generation,
-                };
-                let address = page_address(virtual_page(pc));
-                if !pages.iter().any(|page: &Page| page.address == address) {
-                    pages.push(Page {
-                        address,
-                        dependency,
-                        stamp: Stamp::Canonical(observation),
-                    });
-                }
-                Ok(FetchedCode {
-                    bits: u32::from_le_bytes(bytes),
-                    dependencies: CodeDependencies::one(dependency),
-                })
-            });
-            let cursor = self.invalidation_cursor();
-            // Arming observers changes host protections, not executable bytes.
-            if arm_tracking && !pages.is_empty() {
-                guard.commit();
-            }
-            drop(inner);
-            drop(guard);
-            if needs_tracking {
-                // No lock/lease survives into the engine callback. Restart the
-                // entire bounded copy, never combine words from two captures.
-                arm_tracking = true;
-                continue;
-            }
-            if let Some(backing) = reconcile {
-                // Visibility callbacks can wait for devices or take the gate.
-                // Never invoke them while holding capture/mapping protection.
-                if let Err(error) = backing.prepare_cpu_access() {
-                    let mut fault = fault.unwrap();
-                    fault.reason = InstructionFetchFaultReason::Memory(error.to_string().into());
-                    return super::InstructionImage {
-                        space,
-                        start,
-                        words,
-                        fault: Some(fault),
-                        pages,
-                        cursor,
-                        owner: self.invalidations.clone(),
-                    };
-                }
-                continue;
-            }
-            return super::InstructionImage {
-                space,
-                start,
-                words,
-                fault,
-                pages,
-                cursor,
-                owner: self.invalidations.clone(),
-            };
-        }
-    }
-
-    fn image_is_current(&self, image: &super::InstructionImage) -> bool {
-        let inner = self.lock_inner();
-        Arc::ptr_eq(&self.invalidations, &image.owner)
-            && image.pages.iter().all(|page| {
-                let Some(mapping) = inner.mapping_at(image.space, page.address) else {
-                    return false;
-                };
-                let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
-                else {
-                    return false;
-                };
-                mapping.permissions.contains(MemoryPermissions::EXECUTE)
-                    && mapping.physical_page == page.dependency.page
-                    && mapping.mapping_generation == page.dependency.mapping_generation
-                    && page.stamp
-                        == super::capture::Stamp::Canonical(backing.executable_observation())
-            })
-    }
-}
-
 impl InstructionMemory for ExecutionMemory {
-    fn code_page_span(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<CodePageSpan, InstructionFetchFault> {
-        let page_start = page_address(virtual_page(address));
-        let inner = self.lock_inner();
-        let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
-            InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::Unmapped,
-            )
-        })?;
-        if !mapping.permissions.contains(MemoryPermissions::EXECUTE) {
-            return Err(InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::ExecutePermissionDenied,
-            ));
-        }
-        let end_exclusive = page_start.checked_add(SYNTHETIC_PAGE_SIZE as u64);
-        Ok(CodePageSpan::containing(page_start, end_exclusive, address)
-            .expect("production page arithmetic contains its source address"))
-    }
-
     fn fetch32(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
-        let (bytes, dependencies) = self.fetch::<4>(address_space, address)?;
-        Ok(FetchedCode {
-            bits: u32::from_le_bytes(bytes),
-            dependencies,
-        })
+    ) -> Result<FetchedInstruction, InstructionFetchFault> {
+        self.fetch32_impl(address_space, address, true)
+            .map(|word| word.expect("blocking instruction fetch resolves visibility"))
     }
 }
 
@@ -2616,7 +2584,6 @@ fn repair_direct_page(
     // lease. Never hold the mapping mutex while entering a backing-page
     // transition; mapping/protection revalidation reacquires it afterwards.
     drop(inner);
-    let visibility_before = backing.visibility_state();
     let transition = match kind {
         DataAccessKind::Read => backing.prepare_cpu_access(),
         DataAccessKind::Write => backing.resolve_direct_write_fault().map(|_| ()),
@@ -2676,7 +2643,7 @@ fn repair_direct_page(
         if !published {
             DirectFaultResolution::Fatal(
                 format!(
-                    "eligible direct RAM did not publish the required host protection: address={address:?} protection={protection:?} visibility_before={visibility_before:?}"
+                    "eligible direct RAM did not publish the required host protection: address={address:?} protection={protection:?} visibility={:?}", backing.visibility_state()
                 )
                 .into_boxed_str(),
             )
@@ -2819,26 +2786,8 @@ impl CpuMemory for ExecutionMemory {
         if resolved.region == MemoryRegionKind::Device {
             return DirectFaultResolution::Cold;
         }
-        // Check the complete subaccess before changing protection: report a
-        // second-page guest fault at its first failing byte. At most two pages
-        // are touched by a supported native access.
-        let pages = [
-            Some((address, resolved.first)),
-            resolved.second.map(|mapping| {
-                (
-                    address.checked_add(resolved.first_bytes as u64).unwrap(),
-                    mapping,
-                )
-            }),
-        ];
         drop(inner);
-        for (address, mapping) in pages.into_iter().flatten() {
-            match repair_direct_page(self, address_space, address, kind, mapping) {
-                DirectFaultResolution::Retry => {}
-                other => return other,
-            }
-        }
-        DirectFaultResolution::Retry
+        self.repair_resolved_direct_access(address_space, address, kind, resolved)
     }
 
     fn read(
@@ -3087,22 +3036,6 @@ impl CpuMemory for ExecutionMemory {
         address: Option<GuestVirtualAddress>,
     ) -> Result<(), DataAccessFault> {
         if kind == super::CacheMaintenanceKind::InstructionInvalidate && address.is_none() {
-            // System completion must have released its own execution epoch and
-            // memory lease before this rendezvous. Publish the stream only once
-            // roots/unlinks are drained, and before admission can reopen.
-            let _transition = self
-                .execution_gate
-                .acquire_code_invalidation(|| {
-                    vec![MemoryInvalidationKind::InstructionCache { address_space }]
-                })
-                .map_err(|error| {
-                    DataAccessFault::new(
-                        address_space,
-                        GuestVirtualAddress::MIN,
-                        DataAccessKind::Read,
-                        DataAccessFaultReason::HostBacking(error.to_string().into()),
-                    )
-                })?;
             self.invalidations
                 .reserve(MemoryInvalidationKind::InstructionCache { address_space })
                 .map_err(|reason| {
@@ -3125,39 +3058,6 @@ impl CpuMemory for ExecutionMemory {
             )
         })?;
         'resolve: loop {
-            let _transition = if kind == super::CacheMaintenanceKind::InstructionInvalidate {
-                self.execution_gate
-                    .acquire_code_invalidation(|| {
-                        // A VA invalidate names its current physical page, including
-                        // every executable alias. Discovery cannot race a remapping or
-                        // capture, and holds no mapping mutex during the engine callback.
-                        let inner = self.lock_inner();
-                        inner
-                            .mapping_at(address_space, address)
-                            .filter(|mapping| {
-                                matches!(
-                                    inner.page(mapping.physical_slot),
-                                    Some(ExecutionPhysicalPage::Ram(_))
-                                )
-                            })
-                            .map(|mapping| MemoryInvalidationKind::ExecutableContent {
-                                first: mapping.physical_page,
-                                second: None,
-                            })
-                            .into_iter()
-                            .collect()
-                    })
-                    .map_err(|error| {
-                        DataAccessFault::new(
-                            address_space,
-                            address,
-                            DataAccessKind::Read,
-                            DataAccessFaultReason::HostBacking(error.to_string().into()),
-                        )
-                    })?
-            } else {
-                None
-            };
             let inner = self.lock_inner();
             let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
                 DataAccessFault::new(
@@ -3572,13 +3472,7 @@ impl ProcessMemory for ExecutionMemory {
         let old_end_page = old_range.end;
         let new_end_page = new_range.end;
         let backing_store = self.backing_store.clone();
-        let mut mutation = self
-            .begin_mapping_mutation(&[MemoryInvalidationKind::Mapping {
-                address_space,
-                start: page_address(old_end_page.min(new_end_page)),
-                size: old_size.abs_diff(new_size),
-            }])
-            .map_err(|cause| error(start, MemoryMappingErrorReason::ExecutionMutation(cause)))?;
+        let mut mutation = self.execution_gate.acquire_exclusive();
         let mut inner = self.lock_inner();
         if matches!(
             inner.backends.get(&address_space),
@@ -3734,20 +3628,7 @@ impl ProcessMemory for ExecutionMemory {
             return Err(error(source, MemoryAliasErrorReason::InvalidRange));
         }
 
-        let mut mutation = self
-            .begin_mapping_mutation(&[
-                MemoryInvalidationKind::Mapping {
-                    address_space,
-                    start: source,
-                    size,
-                },
-                MemoryInvalidationKind::Mapping {
-                    address_space,
-                    start: destination,
-                    size,
-                },
-            ])
-            .map_err(|cause| error(source, MemoryAliasErrorReason::ExecutionMutation(cause)))?;
+        let mut mutation = self.execution_gate.acquire_exclusive();
         let mut inner = self.lock_inner();
         if matches!(
             inner.backends.get(&address_space),
@@ -3873,20 +3754,7 @@ impl ProcessMemory for ExecutionMemory {
             return Err(error(source, MemoryAliasErrorReason::InvalidRange));
         }
 
-        let mut mutation = self
-            .begin_mapping_mutation(&[
-                MemoryInvalidationKind::Mapping {
-                    address_space,
-                    start: source,
-                    size,
-                },
-                MemoryInvalidationKind::Mapping {
-                    address_space,
-                    start: destination,
-                    size,
-                },
-            ])
-            .map_err(|cause| error(source, MemoryAliasErrorReason::ExecutionMutation(cause)))?;
+        let mut mutation = self.execution_gate.acquire_exclusive();
         let mut inner = self.lock_inner();
         if matches!(
             inner.backends.get(&address_space),
@@ -4009,13 +3877,7 @@ impl ProcessMemory for ExecutionMemory {
                 MemoryProtectionErrorReason::UnsupportedPermissions,
             ));
         }
-        let mut mutation = self
-            .begin_mapping_mutation(&[MemoryInvalidationKind::Mapping {
-                address_space,
-                start,
-                size,
-            }])
-            .map_err(|cause| error(start, MemoryProtectionErrorReason::ExecutionMutation(cause)))?;
+        let mut mutation = self.execution_gate.acquire_exclusive();
         let mut inner = self.lock_inner();
         for page in range.first..range.end {
             let Some(mapping) = inner.mappings.get(address_space, page) else {
@@ -4082,13 +3944,7 @@ impl ProcessMemory for ExecutionMemory {
         if masked_attributes(MemoryAttributes::NONE, mask, value).is_none() {
             return Err(error(start, MemoryProtectionErrorReason::InvalidRange));
         }
-        let mut mutation = self
-            .begin_mapping_mutation(&[MemoryInvalidationKind::Mapping {
-                address_space,
-                start,
-                size,
-            }])
-            .map_err(|cause| error(start, MemoryProtectionErrorReason::ExecutionMutation(cause)))?;
+        let mut mutation = self.execution_gate.acquire_exclusive();
         let mut inner = self.lock_inner();
         for page in range.first..range.end {
             if inner.mappings.get(address_space, page).is_none() {
@@ -4406,7 +4262,7 @@ mod tests {
     }
 
     impl VisibilityCoordinator for DeviceWriteback {
-        fn make_device_visible(
+        fn cache_cpu_page(
             &self,
             _request: DeviceVisibilityRequest,
             _canonical_bytes: &[u8],
@@ -4635,12 +4491,16 @@ mod tests {
             DeviceVisibilityPoint::new(12),
         )
         .unwrap();
-        retained
-            .prepare_device_access(declaration, Arc::clone(&coordinator))
-            .unwrap();
-        retained
-            .publish_device_write(declaration, Arc::clone(&coordinator))
-            .unwrap();
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        nixe_memory::CanonicalBackingRange::publish_device_writes(
+            [(&retained, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
         assert!(matches!(
             retained.segments()[0].visibility_state(),
             VisibilityState::GpuNewer { .. }
@@ -4665,12 +4525,16 @@ mod tests {
             DeviceVisibilityPoint::new(14),
         )
         .unwrap();
-        retained
-            .prepare_device_access(second_write, Arc::clone(&coordinator))
-            .unwrap();
-        retained
-            .publish_device_write(second_write, coordinator)
-            .unwrap();
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, second_write)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        nixe_memory::CanonicalBackingRange::publish_device_writes(
+            [(&retained, second_write)],
+            coordinator,
+        )
+        .unwrap();
         memory
             .write(
                 space,
@@ -4719,12 +4583,16 @@ mod tests {
             DeviceVisibilityPoint::new(21),
         )
         .unwrap();
-        retained
-            .prepare_device_access(declaration, Arc::clone(&coordinator))
-            .unwrap();
-        retained
-            .publish_device_write(declaration, coordinator)
-            .unwrap();
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        nixe_memory::CanonicalBackingRange::publish_device_writes(
+            [(&retained, declaration)],
+            coordinator,
+        )
+        .unwrap();
 
         for _ in 0..2 {
             assert_eq!(
@@ -4774,12 +4642,16 @@ mod tests {
             DeviceVisibilityPoint::new(31),
         )
         .unwrap();
-        retained
-            .prepare_device_access(declaration, Arc::clone(&coordinator))
-            .unwrap();
-        retained
-            .publish_device_write(declaration, coordinator)
-            .unwrap();
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        nixe_memory::CanonicalBackingRange::publish_device_writes(
+            [(&retained, declaration)],
+            coordinator,
+        )
+        .unwrap();
 
         let mut records = Vec::new();
         memory
@@ -4833,12 +4705,16 @@ mod tests {
             DeviceVisibilityPoint::new(21),
         )
         .unwrap();
-        retained
-            .prepare_device_access(declaration, Arc::clone(&coordinator))
-            .unwrap();
-        retained
-            .publish_device_write(declaration, coordinator)
-            .unwrap();
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        nixe_memory::CanonicalBackingRange::publish_device_writes(
+            [(&retained, declaration)],
+            coordinator,
+        )
+        .unwrap();
 
         {
             let _lease = memory.acquire_execution_lease();
@@ -4957,7 +4833,7 @@ mod tests {
         use crate::memory::{MemoryAccessSize, MemoryOrdering};
         struct RemapOnDownload(std::sync::Weak<ExecutionMemory>);
         impl VisibilityCoordinator for RemapOnDownload {
-            fn make_device_visible(
+            fn cache_cpu_page(
                 &self,
                 _: DeviceVisibilityRequest,
                 _: &[u8],
@@ -5025,12 +4901,16 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        retained
-            .prepare_device_access(declaration, coordinator.clone())
-            .unwrap();
-        retained
-            .publish_device_write(declaration, coordinator)
-            .unwrap();
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, declaration)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        nixe_memory::CanonicalBackingRange::publish_device_writes(
+            [(&retained, declaration)],
+            coordinator,
+        )
+        .unwrap();
         let access = MemoryAccess::new(
             MemoryAccessSize::Word,
             MemoryAlignment::Natural,
@@ -5452,12 +5332,16 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        retained
-            .prepare_device_access(declaration, Arc::clone(&coordinator))
-            .unwrap();
-        retained
-            .publish_device_write(declaration, coordinator)
-            .unwrap();
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        nixe_memory::CanonicalBackingRange::publish_device_writes(
+            [(&retained, declaration)],
+            coordinator,
+        )
+        .unwrap();
         assert_eq!(
             memory.direct_protection_at(space, first),
             Some(DirectProtection::None)
@@ -5632,6 +5516,56 @@ mod tests {
             memory
                 .mapping_info(AddressSpaceId::new(1), address)
                 .is_none()
+        );
+    }
+    #[test]
+    fn alias_ranges_use_current_mappings_and_exclude_other_address_spaces() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(7);
+        let other = AddressSpaceId::new(8);
+        let page = GuestPhysicalPageId::new(1);
+        assert!(memory.add_ram_page(page));
+        for (space, address, permissions) in [
+            (space, 0x1000, MemoryPermissions::EXECUTE),
+            (space, 0x3000, MemoryPermissions::READ_WRITE),
+            (other, 0x5000, MemoryPermissions::READ_EXECUTE),
+        ] {
+            assert!(memory.map_page(space, GuestVirtualAddress::new(address), page, permissions));
+        }
+        let mut ranges = Vec::new();
+        {
+            let _lease = memory.acquire_execution_lease();
+            memory.append_mapped_alias_ranges(
+                space,
+                &[page, GuestPhysicalPageId::new(999)],
+                &mut ranges,
+            );
+        }
+        assert_eq!(
+            ranges,
+            vec![
+                (GuestVirtualAddress::new(0x1000), 4096),
+                (GuestVirtualAddress::new(0x3000), 4096)
+            ]
+        );
+        memory
+            .set_permissions(
+                space,
+                GuestVirtualAddress::new(0x1000),
+                4096,
+                MemoryPermissions::NONE,
+            )
+            .unwrap();
+        ranges.clear();
+        let _lease = memory.acquire_execution_lease();
+        memory.append_mapped_alias_ranges(space, &[page], &mut ranges);
+        // Aliases are mapping facts, not a second executable-code cache index.
+        assert_eq!(
+            ranges,
+            vec![
+                (GuestVirtualAddress::new(0x1000), 4096),
+                (GuestVirtualAddress::new(0x3000), 4096)
+            ]
         );
     }
 }

@@ -883,7 +883,7 @@ impl MaxwellThreeDDescriptorRead {
         }
         let mut bytes = [0; 32];
         staged_writes
-            .read_staged(&self.range, 0, &mut bytes[..usize::from(self.size)])
+            .read_overlay(&self.range, 0, &mut bytes[..usize::from(self.size)])
             .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?;
         Ok(bytes[..usize::from(self.size)] == self.bytes[..usize::from(self.size)])
     }
@@ -2724,7 +2724,7 @@ fn read_backing_bytes(
 ) -> Result<(), MaxwellThreeDResourceError> {
     if let Some(staged_writes) = staged_writes {
         staged_writes
-            .read_staged(range, offset, bytes)
+            .read_overlay(range, offset, bytes)
             .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?;
     } else {
         range
@@ -3815,7 +3815,8 @@ mod tests {
         ));
 
         // Failure to arm is not a usable resource without a dependency.
-        first.backing.range().invalidate_visibility().unwrap();
+        nixe_memory::CanonicalBackingRange::invalidate_visibility_ranges([first.backing.range()])
+            .unwrap();
         let error = MaxwellThreeDRetainedBackingCache::default()
             .retain(&source, role)
             .unwrap_err();

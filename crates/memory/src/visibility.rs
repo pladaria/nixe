@@ -58,12 +58,16 @@ pub struct CpuVisibilityRequest {
 
 /// Host-independent boundary which performs residency and visibility work.
 ///
-/// Implementations may copy through staging memory, flush or invalidate a
-/// shared mapping, wait for host completion, or prove that data movement is a
-/// no-op. Concrete graphics API types remain behind this interface.
+/// CPU-page caching is a bounded local operation. CPU-demand resolution may
+/// wait for host completion and must run outside execution guards and locks.
+/// Concrete graphics API types remain behind this interface.
 pub trait VisibilityCoordinator: Send + Sync {
-    /// Makes the supplied complete canonical page visible to a device.
-    fn make_device_visible(
+    /// Retains complete CPU bytes for subsequent device work. This local cache
+    /// operation must not submit/wait for GPU work, request CPU visibility,
+    /// remap memory, acquire execution gates, or reenter canonical pages.
+    /// Callers may hold execution exclusion and canonical page locks.
+    /// Actual resource transfers happen later, outside those guards.
+    fn cache_cpu_page(
         &self,
         request: DeviceVisibilityRequest,
         canonical_bytes: &[u8],
@@ -99,7 +103,7 @@ impl std::error::Error for VisibilityCoordinatorError {}
 /// Failure to establish or publish a canonical visibility transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VisibilityError {
-    ExecutionMutation(crate::ExecutionMutationError),
+    IncompatibleDeclarations,
     DeclarationDoesNotWrite,
     ConflictingAccess,
     InvalidState,
@@ -116,9 +120,8 @@ pub enum VisibilityError {
 impl Display for VisibilityError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ExecutionMutation(error) => {
-                write!(formatter, "execution coordination failed: {error}")
-            }
+            Self::IncompatibleDeclarations => formatter
+                .write_str("device access batch crosses an incompatible visibility boundary"),
             Self::DeclarationDoesNotWrite => {
                 formatter.write_str("device access declaration does not write")
             }

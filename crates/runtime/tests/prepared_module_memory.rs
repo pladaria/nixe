@@ -330,7 +330,7 @@ fn collisions_and_every_backend_stage_roll_back_the_complete_module() {
     let dependency_before = occupied
         .fetch32(SPACE, GuestVirtualAddress::new(module.entry_address()))
         .unwrap()
-        .dependencies;
+        .physical_page;
     let collision = install_prepared_module(&mut occupied, SPACE, &module).unwrap_err();
     assert_eq!(collision.stage(), InstallStage::Preflight);
     assert_eq!(occupied.physical_page_count(), pages_before);
@@ -338,7 +338,7 @@ fn collisions_and_every_backend_stage_roll_back_the_complete_module() {
         occupied
             .fetch32(SPACE, GuestVirtualAddress::new(module.entry_address()))
             .unwrap()
-            .dependencies,
+            .physical_page,
         dependency_before
     );
 

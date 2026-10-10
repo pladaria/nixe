@@ -39,12 +39,12 @@ use nixe_gpu::{
     VertexAttribute, VertexBufferLayout, VertexComponentCount, VertexComponentWidth, VertexFormat,
     VertexStepMode, ViewportTransform,
 };
-use nixe_memory::CanonicalCpuWriteDependency;
+use nixe_memory::{CanonicalCpuWriteDependency, CanonicalWriteBatch};
 
 use crate::MaxwellMethodSource;
 use crate::shader::{
     MaxwellShaderTranslationError, MaxwellShaderTranslationInputs,
-    MaxwellShaderTranslationSourceKey, MaxwellStagedShaderWrite, MaxwellTranslatedShaderProgram,
+    MaxwellShaderTranslationSourceKey, MaxwellTranslatedShaderProgram,
     prepare_maxwell_shader_translation_inputs_from_source,
     prepare_maxwell_shader_translation_source, translate_prepared_maxwell_shader_programs,
 };
@@ -1168,8 +1168,9 @@ impl MaxwellLoweringCache {
 
     pub(crate) fn resolve_shader_translation_source(
         &mut self,
-        source: MaxwellShaderTranslationSourceKey<'_>,
+        source: MaxwellShaderTranslationSourceKey,
         address_space: &crate::MaxwellGpuAddressSpace,
+        staged_writes: &CanonicalWriteBatch,
     ) -> Result<Arc<[MaxwellTranslatedShaderProgram]>, MaxwellShaderTranslationError> {
         let source_fingerprint = source.fingerprint();
         if let Some(record) = self.shader_translation_sources.get(source_fingerprint) {
@@ -1178,7 +1179,9 @@ impl MaxwellLoweringCache {
                 source.matches(&record.source),
                 "XXH3-128 collision or incomplete shader-source cache key"
             );
-            if record.inputs.source_is_current(address_space) {
+            if record.inputs.source_is_current(address_space)
+                && record.inputs.staged_writes_are_irrelevant(staged_writes)
+            {
                 return Ok(Arc::clone(&record.programs));
             }
         }
@@ -1188,7 +1191,11 @@ impl MaxwellLoweringCache {
         );
 
         let source = source.materialize();
-        let inputs = prepare_maxwell_shader_translation_inputs_from_source(&source, address_space)?;
+        let inputs = prepare_maxwell_shader_translation_inputs_from_source(
+            &source,
+            address_space,
+            staged_writes,
+        )?;
         let programs = self.resolve_shader_translation_inputs(inputs.clone())?;
         self.shader_translation_sources.replace(
             source_fingerprint,
@@ -1212,7 +1219,7 @@ impl MaxwellLoweringCache {
     pub(crate) fn resolve_shader_translation_for_state(
         &mut self,
         state: &MaxwellThreeDState,
-        staged_writes: &[MaxwellStagedShaderWrite],
+        staged_writes: &CanonicalWriteBatch,
         address_space: &crate::MaxwellGpuAddressSpace,
     ) -> Result<Arc<[MaxwellTranslatedShaderProgram]>, MaxwellShaderTranslationError> {
         if let Some(record) = &self.shader_state
@@ -1223,9 +1230,10 @@ impl MaxwellLoweringCache {
             return Ok(Arc::clone(&record.programs));
         }
 
-        let source = prepare_maxwell_shader_translation_source(state, staged_writes)?;
+        let source = prepare_maxwell_shader_translation_source(state)?;
         let fingerprint = source.fingerprint();
-        let programs = self.resolve_shader_translation_source(source, address_space)?;
+        let programs =
+            self.resolve_shader_translation_source(source, address_space, staged_writes)?;
         let inputs = self
             .shader_translation_sources
             .get(fingerprint)
@@ -1244,7 +1252,7 @@ impl MaxwellLoweringCache {
     pub(crate) fn reuse_translated_shaders_for_state(
         &self,
         state: &MaxwellThreeDState,
-        staged_writes: &[MaxwellStagedShaderWrite],
+        staged_writes: &CanonicalWriteBatch,
         address_space: &crate::MaxwellGpuAddressSpace,
     ) -> Option<Arc<MaxwellThreeDTranslatedShaders>> {
         let record = self.shader_state.as_ref()?;
@@ -3128,6 +3136,7 @@ fn prepare_resources(
                 value.allocation_description(),
                 value.view().backing().clone(),
                 value.shared_mappings(),
+                false,
                 cache,
                 creations,
                 invalidations,
@@ -3216,7 +3225,13 @@ fn prepare_resources(
             continue;
         }
         let key = view_key(resource);
-        retire_overlapping_views(&key, result.iter().flatten().copied(), cache, invalidations);
+        retire_overlapping_views(
+            &key,
+            true,
+            result.iter().flatten().copied(),
+            cache,
+            invalidations,
+        );
         let materialization = if !image.guest_layout().requires_materialization() {
             ViewMaterialization::Direct
         } else if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget {
@@ -3284,6 +3299,7 @@ fn prepare_resources(
 
 fn retire_overlapping_views(
     key: &ViewKey,
+    writable: bool,
     retained: impl Iterator<Item = ResourceDependency> + Clone,
     cache: &mut MaxwellLoweringCache,
     invalidations: &mut Vec<ResourceDependency>,
@@ -3292,7 +3308,15 @@ fn retire_overlapping_views(
         .views
         .iter()
         .filter(|record| {
-            record.key.overlaps(key)
+            // Read-only slices may coexist: each submission uploads the
+            // current canonical input before using its own host view. Retiring
+            // them on every overlapping slice destroys reuse of guest rings.
+            // GPU-written views and incoming writable views retain the alias
+            // reconciliation path; the LRU still bounds read-only metadata.
+            (writable
+                || record.write_revision != 0
+                || !matches!(record.key, ViewKey::Buffer { .. }))
+                && record.key.overlaps(key)
                 && !retained
                     .clone()
                     .any(|dependency| dependency == record.dependency)
@@ -3390,9 +3414,13 @@ fn trim_read_only_buffer_views(
         .map(|record| (record.last_used, record.dependency))
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
+    // Retire a small LRU batch, keeping the same upper bound. Evicting
+    // exactly one slice sorts the whole cache again on every ring-buffer
+    // draw; leave room for upcoming slices to amortize that bookkeeping.
+    let retire_count = (count - limit).max(limit / 8);
     let retired = candidates
         .into_iter()
-        .take(count - limit)
+        .take(retire_count)
         .map(|(_, dependency)| dependency)
         .collect::<Vec<_>>();
     retire_view_dependencies(&retired, cache, invalidations);

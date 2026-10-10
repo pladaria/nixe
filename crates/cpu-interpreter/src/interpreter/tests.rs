@@ -392,10 +392,10 @@ fn a64_prefetch_does_not_access_unmapped_memory_or_modify_registers() {
         let mut state = A64State::default();
         state.set_pc(0x1000);
         state.set_nzcv(nixe_cpu::state::a64::Nzcv::from_bits(0xa000_0000));
-        for (i, value) in state.general_register_storage_mut().iter_mut().enumerate() {
-            *value = u64::MAX - i as u64;
+        for i in 0..31 {
+            state.write_x(x(i), u64::MAX - u64::from(i));
         }
-        *state.stack_pointer_storage_mut() = u64::MAX;
+        state.write_x(A64Register::StackPointer, u64::MAX);
         let mut expected = state.clone();
         expected.set_pc(0x1004);
         assert_eq!(
@@ -3074,14 +3074,14 @@ fn a64_interleaved_load_fault_retains_completed_lanes_and_clears_upper_bits() {
                     assert!(state.set_vector(register, u128::MAX));
                 }
                 let base = 0x2000 - (completed * bytes) as u64;
-                state.general_register_storage_mut()[1] = base;
+                state.write_x(x(1), base);
                 let word = 0x0cdf_003f | (opcode << 12) | (size << 10);
                 assert!(matches!(
                     execute_one_with_context(context, &mut state, word).unwrap(),
                     InstructionStep::Exit(CpuExit::DataFault { .. })
                 ));
                 assert_eq!(state.pc(), 0x100);
-                assert_eq!(state.general_register_storage_mut()[1], base);
+                assert_eq!(state.read_x(x(1)), base);
                 let mut expected = [u128::MAX; 32];
                 for index in 0..completed {
                     let register = (31 + index % count) & 31;

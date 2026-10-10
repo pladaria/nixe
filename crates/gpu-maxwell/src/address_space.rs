@@ -368,6 +368,22 @@ pub struct MaxwellResolvedRange {
 }
 
 impl MaxwellResolvedRange {
+    /// Extend an ordered inline upload within its already retained mapping.
+    /// The planner borrows the address space immutably for its whole delivery,
+    /// so adjacent words need no new VA lookup or mapping allocation.
+    pub(crate) fn append_inline_word(&mut self, address: u64) -> Option<()> {
+        if self.offset.get().checked_add(self.size)? != address || self.segments.len() != 1 {
+            return None;
+        }
+        let segment = &mut self.segments[0];
+        if address.checked_add(4)? > segment.mapping.end().ok()? {
+            return None;
+        }
+        segment.size += 4;
+        self.size += 4;
+        Some(())
+    }
+
     #[must_use]
     pub const fn address_space(&self) -> MaxwellAddressSpaceId {
         self.address_space
@@ -2300,7 +2316,7 @@ mod tests {
                 mapping: Some(sparse_mapping(2, second_backing)),
             }])
             .unwrap();
-        first_backing.invalidate_visibility().unwrap();
+        nixe_memory::CanonicalBackingRange::invalidate_visibility_ranges([&first_backing]).unwrap();
         assert!(matches!(
             address_space.read_resolved(&stale, &mut [0]),
             Err(MaxwellGpuAccessError::StaleMapping { .. })

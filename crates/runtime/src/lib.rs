@@ -67,3 +67,6 @@ pub use process::{
 };
 pub use process_mount::ProcessMountNamespace;
 pub use virtual_time::{VirtualClock, VirtualClockMode};
+
+/// Exclusive saved/native register owner carried by guest scheduler leases.
+pub use nixe_cpu_jit::ThreadState as GuestCpuState;

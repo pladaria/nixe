@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use nixe_cpu::state::ThreadCpuState;
+use crate::GuestCpuState;
 use nixe_memory::GuestVirtualAddress;
 use nixe_scheduler::{CoreSet, GuestThreadId, VirtualCpuId};
 
@@ -51,9 +51,7 @@ pub struct GuestThread {
     pub(crate) id: GuestThreadId,
     pub(crate) object: ThreadObject,
     pub(crate) exit: Option<ThreadExit>,
-    pub(crate) state: Option<ThreadCpuState>,
-    /// Moves with architectural state, not with the worker/vCPU's JIT cache.
-    pub(crate) jit_returns: Option<Box<nixe_cpu_jit::ReturnStack>>,
+    pub(crate) state: Option<GuestCpuState>,
     pub handle: u32,
     pub stack_bottom: GuestVirtualAddress,
     pub stack_top: GuestVirtualAddress,
@@ -83,38 +81,31 @@ impl GuestThread {
         self.exit
     }
 
+    /// Returns the current exclusive register owner. It may access a stopped
+    /// native context, but never saved bytes that precede its execution.
+    /// Running leases and unsynchronized failures make it unavailable.
     #[must_use]
-    pub fn state(&self) -> &ThreadCpuState {
-        self.state
-            .as_ref()
-            .expect("thread state is unavailable only while its scheduler lease runs")
+    pub fn state(&self) -> &GuestCpuState {
+        self.state.as_ref().expect(
+            "thread state is unavailable during execution or after an unsynchronized failure",
+        )
     }
 
-    pub fn state_mut(&mut self) -> &mut ThreadCpuState {
-        self.state
-            .as_mut()
-            .expect("thread state is unavailable only while its scheduler lease runs")
+    pub fn state_mut(&mut self) -> &mut GuestCpuState {
+        self.state.as_mut().expect(
+            "thread state is unavailable during execution or after an unsynchronized failure",
+        )
     }
 
-    pub(crate) fn take_state(
-        &mut self,
-    ) -> Option<(ThreadCpuState, Option<Box<nixe_cpu_jit::ReturnStack>>)> {
-        self.state
-            .take()
-            .map(|state| (state, self.jit_returns.take()))
+    pub(crate) fn take_state(&mut self) -> Option<GuestCpuState> {
+        self.state.take()
     }
 
-    pub(crate) fn restore_state(
-        &mut self,
-        state: ThreadCpuState,
-        returns: Option<Box<nixe_cpu_jit::ReturnStack>>,
-    ) {
+    pub(crate) fn restore_state(&mut self, state: GuestCpuState) {
         assert!(
             self.state.replace(state).is_none(),
             "a scheduler lease restores thread state exactly once"
         );
-        assert!(self.jit_returns.is_none());
-        self.jit_returns = returns;
     }
 }
 
@@ -187,6 +178,9 @@ impl ThreadTable {
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&GuestThreadId, &GuestThread)> {
         self.entries.iter()
     }
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&GuestThreadId, &mut GuestThread)> {
+        self.entries.iter_mut()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,8 +208,7 @@ mod tests {
             id: GuestThreadId::new(id),
             object: ThreadObject::new(id),
             exit: None,
-            state: Some(ThreadCpuState::default()),
-            jit_returns: None,
+            state: Some(GuestCpuState::default()),
             handle: 0,
             stack_bottom: GuestVirtualAddress::new(0),
             stack_top: GuestVirtualAddress::new(0),
@@ -226,25 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn architectural_and_prediction_owners_are_taken_and_restored_together() {
+    fn architectural_state_has_one_scheduler_owner() {
         let mut guest = thread(7);
-        guest.jit_returns = Some(Box::default());
-        let original = std::ptr::from_ref(guest.jit_returns.as_deref().unwrap());
-        let copy = guest.clone();
-        assert_ne!(
-            std::ptr::from_ref(copy.jit_returns.as_deref().unwrap()),
-            original
-        );
-        let (state, returns) = guest.take_state().unwrap();
+        let original = guest.clone();
+        let state = guest.take_state().unwrap();
         assert!(guest.take_state().is_none());
-        assert!(guest.jit_returns.is_none());
-        assert_eq!(std::ptr::from_ref(returns.as_deref().unwrap()), original);
-        guest.restore_state(state, returns);
-        assert_eq!(
-            std::ptr::from_ref(guest.jit_returns.as_deref().unwrap()),
-            original
-        );
-        assert_eq!(guest, copy);
+        guest.restore_state(state);
+        assert_eq!(guest, original);
     }
 
     #[test]

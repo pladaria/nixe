@@ -10,6 +10,12 @@ use std::process::ExitCode;
 
 use nixe_config::{CpuBackendSelection, GuestLogsLevel};
 
+// The graphics workers allocate and release captured resources across threads.
+// Use a sharded heap for Rust allocations; native libraries keep their own ABI.
+// https://github.com/microsoft/mimalloc
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 enum Command {
     Input,
     List(commands::list::Arguments),

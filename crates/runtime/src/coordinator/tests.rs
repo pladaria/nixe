@@ -415,6 +415,177 @@ fn external_wakes_are_generation_safe_and_idempotent() {
 
 struct ResumeDispatcher;
 
+#[test]
+fn native_residency_preserves_real_worker_switches_blocking_results_and_migration() {
+    use crate::process::tests::synthetic_backend_instruction_process;
+    use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
+    let x0 = A64Register::General(A64GeneralRegister::new(0).unwrap());
+    let mut coordinator = RuntimeCoordinator::new(two_core_profile());
+    let process = coordinator
+        .register_process(
+            synthetic_backend_instruction_process(
+                1,
+                crate::CpuBackendConfig::Jit,
+                &[0xd4000021, 0x17ffffff],
+            ), // SVC #1; B back to SVC
+            ProcessRegistration {
+                priority: 44,
+                ideal_vcpu: Some(VirtualCpuId::new(7)),
+                affinity: coordinator
+                    .scheduler
+                    .profile()
+                    .core_set([VirtualCpuId::new(7)])
+                    .unwrap(),
+            },
+        )
+        .unwrap();
+    let main = coordinator.process(process).unwrap().main_thread_id();
+    let child = coordinator
+        .create_thread(
+            process,
+            ThreadCreateRequest {
+                ideal_vcpu: Some(VirtualCpuId::new(7)),
+                affinity: coordinator
+                    .scheduler
+                    .profile()
+                    .core_set([VirtualCpuId::new(7)])
+                    .unwrap(),
+                priority: 44,
+                ..valid_thread_request(&coordinator, process)
+            },
+        )
+        .unwrap()
+        .id;
+    let vector = |id: GuestThreadId| (u128::from(id.get()) << 96) | 0xfedcba9876543210;
+    for thread in [main, child] {
+        let state = coordinator
+            .process_mut(process)
+            .unwrap()
+            .thread_mut(thread)
+            .unwrap()
+            .state_mut();
+        state.write_x(x0, thread.get());
+        state.set_vector(31, vector(thread));
+    }
+    coordinator.start_thread(child.get()).unwrap();
+    let mut observed = BTreeSet::new();
+    let mut blocked = None;
+    for turn in 0..12 {
+        let execution = coordinator.run_next(8).unwrap().unwrap();
+        observed.insert(execution.lease.thread);
+        assert!(execution.report.context.is_none());
+        let state = coordinator
+            .process(process)
+            .unwrap()
+            .thread(execution.lease.thread)
+            .unwrap()
+            .state();
+        assert!(state.is_resident());
+        assert_eq!(state.vector(31), Some(vector(execution.lease.thread)));
+        if turn == 10 {
+            coordinator
+                .route_supervisor_call(
+                    execution.lease,
+                    &execution.report.stop,
+                    &mut SuspendDispatcher,
+                )
+                .unwrap();
+            let token = coordinator
+                .register_timed_wait(execution.lease.thread, None)
+                .unwrap();
+            blocked = Some((execution.lease.thread, token));
+        } else {
+            coordinator
+                .route_supervisor_call(
+                    execution.lease,
+                    &execution.report.stop,
+                    &mut ResumeDispatcher,
+                )
+                .unwrap();
+        }
+    }
+    assert_eq!(observed, BTreeSet::from([main, child]));
+    let (blocked, token) = blocked.unwrap();
+    let old_snapshot = coordinator.thread_cpu_state(blocked.get()).unwrap();
+    let state = coordinator
+        .process_mut(process)
+        .unwrap()
+        .thread_mut(blocked)
+        .unwrap()
+        .state_mut();
+    state.write_x(x0, 0xbeef); // The completion writes the actual current owner.
+    assert_eq!(old_snapshot.read_x(x0), blocked.get());
+    assert!(coordinator.cancel_wait(token).unwrap());
+    coordinator.set_thread_priority(blocked.get(), 0).unwrap();
+    let execution = coordinator.run_next(8).unwrap().unwrap();
+    assert_eq!(execution.lease.thread, blocked);
+    assert_eq!(
+        coordinator
+            .thread_cpu_state(blocked.get())
+            .unwrap()
+            .read_x(x0),
+        0xbeef
+    );
+    coordinator
+        .route_supervisor_call(
+            execution.lease,
+            &execution.report.stop,
+            &mut TerminateDispatcher(crate::ExceptionTerminationScope::CurrentThread),
+        )
+        .unwrap();
+
+    let remaining = if blocked == main { child } else { main };
+    coordinator
+        .migrate_thread(
+            remaining,
+            Some(VirtualCpuId::new(3)),
+            coordinator
+                .scheduler
+                .profile()
+                .core_set([VirtualCpuId::new(3)])
+                .unwrap(),
+        )
+        .unwrap();
+    let execution = coordinator.run_next(8).unwrap().unwrap();
+    assert_eq!(execution.lease.vcpu, VirtualCpuId::new(3));
+    assert_eq!(execution.lease.thread, remaining);
+    let snapshot = coordinator.thread_cpu_state(remaining.get()).unwrap();
+    assert_eq!(snapshot.vector(31), Some(vector(remaining)));
+    assert_eq!(snapshot.read_x(x0), remaining.get());
+    coordinator
+        .route_supervisor_call(
+            execution.lease,
+            &execution.report.stop,
+            &mut TerminateDispatcher(crate::ExceptionTerminationScope::Process),
+        )
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .process(process)
+            .unwrap()
+            .exit()
+            .unwrap()
+            .context
+            .as_ref()
+            .unwrap()
+            .x[0],
+        remaining.get()
+    );
+    coordinator.remove_process(process).unwrap();
+}
+
+struct SuspendDispatcher;
+impl crate::ExceptionDispatcher for SuspendDispatcher {
+    type Fault = &'static str;
+    fn dispatch(
+        &mut self,
+        _context: &mut crate::ExceptionDispatchContext<'_>,
+        _request: crate::ExceptionDispatchRequest,
+    ) -> crate::ExceptionDispatchOutcome<Self::Fault> {
+        crate::ExceptionDispatchOutcome::Suspend(crate::ExceptionResume::Next)
+    }
+}
+
 impl crate::ExceptionDispatcher for ResumeDispatcher {
     type Fault = &'static str;
 
@@ -1444,47 +1615,56 @@ fn host_termination_keeps_already_exited_guest_threads_terminal() {
 
 #[test]
 fn parallel_completion_returns_before_a_busy_core_and_quiescence_restores_its_state() {
-    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-        two_core_profile(),
-        crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
-        VcpuExecutionMode::Parallel,
-    )
-    .unwrap();
-    for (id, core, code) in [(1, 3, 0xd400_0021), (2, 7, 0x1400_0000)] {
-        coordinator
-            .register_process(
-                synthetic_instruction_process_for_coordinator(id, &[code]),
-                ProcessRegistration {
-                    priority: 44,
-                    ideal_vcpu: Some(VirtualCpuId::new(core)),
-                    affinity: coordinator
-                        .scheduler()
-                        .profile()
-                        .core_set([VirtualCpuId::new(core)])
-                        .unwrap(),
-                },
-            )
-            .unwrap();
+    for backend in [
+        crate::CpuBackendConfig::Interpreter,
+        crate::CpuBackendConfig::Jit,
+    ] {
+        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+            two_core_profile(),
+            crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
+            VcpuExecutionMode::Parallel,
+        )
+        .unwrap();
+        for (id, core, code) in [(1, 3, 0xd400_0021), (2, 7, 0x1400_0000)] {
+            coordinator
+                .register_process(
+                    crate::process::tests::synthetic_backend_instruction_process(
+                        id,
+                        backend.clone(),
+                        &[code],
+                    ),
+                    ProcessRegistration {
+                        priority: 44,
+                        ideal_vcpu: Some(VirtualCpuId::new(core)),
+                        affinity: coordinator
+                            .scheduler()
+                            .profile()
+                            .core_set([VirtualCpuId::new(core)])
+                            .unwrap(),
+                    },
+                )
+                .unwrap();
+        }
+        let completed = coordinator.run_parallel(1_000_000_000).unwrap().unwrap();
+        assert_eq!(completed.lease.vcpu, VirtualCpuId::new(3));
+        assert!(matches!(
+            completed.report.stop,
+            ExecutionStop::SupervisorCall { .. }
+        ));
+        let busy = coordinator.scheduler.active_leases().next().unwrap();
+        assert_eq!(busy.vcpu, VirtualCpuId::new(7));
+        assert_eq!(
+            coordinator.thread_cpu_state(busy.thread.get()),
+            Err(ThreadOperationError::InvalidState)
+        );
+        coordinator.quiesce().unwrap();
+        assert!(coordinator.scheduler.active_leases().next().is_none());
+        assert!(coordinator.thread_cpu_state(busy.thread.get()).is_ok());
+        let stopped = coordinator.run_parallel(1).unwrap().unwrap();
+        assert_eq!(stopped.lease, busy);
+        assert!(matches!(
+            stopped.report.stop,
+            ExecutionStop::Safepoint | ExecutionStop::BudgetExhausted
+        ));
     }
-    let completed = coordinator.run_parallel(1_000_000).unwrap().unwrap();
-    assert_eq!(completed.lease.vcpu, VirtualCpuId::new(3));
-    assert!(matches!(
-        completed.report.stop,
-        ExecutionStop::SupervisorCall { .. }
-    ));
-    let busy = coordinator.scheduler.active_leases().next().unwrap();
-    assert_eq!(busy.vcpu, VirtualCpuId::new(7));
-    assert_eq!(
-        coordinator.thread_cpu_state(busy.thread.get()),
-        Err(ThreadOperationError::InvalidState)
-    );
-    coordinator.quiesce().unwrap();
-    assert!(coordinator.scheduler.active_leases().next().is_none());
-    assert!(coordinator.thread_cpu_state(busy.thread.get()).is_ok());
-    let stopped = coordinator.run_parallel(1).unwrap().unwrap();
-    assert_eq!(stopped.lease, busy);
-    assert!(matches!(
-        stopped.report.stop,
-        ExecutionStop::Safepoint | ExecutionStop::BudgetExhausted
-    ));
 }

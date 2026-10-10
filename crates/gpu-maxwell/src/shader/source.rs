@@ -1,9 +1,8 @@
 //! Graphics shader source identity, immutable translation inputs, and cache dependencies.
 
 use super::binary::{
-    MAXWELL_SCHEDULE_BUNDLE_SIZE, MAXWELL_SHADER_PROGRAM_HEADER_SIZE, MAXWELL_SHADER_READ_LIMIT,
-    MaxwellShaderBinary, MaxwellShaderMemoryView, MaxwellStagedShaderWrite,
-    canonical_shader_writes, read_shader_binary, validate_program_header,
+    MAXWELL_SCHEDULE_BUNDLE_SIZE, MAXWELL_SHADER_PROGRAM_HEADER_SIZE, MaxwellShaderBinary,
+    MaxwellShaderMemoryView, read_shader_binary, validate_program_header,
 };
 use super::error::MaxwellShaderTranslationError;
 use super::interface::neutral_stage;
@@ -12,7 +11,7 @@ use crate::{
     MaxwellShaderStage, MaxwellThreeDState, MaxwellThreeDVertexNumericalType,
 };
 use nixe_gpu::{ShaderIoLocation, ShaderScalarType, ShaderStage};
-use nixe_memory::CanonicalCpuWriteDependency;
+use nixe_memory::{CanonicalCpuWriteDependency, CanonicalWriteBatch};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -63,14 +62,21 @@ impl MaxwellShaderTranslationInputs {
         })
     }
 
-    pub(crate) fn staged_writes_are_irrelevant(&self, writes: &[MaxwellStagedShaderWrite]) -> bool {
-        writes.iter().all(|write| {
-            self.programs.iter().all(|program| {
-                let binary = &program.binary;
-                let size = MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64
-                    + binary.bundles.len() as u64 * MAXWELL_SCHEDULE_BUNDLE_SIZE as u64;
-                let end = binary.address.saturating_add(size);
-                write.address.saturating_add(4) <= binary.address || write.address >= end
+    pub(crate) fn staged_writes_are_irrelevant(&self, writes: &CanonicalWriteBatch) -> bool {
+        self.programs.iter().all(|program| {
+            let binary = &program.binary;
+            let size = MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64
+                + binary.bundles.len() as u64 * MAXWELL_SCHEDULE_BUNDLE_SIZE as u64;
+            let end = binary.address.saturating_add(size);
+            binary.source_mappings.iter().all(|mapping| {
+                let start = binary.address.max(mapping.offset().get());
+                let end = end.min(mapping.offset().get().saturating_add(mapping.size()));
+                start >= end
+                    || writes.overlaps(
+                        mapping.backing(),
+                        mapping.backing_offset() + start - mapping.offset().get(),
+                        end - start,
+                    ) == Ok(false)
             })
         })
     }
@@ -81,7 +87,6 @@ pub(crate) struct MaxwellShaderTranslationSource {
     programs: Box<[MaxwellShaderSourceProgram]>,
     texture_constant_buffer_slot: Option<u8>,
     vertex_input_types: Box<[(ShaderIoLocation, ShaderScalarType)]>,
-    staged_writes: Box<[MaxwellStagedShaderWrite]>,
 }
 
 impl PartialEq for MaxwellShaderTranslationSource {
@@ -89,7 +94,6 @@ impl PartialEq for MaxwellShaderTranslationSource {
         self.programs == other.programs
             && self.texture_constant_buffer_slot == other.texture_constant_buffer_slot
             && self.vertex_input_types == other.vertex_input_types
-            && self.staged_writes == other.staged_writes
     }
 }
 
@@ -106,27 +110,22 @@ impl Hash for MaxwellShaderTranslationSource {
         for input in &self.vertex_input_types {
             input.hash(state);
         }
-        self.staged_writes.len().hash(state);
-        for write in &self.staged_writes {
-            write.hash(state);
-        }
     }
 }
 
 /// Allocation-free semantic lookup key for the frontend shader-source cache.
 /// Owned storage is materialized only after a miss or stale source snapshot.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MaxwellShaderTranslationSourceKey<'a> {
+pub(crate) struct MaxwellShaderTranslationSourceKey {
     programs: [Option<MaxwellShaderSourceProgram>; MAXWELL_PIPELINE_SHADER_COUNT],
     program_count: usize,
     texture_constant_buffer_slot: Option<u8>,
     vertex_input_types:
         [Option<(ShaderIoLocation, ShaderScalarType)>; MAXWELL_VERTEX_ATTRIBUTE_COUNT],
     vertex_input_count: usize,
-    staged_writes: &'a [MaxwellStagedShaderWrite],
 }
 
-impl MaxwellShaderTranslationSourceKey<'_> {
+impl MaxwellShaderTranslationSourceKey {
     pub(crate) fn fingerprint(&self) -> u128 {
         nixe_gpu::cache_fingerprint(&self)
     }
@@ -138,9 +137,6 @@ impl MaxwellShaderTranslationSourceKey<'_> {
             && self
                 .vertex_input_types()
                 .eq(source.vertex_input_types.iter().copied())
-            && self
-                .relevant_staged_writes()
-                .eq(source.staged_writes.iter().copied())
     }
 
     pub(crate) fn materialize(&self) -> MaxwellShaderTranslationSource {
@@ -148,7 +144,6 @@ impl MaxwellShaderTranslationSourceKey<'_> {
             programs: self.programs().collect(),
             texture_constant_buffer_slot: self.texture_constant_buffer_slot,
             vertex_input_types: self.vertex_input_types().collect(),
-            staged_writes: self.relevant_staged_writes().collect(),
         }
     }
 
@@ -165,25 +160,9 @@ impl MaxwellShaderTranslationSourceKey<'_> {
             .iter()
             .map(|input| input.expect("bounded vertex-input key is densely populated"))
     }
-
-    fn relevant_staged_writes(&self) -> impl Iterator<Item = MaxwellStagedShaderWrite> + '_ {
-        self.staged_writes
-            .iter()
-            .copied()
-            .filter(|write| self.shader_write_is_relevant(*write))
-    }
-
-    fn shader_write_is_relevant(&self, write: MaxwellStagedShaderWrite) -> bool {
-        self.programs().any(|program| {
-            let end = program
-                .address
-                .saturating_add(MAXWELL_SHADER_READ_LIMIT as u64);
-            write.address < end && write.address.saturating_add(4) > program.address
-        })
-    }
 }
 
-impl Hash for MaxwellShaderTranslationSourceKey<'_> {
+impl Hash for MaxwellShaderTranslationSourceKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.program_count.hash(state);
         for program in self.programs() {
@@ -193,11 +172,6 @@ impl Hash for MaxwellShaderTranslationSourceKey<'_> {
         self.vertex_input_count.hash(state);
         for input in self.vertex_input_types() {
             input.hash(state);
-        }
-        let staged_write_count = self.relevant_staged_writes().count();
-        staged_write_count.hash(state);
-        for write in self.relevant_staged_writes() {
-            write.hash(state);
         }
     }
 }
@@ -243,10 +217,9 @@ impl Hash for MaxwellShaderProgramTranslationInput {
     }
 }
 
-pub(crate) fn prepare_maxwell_shader_translation_source<'a>(
+pub(crate) fn prepare_maxwell_shader_translation_source(
     state: &MaxwellThreeDState,
-    staged_writes: &'a [MaxwellStagedShaderWrite],
-) -> Result<MaxwellShaderTranslationSourceKey<'a>, MaxwellShaderTranslationError> {
+) -> Result<MaxwellShaderTranslationSourceKey, MaxwellShaderTranslationError> {
     let bindings = state.shader_bindings();
     if !bindings
         .pipeline()
@@ -313,7 +286,6 @@ pub(crate) fn prepare_maxwell_shader_translation_source<'a>(
             .value()
             .copied(),
         vertex_input_types,
-        staged_writes,
         vertex_input_count,
     })
 }
@@ -321,15 +293,10 @@ pub(crate) fn prepare_maxwell_shader_translation_source<'a>(
 pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
     source: &MaxwellShaderTranslationSource,
     address_space: &MaxwellGpuAddressSpace,
+    staged_writes: &CanonicalWriteBatch,
 ) -> Result<MaxwellShaderTranslationInputs, MaxwellShaderTranslationError> {
     let mapping_generation = address_space.mapping_generation();
-    let stage = source
-        .programs
-        .first()
-        .ok_or(MaxwellShaderTranslationError::MissingEnabledShader)?
-        .stage;
-    let staged = canonical_shader_writes(address_space, &source.staged_writes, stage)?;
-    let memory = MaxwellShaderMemoryView::new(address_space, &staged);
+    let memory = MaxwellShaderMemoryView::new(address_space, staged_writes);
     let mut programs = Vec::with_capacity(source.programs.len());
     for program in &source.programs {
         let binary = read_shader_binary(&memory, program.stage, program.address)?;

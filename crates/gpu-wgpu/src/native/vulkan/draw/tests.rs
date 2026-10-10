@@ -83,7 +83,7 @@ fn native_pipeline_key_excludes_dynamic_levels_bindings_and_viewport() {
         h.finish()
     };
     assert_eq!(fingerprint(&a), fingerprint(&b));
-    let mut keys = HashMap::new();
+    let mut keys = HashMap::default();
     keys.insert(a, 42);
     assert_eq!(keys.get(&b), Some(&42));
     let mut depth_mode = (*b.draw).clone();
@@ -108,7 +108,7 @@ fn native_wireframe_pipeline_key_excludes_width_but_includes_coverage_mode() {
     let a = draw(1.0, true);
     let b = draw(4.0, true);
     assert!(a == b);
-    let mut cached = HashMap::new();
+    let mut cached = HashMap::default();
     cached.insert(a, 42);
     assert_eq!(cached.get(&b), Some(&42));
     assert!(b != draw(4.0, false));
@@ -130,7 +130,7 @@ fn native_direct_lines_cache_width_dynamically_and_do_not_require_wireframe() {
     let a = line(1.0, true);
     let b = line(16.0, true);
     assert!(a == b);
-    let mut cache = HashMap::new();
+    let mut cache = HashMap::default();
     cache.insert(a, 42);
     assert_eq!(cache.get(&b), Some(&42));
     assert!(b != line(16.0, false));

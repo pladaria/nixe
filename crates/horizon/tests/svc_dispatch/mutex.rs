@@ -31,7 +31,7 @@ fn start(process: &mut ScheduledProcess, thread: GuestThreadId) {
     process.coordinator_mut().start_thread(object).unwrap();
 }
 
-fn lock_arguments(state: &mut A64State, owner: u32, mutex: u64, tag: u32) {
+fn lock_arguments(state: &mut nixe_runtime::GuestCpuState, owner: u32, mutex: u64, tag: u32) {
     state.write_w(x(0), owner);
     state.write_x(x(1), mutex);
     state.write_w(x(2), tag);

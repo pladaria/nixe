@@ -4,6 +4,7 @@
 //! handles it and returns an [`ExceptionDispatchOutcome`] which an outer
 //! execution loop applies. Neither side assumes the interpreter or JIT backend.
 
+use crate::GuestCpuState;
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::{
     memory::{
@@ -12,7 +13,6 @@ use nixe_cpu::{
         MemoryProtectionError, ProcessMemory,
     },
     profile::ProcessCpuContext,
-    state::ThreadCpuState,
 };
 use nixe_memory::CanonicalRangeTranslator;
 use nixe_memory::MemoryInvalidationSource;
@@ -507,7 +507,7 @@ pub struct ExceptionThreadContext<'a> {
     vcpu: VirtualCpuId,
     object: ThreadObject,
     handle: u32,
-    state: &'a mut ThreadCpuState,
+    state: &'a mut GuestCpuState,
 }
 
 impl<'a> ExceptionThreadContext<'a> {
@@ -516,7 +516,7 @@ impl<'a> ExceptionThreadContext<'a> {
         vcpu: VirtualCpuId,
         object: ThreadObject,
         handle: u32,
-        state: &'a mut ThreadCpuState,
+        state: &'a mut GuestCpuState,
     ) -> Self {
         Self {
             id,
@@ -549,14 +549,14 @@ impl<'a> ExceptionThreadContext<'a> {
         self.handle
     }
 
-    /// Returns the current architectural register state.
+    /// Reads current registers through the exclusive stopped-context owner.
     #[must_use]
-    pub const fn state(&self) -> &ThreadCpuState {
+    pub const fn state(&self) -> &GuestCpuState {
         self.state
     }
 
-    /// Returns mutable architectural register state for syscall results.
-    pub const fn state_mut(&mut self) -> &mut ThreadCpuState {
+    /// Writes syscall results directly into the current register owner.
+    pub const fn state_mut(&mut self) -> &mut GuestCpuState {
         self.state
     }
 }

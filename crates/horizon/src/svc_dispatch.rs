@@ -20,6 +20,7 @@ use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_memory::CanonicalRangeTranslationError;
 use nixe_memory::GuestVirtualAddress;
+use nixe_runtime::GuestCpuState;
 use nixe_runtime::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionResume, ExceptionTerminationReason, ExceptionTerminationScope,
@@ -234,8 +235,7 @@ impl HorizonSvcFault {
                 | MemoryProtectionErrorReason::PermissionLocked => {
                     Some(HorizonKernelResult::INVALID_STATE)
                 }
-                MemoryProtectionErrorReason::GenerationExhausted
-                | MemoryProtectionErrorReason::ExecutionMutation(_) => None,
+                MemoryProtectionErrorReason::GenerationExhausted => None,
             },
             Self::MemoryMapping { fault } => match fault.reason {
                 MemoryMappingErrorReason::InvalidRange
@@ -249,8 +249,7 @@ impl HorizonSvcFault {
                 MemoryMappingErrorReason::ResourceExhausted => {
                     Some(HorizonKernelResult::RESOURCE_LIMIT)
                 }
-                MemoryMappingErrorReason::GenerationExhausted
-                | MemoryMappingErrorReason::ExecutionMutation(_) => None,
+                MemoryMappingErrorReason::GenerationExhausted => None,
             },
             Self::MemoryAlias { fault } => match fault.reason {
                 MemoryAliasErrorReason::InvalidRange
@@ -264,8 +263,7 @@ impl HorizonSvcFault {
                 MemoryAliasErrorReason::ResourceExhausted => {
                     Some(HorizonKernelResult::OUT_OF_RESOURCE)
                 }
-                MemoryAliasErrorReason::GenerationExhausted
-                | MemoryAliasErrorReason::ExecutionMutation(_) => None,
+                MemoryAliasErrorReason::GenerationExhausted => None,
             },
             Self::CanonicalMemory { .. } | Self::Ipc { .. } | Self::InternalRuntime { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
@@ -1256,7 +1254,7 @@ fn result(context: &mut ExceptionDispatchContext<'_>, value: HorizonKernelResult
 
 fn trace_completed_svc_result(
     descriptor: HorizonSvcDescriptor,
-    state: &ThreadCpuState,
+    state: &GuestCpuState,
     outcome: &ExceptionDispatchOutcome<HorizonSvcFault>,
 ) {
     if !log::log_enabled!(log::Level::Trace) {
@@ -1273,7 +1271,7 @@ fn trace_completed_svc_result(
 
 fn completed_svc_guest_error(
     descriptor: HorizonSvcDescriptor,
-    state: &ThreadCpuState,
+    state: &GuestCpuState,
     outcome: &ExceptionDispatchOutcome<HorizonSvcFault>,
 ) -> Option<HorizonKernelResult> {
     if descriptor.return_kind() != HorizonSvcReturnKind::Result
@@ -1313,7 +1311,7 @@ fn trace_guest_result(immediate: Option<u32>, name: &str, code: HorizonKernelRes
     }
 }
 
-fn thread_tls(state: &ThreadCpuState) -> GuestVirtualAddress {
+fn thread_tls(state: &GuestCpuState) -> GuestVirtualAddress {
     // Horizon owns TPIDRRO_EL0 and uses it as the fixed thread-local IPC buffer base.
     // TPIDR_EL0 belongs to userspace and software is free to repurpose it (including
     // clearing it), so it cannot be used to locate the kernel-managed TLS region.
@@ -1416,7 +1414,7 @@ fn read_c_name(
     Ok(None)
 }
 
-fn read_register(state: &ThreadCpuState, index: u8) -> u64 {
+fn read_register(state: &GuestCpuState, index: u8) -> u64 {
     state.read_x(A64Register::General(
         A64GeneralRegister::new(index).expect("A64 ABI register index is valid"),
     ))
@@ -1432,7 +1430,7 @@ fn finish_pending_caller(
     thread_id: GuestThreadId,
     operation: &'static str,
     code: HorizonKernelResult,
-    write_output: impl FnOnce(&mut ThreadCpuState),
+    write_output: impl FnOnce(&mut GuestCpuState),
 ) -> Result<(), HorizonSvcFault> {
     let state = coordinator
         .process_mut(process_id)
@@ -1517,11 +1515,11 @@ fn put_context_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn read_reply_timeout(state: &ThreadCpuState, user_buffer: bool) -> i64 {
+fn read_reply_timeout(state: &GuestCpuState, user_buffer: bool) -> i64 {
     read_register(state, if user_buffer { 6 } else { 4 }) as i64
 }
 
-fn write_register(state: &mut ThreadCpuState, index: u8, value: u64) {
+fn write_register(state: &mut GuestCpuState, index: u8, value: u64) {
     state.write_x(
         A64Register::General(
             A64GeneralRegister::new(index).expect("A64 ABI register index is valid"),
@@ -1530,11 +1528,11 @@ fn write_register(state: &mut ThreadCpuState, index: u8, value: u64) {
     );
 }
 
-fn write_u64(state: &mut ThreadCpuState, index: u8, value: u64) {
+fn write_u64(state: &mut GuestCpuState, index: u8, value: u64) {
     write_register(state, index, value);
 }
 
-fn read_wait_timeout(state: &ThreadCpuState) -> i64 {
+fn read_wait_timeout(state: &GuestCpuState) -> i64 {
     read_register(state, 3) as i64
 }
 
@@ -1890,7 +1888,7 @@ mod tests {
 
     #[test]
     fn completed_result_svc_errors_are_selected_for_generic_tracing() {
-        let mut state = ThreadCpuState::default();
+        let mut state = GuestCpuState::default();
         write_register(
             &mut state,
             0,
@@ -2064,40 +2062,6 @@ mod tests {
 
         for fault in faults {
             assert_eq!(fault.guest_result(), None);
-        }
-    }
-
-    #[test]
-    fn engine_mutation_failures_remain_terminal_and_preserve_the_diagnostic() {
-        let address_space = AddressSpaceId::new(1);
-        let address = GuestVirtualAddress::new(0x1000);
-        let cause = || nixe_memory::ExecutionMutationError("JIT admission is disabled".into());
-        let faults = [
-            HorizonSvcFault::MemoryProtection {
-                fault: MemoryProtectionError {
-                    address_space,
-                    address,
-                    reason: MemoryProtectionErrorReason::ExecutionMutation(cause()),
-                },
-            },
-            HorizonSvcFault::MemoryMapping {
-                fault: MemoryMappingError {
-                    address_space,
-                    address,
-                    reason: MemoryMappingErrorReason::ExecutionMutation(cause()),
-                },
-            },
-            HorizonSvcFault::MemoryAlias {
-                fault: MemoryAliasError {
-                    address_space,
-                    address,
-                    reason: MemoryAliasErrorReason::ExecutionMutation(cause()),
-                },
-            },
-        ];
-        for fault in faults {
-            assert_eq!(fault.guest_result(), None);
-            assert!(fault.to_string().contains("JIT admission is disabled"));
         }
     }
 

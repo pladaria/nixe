@@ -29,33 +29,24 @@ supported through the emulated HID services.
 
 ## JIT compiler
 
-Nixe's tiered JIT translates guest AArch64 instructions using a customized
-[Cranelift](https://cranelift.dev/) backend. LCQ compiles blocks on demand with
-minimal optimization; HCQ compiles hot regions with stronger optimization in
-background workers. Native links connect compiled
-units across both tiers without returning to Rust on each block transition.
-Nixe manages code replacement, invalidation and safe reclamation within a
-bounded code-and-metadata cache.
+Nixe translates guest AArch64 with [Dynarmic](https://github.com/lioncash/dynarmic).
+The original repository is vendored in `vendor/dynarmic`, pinned to commit
+`a41c380246d3d9f9874f0f792d234dc0cc17c180`, including its bundled dependencies
+and licenses. Cargo builds its A64 frontend, host backend and the C++ bridge
+automatically.
 
-Our Cranelift fork adds:
+Each virtual CPU owns a native code cache, block links, register allocator and
+return prediction. The process shares memory and the exclusive monitor. Fastmem
+uses nixe's direct arena and signal capture; memory ownership, invalidation,
+scheduler interrupts, SVCs and architectural state remain connected to the
+runtime. Unsupported instructions stop explicitly rather than falling back to
+the interpreter. The interpreter remains available as a separate CPU backend.
 
-- A custom native ABI with reserved registers and fixed-frame spills, avoiding
-  per-block host-stack setup and teardown.
-- Multiple independent entry points into a shared optimized body.
-- Precise guest-state maps after register allocation for state transfer and
-  fault recovery, with constant locations and explicit subtraction-flag
-  contracts at eligible exits.
-- Patchable exits, execution-budget checkpoints and exact faulting-instruction
-  metadata for native linking and controlled exits.
-- Preservation of observable floating-point effects during optimization, plus
-  atomic lowering fixes and extensions required by guest memory semantics.
-
-The fork retains Cranelift's optimizers, register allocators and machine-code
-backends. It is published on the
-[Wasmtime fork's `nixe` branch](https://github.com/pladaria/wasmtime/tree/nixe),
-with the exact revision pinned in `Cargo.lock`; no local override is required.
-See the [tiered JIT design](docs/specs/tiered-jit/spec.md) and
-[Cranelift modifications](docs/cranelift-modifications.md) for details.
+Building requires a C++20 compiler, CMake and Boost headers, in addition to the
+Rust toolchain and existing graphics/audio dependencies. On Debian/Ubuntu these
+are provided by `build-essential cmake libboost-dev`. Native dependencies are
+built from the vendored tree; no CMake download step is required. The small
+upstream adaptations are listed in [UPSTREAM.txt](vendor/dynarmic/UPSTREAM.txt).
 
 ## Running
 
@@ -79,7 +70,7 @@ cargo cli run <id | name>
 ```
 
 With the game window focused, press **S** to save a PNG to
-`docs/screenshots/nixe/<title>-<UTC timestamp>.png` (relative to the working
+`dump/screenshots/nixe/<title>-<UTC timestamp>.png` (relative to the working
 directory). Captures copy the next presented framebuffer at its native cropped
 resolution, applying its display orientation without filtering or window scaling.
 RGB bytes are preserved; internal framebuffer alpha is omitted, as in window

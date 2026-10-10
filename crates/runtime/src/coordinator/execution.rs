@@ -123,8 +123,9 @@ impl RuntimeCoordinator {
         self.complete_worker(lease, result).map(Some)
     }
 
-    /// Returns every CPU state to the coordinator before state transfer,
-    /// process termination or teardown. Preemption is requested before waiting.
+    /// Returns every register owner to the coordinator before migration,
+    /// process termination or teardown. Native contexts remain resident until
+    /// an actual switch or full-state consumer. Preemption precedes waiting.
     pub fn quiesce(&mut self) -> Result<(), CoordinatorError> {
         let leases: Vec<_> = self.scheduler.active_leases().collect();
         for process in leases
@@ -181,13 +182,23 @@ impl RuntimeCoordinator {
             .get(&lease.vcpu)
             .expect("a scheduler lease references a configured vCPU")
             .clone();
+        let capture_context = self
+            .execution_record
+            .as_ref()
+            .is_some_and(|record| record.retains_architectural_context());
         let execution = self
             .processes
             .get_mut(&lease.process)
             .ok_or(CoordinatorError::UnknownProcess(lease.process))
             .and_then(|process| {
                 process
-                    .begin_thread_execution(lease.thread, lease.vcpu, instruction_budget, events)
+                    .begin_thread_execution(
+                        lease.thread,
+                        lease.vcpu,
+                        instruction_budget,
+                        events,
+                        capture_context,
+                    )
                     .map_err(|error| CoordinatorError::Execution {
                         process: lease.process,
                         thread: lease.thread,
@@ -217,7 +228,7 @@ impl RuntimeCoordinator {
             self.processes
                 .get_mut(&lease.process)
                 .expect("the dispatched process remains registered")
-                .abort_thread_execution(lease.thread, lease.vcpu, failure.request.execution);
+                .abort_thread_execution(lease.thread, lease.vcpu, Some(failure.request.execution));
             self.complete_failed_worker_lease(lease)?;
             return Err(CoordinatorError::Worker(failure.failure));
         }
@@ -251,7 +262,7 @@ impl RuntimeCoordinator {
             self.processes
                 .get_mut(&expected.process)
                 .expect("the dispatched process remains registered")
-                .abort_thread_execution(expected.thread, expected.vcpu, worker_result.execution);
+                .abort_thread_execution(expected.thread, expected.vcpu, None);
             self.complete_failed_worker_lease(expected)?;
             return Err(CoordinatorError::Worker(WorkerFailure::StaleResult {
                 expected,
@@ -265,11 +276,7 @@ impl RuntimeCoordinator {
                 self.processes
                     .get_mut(&expected.process)
                     .expect("the dispatched process remains registered")
-                    .abort_thread_execution(
-                        expected.thread,
-                        expected.vcpu,
-                        worker_result.execution,
-                    );
+                    .abort_thread_execution(expected.thread, expected.vcpu, None);
                 self.complete_failed_worker_lease(expected)?;
                 return Err(CoordinatorError::Worker(failure));
             }

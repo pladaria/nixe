@@ -184,66 +184,9 @@ impl MaxwellShaderProgramHeader {
     }
 }
 
-/// One ordered four-byte write visible to later work in the same submission.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct MaxwellStagedShaderWrite {
-    pub(super) address: u64,
-    pub(super) value: u32,
-}
-
-impl MaxwellStagedShaderWrite {
-    pub(crate) const fn new(address: u64, value: u32) -> Self {
-        Self { address, value }
-    }
-}
-
 pub(super) struct MaxwellShaderMemoryView<'a> {
     address_space: &'a MaxwellGpuAddressSpace,
     staged_writes: &'a CanonicalWriteBatch,
-}
-
-// Graphics cache keys retain ordered VA writes; resolve their bytes once on a
-// translation miss. Both graphics and compute then read one canonical overlay,
-// including GPU-VA aliases, without materializing overwritten source bytes.
-pub(super) fn canonical_shader_writes(
-    address_space: &MaxwellGpuAddressSpace,
-    writes: &[MaxwellStagedShaderWrite],
-    stage: MaxwellShaderStage,
-) -> Result<CanonicalWriteBatch, MaxwellShaderTranslationError> {
-    let mut batch = CanonicalWriteBatch::new();
-    for write in writes {
-        let address = write.address;
-        let memory_error = |error| MaxwellShaderTranslationError::Memory {
-            stage,
-            address,
-            error,
-        };
-        let gpu_address = address_space
-            .address(address)
-            .map_err(MaxwellGpuAccessError::Address)
-            .map_err(memory_error)?;
-        let range = address_space
-            .resolve_range(gpu_address, 4, MemoryPermissions::READ)
-            .map_err(memory_error)?;
-        let mut offset = 0;
-        let bytes = write.value.to_le_bytes();
-        for segment in range.segments() {
-            let end = offset + segment.size() as usize;
-            batch
-                .stage(
-                    segment.mapping().backing(),
-                    segment.backing_offset(),
-                    &bytes[offset..end],
-                )
-                .map_err(|error| MaxwellShaderTranslationError::StagedMemory {
-                    stage,
-                    address,
-                    error,
-                })?;
-            offset = end;
-        }
-    }
-    Ok(batch)
 }
 
 pub(super) struct MaxwellShaderRead {
@@ -349,7 +292,7 @@ impl<'a> MaxwellShaderMemoryView<'a> {
         })?;
         let mut bytes = vec![0; size];
         self.staged_writes
-            .read_staged(&snapshot, 0, &mut bytes)
+            .read_overlay(&snapshot, 0, &mut bytes)
             .map_err(|error| MaxwellShaderTranslationError::StagedMemory {
                 stage,
                 address,
@@ -459,10 +402,12 @@ pub(super) fn read_shader_code(
                 .iter()
                 .any(|dependency| !dependency.remains_current())
             {
-                return Err(MaxwellShaderTranslationError::SourceChangedDuringRead {
-                    stage,
-                    address,
-                });
+                // Epochs cover physical pages, including neighboring shaders
+                // and constants. Confirm the exact decoded bytes in one
+                // coherent read before treating such a write as a code change.
+                let confirmed = confirm_shader_read(memory, stage, address, metadata, &bundles)?;
+                source_cpu_writes.clear();
+                source_cpu_writes.push(confirmed.cpu_writes);
             }
             return Ok(MaxwellShaderBinary {
                 address,
@@ -477,6 +422,36 @@ pub(super) fn read_shader_code(
         stage,
         limit: MAXWELL_SHADER_READ_LIMIT,
     })
+}
+
+fn confirm_shader_read(
+    memory: &MaxwellShaderMemoryView<'_>,
+    stage: MaxwellShaderStage,
+    address: u64,
+    metadata: MaxwellShaderMetadata,
+    bundles: &[MaxwellShaderInstructionBundle],
+) -> Result<MaxwellShaderRead, MaxwellShaderTranslationError> {
+    let mut expected = Vec::new();
+    if let MaxwellShaderMetadata::Graphics(header) = metadata {
+        for word in header.words {
+            expected.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    for bundle in bundles {
+        for word in [
+            bundle.control,
+            bundle.instructions[0],
+            bundle.instructions[1],
+            bundle.instructions[2],
+        ] {
+            expected.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    let confirmed = memory.read(stage, address, expected.len())?;
+    if confirmed.bytes != expected {
+        return Err(MaxwellShaderTranslationError::SourceChangedDuringRead { stage, address });
+    }
+    Ok(confirmed)
 }
 
 fn retain_shader_read_evidence(

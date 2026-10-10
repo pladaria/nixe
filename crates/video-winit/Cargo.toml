@@ -20,3 +20,6 @@ winit.workspace = true
 [dev-dependencies]
 pollster.workspace = true
 tempfile.workspace = true
+
+[features]
+performance-counters = []

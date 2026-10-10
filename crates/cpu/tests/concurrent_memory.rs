@@ -21,7 +21,7 @@ const ALIAS: GuestVirtualAddress = GuestVirtualAddress::new(0x2000);
 struct NoopVisibility;
 
 impl VisibilityCoordinator for NoopVisibility {
-    fn make_device_visible(
+    fn cache_cpu_page(
         &self,
         _request: DeviceVisibilityRequest,
         _canonical_bytes: &[u8],
@@ -115,10 +115,17 @@ fn external_device_transition_requests_a_safepoint_and_waits_for_the_active_slic
     })));
     let (finished_tx, finished_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let declaration =
-            DeviceAccessDeclaration::read(NonCpuDeviceId::new(9), DeviceVisibilityPoint::new(1));
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(9),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
         let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(NoopVisibility);
-        let result = retained.prepare_device_access(declaration, coordinator);
+        let result = nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, declaration)],
+            coordinator,
+        );
         finished_tx.send(result).unwrap();
     });
 

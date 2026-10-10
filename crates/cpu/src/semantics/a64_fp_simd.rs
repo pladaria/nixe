@@ -3,7 +3,7 @@
 //! This is the sole architectural provider used by both the reference
 //! interpreter and the JIT slow path. It operates only on canonical guest
 //! register state and integer representations of IEEE values; host FP state
-//! and Cranelift instructions are never semantic authorities.
+//! and native backend instructions are never semantic authorities.
 
 use crate::{
     decode::a64::fp_simd::{

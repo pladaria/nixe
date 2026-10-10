@@ -74,111 +74,11 @@ pub struct SyntheticMappingInfo {
     pub purpose: MemoryMappingPurpose,
 }
 
-/// Physical and virtual-mapping identity of one fetched code page.
+/// One checked A64 instruction and its canonical physical-page identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CodePageDependency {
-    /// Stable physical-page identity, shared by virtual aliases.
-    pub page: GuestPhysicalPageId,
-    /// Generation of the virtual mapping used for the fetch.
-    pub mapping_generation: MappingGeneration,
-}
-
-/// The one or two physical pages on which fetched instruction bytes depend.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CodeDependencies {
-    first: CodePageDependency,
-    second: Option<CodePageDependency>,
-}
-
-impl CodeDependencies {
-    /// Creates a dependency set for bytes contained in one page.
-    #[must_use]
-    pub const fn one(first: CodePageDependency) -> Self {
-        Self {
-            first,
-            second: None,
-        }
-    }
-
-    /// Creates an ordered dependency set for bytes spanning two pages.
-    ///
-    /// Equal dependencies are canonicalized to a one-page set.
-    #[must_use]
-    pub fn two(first: CodePageDependency, second: CodePageDependency) -> Self {
-        Self::one(first).merge(Self::one(second))
-    }
-
-    /// Returns dependencies in address order, without duplicate aliases.
-    pub fn iter(self) -> impl Iterator<Item = CodePageDependency> {
-        [Some(self.first), self.second].into_iter().flatten()
-    }
-
-    pub(super) fn merge(self, other: Self) -> Self {
-        let mut merged = self;
-        for dependency in other.iter() {
-            if !merged.iter().any(|present| present == dependency) {
-                debug_assert!(merged.second.is_none());
-                merged.second = Some(dependency);
-            }
-        }
-        merged
-    }
-}
-
-/// Canonical instruction bits accompanied by code-cache dependencies.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct FetchedCode<T> {
-    /// Host-endian integer holding the canonical architectural bit pattern.
-    pub bits: T,
-    /// Physical pages and generations from which the bytes were read.
-    pub dependencies: CodeDependencies,
-}
-
-/// Contiguous virtual extent of one code page.
-///
-/// The extent belongs to the memory backend rather than a CPU profile: real
-/// process mappings may use different page sizes, and frontend region formation
-/// must not assume the synthetic backend's 4 KiB granule.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CodePageSpan {
-    /// First byte covered by the page.
-    pub start: GuestVirtualAddress,
-    /// First byte after the page. `None` represents a page ending at 2^64.
-    pub end_exclusive: Option<GuestVirtualAddress>,
-}
-
-impl CodePageSpan {
-    /// Creates a validated non-empty span containing `address`.
-    #[must_use]
-    pub const fn containing(
-        start: GuestVirtualAddress,
-        end_exclusive: Option<GuestVirtualAddress>,
-        address: GuestVirtualAddress,
-    ) -> Option<Self> {
-        let after_start = address.get() >= start.get();
-        let before_end = match end_exclusive {
-            Some(end) => start.get() < end.get() && address.get() < end.get(),
-            None => true,
-        };
-        if after_start && before_end {
-            Some(Self {
-                start,
-                end_exclusive,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Returns whether `address` lies in this span.
-    #[must_use]
-    pub const fn contains(self, address: GuestVirtualAddress) -> bool {
-        address.get() >= self.start.get()
-            && match self.end_exclusive {
-                Some(end) => address.get() < end.get(),
-                None => true,
-            }
-    }
+pub struct FetchedInstruction {
+    pub bits: u32,
+    pub physical_page: GuestPhysicalPageId,
 }
 
 /// Read-only instruction view of a final process address space.
@@ -187,22 +87,12 @@ impl CodePageSpan {
 /// operation. Returned integers are canonical bit patterns; implementations
 /// must decode guest bytes explicitly and never rely on host endianness.
 pub trait InstructionMemory: Send + Sync {
-    /// Returns the virtual code-page extent containing `address`.
-    ///
-    /// Translators use this only as a block-cut boundary. Fetch methods remain
-    /// authoritative for mapping, permission, byte, and generation checks.
-    fn code_page_span(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<CodePageSpan, InstructionFetchFault>;
-
     /// Fetches one A64 word at a four-byte-aligned address.
     fn fetch32(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u32>, InstructionFetchFault>;
+    ) -> Result<FetchedInstruction, InstructionFetchFault>;
 }
 
 /// Width of one architectural data access.
@@ -1098,7 +988,6 @@ pub trait ProcessMemory: CpuMemory {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryAliasErrorReason {
-    ExecutionMutation(nixe_memory::ExecutionMutationError),
     InvalidRange,
     SourceStateMismatch,
     DestinationStateMismatch,
@@ -1117,7 +1006,6 @@ pub struct MemoryAliasError {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryMappingErrorReason {
-    ExecutionMutation(nixe_memory::ExecutionMutationError),
     InvalidRange,
     AlreadyMapped,
     MappingStateMismatch,
@@ -1136,7 +1024,6 @@ pub struct MemoryMappingError {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryProtectionErrorReason {
-    ExecutionMutation(nixe_memory::ExecutionMutationError),
     InvalidRange,
     Unmapped,
     WritableExecutable,

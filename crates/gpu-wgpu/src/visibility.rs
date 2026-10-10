@@ -1,6 +1,6 @@
 //! Canonical-page mirrors and demanded readback routing.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use nixe_gpu::BackendVisibilityRequester;
@@ -25,7 +25,7 @@ impl WgpuVisibilityCoordinator {
     pub(crate) fn new(device: NonCpuDeviceId) -> Self {
         Self {
             device,
-            pages: Mutex::new(HashMap::new()),
+            pages: Mutex::new(HashMap::default()),
             requester: OnceLock::new(),
         }
     }
@@ -214,7 +214,7 @@ impl WgpuVisibilityCoordinator {
 }
 
 impl VisibilityCoordinator for WgpuVisibilityCoordinator {
-    fn make_device_visible(
+    fn cache_cpu_page(
         &self,
         request: DeviceVisibilityRequest,
         canonical_bytes: &[u8],

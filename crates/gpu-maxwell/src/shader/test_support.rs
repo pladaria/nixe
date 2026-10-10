@@ -1,8 +1,6 @@
 //! Shared shader fixtures and validation helpers, compiled only for tests.
 
-use super::binary::{
-    MaxwellShaderMemoryView, MaxwellStagedShaderWrite, read_shader_binary, validate_program_header,
-};
+use super::binary::{MaxwellShaderMemoryView, read_shader_binary, validate_program_header};
 use super::error::MaxwellShaderTranslationError;
 use super::link::{MaxwellTranslatedShaderProgram, translate_prepared_maxwell_shader_programs};
 use super::source::{
@@ -21,20 +19,52 @@ use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress, MappingGeneration, Verif
 use nixe_memory::{CanonicalAllocation, CanonicalWriteBatch, MemoryPermissions};
 use std::collections::BTreeMap;
 
+pub(super) fn canonical_shader_writes(
+    address_space: &MaxwellGpuAddressSpace,
+    writes: &[(u64, u32)],
+) -> CanonicalWriteBatch {
+    let mut batch = CanonicalWriteBatch::new();
+    for &(address, value) in writes {
+        let range = address_space
+            .resolve_range(
+                address_space.address(address).unwrap(),
+                4,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        let mut offset = 0;
+        let bytes = value.to_le_bytes();
+        for segment in range.segments() {
+            let end = offset + segment.size() as usize;
+            batch
+                .stage(
+                    segment.mapping().backing(),
+                    segment.backing_offset(),
+                    &bytes[offset..end],
+                )
+                .unwrap();
+            offset = end;
+        }
+    }
+    batch
+}
+
 pub(super) fn translate_maxwell_shader_programs(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
-    staged_writes: &[MaxwellStagedShaderWrite],
+    staged_writes: &[(u64, u32)],
 ) -> Result<Vec<MaxwellTranslatedShaderProgram>, MaxwellShaderTranslationError> {
-    let source = prepare_maxwell_shader_translation_source(state, staged_writes)?.materialize();
-    let inputs = prepare_maxwell_shader_translation_inputs_from_source(&source, address_space)?;
+    let source = prepare_maxwell_shader_translation_source(state)?.materialize();
+    let staged = canonical_shader_writes(address_space, staged_writes);
+    let inputs =
+        prepare_maxwell_shader_translation_inputs_from_source(&source, address_space, &staged)?;
     translate_prepared_maxwell_shader_programs(&inputs)
 }
 
 pub(super) fn preflight_maxwell_shader_translation(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
-    staged_writes: &[MaxwellStagedShaderWrite],
+    staged_writes: &[(u64, u32)],
 ) -> Result<(), MaxwellShaderTranslationError> {
     translate_maxwell_shader_programs(state, address_space, staged_writes).map(|_| ())
 }

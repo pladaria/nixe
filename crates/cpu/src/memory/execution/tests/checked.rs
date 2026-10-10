@@ -40,7 +40,7 @@ struct Download {
 }
 
 impl VisibilityCoordinator for Download {
-    fn make_device_visible(
+    fn cache_cpu_page(
         &self,
         _: DeviceVisibilityRequest,
         _: &[u8],
@@ -122,10 +122,13 @@ fn device_owned_second_page(memory: &Arc<ExecutionMemory>, fail: bool) {
         DeviceVisibilityPoint::new(2),
     )
     .unwrap();
-    range
-        .prepare_device_access(declaration, device.clone())
+    nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+        [(&range, declaration)],
+        device.clone(),
+    )
+    .unwrap();
+    nixe_memory::CanonicalBackingRange::publish_device_writes([(&range, declaration)], device)
         .unwrap();
-    range.publish_device_write(declaration, device).unwrap();
 }
 
 #[test]

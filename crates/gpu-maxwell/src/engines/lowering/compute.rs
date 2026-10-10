@@ -107,6 +107,7 @@ impl MaxwellLoweringCache {
                 allocation_description,
                 backing,
                 mappings,
+                storage,
                 self,
                 &mut creations,
                 &mut invalidations,

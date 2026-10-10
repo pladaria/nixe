@@ -31,13 +31,23 @@ impl RunnableProcess {
     pub(crate) fn cpu_thread_teardown_state(&self) -> super::execution::CpuThreadTeardownState {
         self.execution.cpu_thread_teardown_state(
             std::sync::Arc::clone(&self.memory),
-            self.main_thread().state().clone(),
+            self.main_thread()
+                .state
+                .as_ref()
+                .filter(|state| state.is_available())
+                .map(|state| Box::new(state.snapshot())),
         )
     }
 
     pub(crate) fn complete_cpu_thread_retirement(
         &mut self,
     ) -> Result<(), nixe_cpu::execution::CpuFault> {
+        for (_, thread) in self.threads.iter_mut() {
+            if let Some(state) = &mut thread.state {
+                state.materialize();
+            }
+        }
+        self.execution.residents.clear();
         self.execution
             .complete_cpu_thread_retirement(self.memory.invalidation_cursor())
     }
@@ -104,8 +114,13 @@ impl RunnableProcess {
     ) -> Result<ExecutionReport, ProcessExecutionError> {
         let vcpu = nixe_scheduler::VirtualCpuId::new(0);
         let events = nixe_cpu::execution::VcpuEventState::default();
-        let mut execution =
-            self.begin_thread_execution(self.main_thread_id, vcpu, instruction_budget, events)?;
+        let mut execution = self.begin_thread_execution(
+            self.main_thread_id,
+            vcpu,
+            instruction_budget,
+            events,
+            true,
+        )?;
         let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
         let result = execution.run(&mut worker, thread);
         worker
@@ -117,28 +132,52 @@ impl RunnableProcess {
     pub(crate) fn begin_thread_execution(
         &mut self,
         thread_id: nixe_scheduler::GuestThreadId,
-        _vcpu: nixe_scheduler::VirtualCpuId,
+        vcpu: nixe_scheduler::VirtualCpuId,
         instruction_budget: u64,
         events: nixe_cpu::execution::VcpuEventState,
+        capture_context: bool,
     ) -> Result<execution::VcpuExecutionState, ProcessExecutionError> {
+        if self
+            .execution
+            .residents
+            .iter()
+            .any(|(core, guest)| *core != vcpu && *guest == thread_id)
+            && let Some(thread) = self.threads.get_mut(thread_id)
+            && let Some(state) = &mut thread.state
+        {
+            // Release the source before either worker can accept another lease.
+            state.leave_core();
+        }
+        // Save the previous context once, only on a genuine guest switch.
+        // A guest moving elsewhere must also leave the old core's residency map.
+        if let Some(previous) = self.execution.residents.insert(vcpu, thread_id)
+            && previous != thread_id
+            && let Some(old) = self.threads.get_mut(previous)
+            && let Some(state) = &mut old.state
+        {
+            state.leave_core();
+        }
+        self.execution
+            .residents
+            .retain(|core, guest| *core == vcpu || *guest != thread_id);
         let (virtual_clock, architectural_timer_frequency, cpu, address_space_end) =
             self.execution.execution_environment();
         let thread = self
             .threads
             .get_mut(thread_id)
             .ok_or(ProcessExecutionError::UnknownThread(thread_id))?;
-        let (state, jit_returns) = thread
+        let state = thread
             .take_state()
             .expect("a ready scheduler thread owns resident CPU state");
         Ok(execution::VcpuExecutionState {
             thread: state,
-            jit_returns,
             cpu,
             memory: std::sync::Arc::clone(&self.memory),
             virtual_clock,
             architectural_timer_frequency,
             address_space_end,
             instruction_budget,
+            capture_context,
             events,
         })
     }
@@ -150,23 +189,20 @@ impl RunnableProcess {
         execution: execution::VcpuExecutionState,
         result: Result<ExecutionReport, ProcessExecutionError>,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
-        let execution::VcpuExecutionState {
-            thread: state,
-            jit_returns,
-            ..
-        } = execution;
+        let execution::VcpuExecutionState { thread: state, .. } = execution;
         let concurrent_stop =
             (self.lifecycle != nixe_scheduler::ProcessLifecycle::Running).then_some(self.lifecycle);
         let thread = self
             .threads
             .get_mut(thread_id)
             .expect("the executed thread remains registered");
-        thread.restore_state(state, jit_returns);
-        if let Some(lifecycle) = concurrent_stop {
-            return Err(ProcessExecutionError::ConcurrentProcessStop {
-                lifecycle,
-                context: Box::new(thread.state().register_context()),
-            });
+        let state_is_current = match &result {
+            Ok(_) => true,
+            Err(ProcessExecutionError::Cpu { fault }) => fault.context.is_some(),
+            Err(_) => false,
+        };
+        if state_is_current {
+            thread.restore_state(state);
         }
         let mut report = match result {
             Ok(report) => report,
@@ -181,6 +217,12 @@ impl RunnableProcess {
                 return Err(error);
             }
         };
+        if let Some(lifecycle) = concurrent_stop {
+            return Err(ProcessExecutionError::ConcurrentProcessStop {
+                lifecycle,
+                context: Box::new(thread.state().register_context()),
+            });
+        }
         // The stub is ordinary guest code, so both backends and native chains
         // reach the same SVC boundary. Recognize the completed SVC's source,
         // not mere arrival at that PC (which may instead stop for budget/control).
@@ -203,6 +245,8 @@ impl RunnableProcess {
             result_code,
         } = &report.stop
         {
+            // Termination is a real diagnostic consumer, unlike an ordinary SVC.
+            report.context = Some(thread.state().register_context());
             let object_thread_id = thread.object.thread_id();
             let exit = ProcessExit {
                 cause: ProcessExitCause::LoaderReturned,
@@ -240,18 +284,17 @@ impl RunnableProcess {
         &mut self,
         thread_id: nixe_scheduler::GuestThreadId,
         _vcpu: nixe_scheduler::VirtualCpuId,
-        execution: execution::VcpuExecutionState,
+        execution: Option<execution::VcpuExecutionState>,
     ) {
-        let execution::VcpuExecutionState {
-            thread: state,
-            jit_returns,
-            ..
-        } = execution;
         let thread = self
             .threads
             .get_mut(thread_id)
             .expect("the failed worker's thread remains registered");
-        thread.restore_state(state, jit_returns);
+        // Only a request rejected before execution retains a known state.
+        // Panicked workers and mismatched results cannot supply an exact state.
+        if let Some(execution::VcpuExecutionState { thread: state, .. }) = execution {
+            thread.restore_state(state);
+        }
         if self.lifecycle == nixe_scheduler::ProcessLifecycle::Running {
             nixe_scheduler::transition_process(
                 &mut self.lifecycle,

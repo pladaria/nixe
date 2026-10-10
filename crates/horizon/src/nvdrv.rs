@@ -136,7 +136,7 @@ impl NvDrvSession {
     #[must_use]
     pub fn new() -> Self {
         let cache_configuration = GpuCacheConfiguration::default();
-        Self::new_with_executor(NvDrvGpuExecutor::new(None), cache_configuration)
+        Self::new_with_executor(NvDrvGpuExecutor::new(None, cache_configuration))
     }
 
     #[must_use]
@@ -144,13 +144,10 @@ impl NvDrvSession {
         backend: Box<dyn NeutralBackendRuntime>,
         cache_configuration: GpuCacheConfiguration,
     ) -> Self {
-        Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend)), cache_configuration)
+        Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend), cache_configuration))
     }
 
-    fn new_with_executor(
-        gpu_executor: NvDrvGpuExecutor,
-        cache_configuration: GpuCacheConfiguration,
-    ) -> Self {
+    fn new_with_executor(gpu_executor: NvDrvGpuExecutor) -> Self {
         Self {
             connection_id: NvDrvSessionId::ROOT,
             state: Arc::new(Mutex::new(NvDrvClientState {
@@ -164,7 +161,7 @@ impl NvDrvSession {
                 next_gpu_address_space_id: 1,
                 gpu_address_spaces: Arc::new(Mutex::new(BTreeMap::new())),
                 next_gpu_channel_id: 1,
-                nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::new(cache_configuration))),
+                nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::new())),
                 nvhost_control: Arc::new(Mutex::new(NvHostControl::default())),
                 nvhost_control_gpu: BTreeMap::new(),
                 nvmap: NvMapObjects::default(),
@@ -781,9 +778,8 @@ impl NvDrvSession {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .bound_address_space(descriptor.fd());
                 let result = {
-                    // Frontend lowering only borrows the mapping table. Keep
-                    // it stable through lowering instead of cloning every
-                    // mapping and reservation for each submission/retry.
+                    // Retain the accepted VA topology for asynchronous frontend
+                    // execution; later unmaps cannot revoke this delivery.
                     let address_spaces = address_spaces
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2687,7 +2683,6 @@ mod tests {
         let session = NvDrvSession::new();
         session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
-        let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
         let as_fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
         let channel_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
 
@@ -2842,248 +2837,6 @@ mod tests {
                 && pushbuffer.get() == 0x4000
         ));
 
-        // A fully mapped source is retained, deterministically scheduled, and
-        // reaches the exact packet-consumer boundary without completion.
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        allocation.write(0, &[0x78, 0x56, 0x34, 0x12]).unwrap();
-        let mapping = {
-            let state = session
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut address_spaces = state
-                .gpu_address_spaces
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let address_space = address_spaces.get_mut(&as_fd).unwrap();
-            address_space
-                .initialize(nixe_gpu_maxwell::MaxwellAddressSpaceInitialization::default())
-                .unwrap();
-            address_space
-                .map(nixe_gpu_maxwell::MaxwellMapRequest {
-                    allocation: nixe_gpu_maxwell::MaxwellAllocationId::new(1),
-                    backing: allocation
-                        .backing_range(MemoryPermissions::READ_WRITE)
-                        .unwrap(),
-                    backing_offset: 0,
-                    size: 0x1000,
-                    allocation_alignment: 0x1000,
-                    page_size: 0x1000,
-                    kind: 0,
-                    cacheable: false,
-                    permissions: MemoryPermissions::READ_WRITE,
-                    fixed_offset: None,
-                })
-                .unwrap()
-        };
-        entry[0..4].copy_from_slice(&(mapping.offset().get() as u32).to_le_bytes());
-        entry[4..8].copy_from_slice(
-            &(((mapping.offset().get() >> 32) as u32) | (1_u32 << 10)).to_le_bytes(),
-        );
-        let Err(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { context, boundary }) =
-            session.ioctl2(channel_fd, request, &submit, &entry)
-        else {
-            panic!("mapped GPFIFO source must reach the packet-consumer boundary");
-        };
-        assert_eq!(
-            context.reason(),
-            NvDrvValidationReason::MaxwellPacketSemanticsUnavailable
-        );
-        assert_eq!(
-            boundary.dispatch().scheduled().stage(),
-            nixe_gpu_maxwell::MaxwellSubmissionOrderingStage::FrontendDispatched
-        );
-        let location = boundary.first_packet().unwrap();
-        assert_eq!(location.entry_index, 0);
-        assert_eq!(location.word_offset, 0);
-        assert!(matches!(
-            boundary.frontend_failure(),
-            Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::PacketDecode(_))
-        ));
-        let submission = boundary.dispatch().scheduled().submission();
-        let completion = boundary.dispatch().scheduled().completion().unwrap();
-        assert_eq!(completion.point().syncpoint().get(), syncpoint);
-        assert_eq!(completion.point().value().get(), 2);
-        let mut read_syncpoint = [0_u8; 8];
-        read_syncpoint[..4].copy_from_slice(&syncpoint.to_le_bytes());
-        let (read_syncpoint, result) = session
-            .ioctl(control_fd, 0xc008_0014, &read_syncpoint)
-            .unwrap();
-        assert_eq!(result, NV_SUCCESS);
-        assert_eq!(input_u32(&read_syncpoint, 4).unwrap(), 0);
-        let capture = submission.capture();
-        assert_eq!(capture.channel(), channel_before_submission.id());
-        assert_eq!(capture.frontend(), nixe_gpu::FrontendSubmissionId::new(1));
-        assert_eq!(
-            capture.address_space(),
-            session.gpu_address_space(as_fd).unwrap().id()
-        );
-        assert_eq!(capture.total_entries(), 1);
-        assert_eq!(capture.total_sources(), 1);
-        assert_eq!(capture.sources()[0].mapping, mapping.id());
-        assert_eq!(capture.sources()[0].generation, mapping.generation());
-
-        // The legacy normal-ioctl ABI carries the same header followed by an
-        // inline, request-sized GPFIFO array. It must converge on the exact
-        // decoder, resolver, scheduler, retention, and packet boundary used by
-        // Ioctl2 rather than introducing a second submission implementation.
-        let legacy_request = 0xc028_4808;
-        let mut legacy = [0_u8; 40];
-        legacy[8..12].copy_from_slice(&2_u32.to_le_bytes());
-        legacy[12..16].copy_from_slice(&(4_u32 | 0x100).to_le_bytes());
-        legacy[20..24].copy_from_slice(&3_u32.to_le_bytes());
-        legacy[24..32].copy_from_slice(&entry);
-        legacy[32..40].copy_from_slice(&entry);
-        let Err(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
-            context: legacy_context,
-            boundary: legacy_boundary,
-        }) = session.ioctl(channel_fd, legacy_request, &legacy)
-        else {
-            panic!("legacy inline submission must reach the packet-consumer boundary");
-        };
-        assert_eq!(legacy_context.request(), legacy_request);
-        assert_eq!(legacy_boundary.first_packet().unwrap().entry_index, 0);
-        let legacy_submission = legacy_boundary.dispatch().scheduled().submission();
-        assert_eq!(
-            legacy_submission.frontend(),
-            nixe_gpu::FrontendSubmissionId::new(2)
-        );
-        assert_eq!(legacy_submission.capture().total_entries(), 2);
-        assert_eq!(legacy_submission.capture().total_sources(), 2);
-        assert_eq!(
-            legacy_boundary
-                .dispatch()
-                .scheduled()
-                .completion()
-                .unwrap()
-                .point()
-                .value()
-                .get(),
-            5,
-            "three guest increments must extend the prior driver reservation by three"
-        );
-
-        // Encoded-size mismatch, truncation, trailing entries, and excessive
-        // counts are rejected before a frontend ID or scheduler state changes.
-        let pending_before_malformed = session
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .nvhost_gpu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending_submission_count();
-        assert_eq!(
-            session
-                .ioctl(channel_fd, legacy_request, &legacy[..39])
-                .unwrap()
-                .1,
-            NV_BAD_PARAMETER
-        );
-        let mut trailing = legacy;
-        trailing[8..12].copy_from_slice(&1_u32.to_le_bytes());
-        assert_eq!(
-            session
-                .ioctl(channel_fd, legacy_request, &trailing)
-                .unwrap()
-                .1,
-            NV_BAD_PARAMETER
-        );
-        let truncated_request = 0xc020_4808;
-        assert_eq!(
-            session
-                .ioctl(channel_fd, truncated_request, &legacy[..32])
-                .unwrap()
-                .1,
-            NV_BAD_PARAMETER
-        );
-        let mut excessive = [0_u8; 24];
-        excessive[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(
-            session
-                .ioctl(channel_fd, 0xc018_4808, &excessive)
-                .unwrap()
-                .1,
-            NV_BAD_PARAMETER
-        );
-        assert_eq!(
-            session
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .nvhost_gpu
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_submission_count(),
-            pending_before_malformed
-        );
-
-        let mut legacy_empty = [0_u8; 24];
-        legacy_empty[12..16].copy_from_slice(&4_u32.to_le_bytes());
-        let Err(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
-            boundary: empty_legacy_boundary,
-            ..
-        }) = session.ioctl(channel_fd, 0xc018_4808, &legacy_empty)
-        else {
-            panic!("empty legacy submission must retain the explicit frontend boundary");
-        };
-        assert!(matches!(
-            empty_legacy_boundary.frontend_failure(),
-            Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::EmptySubmission)
-        ));
-        assert_eq!(
-            empty_legacy_boundary
-                .dispatch()
-                .scheduled()
-                .submission()
-                .frontend(),
-            nixe_gpu::FrontendSubmissionId::new(3),
-            "malformed legacy requests must not consume frontend identities"
-        );
-        let mut legacy_syncpoint = [0_u8; 8];
-        legacy_syncpoint[..4].copy_from_slice(&syncpoint.to_le_bytes());
-        let (legacy_syncpoint, result) = session
-            .ioctl(control_fd, 0xc008_0014, &legacy_syncpoint)
-            .unwrap();
-        assert_eq!(result, NV_SUCCESS);
-        assert_eq!(input_u32(&legacy_syncpoint, 4).unwrap(), 0);
-        assert!(matches!(
-            session.ioctl(channel_fd, 0xc018_4807, &legacy_empty),
-            Err(UnsupportedNvDrvOperation::Ioctl { .. })
-        ));
-
-        drop(allocation);
-        {
-            let state = session
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state
-                .gpu_address_spaces
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_mut(&as_fd)
-                .unwrap()
-                .unmap(mapping.offset())
-                .unwrap();
-        }
-        let active_address_space = session.gpu_address_space(as_fd).unwrap();
-        assert!(matches!(
-            submission.validate_sources(&active_address_space),
-            Err(nixe_gpu_maxwell::MaxwellGpfifoSourceError::StaleMapping { .. })
-        ));
-        let retained_mapping = submission.pushbuffers()[0].source().segments()[0].mapping();
-        let mut retained_word = [0; 4];
-        retained_mapping
-            .backing()
-            .read(retained_mapping.backing_offset(), &mut retained_word)
-            .unwrap();
-        assert_eq!(retained_word, [0x78, 0x56, 0x34, 0x12]);
-        assert_eq!(
-            session.gpu_channel(channel_fd),
-            Some(channel_before_submission.clone())
-        );
-
         // A count/byte mismatch is a verified guest argument error. Neither
         // it nor a fatal known-but-unsupported mode may retain a prefix.
         assert_eq!(
@@ -3140,7 +2893,189 @@ mod tests {
     }
 
     #[test]
-    fn gpfifo_empty_close_and_process_teardown_preserve_no_false_progress() {
+    fn asynchronous_frontend_failures_retain_sources_and_never_publish_completion() {
+        for (legacy, empty) in [(false, false), (true, false), (false, true), (true, true)] {
+            let session = NvDrvSession::new();
+            session.initialize(0);
+            let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
+            let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
+            let as_fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
+            let channel_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
+            session
+                .ioctl(channel_fd, 0x4004_4801, &nvmap_fd.raw().to_le_bytes())
+                .unwrap();
+            session
+                .ioctl(as_fd, 0x4004_4101, &channel_fd.raw().to_le_bytes())
+                .unwrap();
+            let mut allocate = [0_u8; 32];
+            allocate[..4].copy_from_slice(&8_u32.to_le_bytes());
+            let (allocated, result) = session.ioctl(channel_fd, 0xc020_481a, &allocate).unwrap();
+            assert_eq!(result, NV_SUCCESS);
+            let syncpoint = GuestSyncpointId::new(input_u32(&allocated, 12).unwrap());
+            let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+            allocation.write(0, &0x1234_5678_u32.to_le_bytes()).unwrap();
+            let mapping = {
+                let state = session.state.lock().unwrap();
+                let mut spaces = state.gpu_address_spaces.lock().unwrap();
+                let space = spaces.get_mut(&as_fd).unwrap();
+                space
+                    .initialize(nixe_gpu_maxwell::MaxwellAddressSpaceInitialization::default())
+                    .unwrap();
+                space
+                    .map(nixe_gpu_maxwell::MaxwellMapRequest {
+                        allocation: nixe_gpu_maxwell::MaxwellAllocationId::new(1),
+                        backing: allocation
+                            .backing_range(MemoryPermissions::READ_WRITE)
+                            .unwrap(),
+                        backing_offset: 0,
+                        size: 0x1000,
+                        allocation_alignment: 0x1000,
+                        page_size: 0x1000,
+                        kind: 0,
+                        cacheable: false,
+                        permissions: MemoryPermissions::READ_WRITE,
+                        fixed_offset: None,
+                    })
+                    .unwrap()
+            };
+            let mut entry = [0_u8; 8];
+            entry[..4].copy_from_slice(&(mapping.offset().get() as u32).to_le_bytes());
+            entry[4..].copy_from_slice(
+                &(((mapping.offset().get() >> 32) as u32) | (1 << 10)).to_le_bytes(),
+            );
+            let mut header = [0_u8; 24];
+            header[8..12].copy_from_slice(&u32::from(!empty).to_le_bytes());
+            header[12..16].copy_from_slice(&4_u32.to_le_bytes());
+            let (accepted, request) = if legacy {
+                let mut input = header.to_vec();
+                if !empty {
+                    input.extend_from_slice(&entry);
+                }
+                let request = if empty { 0xc018_4808 } else { 0xc020_4808 };
+                // A malformed request is rejected before allocating a frontend ID.
+                if !empty {
+                    assert_eq!(
+                        session.ioctl(channel_fd, request, &header).unwrap().1,
+                        NV_BAD_PARAMETER
+                    );
+                    let mut excessive = header;
+                    excessive[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+                    assert_eq!(
+                        session
+                            .ioctl(channel_fd, 0xc018_4808, &excessive)
+                            .unwrap()
+                            .1,
+                        NV_BAD_PARAMETER
+                    );
+                }
+                (session.ioctl(channel_fd, request, &input).unwrap(), request)
+            } else {
+                let entries = if empty { &[][..] } else { &entry[..] };
+                (
+                    session
+                        .ioctl2(channel_fd, 0xc018_481b, &header, entries)
+                        .unwrap(),
+                    0xc018_481b,
+                )
+            };
+            assert_eq!(
+                accepted.1, NV_SUCCESS,
+                "acceptance precedes frontend execution"
+            );
+            let (backend, control_descriptor) = {
+                let state = session.state.lock().unwrap();
+                (
+                    state.gpu_backend.as_ref().unwrap().clone(),
+                    state.devices[&control_fd],
+                )
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let failure = loop {
+                if let Err(failure) = backend.require_healthy() {
+                    break failure;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "frontend failure was lost"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            // A later control call must report the original submitting ABI.
+            let UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { context, boundary } =
+                nvhost_gpu::queued_execution_error(control_descriptor, 0xc008_0014, failure)
+            else {
+                panic!("frontend diagnostic lost its retained dispatch")
+            };
+            assert_eq!(context.request(), request);
+            assert_eq!(context.fd(), channel_fd);
+            assert_eq!(
+                context.reason(),
+                NvDrvValidationReason::MaxwellPacketSemanticsUnavailable
+            );
+            assert_eq!(
+                boundary.dispatch().scheduled().frontend(),
+                nixe_gpu::FrontendSubmissionId::new(1)
+            );
+            assert_eq!(
+                session.guest_timeline_point_reached(GuestTimelinePoint::new(
+                    syncpoint,
+                    GuestSyncpointValue::new(0)
+                )),
+                Some(true)
+            );
+            assert_eq!(
+                session.guest_timeline_point_reached(GuestTimelinePoint::new(
+                    syncpoint,
+                    GuestSyncpointValue::new(1)
+                )),
+                Some(false)
+            );
+            if empty {
+                assert!(matches!(
+                    boundary.frontend_failure(),
+                    Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::EmptySubmission)
+                ));
+            } else {
+                assert!(matches!(
+                    boundary.frontend_failure(),
+                    Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::PacketDecode(_))
+                ));
+                let submission = boundary.dispatch().scheduled().submission();
+                assert_eq!(submission.capture().sources()[0].mapping, mapping.id());
+                assert_eq!(boundary.first_packet().unwrap().word_offset, 0);
+                assert_eq!(
+                    boundary.frontend_diagnostic().unwrap().unwrap().words(),
+                    &[0x1234_5678]
+                );
+                drop(allocation);
+                {
+                    let state = session.state.lock().unwrap();
+                    state
+                        .gpu_address_spaces
+                        .lock()
+                        .unwrap()
+                        .get_mut(&as_fd)
+                        .unwrap()
+                        .unmap(mapping.offset())
+                        .unwrap();
+                }
+                assert!(matches!(
+                    submission.validate_sources(&session.gpu_address_space(as_fd).unwrap()),
+                    Err(nixe_gpu_maxwell::MaxwellGpfifoSourceError::StaleMapping { .. })
+                ));
+                let retained = submission.pushbuffers()[0].source().segments()[0].mapping();
+                let mut bytes = [0; 4];
+                retained
+                    .backing()
+                    .read(retained.backing_offset(), &mut bytes)
+                    .unwrap();
+                assert_eq!(bytes, 0x1234_5678_u32.to_le_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn gpfifo_pending_close_and_process_teardown_preserve_no_false_progress() {
         let session = NvDrvSession::new();
         session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
@@ -3158,23 +3093,6 @@ mod tests {
         let (allocated, result) = session.ioctl(channel_fd, 0xc020_481a, &allocate).unwrap();
         assert_eq!(result, NV_SUCCESS);
         let syncpoint = GuestSyncpointId::new(input_u32(&allocated, 12).unwrap());
-
-        // Even zero command entries cross a typed frontend boundary. T6 does
-        // not infer that empty work is complete or advance the channel fence.
-        let mut empty = [0_u8; 24];
-        empty[12..16].copy_from_slice(&4_u32.to_le_bytes());
-        let Err(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
-            boundary: empty_boundary,
-            ..
-        }) = session.ioctl2(channel_fd, 0xc018_481b, &empty, &[])
-        else {
-            panic!("empty work must stop at its explicit frontend boundary");
-        };
-        assert!(matches!(
-            empty_boundary.frontend_failure(),
-            Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::EmptySubmission)
-        ));
-        assert!(empty_boundary.dispatch().scheduled().completion().is_none());
 
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         allocation.write(0, &[0x12, 0x34, 0x56, 0x78]).unwrap();

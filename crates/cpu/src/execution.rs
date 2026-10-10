@@ -10,9 +10,8 @@ use crate::coverage::CoverageId;
 use crate::error::{InstructionFetchFault, UnallocatedEncoding};
 use crate::exception::ExceptionKind;
 use crate::location::{InstructionEncoding, LocationDescriptor};
-use crate::memory::{CpuMemory, DataAccessFault, ExecutionMemoryLease};
-use crate::profile::ProcessCpuContext;
-use crate::state::{RegisterContext, ThreadCpuState};
+use crate::memory::{CpuMemory, DataAccessFault};
+use crate::state::RegisterContext;
 
 macro_rules! identity {
     ($name:ident) => {
@@ -84,11 +83,6 @@ impl VcpuEventState {
     pub fn take_pending_interrupts(&self) -> u32 {
         self.state.pending_interrupts.swap(0, Ordering::AcqRel)
     }
-
-    #[must_use]
-    pub fn pending_interrupts_address(&self) -> usize {
-        std::ptr::from_ref(&self.state.pending_interrupts).addr()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -97,19 +91,6 @@ pub enum SchedulerRequest {
     WaitForEvent,
     WaitForInterrupt,
     SendEvent,
-}
-
-pub struct RunRequest<'a> {
-    pub cpu: ProcessCpuContext,
-    pub memory: &'a dyn CpuMemory,
-    /// Live mapping-stability proof required by a LinuxDirect backend.
-    pub memory_lease: Option<ExecutionMemoryLease<'a>>,
-    pub state: &'a mut ThreadCpuState,
-    /// Exact instruction limit for the interpreter. The normal JIT uses
-    /// control-driven entry and backedge synchronization instead.
-    pub instruction_budget: u64,
-    pub timer: &'a dyn ArchitecturalTimer,
-    pub events: VcpuEventState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,8 +253,9 @@ pub struct ExecutionReport {
     /// may overshoot a slice budget by the remaining work in a bounded block.
     pub progress: u64,
     pub stop: CpuExit,
-    /// Exact architectural state at the reported stop, when the frontend can
-    /// provide it without reconstructing values from native execution.
+    /// Owned compact snapshot at the reported stop, when requested by a
+    /// diagnostic/replay consumer or required by a fault. A normal native
+    /// boundary may omit it while retaining complete state with its owner.
     pub context: Option<RegisterContext>,
 }
 
@@ -286,7 +268,7 @@ impl Display for ExecutionReport {
         )?;
         match &self.context {
             Some(context) => Display::fmt(context, formatter)?,
-            None => formatter.write_str("unavailable")?,
+            None => formatter.write_str("not captured")?,
         }
         formatter.write_str("]")
     }
@@ -305,16 +287,25 @@ pub struct CpuFault {
     pub kind: CpuFaultKind,
     pub progress: u64,
     pub message: Box<str>,
-    pub context: Box<RegisterContext>,
+    /// Compact snapshot of exact synchronized state, if available. `Some`
+    /// also guarantees that the caller's full architectural state is current.
+    /// A terminal native failure may leave no coherent snapshot; the incoming
+    /// state must not be substituted.
+    pub context: Option<Box<RegisterContext>>,
 }
 
 impl Display for CpuFault {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "backend={} kind={:?} progress={} message={} registers=[{}]",
-            self.backend, self.kind, self.progress, self.message, self.context
-        )
+            "backend={} kind={:?} progress={} message={} registers=[",
+            self.backend, self.kind, self.progress, self.message
+        )?;
+        match &self.context {
+            Some(context) => Display::fmt(context, formatter)?,
+            None => formatter.write_str("unavailable")?,
+        }
+        formatter.write_str("]")
     }
 }
 
@@ -365,20 +356,20 @@ impl ControlSnapshot {
 
 struct CpuControlState {
     requests: AtomicU32,
-    synchronization_counter: AtomicU32,
     invalidation_epoch: AtomicU64,
     acknowledged_invalidation_epoch: AtomicU64,
     active_executions: AtomicU32,
+    interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for CpuControlState {
     fn default() -> Self {
         Self {
             requests: AtomicU32::new(0),
-            synchronization_counter: AtomicU32::new(CpuControl::SYNCHRONIZATION_INTERVAL),
             invalidation_epoch: AtomicU64::new(0),
             acknowledged_invalidation_epoch: AtomicU64::new(0),
             active_executions: AtomicU32::new(0),
+            interrupt: None,
         }
     }
 }
@@ -399,7 +390,15 @@ impl Drop for ExecutionGuard {
 }
 
 impl CpuControl {
-    pub const SYNCHRONIZATION_INTERVAL: u32 = 4000;
+    /// Connect a native backend's thread-safe halt mechanism to scheduler requests.
+    pub fn with_interrupt(interrupt: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            state: Arc::new(CpuControlState {
+                interrupt: Some(interrupt),
+                ..Default::default()
+            }),
+        }
+    }
 
     #[must_use]
     pub fn enter_execution(&self) -> ExecutionGuard {
@@ -418,9 +417,9 @@ impl CpuControl {
         self.state
             .requests
             .fetch_or(request.bit(), Ordering::Release);
-        self.state
-            .synchronization_counter
-            .store(0, Ordering::Release);
+        if let Some(interrupt) = &self.state.interrupt {
+            interrupt();
+        }
     }
 
     pub fn request_invalidation(&self, epoch: u64) {
@@ -437,16 +436,6 @@ impl CpuControl {
             requests,
             invalidation_epoch: self.state.invalidation_epoch.load(Ordering::Acquire),
         })
-    }
-
-    #[must_use]
-    pub fn pending_word_address(&self) -> usize {
-        std::ptr::from_ref(&self.state.requests).addr()
-    }
-
-    #[must_use]
-    pub fn synchronization_counter_address(&self) -> usize {
-        std::ptr::from_ref(&self.state.synchronization_counter).addr()
     }
 
     pub fn acknowledge(&self, snapshot: ControlSnapshot) {
@@ -477,25 +466,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_pending_word_is_the_linearizable_request_set() {
+    fn pending_requests_are_consumed_once() {
         let control = CpuControl::default();
-        let pending = unsafe { &*(control.pending_word_address() as *const AtomicU32) };
-        let synchronization =
-            unsafe { &*(control.synchronization_counter_address() as *const AtomicU32) };
-        assert_eq!(
-            synchronization.load(Ordering::Acquire),
-            CpuControl::SYNCHRONIZATION_INTERVAL
-        );
-
         control.request(ControlRequest::CodeInvalidation);
-        assert_eq!(pending.load(Ordering::Acquire), CONTROL_CODE_INVALIDATION);
-        assert_eq!(synchronization.load(Ordering::Acquire), 0);
         let snapshot = control.take_pending().unwrap();
         assert!(snapshot.contains(ControlRequest::CodeInvalidation));
-        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(control.take_pending().is_none());
 
         control.request(ControlRequest::Preempt);
-        assert_ne!(pending.load(Ordering::Acquire), 0);
         assert!(
             control
                 .take_pending()

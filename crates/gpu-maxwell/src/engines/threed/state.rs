@@ -4,7 +4,7 @@
 //! In particular, an undocumented hardware reset must stay `Unset`: zero is
 //! not a reset value unless a pinned public source establishes that fact.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use nixe_gpu::GpuMethodId;
 
@@ -1021,7 +1021,7 @@ impl MaxwellThreeDResourceSemanticWrites {
 /// Complete currently modeled live state of one channel's `MAXWELL_B` engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellThreeDFrontendState {
-    raw_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
+    raw_registers: Box<[Option<MaxwellThreeDRegister<u32>>]>,
     pub(in crate::engines) pending_notification: Option<(u64, MaxwellMethodSource)>,
     operation: MaxwellThreeDState,
     mme: MaxwellThreeDMmeState,
@@ -1031,7 +1031,9 @@ pub(crate) struct MaxwellThreeDFrontendState {
 
 impl Default for MaxwellThreeDFrontendState {
     fn default() -> Self {
-        let mut raw_registers = BTreeMap::new();
+        // Maxwell methods are 12-bit word addresses in PFIFO. Keep validated
+        // raw values and provenance in that fixed register file, not a tree.
+        let mut raw_registers = vec![None; 0x1000].into_boxed_slice();
         for method in [
             0x1208,
             0x15b8,
@@ -1048,10 +1050,8 @@ impl Default for MaxwellThreeDFrontendState {
         ] {
             let reset = verified_raw_register_reset(GpuMethodId(method))
                 .expect("listed Maxwell register reset must be verified");
-            raw_registers.insert(
-                method,
-                MaxwellThreeDRegister::verified_reset(reset, Some(reset)),
-            );
+            raw_registers[(method / 4) as usize] =
+                Some(MaxwellThreeDRegister::verified_reset(reset, Some(reset)));
         }
         for pipeline in 0..MAXWELL_PIPELINE_SHADER_COUNT {
             let method = MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD
@@ -1059,37 +1059,30 @@ impl Default for MaxwellThreeDFrontendState {
             for register in [method, method + 0x10] {
                 let reset = verified_raw_register_reset(GpuMethodId(register))
                     .expect("listed Maxwell pipeline reset must be verified");
-                raw_registers.insert(
-                    register,
-                    MaxwellThreeDRegister::verified_reset(reset, Some(reset)),
-                );
+                raw_registers[(register / 4) as usize] =
+                    Some(MaxwellThreeDRegister::verified_reset(reset, Some(reset)));
             }
         }
         for target in 0..MAXWELL_COLOR_TARGET_COUNT {
             let blend_method = BLEND_SEPARATE_ALPHA_BASE + target as u32 * BLEND_TARGET_STRIDE;
-            raw_registers.insert(
-                blend_method,
-                MaxwellThreeDRegister::verified_reset(
+            raw_registers[(blend_method / 4) as usize] =
+                Some(MaxwellThreeDRegister::verified_reset(
                     BLEND_SEPARATE_ALPHA_RESET,
                     Some(BLEND_SEPARATE_ALPHA_RESET),
-                ),
-            );
+                ));
             let method = MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD
                 + target as u32 * MAXWELL_THREE_D_COLOR_TARGET_STRIDE
                 + MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET;
             let reset = verified_raw_register_reset(GpuMethodId(method))
                 .expect("listed Maxwell color-target layer reset must be verified");
-            raw_registers.insert(
-                method,
-                MaxwellThreeDRegister::verified_reset(reset, Some(reset)),
-            );
+            raw_registers[(method / 4) as usize] =
+                Some(MaxwellThreeDRegister::verified_reset(reset, Some(reset)));
 
             let compression_method = MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD
                 + target as u32 * MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE;
             let compression_reset = verified_raw_register_reset(GpuMethodId(compression_method))
                 .expect("listed Maxwell color-compression reset must be verified");
-            raw_registers.insert(
-                compression_method,
+            raw_registers[(compression_method / 4) as usize] = Some(
                 MaxwellThreeDRegister::verified_reset(compression_reset, Some(compression_reset)),
             );
         }
@@ -1131,12 +1124,14 @@ impl MaxwellThreeDFrontendState {
     /// Returns the last validated raw value for one byte-addressed class method.
     #[must_use]
     pub fn raw_register(&self, method: GpuMethodId) -> Option<&MaxwellThreeDRegister<u32>> {
-        self.raw_registers.get(&method.0)
+        if !method.0.is_multiple_of(4) {
+            return None;
+        }
+        self.raw_registers.get((method.0 / 4) as usize)?.as_ref()
     }
 
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
-        self.raw_registers.insert(
-            source.method().0,
+        self.raw_registers[(source.method().0 / 4) as usize] = Some(
             MaxwellThreeDRegister::programmed(source.argument(), source.argument(), source),
         );
     }
@@ -1510,10 +1505,8 @@ impl MaxwellThreeDFrontendState {
                     source: write.source(),
                 };
                 self.mme.apply(completion);
-                self.raw_registers.insert(
-                    0x3400,
-                    MaxwellThreeDRegister::programmed(1, 1, write.source()),
-                );
+                self.raw_registers[(0x3400 / 4) as usize] =
+                    Some(MaxwellThreeDRegister::programmed(1, 1, write.source()));
             }
             MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
         }

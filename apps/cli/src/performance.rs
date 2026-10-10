@@ -21,11 +21,17 @@ impl Capture {
         let counters = || {
             let mut values = nixe_memory::metrics::snapshot();
             values.extend(nixe_gpu::metrics::snapshot());
+            values.extend(nixe_cpu_jit::metrics::snapshot());
+            values.extend(nixe_audio::metrics::snapshot());
+            values.extend(nixe_video_winit::metrics::snapshot());
             values
         };
         write!(output, "seconds")?;
         for (name, _) in counters() {
             write!(output, ",{name}")?;
+        }
+        for bin in 0..nixe_video_winit::metrics::histogram().len() {
+            write!(output, ",FrameIntervalBin{bin}")?;
         }
         writeln!(output)?;
         let worker = thread::spawn(move || {
@@ -37,6 +43,9 @@ impl Capture {
                 );
                 write!(output, "{:.6}", started.elapsed().as_secs_f64())?;
                 for (_, value) in counters() {
+                    write!(output, ",{value}")?;
+                }
+                for value in nixe_video_winit::metrics::histogram() {
                     write!(output, ",{value}")?;
                 }
                 writeln!(output)?;

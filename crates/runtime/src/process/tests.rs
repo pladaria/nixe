@@ -78,12 +78,88 @@ fn worker_slice_moves_thread_state_out_of_the_process_until_reconciliation() {
             vcpu,
             1,
             nixe_cpu::execution::VcpuEventState::default(),
+            true,
         )
         .unwrap();
     assert!(process.main_thread().state.is_none());
 
-    process.abort_thread_execution(thread, vcpu, execution);
+    process.abort_thread_execution(thread, vcpu, Some(execution));
     assert!(process.main_thread().state.is_some());
+    assert_eq!(
+        process.lifecycle(),
+        nixe_scheduler::ProcessLifecycle::Faulted
+    );
+}
+
+#[test]
+fn unsynchronized_cpu_failure_discards_state_and_allows_retirement() {
+    let mut process = synthetic_process_for_coordinator(1);
+    let thread = process.main_thread_id();
+    let vcpu = nixe_scheduler::VirtualCpuId::new(0);
+    let mut cpu = process.create_worker_cpu_thread(vcpu).unwrap();
+    let execution = process
+        .begin_thread_execution(thread, vcpu, 1, Default::default(), true)
+        .unwrap();
+    let failure = ProcessExecutionError::Cpu {
+        fault: nixe_cpu::execution::CpuFault {
+            backend: "dynarmic",
+            kind: nixe_cpu::execution::CpuFaultKind::Internal,
+            progress: 0,
+            message: "native execution did not synchronize".into(),
+            context: None,
+        },
+    };
+    assert_eq!(
+        process.finish_thread_execution(thread, vcpu, execution, Err(failure.clone())),
+        Err(failure)
+    );
+    assert!(process.main_thread().state.is_none());
+    assert_eq!(
+        process.lifecycle(),
+        nixe_scheduler::ProcessLifecycle::Faulted
+    );
+    process
+        .cpu_thread_teardown_state()
+        .prepare(&mut cpu)
+        .unwrap();
+}
+
+#[test]
+fn concurrent_stop_does_not_hide_an_unsynchronized_native_failure() {
+    let mut process = synthetic_process_for_coordinator(1);
+    let thread = process.main_thread_id();
+    let vcpu = nixe_scheduler::VirtualCpuId::new(0);
+    let execution = process
+        .begin_thread_execution(thread, vcpu, 1, Default::default(), true)
+        .unwrap();
+    assert!(process.terminate_from_host());
+    let failure = ProcessExecutionError::Cpu {
+        fault: nixe_cpu::execution::CpuFault {
+            backend: "dynarmic",
+            kind: nixe_cpu::execution::CpuFaultKind::Internal,
+            progress: 0,
+            message: "native execution did not synchronize".into(),
+            context: None,
+        },
+    };
+    assert_eq!(
+        process.finish_thread_execution(thread, vcpu, execution, Err(failure.clone())),
+        Err(failure)
+    );
+    assert!(process.main_thread().state.is_none());
+}
+
+#[test]
+fn panicked_worker_does_not_restore_an_incoming_snapshot() {
+    let mut process = synthetic_process_for_coordinator(1);
+    let thread = process.main_thread_id();
+    let vcpu = nixe_scheduler::VirtualCpuId::new(0);
+    let execution = process
+        .begin_thread_execution(thread, vcpu, 1, Default::default(), true)
+        .unwrap();
+    drop(execution);
+    process.abort_thread_execution(thread, vcpu, None);
+    assert!(process.main_thread().state.is_none());
     assert_eq!(
         process.lifecycle(),
         nixe_scheduler::ProcessLifecycle::Faulted
@@ -169,13 +245,20 @@ pub(crate) fn synthetic_memory_loop_process(
     process_id: u64,
     backend: crate::CpuBackendConfig,
 ) -> RunnableProcess {
-    // ADR X1,.; LDR X0,[X1]; YIELD; B entry. The load reads this process's
-    // executable mapping on every loop, through the selected native frontend.
+    synthetic_backend_instruction_process(
+        process_id,
+        backend,
+        &[0x10000001, 0xf9400020, 0xd503203f, 0x17fffffd],
+    )
+}
+
+pub(crate) fn synthetic_backend_instruction_process(
+    process_id: u64,
+    backend: crate::CpuBackendConfig,
+    code: &[u32],
+) -> RunnableProcess {
     let mut bytes = synthetic_nro();
-    for (index, word) in [0x10000001_u32, 0xf9400020, 0xd503203f, 0x17fffffd]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, word) in code.iter().copied().enumerate() {
         put_u32(&mut bytes, 0x80 + index * 4, word);
     }
     let directory = tempfile::tempdir().unwrap();

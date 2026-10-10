@@ -7,7 +7,6 @@ use nixe_memory::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::atomic::AtomicU64,
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
@@ -20,15 +19,14 @@ use super::common::{
     virtual_page, writable_executable,
 };
 use super::{
-    AtomicMemoryResult, AtomicRmwKind, CodeDependencies, CodePageDependency, CodePageSpan,
-    CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, DataReadResult,
-    DataWriteResult, FetchedCode, InstructionMemory, MemoryAccess, MemoryAccessClass,
-    MemoryAliasError, MemoryAliasErrorReason, MemoryAliasRequest, MemoryAlignment,
-    MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason, MemoryMappingProperties,
-    MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, MemoryProtectionErrorReason,
-    MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory, SYNTHETIC_PAGE_SIZE,
-    SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo, SyntheticMmio,
-    SyntheticRamPage,
+    AtomicMemoryResult, AtomicRmwKind, CpuMemory, DataAccessFault, DataAccessFaultReason,
+    DataAccessKind, DataReadResult, DataWriteResult, FetchedInstruction, InstructionMemory,
+    MemoryAccess, MemoryAccessClass, MemoryAliasError, MemoryAliasErrorReason, MemoryAliasRequest,
+    MemoryAlignment, MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason,
+    MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
+    MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory,
+    SYNTHETIC_PAGE_SIZE, SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo,
+    SyntheticMmio, SyntheticRamPage,
 };
 
 #[derive(Clone, Copy)]
@@ -588,160 +586,11 @@ impl SyntheticMemory {
             .data_faults
             .insert((address_space, address, kind), reason.into());
     }
-
-    fn fetch<const N: usize>(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<([u8; N], CodeDependencies), InstructionFetchFault> {
-        if !address.is_aligned_to(4) {
-            return Err(InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::Misaligned,
-            ));
-        }
-        let inner = self.lock_inner();
-        Self::fetch_locked(&inner, address_space, address)
-    }
-
-    fn fetch_locked<const N: usize>(
-        inner: &SyntheticMemoryInner,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<([u8; N], CodeDependencies), InstructionFetchFault> {
-        if !address.is_aligned_to(4) {
-            return Err(InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::Misaligned,
-            ));
-        }
-        let end_offset = page_offset(address) + N;
-        if end_offset <= SYNTHETIC_PAGE_SIZE {
-            if !inner.instruction_faults.is_empty()
-                && let Some((fault_address, reason)) = (0..N).find_map(|index| {
-                    let current = address.checked_add(index as u64)?;
-                    inner
-                        .instruction_faults
-                        .get(&(address_space, current))
-                        .map(|reason| (current, reason))
-                })
-            {
-                return Err(InstructionFetchFault::new(
-                    address_space,
-                    fault_address,
-                    InstructionFetchFaultReason::Memory(reason.clone()),
-                ));
-            }
-            let mapping = mapping_at(inner, address_space, address).ok_or_else(|| {
-                InstructionFetchFault::new(
-                    address_space,
-                    address,
-                    InstructionFetchFaultReason::Unmapped,
-                )
-            })?;
-            if !mapping.permissions.contains(MemoryPermissions::EXECUTE) {
-                return Err(InstructionFetchFault::new(
-                    address_space,
-                    address,
-                    InstructionFetchFaultReason::ExecutePermissionDenied,
-                ));
-            }
-            let Some(PhysicalPage::Ram {
-                bytes: contents,
-                generation: _,
-            }) = inner.pages.get(&mapping.physical_page)
-            else {
-                return Err(InstructionFetchFault::new(
-                    address_space,
-                    address,
-                    InstructionFetchFaultReason::Memory("executable mapping is not RAM".into()),
-                ));
-            };
-            let mut bytes = [0; N];
-            if let Some(contents) = contents {
-                bytes.copy_from_slice(&contents[page_offset(address)..end_offset]);
-            }
-            return Ok((
-                bytes,
-                CodeDependencies::one(CodePageDependency {
-                    page: mapping.physical_page,
-                    mapping_generation: mapping.mapping_generation,
-                }),
-            ));
-        }
-
-        let mut bytes = [0; N];
-        let mut dependencies: Option<CodeDependencies> = None;
-        for (index, destination) in bytes.iter_mut().enumerate() {
-            let Some(current) = address.checked_add(index as u64) else {
-                return Err(InstructionFetchFault::new(
-                    address_space,
-                    address,
-                    InstructionFetchFaultReason::AddressOverflow,
-                ));
-            };
-            if let Some(reason) = inner.instruction_faults.get(&(address_space, current)) {
-                return Err(InstructionFetchFault::new(
-                    address_space,
-                    current,
-                    InstructionFetchFaultReason::Memory(reason.clone()),
-                ));
-            }
-            let mapping = mapping_at(inner, address_space, current).ok_or_else(|| {
-                InstructionFetchFault::new(
-                    address_space,
-                    current,
-                    InstructionFetchFaultReason::Unmapped,
-                )
-            })?;
-            if !mapping.permissions.contains(MemoryPermissions::EXECUTE) {
-                return Err(InstructionFetchFault::new(
-                    address_space,
-                    current,
-                    InstructionFetchFaultReason::ExecutePermissionDenied,
-                ));
-            }
-            let Some(PhysicalPage::Ram {
-                bytes: contents,
-                generation: _,
-            }) = inner.pages.get(&mapping.physical_page)
-            else {
-                return Err(InstructionFetchFault::new(
-                    address_space,
-                    current,
-                    InstructionFetchFaultReason::Memory("executable mapping is not RAM".into()),
-                ));
-            };
-            *destination = contents
-                .as_ref()
-                .map_or(0, |contents| contents[page_offset(current)]);
-            let dependency = CodePageDependency {
-                page: mapping.physical_page,
-                mapping_generation: mapping.mapping_generation,
-            };
-            dependencies = Some(match dependencies {
-                None => CodeDependencies::one(dependency),
-                Some(current_dependencies) => {
-                    current_dependencies.merge(CodeDependencies::one(dependency))
-                }
-            });
-        }
-        Ok((
-            bytes,
-            dependencies.expect("non-empty fetch has a dependency"),
-        ))
-    }
 }
 
 impl MemoryInvalidationSource for SyntheticMemory {
     fn invalidation_cursor(&self) -> MemoryInvalidationCursor {
         self.invalidations.cursor()
-    }
-
-    fn invalidation_signal(&self) -> &AtomicU64 {
-        self.invalidations.cursor_signal()
     }
 
     fn read_invalidations_since(
@@ -768,77 +617,36 @@ fn fail_install_if_requested(
     Ok(())
 }
 
-impl super::ExecutableMemory for SyntheticMemory {
-    fn capture_instructions(
-        &self,
-        space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        limit: std::num::NonZeroU16,
-        stop: &dyn Fn(GuestVirtualAddress, u32) -> bool,
-    ) -> super::InstructionImage {
-        use super::capture::{Page, Stamp, copy_words};
-        let inner = self.lock_inner();
-        let mut pages = Vec::new();
-        let (words, fault) = copy_words(start, limit, stop, |pc| {
-            let (bytes, dependencies) = Self::fetch_locked::<4>(&inner, space, pc)?;
-            let address = page_address(virtual_page(pc));
-            if !pages.iter().any(|page: &Page| page.address == address) {
-                let dependency = dependencies.iter().next().unwrap();
-                let PhysicalPage::Ram { generation, .. } =
-                    inner.pages.get(&dependency.page).unwrap()
-                else {
-                    unreachable!()
-                };
-                pages.push(Page {
-                    address,
-                    dependency,
-                    stamp: Stamp::Synthetic(*generation),
-                });
-            }
-            Ok(FetchedCode {
-                bits: u32::from_le_bytes(bytes),
-                dependencies,
-            })
-        });
-        super::InstructionImage {
-            space,
-            start,
-            words,
-            fault,
-            pages,
-            cursor: self.invalidation_cursor(),
-            owner: self.invalidations.clone(),
-        }
-    }
-
-    fn image_is_current(&self, image: &super::InstructionImage) -> bool {
-        let inner = self.lock_inner();
-        std::sync::Arc::ptr_eq(&self.invalidations, &image.owner)
-            && image.pages.iter().all(|page| {
-                let Some(mapping) = mapping_at(&inner, image.space, page.address) else {
-                    return false;
-                };
-                let Some(PhysicalPage::Ram { generation, .. }) =
-                    inner.pages.get(&mapping.physical_page)
-                else {
-                    return false;
-                };
-                mapping.permissions.contains(MemoryPermissions::EXECUTE)
-                    && mapping.physical_page == page.dependency.page
-                    && mapping.mapping_generation == page.dependency.mapping_generation
-                    && page.stamp == super::capture::Stamp::Synthetic(*generation)
-            })
-    }
-}
-
 impl InstructionMemory for SyntheticMemory {
-    fn code_page_span(
+    fn fetch32(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
-    ) -> Result<CodePageSpan, InstructionFetchFault> {
-        let page_start = page_address(virtual_page(address));
+    ) -> Result<FetchedInstruction, InstructionFetchFault> {
+        if !address.is_aligned_to(4) {
+            return Err(InstructionFetchFault::new(
+                address_space,
+                address,
+                InstructionFetchFaultReason::Misaligned,
+            ));
+        }
         let inner = self.lock_inner();
+        let end_offset = page_offset(address) + 4;
+        if !inner.instruction_faults.is_empty()
+            && let Some((fault_address, reason)) = (0..4).find_map(|index| {
+                let current = address.checked_add(index as u64)?;
+                inner
+                    .instruction_faults
+                    .get(&(address_space, current))
+                    .map(|reason| (current, reason))
+            })
+        {
+            return Err(InstructionFetchFault::new(
+                address_space,
+                fault_address,
+                InstructionFetchFaultReason::Memory(reason.clone()),
+            ));
+        }
         let mapping = mapping_at(&inner, address_space, address).ok_or_else(|| {
             InstructionFetchFault::new(
                 address_space,
@@ -853,20 +661,24 @@ impl InstructionMemory for SyntheticMemory {
                 InstructionFetchFaultReason::ExecutePermissionDenied,
             ));
         }
-        let end_exclusive = page_start.checked_add(SYNTHETIC_PAGE_SIZE as u64);
-        Ok(CodePageSpan::containing(page_start, end_exclusive, address)
-            .expect("synthetic page arithmetic contains its source address"))
-    }
-
-    fn fetch32(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
-        let (bytes, dependencies) = self.fetch::<4>(address_space, address)?;
-        Ok(FetchedCode {
+        let Some(PhysicalPage::Ram {
+            bytes: contents,
+            generation: _,
+        }) = inner.pages.get(&mapping.physical_page)
+        else {
+            return Err(InstructionFetchFault::new(
+                address_space,
+                address,
+                InstructionFetchFaultReason::Memory("executable mapping is not RAM".into()),
+            ));
+        };
+        let mut bytes = [0; 4];
+        if let Some(contents) = contents {
+            bytes.copy_from_slice(&contents[page_offset(address)..end_offset]);
+        }
+        Ok(FetchedInstruction {
             bits: u32::from_le_bytes(bytes),
-            dependencies,
+            physical_page: mapping.physical_page,
         })
     }
 }
@@ -2273,29 +2085,9 @@ mod tests {
 
     use super::*;
     use crate::memory::{
-        CacheMaintenanceKind, ExecutableMemory, ExecutionMemory, MemoryAccessClass,
-        MemoryAccessSize, MemoryAlignment, MemoryOrdering,
+        CacheMaintenanceKind, ExecutionMemory, MemoryAccessClass, MemoryAccessSize,
+        MemoryAlignment, MemoryOrdering,
     };
-
-    #[test]
-    fn code_page_spans_support_backend_defined_sizes_and_top_of_address_space() {
-        let small = CodePageSpan::containing(
-            GuestVirtualAddress::new(0x4000),
-            Some(GuestVirtualAddress::new(0x8000)),
-            GuestVirtualAddress::new(0x7fff),
-        )
-        .unwrap();
-        assert!(small.contains(GuestVirtualAddress::new(0x4000)));
-        assert!(!small.contains(GuestVirtualAddress::new(0x8000)));
-
-        let top = CodePageSpan::containing(
-            GuestVirtualAddress::new(0xffff_ffff_ffff_f000),
-            None,
-            GuestVirtualAddress::MAX,
-        )
-        .unwrap();
-        assert!(top.contains(GuestVirtualAddress::MAX));
-    }
 
     const SPACE: AddressSpaceId = AddressSpaceId::new(7);
     const CODE: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);
@@ -2380,62 +2172,13 @@ mod tests {
     }
 
     #[test]
-    fn executable_images_validate_exact_dependencies_not_unrelated_history() {
-        fn check<M: MemorySetup + ExecutableMemory + MemoryInvalidationSource + ProcessMemory>(
-            mut memory: M,
-            other: M,
-        ) {
-            assert!(memory.add_ram_page(PAGE_1));
-            assert!(memory.add_ram_page(PAGE_2));
-            assert!(memory.initialize_ram(PAGE_1, 0, &0xd503201fu32.to_le_bytes()));
-            assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_EXECUTE));
-            let capture = |memory: &M| {
-                memory.capture_instructions(
-                    SPACE,
-                    CODE,
-                    std::num::NonZeroU16::new(1).unwrap(),
-                    &|_, _| false,
-                )
-            };
-            let image = capture(&memory);
-            assert!(memory.image_is_current(&image));
-            assert!(!other.image_is_current(&image));
-            assert!(memory.map_page(SPACE, ALIAS, PAGE_2, MemoryPermissions::READ_EXECUTE));
-            assert_ne!(memory.invalidation_cursor(), image.cursor());
-            assert!(memory.image_is_current(&image));
-            assert!(memory.initialize_ram(PAGE_2, 0, &0xd65f03c0u32.to_le_bytes()));
-            assert!(memory.image_is_current(&image));
-            assert!(memory.initialize_ram(PAGE_1, 0, &0xd65f03c0u32.to_le_bytes()));
-            assert!(!memory.image_is_current(&image));
-            let image = capture(&memory);
-            memory
-                .set_permissions(SPACE, CODE, PAGE_SIZE, MemoryPermissions::READ)
-                .unwrap();
-            assert!(!memory.image_is_current(&image));
-            memory
-                .set_permissions(SPACE, CODE, PAGE_SIZE, MemoryPermissions::READ_EXECUTE)
-                .unwrap();
-            // Restored permissions still have a new mapping identity.
-            assert!(!memory.image_is_current(&image));
-        }
-        check(SyntheticMemory::new(), SyntheticMemory::new());
-        check(ExecutionMemory::new(), ExecutionMemory::new());
-    }
-
-    #[test]
     fn a64_words_use_explicit_little_endian_canonicalization() {
         let memory = code_memory();
 
-        let a64_or_a32 = memory.fetch32(SPACE, CODE).unwrap();
+        let instruction = memory.fetch32(SPACE, CODE).unwrap();
 
-        assert_eq!(a64_or_a32.bits, 0xd503_201f);
-        assert_eq!(
-            a64_or_a32.dependencies.iter().collect::<Vec<_>>(),
-            vec![CodePageDependency {
-                page: PAGE_1,
-                mapping_generation: MappingGeneration::new(1),
-            }]
-        );
+        assert_eq!(instruction.bits, 0xd503_201f);
+        assert_eq!(instruction.physical_page, PAGE_1);
     }
 
     #[test]
@@ -2624,13 +2367,13 @@ mod tests {
         let after = memory.fetch32(SPACE, CODE).unwrap();
 
         assert_eq!(after.bits, 0x1122_3344);
-        assert_eq!(before.dependencies.iter().next().unwrap().page, PAGE_1);
-        assert_eq!(after.dependencies.iter().next().unwrap().page, PAGE_1);
-        assert_eq!(before.dependencies, after.dependencies);
+        assert_eq!(before.physical_page, PAGE_1);
+        assert_eq!(after.physical_page, PAGE_1);
+        assert_eq!(before.physical_page, after.physical_page);
     }
 
     #[test]
-    fn code_dependencies_track_mapping_identity_in_both_backends() {
+    fn instruction_fetch_tracks_physical_identity_in_both_backends() {
         let mut synthetic = SyntheticMemory::new();
         let mut execution = ExecutionMemory::new();
         for memory in [
@@ -2647,7 +2390,7 @@ mod tests {
         let synthetic_before = synthetic.fetch32(SPACE, CODE).unwrap();
         let execution_before = execution.fetch32(SPACE, CODE).unwrap();
         assert_eq!(synthetic_before, execution_before);
-        let before = synthetic_before.dependencies.iter().next().unwrap();
+        let before = synthetic_before.physical_page;
 
         for memory in [&synthetic as &dyn CpuMemory, &execution as &dyn CpuMemory] {
             memory
@@ -2662,8 +2405,9 @@ mod tests {
         let synthetic_after_write = synthetic.fetch32(SPACE, CODE).unwrap();
         let execution_after_write = execution.fetch32(SPACE, CODE).unwrap();
         assert_eq!(synthetic_after_write, execution_after_write);
-        let after_write = synthetic_after_write.dependencies.iter().next().unwrap();
+        let after_write = synthetic_after_write.physical_page;
         assert_eq!(after_write, before);
+        let before_remap = synthetic.mapping_info(SPACE, CODE).unwrap();
 
         for memory in [
             &synthetic as &dyn ProcessMemory,
@@ -2689,10 +2433,14 @@ mod tests {
         let synthetic_after_remap = synthetic.fetch32(SPACE, CODE).unwrap();
         let execution_after_remap = execution.fetch32(SPACE, CODE).unwrap();
         assert_eq!(synthetic_after_remap, execution_after_remap);
-        let after_remap = synthetic_after_remap.dependencies.iter().next().unwrap();
+        let after_remap = synthetic_after_remap.physical_page;
+        assert_eq!(after_remap, after_write);
         assert_ne!(
-            after_remap.mapping_generation,
-            after_write.mapping_generation
+            synthetic
+                .mapping_info(SPACE, CODE)
+                .unwrap()
+                .mapping_generation,
+            before_remap.mapping_generation
         );
 
         let synthetic_mapping = synthetic.mapping_info(SPACE, CODE).unwrap();
@@ -3524,7 +3272,10 @@ mod tests {
         assert_eq!(before_synthetic, before_execution);
         assert_eq!(after_synthetic, after_execution);
         assert_eq!(after_execution.bits, 0x5566_7788);
-        assert_eq!(before_execution.dependencies, after_execution.dependencies);
+        assert_eq!(
+            before_execution.physical_page,
+            after_execution.physical_page
+        );
     }
 
     #[test]

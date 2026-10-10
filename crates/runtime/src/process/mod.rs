@@ -31,6 +31,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
+use crate::GuestCpuState;
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::{
     CpuMemory, ExecutionMemory, MappingEpoch, MemoryAttributes, MemoryMappingError,
@@ -39,7 +40,7 @@ use nixe_cpu::memory::{
 };
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
-use nixe_cpu::state::{ThreadCpuState, a64::A64Register};
+use nixe_cpu::state::a64::A64Register;
 use nixe_loader_executable::{
     AddressSpaceType, ExternalSymbol, PreparationConfig, PreparedModule, SymbolResolution,
 };
@@ -350,7 +351,7 @@ impl RunnableProcess {
                 return Err(ThreadCreateError::ResourceLimit);
             }
         };
-        let mut state = ThreadCpuState::default();
+        let mut state = GuestCpuState::default();
         if initialize_created_thread(&mut state, request, tls_base).is_err() {
             let _ = self.handles.close(handle);
             self.rollback_thread_tls(tls_base);
@@ -364,7 +365,6 @@ impl RunnableProcess {
             object,
             exit: None,
             state: Some(state),
-            jit_returns: self.execution.new_return_stack(),
             handle,
             stack_bottom: request.stack_top,
             stack_top: request.stack_top,
@@ -576,7 +576,7 @@ fn supervisor_call_continuation(
 
 fn install_continuation(
     cpu: ProcessCpuContext,
-    state: &mut ThreadCpuState,
+    state: &mut GuestCpuState,
     target: LocationDescriptor,
 ) -> Result<(), ExceptionRouteError> {
     let expected_profile = cpu.profile_id();

@@ -1,0 +1,19 @@
+Source: https://github.com/lioncash/dynarmic
+Revision: a41c380246d3d9f9874f0f792d234dc0cc17c180
+License: 0BSD (LICENSE.txt); bundled dependencies retain their own licenses.
+
+Vendored source including bundled dependencies. Built for A64 by nixe-cpu-jit.
+
+Nixe adaptations:
+- backend/exception_handler{.h,_posix.cpp}: expose cold fault resolution and
+  allow nixe to own POSIX signal capture (DYNARMIC_EXTERNAL_FAULT_HANDLER).
+- backend/x64/a64_emit_x64.cpp: check halt/budget at linked and indirect/return
+  transitions so scheduler preemption and memory transitions remain bounded.
+- frontend/A64/translate/impl/sys_dc.cpp: end blocks after cache operations;
+  nixe applies ownership transitions after dropping its execution lease.
+- ir/opt/a64_get_set_elimination_pass.cpp, ir/opt/passes.h and
+  backend/x64/a64_interface.cpp: retain setters visible at memory-abort exits
+  while still forwarding register values and eliminating redundant accesses.
+
+The Rust/C ABI integration is in crates/cpu-jit. The generic native fault
+capture implementation is shared with the interpreter in cpu-direct-memory.

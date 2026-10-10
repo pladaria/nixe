@@ -196,7 +196,7 @@ fn draws_stop_consuming_vertex_streams_when_their_attributes_are_disabled() {
 struct MaterializationWriteback;
 
 impl VisibilityCoordinator for MaterializationWriteback {
-    fn make_device_visible(
+    fn cache_cpu_page(
         &self,
         _request: DeviceVisibilityRequest,
         _canonical_bytes: &[u8],
@@ -767,12 +767,16 @@ fn check_compressed_color_materialization(format: u32, kind: u8, zbc_mask: Optio
     )
     .unwrap();
     let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(MaterializationWriteback);
-    backing
-        .prepare_device_access(declaration, Arc::clone(&coordinator))
-        .unwrap();
-    backing
-        .publish_device_write(declaration, Arc::clone(&coordinator))
-        .unwrap();
+    nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+        [(&backing, declaration)],
+        Arc::clone(&coordinator),
+    )
+    .unwrap();
+    nixe_memory::CanonicalBackingRange::publish_device_writes(
+        [(&backing, declaration)],
+        Arc::clone(&coordinator),
+    )
+    .unwrap();
     // Presentation may materialize only the pages it reads. The remaining
     // pages retain GPU authority and the original content generation.
     let mut writeback = vec![0; 0x1000];
@@ -2112,6 +2116,46 @@ fn mme_macro_executes_captured_code_and_emits_validated_methods() {
             .and_then(MaxwellThreeDRegister::raw),
         Some(argument)
     );
+}
+
+#[test]
+fn mme_execution_crosses_instruction_windows_and_preserves_sparse_addresses() {
+    for start in [63, u32::MAX - 4] {
+        let mut channel = three_d_channel();
+        let macro_index = 5;
+        let set_method = 1 | (2 << 4) | ((0x1518 / 4) << 14);
+        let send_parameter_and_exit = (4 << 4) | (1 << 7) | (1 << 11);
+        dispatch_incrementing(&mut channel, 0x011c / 4, &[macro_index, start]).unwrap();
+        dispatch_increment_once(
+            &mut channel,
+            0x0114 / 4,
+            &[start, set_method, send_parameter_and_exit, 0x11],
+        )
+        .unwrap();
+        let before = channel.three_d_mut().mme().clone();
+        let value = 2.5_f32.to_bits();
+        dispatch_method(&mut channel, (0x3800 + macro_index * 8) / 4, value).unwrap();
+        assert_eq!(channel.three_d().raster().point_size().raw(), Some(value));
+        let mme = channel.three_d_mut().mme();
+        assert_eq!(mme.instruction_count(), 3);
+        assert!(
+            mme.instruction(MaxwellThreeDMmeRamAddress::new(start - 1))
+                .is_none()
+        );
+        assert!(
+            mme.instruction(MaxwellThreeDMmeRamAddress::new(start + 3))
+                .is_none()
+        );
+        dispatch_incrementing(&mut channel, 0x0114 / 4, &[start, 0x11]).unwrap();
+        assert_eq!(
+            before
+                .instruction(MaxwellThreeDMmeRamAddress::new(start))
+                .unwrap()
+                .raw(),
+            Some(set_method)
+        );
+        assert_eq!(channel.three_d_mut().mme().instruction_count(), 3);
+    }
 }
 
 #[test]

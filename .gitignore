@@ -41,4 +41,4 @@ Thumbs.db
 /docker/reference-*
 
 # Local validation/debug tools (downloaded sources and binaries)
-/dev-tools/
+/dev-tools/*

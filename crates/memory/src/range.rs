@@ -126,20 +126,31 @@ pub struct CanonicalBackingRange {
 #[derive(Debug)]
 struct CanonicalRangeLayout {
     segments: Box<[CanonicalBackingSegment]>,
+    segment_runs: Box<[CanonicalSegmentRun]>,
+    // Exclusive logical ends allow subrange access without walking the prefix.
+    segment_ends: Box<[u64]>,
     // Indices retain first-occurrence order without duplicating page authority.
     pages: Box<[usize]>,
-    // Stable identity order is also the lock order for multi-store transitions.
-    stores: Box<[CanonicalRangeStore]>,
+    // Gate identity order deduplicates stores sharing one non-reentrant gate.
+    gates: Box<[crate::ExecutionGate]>,
     owner: Mutex<Option<Arc<crate::backing::RangeDeviceOwner>>>,
     visibility_epoch: std::sync::OnceLock<Arc<AtomicU64>>,
     clean_read_epoch: AtomicU64,
     cpu_summary: Mutex<std::sync::Weak<CpuWriteSummary>>,
 }
 
-#[derive(Debug)]
-struct CanonicalRangeStore {
-    store: crate::CanonicalBackingStore,
-    changes: Box<[crate::MemoryInvalidationKind]>,
+/// Lossless run encoding of the ordered segment sequence. Segments only share
+/// a run when every field except the consecutive physical page number matches.
+/// In particular, aliases, boundaries, permissions and mapping generations
+/// remain part of equality; this is not a fingerprint of byte coverage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CanonicalSegmentRun {
+    first_page: CanonicalPageId,
+    last_page: CanonicalPageId,
+    offset: u64,
+    size: u64,
+    permissions: MemoryPermissions,
+    mapping_generation: MappingGeneration,
 }
 
 impl PartialEq for CanonicalBackingRange {
@@ -151,13 +162,13 @@ impl PartialEq for CanonicalBackingRange {
                 crate::metrics::record(crate::metrics::Counter::RangeStructuralComparisons, 1);
                 crate::metrics::record(
                     crate::metrics::Counter::RangeEqualityInputSegments,
-                    (self.layout.segments.len() + other.layout.segments.len()) as u64,
+                    (self.layout.segment_runs.len() + other.layout.segment_runs.len()) as u64,
                 );
             }
         }
         self.size == other.size
             && (Arc::ptr_eq(&self.layout, &other.layout)
-                || self.layout.segments == other.layout.segments)
+                || self.layout.segment_runs == other.layout.segment_runs)
     }
 }
 
@@ -168,7 +179,7 @@ struct CpuWriteDependencyPage {
     observed_epoch: AtomicU64,
 }
 
-const CPU_WRITE_GROUP_PAGES: usize = 64;
+pub(crate) const CPU_WRITE_GROUP_PAGES: usize = 64;
 
 pub(crate) struct CpuWriteSummary {
     epoch: AtomicU64,
@@ -270,6 +281,15 @@ struct StreamingCpuPage {
 /// Logical offsets and copied bytes from a canonical dependency snapshot.
 pub type CanonicalByteSnapshots = Vec<(u64, Box<[u8]>)>;
 
+/// One resource's requested CPU-byte sampling boundary.
+/// A batch does not share or refresh another resource's dirty observation.
+pub struct CpuWriteSnapshotRequest<'a> {
+    pub dependency: &'a CanonicalCpuWriteDependency,
+    pub range: &'a CanonicalBackingRange,
+    pub selection: CpuWriteSnapshotSelection,
+    pub alignment: u64,
+}
+
 /// Cloneable page-granular observation of CPU writes.
 ///
 /// Capturing establishes a read-only baseline through every direct alias.
@@ -280,6 +300,30 @@ pub struct CanonicalCpuWriteDependency {
     inner: Arc<CanonicalCpuWriteDependencyInner>,
 }
 
+pub(crate) struct CpuWriteObservation {
+    pub(crate) summary: Arc<CpuWriteSummary>,
+    pub(crate) epochs: Vec<u64>,
+    pub(crate) summary_epoch: u64,
+    pub(crate) group_epochs: Vec<u64>,
+}
+
+impl CpuWriteObservation {
+    pub(crate) fn new(summary: Arc<CpuWriteSummary>, epochs: Vec<u64>) -> Self {
+        let summary_epoch = summary.epoch.load(Ordering::Acquire);
+        let group_epochs = summary
+            .groups
+            .iter()
+            .map(|epoch| epoch.load(Ordering::Acquire))
+            .collect();
+        Self {
+            summary,
+            epochs,
+            summary_epoch,
+            group_epochs,
+        }
+    }
+}
+
 impl CanonicalCpuWriteDependency {
     /// Captures and arms every distinct physical page in one range.
     /// Call without a native epoch, memory lease or cache lock.
@@ -288,20 +332,21 @@ impl CanonicalCpuWriteDependency {
     }
 
     /// Captures several ranges as one page-granular dependency domain.
-    /// Restrictive protections are established while every affected backing
-    /// store and its bound engine are quiescent. No native epoch, memory lease
-    /// or cache lock may survive into this operation. Empty input is an error.
+    /// Already protected pages register observers under shared execution
+    /// admission and page locks. Establishing new protections excludes CPU
+    /// execution. Call without an execution lease or cache lock. Empty input
+    /// is an error.
     pub fn capture_ranges<'a>(
         ranges: impl IntoIterator<Item = &'a CanonicalBackingRange>,
     ) -> Result<Self, CanonicalRangeAccessError> {
         let domains = ranges.into_iter().cloned().collect::<Box<[_]>>();
-        let mut execution_stores = BTreeMap::new();
+        let mut execution_gates = BTreeMap::new();
         let mut pages = BTreeMap::new();
         for range in &domains {
             for segment in range.segments() {
-                execution_stores
-                    .entry(segment.backing.store().identity())
-                    .or_insert_with(|| segment.backing.store().clone());
+                execution_gates
+                    .entry(segment.backing.store().execution_gate().identity())
+                    .or_insert_with(|| segment.backing.store().execution_gate().clone());
                 pages
                     .entry(segment.page())
                     .or_insert_with(|| segment.backing().clone());
@@ -310,101 +355,104 @@ impl CanonicalCpuWriteDependency {
         if pages.is_empty() {
             return Err(CanonicalRangeAccessError::IncompleteRange);
         }
-        let execution_stores = execution_stores.into_values().collect::<Vec<_>>();
-        // An initially unarmed page needs the engine handshake before waiting
-        // for execution leases. Treat this inspection only as a hint: a CPU
-        // write can disarm tracking before admission closes, so check again
-        // under exclusion and retry with the mutation handshake if necessary.
-        let mut arm_tracking = pages.values().try_fold(false, |needed, page| {
-            Ok::<_, CanonicalRangeAccessError>(
-                needed
-                    || page
-                        .needs_cpu_dirty_tracking()
-                        .map_err(CanonicalRangeAccessError::Backing)?,
-            )
-        })?;
-        let _transitions = loop {
-            let mut transitions = execution_stores
+        let execution_gates = execution_gates.into_values().collect::<Vec<_>>();
+        let group_count = pages.len().div_ceil(CPU_WRITE_GROUP_PAGES);
+        // Consumers of identical retained topology share one page observer,
+        // while their baseline epochs remain independent. Refreshing content
+        // never makes an older opaque interpretation current again.
+        let page_list = pages.into_values().collect::<Vec<_>>();
+        let mut select_summary = || {
+            let existing = if domains.len() == 1 {
+                domains[0]
+                    .layout
+                    .cpu_summary
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .upgrade()
+            } else {
+                None
+            };
+            let (summary, shared) = if let Some(summary) = existing {
+                (summary, true)
+            } else {
+                let coverage =
+                    PageCoverage::from_sorted(page_list.iter().map(CanonicalBackingPage::identity));
+                let mut interner = CPU_SUMMARIES
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(summary) = interner.find(&coverage) {
+                    (summary, true)
+                } else {
+                    let summary = Arc::new(CpuWriteSummary {
+                        epoch: AtomicU64::new(0),
+                        groups: (0..group_count).map(|_| AtomicU64::new(0)).collect(),
+                    });
+                    interner.insert(coverage, &summary);
+                    (summary, false)
+                }
+            };
+            if domains.len() == 1 {
+                *domains[0]
+                    .layout
+                    .cpu_summary
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&summary);
+            }
+            (summary, shared)
+        };
+        let observation = {
+            let leases = execution_gates
                 .iter()
-                .map(|store| store.execution_gate().acquire_capture(arm_tracking))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(CanonicalRangeAccessError::Mutation)?;
-            let needs_tracking = pages.values().try_fold(false, |needed, page| {
+                .map(crate::ExecutionGate::acquire_shared)
+                .collect::<Vec<_>>();
+            let protected =
+                crate::backing::observe_protected_cpu_pages(&page_list, &mut select_summary)
+                    .map_err(CanonicalRangeAccessError::Backing)?;
+            drop(leases);
+            protected
+        };
+        let observation = if let Some(observation) = observation {
+            observation
+        } else {
+            let mut transitions = execution_gates
+                .iter()
+                .map(crate::ExecutionGate::acquire_exclusive)
+                .collect::<Vec<_>>();
+            if page_list.iter().try_fold(false, |needed, page| {
                 Ok::<_, CanonicalRangeAccessError>(
                     needed
                         || page
                             .needs_cpu_dirty_tracking()
                             .map_err(CanonicalRangeAccessError::Backing)?,
                 )
-            })?;
-            if !arm_tracking && needs_tracking {
-                drop(transitions);
-                arm_tracking = true;
-                continue;
-            }
-            if arm_tracking {
+            })? {
                 for transition in &mut transitions {
                     transition.commit();
                 }
             }
-            break transitions;
-        };
-        let group_count = pages.len().div_ceil(CPU_WRITE_GROUP_PAGES);
-        // Consumers of identical retained topology share one page observer,
-        // while their baseline epochs remain independent. Refreshing content
-        // never makes an older opaque interpretation current again.
-        let existing = if domains.len() == 1 {
-            domains[0]
-                .layout
-                .cpu_summary
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .upgrade()
-        } else {
-            None
-        };
-        let (summary, shared) = if let Some(summary) = existing {
-            (summary, true)
-        } else {
-            let coverage = PageCoverage::from_sorted(pages.keys().copied());
-            let mut interner = CPU_SUMMARIES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(summary) = interner.find(&coverage) {
-                (summary, true)
-            } else {
-                let summary = Arc::new(CpuWriteSummary {
-                    epoch: AtomicU64::new(0),
-                    groups: (0..group_count).map(|_| AtomicU64::new(0)).collect(),
-                });
-                interner.insert(coverage, &summary);
-                (summary, false)
-            }
-        };
-        if domains.len() == 1 {
-            *domains[0]
-                .layout
-                .cpu_summary
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&summary);
-        }
-        let pages = pages
-            .into_values()
-            .enumerate()
-            .map(|(index, page)| {
-                let observed_epoch = if shared {
-                    page.arm_cpu_dirty_observer_quiescent()
-                } else {
-                    page.observe_cpu_write_summary(&summary, index / CPU_WRITE_GROUP_PAGES)
-                }
-                .map_err(CanonicalRangeAccessError::Backing)?;
-                Ok(CpuWriteDependencyPage {
-                    page,
-                    observed_epoch: AtomicU64::new(observed_epoch),
+            let (summary, shared) = select_summary();
+            let epochs = page_list
+                .iter()
+                .enumerate()
+                .map(|(index, page)| {
+                    if shared {
+                        page.arm_cpu_dirty_observer_quiescent()
+                    } else {
+                        page.observe_cpu_write_summary(&summary, index / CPU_WRITE_GROUP_PAGES)
+                    }
+                    .map_err(CanonicalRangeAccessError::Backing)
                 })
+                .collect::<Result<Vec<_>, _>>()?;
+            CpuWriteObservation::new(summary, epochs)
+        };
+        let pages = page_list
+            .into_iter()
+            .zip(observation.epochs)
+            .map(|(page, epoch)| CpuWriteDependencyPage {
+                page,
+                observed_epoch: AtomicU64::new(epoch),
             })
-            .collect::<Result<Vec<_>, CanonicalRangeAccessError>>()?
-            .into_boxed_slice();
+            .collect::<Box<[_]>>();
         Ok(Self {
             inner: Arc::new(CanonicalCpuWriteDependencyInner {
                 domains,
@@ -413,13 +461,13 @@ impl CanonicalCpuWriteDependency {
                     streaming: BTreeMap::new(),
                 }),
                 pages,
-                observed_summary: AtomicU64::new(summary.epoch.load(Ordering::Acquire)),
-                observed_groups: summary
-                    .groups
-                    .iter()
-                    .map(|epoch| AtomicU64::new(epoch.load(Ordering::Acquire)))
+                observed_summary: AtomicU64::new(observation.summary_epoch),
+                observed_groups: observation
+                    .group_epochs
+                    .into_iter()
+                    .map(AtomicU64::new)
                     .collect(),
-                summary,
+                summary: observation.summary,
                 streaming_pages: AtomicU64::new(0),
                 clean_since_snapshot: AtomicBool::new(false),
             }),
@@ -448,18 +496,19 @@ impl CanonicalCpuWriteDependency {
     /// completely overwrites these bytes. Call outside native execution and
     /// without a memory lease: protection changes rendezvous with the engine.
     pub fn rearm(&self) -> Result<(), CanonicalRangeAccessError> {
-        let mut stores = BTreeMap::new();
-        for page in &self.inner.pages {
-            stores
-                .entry(page.page.store().identity())
-                .or_insert_with(|| page.page.store().clone());
-        }
-        let stores = stores.into_values().collect::<Vec<_>>();
-        let mut transitions = stores
-            .iter()
-            .map(|store| store.execution_gate().acquire_mutation(&[]))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(CanonicalRangeAccessError::Mutation)?;
+        Self::snapshot_batch_with_resolver(
+            &[CpuWriteSnapshotRequest {
+                dependency: self,
+                range: &self.inner.domains[0],
+                selection: CpuWriteSnapshotSelection::Rearm,
+                alignment: 1,
+            }],
+            &mut |_, _| unreachable!("tracking rearm never demands CPU visibility"),
+        )?;
+        Ok(())
+    }
+
+    fn rearm_quiescent(&self) -> Result<(), CanonicalRangeAccessError> {
         let mut adaptive = self
             .inner
             .adaptive
@@ -472,9 +521,6 @@ impl CanonicalCpuWriteDependency {
         adaptive.streaming.clear();
         self.inner.streaming_pages.store(0, Ordering::Release);
         self.record_summary();
-        for transition in &mut transitions {
-            transition.commit();
-        }
         Ok(())
     }
 
@@ -543,13 +589,106 @@ impl CanonicalCpuWriteDependency {
         alignment: u64,
         resolve: &mut crate::CpuVisibilityResolver<'_>,
     ) -> Result<CanonicalByteSnapshots, CanonicalRangeAccessError> {
+        Self::snapshot_batch_with_resolver(
+            &[CpuWriteSnapshotRequest {
+                dependency: self,
+                range,
+                selection,
+                alignment,
+            }],
+            resolve,
+        )
+        .map(|mut snapshots| snapshots.pop().expect("one snapshot request"))
+    }
+
+    /// Samples compatible inputs under one ordered set of execution gates.
+    /// Independent resource observations and logical byte layouts remain distinct.
+    /// A required readback ends the current exclusion phase; already copied bytes
+    /// remain retained while pending requests revalidate after the callback.
+    pub fn snapshot_batch_with_resolver(
+        requests: &[CpuWriteSnapshotRequest<'_>],
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<Vec<CanonicalByteSnapshots>, CanonicalRangeAccessError> {
+        for request in requests {
+            request
+                .dependency
+                .validate_snapshot_range(request.range, request.alignment)?;
+            if request.selection != CpuWriteSnapshotSelection::Rearm {
+                crate::metrics::record(
+                    crate::metrics::Counter::SnapshotRequestedBytes,
+                    request.range.size(),
+                );
+            }
+        }
+        let mut snapshots = vec![Vec::new(); requests.len()];
+        let mut pending = (0..requests.len())
+            .filter(|index| {
+                let request = &requests[*index];
+                matches!(
+                    request.selection,
+                    CpuWriteSnapshotSelection::All | CpuWriteSnapshotSelection::Rearm
+                ) || !request.dependency.remains_current()
+            })
+            .collect::<Vec<_>>();
+        while !pending.is_empty() {
+            let mut gates = BTreeMap::new();
+            for &index in &pending {
+                let request = &requests[index];
+                if request.selection == CpuWriteSnapshotSelection::Rearm {
+                    for page in &request.dependency.inner.pages {
+                        let gate = page.page.store().execution_gate();
+                        gates.entry(gate.identity()).or_insert_with(|| gate.clone());
+                    }
+                } else {
+                    for gate in request.range.execution_gates() {
+                        gates.entry(gate.identity()).or_insert_with(|| gate.clone());
+                    }
+                }
+            }
+            let mut transitions = gates
+                .values()
+                .map(crate::ExecutionGate::acquire_exclusive)
+                .collect::<Vec<_>>();
+            let mut demands = BTreeMap::new();
+            let mut retry = Vec::new();
+            for &index in &pending {
+                let request = &requests[index];
+                match request.dependency.snapshot_quiescent(
+                    request.range,
+                    request.selection,
+                    request.alignment,
+                )? {
+                    Ok(bytes) => snapshots[index] = bytes,
+                    Err(pages) => {
+                        for page in pages {
+                            demands.entry(page.identity()).or_insert(page);
+                        }
+                        retry.push(index);
+                    }
+                }
+            }
+            for transition in &mut transitions {
+                transition.commit();
+            }
+            drop(transitions);
+            for page in demands.values() {
+                page.ensure_cpu_visible_with(resolve).map_err(|error| {
+                    CanonicalRangeAccessError::Backing(crate::CanonicalPageError::Visibility(error))
+                })?;
+            }
+            pending = retry;
+        }
+        Ok(snapshots)
+    }
+
+    fn validate_snapshot_range(
+        &self,
+        range: &CanonicalBackingRange,
+        alignment: u64,
+    ) -> Result<(), CanonicalRangeAccessError> {
         if alignment == 0 {
             return Err(CanonicalRangeAccessError::InvalidAlignment(alignment));
         }
-        crate::metrics::record(
-            crate::metrics::Counter::SnapshotRequestedBytes,
-            range.size(),
-        );
         let known_domain = self
             .inner
             .domains
@@ -569,273 +708,260 @@ impl CanonicalCpuWriteDependency {
                 return Err(CanonicalRangeAccessError::DependencyMismatch);
             }
         }
+        Ok(())
+    }
+
+    fn snapshot_quiescent(
+        &self,
+        range: &CanonicalBackingRange,
+        selection: CpuWriteSnapshotSelection,
+        alignment: u64,
+    ) -> Result<Result<CanonicalByteSnapshots, Vec<CanonicalBackingPage>>, CanonicalRangeAccessError>
+    {
+        if selection == CpuWriteSnapshotSelection::Rearm {
+            self.rearm_quiescent()?;
+            return Ok(Ok(Vec::new()));
+        }
         if selection != CpuWriteSnapshotSelection::All && self.remains_current() {
-            return Ok(Vec::new());
+            return Ok(Ok(Vec::new()));
         }
         let range_pages = range
             .pages()
             .map(CanonicalBackingPage::identity)
             .collect::<BTreeSet<_>>();
-        loop {
-            let mut transitions = range
-                .execution_stores()
-                .map(|store| store.execution_gate().acquire_mutation(&[]))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(CanonicalRangeAccessError::Mutation)?;
-            let mut adaptive = self
-                .inner
-                .adaptive
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if self
-                .inner
-                .clean_since_snapshot
-                .swap(false, Ordering::AcqRel)
-            {
-                adaptive.streaks.fill(0);
-            }
-            if selection != CpuWriteSnapshotSelection::All {
-                let device_owned = adaptive
-                    .streaming
-                    .keys()
-                    .copied()
-                    .filter(|index| {
-                        let page = &self.inner.pages[*index];
-                        range_pages.contains(&page.page.identity())
-                            && page.page.cpu_dirty_epoch()
-                                == page.observed_epoch.load(Ordering::Acquire)
-                            && matches!(
-                                page.page.visibility_state(),
-                                VisibilityState::GpuNewer { .. }
-                            )
-                    })
-                    .collect::<Vec<_>>();
-                for index in device_owned {
-                    // Device ownership already revokes CPU writes. Restore a
-                    // protected observation without downloading unchanged GPU
-                    // bytes merely to compare a former CPU streaming shadow.
-                    self.arm_page(&self.inner.pages[index])?;
-                    adaptive.streaming.remove(&index);
-                    adaptive.streaks[index] = 0;
-                }
-            }
-            let mut candidates = adaptive.streaming.keys().copied().collect::<BTreeSet<_>>();
-            for (group, pages) in self.inner.pages.chunks(CPU_WRITE_GROUP_PAGES).enumerate() {
-                crate::metrics::record(crate::metrics::Counter::DirtyGroupChecks, 1);
-                let epoch = self.inner.summary.groups[group].load(Ordering::Acquire);
-                if epoch == u64::MAX
-                    || epoch != self.inner.observed_groups[group].load(Ordering::Acquire)
-                {
-                    crate::metrics::record(
-                        crate::metrics::Counter::DirtyPageChecks,
-                        pages.len() as u64,
-                    );
-                    for (offset, page) in pages.iter().enumerate() {
-                        if page.page.cpu_dirty_epoch()
-                            != page.observed_epoch.load(Ordering::Acquire)
-                        {
-                            candidates.insert(group * CPU_WRITE_GROUP_PAGES + offset);
-                        }
-                    }
-                }
-            }
-            candidates
-                .retain(|index| range_pages.contains(&self.inner.pages[*index].page.identity()));
-            let mut needed = if selection == CpuWriteSnapshotSelection::All {
-                self.inner
-                    .pages
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, page)| {
-                        range_pages.contains(&page.page.identity()).then_some(index)
-                    })
-                    .collect::<BTreeSet<_>>()
-            } else {
-                candidates.clone()
-            };
-            // Streaming pages have no protected observation. Compare their
-            // exact bytes while CPU execution is quiescent; unchanged samples
-            // transfer nothing and eventually recover protected tracking.
-            let visible = needed.iter().try_fold(true, |visible, index| {
-                Ok::<_, CanonicalRangeAccessError>(
-                    visible
-                        && self.inner.pages[*index]
-                            .page
-                            .cpu_visible_quiescent()
-                            .map_err(CanonicalRangeAccessError::Backing)?,
-                )
-            })?;
-            if !visible {
-                drop(adaptive);
-                drop(transitions);
-                self.resolve_pages(&needed, resolve)?;
-                continue;
-            }
-            let mut dirty = candidates.clone();
-            let streaming = adaptive
+        let mut adaptive = self
+            .inner
+            .adaptive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .inner
+            .clean_since_snapshot
+            .swap(false, Ordering::AcqRel)
+        {
+            adaptive.streaks.fill(0);
+        }
+        if selection != CpuWriteSnapshotSelection::All {
+            let device_owned = adaptive
                 .streaming
                 .keys()
                 .copied()
-                .filter(|index| range_pages.contains(&self.inner.pages[*index].page.identity()))
+                .filter(|index| {
+                    let page = &self.inner.pages[*index];
+                    range_pages.contains(&page.page.identity())
+                        && page.page.cpu_dirty_epoch()
+                            == page.observed_epoch.load(Ordering::Acquire)
+                        && matches!(
+                            page.page.visibility_state(),
+                            VisibilityState::GpuNewer { .. }
+                        )
+                })
                 .collect::<Vec<_>>();
-            for index in streaming {
-                let page = &self.inner.pages[index];
+            for index in device_owned {
+                // Device ownership already revokes CPU writes. Restore a
+                // protected observation without downloading unchanged GPU
+                // bytes merely to compare a former CPU streaming shadow.
+                self.arm_page(&self.inner.pages[index])?;
+                adaptive.streaming.remove(&index);
+                adaptive.streaks[index] = 0;
+            }
+        }
+        let mut candidates = adaptive.streaming.keys().copied().collect::<BTreeSet<_>>();
+        for (group, pages) in self.inner.pages.chunks(CPU_WRITE_GROUP_PAGES).enumerate() {
+            crate::metrics::record(crate::metrics::Counter::DirtyGroupChecks, 1);
+            let epoch = self.inner.summary.groups[group].load(Ordering::Acquire);
+            if epoch == u64::MAX
+                || epoch != self.inner.observed_groups[group].load(Ordering::Acquire)
+            {
                 crate::metrics::record(
-                    crate::metrics::Counter::StreamingComparedBytes,
-                    page.page.size() as u64,
+                    crate::metrics::Counter::DirtyPageChecks,
+                    pages.len() as u64,
                 );
+                for (offset, page) in pages.iter().enumerate() {
+                    if page.page.cpu_dirty_epoch() != page.observed_epoch.load(Ordering::Acquire) {
+                        candidates.insert(group * CPU_WRITE_GROUP_PAGES + offset);
+                    }
+                }
+            }
+        }
+        candidates.retain(|index| range_pages.contains(&self.inner.pages[*index].page.identity()));
+        let mut needed = if selection == CpuWriteSnapshotSelection::All {
+            self.inner
+                .pages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, page)| {
+                    range_pages.contains(&page.page.identity()).then_some(index)
+                })
+                .collect::<BTreeSet<_>>()
+        } else {
+            candidates.clone()
+        };
+        // Streaming pages have no protected observation. Compare their
+        // exact bytes while CPU execution is quiescent; unchanged samples
+        // transfer nothing and eventually recover protected tracking.
+        let visible = needed.iter().try_fold(true, |visible, index| {
+            Ok::<_, CanonicalRangeAccessError>(
+                visible
+                    && self.inner.pages[*index]
+                        .page
+                        .cpu_visible_quiescent()
+                        .map_err(CanonicalRangeAccessError::Backing)?,
+            )
+        })?;
+        if !visible {
+            drop(adaptive);
+            return Ok(Err(needed
+                .iter()
+                .map(|index| self.inner.pages[*index].page.clone())
+                .collect()));
+        }
+        let mut dirty = candidates.clone();
+        let streaming = adaptive
+            .streaming
+            .keys()
+            .copied()
+            .filter(|index| range_pages.contains(&self.inner.pages[*index].page.identity()))
+            .collect::<Vec<_>>();
+        for index in streaming {
+            let page = &self.inner.pages[index];
+            crate::metrics::record(
+                crate::metrics::Counter::StreamingComparedBytes,
+                page.page.size() as u64,
+            );
+            let mut bytes = vec![0; page.page.size()].into_boxed_slice();
+            page.page
+                .read_quiescent(0, &mut bytes)
+                .map_err(CanonicalRangeAccessError::Backing)?;
+            page.observed_epoch
+                .store(page.page.cpu_dirty_epoch(), Ordering::Release);
+            let streaming = adaptive
+                .streaming
+                .get_mut(&index)
+                .expect("retained streaming page");
+            if streaming.bytes == bytes {
+                dirty.remove(&index);
+                streaming.quiet = streaming.quiet.saturating_add(1);
+                if streaming.quiet >= STREAMING_QUIET_THRESHOLD {
+                    self.arm_page(page)?;
+                    adaptive.streaming.remove(&index);
+                    adaptive.streaks[index] = 0;
+                }
+            } else {
+                streaming.bytes = bytes;
+                streaming.quiet = 0;
+                dirty.insert(index);
+            }
+        }
+        let dirty_pages = dirty
+            .iter()
+            .map(|index| self.inner.pages[*index].page.identity())
+            .collect::<BTreeSet<_>>();
+        let mut intervals = Vec::new();
+        if selection == CpuWriteSnapshotSelection::All
+            || (selection == CpuWriteSnapshotSelection::WholeIfDirty && !dirty.is_empty())
+        {
+            intervals.push((0, range.size()));
+        } else if selection == CpuWriteSnapshotSelection::DirtyPages {
+            let mut offset = 0;
+            for segment in range.segments() {
+                let end = offset + segment.size();
+                if dirty_pages.contains(&segment.page()) {
+                    let start = offset / alignment * alignment;
+                    let end = end
+                        .checked_add(alignment - 1)
+                        .ok_or(CanonicalRangeAccessError::RangeOverflow)?
+                        / alignment
+                        * alignment;
+                    intervals.push((start, end.min(range.size())));
+                }
+                offset += segment.size();
+            }
+            normalize_intervals(&mut intervals);
+        }
+        // Alignment or WholeIfDirty can include additional pages. Resolve
+        // only pages actually copied, never unrelated GPU-owned bindings.
+        let mut offset = 0;
+        for segment in range.segments() {
+            let end = offset + segment.size();
+            if intervals
+                .iter()
+                .any(|(start, stop)| *start < end && offset < *stop)
+            {
+                let index = self
+                    .inner
+                    .pages
+                    .binary_search_by_key(&segment.page(), |page| page.page.identity())
+                    .expect("validated dependency page");
+                needed.insert(index);
+            }
+            offset = end;
+        }
+        let visible = needed.iter().try_fold(true, |visible, index| {
+            Ok::<_, CanonicalRangeAccessError>(
+                visible
+                    && self.inner.pages[*index]
+                        .page
+                        .cpu_visible_quiescent()
+                        .map_err(CanonicalRangeAccessError::Backing)?,
+            )
+        })?;
+        if !visible {
+            drop(adaptive);
+            return Ok(Err(needed
+                .iter()
+                .map(|index| self.inner.pages[*index].page.clone())
+                .collect()));
+        }
+        let mut snapshots = Vec::new();
+        for (offset, end) in intervals {
+            let mut bytes = vec![
+                0;
+                usize::try_from(end - offset)
+                    .map_err(|_| CanonicalRangeAccessError::RangeOverflow)?
+            ];
+            crate::metrics::record(
+                crate::metrics::Counter::SnapshotCopiedBytes,
+                bytes.len() as u64,
+            );
+            range.read_quiescent(offset, &mut bytes)?;
+            snapshots.push((offset, bytes.into_boxed_slice()));
+        }
+        for index in &dirty {
+            if adaptive.streaming.contains_key(index) {
+                continue;
+            }
+            let streak = adaptive.streaks[*index].saturating_add(1);
+            adaptive.streaks[*index] = streak;
+            let page = &self.inner.pages[*index];
+            if streak >= STREAMING_DIRTY_THRESHOLD {
                 let mut bytes = vec![0; page.page.size()].into_boxed_slice();
                 page.page
                     .read_quiescent(0, &mut bytes)
                     .map_err(CanonicalRangeAccessError::Backing)?;
                 page.observed_epoch
                     .store(page.page.cpu_dirty_epoch(), Ordering::Release);
-                let streaming = adaptive
+                adaptive
                     .streaming
-                    .get_mut(&index)
-                    .expect("retained streaming page");
-                if streaming.bytes == bytes {
-                    dirty.remove(&index);
-                    streaming.quiet = streaming.quiet.saturating_add(1);
-                    if streaming.quiet >= STREAMING_QUIET_THRESHOLD {
-                        self.arm_page(page)?;
-                        adaptive.streaming.remove(&index);
-                        adaptive.streaks[index] = 0;
-                    }
-                } else {
-                    streaming.bytes = bytes;
-                    streaming.quiet = 0;
-                    dirty.insert(index);
-                }
+                    .insert(*index, StreamingCpuPage { bytes, quiet: 0 });
+            } else {
+                self.arm_page(page)?;
             }
-            let dirty_pages = dirty
-                .iter()
-                .map(|index| self.inner.pages[*index].page.identity())
-                .collect::<BTreeSet<_>>();
-            let mut intervals = Vec::new();
-            if selection == CpuWriteSnapshotSelection::All
-                || (selection == CpuWriteSnapshotSelection::WholeIfDirty && !dirty.is_empty())
-            {
-                intervals.push((0, range.size()));
-            } else if selection == CpuWriteSnapshotSelection::DirtyPages {
-                let mut offset = 0;
-                for segment in range.segments() {
-                    let end = offset + segment.size();
-                    if dirty_pages.contains(&segment.page()) {
-                        let start = offset / alignment * alignment;
-                        let end = end
-                            .checked_add(alignment - 1)
-                            .ok_or(CanonicalRangeAccessError::RangeOverflow)?
-                            / alignment
-                            * alignment;
-                        intervals.push((start, end.min(range.size())));
-                    }
-                    offset += segment.size();
-                }
-                normalize_intervals(&mut intervals);
-            }
-            // Alignment or WholeIfDirty can include additional pages. Resolve
-            // only pages actually copied, never unrelated GPU-owned bindings.
-            let mut offset = 0;
-            for segment in range.segments() {
-                let end = offset + segment.size();
-                if intervals
-                    .iter()
-                    .any(|(start, stop)| *start < end && offset < *stop)
+        }
+        if selection == CpuWriteSnapshotSelection::All {
+            for (index, page) in self.inner.pages.iter().enumerate() {
+                if range_pages.contains(&page.page.identity())
+                    && !adaptive.streaming.contains_key(&index)
                 {
-                    let index = self
-                        .inner
-                        .pages
-                        .binary_search_by_key(&segment.page(), |page| page.page.identity())
-                        .expect("validated dependency page");
-                    needed.insert(index);
-                }
-                offset = end;
-            }
-            let visible = needed.iter().try_fold(true, |visible, index| {
-                Ok::<_, CanonicalRangeAccessError>(
-                    visible
-                        && self.inner.pages[*index]
-                            .page
-                            .cpu_visible_quiescent()
-                            .map_err(CanonicalRangeAccessError::Backing)?,
-                )
-            })?;
-            if !visible {
-                drop(adaptive);
-                drop(transitions);
-                self.resolve_pages(&needed, resolve)?;
-                continue;
-            }
-            let mut snapshots = Vec::new();
-            for (offset, end) in intervals {
-                let mut bytes = vec![
-                    0;
-                    usize::try_from(end - offset)
-                        .map_err(|_| CanonicalRangeAccessError::RangeOverflow)?
-                ];
-                crate::metrics::record(
-                    crate::metrics::Counter::SnapshotCopiedBytes,
-                    bytes.len() as u64,
-                );
-                range.read_quiescent(offset, &mut bytes)?;
-                snapshots.push((offset, bytes.into_boxed_slice()));
-            }
-            for index in &dirty {
-                if adaptive.streaming.contains_key(index) {
-                    continue;
-                }
-                let streak = adaptive.streaks[*index].saturating_add(1);
-                adaptive.streaks[*index] = streak;
-                let page = &self.inner.pages[*index];
-                if streak >= STREAMING_DIRTY_THRESHOLD {
-                    let mut bytes = vec![0; page.page.size()].into_boxed_slice();
-                    page.page
-                        .read_quiescent(0, &mut bytes)
-                        .map_err(CanonicalRangeAccessError::Backing)?;
-                    page.observed_epoch
-                        .store(page.page.cpu_dirty_epoch(), Ordering::Release);
-                    adaptive
-                        .streaming
-                        .insert(*index, StreamingCpuPage { bytes, quiet: 0 });
-                } else {
                     self.arm_page(page)?;
                 }
             }
-            if selection == CpuWriteSnapshotSelection::All {
-                for (index, page) in self.inner.pages.iter().enumerate() {
-                    if range_pages.contains(&page.page.identity())
-                        && !adaptive.streaming.contains_key(&index)
-                    {
-                        self.arm_page(page)?;
-                    }
-                }
-            }
-            self.inner
-                .streaming_pages
-                .store(adaptive.streaming.len() as u64, Ordering::Release);
-            self.record_summary();
-            for transition in &mut transitions {
-                transition.commit();
-            }
-            return Ok(snapshots);
         }
-    }
-
-    fn resolve_pages(
-        &self,
-        pages: &BTreeSet<usize>,
-        resolve: &mut crate::CpuVisibilityResolver<'_>,
-    ) -> Result<(), CanonicalRangeAccessError> {
-        for index in pages {
-            self.inner.pages[*index]
-                .page
-                .ensure_cpu_visible_with(resolve)
-                .map_err(|error| {
-                    CanonicalRangeAccessError::Backing(CanonicalPageError::Visibility(error))
-                })?;
-        }
-        Ok(())
+        self.inner
+            .streaming_pages
+            .store(adaptive.streaming.len() as u64, Ordering::Release);
+        self.record_summary();
+        Ok(Ok(snapshots))
     }
 
     fn arm_page(&self, page: &CpuWriteDependencyPage) -> Result<(), CanonicalRangeAccessError> {
@@ -883,6 +1009,8 @@ impl CanonicalCpuWriteDependency {
 /// Which bytes a CPU-write dependency snapshot must materialize.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CpuWriteSnapshotSelection {
+    /// Rearm the complete dependency after overwrite, without copying/readback.
+    Rearm,
     /// Only intersections with pages whose CPU-write epochs changed.
     DirtyPages,
     /// The entire range if any observed page changed.
@@ -948,30 +1076,8 @@ impl PartialEq for CanonicalCpuWriteDependency {
 impl Eq for CanonicalCpuWriteDependency {}
 
 impl CanonicalBackingRange {
-    /// Retained physical identity is the authority for device ranges, even
-    /// after their original virtual mapping has changed. Register all pages
-    /// before closing the gate: a compiler can publish between discovery and
-    /// closure, and its newly captured page must be included too. Reads also
-    /// change visibility authority and can leave a page Invalid on failure;
-    /// no code derived from that page may survive the transition in that case.
-    fn begin_device_transition(
-        &self,
-    ) -> Result<Vec<crate::ExecutionMutationGuard<'_>>, VisibilityError> {
-        self.layout
-            .stores
-            .iter()
-            .map(|entry| {
-                entry
-                    .store
-                    .execution_gate()
-                    .acquire_mutation(&entry.changes)
-                    .map_err(VisibilityError::ExecutionMutation)
-            })
-            .collect()
-    }
-
-    fn execution_stores(&self) -> impl Iterator<Item = &crate::CanonicalBackingStore> {
-        self.layout.stores.iter().map(|entry| &entry.store)
+    fn execution_gates(&self) -> impl Iterator<Item = &crate::ExecutionGate> {
+        self.layout.gates.iter()
     }
 
     fn pages(&self) -> impl Iterator<Item = &CanonicalBackingPage> {
@@ -987,10 +1093,33 @@ impl CanonicalBackingRange {
             return Err(CanonicalRangeError::Empty);
         }
         let mut size = 0_u64;
+        let mut segment_ends = Vec::with_capacity(segments.len());
+        let mut segment_runs: Vec<CanonicalSegmentRun> = Vec::new();
         for segment in &segments {
             size = size
                 .checked_add(segment.size)
                 .ok_or(CanonicalRangeError::RangeOverflow)?;
+            segment_ends.push(size);
+            let page = segment.page();
+            if let Some(run) = segment_runs.last_mut()
+                && run.last_page.store() == page.store()
+                && run.last_page.page().get().checked_add(1) == Some(page.page().get())
+                && run.offset == segment.offset
+                && run.size == segment.size
+                && run.permissions == segment.permissions
+                && run.mapping_generation == segment.mapping_generation
+            {
+                run.last_page = page;
+            } else {
+                segment_runs.push(CanonicalSegmentRun {
+                    first_page: page,
+                    last_page: page,
+                    offset: segment.offset,
+                    size: segment.size,
+                    permissions: segment.permissions,
+                    mapping_generation: segment.mapping_generation,
+                });
+            }
         }
         let mut seen_pages = BTreeSet::new();
         let mut pages = Vec::new();
@@ -998,30 +1127,19 @@ impl CanonicalBackingRange {
         for (index, segment) in segments.iter().enumerate() {
             if seen_pages.insert(segment.page()) {
                 pages.push(index);
-                let (_, changes) = stores
-                    .entry(segment.page().store())
-                    .or_insert_with(|| (segment.backing.store().clone(), BTreeSet::new()));
-                changes.insert(segment.page().page());
+                stores
+                    .entry(segment.backing().store().execution_gate().identity())
+                    .or_insert_with(|| segment.backing().store().execution_gate().clone());
             }
         }
-        let stores = stores
-            .into_values()
-            .map(|(store, pages)| CanonicalRangeStore {
-                store,
-                changes: pages
-                    .into_iter()
-                    .map(|first| crate::MemoryInvalidationKind::ExecutableContent {
-                        first,
-                        second: None,
-                    })
-                    .collect(),
-            })
-            .collect();
+        let stores = stores.into_values().collect();
         Ok(Self {
             layout: Arc::new(CanonicalRangeLayout {
                 segments: segments.into(),
+                segment_runs: segment_runs.into(),
+                segment_ends: segment_ends.into(),
                 pages: pages.into(),
-                stores,
+                gates: stores,
                 owner: Mutex::new(None),
                 visibility_epoch: std::sync::OnceLock::new(),
                 clean_read_epoch: AtomicU64::new(u64::MAX),
@@ -1050,6 +1168,55 @@ impl CanonicalBackingRange {
         &self.layout.segments
     }
 
+    pub(crate) fn segments_between(
+        &self,
+        offset: u64,
+        end: u64,
+    ) -> impl Iterator<Item = (u64, &CanonicalBackingSegment)> {
+        let first = self
+            .layout
+            .segment_ends
+            .partition_point(|&limit| limit <= offset);
+        let last = self
+            .layout
+            .segment_ends
+            .partition_point(|&limit| limit < end);
+        let limit = if offset < end {
+            (last + 1).min(self.layout.segments.len())
+        } else {
+            first
+        };
+        (first..limit).map(|index| {
+            let start = if index == 0 {
+                0
+            } else {
+                self.layout.segment_ends[index - 1]
+            };
+            (start, &self.layout.segments[index])
+        })
+    }
+
+    /// Observes whether a retained subrange needs no device readback. This does
+    /// not acquire a lease; callers still perform the normal checked access.
+    pub fn subrange_is_cpu_visible(
+        &self,
+        offset: u64,
+        size: u64,
+    ) -> Result<bool, CanonicalRangeError> {
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalRangeError::RangeOverflow)?;
+        if size == 0 || end > self.size {
+            return Err(CanonicalRangeError::InvalidSubrange);
+        }
+        Ok(self.segments_between(offset, end).all(|(_, segment)| {
+            matches!(
+                segment.visibility_state(),
+                VisibilityState::Clean | VisibilityState::CpuNewer
+            )
+        }))
+    }
+
     /// Retains a checked logical subrange with the same canonical page identity.
     pub fn snapshot_subrange(&self, offset: u64, size: u64) -> Result<Self, CanonicalRangeError> {
         let mut captured = Vec::new();
@@ -1075,9 +1242,8 @@ impl CanonicalBackingRange {
             return Err(CanonicalRangeError::InvalidSubrange);
         }
         let original_len = output.len();
-        let mut logical_start = 0_u64;
         let result = (|| {
-            for segment in self.layout.segments.iter() {
+            for (logical_start, segment) in self.segments_between(offset, end) {
                 let logical_end = logical_start
                     .checked_add(segment.size)
                     .ok_or(CanonicalRangeError::RangeOverflow)?;
@@ -1096,10 +1262,6 @@ impl CanonicalBackingRange {
                         segment.permissions,
                         segment.mapping_generation,
                     )?);
-                }
-                logical_start = logical_end;
-                if logical_start >= end {
-                    break;
                 }
             }
             Ok(())
@@ -1131,10 +1293,28 @@ impl CanonicalBackingRange {
         if output.is_empty() {
             return Ok(());
         }
+        // Scalar command/descriptor fetches commonly occupy one protected
+        // page. They need neither a native stop nor protection changes.
+        {
+            let mut segments = self.segments_between(offset, end);
+            if let Some((logical, segment)) = segments.next()
+                && segments.next().is_none()
+            {
+                let page_offset = usize::try_from(segment.offset + (offset - logical))
+                    .map_err(|_| CanonicalRangeAccessError::RangeOverflow)?;
+                let _lease = segment.backing.store().execution_gate().acquire_shared();
+                if segment
+                    .backing
+                    .read_protected(page_offset, output)
+                    .map_err(CanonicalRangeAccessError::Backing)?
+                {
+                    return Ok(());
+                }
+            }
+        }
         loop {
-            let mut logical_start = 0_u64;
             let mut visited = BTreeSet::new();
-            for segment in self.layout.segments.iter() {
+            for (logical_start, segment) in self.segments_between(offset, end) {
                 let logical_end = logical_start
                     .checked_add(segment.size)
                     .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
@@ -1146,19 +1326,14 @@ impl CanonicalBackingRange {
                         .prepare_cpu_access()
                         .map_err(CanonicalRangeAccessError::Backing)?;
                 }
-                logical_start = logical_end;
-                if logical_start >= end {
-                    break;
-                }
             }
 
             let _transitions = self
-                .execution_stores()
-                .map(|store| store.execution_gate().acquire_exclusive())
+                .execution_gates()
+                .map(crate::ExecutionGate::acquire_exclusive)
                 .collect::<Vec<_>>();
-            let mut logical_start = 0_u64;
             let mut cpu_visible = true;
-            for segment in self.layout.segments.iter() {
+            for (logical_start, segment) in self.segments_between(offset, end) {
                 let logical_end = logical_start
                     .checked_add(segment.size)
                     .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
@@ -1169,10 +1344,6 @@ impl CanonicalBackingRange {
                         .map_err(CanonicalRangeAccessError::Backing)?
                 {
                     cpu_visible = false;
-                    break;
-                }
-                logical_start = logical_end;
-                if logical_start >= end {
                     break;
                 }
             }
@@ -1202,9 +1373,8 @@ impl CanonicalBackingRange {
                 range_size: self.size,
             });
         }
-        let mut logical_start = 0_u64;
         let mut copied = 0_usize;
-        for segment in self.layout.segments.iter() {
+        for (logical_start, segment) in self.segments_between(offset, end) {
             let logical_end = logical_start
                 .checked_add(segment.size)
                 .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
@@ -1228,10 +1398,6 @@ impl CanonicalBackingRange {
                     .read_quiescent(page_offset, &mut output[copied..copied_end])
                     .map_err(CanonicalRangeAccessError::Backing)?;
                 copied = copied_end;
-            }
-            logical_start = logical_end;
-            if logical_start >= end {
-                break;
             }
         }
         if copied != output.len() {
@@ -1262,37 +1428,7 @@ impl CanonicalBackingRange {
         })
     }
 
-    /// Establishes device visibility before executing a declared access.
-    ///
-    /// The initial implementation transitions complete canonical pages even
-    /// when the logical range contains only a page fragment. This deliberately
-    /// conservative granularity preserves overlapping-alias correctness.
-    pub fn prepare_device_access(
-        &self,
-        declaration: DeviceAccessDeclaration,
-        coordinator: Arc<dyn VisibilityCoordinator>,
-    ) -> Result<(), VisibilityError> {
-        let mut transitions = self.begin_device_transition()?;
-        for transition in &mut transitions {
-            transition.commit();
-        }
-        for page in self.pages() {
-            page.prepare_device_access(declaration, Arc::clone(&coordinator))?;
-        }
-        Ok(())
-    }
-
-    /// Establishes device visibility only where canonical CPU bytes are newer.
-    ///
-    /// A resident resource already owns a device representation for clean
-    /// pages. Avoiding another whole-page handoff for those pages keeps the
-    /// steady-state path proportional to actual CPU writes. Newly created
-    /// resources remain responsible for their initial upload.
-    pub fn prepare_resident_device_access(
-        &self,
-        declaration: DeviceAccessDeclaration,
-        coordinator: Arc<dyn VisibilityCoordinator>,
-    ) -> Result<(), VisibilityError> {
+    fn resident_access_ready(&self, declaration: DeviceAccessDeclaration) -> bool {
         crate::metrics::record(crate::metrics::Counter::RangeChecks, 1);
         crate::metrics::record(crate::metrics::Counter::TrackingLocks, 1);
         if self
@@ -1303,7 +1439,7 @@ impl CanonicalBackingRange {
             .as_ref()
             .is_some_and(|owner| owner.is_current_for(declaration))
         {
-            return Ok(());
+            return true;
         }
         let visibility_summary = (!declaration.kind().writes()).then(|| self.visibility_summary());
         let visibility_epoch =
@@ -1312,7 +1448,7 @@ impl CanonicalBackingRange {
             && visibility_epoch != u64::MAX
             && self.layout.clean_read_epoch.load(Ordering::Acquire) == visibility_epoch
         {
-            return Ok(());
+            return true;
         }
         let mut all_clean = true;
         // These accesses change no visibility, tracking, permissions or bytes.
@@ -1339,114 +1475,238 @@ impl CanonicalBackingRange {
                     .clean_read_epoch
                     .store(visibility_epoch, Ordering::Release);
             }
+            return true;
+        }
+        false
+    }
+
+    /// Prepares compatible accesses once per physical page and execution gate.
+    /// Resource views and completion retains stay with the original requests.
+    /// CPU-page caching is bounded; host submission and CPU demand happen later.
+    pub fn prepare_resident_device_accesses<'a>(
+        accesses: impl IntoIterator<Item = (&'a Self, DeviceAccessDeclaration)>,
+        coordinator: Arc<dyn VisibilityCoordinator>,
+    ) -> Result<(), VisibilityError> {
+        let mut boundary = None;
+        let mut write_boundary = None;
+        let mut pages =
+            BTreeMap::<CanonicalPageId, (CanonicalBackingPage, DeviceAccessDeclaration)>::new();
+        for (range, declaration) in accesses {
+            let current = (declaration.device(), declaration.device_visible_at());
+            if boundary.is_some_and(|prior| prior != current) {
+                return Err(VisibilityError::IncompatibleDeclarations);
+            }
+            boundary = Some(current);
+            if let Some(point) = declaration.cpu_visible_at() {
+                if write_boundary.is_some_and(|prior| prior != point) {
+                    return Err(VisibilityError::IncompatibleDeclarations);
+                }
+                write_boundary = Some(point);
+            }
+            if range.resident_access_ready(declaration) {
+                continue;
+            }
+            for page in range.pages() {
+                match pages.entry(page.identity()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((page.clone(), declaration));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let previous = entry.get().1;
+                        if previous.cpu_visible_at().is_some()
+                            && declaration.cpu_visible_at().is_some()
+                            && previous.cpu_visible_at() != declaration.cpu_visible_at()
+                        {
+                            return Err(VisibilityError::IncompatibleDeclarations);
+                        }
+                        let kind = match (
+                            previous.kind().reads() || declaration.kind().reads(),
+                            previous.kind().writes() || declaration.kind().writes(),
+                        ) {
+                            (true, true) => crate::DeviceAccessKind::ReadWrite,
+                            (false, true) => crate::DeviceAccessKind::Write,
+                            _ => crate::DeviceAccessKind::Read,
+                        };
+                        entry.get_mut().1 = DeviceAccessDeclaration::new(
+                            declaration.device(),
+                            kind,
+                            declaration.device_visible_at(),
+                            previous.cpu_visible_at().or(declaration.cpu_visible_at()),
+                        )
+                        .map_err(|_| VisibilityError::IncompatibleDeclarations)?;
+                    }
+                }
+            }
+        }
+        if pages.is_empty() {
             return Ok(());
         }
-        let mut transitions = self.begin_device_transition()?;
+        let mut gates = BTreeMap::new();
+        for (page, _) in pages.values() {
+            let gate = page.store().execution_gate();
+            gates.entry(gate.identity()).or_insert_with(|| gate.clone());
+        }
+        let pages = pages.into_values().collect::<Vec<_>>();
+        if pages
+            .iter()
+            .all(|(_, declaration)| !declaration.kind().writes())
+        {
+            let shared = gates
+                .values()
+                .map(crate::ExecutionGate::acquire_shared)
+                .collect::<Vec<_>>();
+            if crate::backing::prepare_protected_device_reads(&pages)? {
+                return Ok(());
+            }
+            drop(shared);
+        }
+        let mut transitions = gates
+            .values()
+            .map(crate::ExecutionGate::acquire_exclusive)
+            .collect::<Vec<_>>();
         for transition in &mut transitions {
             transition.commit();
         }
-        for page in self.pages() {
-            match page.visibility_state() {
-                VisibilityState::Clean if !declaration.kind().writes() => {}
-                VisibilityState::Clean => {
-                    page.prepare_device_access(declaration, Arc::clone(&coordinator))?
-                }
-                VisibilityState::CpuNewer if !declaration.kind().writes() => {
-                    page.prepare_resident_device_read(declaration)?
-                }
-                VisibilityState::CpuNewer => {
-                    page.prepare_device_access(declaration, Arc::clone(&coordinator))?
-                }
-                VisibilityState::GpuNewer { device, visible_at }
-                    if device == declaration.device()
-                        && visible_at <= declaration.device_visible_at() => {}
-                VisibilityState::GpuNewer { .. }
-                | VisibilityState::Conflicting
-                | VisibilityState::Invalid => {
-                    page.prepare_device_access(declaration, Arc::clone(&coordinator))?
-                }
-            }
-        }
-        Ok(())
+        crate::backing::prepare_device_pages(&pages, coordinator.as_ref())
     }
 
-    /// Publishes device ownership with its required completion point.
+    fn advance_device_owner(&self, declaration: DeviceAccessDeclaration) -> bool {
+        crate::metrics::record(crate::metrics::Counter::TrackingLocks, 1);
+        self.layout
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|owner| owner.advance(declaration))
+    }
+
+    /// Publishes compatible writes from one accepted host submission.
     ///
-    /// The point may still be in flight. CPU consumers route through the
-    /// visibility coordinator, which waits for that point before materializing
-    /// bytes. This does not signal a guest fence or claim host completion.
-    pub fn publish_device_write(
-        &self,
-        declaration: DeviceAccessDeclaration,
+    /// Physical pages, execution gates and alias protections are updated once.
+    /// Resource ranges retain independent ownership records: advancing one
+    /// overlapping view must never advance the completion of untouched pages.
+    /// The point may be in flight; CPU consumers wait through the coordinator.
+    pub fn publish_device_writes<'a>(
+        accesses: impl IntoIterator<Item = (&'a Self, DeviceAccessDeclaration)>,
         coordinator: Arc<dyn VisibilityCoordinator>,
     ) -> Result<(), VisibilityError> {
-        if !declaration.kind().writes() {
-            return Err(VisibilityError::DeclarationDoesNotWrite);
-        }
-        crate::metrics::record(crate::metrics::Counter::OwnershipPublications, 1);
-        crate::metrics::record(crate::metrics::Counter::TrackingLocks, 1);
-        {
-            let cached = self
-                .layout
-                .owner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if cached
-                .as_ref()
-                .is_some_and(|owner| owner.advance(declaration))
-            {
+        let mut accesses = accesses.into_iter();
+        let Some(first) = accesses.next() else {
+            return Ok(());
+        };
+        let second = accesses.next();
+        if second.is_none() {
+            if !first.1.kind().writes() || first.1.cpu_visible_at().is_none() {
+                return Err(VisibilityError::DeclarationDoesNotWrite);
+            }
+            // The common resident single-writer case needs neither a batch
+            // allocation nor a physical-page walk. This is the same authority
+            // advancement used for each independent range in a larger batch.
+            if first.0.advance_device_owner(first.1) {
+                crate::metrics::record(crate::metrics::Counter::OwnershipPublications, 1);
                 return Ok(());
             }
         }
-        // Never retain an ownership lock across an execution handshake.
-        let owner = Arc::new(crate::backing::RangeDeviceOwner::new(
-            declaration.device(),
-            declaration
+        let accesses = std::iter::once(first)
+            .chain(second)
+            .chain(accesses)
+            .collect::<Vec<_>>();
+        let mut boundary = None;
+        for (_, declaration) in &accesses {
+            let point = declaration
                 .cpu_visible_at()
-                .ok_or(VisibilityError::DeclarationDoesNotWrite)?,
-            coordinator,
-        ));
-        let mut pages = self.pages();
-        while let Some(page) = pages.next() {
-            crate::metrics::record(crate::metrics::Counter::PageOwnershipUpdates, 1);
-            if page.attach_resident_device_owner(declaration, &owner)? {
+                .filter(|_| declaration.kind().writes())
+                .ok_or(VisibilityError::DeclarationDoesNotWrite)?;
+            let current = (declaration.device(), declaration.device_visible_at(), point);
+            if boundary.is_some_and(|previous| previous != current) {
+                return Err(VisibilityError::IncompatibleDeclarations);
+            }
+            boundary = Some(current);
+        }
+        let mut layouts = BTreeSet::new();
+        let mut owners = Vec::new();
+        let mut pages = BTreeMap::new();
+        for (range, declaration) in accesses {
+            if !layouts.insert(Arc::as_ptr(&range.layout).addr()) {
                 continue;
             }
-            let mut transitions = self.begin_device_transition()?;
+            crate::metrics::record(crate::metrics::Counter::OwnershipPublications, 1);
+            if range.advance_device_owner(declaration) {
+                continue;
+            }
+            // No ownership mutex is retained across an execution handshake.
+            let owner = Arc::new(crate::backing::RangeDeviceOwner::new(
+                declaration.device(),
+                declaration.cpu_visible_at().expect("validated write"),
+                Arc::clone(&coordinator),
+            ));
+            for page in range.pages() {
+                if let Some((_, _, displaced)) = pages.insert(
+                    page.identity(),
+                    (page.clone(), declaration, Arc::clone(&owner)),
+                ) {
+                    // Only the last range owns this physical page. A displaced
+                    // range cannot later use its whole-range advancement cache.
+                    displaced.detach();
+                }
+            }
+            owners.push((range, owner));
+        }
+        let mut transitions_required = Vec::new();
+        for (page, declaration, owner) in pages.into_values() {
+            crate::metrics::record(crate::metrics::Counter::PageOwnershipUpdates, 1);
+            if !page.attach_resident_device_owner(declaration, &owner)? {
+                transitions_required.push((page, declaration, owner));
+            }
+        }
+        if !transitions_required.is_empty() {
+            let mut gates = BTreeMap::new();
+            for (page, _, _) in &transitions_required {
+                let gate = page.store().execution_gate();
+                gates.entry(gate.identity()).or_insert_with(|| gate.clone());
+            }
+            let mut transitions = gates
+                .values()
+                .map(crate::ExecutionGate::acquire_exclusive)
+                .collect::<Vec<_>>();
             for transition in &mut transitions {
                 transition.commit();
             }
-            page.publish_device_write(declaration, Arc::clone(&owner))?;
-            for page in pages {
-                crate::metrics::record(crate::metrics::Counter::PageOwnershipUpdates, 1);
-                page.publish_device_write(declaration, Arc::clone(&owner))?;
-            }
-            *self
+            crate::backing::publish_device_pages(&transitions_required)?;
+        }
+        for (range, owner) in owners {
+            *range
                 .layout
                 .owner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(owner);
-            return Ok(());
         }
-        *self
-            .layout
-            .owner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(owner);
         Ok(())
     }
 
-    /// Marks every retained page invalid after an unrecoverable residency or
-    /// visibility failure.
-    pub fn invalidate_visibility(&self) -> Result<(), VisibilityError> {
-        let mut transitions = self.begin_device_transition()?;
+    /// Invalidates retained physical pages after an unrecoverable transition.
+    /// Aliases sharing pages or execution gates do not repeat the handshake.
+    pub fn invalidate_visibility_ranges<'a>(
+        ranges: impl IntoIterator<Item = &'a Self>,
+    ) -> Result<(), VisibilityError> {
+        let pages = ranges
+            .into_iter()
+            .flat_map(Self::pages)
+            .map(|page| (page.identity(), page.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut gates = BTreeMap::new();
+        for page in pages.values() {
+            let gate = page.store().execution_gate();
+            gates.entry(gate.identity()).or_insert_with(|| gate.clone());
+        }
+        let mut transitions = gates
+            .values()
+            .map(crate::ExecutionGate::acquire_exclusive)
+            .collect::<Vec<_>>();
         for transition in &mut transitions {
             transition.commit();
         }
-        for page in self.pages() {
-            page.invalidate_visibility()?;
-        }
-        Ok(())
+        crate::backing::invalidate_device_pages(&pages.into_values().collect::<Vec<_>>())
     }
 }
 
@@ -1488,7 +1748,6 @@ pub enum CanonicalRangeAccessError {
     },
     IncompleteRange,
     Backing(CanonicalPageError),
-    Mutation(crate::ExecutionMutationError),
 }
 
 impl Display for CanonicalRangeAccessError {
@@ -1515,7 +1774,6 @@ impl Display for CanonicalRangeAccessError {
                 formatter.write_str("canonical range segments do not cover the requested bytes")
             }
             Self::Backing(error) => write!(formatter, "canonical backing access failed: {error}"),
-            Self::Mutation(error) => error.fmt(formatter),
         }
     }
 }
@@ -1569,6 +1827,55 @@ pub trait CanonicalRangeTranslator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_topology_equality_matches_the_full_ordered_segments() {
+        let allocation = crate::CanonicalAllocation::zeroed(8 * 4096, 4096).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let original = full.segments().to_vec();
+        let mut variants = vec![original.clone(), original.clone()];
+        let mut reversed = original.clone();
+        reversed.reverse();
+        variants.push(reversed);
+        for field in 0..5 {
+            let mut changed = original.clone();
+            match field {
+                0 => changed[3].permissions = MemoryPermissions::READ,
+                1 => changed[3].mapping_generation = MappingGeneration::new(7),
+                2 => changed[3].offset = 1,
+                3 => changed[3].size -= 1,
+                4 => changed[3].backing = changed[2].backing.clone(),
+                _ => unreachable!(),
+            }
+            if field == 2 {
+                changed[3].size -= 1;
+            }
+            variants.push(changed);
+        }
+        let mut split = original.clone();
+        split[0].size = 2048;
+        let mut tail = split[0].clone();
+        tail.offset = 2048;
+        split.insert(1, tail);
+        variants.push(split);
+        let ranges = variants
+            .iter()
+            .cloned()
+            .map(|segments| CanonicalBackingRange::new(segments).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ranges[0].layout.segment_runs.len(), 1);
+        for (left, a) in ranges.iter().enumerate() {
+            for (right, b) in ranges.iter().enumerate() {
+                assert_eq!(
+                    a == b,
+                    variants[left] == variants[right],
+                    "{left} vs {right}"
+                );
+            }
+        }
+    }
     use crate::{
         CanonicalAllocation, CanonicalBackingStore, CanonicalWriteBatch, ContentGeneration,
         CpuVisibilityRequest, DeviceVisibilityPoint, DeviceVisibilityRequest, GuestPhysicalPageId,
@@ -1577,8 +1884,1016 @@ mod tests {
 
     struct UnexpectedCpuVisibility;
 
+    #[test]
+    fn protected_scalar_read_uses_shared_admission_without_refreshing_dirty_observations() {
+        for protected in [false, true] {
+            let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+            allocation.write(12, &[1, 2, 3, 4]).unwrap();
+            let range = allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap();
+            let observation =
+                protected.then(|| CanonicalCpuWriteDependency::capture(&range).unwrap());
+            let gate = range
+                .pages()
+                .next()
+                .unwrap()
+                .store()
+                .execution_gate()
+                .clone();
+            let lease = gate.acquire_shared();
+            let initial_epoch = gate.epoch();
+            let (send, receive) = std::sync::mpsc::channel();
+            let input = range.clone();
+            let worker = std::thread::spawn(move || {
+                let mut bytes = [0; 4];
+                let result = input.read(12, &mut bytes);
+                send.send((result, bytes)).unwrap();
+            });
+            let early = receive.recv_timeout(std::time::Duration::from_millis(100));
+            assert_eq!(early.is_ok(), protected);
+            drop(lease);
+            let (result, bytes) = early.unwrap_or_else(|_| {
+                receive
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap()
+            });
+            worker.join().unwrap();
+            result.unwrap();
+            assert_eq!(bytes, [1, 2, 3, 4]);
+            assert_eq!(gate.epoch(), initial_epoch);
+            if let Some(observation) = observation {
+                assert!(observation.remains_current());
+                allocation.write(12, &[0x42]).unwrap();
+                assert!(!observation.remains_current());
+                let mut bytes = [0; 4];
+                range.read(12, &mut bytes).unwrap();
+                assert_eq!(bytes, [0x42, 2, 3, 4]);
+                assert!(!observation.remains_current());
+            }
+        }
+    }
+
+    #[test]
+    fn protected_observer_capture_does_not_stop_readers_and_keeps_independent_baselines() {
+        for protected in [false, true] {
+            for keep_existing in [false, true] {
+                let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+                let range = allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap();
+                let existing =
+                    protected.then(|| CanonicalCpuWriteDependency::capture(&range).unwrap());
+                let existing = if keep_existing { existing } else { None };
+                let gate = range
+                    .pages()
+                    .next()
+                    .unwrap()
+                    .store()
+                    .execution_gate()
+                    .clone();
+                let lease = gate.acquire_shared();
+                let initial_epoch = gate.epoch();
+                let (send, receive) = std::sync::mpsc::channel();
+                let input = range.clone();
+                let worker = std::thread::spawn(move || {
+                    send.send(CanonicalCpuWriteDependency::capture(&input))
+                        .unwrap();
+                });
+                let early = receive.recv_timeout(std::time::Duration::from_millis(100));
+                assert_eq!(early.is_ok(), protected);
+                drop(lease);
+                let observation = early
+                    .unwrap_or_else(|_| {
+                        receive
+                            .recv_timeout(std::time::Duration::from_secs(3))
+                            .unwrap()
+                    })
+                    .unwrap();
+                worker.join().unwrap();
+                assert_eq!(gate.epoch() == initial_epoch, protected);
+                assert!(observation.remains_current());
+                allocation.write(0, &[0x42]).unwrap();
+                assert!(!observation.remains_current());
+                if let Some(existing) = existing {
+                    assert!(!existing.remains_current());
+                }
+                let refreshed = CanonicalCpuWriteDependency::capture(&range).unwrap();
+                assert!(refreshed.remains_current());
+                assert!(!observation.remains_current());
+            }
+        }
+    }
+
+    #[test]
+    fn protected_device_reads_keep_native_execution_running_but_writers_rendezvous() {
+        for protected in [false, true] {
+            for kind in [
+                crate::DeviceAccessKind::Read,
+                crate::DeviceAccessKind::Write,
+            ] {
+                let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+                let range = allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap();
+                if protected {
+                    CanonicalCpuWriteDependency::capture(&range).unwrap();
+                    let mut batch = CanonicalWriteBatch::new();
+                    batch.stage(&range, 0, &[0x42]).unwrap();
+                    batch.commit().unwrap();
+                } else {
+                    allocation.write(0, &[0x42]).unwrap();
+                }
+                let gate = range
+                    .pages()
+                    .next()
+                    .unwrap()
+                    .store()
+                    .execution_gate()
+                    .clone();
+                let lease = gate.acquire_shared();
+                let initial_epoch = gate.epoch();
+                let (send, receive) = std::sync::mpsc::channel();
+                let input = range.clone();
+                let worker = std::thread::spawn(move || {
+                    let declaration = DeviceAccessDeclaration::new(
+                        NonCpuDeviceId::new(1),
+                        kind,
+                        DeviceVisibilityPoint::new(1),
+                        kind.writes().then_some(DeviceVisibilityPoint::new(2)),
+                    )
+                    .unwrap();
+                    let result = CanonicalBackingRange::prepare_resident_device_accesses(
+                        [(&input, declaration)],
+                        Arc::new(UnexpectedCpuVisibility),
+                    );
+                    send.send(result).unwrap();
+                });
+                let early = receive.recv_timeout(std::time::Duration::from_millis(200));
+                assert_eq!(early.is_ok(), protected && !kind.writes());
+                drop(lease);
+                early
+                    .unwrap_or_else(|_| {
+                        receive
+                            .recv_timeout(std::time::Duration::from_secs(3))
+                            .unwrap()
+                    })
+                    .unwrap();
+                worker.join().unwrap();
+                assert_eq!(gate.epoch() == initial_epoch, protected && !kind.writes());
+                assert_eq!(
+                    range.pages().next().unwrap().visibility_state(),
+                    VisibilityState::Clean
+                );
+                let mut bytes = [0];
+                allocation.read(0, &mut bytes).unwrap();
+                assert_eq!(bytes, [0x42]);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_subranges_preserve_fragment_order_and_exact_boundaries() {
+        let allocation = CanonicalAllocation::zeroed(0x3000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mut expected = Vec::new();
+        let mut segments = Vec::new();
+        for (index, offset, size, byte) in [
+            (2, 17, 10, 0x11),
+            (0, 300, 25, 0x22),
+            (2, 40, 7, 0x33),
+            (1, 5, 19, 0x44),
+        ] {
+            allocation
+                .write(index * 0x1000 + offset, &vec![byte; size])
+                .unwrap();
+            segments.push(
+                CanonicalBackingSegment::new(
+                    full.segments()[index].backing().clone(),
+                    offset as u64,
+                    size as u64,
+                    MemoryPermissions::READ_WRITE,
+                    MappingGeneration::new(index as u64 + 1),
+                )
+                .unwrap(),
+            );
+            expected.extend(std::iter::repeat_n(byte, size));
+        }
+        let range = CanonicalBackingRange::new(segments).unwrap();
+        for offset in 0..=expected.len() {
+            for size in 0..=expected.len() - offset {
+                let mut bytes = vec![0; size];
+                range.read(offset as u64, &mut bytes).unwrap();
+                assert_eq!(bytes, expected[offset..offset + size]);
+                if size != 0 {
+                    range
+                        .snapshot_subrange(offset as u64, size as u64)
+                        .unwrap()
+                        .read(0, &mut bytes)
+                        .unwrap();
+                    assert_eq!(bytes, expected[offset..offset + size]);
+                }
+            }
+        }
+        let mut writes = CanonicalWriteBatch::new();
+        writes.stage(&range, 8, &[0x55; 40]).unwrap();
+        assert!(!writes.overlaps(&range, 0, 8).unwrap());
+        assert!(writes.overlaps(&range, 8, 40).unwrap());
+        assert!(!writes.overlaps(&range, 48, 13).unwrap());
+        writes.read_staged(&range, 0, &mut expected).unwrap();
+        assert_eq!(&expected[8..48], &[0x55; 40]);
+        writes.commit().unwrap();
+        let mut actual = vec![0; expected.len()];
+        range.read(0, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn publication_batch_revokes_all_aliases_once_and_invalidates_executable_pages() {
+        let allocation = CanonicalAllocation::zeroed(0x3000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let a = full.snapshot_subrange(0, 0x2000).unwrap();
+        let b = full.snapshot_subrange(0x1000, 0x2000).unwrap();
+        let clone = a.clone();
+        let log = Arc::new(crate::MemoryInvalidationLog::default());
+        let arenas = [
+            crate::DirectArena::new(0x5000).unwrap(),
+            crate::DirectArena::new(0x5000).unwrap(),
+        ];
+        for (index, page) in full.pages().enumerate() {
+            assert!(page.observe_executable_content(log.clone()));
+            for arena in &arenas {
+                let backing = page.direct_backing().unwrap();
+                let address = (index as u64 + 1) * 0x1000;
+                arena
+                    .map_pages(&[crate::DirectMapRequest {
+                        guest_address: address,
+                        backing: &backing,
+                        protection: crate::DirectProtection::Read,
+                    }])
+                    .unwrap();
+                page.register_direct_alias(arena, address, crate::DirectProtection::ReadWrite)
+                    .unwrap();
+            }
+        }
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let write = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(1),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(1),
+        )
+        .unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&a, write), (&b, write)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        let gate = full.pages().next().unwrap().store().execution_gate();
+        let epoch = gate.epoch();
+        let summary = full.visibility_summary().load(Ordering::Acquire);
+        let cursor = log.cursor();
+        CanonicalBackingRange::publish_device_writes(
+            [(&a, write), (&clone, write), (&b, write)],
+            coordinator,
+        )
+        .unwrap();
+        assert_eq!(gate.epoch(), epoch + 1);
+        assert!(!gate.transition_pending());
+        assert_eq!(
+            full.visibility_summary().load(Ordering::Acquire),
+            summary + 3
+        );
+        let mut changes = Vec::new();
+        log.read_since(cursor, &mut changes).unwrap();
+        assert_eq!(changes.len(), 3);
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.origin == crate::MemoryInvalidationOrigin::DeviceWrite)
+        );
+        for arena in &arenas {
+            for address in [0x1000, 0x2000, 0x3000] {
+                assert_eq!(
+                    arena.protection_at(address),
+                    Some(crate::DirectProtection::None)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_alias_protection_preserves_error_and_terminal_invalidation_releases_execution() {
+        let memory = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = memory.backing_range(MemoryPermissions::READ_WRITE).unwrap();
+        let arena = crate::DirectArena::new(0x4000).unwrap();
+        for (index, page) in range.pages().enumerate() {
+            let backing = page.direct_backing().unwrap();
+            let address = (index as u64 + 1) * 0x1000;
+            arena
+                .map_pages(&[crate::DirectMapRequest {
+                    guest_address: address,
+                    backing: &backing,
+                    protection: crate::DirectProtection::Read,
+                }])
+                .unwrap();
+            page.register_direct_alias(&arena, address, crate::DirectProtection::ReadWrite)
+                .unwrap();
+        }
+        // Inject an invalid retained alias through the real registration
+        // boundary. A terminal transition must preserve the host-range error
+        // even when protection fails before all aliases have been revoked.
+        assert!(
+            memory.pages()[1]
+                .register_direct_alias(&arena, 0x4000, crate::DirectProtection::ReadWrite)
+                .is_err()
+        );
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let write = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(1),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(1),
+        )
+        .unwrap();
+        let error = CanonicalBackingRange::publish_device_writes([(&range, write)], coordinator)
+            .unwrap_err();
+        assert!(matches!(error, VisibilityError::HostMemory(_)));
+        assert!(error.to_string().contains("outside the reservation"));
+        let gate = range.pages().next().unwrap().store().execution_gate();
+        assert!(!gate.transition_pending());
+        assert!(matches!(
+            CanonicalBackingRange::invalidate_visibility_ranges([&range]),
+            Err(VisibilityError::HostMemory(_))
+        ));
+        assert!(
+            range
+                .pages()
+                .all(|page| page.visibility_state() == VisibilityState::Invalid)
+        );
+        assert!(!gate.transition_pending());
+    }
+
+    #[test]
+    fn overlapping_batch_owners_never_advance_untouched_pages() {
+        let allocation = CanonicalAllocation::zeroed(0x3000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let a = full.snapshot_subrange(0, 0x2000).unwrap();
+        let b = full.snapshot_subrange(0x1000, 0x2000).unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let device = NonCpuDeviceId::new(1);
+        let write = |point| {
+            DeviceAccessDeclaration::write(
+                device,
+                DeviceVisibilityPoint::new(point),
+                DeviceVisibilityPoint::new(point),
+            )
+            .unwrap()
+        };
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&a, write(1)), (&b, write(1))],
+            coordinator.clone(),
+        )
+        .unwrap();
+        CanonicalBackingRange::publish_device_writes(
+            [(&a, write(1)), (&b, write(1))],
+            coordinator.clone(),
+        )
+        .unwrap();
+        let gate = full.pages().next().unwrap().store().execution_gate();
+        let epoch = gate.epoch();
+        let shared = gate.acquire_shared();
+        CanonicalBackingRange::publish_device_writes([(&a, write(2))], coordinator.clone())
+            .unwrap();
+        assert_eq!(gate.epoch(), epoch);
+        let points = full
+            .pages()
+            .map(|page| page.visibility_state())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            points,
+            [2, 2, 1].map(|point| VisibilityState::GpuNewer {
+                device,
+                visible_at: DeviceVisibilityPoint::new(point)
+            })
+        );
+        CanonicalBackingRange::publish_device_writes([(&b, write(3))], coordinator).unwrap();
+        assert_eq!(gate.epoch(), epoch);
+        assert_eq!(
+            full.pages()
+                .map(|page| page.visibility_state())
+                .collect::<Vec<_>>(),
+            [2, 3, 3].map(|point| VisibilityState::GpuNewer {
+                device,
+                visible_at: DeviceVisibilityPoint::new(point)
+            })
+        );
+        drop(shared);
+    }
+
+    #[test]
+    fn published_aliases_download_current_bytes_once_per_physical_page_without_exclusion() {
+        struct Readback {
+            gate: crate::ExecutionGate,
+            requests: Mutex<Vec<CpuVisibilityRequest>>,
+        }
+        impl VisibilityCoordinator for Readback {
+            fn cache_cpu_page(
+                &self,
+                _: DeviceVisibilityRequest,
+                _: &[u8],
+            ) -> Result<(), VisibilityCoordinatorError> {
+                Ok(())
+            }
+            fn make_cpu_visible(
+                &self,
+                request: CpuVisibilityRequest,
+            ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+                let gate = self.gate.clone();
+                let (sent, received) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let _cpu = gate.acquire_shared();
+                    sent.send(()).unwrap();
+                });
+                received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("readback must not exclude CPU execution");
+                worker.join().unwrap();
+                self.requests.lock().unwrap().push(request);
+                Ok(vec![request.visible_at.get() as u8; request.size].into_boxed_slice())
+            }
+        }
+        let allocation = CanonicalAllocation::zeroed(0x3000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let a = full.snapshot_subrange(0, 0x2000).unwrap();
+        let b = full.snapshot_subrange(0x1000, 0x2000).unwrap();
+        let readback = Arc::new(Readback {
+            gate: full
+                .pages()
+                .next()
+                .unwrap()
+                .store()
+                .execution_gate()
+                .clone(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let device = NonCpuDeviceId::new(1);
+        let write = |point| {
+            DeviceAccessDeclaration::write(
+                device,
+                DeviceVisibilityPoint::new(point),
+                DeviceVisibilityPoint::new(point),
+            )
+            .unwrap()
+        };
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&a, write(1)), (&b, write(1))],
+            readback.clone(),
+        )
+        .unwrap();
+        CanonicalBackingRange::publish_device_writes(
+            [(&a, write(1)), (&b, write(1))],
+            readback.clone(),
+        )
+        .unwrap();
+        CanonicalBackingRange::publish_device_writes([(&a, write(2))], readback.clone()).unwrap();
+        let mut bytes = vec![0; 0x2000];
+        b.read(0, &mut bytes).unwrap();
+        assert_eq!(&bytes[..0x1000], &[2; 0x1000]);
+        assert_eq!(&bytes[0x1000..], &[1; 0x1000]);
+        a.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, vec![2; 0x2000]);
+        let mut all = vec![0; 0x3000];
+        full.read(0, &mut all).unwrap();
+        assert_eq!(&all[..0x2000], &[2; 0x2000]);
+        assert_eq!(&all[0x2000..], &[1; 0x1000]);
+        let requests = readback.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.page)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn publication_rejects_mixed_points_before_advancing_cached_ownership() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let a = full.snapshot_subrange(0, 0x1000).unwrap();
+        let b = full.snapshot_subrange(0x1000, 0x1000).unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let device = NonCpuDeviceId::new(1);
+        let write = |point| {
+            DeviceAccessDeclaration::write(
+                device,
+                DeviceVisibilityPoint::new(point),
+                DeviceVisibilityPoint::new(point),
+            )
+            .unwrap()
+        };
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&a, write(1)), (&b, write(1))],
+            coordinator.clone(),
+        )
+        .unwrap();
+        CanonicalBackingRange::publish_device_writes(
+            [(&a, write(1)), (&b, write(1))],
+            coordinator.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            CanonicalBackingRange::publish_device_writes(
+                [(&a, write(2)), (&b, write(3))],
+                coordinator
+            ),
+            Err(VisibilityError::IncompatibleDeclarations)
+        );
+        assert!(full.pages().all(|page| page.visibility_state()
+            == VisibilityState::GpuNewer {
+                device,
+                visible_at: DeviceVisibilityPoint::new(1)
+            }));
+    }
+
+    #[test]
+    fn publication_and_invalidation_deduplicate_distinct_stores_sharing_one_gate() {
+        let gate = crate::ExecutionGate::new();
+        let pages = (0..2)
+            .map(|_| {
+                let store =
+                    CanonicalBackingStore::allocate_with_execution_gate(gate.clone()).unwrap();
+                CanonicalBackingPage::zeroed(
+                    &store,
+                    GuestPhysicalPageId::new(1),
+                    0x1000,
+                    ContentGeneration::INITIAL,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let ranges = pages
+            .iter()
+            .map(|page| {
+                CanonicalBackingRange::new(vec![
+                    CanonicalBackingSegment::new(
+                        page.clone(),
+                        0,
+                        0x1000,
+                        MemoryPermissions::READ_WRITE,
+                        MappingGeneration::INITIAL,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let write = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(1),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(1),
+        )
+        .unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let epoch = gate.epoch();
+        CanonicalBackingRange::publish_device_writes(
+            ranges.iter().rev().map(|range| (range, write)),
+            coordinator,
+        )
+        .unwrap();
+        assert_eq!(gate.epoch(), epoch + 1);
+        CanonicalBackingRange::invalidate_visibility_ranges(
+            ranges.iter().chain(ranges.iter().rev()),
+        )
+        .unwrap();
+        assert_eq!(gate.epoch(), epoch + 2);
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.visibility_state() == VisibilityState::Invalid)
+        );
+        assert!(!gate.transition_pending());
+    }
+
+    #[test]
+    fn reversed_multi_gate_topology_is_safe_under_contention() {
+        let stores = [
+            CanonicalBackingStore::allocate().unwrap(),
+            CanonicalBackingStore::allocate().unwrap(),
+        ];
+        let pages = stores
+            .iter()
+            .map(|store| {
+                CanonicalBackingPage::zeroed(
+                    store,
+                    GuestPhysicalPageId::new(1),
+                    0x1000,
+                    ContentGeneration::INITIAL,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let segments = pages
+            .iter()
+            .map(|page| {
+                CanonicalBackingSegment::new(
+                    page.clone(),
+                    0,
+                    0x1000,
+                    MemoryPermissions::READ_WRITE,
+                    MappingGeneration::INITIAL,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let forward = CanonicalBackingRange::new(segments.clone()).unwrap();
+        let reversed = CanonicalBackingRange::new(segments.into_iter().rev().collect()).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (done, received) = std::sync::mpsc::channel();
+        let workers = [forward, reversed]
+            .into_iter()
+            .map(|range| {
+                let start = start.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..32 {
+                        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+                        assert_eq!(dependency.snapshot_all(&range).unwrap().len(), 0x2000);
+                    }
+                    done.send(()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            received
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("multi-gate operations must share one acquisition order");
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_cache_batch_invalidates_changed_pages_and_revokes_all_aliases() {
+        struct FailedCache(std::sync::atomic::AtomicUsize);
+        impl VisibilityCoordinator for FailedCache {
+            fn cache_cpu_page(
+                &self,
+                _: DeviceVisibilityRequest,
+                _: &[u8],
+            ) -> Result<(), VisibilityCoordinatorError> {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(())
+                } else {
+                    Err(VisibilityCoordinatorError::new(
+                        "injected page-cache failure",
+                    ))
+                }
+            }
+            fn make_cpu_visible(
+                &self,
+                _: CpuVisibilityRequest,
+            ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+                unreachable!()
+            }
+        }
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let arena = crate::DirectArena::new(0x5000).unwrap();
+        for (index, page) in range.pages().enumerate() {
+            let backing = page.direct_backing().unwrap();
+            let address = 0x1000 + index as u64 * 0x1000;
+            arena
+                .map_pages(&[crate::DirectMapRequest {
+                    guest_address: address,
+                    backing: &backing,
+                    protection: crate::DirectProtection::Read,
+                }])
+                .unwrap();
+            page.register_direct_alias(&arena, address, crate::DirectProtection::ReadWrite)
+                .unwrap();
+        }
+        let alias = range.snapshot_subrange(0x800, 0x1000).unwrap();
+        let write = DeviceAccessDeclaration::read_write(
+            NonCpuDeviceId::new(1),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        assert!(
+            CanonicalBackingRange::prepare_resident_device_accesses(
+                [(&range, write), (&alias, write)],
+                Arc::new(FailedCache(std::sync::atomic::AtomicUsize::new(0)))
+            )
+            .is_err()
+        );
+        assert!(
+            range
+                .pages()
+                .all(|page| page.visibility_state() == VisibilityState::Invalid)
+        );
+        assert_eq!(
+            arena.protection_at(0x1000),
+            Some(crate::DirectProtection::None)
+        );
+        assert_eq!(
+            arena.protection_at(0x2000),
+            Some(crate::DirectProtection::None)
+        );
+    }
+
+    #[test]
+    fn batched_overwrite_rearms_without_downloading_device_owned_bytes() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let write = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(1),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, write)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&range, write)], coordinator)
+            .unwrap();
+        let before = range
+            .pages()
+            .map(CanonicalBackingPage::visibility_state)
+            .collect::<Vec<_>>();
+        let bytes = CanonicalCpuWriteDependency::snapshot_batch_with_resolver(
+            &[CpuWriteSnapshotRequest {
+                dependency: &dependency,
+                range: &range,
+                selection: CpuWriteSnapshotSelection::Rearm,
+                alignment: 1,
+            }],
+            &mut |_, _| panic!("overwrite tracking must not download old bytes"),
+        )
+        .unwrap();
+        assert!(bytes[0].is_empty());
+        assert_eq!(
+            range
+                .pages()
+                .map(CanonicalBackingPage::visibility_state)
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn resident_batch_unions_aliases_and_keeps_clean_reads_without_exclusion() {
+        let allocation = CanonicalAllocation::zeroed(0x3000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let a = full.snapshot_subrange(0, 0x2000).unwrap();
+        let b = full.snapshot_subrange(0x1000, 0x2000).unwrap();
+        let alias = full.snapshot_subrange(0, 0x3000).unwrap();
+        let gate = full.segments()[0].backing().store().execution_gate();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        let read =
+            DeviceAccessDeclaration::read(NonCpuDeviceId::new(1), DeviceVisibilityPoint::new(7));
+        allocation.write(0, &[1]).unwrap();
+        allocation.write(0x1000, &[2]).unwrap();
+        allocation.write(0x2000, &[3]).unwrap();
+        let epoch = gate.epoch();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&a, read), (&b, read), (&alias, read)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        assert_eq!(gate.epoch(), epoch + 1);
+        assert!(
+            full.pages()
+                .all(|page| page.visibility_state() == VisibilityState::Clean)
+        );
+        let active = gate.acquire_shared();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&a, read), (&b, read), (&alias, read)],
+            coordinator,
+        )
+        .unwrap();
+        assert_eq!(gate.epoch(), epoch + 1);
+        drop(active);
+    }
+
+    #[test]
+    fn batches_do_not_merge_incompatible_visibility_points() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let a = full.snapshot_subrange(0, 0x1000).unwrap();
+        let b = full.snapshot_subrange(0x1000, 0x1000).unwrap();
+        let gate = full.segments()[0].backing().store().execution_gate();
+        let epoch = gate.epoch();
+        let device = NonCpuDeviceId::new(1);
+        let first = DeviceAccessDeclaration::write(
+            device,
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        let later = DeviceAccessDeclaration::write(
+            device,
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(3),
+        )
+        .unwrap();
+        assert_eq!(
+            CanonicalBackingRange::prepare_resident_device_accesses(
+                [(&a, first), (&b, later)],
+                Arc::new(UnexpectedCpuVisibility),
+            ),
+            Err(VisibilityError::IncompatibleDeclarations)
+        );
+        assert_eq!(gate.epoch(), epoch);
+    }
+
+    #[test]
+    fn snapshot_batch_shares_exclusion_but_not_resource_observations() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let alias = full.snapshot_subrange(0x100, 0x1100).unwrap();
+        let a = CanonicalCpuWriteDependency::capture(&full).unwrap();
+        let b = CanonicalCpuWriteDependency::capture(&alias).unwrap();
+        let old = CanonicalCpuWriteDependency::capture(&full).unwrap();
+        allocation.write(0x180, &[0x42]).unwrap();
+        let requests = [
+            CpuWriteSnapshotRequest {
+                dependency: &a,
+                range: &full,
+                selection: CpuWriteSnapshotSelection::DirtyPages,
+                alignment: 4,
+            },
+            CpuWriteSnapshotRequest {
+                dependency: &b,
+                range: &alias,
+                selection: CpuWriteSnapshotSelection::DirtyPages,
+                alignment: 16,
+            },
+        ];
+        let gate = full.segments()[0].backing().store().execution_gate();
+        let epoch = gate.epoch();
+        let samples =
+            CanonicalCpuWriteDependency::snapshot_batch_with_resolver(&requests, &mut |_, _| {
+                panic!("CPU-only snapshot does not need readback")
+            })
+            .unwrap();
+        assert_eq!(gate.epoch(), epoch + 1);
+        assert_eq!(samples[0][0].1[0x180], 0x42);
+        assert_eq!(samples[1][0].1[0x80], 0x42);
+        assert!(a.remains_current() && b.remains_current());
+        assert!(!old.remains_current());
+        let active = gate.acquire_shared();
+        let clean = CanonicalCpuWriteDependency::snapshot_batch_with_resolver(
+            &requests,
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        assert!(clean.iter().all(Vec::is_empty));
+        assert_eq!(gate.epoch(), epoch + 1);
+        drop(active);
+    }
+
+    #[test]
+    fn snapshot_batch_releases_exclusion_and_retains_samples_across_readback() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let a = full.snapshot_subrange(0, 0x1000).unwrap();
+        let b = full.snapshot_subrange(0x1000, 0x1000).unwrap();
+        let first = CanonicalCpuWriteDependency::capture(&a).unwrap();
+        let second = CanonicalCpuWriteDependency::capture(&b).unwrap();
+        let write = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(1),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&b, write)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&b, write)], coordinator).unwrap();
+        allocation.write(0x80, &[0x11]).unwrap();
+        let mut calls = 0;
+        let samples = CanonicalCpuWriteDependency::snapshot_batch_with_resolver(
+            &[
+                CpuWriteSnapshotRequest {
+                    dependency: &first,
+                    range: &a,
+                    selection: CpuWriteSnapshotSelection::DirtyPages,
+                    alignment: 4,
+                },
+                CpuWriteSnapshotRequest {
+                    dependency: &second,
+                    range: &b,
+                    selection: CpuWriteSnapshotSelection::All,
+                    alignment: 1,
+                },
+            ],
+            &mut |_, request| {
+                calls += 1;
+                // This write acquires the same gate. No snapshot/adaptive/page guard
+                // may survive the callback, and it must not erase the earlier sample.
+                allocation.write(0x80, &[0x22]).unwrap();
+                Ok(vec![0x55; request.size].into_boxed_slice())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(samples[0][0].1[0x80], 0x11);
+        assert_eq!(samples[1][0].1[0], 0x55);
+        assert!(!first.remains_current());
+        assert_eq!(first.snapshot_dirty_pages(&a, 4).unwrap()[0].1[0x80], 0x22);
+    }
+
+    #[test]
+    fn distinct_stores_sharing_one_gate_do_not_reacquire_it() {
+        let (done, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let gate = crate::ExecutionGate::new();
+            let stores = [
+                CanonicalBackingStore::allocate_with_execution_gate(gate.clone()).unwrap(),
+                CanonicalBackingStore::allocate_with_execution_gate(gate.clone()).unwrap(),
+            ];
+            let pages = stores
+                .iter()
+                .map(|store| {
+                    CanonicalBackingPage::zeroed(
+                        store,
+                        GuestPhysicalPageId::new(1),
+                        0x1000,
+                        ContentGeneration::INITIAL,
+                    )
+                    .unwrap()
+                })
+                .map(|page| {
+                    CanonicalBackingSegment::new(
+                        page,
+                        0,
+                        0x1000,
+                        MemoryPermissions::READ_WRITE,
+                        MappingGeneration::INITIAL,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let range = CanonicalBackingRange::new(pages).unwrap();
+            assert_eq!(range.execution_gates().count(), 1);
+            let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+            assert_eq!(dependency.snapshot_all(&range).unwrap().len(), 0x2000);
+            dependency.rearm().unwrap();
+            let mut writes = CanonicalWriteBatch::new();
+            writes.stage(&range, 0xfff, &[0x11, 0x22]).unwrap();
+            writes.commit().unwrap();
+            let read = DeviceAccessDeclaration::read(
+                NonCpuDeviceId::new(1),
+                DeviceVisibilityPoint::new(7),
+            );
+            CanonicalBackingRange::prepare_resident_device_accesses(
+                [(&range, read)],
+                Arc::new(UnexpectedCpuVisibility),
+            )
+            .unwrap();
+            done.send(()).unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("shared gate must not self-deadlock");
+        worker.join().unwrap();
+    }
+
     impl VisibilityCoordinator for UnexpectedCpuVisibility {
-        fn make_device_visible(
+        fn cache_cpu_page(
             &self,
             _request: DeviceVisibilityRequest,
             _canonical_bytes: &[u8],
@@ -1839,23 +3154,17 @@ mod tests {
         );
         assert_eq!(
             range
-                .execution_stores()
-                .map(CanonicalBackingStore::identity)
+                .execution_gates()
+                .map(crate::ExecutionGate::identity)
                 .collect::<Vec<_>>(),
-            [first.identity(), second.identity()]
-        );
-        assert_eq!(
-            &*range.layout.stores[0].changes,
-            &[
-                crate::MemoryInvalidationKind::ExecutableContent {
-                    first: GuestPhysicalPageId::new(1),
-                    second: None
-                },
-                crate::MemoryInvalidationKind::ExecutableContent {
-                    first: GuestPhysicalPageId::new(3),
-                    second: None
-                },
-            ]
+            {
+                let mut ids = [
+                    first.execution_gate().identity(),
+                    second.execution_gate().identity(),
+                ];
+                ids.sort_unstable();
+                ids
+            }
         );
         let subrange = range.snapshot_subrange(0x100, 0x100).unwrap();
         assert_eq!(
@@ -1865,7 +3174,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [a.identity()]
         );
-        assert_eq!(subrange.execution_stores().count(), 1);
+        assert_eq!(subrange.execution_gates().count(), 1);
     }
 
     #[test]
@@ -2013,7 +3322,7 @@ mod tests {
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
         let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
-        range.invalidate_visibility().unwrap();
+        crate::CanonicalBackingRange::invalidate_visibility_ranges([&range]).unwrap();
         assert_eq!(
             dependency.rearm(),
             Err(CanonicalRangeAccessError::Backing(
@@ -2033,97 +3342,13 @@ mod tests {
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
-        range.invalidate_visibility().unwrap();
+        crate::CanonicalBackingRange::invalidate_visibility_ranges([&range]).unwrap();
         assert_eq!(
             CanonicalCpuWriteDependency::capture(&range).unwrap_err(),
             CanonicalRangeAccessError::Backing(CanonicalPageError::Visibility(
                 VisibilityError::InvalidState
             ))
         );
-    }
-
-    #[test]
-    fn multi_store_capture_rejection_releases_prior_holds_before_arming_any_page() {
-        use crate::{ExecutionMutation, ExecutionMutationError, ExecutionMutationObserver};
-        struct Hold(Arc<AtomicBool>);
-        impl ExecutionMutation for Hold {}
-        impl Drop for Hold {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        struct Owner {
-            active: Arc<AtomicBool>,
-            reject: bool,
-        }
-        impl ExecutionMutationObserver for Owner {
-            fn begin(
-                self: Arc<Self>,
-                changes: &[crate::MemoryInvalidationKind],
-            ) -> Result<Box<dyn ExecutionMutation>, ExecutionMutationError> {
-                assert!(changes.is_empty());
-                if self.reject {
-                    assert!(self.active.load(Ordering::Acquire));
-                    return Err(ExecutionMutationError(
-                        "second tracking owner rejected".into(),
-                    ));
-                }
-                self.active.store(true, Ordering::Release);
-                Ok(Box::new(Hold(self.active.clone())))
-            }
-        }
-        let stores = [
-            CanonicalBackingStore::allocate().unwrap(),
-            CanonicalBackingStore::allocate().unwrap(),
-        ];
-        let active = Arc::new(AtomicBool::new(false));
-        let mut pages = Vec::new();
-        let mut ranges = Vec::new();
-        for (index, store) in stores.iter().enumerate() {
-            store
-                .execution_gate()
-                .set_mutation_observer(Arc::new(Owner {
-                    active: active.clone(),
-                    reject: index == 1,
-                }))
-                .unwrap();
-            let page = CanonicalBackingPage::zeroed(
-                store,
-                GuestPhysicalPageId::new(index as u64),
-                4096,
-                ContentGeneration::INITIAL,
-            )
-            .unwrap();
-            ranges.push(
-                CanonicalBackingRange::new(vec![
-                    CanonicalBackingSegment::new(
-                        page.clone(),
-                        0,
-                        4096,
-                        MemoryPermissions::READ_WRITE,
-                        MappingGeneration::new(1),
-                    )
-                    .unwrap(),
-                ])
-                .unwrap(),
-            );
-            pages.push(page);
-        }
-        // Reverse input order; acquisition still follows stable store identity.
-        assert_eq!(
-            CanonicalCpuWriteDependency::capture_ranges([&ranges[1], &ranges[0]]).unwrap_err(),
-            CanonicalRangeAccessError::Mutation(ExecutionMutationError(
-                "second tracking owner rejected".into()
-            ))
-        );
-        assert!(!active.load(Ordering::Acquire));
-        for (store, page) in stores.iter().zip(&pages) {
-            assert!(!store.execution_gate().transition_pending());
-            assert_eq!(store.execution_gate().epoch(), 1);
-            let epoch = page.cpu_dirty_epoch();
-            page.prepare_cpu_write().unwrap();
-            assert_eq!(page.cpu_dirty_epoch(), epoch); // No observer was armed.
-        }
     }
 
     #[test]
@@ -2161,11 +3386,12 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        range
-            .prepare_device_access(declaration, Arc::clone(&coordinator))
-            .unwrap();
-        range
-            .publish_device_write(declaration, coordinator)
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&range, declaration)], coordinator)
             .unwrap();
 
         assert!(dependency.remains_current());
@@ -2193,32 +3419,43 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        range
-            .prepare_device_access(write, Arc::clone(&coordinator))
-            .unwrap();
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, write)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
         let gate = range.segments()[0].backing().store().execution_gate();
         let epoch = gate.epoch();
-        range
-            .prepare_resident_device_access(
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            std::iter::once((
+                &range,
                 DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(2)),
-                Arc::clone(&coordinator),
-            )
-            .unwrap();
+            )),
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
         assert_eq!(gate.epoch(), epoch);
-        range
-            .publish_device_write(write, Arc::clone(&coordinator))
-            .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes(
+            [(&range, write)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
         let epoch = gate.epoch();
-        range
-            .prepare_resident_device_access(
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            std::iter::once((
+                &range,
                 DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(2)),
-                Arc::clone(&coordinator),
-            )
-            .unwrap();
+            )),
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
         assert_eq!(gate.epoch(), epoch);
         assert_eq!(
-            range.prepare_resident_device_access(
-                DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(1)),
+            CanonicalBackingRange::prepare_resident_device_accesses(
+                std::iter::once((
+                    &range,
+                    DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(1))
+                )),
                 coordinator
             ),
             Err(VisibilityError::ConflictingAccess)
@@ -2243,11 +3480,12 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        range
-            .prepare_device_access(first, coordinator.clone())
-            .unwrap();
-        range
-            .publish_device_write(first, coordinator.clone())
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, first)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&range, first)], coordinator.clone())
             .unwrap();
         let gate = range.segments()[0].backing().store().execution_gate();
         let epoch = gate.epoch();
@@ -2258,10 +3496,12 @@ mod tests {
             DeviceVisibilityPoint::new(4),
         )
         .unwrap();
-        range
-            .prepare_resident_device_access(next, coordinator.clone())
-            .unwrap();
-        range.publish_device_write(next, coordinator).unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            std::iter::once((&range, next)),
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&range, next)], coordinator).unwrap();
         assert_eq!(gate.epoch(), epoch);
         assert!(!gate.transition_pending());
         for page in range.pages() {
@@ -2293,17 +3533,21 @@ mod tests {
         let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
         let read =
             DeviceAccessDeclaration::read(NonCpuDeviceId::new(1), DeviceVisibilityPoint::new(1));
-        range
-            .prepare_resident_device_access(read, coordinator.clone())
-            .unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            std::iter::once((&range, read)),
+            coordinator.clone(),
+        )
+        .unwrap();
         let mut aliases = Vec::new();
         for offset in 0..128 {
             let alias = range.snapshot_subrange(offset, 0x100).unwrap();
             let dependency = CanonicalCpuWriteDependency::capture(&alias).unwrap();
             assert!(Arc::ptr_eq(&first.inner.summary, &dependency.inner.summary));
-            alias
-                .prepare_resident_device_access(read, coordinator.clone())
-                .unwrap();
+            CanonicalBackingRange::prepare_resident_device_accesses(
+                std::iter::once((&alias, read)),
+                coordinator.clone(),
+            )
+            .unwrap();
             assert!(Arc::ptr_eq(
                 range.visibility_summary(),
                 alias.visibility_summary()
@@ -2357,9 +3601,12 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        full.prepare_device_access(first, coordinator.clone())
-            .unwrap();
-        full.publish_device_write(first, coordinator.clone())
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&full, first)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&full, first)], coordinator.clone())
             .unwrap();
         let partial = DeviceAccessDeclaration::write(
             device,
@@ -2367,12 +3614,16 @@ mod tests {
             DeviceVisibilityPoint::new(3),
         )
         .unwrap();
-        first_page
-            .prepare_resident_device_access(partial, coordinator.clone())
-            .unwrap();
-        first_page
-            .publish_device_write(partial, coordinator.clone())
-            .unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            std::iter::once((&first_page, partial)),
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes(
+            [(&first_page, partial)],
+            coordinator.clone(),
+        )
+        .unwrap();
         assert_eq!(
             full.segments()[0].visibility_state(),
             VisibilityState::GpuNewer {
@@ -2393,9 +3644,12 @@ mod tests {
             DeviceVisibilityPoint::new(4),
         )
         .unwrap();
-        full.prepare_resident_device_access(next, coordinator.clone())
-            .unwrap();
-        full.publish_device_write(next, coordinator).unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            std::iter::once((&full, next)),
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&full, next)], coordinator).unwrap();
         assert!(full.pages().all(|page| page.visibility_state()
             == VisibilityState::GpuNewer {
                 device,
@@ -2427,10 +3681,13 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        range
-            .prepare_device_access(write, coordinator.clone())
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, write)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&range, write)], coordinator)
             .unwrap();
-        range.publish_device_write(write, coordinator).unwrap();
         assert!(
             dependency
                 .snapshot_dirty_pages(&range, 16)
@@ -2465,11 +3722,12 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        range
-            .prepare_device_access(first, coordinator.clone())
-            .unwrap();
-        range
-            .publish_device_write(first, coordinator.clone())
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, first)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&range, first)], coordinator.clone())
             .unwrap();
         let mut requests = Vec::new();
         let snapshot = dependency
@@ -2486,9 +3744,11 @@ mod tests {
                             DeviceVisibilityPoint::new(next_point),
                         )
                         .unwrap();
-                        range
-                            .publish_device_write(next, coordinator.clone())
-                            .unwrap();
+                        crate::CanonicalBackingRange::publish_device_writes(
+                            [(&range, next)],
+                            coordinator.clone(),
+                        )
+                        .unwrap();
                         Ok(vec![0x11; request.size].into_boxed_slice())
                     } else {
                         Ok(vec![0x44; request.size].into_boxed_slice())
@@ -2518,10 +3778,12 @@ mod tests {
             DeviceVisibilityPoint::new(6),
         )
         .unwrap();
-        range
-            .prepare_resident_device_access(next, coordinator.clone())
-            .unwrap();
-        range.publish_device_write(next, coordinator).unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            std::iter::once((&range, next)),
+            coordinator.clone(),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&range, next)], coordinator).unwrap();
         assert!(gate.epoch() > epoch);
     }
 
@@ -2539,11 +3801,12 @@ mod tests {
             DeviceVisibilityPoint::new(2),
         )
         .unwrap();
-        range
-            .prepare_device_access(declaration, Arc::clone(&coordinator))
-            .unwrap();
-        range
-            .publish_device_write(declaration, coordinator)
+        crate::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, declaration)],
+            Arc::clone(&coordinator),
+        )
+        .unwrap();
+        crate::CanonicalBackingRange::publish_device_writes([(&range, declaration)], coordinator)
             .unwrap();
         let mut requests = 0;
         let snapshots = dependency

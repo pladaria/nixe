@@ -1,5 +1,6 @@
 //! Linux shared-file storage for canonical guest bytes.
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -9,8 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::DIRECT_PAGE_SIZE;
 
-const HOST_BACKING_RESERVATION_SIZE: usize = 1usize << 39;
-const HOST_BACKING_GROWTH_SIZE: usize = 1 << 26;
+pub(crate) const HOST_BACKING_CAPACITY: usize = 1usize << 39;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn host_atomic_128_supported() -> bool {
@@ -27,7 +27,7 @@ pub(crate) const fn host_atomic_128_supported() -> bool {
     false
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostMappedError(Box<str>);
 
 impl HostMappedError {
@@ -52,6 +52,7 @@ impl std::error::Error for HostMappedError {}
 struct HostMappedStoreInner {
     fd: OwnedFd,
     canonical_base: NonNull<u8>,
+    capacity: usize,
     allocation: Mutex<HostMappedAllocation>,
 }
 
@@ -60,19 +61,71 @@ unsafe impl Sync for HostMappedStoreInner {}
 
 #[derive(Debug, Default)]
 struct HostMappedAllocation {
-    next_offset: u64,
-    mapped_capacity: usize,
+    next_offset: usize,
+    free: BTreeMap<usize, usize>,
+}
+
+impl HostMappedAllocation {
+    fn allocate(&mut self, size: usize, capacity: usize) -> Result<(usize, bool), HostMappedError> {
+        if let Some((&offset, &available)) =
+            self.free.iter().find(|(_, available)| **available >= size)
+        {
+            self.free.remove(&offset);
+            if available > size {
+                self.free.insert(offset + size, available - size);
+            }
+            return Ok((offset, true));
+        }
+        // A freed tail and the unused file suffix form one contiguous extent.
+        if let Some((&offset, &available)) = self.free.last_key_value()
+            && offset + available == self.next_offset
+            && let Some(end) = offset.checked_add(size).filter(|end| *end <= capacity)
+        {
+            self.free.remove(&offset);
+            self.next_offset = end;
+            return Ok((offset, true));
+        }
+        let offset = self.next_offset;
+        let end = offset.checked_add(size).filter(|end| *end <= capacity).ok_or_else(|| {
+            HostMappedError(format!("canonical backing exhausted: requested={size:#x}, capacity={capacity:#x}, tail={offset:#x}; no contiguous free extent fits").into())
+        })?;
+        self.next_offset = end;
+        Ok((offset, false))
+    }
+
+    fn release(&mut self, mut offset: usize, mut size: usize) {
+        if let Some((&previous, &length)) = self.free.range(..offset).next_back()
+            && previous + length == offset
+        {
+            self.free.remove(&previous);
+            offset = previous;
+            size += length;
+        }
+        if let Some((&next, &length)) = self.free.range(offset..).next()
+            && offset + size == next
+        {
+            self.free.remove(&next);
+            size += length;
+        }
+        self.free.insert(offset, size);
+    }
 }
 
 impl Drop for HostMappedStoreInner {
     fn drop(&mut self) {
-        let result = unsafe {
-            libc::munmap(
-                self.canonical_base.as_ptr().cast(),
-                HOST_BACKING_RESERVATION_SIZE,
-            )
-        };
-        debug_assert_eq!(result, 0, "canonical arena munmap failed");
+        #[cfg(feature = "performance-counters")]
+        {
+            crate::metrics::subtract(
+                crate::metrics::Counter::BackingReservedBytes,
+                self.capacity as u64,
+            );
+            crate::metrics::subtract(
+                crate::metrics::Counter::BackingMappedBytes,
+                self.capacity as u64,
+            );
+        }
+        let result = unsafe { libc::munmap(self.canonical_base.as_ptr().cast(), self.capacity) };
+        debug_assert_eq!(result, 0, "canonical mapping munmap failed");
     }
 }
 
@@ -82,7 +135,14 @@ pub(crate) struct HostMappedStore {
 }
 
 impl HostMappedStore {
-    pub(crate) fn new() -> Result<Self, HostMappedError> {
+    pub(crate) fn new(capacity: usize) -> Result<Self, HostMappedError> {
+        if capacity == 0 || !capacity.is_multiple_of(DIRECT_PAGE_SIZE) {
+            return Err(HostMappedError::invalid(
+                "canonical capacity must be a nonzero guest-page multiple",
+            ));
+        }
+        let file_size = libc::off_t::try_from(capacity)
+            .map_err(|_| HostMappedError::invalid("canonical capacity exceeds off_t"))?;
         let name = CString::new("nixe-canonical-memory").expect("static memfd name has no NUL");
         let raw = unsafe {
             libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
@@ -91,14 +151,44 @@ impl HostMappedStore {
             return Err(HostMappedError::last("memfd_create failed"));
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let canonical_base = reserve(
-            HOST_BACKING_RESERVATION_SIZE,
-            "canonical backing arena mmap failed",
-        )?;
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), file_size) } != 0 {
+            return Err(HostMappedError::last("canonical file sizing failed"));
+        }
+        // One stable physical mapping, separate from the guest fastmem arena.
+        // Eden/Yuzu use the same separation; Nixe keeps its existing sparse capacity.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/67bada77f8a43a90da2e94e89b8e7da73c256989/src/common/host_memory.cpp
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                capacity,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_NORESERVE,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(HostMappedError::last("canonical shared mapping failed"));
+        }
+        // A sparse memfd is classified as anonymous shared memory for core dumps.
+        // Dumping its full virtual capacity would fault in otherwise unused pages.
+        if unsafe { libc::madvise(mapped, capacity, libc::MADV_DONTDUMP) } != 0 {
+            let error = HostMappedError::last("canonical core-dump exclusion failed");
+            unsafe { libc::munmap(mapped, capacity) };
+            return Err(error);
+        }
+        let canonical_base =
+            NonNull::new(mapped.cast()).expect("mmap never returns null on success");
+        crate::metrics::record(
+            crate::metrics::Counter::BackingReservedBytes,
+            capacity as u64,
+        );
+        crate::metrics::record(crate::metrics::Counter::BackingMappedBytes, capacity as u64);
         Ok(Self {
             inner: Arc::new(HostMappedStoreInner {
                 fd,
                 canonical_base,
+                capacity,
                 allocation: Mutex::new(HostMappedAllocation::default()),
             }),
         })
@@ -119,72 +209,36 @@ impl HostMappedStore {
                 "host-mapped initial contents must fill the backing",
             ));
         }
-        let mut allocation = self
-            .inner
-            .allocation
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         let mapped_size = size
             .checked_add(DIRECT_PAGE_SIZE - 1)
             .map(|value| value & !(DIRECT_PAGE_SIZE - 1))
             .ok_or_else(|| HostMappedError::invalid("host-mapped backing size overflow"))?;
-        let offset = allocation.next_offset;
-        let end = offset
-            .checked_add(mapped_size as u64)
-            .ok_or_else(|| HostMappedError::invalid("host-mapped backing offset overflow"))?;
-        let end_usize = usize::try_from(end)
-            .map_err(|_| HostMappedError::invalid("host-mapped backing exceeds usize"))?;
-        if end_usize > HOST_BACKING_RESERVATION_SIZE {
-            return Err(HostMappedError::invalid(
-                "canonical backing arena capacity exceeded",
-            ));
-        }
-        if end_usize > allocation.mapped_capacity {
-            let new_capacity = end_usize
-                .checked_add(HOST_BACKING_GROWTH_SIZE - 1)
-                .map(|value| value & !(HOST_BACKING_GROWTH_SIZE - 1))
-                .ok_or_else(|| HostMappedError::invalid("canonical capacity overflow"))?
-                .min(HOST_BACKING_RESERVATION_SIZE);
-            let capacity_off = libc::off_t::try_from(new_capacity)
-                .map_err(|_| HostMappedError::invalid("canonical capacity exceeds off_t"))?;
-            if unsafe { libc::ftruncate(self.inner.fd.as_raw_fd(), capacity_off) } != 0 {
-                return Err(HostMappedError::last("ftruncate failed"));
+        let (offset, reused) = self
+            .inner
+            .allocation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .allocate(mapped_size, self.inner.capacity)?;
+        let base =
+            unsafe { NonNull::new_unchecked(self.inner.canonical_base.as_ptr().add(offset)) };
+        // Fresh file extents are zero. Reused extents have no remaining consumers;
+        // initialize them before publishing the new owner, including alignment padding.
+        unsafe {
+            if let Some(contents) = contents {
+                std::ptr::copy_nonoverlapping(contents.as_ptr(), base.as_ptr(), size);
+                if reused {
+                    std::ptr::write_bytes(base.as_ptr().add(size), 0, mapped_size - size);
+                }
+            } else if reused {
+                std::ptr::write_bytes(base.as_ptr(), 0, mapped_size);
             }
-            let extension = new_capacity - allocation.mapped_capacity;
-            let destination = unsafe {
-                self.inner
-                    .canonical_base
-                    .as_ptr()
-                    .add(allocation.mapped_capacity)
-            };
-            let file_offset = libc::off_t::try_from(allocation.mapped_capacity)
-                .map_err(|_| HostMappedError::invalid("canonical offset exceeds off_t"))?;
-            let mapped = unsafe {
-                libc::mmap(
-                    destination.cast(),
-                    extension,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_FIXED,
-                    self.inner.fd.as_raw_fd(),
-                    file_offset,
-                )
-            };
-            if mapped == libc::MAP_FAILED || mapped != destination.cast() {
-                return Err(HostMappedError::last("canonical mmap extension failed"));
-            }
-            allocation.mapped_capacity = new_capacity;
         }
-        let base = unsafe {
-            NonNull::new_unchecked(self.inner.canonical_base.as_ptr().add(offset as usize))
-        };
-        if let Some(contents) = contents {
-            unsafe { std::ptr::copy_nonoverlapping(contents.as_ptr(), base.as_ptr(), size) };
-        }
-        allocation.next_offset = end;
+        #[cfg(feature = "performance-counters")]
+        crate::metrics::allocate_backing(size as u64, (offset + mapped_size) as u64);
         Ok(HostMappedBacking {
             inner: Arc::new(HostMappedBackingInner {
                 store: self.clone(),
-                offset,
+                offset: offset as u64,
                 base,
                 size,
             }),
@@ -198,6 +252,26 @@ struct HostMappedBackingInner {
     offset: u64,
     base: NonNull<u8>,
     size: usize,
+}
+
+impl Drop for HostMappedBackingInner {
+    fn drop(&mut self) {
+        let mapped_size = self.size.div_ceil(DIRECT_PAGE_SIZE) * DIRECT_PAGE_SIZE;
+        self.store
+            .inner
+            .allocation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release(self.offset as usize, mapped_size);
+        #[cfg(feature = "performance-counters")]
+        {
+            crate::metrics::record(
+                crate::metrics::Counter::BackingReleasedBytes,
+                self.size as u64,
+            );
+            crate::metrics::subtract(crate::metrics::Counter::BackingLiveBytes, self.size as u64);
+        }
+    }
 }
 
 unsafe impl Send for HostMappedBackingInner {}
@@ -446,30 +520,198 @@ nixe_memory_compare_exchange_128:
 "#
 );
 
-fn reserve(size: usize, operation: &str) -> Result<NonNull<u8>, HostMappedError> {
-    let mapped = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    if mapped == libc::MAP_FAILED {
-        return Err(HostMappedError::last(operation));
-    }
-    Ok(NonNull::new(mapped.cast()).expect("mmap never returns null on success"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::HostMappedStore;
+    use crate::{DIRECT_PAGE_SIZE, DirectArena, DirectMapRequest, DirectProtection};
+
+    #[test]
+    fn bounded_churn_reuses_zeroed_storage_and_preserves_retained_pointers() {
+        let store = HostMappedStore::new(3 * DIRECT_PAGE_SIZE).unwrap();
+        let anchor = store
+            .allocate(DIRECT_PAGE_SIZE, Some(&[0x42; DIRECT_PAGE_SIZE]))
+            .unwrap();
+        let pointer = anchor.base();
+        for _ in 0..64 {
+            let temporary = store.allocate(2 * DIRECT_PAGE_SIZE, None).unwrap();
+            unsafe {
+                let bytes =
+                    std::slice::from_raw_parts_mut(temporary.base() as *mut u8, temporary.size());
+                assert!(bytes.iter().all(|byte| *byte == 0));
+                bytes.fill(0xa5);
+                assert_eq!((pointer as *const u8).read(), 0x42);
+            }
+            assert_eq!(anchor.base(), pointer);
+            assert!(
+                store
+                    .allocate(1, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("canonical backing exhausted")
+            );
+        }
+        assert_eq!(
+            store.inner.allocation.lock().unwrap().next_offset,
+            3 * DIRECT_PAGE_SIZE
+        );
+        drop(anchor);
+        let whole = store.allocate(3 * DIRECT_PAGE_SIZE, None).unwrap();
+        assert_eq!(whole.offset(), 0);
+        assert!(
+            unsafe { std::slice::from_raw_parts(whole.base() as *const u8, whole.size()) }
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn extents_split_coalesce_and_extend_into_the_unused_tail() {
+        let store = HostMappedStore::new(4 * DIRECT_PAGE_SIZE).unwrap();
+        let first = store.allocate(DIRECT_PAGE_SIZE, None).unwrap();
+        let second = store.allocate(DIRECT_PAGE_SIZE, None).unwrap();
+        let third = store.allocate(DIRECT_PAGE_SIZE, None).unwrap();
+        drop(second);
+        drop(first);
+        let pair = store.allocate(2 * DIRECT_PAGE_SIZE, None).unwrap();
+        assert_eq!(pair.offset(), 0);
+        drop(third);
+        drop(pair);
+        // Three freed pages plus one never allocated page must fit without compaction.
+        let whole = store.allocate(4 * DIRECT_PAGE_SIZE, None).unwrap();
+        assert_eq!(whole.offset(), 0);
+        drop(whole);
+        let page = store.allocate(DIRECT_PAGE_SIZE, None).unwrap();
+        let remainder = store.allocate(3 * DIRECT_PAGE_SIZE, None).unwrap();
+        assert_eq!(remainder.offset(), DIRECT_PAGE_SIZE as u64);
+        drop(remainder);
+        drop(page);
+        assert_eq!(store.inner.allocation.lock().unwrap().free.len(), 1);
+    }
+
+    #[test]
+    fn direct_aliases_retain_storage_until_the_last_os_mapping_is_removed() {
+        let store = HostMappedStore::new(DIRECT_PAGE_SIZE).unwrap();
+        let host = store
+            .allocate(DIRECT_PAGE_SIZE, Some(&[0x5a; DIRECT_PAGE_SIZE]))
+            .unwrap();
+        let pointer = host.base();
+        let arena = DirectArena::new(3 * DIRECT_PAGE_SIZE).unwrap();
+        for address in [0x1000, 0x2000] {
+            arena
+                .map_pages(&[DirectMapRequest {
+                    guest_address: address,
+                    backing: &host,
+                    protection: DirectProtection::ReadWrite,
+                }])
+                .unwrap();
+        }
+        drop(host);
+        assert!(store.allocate(DIRECT_PAGE_SIZE, None).is_err());
+        arena.reconcile_page(0x1000, None).unwrap();
+        assert!(store.allocate(DIRECT_PAGE_SIZE, None).is_err());
+        assert_eq!(
+            unsafe { (arena.view().host_address(0x2000).unwrap() as *const u8).read_volatile() },
+            0x5a
+        );
+        arena.reconcile_page(0x2000, None).unwrap();
+        let reused = store.allocate(DIRECT_PAGE_SIZE, None).unwrap();
+        assert_eq!(reused.base(), pointer);
+        assert_eq!(reused.atomic_load(0, 1).unwrap(), 0);
+        drop(reused);
+        let host = store.allocate(DIRECT_PAGE_SIZE, None).unwrap();
+        arena
+            .map_pages(&[DirectMapRequest {
+                guest_address: 0x1000,
+                backing: &host,
+                protection: DirectProtection::ReadWrite,
+            }])
+            .unwrap();
+        drop(host);
+        drop(arena);
+        assert!(store.allocate(DIRECT_PAGE_SIZE, None).is_ok());
+    }
+
+    #[test]
+    fn reused_padding_and_atomic_boundaries_are_initialized_and_checked() {
+        let store = HostMappedStore::new(DIRECT_PAGE_SIZE).unwrap();
+        let dirty = store
+            .allocate(DIRECT_PAGE_SIZE, Some(&[0xff; DIRECT_PAGE_SIZE]))
+            .unwrap();
+        drop(dirty);
+        let partial = store.allocate(17, Some(&[0x5a; 17])).unwrap();
+        let bytes =
+            unsafe { std::slice::from_raw_parts(partial.base() as *const u8, DIRECT_PAGE_SIZE) };
+        assert!(bytes[..17].iter().all(|byte| *byte == 0x5a));
+        assert!(bytes[17..].iter().all(|byte| *byte == 0));
+        drop(partial);
+        let whole = store.allocate(DIRECT_PAGE_SIZE, None).unwrap();
+        for size in [1, 2, 4, 8, 16] {
+            let offset = DIRECT_PAGE_SIZE - size;
+            assert_eq!(
+                whole.atomic_compare_exchange(offset, size, 0, 1).unwrap(),
+                (0, true)
+            );
+            assert_eq!(whole.atomic_load(offset, size).unwrap(), 1);
+            assert_eq!(
+                whole.atomic_compare_exchange(offset, size, 1, 0).unwrap(),
+                (1, true)
+            );
+            assert!(whole.atomic_load(DIRECT_PAGE_SIZE, size).is_err());
+            if size > 1 {
+                assert!(whole.atomic_load(offset + 1, size).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_allocation_and_final_clone_release_do_not_overlap_live_bytes() {
+        let store = HostMappedStore::new(16 * DIRECT_PAGE_SIZE).unwrap();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for value in 1..=8u8 {
+                let store = &store;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..100 {
+                        let allocation = store.allocate(DIRECT_PAGE_SIZE, None).unwrap();
+                        let retained = allocation.clone();
+                        let pointer = allocation.base() as *mut u8;
+                        unsafe {
+                            let bytes = std::slice::from_raw_parts_mut(pointer, DIRECT_PAGE_SIZE);
+                            assert!(bytes.iter().all(|byte| *byte == 0));
+                            bytes.fill(value);
+                        }
+                        drop(allocation);
+                        std::thread::yield_now();
+                        assert!(
+                            unsafe { std::slice::from_raw_parts(pointer, DIRECT_PAGE_SIZE) }
+                                .iter()
+                                .all(|byte| *byte == value)
+                        );
+                        drop(retained);
+                    }
+                });
+            }
+        });
+        assert!(store.allocate(16 * DIRECT_PAGE_SIZE, None).is_ok());
+    }
+
+    #[test]
+    fn invalid_requests_do_not_consume_capacity() {
+        assert!(HostMappedStore::new(0).is_err());
+        assert!(HostMappedStore::new(1).is_err());
+        let store = HostMappedStore::new(DIRECT_PAGE_SIZE).unwrap();
+        assert!(store.allocate(0, None).is_err());
+        assert!(store.allocate(2, Some(&[1])).is_err());
+        assert!(store.allocate(usize::MAX, None).is_err());
+        assert!(store.allocate(2 * DIRECT_PAGE_SIZE, None).is_err());
+        assert!(store.allocate(DIRECT_PAGE_SIZE, None).is_ok());
+    }
 
     #[test]
     fn canonical_atomic_128_reads_and_mismatches_never_return_a_torn_pair() {
-        let store = HostMappedStore::new().unwrap();
+        let store = HostMappedStore::new(4096).unwrap();
         let backing = store.allocate(4096, None).unwrap();
         let start = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
@@ -500,7 +742,7 @@ mod tests {
 
     #[test]
     fn canonical_host_atomics_cover_every_architectural_width() {
-        let store = HostMappedStore::new().unwrap();
+        let store = HostMappedStore::new(4096).unwrap();
         let backing = store.allocate(4096, None).unwrap();
         for (offset, size, value) in [
             (0, 1, 0xa5),
