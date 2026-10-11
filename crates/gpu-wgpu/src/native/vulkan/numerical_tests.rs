@@ -500,6 +500,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
             &ir,
             SpirvShaderOptions {
                 depth_clip_negative_one_to_one: false,
+                vertex_position_transform: None,
                 input_control_points: 0,
                 tessellation_mode: None,
                 float32,

@@ -146,12 +146,12 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         .unwrap()[target_index];
         assert!(creations.iter().any(|creation| matches!(
             creation,
-            BackendResourceCreateInfo::Image { view, .. } if view.is_none() == (compression != 0)
+            BackendResourceCreateInfo::Image { view: Some(view), .. } if !view.has_canonical_texels()
         )));
         creations.clear();
-        // Opaque storage requires a recorded clear/render operation; a direct
-        // producer already initializes its resident image from canonical bytes.
-        assert_eq!(
+        // Disabling future compression does not make existing compressed
+        // allocation bytes importable. Both selectors need a recorded producer.
+        assert!(
             prepare(
                 &textures,
                 texture_index,
@@ -159,12 +159,9 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
                 &mut creations,
                 &mut invalidations
             )
-            .is_err(),
-            compression != 0
+            .is_err()
         );
-        if compression != 0 {
-            record_color_materialization(image, &mut cache);
-        }
+        record_color_materialization(image, &mut cache);
         for _ in 0..3 {
             assert_eq!(
                 prepare(
@@ -222,7 +219,7 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         assert_ne!(cropped_binding, target_binding);
         assert_eq!(creations.len(), 1);
         assert!(matches!(
-            creations[0],
+            &creations[0],
             BackendResourceCreateInfo::Image { view: None, .. }
         ));
         assert_eq!(cache.image_alias_copies.len(), 1);
@@ -312,83 +309,33 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
             .is_err()
         );
         cache.views.push(resident);
-        // Two sampled widths share the direct producer, but each copied
-        // image must observe CPU writes independently of every other alias.
+        // CPU writes invalidate every compressed alias independently, even
+        // when the producer disabled compression for subsequent writes.
         tic(&metadata, address, 62, texture_format);
         let second_cropped = resolve(&space, sampled);
-        let second_binding = prepare(
+        prepare(
             &second_cropped,
             texture_index,
             &mut cache,
             &mut creations,
             &mut invalidations,
         )
-        .unwrap()[texture_index];
+        .unwrap();
         creations.clear();
         cache.image_alias_copies.clear();
         pixels.write(0, &[0; 4]).unwrap();
-        for (textures, binding) in [
-            (&cropped, cropped_binding),
-            (&second_cropped, second_binding),
-        ] {
-            let prepared = prepare(
-                textures,
-                texture_index,
-                &mut cache,
-                &mut creations,
-                &mut invalidations,
-            );
-            if compression != 0 {
-                assert!(matches!(
-                    prepared,
-                    Err(MaxwellLoweringError::CompressedSampledImageImportRequired { .. })
-                ));
-                assert!(cache.image_alias_copies.is_empty());
-            } else {
-                // Direct canonical storage can be uploaded before copying,
-                // even when the resolver and producer observation are stale.
-                assert_eq!(prepared.unwrap()[texture_index], binding);
-                assert_eq!(cache.image_alias_copies.len(), 1);
-                cache.image_alias_copies.clear();
-                assert_eq!(
-                    prepare(
-                        textures,
-                        texture_index,
-                        &mut cache,
-                        &mut creations,
-                        &mut invalidations
-                    )
-                    .unwrap()[texture_index],
-                    binding
-                );
-                assert!(cache.image_alias_copies.is_empty());
-            }
-        }
-        // A fresh, full-width sampled alias is also legal only for a direct
-        // producer. Its new copy must capture the current CPU-write baseline.
-        let prepared = prepare(
-            &textures,
-            texture_index,
-            &mut cache,
-            &mut creations,
-            &mut invalidations,
-        );
-        assert_eq!(prepared.is_err(), compression != 0);
-        if compression == 0 {
-            assert_eq!(creations.len(), 1);
-            assert_eq!(cache.image_alias_copies.len(), 1);
-            creations.clear();
-            cache.image_alias_copies.clear();
-            assert!(
+        for textures in [&cropped, &second_cropped, &textures] {
+            assert!(matches!(
                 prepare(
-                    &textures,
+                    textures,
                     texture_index,
                     &mut cache,
                     &mut creations,
                     &mut invalidations
-                )
-                .is_ok()
-            );
+                ),
+                Err(MaxwellLoweringError::CompressedSampledImageImportRequired { .. })
+            ));
+            assert!(cache.image_alias_copies.is_empty());
         }
         assert!(creations.is_empty());
         assert!(invalidations.is_empty());
@@ -655,4 +602,240 @@ fn inline_image_offsets_preserve_gob_coordinates_and_block_rows() {
     assert_eq!(inline_block_linear_position(512, 32, 4), (0, 8));
     assert_eq!(inline_block_linear_position(8192, 32, 4), (64, 0));
     assert_eq!(inline_block_linear_position(16384, 32, 4), (0, 128));
+}
+
+#[test]
+fn direct_overlapping_texture_views_retain_identity_until_a_device_write() {
+    use super::super::threed::{
+        MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
+        resolve_maxwell_three_d_resources_for_roles,
+    };
+    let mut space =
+        MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+    space
+        .initialize(MaxwellAddressSpaceInitialization::default())
+        .unwrap();
+    let pixels = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let metadata = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let address = map(&mut space, &pixels, 1, 0xfe);
+    let descriptors = map(&mut space, &metadata, 2, 0xfe);
+    let mut channel = three_d_channel();
+    for (method, argument) in [
+        (0x1574, (descriptors >> 32) as u32),
+        (0x1578, descriptors as u32),
+        (0x157c, 0),
+        (0x2380, 4),
+        (0x2384, (descriptors >> 32) as u32),
+        (0x2388, (descriptors + 0x100) as u32),
+        (0x2490, 1),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let role = MaxwellThreeDResourceRole::SampledImage {
+        texture: MaxwellThreeDTextureReference::new(4, 0, 0),
+        dimension: MaxwellThreeDTextureDimension::Two,
+    };
+    let mut cache = MaxwellLoweringCache::default();
+    let mut invalidations = Vec::new();
+    let prepare = |width, cache: &mut MaxwellLoweringCache, invalidations: &mut Vec<_>| {
+        tic(&metadata, address, width, 0x58d2_4908);
+        let resources =
+            resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &space, &[role])
+                .unwrap();
+        let index = resource_index(&resources, role).unwrap();
+        prepare_resources(&resources, &[index], cache, &mut Vec::new(), invalidations).unwrap()
+            [index]
+            .unwrap()
+    };
+    let first = prepare(64, &mut cache, &mut invalidations);
+    let overlapping = prepare(32, &mut cache, &mut invalidations);
+    assert_ne!(first, overlapping);
+    assert!(invalidations.is_empty());
+    assert_eq!(prepare(64, &mut cache, &mut invalidations), first);
+    assert_eq!(prepare(32, &mut cache, &mut invalidations), overlapping);
+    // CPU contents change without changing immutable host view identities.
+    pixels.write(0, &[1, 2, 3, 4]).unwrap();
+    assert_eq!(prepare(64, &mut cache, &mut invalidations), first);
+    cache
+        .views
+        .iter_mut()
+        .find(|r| r.dependency == first)
+        .unwrap()
+        .write_revision = 1;
+    let third = prepare(16, &mut cache, &mut invalidations);
+    assert!(invalidations.contains(&first));
+    assert!(!invalidations.contains(&overlapping));
+    assert!(cache.views.iter().any(|r| r.dependency == third));
+    // Image writes invalidate cached texels in the backend without retiring read-only identities.
+    let key = cache
+        .views
+        .iter()
+        .find(|r| r.dependency == third)
+        .unwrap()
+        .key
+        .clone();
+    retire_overlapping_views(
+        &key,
+        true,
+        std::iter::once(third),
+        &mut cache,
+        &mut invalidations,
+    );
+    assert!(!invalidations.contains(&overlapping));
+    assert_eq!(cache.views.len(), 2);
+}
+
+#[test]
+fn vic_producer_and_maxwell_texture_share_the_same_canonical_image() {
+    use super::super::threed::{
+        MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
+        resolve_maxwell_three_d_resources_for_roles,
+    };
+    use nixe_gpu::{ConversionImage, Nv12ColorTransform};
+    let mut space =
+        MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+    space
+        .initialize(MaxwellAddressSpaceInitialization::default())
+        .unwrap();
+    let pixels = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let metadata = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let address = map(&mut space, &pixels, 1, 0xfe);
+    let descriptors = map(&mut space, &metadata, 2, 0xfe);
+    let mut channel = three_d_channel();
+    for (method, argument) in [
+        (0x1574, (descriptors >> 32) as u32),
+        (0x1578, descriptors as u32),
+        (0x157c, 0),
+        (0x2380, 4),
+        (0x2384, (descriptors >> 32) as u32),
+        (0x2388, (descriptors + 0x100) as u32),
+        (0x2490, 1),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    tic(&metadata, address, 64, 0x58d2_4908);
+    let role = MaxwellThreeDResourceRole::SampledImage {
+        texture: MaxwellThreeDTextureReference::new(4, 0, 0),
+        dimension: MaxwellThreeDTextureDimension::Two,
+    };
+    let resources =
+        resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &space, &[role]).unwrap();
+    let index = resource_index(&resources, role).unwrap();
+    let image = resolved_image(&resources, index).unwrap();
+    let output = ConversionImage {
+        description: image.description(),
+        allocation: image.allocation_description(),
+        view: image.view().clone(),
+    };
+    let plane = |id, format, width, height| {
+        let storage = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let allocation = nixe_gpu::GpuAllocationDescription::new(0x1000, 1).unwrap();
+        let description = nixe_gpu::ImageDescription::new(
+            nixe_gpu::ImageDimension::Two,
+            nixe_gpu::ImageExtent::new(width, height, 1).unwrap(),
+            format,
+            nixe_gpu::ImageKind::Color,
+            1,
+            1,
+            nixe_gpu::SampleCount::One,
+        )
+        .unwrap();
+        let backing = nixe_gpu::BackingView::new(
+            nixe_gpu::GpuAllocationId::new(id),
+            allocation,
+            0,
+            storage
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+        )
+        .unwrap();
+        ConversionImage {
+            description,
+            allocation,
+            view: ImageView::new(
+                ImageId::new(0),
+                description,
+                nixe_gpu::Swizzle::IDENTITY,
+                vec![(
+                    ImageSubresourceRange {
+                        mip_level: 0,
+                        base_layer: 0,
+                        layer_count: 1,
+                        plane: 0,
+                    },
+                    nixe_gpu::ImageMemoryLayout::PitchLinear {
+                        row_pitch: 64,
+                        layer_stride: 0x1000,
+                    },
+                    backing,
+                )],
+            )
+            .unwrap(),
+        }
+    };
+    let images = [
+        plane(3, nixe_gpu::ImageFormat::R8Unorm, 64, 32),
+        plane(4, nixe_gpu::ImageFormat::Rg8Unorm, 32, 16),
+        output,
+    ];
+    let transform = Nv12ColorTransform {
+        coefficients: [[0; 4]; 3],
+        shift: 0,
+        enabled: false,
+        clamp: [0, 1023],
+        alpha: 255,
+        source_origin: [0, 0],
+    };
+    let mut cache = MaxwellLoweringCache::default();
+    let work = cache
+        .lower_nv12_conversion(images.clone(), transform)
+        .unwrap();
+    let destination = work
+        .submission()
+        .operations()
+        .iter()
+        .find_map(|op| match op.command() {
+            GpuCommand::ConvertNv12(c) => Some(ResourceDependency::Image(c.destination.image)),
+            _ => None,
+        })
+        .unwrap();
+    for _ in 0..3 {
+        let mut creations = Vec::new();
+        let mut invalidations = Vec::new();
+        let resolved = prepare_resources(
+            &resources,
+            &[index],
+            &mut cache,
+            &mut creations,
+            &mut invalidations,
+        )
+        .unwrap();
+        assert_eq!(resolved[index], Some(destination));
+        assert!(
+            creations.is_empty(),
+            "sampling a VIC output must not create an importing texture"
+        );
+        assert!(invalidations.is_empty());
+        let work = cache
+            .lower_nv12_conversion(images.clone(), transform)
+            .unwrap();
+        assert!(work.resource_creations().is_empty());
+        assert!(work.resource_invalidations().is_empty());
+    }
+    // The game may consume the same bytes through an sRGB TIC. Keep that
+    // interpretation resident and refresh it once per actual producer write.
+    metadata.write(16, &((64 - 1) | (1u32 << 23) | (1 << 22)).to_le_bytes()).unwrap();
+    let srgb_resources = resolve_maxwell_three_d_resources_for_roles(channel.three_d(), &space, &[role]).unwrap();
+    let srgb_index = resource_index(&srgb_resources, role).unwrap();
+    let mut creations = Vec::new();
+    let sampled = prepare_resources(&srgb_resources, &[srgb_index], &mut cache, &mut creations, &mut Vec::new()).unwrap()[srgb_index].unwrap();
+    assert_ne!(sampled, destination);
+    assert!(matches!(&creations[..], [BackendResourceCreateInfo::Image { view: None, .. }]));
+    assert_eq!(cache.image_alias_copies.len(), 1);
+    finish_lowered_work(&mut cache, FrontendSubmissionId::new(1000), vec![], creations, vec![], [], Arc::from([])).unwrap();
+    assert_eq!(prepare_resources(&srgb_resources, &[srgb_index], &mut cache, &mut Vec::new(), &mut Vec::new()).unwrap()[srgb_index], Some(sampled));
+    assert!(cache.image_alias_copies.is_empty());
+    cache.lower_nv12_conversion(images, transform).unwrap();
+    assert_eq!(prepare_resources(&srgb_resources, &[srgb_index], &mut cache, &mut Vec::new(), &mut Vec::new()).unwrap()[srgb_index], Some(sampled));
+    assert_eq!(cache.image_alias_copies.len(), 1);
 }

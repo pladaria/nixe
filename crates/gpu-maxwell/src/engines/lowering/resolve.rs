@@ -106,9 +106,20 @@ impl MaxwellLoweringCache {
                         ViewMaterialization::CopiedColor { .. }
                     ) || sampled_alias::copy_is_current(view, self))
                     && view.uninitialized_color_regions.is_empty()
+                    && view
+                        .uninitialized_depth_stencil_regions
+                        .iter()
+                        .all(Vec::is_empty)
             })
         {
             return Err(MaxwellLoweringError::BlitSourceNotResident);
+        }
+        if matches!(
+            request.kind,
+            super::super::twod::blit::BlitKind::Copy { .. }
+        ) && source.guest_format() != destination.guest_format()
+        {
+            return Err(MaxwellLoweringError::BlitFormatMismatch);
         }
         let mut creations = Vec::new();
         let mut invalidations = std::mem::take(&mut self.retired_resources);
@@ -125,16 +136,71 @@ impl MaxwellLoweringCache {
             })
         };
         let command = match request.kind {
-            super::super::twod::blit::BlitKind::Resolve => GpuCommand::Resolve(
-                nixe_gpu::ResolveOperation::new(
-                    region(0, source)?,
-                    region(1, destination)?,
-                    source.description().format(),
-                    source.description().samples(),
+            super::super::twod::blit::BlitKind::Scale {
+                filter,
+                first,
+                step,
+            } => {
+                if source.description().samples() != nixe_gpu::SampleCount::One {
+                    return Err(MaxwellLoweringError::UnsupportedBlit(
+                        "affine sampling of multisampled images is not implemented",
+                    ));
+                }
+                let fixed_to_float = |value: u64| (value as f64 / 4294967296.0) as f32;
+                GpuCommand::Blit(
+                    nixe_gpu::BlitOperation::new(
+                        region(0, source)?,
+                        region(1, destination)?,
+                        [
+                            source.description().format(),
+                            destination.description().format(),
+                        ],
+                        filter,
+                    )
+                    .and_then(|blit| {
+                        blit.with_sampling(first.map(fixed_to_float), step.map(fixed_to_float))
+                    })
+                    .map_err(MaxwellLoweringError::Command)?,
                 )
-                .map_err(MaxwellLoweringError::Command)?,
-            ),
-            super::super::twod::blit::BlitKind::Copy { origins, extent } => {
+            }
+            super::super::twod::blit::BlitKind::Downsample2x { filter } => {
+                if source.description().samples() == nixe_gpu::SampleCount::One {
+                    GpuCommand::Blit(
+                        nixe_gpu::BlitOperation::new(
+                            region(0, source)?,
+                            region(1, destination)?,
+                            [
+                                source.description().format(),
+                                destination.description().format(),
+                            ],
+                            filter,
+                        )
+                        .map_err(MaxwellLoweringError::Command)?,
+                    )
+                } else {
+                    if source.description().format() != destination.description().format() {
+                        return Err(MaxwellLoweringError::UnsupportedBlit(
+                            "multisample resolve with format conversion requires a conversion pass",
+                        ));
+                    }
+                    if filter != nixe_gpu::BlitFilter::Linear {
+                        return Err(MaxwellLoweringError::UnsupportedBlit(
+                            "point sampling of a multisampled 2D source is not implemented",
+                        ));
+                    }
+                    GpuCommand::Resolve(
+                        nixe_gpu::ResolveOperation::new(
+                            region(0, source)?,
+                            region(1, destination)?,
+                            source.description().format(),
+                            source.description().samples(),
+                        )
+                        .map_err(MaxwellLoweringError::Command)?,
+                    )
+                }
+            }
+            super::super::twod::blit::BlitKind::Copy { origins, extent }
+            | super::super::twod::blit::BlitKind::Convert { origins, extent } => {
                 let mut src = region(0, source)?;
                 let mut dst = region(1, destination)?;
                 src.origin = origins[0];
@@ -155,18 +221,83 @@ impl MaxwellLoweringCache {
                         dst.origin.y + extent.height,
                     ],
                 );
-                GpuCommand::Copy(nixe_gpu::CopyOperation::ImageToImage {
-                    source: src,
-                    destination: dst,
-                })
+                if let ViewMaterialization::CompressedDepthStencil { .. } = record.materialization {
+                    for regions in &mut record.uninitialized_depth_stencil_regions {
+                        subtract_initialized_rect(
+                            regions,
+                            [
+                                dst.origin.x,
+                                dst.origin.y,
+                                dst.origin.x + extent.width,
+                                dst.origin.y + extent.height,
+                            ],
+                        );
+                    }
+                    record.materialization = ViewMaterialization::CompressedDepthStencil {
+                        depth: record.uninitialized_depth_stencil_regions[0].is_empty(),
+                        stencil: record.uninitialized_depth_stencil_regions[1].is_empty(),
+                    };
+                }
+                if matches!(
+                    request.kind,
+                    super::super::twod::blit::BlitKind::Convert { .. }
+                ) {
+                    GpuCommand::Blit(
+                        nixe_gpu::BlitOperation::new(
+                            src,
+                            dst,
+                            [
+                                source.description().format(),
+                                destination.description().format(),
+                            ],
+                            nixe_gpu::BlitFilter::Point,
+                        )
+                        .map_err(MaxwellLoweringError::Command)?,
+                    )
+                } else {
+                    GpuCommand::Copy(nixe_gpu::CopyOperation::ImageToImage {
+                        source: src,
+                        destination: dst,
+                    })
+                }
             }
         };
+        if matches!(
+            request.kind,
+            super::super::twod::blit::BlitKind::Downsample2x { .. }
+                | super::super::twod::blit::BlitKind::Scale { .. }
+        ) {
+            let dependency =
+                ResourceDependency::Image(image_dependency(binding_at(resources, &bindings, 1)?)?);
+            let record = self
+                .views
+                .iter_mut()
+                .find(|record| record.dependency == dependency)
+                .expect("prepared blit destination");
+            record.uninitialized_color_regions.clear();
+            for regions in &mut record.uninitialized_depth_stencil_regions {
+                regions.clear();
+            }
+            if matches!(
+                record.materialization,
+                ViewMaterialization::CompressedDepthStencil { .. }
+            ) {
+                record.materialization = ViewMaterialization::CompressedDepthStencil {
+                    depth: true,
+                    stencil: true,
+                };
+            }
+        }
         record_image_write(destination, self);
-        if request.kind == super::super::twod::blit::BlitKind::Resolve
-            || self.views.iter().any(|record| {
+        if destination.description().kind() == nixe_gpu::ImageKind::Color
+            && (matches!(
+                request.kind,
+                super::super::twod::blit::BlitKind::Downsample2x { .. }
+                    | super::super::twod::blit::BlitKind::Scale { .. }
+            ) || self.views.iter().any(|record| {
                 record.remains_current_for_image(destination)
                     && record.uninitialized_color_regions.is_empty()
-            })
+            }))
         {
             record_color_materialization(destination, self);
         }
@@ -366,6 +497,81 @@ mod depth_rect_tests {
             &cache,
         )
         .unwrap();
+        let destination = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+        let dst = space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(2),
+                backing: destination
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: 0x10000,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0x51,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap()
+            .offset()
+            .get();
+        let mut copy = super::super::super::twod::MaxwellTwoDBlitOperation {
+            source,
+            images: [
+                request.destination,
+                BlitSurface {
+                    address: dst,
+                    ..request.destination
+                },
+            ],
+            destination_compression: true,
+            kind: super::super::super::twod::blit::BlitKind::Copy {
+                origins: [ImageOrigin { x: 0, y: 0, z: 0 }; 2],
+                extent: nixe_gpu::ImageExtent {
+                    width: 16,
+                    height: 16,
+                    depth: 1,
+                },
+            },
+        };
+        for (serial, x) in [(3, 0), (4, 16)] {
+            if let super::super::super::twod::blit::BlitKind::Copy { origins, .. } = &mut copy.kind
+            {
+                origins[0].x = x;
+                origins[1].x = x;
+            }
+            let resources = cache
+                .resolved_resources_mut()
+                .resolve_color_images(&copy, &space, 16)
+                .unwrap();
+            let work = cache
+                .lower_color_blit(&copy, &resources, FrontendSubmissionId::new(serial), vec![])
+                .unwrap();
+            let target = work
+                .submission()
+                .operations()
+                .iter()
+                .find_map(|op| match op.command() {
+                    GpuCommand::Copy(nixe_gpu::CopyOperation::ImageToImage {
+                        destination, ..
+                    }) => Some(destination.image),
+                    _ => None,
+                })
+                .unwrap();
+            let record = cache
+                .views
+                .iter()
+                .find(|r| r.dependency == ResourceDependency::Image(target))
+                .unwrap();
+            assert_eq!(
+                record.materialization,
+                ViewMaterialization::CompressedDepthStencil {
+                    depth: x == 16,
+                    stencil: x == 16
+                }
+            );
+        }
         storage.write(0, &[0; 4]).unwrap();
         assert!(matches!(
             validate_compressed_depth_materialization(

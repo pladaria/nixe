@@ -121,6 +121,11 @@ struct GpuFrontendWork {
     reason = "retained deliveries are bounded by shared permits"
 )]
 enum GpuFrontendMessage {
+    ConvertNv12 {
+        images: Box<[nixe_gpu::ConversionImage; 3]>,
+        transform: nixe_gpu::Nv12ColorTransform,
+        reply: mpsc::SyncSender<Result<(), Box<str>>>,
+    },
     Submission(GpuFrontendWork),
     PresentImage {
         request: PresentationImageRequest,
@@ -309,6 +314,10 @@ impl Drop for GpuFrontendPermit {
     reason = "submission packets are already bounded and boxing adds one allocation per ioctl"
 )]
 enum GpuExecutorMessage {
+    ConvertedWork {
+        work: Box<nixe_gpu_maxwell::MaxwellLoweredWork>,
+        reply: mpsc::SyncSender<Result<(), Box<str>>>,
+    },
     Submission(GpuWork),
     Append {
         frontend: FrontendSubmissionId,
@@ -454,8 +463,16 @@ impl NvDrvGpuExecutor {
                 let mut cache = MaxwellLoweringCache::new(configuration);
                 while let Ok(message) = frontend_receiver.recv() {
                     if frontend_stop.load(Ordering::Acquire) || frontend_budget.is_stopped() {
-                        if let GpuFrontendMessage::PresentImage { reply, .. } = message {
-                            let _ = reply.send(Err("GPU frontend owner is shutting down".into()));
+                        match message {
+                            GpuFrontendMessage::PresentImage { reply, .. } => {
+                                let _ =
+                                    reply.send(Err("GPU frontend owner is shutting down".into()));
+                            }
+                            GpuFrontendMessage::ConvertNv12 { reply, .. } => {
+                                let _ =
+                                    reply.send(Err("GPU frontend owner is shutting down".into()));
+                            }
+                            _ => {}
                         }
                         continue;
                     }
@@ -463,9 +480,35 @@ impl NvDrvGpuExecutor {
                         GpuFrontendMessage::Submission(work) => {
                             work.submission.dispatch.scheduled().frontend()
                         }
-                        GpuFrontendMessage::PresentImage { .. } => FrontendSubmissionId::new(0),
+                        GpuFrontendMessage::PresentImage { .. }
+                        | GpuFrontendMessage::ConvertNv12 { .. } => FrontendSubmissionId::new(0),
                     };
                     let result = match message {
+                        GpuFrontendMessage::ConvertNv12 {
+                            images,
+                            transform,
+                            reply,
+                        } => match cache.lower_nv12_conversion(*images, transform) {
+                            Ok(work) => backend_sender
+                                .send(GpuExecutorMessage::ConvertedWork {
+                                    work: Box::new(work),
+                                    reply,
+                                })
+                                .map_err(|_| GpuExecutorFailure {
+                                    frontend,
+                                    boundary: None,
+                                    detail: "GPU owner stopped before image conversion".into(),
+                                }),
+                            Err(error) => {
+                                let detail = error.to_string().into_boxed_str();
+                                let _ = reply.send(Err(detail.clone()));
+                                Err(GpuExecutorFailure {
+                                    frontend,
+                                    boundary: None,
+                                    detail,
+                                })
+                            }
+                        },
                         GpuFrontendMessage::Submission(work) => {
                             stream_gpu_work(work, &mut cache, &backend_sender)
                         }
@@ -553,6 +596,34 @@ impl NvDrvGpuExecutor {
             Some(failure) => Err(failure),
             None => Ok(()),
         }
+    }
+
+    /// Host1x completes its syncpoint only after the real GPU conversion. The
+    /// result remains device-owned; this acknowledgement never reads pixels.
+    pub(super) fn convert_nv12(
+        &self,
+        images: [nixe_gpu::ConversionImage; 3],
+        transform: nixe_gpu::Nv12ColorTransform,
+    ) -> Result<(), String> {
+        self.require_healthy().map_err(|e| e.to_string())?;
+        let sender = self
+            .frontend_sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or("GPU frontend is torn down")?;
+        let (reply, result) = mpsc::sync_channel(1);
+        sender
+            .send(GpuFrontendMessage::ConvertNv12 {
+                images: Box::new(images),
+                transform,
+                reply,
+            })
+            .map_err(|_| "GPU frontend stopped before conversion")?;
+        result
+            .recv()
+            .map_err(|_| "GPU conversion reply was lost")?
+            .map_err(|e| e.to_string())
     }
 
     pub(super) fn request_progress(&self) -> Result<(), GpuExecutorFailure> {
@@ -822,6 +893,44 @@ fn run_gpu_owner(
 
         let message = receiver.recv();
         match message {
+            Ok(GpuExecutorMessage::ConvertedWork { work, reply }) => {
+                let result = (|| -> Result<(), GpuExecutorFailure> {
+                    let runtime = backend.as_deref_mut().ok_or_else(|| {
+                        owner_failure(&works, "image conversion requires an accelerated backend")
+                    })?;
+                    let token = runtime
+                        .submit(
+                            work.resource_creations(),
+                            work.resource_invalidations(),
+                            work.submission(),
+                        )
+                        .map_err(|e| owner_failure(&works, e.to_string()))?;
+                    loop {
+                        let completion = backend
+                            .as_deref_mut()
+                            .unwrap()
+                            .wait_for_completion()
+                            .map_err(|e| owner_failure(&works, e.to_string()))?
+                            .ok_or_else(|| {
+                                owner_failure(&works, "GPU conversion completion was lost")
+                            })?;
+                        if completion.submission() == token {
+                            break;
+                        }
+                        // Earlier Maxwell segments share the same host timeline.
+                        // Their completions still advance their real guest fences.
+                        complete_backend_segment(&mut works, backend, completion, true)?;
+                    }
+                    Ok(())
+                })();
+                let _ = reply.send(
+                    result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|e| e.to_string().into_boxed_str()),
+                );
+                result?;
+            }
             Ok(GpuExecutorMessage::Submission(work)) if !budget.is_stopped() => {
                 works.push_back(work);
             }

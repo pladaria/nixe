@@ -319,6 +319,7 @@ impl RunnableProcess {
         request: &ThreadCreateRequest,
     ) -> Result<ThreadCreation, ThreadCreateError> {
         if !self.memory_accounting.can_commit_normal_memory(TLS_SIZE) {
+            log::debug!("thread TLS allocation exceeds process physical memory limit");
             return Err(ThreadCreateError::ResourceLimit);
         }
         let recycled_tls = self.free_thread_tls.pop_first();
@@ -330,6 +331,10 @@ impl RunnableProcess {
                 .ok_or(ThreadCreateError::ResourceLimit)?,
         };
         if tls_base.get() < self.memory_layout.stack().base().get() {
+            log::debug!(
+                "thread TLS allocation exhausted stack region: tls={tls_base:?} stack={:?}",
+                self.memory_layout.stack()
+            );
             return Err(ThreadCreateError::ResourceLimit);
         }
         self.resize_memory_mapping(
@@ -339,11 +344,15 @@ impl RunnableProcess {
             MemoryPermissions::READ_WRITE,
             MemoryMappingPurpose::ThreadLocal,
         )
-        .map_err(|_| ThreadCreateError::ResourceLimit)?;
+        .map_err(|error| {
+            log::debug!("thread TLS mapping failed: tls={tls_base:?} error={error:?}");
+            ThreadCreateError::ResourceLimit
+        })?;
         let object = crate::ThreadObject::new(id.get());
         let handle = match self.handles.insert(object.clone()) {
             Ok(handle) => handle,
-            Err(_) => {
+            Err(error) => {
+                log::debug!("thread handle allocation failed: {error}");
                 self.rollback_thread_tls(tls_base);
                 if recycled_tls.is_some() {
                     self.free_thread_tls.insert(tls_base);

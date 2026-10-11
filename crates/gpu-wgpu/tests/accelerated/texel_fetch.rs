@@ -6,6 +6,54 @@ use nixe_gpu::{
 
 #[test]
 fn rgba16_texel_fetch_preserves_coordinates_mip_and_hdr_without_sampler() {
+    let halves: [u16; 16] = [
+        0x4000, 0xbc00, 0x3800, 0x3c00, 0, 0x3c00, 0, 0x3800, 0x3c00, 0, 0x4000, 0, 0x3800, 0x4000,
+        0xbc00, 0x3c00,
+    ];
+    texel_fetch(
+        wgpu::TextureFormat::Rgba16Float,
+        &halves
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+        [
+            2.0, -1.0, 0.5, 1.0, 0.0, 1.0, 0.0, 0.5, 1.0, 0.0, 2.0, 0.0, 0.5, 2.0, -1.0, 1.0,
+        ],
+    );
+}
+
+#[test]
+fn packed_float_texel_fetch_preserves_hdr_mantissas_and_supplies_alpha_one() {
+    let words: [u32; 4] = [
+        0x400 | (0x3c0 << 11) | (0x1c0 << 22),
+        0x3c1 | (0x3c2 << 11) | (0x1e1 << 22),
+        0x3c0 | (0x240 << 22),
+        0x380 | (0x400 << 11),
+    ];
+    texel_fetch(
+        wgpu::TextureFormat::Rg11b10Ufloat,
+        &words
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+        [
+            2.0, 1.0, 0.5, 1.0, 1.015625, 1.03125, 1.03125, 1.0, 1.0, 0.0, 8.0, 1.0, 0.5, 2.0, 0.0,
+            1.0,
+        ],
+    );
+}
+
+#[test]
+fn depth_texel_fetch_replicates_normalized_depth_and_forces_alpha_one() {
+    texel_fetch(
+        wgpu::TextureFormat::Depth24PlusStencil8,
+        &[],
+        [0.375, 0.375, 0.375, 1.0].repeat(4).try_into().unwrap(),
+    );
+}
+
+fn texel_fetch(format: wgpu::TextureFormat, pixels: &[u8], expected: [f32; 16]) {
+    let depth = format == wgpu::TextureFormat::Depth24PlusStencil8;
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
         BackendInstanceId::new(740),
@@ -66,7 +114,19 @@ fn rgba16_texel_fetch_preserves_coordinates_mip_and_hdr_without_sampler() {
         ShaderStage::Fragment,
         interface(ShaderIoLocation::Position, 2),
         interface(ShaderIoLocation::Color(0), 4),
-        vec![ShaderResourceAccess::new(0, ShaderResourceKind::SampledImage, true, false).unwrap()],
+        vec![
+            ShaderResourceAccess::new(
+                0,
+                if depth {
+                    ShaderResourceKind::SampledDepthImage
+                } else {
+                    ShaderResourceKind::SampledImage
+                },
+                true,
+                false,
+            )
+            .unwrap(),
+        ],
         instructions,
     ))
     .unwrap();
@@ -113,8 +173,14 @@ fn rgba16_texel_fetch_preserves_coordinates_mip_and_hdr_without_sampler() {
         mip_level_count: 2,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | if depth {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            } else {
+                wgpu::TextureUsages::empty()
+            },
         view_formats: &[],
     });
     let extent = wgpu::Extent3d {
@@ -122,30 +188,54 @@ fn rgba16_texel_fetch_preserves_coordinates_mip_and_hdr_without_sampler() {
         height: 2,
         depth_or_array_layers: 1,
     };
-    let halves: [u16; 16] = [
-        0x4000, 0xbc00, 0x3800, 0x3c00, 0, 0x3c00, 0, 0x3800, 0x3c00, 0, 0x4000, 0, 0x3800, 0x4000,
-        0xbc00, 0x3c00,
-    ];
-    let expected = [
-        2.0_f32, -1.0, 0.5, 1.0, 0.0, 1.0, 0.0, 0.5, 1.0, 0.0, 2.0, 0.0, 0.5, 2.0, -1.0, 1.0,
-    ];
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            mip_level: 1,
-            ..texture.as_image_copy()
+    if !depth {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                mip_level: 1,
+                ..texture.as_image_copy()
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pixels.len() as u32 / 2),
+                rows_per_image: None,
+            },
+            extent,
+        );
+    } else {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: 1,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.375),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(17),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                }),
+                ..Default::default()
+            });
+        }
+        queue.submit([encoder.finish()]);
+    }
+    let input_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        aspect: if depth {
+            wgpu::TextureAspect::DepthOnly
+        } else {
+            wgpu::TextureAspect::All
         },
-        &halves
-            .into_iter()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>(),
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(16),
-            rows_per_image: None,
-        },
-        extent,
-    );
-    let input_view = texture.create_view(&Default::default());
+        ..Default::default()
+    });
     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
@@ -211,10 +301,14 @@ fn rgba16_texel_fetch_preserves_coordinates_mip_and_hdr_without_sampler() {
     let bytes = readback.get_mapped_range(..).unwrap();
     for (row, expected) in bytes.chunks_exact(256).zip(expected.chunks_exact(8)) {
         for (actual, expected) in row[..32].chunks_exact(4).zip(expected) {
-            assert_eq!(
-                u32::from_le_bytes(actual.try_into().unwrap()),
-                expected.to_bits()
-            );
+            let actual = u32::from_le_bytes(actual.try_into().unwrap());
+            if depth {
+                // D24 storage may quantize the clear by one normalized step;
+                // hosts that back Depth24PlusStencil8 with D32 retain it exactly.
+                assert!((f32::from_bits(actual) - expected).abs() <= 1.0 / 0x00ff_ffff_u32 as f32);
+            } else {
+                assert_eq!(actual, expected.to_bits());
+            }
         }
     }
 }

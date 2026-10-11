@@ -118,13 +118,22 @@ impl BktrPatch {
 
         let subsection_entries = parse_subsection_table(update.storage(), info)?;
         let subsection_end = bucket_end(update.storage(), info.aes_ctr_ex_offset())?;
-        if subsection_end != info.aes_ctr_ex_offset() {
+        // The bucket tree advertises the encrypted data domain, not the table's
+        // file offset. It may end at the patch payload, leaving relocation
+        // metadata in the ordinary CTR view. Atmosphere bounds reads by the
+        // tree's offsets independently of the backing substorage size:
+        // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libstratosphere/source/fssystem/fssystem_aes_ctr_counter_extended_storage.cpp
+        if subsection_end < info.indirect_offset() || subsection_end > info.aes_ctr_ex_offset() {
             return Err(LoadError::invalid(
                 FORMAT,
-                "subsection tree does not cover its advertised physical domain",
+                format!(
+                    "subsection tree end {subsection_end:#x} is outside the patch-data and metadata bounds {:#x}..={:#x}",
+                    info.indirect_offset(),
+                    info.aes_ctr_ex_offset(),
+                ),
             ));
         }
-        validate_subsections(&subsection_entries, info.aes_ctr_ex_offset())?;
+        validate_subsections(&subsection_entries, subsection_end)?;
         let patch_data: StorageRef = Arc::new(AesCtrExStorage {
             parent: crypto.raw_storage.clone(),
             len: info.indirect_offset(),
@@ -917,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn composes_synthetic_ncas_and_reuses_romfs_loader() {
+    fn composes_romfs_with_payload_and_metadata_subsection_domains() {
         let base_romfs = build_romfs(&[
             ("keep", b"same"),
             ("replace", b"old!"),
@@ -967,43 +976,58 @@ mod tests {
             final_romfs.len() as u64,
         );
         let aes_offset = indirect_offset + indirect_table.len();
-        let subsection_table = build_bucket_table(
-            &[subsection_entry(0, false, 0)],
-            SUBSECTION_ENTRY_SIZE as usize,
-            aes_offset as u64,
-        );
-        let mut patch_section = vec![0_u8; aes_offset + subsection_table.len()];
-        patch_section[..final_romfs.len()].copy_from_slice(&final_romfs);
-        patch_section[indirect_offset..indirect_offset + indirect_table.len()]
-            .copy_from_slice(&indirect_table);
-        patch_section[aes_offset..].copy_from_slice(&subsection_table);
+        for subsection_end in [
+            indirect_offset - AES_BLOCK_SIZE as usize,
+            indirect_offset,
+            aes_offset,
+            aes_offset + AES_BLOCK_SIZE as usize,
+        ] {
+            let subsection_table = build_bucket_table(
+                &[subsection_entry(0, false, 0)],
+                SUBSECTION_ENTRY_SIZE as usize,
+                subsection_end as u64,
+            );
+            let mut patch_section = vec![0_u8; aes_offset + subsection_table.len()];
+            patch_section[..final_romfs.len()].copy_from_slice(&final_romfs);
+            patch_section[indirect_offset..indirect_offset + indirect_table.len()]
+                .copy_from_slice(&indirect_table);
+            patch_section[aes_offset..].copy_from_slice(&subsection_table);
 
-        let mut patch_fs = [0_u8; 0x200];
-        patch_fs[3] = 3;
-        patch_fs[4] = 4;
-        ivfc_header(&mut patch_fs, final_romfs.len() as u64);
-        put_u64(&mut patch_fs, 0x100, indirect_offset as u64);
-        put_u64(&mut patch_fs, 0x108, indirect_table.len() as u64);
-        write_bucket_header(&mut patch_fs[0x110..0x120], relocations.len() as u32);
-        put_u64(&mut patch_fs, 0x120, aes_offset as u64);
-        put_u64(&mut patch_fs, 0x128, subsection_table.len() as u64);
-        write_bucket_header(&mut patch_fs[0x130..0x140], 1);
-        let patch = load_nca(build_nca(patch_section, patch_fs));
+            let mut patch_fs = [0_u8; 0x200];
+            patch_fs[3] = 3;
+            patch_fs[4] = 4;
+            ivfc_header(&mut patch_fs, final_romfs.len() as u64);
+            put_u64(&mut patch_fs, 0x100, indirect_offset as u64);
+            put_u64(&mut patch_fs, 0x108, indirect_table.len() as u64);
+            write_bucket_header(&mut patch_fs[0x110..0x120], relocations.len() as u32);
+            put_u64(&mut patch_fs, 0x120, aes_offset as u64);
+            put_u64(&mut patch_fs, 0x128, subsection_table.len() as u64);
+            write_bucket_header(&mut patch_fs[0x130..0x140], 1);
+            let patch = load_nca(build_nca(patch_section, patch_fs));
 
-        let composed = BktrPatch::open(&base.sections()[0], &patch.sections()[0]).unwrap();
-        let archive = composed.load_romfs().unwrap();
-        assert!(archive.open("/keep").unwrap().is_some());
-        assert!(archive.open("/replace").unwrap().is_some());
-        assert!(archive.open("/addedxx").unwrap().is_some());
-        assert!(archive.open("/removed").unwrap().is_none());
-        let mut replacement = [0_u8; 4];
-        archive
-            .open("/replace")
-            .unwrap()
-            .unwrap()
-            .read_at(0, &mut replacement)
-            .unwrap();
-        assert_eq!(&replacement, b"new!");
+            let composed = BktrPatch::open(&base.sections()[0], &patch.sections()[0]);
+            if subsection_end < indirect_offset || subsection_end > aes_offset {
+                assert!(
+                    composed.is_err(),
+                    "accepted invalid domain {subsection_end:#x}"
+                );
+                continue;
+            }
+            let composed = composed.unwrap();
+            let archive = composed.load_romfs().unwrap();
+            assert!(archive.open("/keep").unwrap().is_some());
+            assert!(archive.open("/replace").unwrap().is_some());
+            assert!(archive.open("/addedxx").unwrap().is_some());
+            assert!(archive.open("/removed").unwrap().is_none());
+            let mut replacement = [0_u8; 4];
+            archive
+                .open("/replace")
+                .unwrap()
+                .unwrap()
+                .read_at(0, &mut replacement)
+                .unwrap();
+            assert_eq!(&replacement, b"new!");
+        }
     }
 
     #[test]

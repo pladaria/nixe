@@ -35,6 +35,15 @@ pub(super) fn decode(
             let descriptor = one_receive_buffer(hipc)?;
             let capacity = usize::try_from(descriptor.size)
                 .map_err(|_| IpcWireError::Malformed("file output buffer is too large"))?;
+            // VIDEO_PROBE_BEGIN
+            if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
+                if let SemanticIpcObject::ReadOnlyFile(file) = object {
+                    if file.path().contains(".webm") || requested > MAX_IPC_READ_BYTES {
+                        log::debug!("VIDEO_PROBE file-read: path={} offset={offset} request={requested} capacity={capacity} file-size={}", file.path(), file.size());
+                    }
+                }
+            }
+            // VIDEO_PROBE_END
             Ok(Some(IpcRequest::ReadFile {
                 offset,
                 size: requested.min(capacity).min(MAX_IPC_READ_BYTES),

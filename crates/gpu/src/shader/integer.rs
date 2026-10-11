@@ -53,17 +53,26 @@ pub(super) fn combine(compared: bool, accumulated: bool, op: ShaderPredicateSetO
 }
 
 pub(super) fn emit_wgsl(source: &mut String, operation: &ShaderOperation) {
-    let ShaderOperation::SetPredicateInteger32 {
-        destinations,
-        left,
-        right,
-        signed,
-        comparison,
-        accumulator,
-        set_operation,
-    } = operation
-    else {
-        unreachable!()
+    let (left, right, signed, comparison, accumulator, set_operation) = match operation {
+        ShaderOperation::SetPredicateInteger32 {
+            left,
+            right,
+            signed,
+            comparison,
+            accumulator,
+            set_operation,
+            ..
+        }
+        | ShaderOperation::CompareInteger32 {
+            left,
+            right,
+            signed,
+            comparison,
+            accumulator,
+            set_operation,
+            ..
+        } => (left, right, signed, comparison, accumulator, set_operation),
+        _ => unreachable!(),
     };
     let scalar = if *signed { "i32" } else { "u32" };
     let left = format!("bitcast<{scalar}>(registers[{}])", left.index());
@@ -95,13 +104,31 @@ pub(super) fn emit_wgsl(source: &mut String, operation: &ShaderOperation) {
         ShaderPredicateSetOperation::Or => "||",
         ShaderPredicateSetOperation::Xor => "!=",
     };
-    for (index, destination) in destinations.iter().enumerate() {
-        if let Some(destination) = destination {
-            let invert = if index == 0 { "" } else { "!" };
-            source.push_str(&format!(
-                "    predicates[{destination}] = ({invert}compared) {op} accumulated;\n"
-            ));
+    match operation {
+        ShaderOperation::CompareInteger32 {
+            destination,
+            float_result,
+            ..
+        } => source.push_str(&format!(
+            "    registers[{}] = select(0u, {}u, compared {op} accumulated);\n",
+            destination.index(),
+            if *float_result {
+                1.0_f32.to_bits()
+            } else {
+                u32::MAX
+            }
+        )),
+        ShaderOperation::SetPredicateInteger32 { destinations, .. } => {
+            for (index, destination) in destinations.iter().enumerate() {
+                if let Some(destination) = destination {
+                    let invert = if index == 0 { "" } else { "!" };
+                    source.push_str(&format!(
+                        "    predicates[{destination}] = ({invert}compared) {op} accumulated;\n"
+                    ));
+                }
+            }
         }
+        _ => unreachable!(),
     }
     source.push_str("  }\n");
 }

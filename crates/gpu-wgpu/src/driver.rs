@@ -45,8 +45,10 @@ use crate::{
     PIPELINE_CACHE_MAGIC, WgpuExecutionContext, WgpuQueueAccess, WgpuVisibilityCoordinator,
 };
 
+mod blit;
 mod color;
 mod compute;
+mod conversion;
 mod multisample;
 #[cfg(not(target_os = "macos"))]
 #[path = "native/vulkan/draw.rs"]
@@ -194,7 +196,7 @@ enum Resource {
     Pipeline {
         description: PipelineDescription,
         render: RenderPipelineCache,
-        compute: HashMap<BackendResourceHandle, compute::CachedComputePipeline>,
+        compute: HashMap<u128, compute::CachedComputePipeline>,
     },
     DescriptorTable {
         bindings: Box<[nixe_gpu::DescriptorTableBinding]>,
@@ -338,6 +340,8 @@ struct HostSubmission {
     completed: bool,
     #[cfg(not(target_os = "macos"))]
     native: Vec<native_draw::RetainedDraw>,
+    #[cfg(not(target_os = "macos"))]
+    native_blit_textures: Vec<Texture>,
 }
 
 struct EncodedSubmission {
@@ -345,6 +349,8 @@ struct EncodedSubmission {
     segments: Vec<wgpu::CommandBuffer>,
     #[cfg(not(target_os = "macos"))]
     native: Vec<native_draw::RetainedDraw>,
+    #[cfg(not(target_os = "macos"))]
+    native_blit_textures: Vec<Texture>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,10 +381,10 @@ struct TransferRange {
 const MAX_REUSABLE_READBACK_BUFFERS: usize = 8;
 const MAX_REUSABLE_READBACK_BYTES: u64 = 64 * 1024 * 1024;
 const UPLOAD_STAGING_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_UPLOAD_BYTES_PER_SUBMISSION: u64 = MAX_RESIDENT_RESOURCE_BYTES;
+const MAX_UPLOAD_BYTES_PER_SUBMISSION: u64 = 512 * 1024 * 1024;
 const MAX_DEVICE_WRITE_REGIONS: usize = 256;
 const MAX_RESIDENT_RESOURCE_COUNT: usize = 4_096;
-pub(super) const MAX_RESIDENT_RESOURCE_BYTES: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_RESIDENT_RESOURCE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 impl ResourceContent {
     fn new(info: &BackendResourceCreateInfo) -> Result<Option<Self>, BackendDriverError> {
@@ -480,7 +486,13 @@ impl RenderPipelineKey {
             fragment,
             topology: draw.prepared.topology,
             triangle_rasterization: draw.prepared.triangle_rasterization,
-            viewport_y_flip: viewport_y_flip(draw.prepared.viewport_transform),
+            viewport_y_flip: draw.prepared.vertex_position_transform.is_some()
+                || viewport_y_flip(draw.prepared.viewport_transform),
+            vertex_position_transform: draw.prepared.vertex_position_transform,
+            fragment_depth_transform: draw
+                .prepared
+                .viewport_transform
+                .and_then(|v| v.fragment_depth_transform()),
             depth_clip_negative_one_to_one: draw
                 .prepared
                 .viewport_transform
@@ -493,6 +505,7 @@ impl RenderPipelineKey {
             depth_format,
             samples,
             depth_state: draw.prepared.depth_state,
+            stencil_state: draw.prepared.stencil_state,
             vertex_buffers: draw
                 .prepared
                 .vertex_buffers
@@ -507,12 +520,20 @@ impl RenderPipelineKey {
             && self.fragment == location.fragment
             && self.topology == draw.prepared.topology
             && self.triangle_rasterization == draw.prepared.triangle_rasterization
-            && self.viewport_y_flip == viewport_y_flip(draw.prepared.viewport_transform)
+            && self.vertex_position_transform == draw.prepared.vertex_position_transform
+            && self.viewport_y_flip
+                == (draw.prepared.vertex_position_transform.is_some()
+                    || viewport_y_flip(draw.prepared.viewport_transform))
             && self.depth_clip_negative_one_to_one
                 == draw
                     .prepared
                     .viewport_transform
                     .is_some_and(|t| t.depth_clip_negative_one_to_one())
+            && self.fragment_depth_transform
+                == draw
+                    .prepared
+                    .viewport_transform
+                    .and_then(|v| v.fragment_depth_transform())
             && self.front_face == draw.prepared.front_face
             && self.cull_mode == draw.prepared.cull_mode
             && self.alpha_test == draw.prepared.alpha_test
@@ -523,6 +544,7 @@ impl RenderPipelineKey {
             && self.depth_format == location.depth_format
             && self.samples == location.samples
             && self.depth_state == draw.prepared.depth_state
+            && self.stencil_state == draw.prepared.stencil_state
             && self.vertex_buffers.len() == draw.prepared.vertex_buffers.len()
             && self
                 .vertex_buffers
@@ -534,7 +556,9 @@ impl RenderPipelineKey {
 
 struct RenderPipelineFingerprintInput<'a> {
     viewport_y_flip: bool,
+    vertex_position_transform: Option<nixe_gpu::VertexPositionTransform>,
     depth_clip_negative_one_to_one: bool,
+    fragment_depth_transform: Option<nixe_gpu::FragmentDepthTransform>,
     front_face: nixe_gpu::FrontFace,
     cull_mode: nixe_gpu::CullMode,
     color_outputs: [nixe_gpu::ColorOutputState; MAX_COLOR_ATTACHMENTS],
@@ -548,6 +572,7 @@ struct RenderPipelineFingerprintInput<'a> {
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
     depth_state: DepthState,
+    stencil_state: Option<nixe_gpu::StencilTestState>,
     vertex_buffers: &'a [VertexBufferLayout],
 }
 
@@ -558,7 +583,9 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.topology.hash(state);
         self.triangle_rasterization.hash(state);
         self.viewport_y_flip.hash(state);
+        self.vertex_position_transform.hash(state);
         self.depth_clip_negative_one_to_one.hash(state);
+        self.fragment_depth_transform.hash(state);
         self.front_face.hash(state);
         self.cull_mode.hash(state);
         self.alpha_test.hash(state);
@@ -572,6 +599,7 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.depth_format.hash(state);
         self.samples.hash(state);
         self.depth_state.hash(state);
+        self.stencil_state.hash(state);
         self.vertex_buffers.len().hash(state);
         for layout in self.vertex_buffers {
             // Only flat quads pull native formats. Smooth quad pipelines must
@@ -599,7 +627,13 @@ fn render_pipeline_fingerprint(
     quad_flat: bool,
 ) -> u128 {
     nixe_gpu::cache_fingerprint(&RenderPipelineFingerprintInput {
-        viewport_y_flip: viewport_y_flip(draw.prepared.viewport_transform),
+        viewport_y_flip: draw.prepared.vertex_position_transform.is_some()
+            || viewport_y_flip(draw.prepared.viewport_transform),
+        vertex_position_transform: draw.prepared.vertex_position_transform,
+        fragment_depth_transform: draw
+            .prepared
+            .viewport_transform
+            .and_then(|v| v.fragment_depth_transform()),
         depth_clip_negative_one_to_one: draw
             .prepared
             .viewport_transform
@@ -617,6 +651,7 @@ fn render_pipeline_fingerprint(
         depth_format,
         samples,
         depth_state: draw.prepared.depth_state,
+        stencil_state: draw.prepared.stencil_state,
         vertex_buffers: &draw.prepared.vertex_buffers,
     })
 }
@@ -654,7 +689,9 @@ impl VertexPipelineLayoutKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RenderPipelineKey {
     viewport_y_flip: bool,
+    vertex_position_transform: Option<nixe_gpu::VertexPositionTransform>,
     depth_clip_negative_one_to_one: bool,
+    fragment_depth_transform: Option<nixe_gpu::FragmentDepthTransform>,
     front_face: nixe_gpu::FrontFace,
     cull_mode: nixe_gpu::CullMode,
     color_outputs: [nixe_gpu::ColorOutputState; MAX_COLOR_ATTACHMENTS],
@@ -667,13 +704,14 @@ struct RenderPipelineKey {
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
     depth_state: DepthState,
+    stencil_state: Option<nixe_gpu::StencilTestState>,
     vertex_buffers: Box<[VertexPipelineLayoutKey]>,
 }
 
 struct CachedRenderPipeline {
     vertex_fetch: VertexFetchPlan,
     identity: PreparedPipelineIdentity,
-    opaque_textures: crate::texture_sampling::OpaqueTextureBindings,
+    texture_swizzles: crate::texture_sampling::TextureSwizzles,
     // Collision evidence is debug-only; do not enlarge every resource slot.
     #[cfg(debug_assertions)]
     key: Box<RenderPipelineKey>,
@@ -711,7 +749,7 @@ impl PreparedPipelineIdentity {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RenderPipelineLocation {
     quad_flat: bool,
     pipeline: BackendResourceHandle,
@@ -721,7 +759,7 @@ struct RenderPipelineLocation {
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
     fingerprint: u128,
-    opaque_textures: crate::texture_sampling::OpaqueTextureBindings,
+    texture_swizzles: crate::texture_sampling::TextureSwizzles,
 }
 
 #[derive(Clone)]
@@ -789,7 +827,7 @@ impl RenderPipelineCache {
         depth_format: Option<ImageFormat>,
         samples: SampleCount,
         draw: &DrawOperation,
-    ) -> Option<(u128, crate::texture_sampling::OpaqueTextureBindings, bool)> {
+    ) -> Option<(u128, crate::texture_sampling::TextureSwizzles, bool)> {
         let current = self.current.as_ref()?;
         current
             .record
@@ -797,7 +835,7 @@ impl RenderPipelineCache {
             .matches(vertex, fragment, color_formats, depth_format, samples, draw)
             .then_some((
                 current.fingerprint,
-                current.record.opaque_textures,
+                current.record.texture_swizzles.clone(),
                 current.record.vertex_fetch.quad_flat,
             ))
     }
@@ -1255,6 +1293,8 @@ pub(crate) struct WgpuBackendDriver {
     presentation_imports: HashMap<PresentationImportKey, PresentationImport>,
     presentation_import_pipeline: Option<ComputePipeline>,
     partial_clear_pipelines: HashMap<PartialClearPipelineKey, RenderPipeline>,
+    blits: blit::BlitCache,
+    conversions: conversion::ConversionCache,
     partial_clear_parameters: PartialClearParameters,
     submissions: HashMap<BackendSubmissionToken, HostSubmission>,
     queued_commands: Vec<wgpu::CommandBuffer>,
@@ -1270,6 +1310,7 @@ pub(crate) struct WgpuBackendDriver {
     upload_rgb565: Vec<u8>,
     vertex_pull_binding_key: Vec<(u32, BackendResourceHandle)>,
     draw_bind_groups: Vec<Vec<BindGroup>>,
+    compatible_color_attachments: Vec<(usize, Texture)>,
     compute_bind_groups: Vec<BindGroup>,
     draw_pipelines: Vec<PreparedRenderPipeline>,
     primitive_indices: crate::primitive_indices::PrimitiveIndices,
@@ -1278,6 +1319,7 @@ pub(crate) struct WgpuBackendDriver {
     readback_pool_bytes: u64,
     resident_resources: usize,
     resident_resource_bytes: u64,
+    resident_resource_budget: u64,
     device_loss: Arc<Mutex<Option<Box<str>>>>,
     backend_error: Arc<Mutex<Option<Box<str>>>>,
     pipeline_cache: Option<PipelineCache>,
@@ -1324,6 +1366,14 @@ impl WgpuBackendDriver {
         let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
         let upload_staging = StagingBelt::new(device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         let partial_clear_parameters = PartialClearParameters::new(&device);
+        #[cfg(not(target_os = "macos"))]
+        let heap_budget = crate::native::vulkan::residency_budget(&device);
+        #[cfg(target_os = "macos")]
+        let heap_budget: Option<u64> = None;
+        let resident_resource_budget = heap_budget
+            .unwrap_or(512 * 1024 * 1024)
+            .min(MAX_RESIDENT_RESOURCE_BYTES);
+        log::debug!("GPU residency budget: {resident_resource_budget} bytes");
         Self {
             #[cfg(not(target_os = "macos"))]
             native: native_draw::NativeCache::new(native_vulkan),
@@ -1339,6 +1389,8 @@ impl WgpuBackendDriver {
             presentation_imports: HashMap::default(),
             presentation_import_pipeline: None,
             partial_clear_pipelines: HashMap::default(),
+            blits: blit::BlitCache::default(),
+            conversions: conversion::ConversionCache::default(),
             partial_clear_parameters,
             submissions: HashMap::default(),
             queued_commands: Vec::new(),
@@ -1354,6 +1406,7 @@ impl WgpuBackendDriver {
             upload_rgb565: Vec::new(),
             vertex_pull_binding_key: Vec::new(),
             draw_bind_groups: Vec::new(),
+            compatible_color_attachments: Vec::new(),
             compute_bind_groups: Vec::new(),
             draw_pipelines: Vec::new(),
             primitive_indices: crate::primitive_indices::PrimitiveIndices::default(),
@@ -1362,6 +1415,7 @@ impl WgpuBackendDriver {
             readback_pool_bytes: 0,
             resident_resources: 0,
             resident_resource_bytes: 0,
+            resident_resource_budget,
             device_loss,
             backend_error,
             pipeline_cache,
@@ -1403,7 +1457,10 @@ impl WgpuBackendDriver {
             if let Some(submission) = self.submissions.get_mut(&token) {
                 submission.completed = true;
                 #[cfg(not(target_os = "macos"))]
-                submission.native.clear();
+                {
+                    submission.native.clear();
+                    submission.native_blit_textures.clear();
+                }
             }
         }
     }
@@ -1456,6 +1513,7 @@ impl WgpuBackendDriver {
         self.upload_rgb565 = Vec::new();
         self.vertex_pull_binding_key = Vec::new();
         self.draw_bind_groups = Vec::new();
+        self.compatible_color_attachments.clear();
         self.compute_bind_groups = Vec::new();
         self.draw_pipelines = Vec::new();
         self.primitive_indices = crate::primitive_indices::PrimitiveIndices::default();
@@ -1572,7 +1630,10 @@ impl WgpuBackendDriver {
         let mut plans = Vec::<InputSnapshot>::new();
         let mut keys = HashMap::<InputSnapshotKey, usize>::default();
         for access in submission.access_plan().accesses() {
-            if !access.mode().reads() {
+            let first = &submission.operations()[access.first_operation()];
+            let conversion_overwrite = matches!(first.command(), GpuCommand::ConvertNv12(conversion)
+                if conversion.destination.target() == access.target());
+            if !access.mode().reads() && !conversion_overwrite {
                 continue;
             }
             let handle = dependencies.indexed(access.dependency_index());
@@ -1588,7 +1649,7 @@ impl WgpuBackendDriver {
                     let record = self.resource_record(handle)?;
                     let Resource::Image {
                         description,
-                        view: Some(_),
+                        view: Some(view),
                         ..
                     } = record.host.as_ref().ok_or_else(|| missing(handle))?
                     else {
@@ -1600,7 +1661,7 @@ impl WgpuBackendDriver {
                         {
                             image_region_is_full(*description, *target)?
                         } else {
-                            false
+                            conversion_overwrite
                         };
                     let content = record
                         .content
@@ -1618,6 +1679,18 @@ impl WgpuBackendDriver {
                         if (overwrite || content.initialized[index]) && dependency.remains_current()
                         {
                             continue;
+                        }
+                        if !view.has_canonical_texels() {
+                            if dependency.remains_current() {
+                                // The frontend supplies a resident producer; retaining
+                                // ownership does not make its opaque encoding importable.
+                                continue;
+                            }
+                            if !overwrite {
+                                return Err(unsupported(
+                                    "resident-only image storage was modified by the CPU and requires rematerialization",
+                                ));
+                            }
                         }
                         let bytes_per_block = description
                             .format()
@@ -1679,7 +1752,7 @@ impl WgpuBackendDriver {
             &requests,
             &mut |coordinator, request| {
                 if request.device == self.visibility.device() {
-                    self.materialize_cpu_page(request, true).map_err(|error| {
+                    self.materialize_cpu_page(request).map_err(|error| {
                         nixe_memory::VisibilityCoordinatorError::new(error.to_string())
                     })
                 } else {
@@ -1909,7 +1982,7 @@ impl WgpuBackendDriver {
                 if request.device == self.visibility.device() {
                     // Submission already prepared the page mirrors. Retain them
                     // for publication of this submission's subsequent GPU writes.
-                    self.materialize_cpu_page(request, true).map_err(|error| {
+                    self.materialize_cpu_page(request).map_err(|error| {
                         nixe_memory::VisibilityCoordinatorError::new(error.to_string())
                     })
                 } else {
@@ -2089,11 +2162,16 @@ impl WgpuBackendDriver {
         let mut segments = Vec::new();
         #[cfg(not(target_os = "macos"))]
         let mut native = Vec::new();
+        #[cfg(not(target_os = "macos"))]
+        let mut native_blit_textures = Vec::new();
         let operations = accepted.submission().operations();
         let mut index = 0;
         while index < operations.len() {
             match operations[index].command() {
                 GpuCommand::Copy(copy) => self.encode_copy(&mut encoder, dependencies, copy)?,
+                GpuCommand::ConvertNv12(conversion) => {
+                    self.encode_nv12_conversion(&mut encoder, dependencies, conversion)?
+                }
                 GpuCommand::UploadImage { destination, bytes } => {
                     let handle = dependency_handle(
                         dependencies,
@@ -2166,6 +2244,27 @@ impl WgpuBackendDriver {
                             Ok(())
                         },
                     )?;
+                }
+                GpuCommand::Blit(blit) => {
+                    if blit.formats[0].is_depth_stencil() {
+                        #[cfg(target_os = "macos")]
+                        return Err(unsupported("depth/stencil blit requires Vulkan"));
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let (raw, textures) =
+                                self.encode_depth_stencil_blit(&mut encoder, dependencies, blit)?;
+                            segments.push(encoder.finish());
+                            segments.push(raw);
+                            native_blit_textures.extend(textures);
+                            encoder =
+                                self.device
+                                    .create_command_encoder(&CommandEncoderDescriptor {
+                                        label: Some("Nixe resumed blit segment"),
+                                    });
+                        }
+                    } else {
+                        self.encode_blit(&mut encoder, dependencies, blit)?;
+                    }
                 }
                 GpuCommand::Resolve(resolve) => {
                     self.encode_resolve(&mut encoder, dependencies, resolve)?
@@ -2240,6 +2339,8 @@ impl WgpuBackendDriver {
             segments,
             #[cfg(not(target_os = "macos"))]
             native,
+            #[cfg(not(target_os = "macos"))]
+            native_blit_textures,
         })
     }
 
@@ -2376,16 +2477,17 @@ impl WgpuBackendDriver {
                 };
                 if source.image == destination.image
                     || source.extent != destination.extent
-                    || source_description.kind() != nixe_gpu::ImageKind::Color
-                    || destination_description.kind() != nixe_gpu::ImageKind::Color
+                    || source_description.kind() != destination_description.kind()
                     || source_description.dimension() != ImageDimension::Two
                     || destination_description.dimension() != ImageDimension::Two
-                    || source_description.format() != destination_description.format()
+                    || !source_description
+                        .format()
+                        .is_copy_compatible(destination_description.format())
                     || source_description.samples() != SampleCount::One
                     || destination_description.samples() != SampleCount::One
                 {
                     return Err(unsupported(
-                        "image copy requires distinct single-sample 2D color images of the same format",
+                        "image copy requires distinct single-sample 2D images of copy-compatible formats",
                     ));
                 }
                 image_region_is_full(*source_description, *source)?;
@@ -2883,6 +2985,109 @@ impl WgpuBackendDriver {
             width: render_width,
             height: render_height,
         };
+        let mut cropped_colors = Vec::new();
+        let mut color_slot = 0;
+        for (index, attachment) in attachments.iter().enumerate() {
+            let handle =
+                dependency_handle(dependencies, ResourceDependency::Image(attachment.image))?;
+            let Resource::Image {
+                texture,
+                description,
+                ..
+            } = self.resource(handle)?
+            else {
+                return Err(kind_mismatch(handle));
+            };
+            let extent = description
+                .mip_extent(attachment.subresources.mip_level)
+                .unwrap();
+            if extent.width != render_width || extent.height != render_height {
+                if attachment.kind != nixe_gpu::ImageKind::Color
+                    || attachment.samples != SampleCount::One
+                    || attachment.subresources.layer_count != 1
+                {
+                    return Err(unsupported(
+                        "unequal attachment sizes require a single-sample color crop",
+                    ));
+                }
+                let original = texture.clone();
+                let format = original.format();
+                let scratch = if let Some((_, texture)) = self
+                    .compatible_color_attachments
+                    .iter()
+                    .find(|(slot, texture)| {
+                        *slot == color_slot
+                            && texture.width() == render_width
+                            && texture.height() == render_height
+                            && texture.format() == format
+                    }) {
+                    texture.clone()
+                } else {
+                    let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Nixe compatible color attachment"),
+                        size: wgpu::Extent3d {
+                            width: render_width,
+                            height: render_height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::COPY_SRC
+                            | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    const COLOR_CROP_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+                    let bytes = |texture: &Texture| {
+                        u64::from(texture.width())
+                            * u64::from(texture.height())
+                            * u64::from(texture.format().block_copy_size(None).unwrap_or(16))
+                    };
+                    let needed = bytes(&texture);
+                    if needed <= COLOR_CROP_CACHE_BYTES {
+                        let mut retained: u64 = self
+                            .compatible_color_attachments
+                            .iter()
+                            .map(|(_, texture)| bytes(texture))
+                            .sum();
+                        while self.compatible_color_attachments.len() >= 32
+                            || retained + needed > COLOR_CROP_CACHE_BYTES
+                        {
+                            retained -= bytes(&self.compatible_color_attachments.remove(0).1);
+                        }
+                        self.compatible_color_attachments
+                            .push((color_slot, texture.clone()));
+                    }
+                    texture
+                };
+                let source = wgpu::TexelCopyTextureInfo {
+                    texture: &original,
+                    mip_level: u32::from(attachment.subresources.mip_level),
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: u32::from(attachment.subresources.base_layer),
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                };
+                let destination = scratch.as_image_copy();
+                let extent = wgpu::Extent3d {
+                    width: render_width,
+                    height: render_height,
+                    depth_or_array_layers: 1,
+                };
+                if attachment.load == AttachmentLoad::Load {
+                    encoder.copy_texture_to_texture(source, destination, extent);
+                }
+                views[index] = scratch.create_view(&Default::default());
+                cropped_colors.push((original, scratch, *attachment));
+            }
+            if attachment.kind == nixe_gpu::ImageKind::Color {
+                color_slot += 1;
+            }
+        }
         let mut draw_bind_groups = std::mem::take(&mut self.draw_bind_groups);
         {
             let mut color_attachments: [Option<RenderPassColorAttachment<'_>>;
@@ -2905,9 +3110,18 @@ impl WgpuBackendDriver {
             let depth_index = attachments
                 .iter()
                 .position(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil);
-            let depth_attachment = depth_index
-                .map(|index| depth_operations(&views[index], &attachments[index]))
-                .transpose()?;
+            let depth_attachment = depth_index.map(|index| {
+                let mut attachment = depth_operations(&views[index], &attachments[index])?;
+                // Draw tests can share the depth image with a texture only when
+                // neither aspect writes. None declares read-only aspect usage.
+                if attachments[index].load == AttachmentLoad::Load {
+                    if !operations[begin + 1..end].iter().any(|operation| matches!(operation.command(), GpuCommand::Draw(draw) if draw.prepared.depth_state.test_enabled && draw.prepared.depth_state.write_enabled)) {
+                        attachment.depth_ops = None;
+                    }
+                    attachment.stencil_ops = None; // Supported draws only compare stencil.
+                }
+                Ok::<_, BackendDriverError>(attachment)
+            }).transpose()?;
             let mut draw_count = 0;
             for operation in &operations[begin + 1..end] {
                 let GpuCommand::Draw(draw) = operation.command() else {
@@ -2948,6 +3162,9 @@ impl WgpuBackendDriver {
                     previous_scissor = scissor;
                 }
                 pass.set_pipeline(&draw_pipelines[draw_index].pipeline);
+                if let Some(stencil) = draw.prepared.stencil_state {
+                    pass.set_stencil_reference(u32::from(stencil.reference));
+                }
                 for (slot, layout) in draw.prepared.vertex_buffers.iter().enumerate() {
                     if draw_pipelines[draw_index].vertex_fetch.quad_flat
                         || !layout
@@ -3074,6 +3291,32 @@ impl WgpuBackendDriver {
             drop(pass);
         }
         self.render_attachment_views = views;
+        // Maxwell/Vulkan permit independently sized attachments. WebGPU
+        // requires equal extents: preserve the overlapping render area through
+        // resident color copies, leaving the original padding untouched.
+        // https://gpuweb.github.io/gpuweb/#render-pass-attachments
+        for (original, scratch, attachment) in cropped_colors {
+            if attachment.store == AttachmentStore::Store {
+                encoder.copy_texture_to_texture(
+                    scratch.as_image_copy(),
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &original,
+                        mip_level: u32::from(attachment.subresources.mip_level),
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: u32::from(attachment.subresources.base_layer),
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: render_width,
+                        height: render_height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
         for groups in &mut draw_bind_groups {
             groups.clear();
         }
@@ -3350,6 +3593,43 @@ impl WgpuBackendDriver {
         Ok(())
     }
 
+    fn sampled_swizzles(
+        &self,
+        dependencies: &ResolvedBackendResources,
+        tables: &[nixe_gpu::DescriptorTableId],
+    ) -> Result<crate::texture_sampling::TextureSwizzles, BackendDriverError> {
+        let mut mappings = Vec::new();
+        // Neutral shader resource bindings are all in group zero.
+        if let Some(table) = tables.first() {
+            let handle =
+                dependency_handle(dependencies, ResourceDependency::DescriptorTable(*table))?;
+            let Resource::DescriptorTable { bindings, .. } = self.resource(handle)? else {
+                return Err(kind_mismatch(handle));
+            };
+            for binding in bindings {
+                if let ResourceDependency::Image(image) = binding.resource {
+                    let image_handle =
+                        dependency_handle(dependencies, ResourceDependency::Image(image))?;
+                    let Resource::Image {
+                        description, view, ..
+                    } = self.resource(image_handle)?
+                    else {
+                        return Err(kind_mismatch(image_handle));
+                    };
+                    let mapping = crate::texture_sampling::TextureSwizzles::mapping(
+                        description.format(),
+                        view.as_ref()
+                            .map_or(nixe_gpu::Swizzle::IDENTITY, nixe_gpu::ImageView::swizzle),
+                    );
+                    if mapping != nixe_gpu::Swizzle::IDENTITY {
+                        mappings.push((binding.binding, mapping));
+                    }
+                }
+            }
+        }
+        Ok(crate::texture_sampling::TextureSwizzles::new(mappings))
+    }
+
     fn render_pipeline_location(
         &self,
         dependencies: &ResolvedBackendResources,
@@ -3394,31 +3674,10 @@ impl WgpuBackendDriver {
         };
         // Immutable prepared draws retain an O(1) pipeline fast path. Only a new
         // descriptor table needs its image formats examined, not its contents.
-        let (fingerprint, opaque_textures, quad_flat) = if let Some(cached) = cached {
+        let (fingerprint, texture_swizzles, quad_flat) = if let Some(cached) = cached {
             cached
         } else {
-            let mut opaque = crate::texture_sampling::OpaqueTextureBindings::default();
-            // Neutral shader resource bindings are all in group zero.
-            if let Some(table) = draw.prepared.descriptor_tables.first() {
-                let handle =
-                    dependency_handle(dependencies, ResourceDependency::DescriptorTable(*table))?;
-                let Resource::DescriptorTable { bindings, .. } = self.resource(handle)? else {
-                    return Err(kind_mismatch(handle));
-                };
-                for binding in bindings {
-                    if let ResourceDependency::Image(image) = binding.resource {
-                        let image_handle =
-                            dependency_handle(dependencies, ResourceDependency::Image(image))?;
-                        let Resource::Image { description, .. } = self.resource(image_handle)?
-                        else {
-                            return Err(kind_mismatch(image_handle));
-                        };
-                        if description.format().has_opaque_bc1_alpha() {
-                            opaque.insert(binding.binding);
-                        }
-                    }
-                }
-            }
+            let swizzles = self.sampled_swizzles(dependencies, &draw.prepared.descriptor_tables)?;
             let quad_flat = if draw.prepared.topology == PrimitiveTopology::Quads {
                 let Resource::Shader { neutral, .. } = self.resource(vertex)? else {
                     return Err(kind_mismatch(vertex));
@@ -3439,8 +3698,8 @@ impl WgpuBackendDriver {
                 quad_flat,
             );
             (
-                nixe_gpu::cache_fingerprint(&(base, opaque)),
-                opaque,
+                nixe_gpu::cache_fingerprint(&(base, &swizzles)),
+                swizzles,
                 quad_flat,
             )
         };
@@ -3453,7 +3712,7 @@ impl WgpuBackendDriver {
             depth_format,
             samples,
             fingerprint,
-            opaque_textures,
+            texture_swizzles,
         })
     }
 
@@ -3487,7 +3746,10 @@ impl WgpuBackendDriver {
                     .current
                     .as_mut()
                     .expect("touched pipeline is current");
-                debug_assert_eq!(current.record.opaque_textures, location.opaque_textures);
+                debug_assert_eq!(
+                    current.record.texture_swizzles.clone(),
+                    location.texture_swizzles
+                );
                 // Equivalent descriptor layouts can share a compiled pipeline.
                 // Remember the latest immutable draw for its next O(1) lookup.
                 if !Arc::ptr_eq(&current.record.identity.draw, &draw.prepared) {
@@ -3534,6 +3796,7 @@ impl WgpuBackendDriver {
                 "WGSL rasterization does not support shader point sizes",
             ));
         }
+
         let vertex_fetch = VertexFetchPlan::new(draw, &vertex_ir, location.quad_flat)?;
         if vertex_fetch.quad_flat
             && (!self.device.features().contains(wgpu::Features::IMMEDIATES)
@@ -3584,7 +3847,21 @@ impl WgpuBackendDriver {
                     } else {
                         CompareFunction::Always
                     }),
-                    stencil: StencilState::default(),
+                    stencil: draw.prepared.stencil_state.map_or_else(
+                        StencilState::default,
+                        |state| StencilState {
+                            front: wgpu::StencilFaceState {
+                                compare: compare_function(state.front_compare),
+                                ..Default::default()
+                            },
+                            back: wgpu::StencilFaceState {
+                                compare: compare_function(state.back_compare),
+                                ..Default::default()
+                            },
+                            read_mask: u32::from(state.read_mask),
+                            write_mask: 0,
+                        },
+                    ),
                     bias: wgpu::DepthBiasState::default(),
                 })
             })
@@ -3609,6 +3886,29 @@ impl WgpuBackendDriver {
             })
         } else {
             vertex
+        };
+        let fragment = if let Some(transform) = draw
+            .prepared
+            .viewport_transform
+            .and_then(|v| v.fragment_depth_transform())
+        {
+            let ir = fragment_ir
+                .ir()
+                .with_fragment_depth_transform(transform)
+                .map_err(|error| {
+                    BackendDriverError::failure(format!(
+                        "fragment depth specialization failed: {error}"
+                    ))
+                })?;
+            let module = nixe_gpu::lower_shader_ir_to_wgsl(&ir).map_err(|error| {
+                BackendDriverError::failure(format!("fragment depth lowering failed: {error}"))
+            })?;
+            self.device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("Nixe window depth shader"),
+                source: ShaderSource::Wgsl(module.source().into()),
+            })
+        } else {
+            fragment
         };
         let attribute_storage = draw
             .prepared
@@ -3646,8 +3946,31 @@ impl WgpuBackendDriver {
                 })
             })
             .collect::<Vec<_>>();
-        let mut vertex_constants = location.opaque_textures.constants(&vertex_ir);
-        if viewport_y_flip(draw.prepared.viewport_transform) {
+        let mut vertex_constants = location.texture_swizzles.constants(&vertex_ir);
+        if let Some(transform) = draw.prepared.vertex_position_transform {
+            vertex_constants.extend([
+                ("nixe_vertex_position_transform".to_owned(), 1.0),
+                (
+                    "nixe_position_scale_x".to_owned(),
+                    f64::from(transform.scale()[0]),
+                ),
+                (
+                    "nixe_position_scale_y".to_owned(),
+                    f64::from(transform.scale()[1]),
+                ),
+                (
+                    "nixe_position_offset_x".to_owned(),
+                    f64::from(transform.offset()[0]),
+                ),
+                (
+                    "nixe_position_offset_y".to_owned(),
+                    f64::from(transform.offset()[1]),
+                ),
+            ]);
+        }
+        if draw.prepared.vertex_position_transform.is_some()
+            || viewport_y_flip(draw.prepared.viewport_transform)
+        {
             vertex_constants.push(("nixe_viewport_y_flip".to_owned(), 1.0));
         }
         if draw
@@ -3657,7 +3980,7 @@ impl WgpuBackendDriver {
         {
             vertex_constants.push(("nixe_depth_negative_one_to_one".to_owned(), 1.0));
         }
-        let mut fragment_constants = location.opaque_textures.constants(&fragment_ir);
+        let mut fragment_constants = location.texture_swizzles.constants(&fragment_ir);
         if let Some(test) = draw.prepared.alpha_test {
             fragment_constants.push((
                 "nixe_alpha_reference".to_owned(),
@@ -3754,7 +4077,7 @@ impl WgpuBackendDriver {
             fingerprint,
             CachedRenderPipeline {
                 vertex_fetch,
-                opaque_textures: location.opaque_textures,
+                texture_swizzles: location.texture_swizzles.clone(),
                 identity: PreparedPipelineIdentity {
                     draw: Arc::clone(&draw.prepared),
                     vertex: vertex_handle,
@@ -3900,8 +4223,19 @@ impl WgpuBackendDriver {
             Resource::Image {
                 texture,
                 description,
+                view,
                 ..
-            } => (texture.clone(), *description),
+            } => {
+                if view
+                    .as_ref()
+                    .is_some_and(|view| !view.has_canonical_texels())
+                {
+                    return Err(unsupported(
+                        "CPU visibility of resident-only image storage requires its native encoding",
+                    ));
+                }
+                (texture.clone(), *description)
+            }
             _ => return Ok(()),
         };
         let domain = self
@@ -4183,6 +4517,64 @@ impl WgpuBackendDriver {
             .ok_or_else(|| missing(handle))
     }
 
+    /// Image bindings and bind groups are immutable. A write through another
+    /// canonical interpretation invalidates their texels, not their identity.
+    /// Only read-only direct replicas can be discarded here: producer/opaque
+    /// representations retain their existing demanded-writeback authority.
+    fn invalidate_read_only_image_aliases(
+        &mut self,
+        handle: BackendResourceHandle,
+        target: nixe_gpu::AccessTarget,
+    ) -> Result<(), BackendDriverError> {
+        let nixe_gpu::AccessTarget::Image { subresources, .. } = target else {
+            return Ok(());
+        };
+        let BackendResourceCreateInfo::Image {
+            view: Some(view), ..
+        } = &self.resource_record(handle)?.immutable
+        else {
+            return Ok(());
+        };
+        let written = view
+            .bindings()
+            .iter()
+            .filter(|binding| image_subresources_overlap(binding.subresources(), subresources))
+            .map(|binding| binding.backing().clone())
+            .collect::<Vec<_>>();
+        for slot in self.resources.iter_mut().flatten() {
+            if slot.handle == handle {
+                continue;
+            }
+            let BackendResourceCreateInfo::Image {
+                view: Some(view), ..
+            } = &slot.record.immutable
+            else {
+                continue;
+            };
+            if !view.has_canonical_texels() {
+                continue;
+            }
+            let Some(content) = slot.record.content.as_mut() else {
+                continue;
+            };
+            if content.has_device_writes() {
+                continue;
+            }
+            for (index, domain) in content.image_domains.iter().enumerate() {
+                if content.initialized[index]
+                    && written
+                        .iter()
+                        .any(|backing| backing.overlaps(view.bindings()[domain.binding].backing()))
+                {
+                    // The next access requests All canonical bytes, whose visibility
+                    // resolver waits for/readbacks the actual device producer.
+                    content.initialized[index] = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn index_presentable_image(
         &mut self,
         handle: BackendResourceHandle,
@@ -4295,6 +4687,7 @@ impl WgpuBackendDriver {
         let import_key = PresentationImportKey::from(&request);
         let device_owns_source =
             device_owns_presentation_source(&request, self.visibility.device());
+
         // CPU-write observers describe import freshness, not which producer
         // currently owns the bytes. Device authority selects direct export.
         if device_owns_source
@@ -4591,9 +4984,18 @@ impl WgpuBackendDriver {
                 description, view, ..
             } => {
                 let plan = if description.samples() == SampleCount::One {
-                    image_texture_plan(description.format(), view.is_some())?
+                    image_texture_plan(
+                        description.format(),
+                        view.as_ref()
+                            .is_some_and(|view| view.has_canonical_texels()),
+                    )?
                 } else {
-                    multisample::texture_plan(&self.device, *description, view.is_some())?
+                    multisample::texture_plan(
+                        &self.device,
+                        *description,
+                        view.as_ref()
+                            .is_some_and(|view| view.has_canonical_texels()),
+                    )?
                 };
                 Resource::Image {
                     texture: self.device.create_texture(&TextureDescriptor {
@@ -4668,7 +5070,7 @@ impl WgpuBackendDriver {
         additional_bytes: u64,
         protected: Option<&ResolvedBackendResources>,
     ) -> Result<(), BackendDriverError> {
-        if additional_bytes > MAX_RESIDENT_RESOURCE_BYTES {
+        if additional_bytes > self.resident_resource_budget {
             return Err(BackendDriverError::failure(
                 "one backend resource exceeds the residency budget",
             ));
@@ -4677,7 +5079,7 @@ impl WgpuBackendDriver {
             || self
                 .resident_resource_bytes
                 .checked_add(additional_bytes)
-                .is_none_or(|bytes| bytes > MAX_RESIDENT_RESOURCE_BYTES)
+                .is_none_or(|bytes| bytes > self.resident_resource_budget)
         {
             let resource_candidate = self
                 .resources
@@ -4718,9 +5120,17 @@ impl WgpuBackendDriver {
                 (Some(resource), None) => resource.1,
                 (None, Some(presentation)) => presentation.1,
                 (None, None) => {
-                    return Err(BackendDriverError::failure(
-                        "resident resource budget is exhausted by active device contents",
-                    ));
+                    return Err(BackendDriverError::failure(format!(
+                        "resident resource budget is exhausted by active device contents: bytes={} requested={additional_bytes} budget={} live={} retired={} retired-bytes={}",
+                        self.resident_resource_bytes,
+                        self.resident_resource_budget,
+                        self.resources.iter().flatten().count(),
+                        self.retired_resources.len(),
+                        self.retired_resources
+                            .values()
+                            .map(|record| record.resident_bytes)
+                            .sum::<u64>(),
+                    )));
                 }
             };
             match candidate {
@@ -4775,7 +5185,6 @@ impl WgpuBackendDriver {
     fn materialize_cpu_page(
         &mut self,
         request: CpuVisibilityRequest,
-        retain_mirror: bool,
     ) -> Result<Box<[u8]>, BackendDriverError> {
         self.flush_queued_commands();
         let mut demanded = Vec::new();
@@ -4836,12 +5245,9 @@ impl WgpuBackendDriver {
         self.visibility
             .mark_page_completed(request.page, request.visible_at)
             .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-        if retain_mirror {
-            self.visibility.copy_completed_page(request)
-        } else {
-            self.visibility.take_completed_page(request)
-        }
-        .map_err(|error| BackendDriverError::failure(error.to_string()))
+        self.visibility
+            .copy_completed_page(request)
+            .map_err(|error| BackendDriverError::failure(error.to_string()))
     }
 
     fn reclaim_cleared_retired_images(
@@ -4945,13 +5351,6 @@ impl BackendDriver for WgpuBackendDriver {
                 ));
             }
         }
-        if let BackendResourceCreateInfo::Image {
-            view: Some(view), ..
-        } = info
-            && view.swizzle() != nixe_gpu::Swizzle::IDENTITY
-        {
-            return Err(unsupported("non-identity image component swizzle"));
-        }
         if let BackendResourceCreateInfo::Sampler { description, .. } = info {
             if description
                 .address_modes
@@ -5014,6 +5413,10 @@ impl BackendDriver for WgpuBackendDriver {
         handle: BackendResourceHandle,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
+        self.blits.bindings.retain(|key, _| key.source != handle);
+        self.conversions
+            .bindings
+            .retain(|key, _| !key.sources.contains(&handle));
         if let Some(BackendResourceCreateInfo::Allocation { id, .. }) = self
             .resource_record(handle)
             .ok()
@@ -5068,6 +5471,8 @@ impl BackendDriver for WgpuBackendDriver {
             segments,
             #[cfg(not(target_os = "macos"))]
             native,
+            #[cfg(not(target_os = "macos"))]
+            native_blit_textures,
         } = self.encode_submission(accepted, dependencies, encoder)?;
         // Finish fallible write tracking and superseded-resource bookkeeping
         // before host acceptance. An error after queue.submit would otherwise
@@ -5082,6 +5487,7 @@ impl BackendDriver for WgpuBackendDriver {
                 access.target(),
                 use_serial,
             )?;
+            self.invalidate_read_only_image_aliases(handle, access.target())?;
             self.index_presentable_image(handle, access.target());
         }
         for operation in accepted.submission().operations() {
@@ -5099,6 +5505,7 @@ impl BackendDriver for WgpuBackendDriver {
         // Keep each snapshot's transfer and draw ordered, but deliver adjacent
         // accepted segments together. A final segment, wait or readback
         // flushes the batch; guest fences still report real GPU completion.
+        accepted.accept_memory()?;
         self.queued_commands.extend(segments);
         self.queued_commands.push(encoder.finish());
         let token = accepted.token();
@@ -5109,6 +5516,8 @@ impl BackendDriver for WgpuBackendDriver {
                 completed: false,
                 #[cfg(not(target_os = "macos"))]
                 native,
+                #[cfg(not(target_os = "macos"))]
+                native_blit_textures,
             },
         );
         self.queued_submissions.push(token);
@@ -5225,7 +5634,7 @@ impl BackendDriver for WgpuBackendDriver {
                 "CPU visibility request targets another device",
             ));
         }
-        self.materialize_cpu_page(request, false)
+        self.materialize_cpu_page(request)
     }
 
     fn acquire_presentable_image(
@@ -5233,6 +5642,7 @@ impl BackendDriver for WgpuBackendDriver {
         request: PresentationImageRequest,
     ) -> Result<ResidentImage, BackendDriverError> {
         self.flush_queued_commands();
+
         self.acquire_presentable(request)
     }
 
@@ -5345,6 +5755,7 @@ pub(crate) const fn texture_format(format: ImageFormat) -> Option<TextureFormat>
         ImageFormat::Rgb565Unorm => TextureFormat::Rgba32Float,
         ImageFormat::Bc1RgbUnorm | ImageFormat::Bc1RgbaUnorm => TextureFormat::Bc1RgbaUnorm,
         ImageFormat::Bc1RgbSrgb | ImageFormat::Bc1RgbaSrgb => TextureFormat::Bc1RgbaUnormSrgb,
+        ImageFormat::Bc4RUnorm => TextureFormat::Bc4RUnorm,
         ImageFormat::R8Unorm => TextureFormat::R8Unorm,
         ImageFormat::Rg8Unorm => TextureFormat::Rg8Unorm,
         ImageFormat::Rgba8Unorm => TextureFormat::Rgba8Unorm,
@@ -5354,6 +5765,7 @@ pub(crate) const fn texture_format(format: ImageFormat) -> Option<TextureFormat>
         ImageFormat::R16Float => TextureFormat::R16Float,
         ImageFormat::Rg16Float => TextureFormat::Rg16Float,
         ImageFormat::Rgba16Float => TextureFormat::Rgba16Float,
+        ImageFormat::Rg11b10Ufloat => TextureFormat::Rg11b10Ufloat,
         ImageFormat::R32Float => TextureFormat::R32Float,
         ImageFormat::Rg32Float => TextureFormat::Rg32Float,
         ImageFormat::Rgba32Float => TextureFormat::Rgba32Float,
@@ -5401,7 +5813,7 @@ fn image_texture_plan(
         }
         return Ok(ImageTexturePlan {
             format: host,
-            usages: TextureUsages::RENDER_ATTACHMENT,
+            usages: required_texture_usages(format),
         });
     }
     Ok(ImageTexturePlan {
@@ -5415,6 +5827,9 @@ pub(crate) fn required_texture_usages(format: ImageFormat) -> TextureUsages {
         TextureUsages::COPY_SRC | TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING
     } else if format == ImageFormat::Depth24UnormStencil8Uint {
         TextureUsages::RENDER_ATTACHMENT
+            | TextureUsages::COPY_SRC
+            | TextureUsages::COPY_DST
+            | TextureUsages::TEXTURE_BINDING
     } else {
         TextureUsages::COPY_SRC
             | TextureUsages::COPY_DST
@@ -5525,7 +5940,11 @@ fn sampled_texture_view_descriptor(
         mip_level_count: Some(u32::from(description.mip_levels())),
         base_array_layer: 0,
         array_layer_count: Some(u32::from(description.array_layers())),
-        aspect: TextureAspect::All,
+        aspect: if description.kind() == nixe_gpu::ImageKind::DepthStencil {
+            TextureAspect::DepthOnly
+        } else {
+            TextureAspect::All
+        },
         ..Default::default()
     }
 }
@@ -6691,7 +7110,9 @@ mod tests {
         };
         let mut input = super::RenderPipelineFingerprintInput {
             viewport_y_flip: false,
+            vertex_position_transform: None,
             depth_clip_negative_one_to_one: false,
+            fragment_depth_transform: None,
             front_face: nixe_gpu::FrontFace::CounterClockwise,
             cull_mode: nixe_gpu::CullMode::None,
             color_outputs: [nixe_gpu::ColorOutputState::REPLACE; super::MAX_COLOR_ATTACHMENTS],
@@ -6705,6 +7126,7 @@ mod tests {
             depth_format: None,
             samples: SampleCount::One,
             depth_state: DepthState::DISABLED,
+            stencil_state: None,
             vertex_buffers: &[],
         };
         input.color_formats[0] = Some(ImageFormat::Rgba16Float);
@@ -6771,7 +7193,9 @@ mod tests {
         let fingerprint = |layout: &VertexBufferLayout, topology, quad_flat| {
             nixe_gpu::cache_fingerprint(&super::RenderPipelineFingerprintInput {
                 viewport_y_flip: false,
+                vertex_position_transform: None,
                 depth_clip_negative_one_to_one: false,
+                fragment_depth_transform: None,
                 front_face: nixe_gpu::FrontFace::CounterClockwise,
                 cull_mode: nixe_gpu::CullMode::None,
                 quad_flat,
@@ -6787,6 +7211,7 @@ mod tests {
                 depth_format: None,
                 samples: SampleCount::One,
                 depth_state: DepthState::DISABLED,
+                stencil_state: None,
                 vertex_buffers: std::slice::from_ref(layout),
             })
         };
@@ -7050,7 +7475,13 @@ mod tests {
         let plan = image_texture_plan(ImageFormat::Depth24UnormStencil8Uint, false).unwrap();
 
         assert_eq!(plan.format, TextureFormat::Depth24PlusStencil8);
-        assert_eq!(plan.usages, TextureUsages::RENDER_ATTACHMENT);
+        assert_eq!(
+            plan.usages,
+            TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::COPY_SRC
+                | TextureUsages::COPY_DST
+                | TextureUsages::TEXTURE_BINDING
+        );
     }
 
     #[test]

@@ -256,7 +256,11 @@ pub(super) fn dispatch_control(
         }
         (
             CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
-            HorizonIpcObject::AudioOutManager(_) | HorizonIpcObject::AudioOut(_),
+            HorizonIpcObject::AudioOutManager(_)
+            | HorizonIpcObject::AudioOut(_)
+            | HorizonIpcObject::AudioRendererManager(_)
+            | HorizonIpcObject::AudioRenderer(_)
+            | HorizonIpcObject::AudioDevice(_),
         ) => {
             install_clone(
                 process,

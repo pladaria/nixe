@@ -2,4 +2,4 @@
 mod device;
 mod fma;
 
-pub(crate) use device::create_device;
+pub(crate) use device::{create_device, residency_budget};

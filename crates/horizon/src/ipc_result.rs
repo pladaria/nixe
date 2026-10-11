@@ -70,10 +70,15 @@ impl HorizonIpcResult {
     pub const AUDIO_OPERATION_FAILED: Self = Self::new(MODULE_AUDIO, 2);
     pub const AUDIO_INVALID_SAMPLE_RATE: Self = Self::new(MODULE_AUDIO, 3);
     pub const AUDIO_INSUFFICIENT_BUFFER: Self = Self::new(MODULE_AUDIO, 4);
+    pub const AUDIO_OUT_OF_SESSIONS: Self = Self::new(MODULE_AUDIO, 5);
     pub const AUDIO_BUFFER_COUNT_REACHED: Self = Self::new(MODULE_AUDIO, 8);
     pub const AUDIO_INVALID_CHANNEL_COUNT: Self = Self::new(MODULE_AUDIO, 10);
+    pub const AUDIO_INVALID_UPDATE_INFO: Self = Self::new(MODULE_AUDIO, 41);
     pub const AUDIO_INVALID_ADDRESS_INFO: Self = Self::new(MODULE_AUDIO, 42);
     pub const AUDIO_INVALID_HANDLE: Self = Self::new(MODULE_AUDIO, 1536);
+    // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/audio/errors.h
+    pub const AUDIO_INVALID_REVISION: Self = Self::new(MODULE_AUDIO, 1537);
+    pub const AUDIO_INVALID_ARGUMENT: Self = Self::new(MODULE_AUDIO, 900);
     pub const FS_PATH_NOT_FOUND: Self = Self::new(MODULE_FS, 1);
     // https://github.com/Atmosphere-NX/Atmosphere/blob/36cc9a9f490da37dd1d5f958ee9a256be132cc1d/libraries/libvapours/include/vapours/results/fs_results.hpp
     pub const FS_TARGET_LOCKED: Self = Self::new(MODULE_FS, 7);

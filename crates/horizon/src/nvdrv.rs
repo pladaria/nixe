@@ -22,6 +22,7 @@ mod nvhost_as_gpu;
 mod nvhost_ctrl;
 mod nvhost_ctrl_gpu;
 pub(crate) use nvhost_ctrl::PendingNvHostCtrlWait;
+mod host1x;
 mod nvhost_gpu;
 mod nvmap;
 mod service;
@@ -88,6 +89,7 @@ struct NvDrvClientState {
     nvhost_control: Arc<Mutex<NvHostControl>>,
     nvhost_control_gpu: BTreeMap<NvDrvFileDescriptor, NvHostControlGpuEvents>,
     nvmap: NvMapObjects,
+    host1x: host1x::Host1x,
     gpu_profile: MaxwellGpuProfile,
     gpu_backend: Option<Arc<NvDrvGpuExecutor>>,
 }
@@ -165,6 +167,7 @@ impl NvDrvSession {
                 nvhost_control: Arc::new(Mutex::new(NvHostControl::default())),
                 nvhost_control_gpu: BTreeMap::new(),
                 nvmap: NvMapObjects::default(),
+                host1x: host1x::Host1x::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
                 gpu_backend: Some(Arc::new(gpu_executor)),
             })),
@@ -268,6 +271,8 @@ impl NvDrvSession {
             // GPU channel creation path used by libnx's OpenGL frontend:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/gpu_channel.c#L11-L36
             b"/dev/nvhost-gpu" => NvDrvDeviceKind::HostGpu,
+            b"/dev/nvhost-nvdec" => NvDrvDeviceKind::HostNvDec,
+            b"/dev/nvhost-vic" => NvDrvDeviceKind::HostVic,
             _ => {
                 return Err(NvDrvCallError::Unsupported(
                     UnsupportedNvDrvOperation::OpenDevice { path: path.into() },
@@ -314,6 +319,14 @@ impl NvDrvSession {
         let fd = NvDrvFileDescriptor::new(state.next_fd);
         let owner = NvDrvDescriptorOwner::new(self.connection_id, process_id);
         let descriptor = NvDrvDeviceDescriptor::open(fd, kind, owner, state.permission);
+        if matches!(kind, NvDrvDeviceKind::HostNvDec | NvDrvDeviceKind::HostVic) {
+            let point = state
+                .nvhost_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .allocate_channel_syncpoint(descriptor, 0)?;
+            state.host1x.open(fd, point.syncpoint());
+        }
         state.next_fd = next_fd;
         state.devices.insert(fd, descriptor);
         if kind == NvDrvDeviceKind::HostControlGpu {
@@ -361,6 +374,13 @@ impl NvDrvSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.devices.remove(&fd).is_some() {
             state.nvhost_control_gpu.remove(&fd);
+            if let Some(syncpoint) = state.host1x.close(fd) {
+                state
+                    .nvhost_control
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .release_channel_syncpoint(syncpoint);
+            }
             let removed_address_space = state
                 .gpu_address_spaces
                 .lock()
@@ -576,6 +596,7 @@ impl NvDrvSession {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.host1x.require_healthy()?;
         let descriptor = state.devices.get(&fd).copied();
         let backend_failure = state
             .gpu_backend
@@ -631,6 +652,33 @@ impl NvDrvSession {
                 )
                 .map(NvHostCtrlIoctlOutcome::Complete)
                 .map(LockedIoctlOutcome::Standard)
+            }
+            Some(descriptor)
+                if matches!(
+                    descriptor.kind(),
+                    NvDrvDeviceKind::HostNvDec | NvDrvDeviceKind::HostVic
+                ) =>
+            {
+                let NvDrvClientState {
+                    host1x,
+                    devices,
+                    nvmap,
+                    nvhost_control,
+                    gpu_backend,
+                    ..
+                } = &mut *state;
+                host1x
+                    .ioctl(
+                        devices,
+                        nvmap,
+                        nvhost_control,
+                        gpu_backend.as_ref(),
+                        descriptor,
+                        request,
+                        input,
+                    )
+                    .map(NvHostCtrlIoctlOutcome::Complete)
+                    .map(LockedIoctlOutcome::Standard)
             }
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostGpu => {
                 match state.gpu_backend.as_ref().cloned() {
@@ -862,6 +910,7 @@ impl NvDrvSession {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.host1x.require_healthy()?;
         let descriptor = state.devices.get(&fd).copied();
         let backend_failure = state
             .gpu_backend
@@ -1006,6 +1055,7 @@ impl NvDrvSession {
                 device_fds_released: state.devices.len(),
                 allocations_released: state.nvmap.clear(),
             };
+            state.host1x.clear();
             state.devices.clear();
             state.nvhost_control_gpu.clear();
             state

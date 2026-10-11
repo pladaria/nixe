@@ -119,6 +119,17 @@ fn error(error: impl std::fmt::Display) -> AudioError {
 }
 
 impl AudioBackend for HostAudioBackend {
+    fn output_layout(&self) -> Result<ChannelLayout, AudioError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.active {
+            return Err(AudioError("SDL audio subsystem has been shut down".into()));
+        }
+        Ok(state.layout)
+    }
+
     fn open(&self, feed: AudioFeed) -> Result<Box<dyn AudioDevice>, AudioError> {
         let mut state = self
             .state
@@ -128,11 +139,11 @@ impl AudioBackend for HostAudioBackend {
             return Err(AudioError("SDL audio subsystem has been shut down".into()));
         }
         let format = feed.format();
-        if format.layout != state.layout {
-            return Err(AudioError(
-                "PCM channel layout does not match the configured output".into(),
-            ));
-        }
+        // A guest PCM stream and the renderer's selected output layout are
+        // independent. SDL converts each stream to the physical device layout.
+        // FL, FR, FC, LFE, BL, BR is also Horizon's six-channel order:
+        // https://wiki.libsdl.org/SDL3/CategoryAudio
+        // https://github.com/eden-emulator/mirror/blob/master/src/audio_core/common/common.h
         let id = state
             .next_id
             .checked_add(1)
@@ -244,6 +255,7 @@ mod tests {
         let runtime = HostAudioRuntime::new(&sdl, ChannelLayout::Stereo).unwrap();
         verify_callback_pitch_and_channels();
         let backend = runtime.backend();
+        assert_eq!(backend.output_layout().unwrap(), ChannelLayout::Stereo);
         let (send, receive) = mpsc::channel();
         let output = AudioOutput::open(
             backend.as_ref(),
@@ -268,12 +280,38 @@ mod tests {
         receive.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(output.released(1).unwrap(), [0x5678]);
 
+        // A six-channel guest stream must remain usable with a stereo host.
+        let surround = AudioOutput::open(
+            backend.as_ref(),
+            PcmFormat::SURROUND_48KHZ,
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        surround
+            .append(0x600, [100, 200, 300, 400, 500, 600].repeat(480))
+            .unwrap();
+        surround.start().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while surround.played_frames().unwrap() != 480 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(surround.released(1).unwrap(), [0x600]);
+        drop(surround);
+
         // Ordinary guest Close destroys its SDL stream on the guest thread.
         std::thread::spawn(move || drop(output)).join().unwrap();
         assert!(backend.state.lock().unwrap().streams.is_empty());
         let surviving =
             AudioOutput::open(backend.as_ref(), PcmFormat::STEREO_48KHZ, Arc::new(|_| {})).unwrap();
         drop(runtime);
+        assert!(
+            backend
+                .output_layout()
+                .unwrap_err()
+                .to_string()
+                .contains("shut down")
+        );
         assert!(backend.state.lock().unwrap().streams.is_empty());
         assert!(
             surviving

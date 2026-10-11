@@ -1163,6 +1163,7 @@ dependencies = [
 name = "nixe-horizon"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "chrono",
  "chrono-tz",
  "log",
@@ -1177,6 +1178,7 @@ dependencies = [
  "nixe-runtime",
  "nixe-scheduler",
  "nixe-video",
+ "pkg-config",
  "sha2",
  "tempfile",
  "toml",

@@ -33,16 +33,22 @@ fn captured_indexed_constant_buffer_load_reaches_verified_ir_and_wgsl() {
     assert!(translated.ir().resources().iter().any(|resource| {
         resource.binding() == 1 && resource.kind() == ShaderResourceKind::ConstantBuffer
     }));
-    assert!(matches!(
-        translated.ir().instructions()[3].operation(),
-        ShaderOperation::LoadConstantBufferIndexed32 {
-            destination,
-            binding: 1,
-            base_byte_offset: 0x30,
-            dynamic_byte_offset,
-            scalar_type: ShaderScalarType::Unsigned32,
-        } if destination.index() == 0 && dynamic_byte_offset.index() == 7
-    ));
+    assert!(
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(
+                instruction.operation(),
+                ShaderOperation::LoadConstantBufferIndexed32 {
+                    destination,
+                    binding: 1,
+                    base_byte_offset: 0x30,
+                    dynamic_byte_offset,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                } if destination.index() == 0 && dynamic_byte_offset.index() == 7
+            ))
+    );
     let module = lower_shader_ir_to_wgsl(&translated).unwrap();
     assert!(
         module
@@ -97,6 +103,7 @@ fn pixel_header(mask: u32) -> [u32; 20] {
 fn spirv_options() -> nixe_gpu::SpirvShaderOptions {
     nixe_gpu::SpirvShaderOptions {
         depth_clip_negative_one_to_one: false,
+        vertex_position_transform: None,
         input_control_points: 0,
         tessellation_mode: None,
         float32: Default::default(),

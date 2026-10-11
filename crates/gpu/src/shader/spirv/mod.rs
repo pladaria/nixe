@@ -58,6 +58,7 @@ pub struct SpirvFloat64Capabilities {
 pub struct SpirvShaderOptions {
     /// Convert only the final pre-raster position, after guest output reads.
     pub depth_clip_negative_one_to_one: bool,
+    pub vertex_position_transform: Option<crate::VertexPositionTransform>,
     /// Incoming patch cardinality: draw patch size for TCS, TCS output size for TES.
     /// Zero for stages without arrayed patch inputs.
     pub input_control_points: u32,
@@ -179,6 +180,27 @@ pub fn lower_shader_ir_to_spirv(
             emitter.operation(&instruction.operation)?;
         } else {
             emitter.predicated(instruction)?;
+        }
+    }
+    if let Some(transform) = options.vertex_position_transform {
+        for component in 0..2 {
+            let value =
+                emitter.load_interface(false, ShaderIoLocation::Position, component, None)?;
+            let value = emitter.b.bitcast(emitter.float, None, value)?;
+            let scale = emitter.constant(transform.scale()[component as usize].to_bits());
+            let offset = emitter.constant(transform.offset()[component as usize].to_bits());
+            let scale = emitter.b.bitcast(emitter.float, None, scale)?;
+            let offset = emitter.b.bitcast(emitter.float, None, offset)?;
+            let value = emitter.b.f_mul(emitter.float, None, value, scale)?;
+            emitter
+                .b
+                .decorate(value, spv::Decoration::NoContraction, []);
+            let value = emitter.b.f_add(emitter.float, None, value, offset)?;
+            emitter
+                .b
+                .decorate(value, spv::Decoration::NoContraction, []);
+            let value = emitter.b.bitcast(emitter.uint, None, value)?;
+            emitter.store_interface(ShaderIoLocation::Position, component, None, value)?;
         }
     }
     if options.depth_clip_negative_one_to_one {

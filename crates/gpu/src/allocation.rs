@@ -98,15 +98,16 @@ impl std::error::Error for AllocationDescriptionError {}
 /// A retained canonical byte range within one logical GPU allocation.
 ///
 /// The range owns canonical page references and remains pointer-free. It does
-/// not give the resource a guest CPU or GPU virtual address. Constructors also
-/// reject a range which names the same canonical bytes more than once; aliases
-/// are represented by distinct views instead.
+/// not give the resource a guest CPU or GPU virtual address. Repeated canonical
+/// bytes retain their virtual ordering for reads, while the coverage index stores
+/// their union. Host writes to such internal aliases require coherent execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackingView {
     allocation: GpuAllocationId,
     allocation_offset: u64,
     range: CanonicalBackingRange,
     canonical_spans: Arc<[CanonicalBackingSpan]>,
+    internal_aliases: bool,
 }
 
 /// One maximal run of canonical bytes retained by a backing view.
@@ -211,13 +212,20 @@ impl BackingView {
                 allocation_size: description.size,
             });
         }
-        let canonical_spans = canonical_spans(&range)?;
+        let (canonical_spans, internal_aliases) = canonical_spans(&range);
         Ok(Self {
             allocation,
             allocation_offset,
             range,
             canonical_spans: canonical_spans.into(),
+            internal_aliases,
         })
+    }
+
+    /// Whether distinct virtual offsets name overlapping canonical bytes.
+    #[must_use]
+    pub const fn has_internal_aliases(&self) -> bool {
+        self.internal_aliases
     }
 
     /// Returns the logical allocation retaining this range.
@@ -279,8 +287,6 @@ pub enum BackingViewError {
         size: u64,
         allocation_size: u64,
     },
-    /// Two segments in the range name overlapping bytes of one canonical page.
-    OverlappingCanonicalBytes,
 }
 
 impl Display for BackingViewError {
@@ -295,35 +301,31 @@ impl Display for BackingViewError {
                 formatter,
                 "GPU backing view offset={offset:#x} size={size:#x} exceeds allocation-size={allocation_size:#x}"
             ),
-            Self::OverlappingCanonicalBytes => {
-                formatter.write_str("GPU backing view contains overlapping canonical page bytes")
-            }
         }
     }
 }
 
 impl std::error::Error for BackingViewError {}
 
-fn canonical_spans(
-    range: &CanonicalBackingRange,
-) -> Result<Vec<CanonicalBackingSpan>, BackingViewError> {
+fn canonical_spans(range: &CanonicalBackingRange) -> (Vec<CanonicalBackingSpan>, bool) {
     let segments = range.segments();
     let ordered = segments
         .windows(2)
         .all(|pair| canonical_segment_key(&pair[0]) <= canonical_segment_key(&pair[1]));
     let mut spans = Vec::new();
+    let mut internal_aliases = false;
     if ordered {
         for segment in segments {
-            append_canonical_span(&mut spans, segment)?;
+            append_canonical_span(&mut spans, segment, &mut internal_aliases);
         }
     } else {
         let mut sorted = segments.iter().collect::<Vec<_>>();
         sorted.sort_unstable_by_key(|segment| canonical_segment_key(segment));
         for segment in sorted {
-            append_canonical_span(&mut spans, segment)?;
+            append_canonical_span(&mut spans, segment, &mut internal_aliases);
         }
     }
-    Ok(spans)
+    (spans, internal_aliases)
 }
 
 fn canonical_segment_key(segment: &CanonicalBackingSegment) -> (CanonicalPageId, u64, u64) {
@@ -337,7 +339,8 @@ fn canonical_segment_key(segment: &CanonicalBackingSegment) -> (CanonicalPageId,
 fn append_canonical_span(
     spans: &mut Vec<CanonicalBackingSpan>,
     segment: &CanonicalBackingSegment,
-) -> Result<(), BackingViewError> {
+    internal_aliases: &mut bool,
+) {
     let span = CanonicalBackingSpan {
         first_page: segment.page(),
         last_page: segment.page(),
@@ -347,13 +350,13 @@ fn append_canonical_span(
     };
     if let Some(previous) = spans.last_mut() {
         if previous.last_page == span.first_page {
-            if span.first_offset < previous.last_end {
-                return Err(BackingViewError::OverlappingCanonicalBytes);
-            }
-            if span.first_offset == previous.last_end {
-                previous.last_end = span.last_end;
-                previous.ends_at_page_boundary = span.ends_at_page_boundary;
-                return Ok(());
+            if span.first_offset <= previous.last_end {
+                *internal_aliases |= span.first_offset < previous.last_end;
+                if span.last_end > previous.last_end {
+                    previous.last_end = span.last_end;
+                    previous.ends_at_page_boundary = span.ends_at_page_boundary;
+                }
+                return;
             }
         } else if previous.last_page.store() == span.first_page.store()
             && previous.last_page.page().get().checked_add(1) == Some(span.first_page.page().get())
@@ -363,11 +366,10 @@ fn append_canonical_span(
             previous.last_page = span.last_page;
             previous.last_end = span.last_end;
             previous.ends_at_page_boundary = span.ends_at_page_boundary;
-            return Ok(());
+            return;
         }
     }
     spans.push(span);
-    Ok(())
 }
 
 fn sorted_spans_overlap(left: &[CanonicalBackingSpan], right: &[CanonicalBackingSpan]) -> bool {
@@ -445,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn backing_view_rejects_bounds_overflow_and_duplicate_canonical_bytes() {
+    fn backing_view_checks_bounds_and_indexes_repeated_canonical_bytes() {
         let page = page();
         let description = GpuAllocationDescription::new(0x1000, 1).unwrap();
         let range = CanonicalBackingRange::new(vec![segment(&page, 0, 0x800)]).unwrap();
@@ -459,10 +461,11 @@ mod tests {
             segment(&page, 0x400, 0x800),
         ])
         .unwrap();
-        assert_eq!(
-            BackingView::new(GpuAllocationId::new(1), description, 0, range),
-            Err(BackingViewError::OverlappingCanonicalBytes)
-        );
+        let view = BackingView::new(GpuAllocationId::new(1), description, 0, range).unwrap();
+        assert!(view.has_internal_aliases());
+        assert_eq!(view.size(), 0x1000);
+        assert_eq!(view.canonical_spans().len(), 1);
+        assert_eq!(view.canonical_spans()[0].last_end(), 0xc00);
     }
 
     #[test]

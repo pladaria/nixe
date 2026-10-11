@@ -103,21 +103,28 @@ pub(super) fn decode_float_multiply(
     let destination = (encoding & 0xff) as u8;
     let left = ((encoding >> 8) & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-    validate_register_range(stage, offset, encoding, left, 1, register_count)?;
-    if !full_immediate && (encoding >> 41) & 0x7 != 0 {
+    if left != 255 {
+        validate_register_range(stage, offset, encoding, left, 1, register_count)?;
+    }
+    let scale = if full_immediate {
+        0
+    } else {
+        (encoding >> 41) & 7
+    };
+    if scale == 7 {
         return Err(malformed(
             stage,
             offset,
             encoding,
-            "FMUL encodes reserved PDIV bits",
+            "FMUL reserved scale encoding",
         ));
     }
-    if !full_immediate && encoding & (1 << 48) != 0 {
+    if scale != 0 && (!ftz || (encoding >> 39) & 3 != 0) {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "FMUL source negation",
+            detail: "scaled FMUL requires FTZ and nearest-even rounding",
         });
     }
     // SAT clamps the rounded result to [0, 1], including NaN -> +0.
@@ -144,10 +151,29 @@ pub(super) fn decode_float_multiply(
     let opcode = (encoding >> 48) as u16;
     let (right, preparation, constant_buffer_binding) = if opcode & 0xfffa == 0x5c68 {
         let right = ((encoding >> 20) & 0xff) as u8;
-        validate_register_range(stage, offset, encoding, right, 1, register_count)?;
-        (ShaderRegister::new(u16::from(right)), None, None)
+        if right == 255 {
+            let destination = allocate_shader_temporary(
+                stage,
+                offset,
+                encoding,
+                "FMUL zero temporary overflow",
+                next_temporary,
+            )?;
+            (
+                destination,
+                Some(ShaderOperation::MoveImmediate32 {
+                    destination,
+                    bits: 0,
+                    scalar_type: ShaderScalarType::Float32,
+                }),
+                None,
+            )
+        } else {
+            validate_register_range(stage, offset, encoding, right, 1, register_count)?;
+            (ShaderRegister::new(u16::from(right)), None, None)
+        }
     } else {
-        if *next_temporary >= 256 {
+        if *next_temporary == u16::MAX {
             return Err(malformed(
                 stage,
                 offset,
@@ -196,17 +222,90 @@ pub(super) fn decode_float_multiply(
     if let Some(preparation) = preparation {
         operations.push(preparation);
     }
+    // PDIV scales operand A before multiplication, preserving its intermediate
+    // rounding. Scale code 6 is x2; it is not a reserved field.
+    // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_multiply.cpp
+    let mut left = if left == 255 {
+        let destination = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "FMUL zero temporary overflow",
+            next_temporary,
+        )?;
+        operations.push(ShaderOperation::MoveImmediate32 {
+            destination,
+            bits: 0,
+            scalar_type: ShaderScalarType::Float32,
+        });
+        destination
+    } else {
+        ShaderRegister::new(u16::from(left))
+    };
+    if scale != 0 {
+        let factor = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "FMUL scale temporary overflow",
+            next_temporary,
+        )?;
+        let scaled = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "FMUL scale temporary overflow",
+            next_temporary,
+        )?;
+        let factor_value: f32 = match scale {
+            1 => 0.5,
+            2 => 0.25,
+            3 => 0.125,
+            4 => 8.0,
+            5 => 4.0,
+            6 => 2.0,
+            _ => unreachable!(),
+        };
+        operations.push(ShaderOperation::MoveImmediate32 {
+            destination: factor,
+            bits: factor_value.to_bits(),
+            scalar_type: ShaderScalarType::Float32,
+        });
+        operations.push(ShaderOperation::Multiply32 {
+            destination: scaled,
+            left,
+            right: factor,
+            scalar_type: ShaderScalarType::Float32,
+            float_control: ShaderFloatControl::PRECISE,
+        });
+        left = scaled;
+    }
+    let mut right = right;
+    if !full_immediate && encoding & (1 << 48) != 0 {
+        let negated = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "FMUL negation temporary overflow",
+            next_temporary,
+        )?;
+        operations.push(ShaderOperation::FloatNegate32 {
+            destination: negated,
+            source: right,
+        });
+        right = negated;
+    }
     operations.push(if dnz {
         ShaderOperation::FloatMultiplyZero32 {
             destination: ShaderRegister::new(u16::from(destination)),
-            left: ShaderRegister::new(u16::from(left)),
+            left,
             right,
             float_control,
         }
     } else {
         ShaderOperation::Multiply32 {
             destination: ShaderRegister::new(u16::from(destination)),
-            left: ShaderRegister::new(u16::from(left)),
+            left,
             right,
             scalar_type: ShaderScalarType::Float32,
             float_control,
@@ -907,3 +1006,173 @@ mod tests;
 
 #[cfg(test)]
 mod control_tests;
+
+pub(super) const fn is_float_set(encoding: u64) -> bool {
+    let opcode = (encoding >> 48) as u16;
+    opcode & 0xff00 == 0x5800 || opcode & 0xfe00 == 0x4800 || opcode & 0xfe00 == 0x3000
+}
+
+pub(super) fn decode_float_set(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next_temporary: &mut u16,
+) -> Result<DecodedFloatSetPredicate, MaxwellShaderTranslationError> {
+    // FSET uses distinct modifier fields from FSET:
+    // https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/envydis/gm107.c
+    if encoding & (1 << 47) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "FSET condition-code write",
+        });
+    }
+    let raw = encoding as u8;
+    let destination = if raw == 255 {
+        allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "FSET temporary register overflow",
+            next_temporary,
+        )?
+    } else {
+        validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
+        ShaderRegister::new(u16::from(raw))
+    };
+    let comparison = match (encoding >> 48) & 0xf {
+        1 => ShaderFloatComparison::OrderedLess,
+        2 => ShaderFloatComparison::OrderedEqual,
+        3 => ShaderFloatComparison::OrderedLessOrEqual,
+        4 => ShaderFloatComparison::OrderedGreater,
+        5 => ShaderFloatComparison::OrderedNotEqual,
+        6 => ShaderFloatComparison::OrderedGreaterOrEqual,
+        7 => ShaderFloatComparison::IsNumber,
+        8 => ShaderFloatComparison::IsNan,
+        9 => ShaderFloatComparison::UnorderedLess,
+        10 => ShaderFloatComparison::UnorderedEqual,
+        11 => ShaderFloatComparison::UnorderedLessOrEqual,
+        12 => ShaderFloatComparison::UnorderedGreater,
+        13 => ShaderFloatComparison::UnorderedNotEqual,
+        14 => ShaderFloatComparison::UnorderedGreaterOrEqual,
+        _ => {
+            return Err(malformed(
+                stage,
+                offset,
+                encoding,
+                "invalid FSET comparison",
+            ));
+        }
+    };
+    let set_operation = match (encoding >> 45) & 0x3 {
+        0 => ShaderPredicateSetOperation::And,
+        1 => ShaderPredicateSetOperation::Or,
+        2 => ShaderPredicateSetOperation::Xor,
+        _ => {
+            return Err(malformed(
+                stage,
+                offset,
+                encoding,
+                "reserved FSET boolean operation",
+            ));
+        }
+    };
+    let accumulator = decode_predicate_fields(encoding, 39, 42);
+    let opcode = (encoding >> 48) as u16;
+    let mut operations = Vec::with_capacity(6);
+    let left = prepare_float_register_source(
+        stage,
+        offset,
+        encoding,
+        ((encoding >> 8) & 0xff) as u8,
+        encoding & (1 << 54) != 0,
+        encoding & (1 << 43) != 0,
+        register_count,
+        next_temporary,
+        &mut operations,
+    )?;
+    let (right, constant_buffer_binding) = if opcode & 0xff00 == 0x5800 {
+        (
+            prepare_float_register_source(
+                stage,
+                offset,
+                encoding,
+                ((encoding >> 20) & 0xff) as u8,
+                encoding & (1 << 44) != 0,
+                encoding & (1 << 53) != 0,
+                register_count,
+                next_temporary,
+                &mut operations,
+            )?,
+            None,
+        )
+    } else {
+        let temporary = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "FSET temporary register overflow",
+            next_temporary,
+        )?;
+        if opcode & 0xfe00 == 0x4800 {
+            let binding = ((encoding >> 34) & 0x1f) as u8;
+            let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
+            operations.push(ShaderOperation::LoadConstantBuffer32 {
+                destination: temporary,
+                binding,
+                byte_offset,
+                scalar_type: ShaderScalarType::Float32,
+            });
+            let right = apply_float_source_modifiers(
+                stage,
+                offset,
+                encoding,
+                temporary,
+                encoding & (1 << 44) != 0,
+                encoding & (1 << 53) != 0,
+                next_temporary,
+                &mut operations,
+            )?;
+            (right, Some(binding))
+        } else {
+            let bits = ((((encoding >> 20) & 0x7ffff) as u32) << 12)
+                | if encoding & (1 << 56) != 0 {
+                    1 << 31
+                } else {
+                    0
+                };
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination: temporary,
+                bits,
+                scalar_type: ShaderScalarType::Float32,
+            });
+            let right = apply_float_source_modifiers(
+                stage,
+                offset,
+                encoding,
+                temporary,
+                encoding & (1 << 44) != 0,
+                encoding & (1 << 53) != 0,
+                next_temporary,
+                &mut operations,
+            )?;
+            (right, None)
+        }
+    };
+    operations.push(ShaderOperation::CompareFloat32 {
+        float_result: encoding & (1 << 52) != 0,
+        destination,
+        left,
+        right,
+        comparison,
+        accumulator,
+        set_operation,
+        flush_denormals_to_zero: encoding & (1 << 55) != 0,
+    });
+    Ok(DecodedFloatSetPredicate {
+        operations,
+        constant_buffer_binding,
+    })
+}

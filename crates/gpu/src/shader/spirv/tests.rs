@@ -13,6 +13,7 @@ mod pipeline;
 fn options() -> SpirvShaderOptions {
     SpirvShaderOptions {
         depth_clip_negative_one_to_one: false,
+        vertex_position_transform: None,
         input_control_points: 3,
         tessellation_mode: None,
         float64: SpirvFloat64Capabilities::default(),
@@ -861,5 +862,41 @@ fn saturation_is_lowered_after_arithmetic_using_integer_classification() {
         assert!(!ops(&module, spv::Op::UGreaterThan).is_empty());
         assert!(!ops(&module, spv::Op::LogicalOr).is_empty());
         assert!(ops(&module, spv::Op::Select).len() >= 2);
+    }
+}
+
+#[test]
+fn bitfield_extract_lowers_signed_reversal_and_safe_boundaries() {
+    for signed in [false, true] {
+        let ir = control(vec![
+            immediate(0, 0x8123_4567),
+            immediate(1, 255),
+            immediate(2, 255),
+            ShaderOperation::ExtractBitfield32 {
+                destination: ShaderRegister(0),
+                value: ShaderRegister(0),
+                offset: ShaderRegister(1),
+                count: ShaderRegister(2),
+                signed,
+                reverse: true,
+            },
+            store(0),
+            ShaderOperation::Exit,
+        ]);
+        let m = module(&ir, options());
+        assert_eq!(ops(&m, spv::Op::BitReverse).len(), 1);
+        assert_eq!(
+            ops(
+                &m,
+                if signed {
+                    spv::Op::BitFieldSExtract
+                } else {
+                    spv::Op::BitFieldUExtract
+                }
+            )
+            .len(),
+            1
+        );
+        assert!(ops(&m, spv::Op::ConvertUToF).is_empty());
     }
 }

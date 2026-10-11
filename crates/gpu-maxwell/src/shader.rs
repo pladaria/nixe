@@ -13,6 +13,7 @@ mod error;
 mod float;
 mod global_memory;
 mod half;
+mod indirect;
 mod integer;
 mod interface;
 mod link;
@@ -22,6 +23,7 @@ mod special;
 mod tessellation;
 mod texture;
 mod translate;
+mod xmad;
 
 pub use binary::{MAXWELL_SHADER_PROGRAM_HEADER_SIZE, MAXWELL_SHADER_READ_LIMIT};
 pub(crate) use compute::{MaxwellComputeProgram, translate_compute_program};
@@ -42,3 +44,6 @@ mod test_support;
 
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) use nixe_gpu_wgpu::test_hardware as hardware;
+
+#[cfg(test)]
+mod arithmetic_tests;

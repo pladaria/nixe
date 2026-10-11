@@ -276,6 +276,7 @@ impl BackendDriver for HeadlessBackendDriver {
             .validate_submission(submission)
             .map_err(|error| BackendDriverError::failure(error.to_string()))?;
         let mut timeline = self.timeline()?;
+        submission.accept_memory()?;
         timeline.accepted.insert(submission.token());
         drop(timeline);
         self.validation = next;

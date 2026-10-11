@@ -117,6 +117,59 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
         // The common selector is initialized alongside the per-target ones.
         // Firmware table provenance and hash are documented in output.rs.
         0x133c => Some(BLEND_SEPARATE_ALPHA_RESET),
+        // GM20B sw_method_init.bin, SHA-256 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24:
+        // byte offsets 0x2490/0x2498 contain (0x064bb197, 1) and (0x064fb197, 0x2c1c).
+        // These defaults must also be visible to MME shadow-register reads.
+        // https://gitlab.com/kernel-firmware/linux-firmware/-/blob/main/nvidia/gm20b/gr/sw_method_init.bin
+        // https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
+        0x192c => Some(1),
+        0x193c => Some(0x2c1c),
+        // SET_VIEWPORT_Z_CLIP, table byte offset 0x24a0.
+        0x0d7c => Some(0),
+        // GM20B table at byte offset 0x1c90: target count one, identity mapping
+        // for all eight selectors (B197 dword 0x487).
+        0x121c => Some(0x0fac_6881),
+        // Adjacent table entry at 0x1ca0 enables the single depth target.
+        0x1538 => Some(1),
+        // Auxiliary blit/raster state restored by MME. Each value is verified
+        // in the same GM20B context table, not inferred from a submitted replay
+        // payload: 0x24c8/0x24d0 (surface clip), 0x1d10/0x1d50 (AA controls),
+        // 0x1d28 (AA mode), 0x1430 (scissor), 0x1c78 (render override), and
+        // raster/test selectors
+        // selectors at 0x22f0, 0x2450, 0x21e0, 0x2758, 0x25b0, 0x21e8,
+        // 0x2408, 0x2400, 0x25b8, 0x25d8, 0x2690, 0x25e0, 0x25f8,
+        // 0x2678 and 0x2770. Unknown methods still have no reset.
+        0x0210 | 0x0744 | 0x0dc8 | 0x0dd0 | 0x0e00 | 0x0f1c | 0x0f40 | 0x0fb4 | 0x0ff4 | 0x0ff8
+        | 0x1148 | 0x11f8 | 0x1224 | 0x12cc | 0x12ec | 0x1380 | 0x1534 | 0x153c | 0x15d0
+        | 0x1944 | 0x19bc | 0x19c4 => Some(0),
+        // Raster enable (0x23f0), hybrid AA (0x1d18), attribute format
+        // (0x10b0), statistics (0x1c88), sample masks (0x1d68..0x1d80), positions
+        // (0x1d30..0x1d48), viewport clip bounds (0x11b0/0x1230).
+        0x037c | 0x0754 => Some(1),
+        0x0a18 => Some(0x6420),
+        0x0d68 | 0x0fbc | 0x0fc0 | 0x0fc4 | 0x0fc8 => Some(0xffff),
+        0x11e0 | 0x11e4 | 0x11e8 | 0x11ec => Some(0x8888_8888),
+        raw if raw >= 0x0c00
+            && raw < 0x0d00
+            && (raw - 0x0c00) % 0x10 < 8
+            && raw.is_multiple_of(4) =>
+        {
+            Some(0)
+        }
+        // GM20B table offsets 0x0000..0x0238 initialize all eight color-target
+        // descriptors (only target zero has a nonzero format); MME restores a
+        // temporarily overridden attachment through shadow replay.
+        raw if raw >= 0x0800 && raw < 0x0a00 && raw.is_multiple_of(4) => {
+            match (raw - 0x0800) % 0x40 {
+                0 | 4 | 0x1c | 0x20 => Some(0),
+                8 => Some(0x400),
+                0x0c => Some(0x300),
+                0x10 => Some(if raw == 0x0810 { 0xcf } else { 0 }),
+                0x14 => Some(0x40),
+                0x18 => Some(1),
+                _ => None,
+            }
+        }
         // GM200 method initialization: disabled culling, clockwise front
         // faces, back-face cull selector, and target-zero RGBA write enable.
         // The same public table provenance as the polygon context above.
@@ -831,10 +884,22 @@ impl MaxwellThreeDViewportZClipRange {
 }
 
 /// Raw viewport registers whose complete combinations are validated later.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDViewportState {
     z_clip_range: MaxwellThreeDRegister<MaxwellThreeDViewportZClipRange>,
     pixel_center: MaxwellThreeDRegister<MaxwellThreeDViewportPixelCenter>,
+}
+
+impl Default for MaxwellThreeDViewportState {
+    fn default() -> Self {
+        Self {
+            z_clip_range: MaxwellThreeDRegister::verified_reset(
+                0,
+                Some(MaxwellThreeDViewportZClipRange::NegativeWToPositiveW),
+            ),
+            pixel_center: Default::default(),
+        }
+    }
 }
 
 impl MaxwellThreeDViewportState {
@@ -1218,6 +1283,10 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
+    pub(crate) fn shader_bindings_snapshot(&self) -> Arc<MaxwellThreeDShaderBindingState> {
+        Arc::clone(&self.shader_bindings)
+    }
+
     pub fn shader_bindings(&self) -> &MaxwellThreeDShaderBindingState {
         &self.shader_bindings
     }

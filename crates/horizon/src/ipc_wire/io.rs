@@ -42,10 +42,21 @@ pub(super) fn has_ipc_descriptors_other_than_pid(hipc: &HipcRequest<'_>) -> bool
         || !matches!(hipc.receive_statics, ReceiveStatics::None)
 }
 
+// VIDEO_PROBE_BEGIN
+#[track_caller]
+// VIDEO_PROBE_END
 pub(super) fn cmif_error(
     token: u32,
     result: HorizonIpcResult,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    // VIDEO_PROBE_BEGIN
+    if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
+        log::debug!(
+            "VIDEO_PROBE cmif-error: result={result:?} caller={}",
+            std::panic::Location::caller()
+        );
+    }
+    // VIDEO_PROBE_END
     Ok((encode_response(token, result, &[], None)?, None))
 }
 

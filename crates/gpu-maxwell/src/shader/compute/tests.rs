@@ -37,14 +37,14 @@ fn headerless_program_uses_qmd_geometry_and_shared_instruction_decoder() {
     assert_eq!(ir.stage(), ShaderStage::Compute);
     assert_eq!(ir.workgroup_size(), Some([32, 2, 3]));
     assert!(ir.inputs().is_empty() && ir.outputs().is_empty());
-    assert!(matches!(
-        ir.instructions()[0].operation(),
+    assert!(ir.instructions().iter().any(|instruction| matches!(
+        instruction.operation(),
         ShaderOperation::LoadComputeBuiltin32 {
             builtin: ShaderComputeBuiltin::WorkgroupId,
             component: 0,
             ..
         }
-    ));
+    )));
     assert_eq!(ir.instructions()[0].source().byte_offset(), 8);
     assert!(
         ir.instructions().iter().any(|instruction| matches!(

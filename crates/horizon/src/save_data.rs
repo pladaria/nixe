@@ -68,6 +68,20 @@ impl SaveDataSystem {
         self.program_id
     }
 
+    /// Prepares declared account/device saves for the selected launch user.
+    /// The system launcher also ensures application saves; applications need
+    /// not issue IApplicationFunctions::EnsureSaveData before mounting them.
+    /// https://switchbrew.org/wiki/AM_services#EnsureSaveData
+    pub fn prepare_for_launch(&self) -> io::Result<()> {
+        let user = u128::from_le_bytes(crate::user::DEFAULT_USER.id().encode());
+        self.ensure_user_volumes(user).map_err(|error| match error {
+            SaveDataError::Unsupported(detail) => {
+                io::Error::new(io::ErrorKind::Unsupported, detail)
+            }
+            SaveDataError::Io(error) => error,
+        })
+    }
+
     pub(crate) fn open(
         &self,
         kind: &str,
@@ -105,6 +119,11 @@ impl SaveDataSystem {
                 "BCAT/cache save creation is not implemented",
             ));
         }
+        self.ensure_user_volumes(user)?;
+        Ok(0)
+    }
+
+    fn ensure_user_volumes(&self, user: u128) -> Result<(), SaveDataError> {
         for (kind, uid, size, journal) in [
             ("account", user, self.account_size, self.account_journal),
             ("device", 0, self.device_size, self.device_journal),
@@ -117,7 +136,7 @@ impl SaveDataSystem {
             }
             ensure_volume(&self.path(kind, uid), size as u64, journal as u64)?;
         }
-        Ok(0)
+        Ok(())
     }
 }
 
@@ -164,6 +183,53 @@ fn ensure_volume(path: &Path, size: u64, journal: u64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_prepares_declared_saves_for_the_same_user_exposed_to_the_guest() {
+        let directory = tempfile::tempdir().unwrap();
+        let saves = SaveDataSystem {
+            root: directory.path().join("saves"),
+            program_id: 0x1234,
+            account_size: 4096,
+            account_journal: 1024,
+            device_size: 2048,
+            device_journal: 0,
+            bcat_size: 0,
+            cache_size: 0,
+            volumes: Arc::default(),
+        };
+        let user = u128::from_le_bytes(crate::user::DEFAULT_USER.id().encode());
+        assert_eq!(
+            saves.open("account", user).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        saves.prepare_for_launch().unwrap();
+        saves.open("account", user).unwrap();
+        saves.open("device", 0).unwrap();
+        assert!(saves.open("account", user + 1).is_err());
+        let metadata = fs::read(saves.path("account", user).join("metadata")).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(metadata[8..16].try_into().unwrap()),
+            4096
+        );
+        let progress = saves.path("account", user).join("data/progress");
+        fs::write(&progress, b"existing progress").unwrap();
+        saves.prepare_for_launch().unwrap();
+        assert_eq!(fs::read(progress).unwrap(), b"existing progress");
+
+        // A title without save declarations does not get fabricated volumes.
+        let empty = SaveDataSystem {
+            program_id: 0x5678,
+            account_size: 0,
+            device_size: 0,
+            volumes: Arc::default(),
+            ..saves
+        };
+        empty.prepare_for_launch().unwrap();
+        assert!(!empty.path("account", user).exists());
+        assert!(!empty.path("device", 0).exists());
+    }
 
     #[test]
     fn creation_is_persistent_and_ensure_preserves_existing_contents_and_sizes() {

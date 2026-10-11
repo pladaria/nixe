@@ -130,6 +130,107 @@ impl ResolveOperation {
     }
 }
 
+/// Color conversion/scaling between texel rectangles. Coordinates map the
+/// destination pixel centers to the source box; clamping occurs at its edges.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BlitFilter {
+    Point,
+    Linear,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlitOperation {
+    pub source: ImageRegion,
+    pub destination: ImageRegion,
+    pub formats: [ImageFormat; 2],
+    pub filter: BlitFilter,
+    sample_origin_bits: [u32; 2],
+    sample_step_bits: [u32; 2],
+}
+impl BlitOperation {
+    pub fn new(
+        source: ImageRegion,
+        destination: ImageRegion,
+        formats: [ImageFormat; 2],
+        filter: BlitFilter,
+    ) -> Result<Self, CommandDescriptionError> {
+        if source.image == destination.image
+            || formats.iter().any(|format| format.block_extent() != [1, 1])
+            || (formats.iter().any(|format| format.is_depth_stencil())
+                && (formats[0] != formats[1] || filter != BlitFilter::Point))
+            || [source, destination].iter().any(|region| {
+                region.extent.depth != 1
+                    || region.origin.z != 0
+                    || region.extent.width == 0
+                    || region.extent.height == 0
+                    || region.subresources.plane != 0
+                    || region.subresources.layer_count != 1
+            })
+        {
+            return Err(CommandDescriptionError::InvalidImageBlit);
+        }
+        Ok(Self {
+            source,
+            destination,
+            formats,
+            filter,
+            sample_origin_bits: [
+                (source.origin.x as f32
+                    + 0.5 * source.extent.width as f32 / destination.extent.width as f32)
+                    .to_bits(),
+                (source.origin.y as f32
+                    + 0.5 * source.extent.height as f32 / destination.extent.height as f32)
+                    .to_bits(),
+            ],
+            sample_step_bits: [
+                (source.extent.width as f32 / destination.extent.width as f32).to_bits(),
+                (source.extent.height as f32 / destination.extent.height as f32).to_bits(),
+            ],
+        })
+    }
+
+    /// Sets affine source coordinates for the first destination pixel and the
+    /// increment per pixel, in texel-corner coordinates. Sampling clamps to the
+    /// retained source region; fractional origins are preserved for filtering.
+    pub fn with_sampling(
+        mut self,
+        origin: [f32; 2],
+        step: [f32; 2],
+    ) -> Result<Self, CommandDescriptionError> {
+        if self.formats.iter().any(|format| format.is_depth_stencil())
+            || origin.iter().any(|value| !value.is_finite())
+            || step.iter().any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(CommandDescriptionError::InvalidImageBlit);
+        }
+        for axis in 0..2 {
+            let low = [self.source.origin.x, self.source.origin.y][axis] as f32;
+            let high = low + [self.source.extent.width, self.source.extent.height][axis] as f32;
+            let count = [
+                self.destination.extent.width,
+                self.destination.extent.height,
+            ][axis];
+            let last = origin[axis] + (count - 1) as f32 * step[axis];
+            if origin[axis] < low || origin[axis] >= high || !last.is_finite() || last >= high {
+                return Err(CommandDescriptionError::InvalidImageBlit);
+            }
+        }
+        self.sample_origin_bits = origin.map(f32::to_bits);
+        self.sample_step_bits = step.map(f32::to_bits);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn sampling_bits(&self) -> [u32; 4] {
+        [
+            self.sample_origin_bits[0],
+            self.sample_origin_bits[1],
+            self.sample_step_bits[0],
+            self.sample_step_bits[1],
+        ]
+    }
+}
+
 /// Neutral clear payload retaining the exact requested value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClearValue {
@@ -341,6 +442,66 @@ impl ScissorRect {
     }
 }
 
+/// Affine conversion of the final shader X/Y output into clip coordinates.
+/// It does not change shader-visible output reads or the Z/W components.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VertexPositionTransform {
+    scale: [u32; 2],
+    offset: [u32; 2],
+}
+
+impl VertexPositionTransform {
+    /// Converts framebuffer pixel coordinates to clip X/Y for a positive-axis viewport.
+    pub fn framebuffer(width: u32, height: u32) -> Result<Self, CommandDescriptionError> {
+        if width == 0 || height == 0 {
+            return Err(CommandDescriptionError::EmptyViewport);
+        }
+        Ok(Self {
+            scale: [2.0 / width as f32, 2.0 / height as f32].map(f32::to_bits),
+            offset: [-1.0_f32; 2].map(f32::to_bits),
+        })
+    }
+
+    #[must_use]
+    pub fn scale(self) -> [f32; 2] {
+        self.scale.map(f32::from_bits)
+    }
+
+    #[must_use]
+    pub fn offset(self) -> [f32; 2] {
+        self.offset.map(f32::from_bits)
+    }
+}
+
+/// Window-depth reconstruction for hosts whose viewport depth is limited to [0,1].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FragmentDepthTransform([u32; 4]);
+
+impl FragmentDepthTransform {
+    pub fn new(
+        scale: f32,
+        offset: f32,
+        minimum: f32,
+        maximum: f32,
+    ) -> Result<Self, CommandDescriptionError> {
+        if ![scale, offset, minimum, maximum]
+            .into_iter()
+            .all(f32::is_finite)
+            || minimum < 0.0
+            || maximum > 1.0
+            || minimum > maximum
+        {
+            return Err(CommandDescriptionError::InvalidFragmentDepthTransform);
+        }
+        Ok(Self([scale, offset, minimum, maximum].map(f32::to_bits)))
+    }
+
+    #[must_use]
+    pub fn coefficients(self) -> [f32; 4] {
+        self.0.map(f32::from_bits)
+    }
+}
+
 /// Backend-independent affine transform from normalized device coordinates to
 /// framebuffer coordinates: `window = ndc * scale + offset`.
 ///
@@ -355,6 +516,7 @@ pub struct ViewportTransform {
     offset: [u32; 3],
     depth_range: [u32; 2],
     depth_clip_negative_one_to_one: bool,
+    fragment_depth_transform: Option<FragmentDepthTransform>,
 }
 
 impl ViewportTransform {
@@ -379,6 +541,7 @@ impl ViewportTransform {
             offset: offset.map(f32::to_bits),
             depth_range: depth_range.map(f32::to_bits),
             depth_clip_negative_one_to_one: false,
+            fragment_depth_transform: None,
         })
     }
 
@@ -403,6 +566,16 @@ impl ViewportTransform {
     #[must_use]
     pub const fn depth_clip_negative_one_to_one(self) -> bool {
         self.depth_clip_negative_one_to_one
+    }
+
+    pub fn with_fragment_depth_transform(mut self, transform: FragmentDepthTransform) -> Self {
+        self.fragment_depth_transform = Some(transform);
+        self
+    }
+
+    #[must_use]
+    pub const fn fragment_depth_transform(self) -> Option<FragmentDepthTransform> {
+        self.fragment_depth_transform
     }
 
     /// Returns the affine viewport endpoints in window-space depth.
@@ -693,6 +866,16 @@ impl DepthState {
     }
 }
 
+/// Read-only stencil comparison. Mutating operations need a separate draw
+/// contract rather than silently discarding their memory side effects.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct StencilTestState {
+    pub front_compare: DepthCompareOperation,
+    pub back_compare: DepthCompareOperation,
+    pub read_mask: u8,
+    pub reference: u8,
+}
+
 /// Immutable neutral state shared by draws which differ only in direct draw
 /// arguments. Frontends retain this record across unchanged draws so vertex
 /// layouts and pipeline state are not rebuilt for every submission.
@@ -713,8 +896,10 @@ pub struct PreparedDraw {
     pub vertex_buffers: Box<[VertexBufferLayout]>,
     pub index_buffer: Option<(BufferRegion, IndexType)>,
     pub viewport_transform: Option<ViewportTransform>,
+    pub vertex_position_transform: Option<VertexPositionTransform>,
     pub scissor: Option<ScissorRect>,
     pub depth_state: DepthState,
+    pub stencil_state: Option<StencilTestState>,
     accesses: Box<[ResourceAccess]>,
     dependencies: Box<[ResourceDependency]>,
 }
@@ -795,8 +980,10 @@ impl PreparedDraw {
             vertex_buffers: vertex_buffers.into_boxed_slice(),
             index_buffer,
             viewport_transform: None,
+            vertex_position_transform: None,
             scissor: None,
             depth_state: DepthState::DISABLED,
+            stencil_state: None,
             accesses: accesses.into_boxed_slice(),
             dependencies: dependencies.into_boxed_slice(),
         })
@@ -1074,6 +1261,7 @@ impl RenderPassOperation {
 /// The semantic kind of one neutral GPU command.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GpuCommand {
+    ConvertNv12(crate::Nv12Conversion),
     Copy(CopyOperation),
     /// Ordered host-authored texels, copied through backend staging storage.
     UploadImage {
@@ -1081,6 +1269,7 @@ pub enum GpuCommand {
         bytes: Arc<[u8]>,
     },
     Resolve(ResolveOperation),
+    Blit(BlitOperation),
     Clear(ClearOperation),
     Draw(DrawOperation),
     Dispatch(DispatchOperation),
@@ -1167,6 +1356,32 @@ impl GpuOperation {
 impl GpuCommand {
     fn accesses(&self) -> Vec<ResourceAccess> {
         match self {
+            Self::ConvertNv12(conversion) => vec![
+                ResourceAccess::new(
+                    conversion.luma.target(),
+                    scope(
+                        PipelineStages::FRAGMENT_SHADER,
+                        AccessMode::Read,
+                        ResourceUsage::SampledImage,
+                    ),
+                ),
+                ResourceAccess::new(
+                    conversion.chroma.target(),
+                    scope(
+                        PipelineStages::FRAGMENT_SHADER,
+                        AccessMode::Read,
+                        ResourceUsage::SampledImage,
+                    ),
+                ),
+                ResourceAccess::new(
+                    conversion.destination.target(),
+                    scope(
+                        PipelineStages::COLOR_OUTPUT,
+                        AccessMode::Write,
+                        ResourceUsage::ColorAttachment,
+                    ),
+                ),
+            ],
             Self::Copy(copy) => copy_accesses(copy),
             Self::UploadImage { destination, .. } => vec![ResourceAccess::new(
                 destination.target(),
@@ -1176,6 +1391,42 @@ impl GpuCommand {
                     ResourceUsage::TransferDestination,
                 ),
             )],
+            Self::Blit(blit) if blit.formats[0].is_depth_stencil() => vec![
+                ResourceAccess::new(
+                    blit.source.target(),
+                    scope(
+                        PipelineStages::COPY,
+                        AccessMode::Read,
+                        ResourceUsage::TransferSource,
+                    ),
+                ),
+                ResourceAccess::new(
+                    blit.destination.target(),
+                    scope(
+                        PipelineStages::COPY,
+                        AccessMode::Write,
+                        ResourceUsage::TransferDestination,
+                    ),
+                ),
+            ],
+            Self::Blit(blit) => vec![
+                ResourceAccess::new(
+                    blit.source.target(),
+                    scope(
+                        PipelineStages::FRAGMENT_SHADER,
+                        AccessMode::Read,
+                        ResourceUsage::SampledImage,
+                    ),
+                ),
+                ResourceAccess::new(
+                    blit.destination.target(),
+                    scope(
+                        PipelineStages::COLOR_OUTPUT,
+                        AccessMode::Write,
+                        ResourceUsage::ColorAttachment,
+                    ),
+                ),
+            ],
             Self::Resolve(resolve) => vec![
                 ResourceAccess::new(
                     resolve.source.target(),
@@ -1207,7 +1458,12 @@ impl GpuCommand {
     fn dependencies(&self) -> Vec<ResourceDependency> {
         let mut dependencies = Vec::new();
         match self {
-            Self::Copy(_) | Self::UploadImage { .. } | Self::Resolve(_) | Self::Clear(_) => {
+            Self::Copy(_)
+            | Self::ConvertNv12(_)
+            | Self::UploadImage { .. }
+            | Self::Resolve(_)
+            | Self::Blit(_)
+            | Self::Clear(_) => {
                 for access in self.accesses() {
                     push_target_dependency(&mut dependencies, access.target());
                 }
@@ -1254,7 +1510,8 @@ impl GpuCommand {
 
     fn capability_requirements(&self) -> CapabilityRequirements {
         let mut requirements = vec![CapabilityRequirement::Features(match self {
-            Self::Copy(_) | Self::UploadImage { .. } => BackendFeatures::COPY,
+            Self::ConvertNv12(_) => BackendFeatures::COPY,
+            Self::Copy(_) | Self::Blit(_) | Self::UploadImage { .. } => BackendFeatures::COPY,
             Self::Resolve(_) => BackendFeatures::RESOLVE,
             Self::Clear(_) => BackendFeatures::CLEAR,
             Self::Draw(draw) if draw.arguments.is_indexed() => {
@@ -1268,6 +1525,21 @@ impl GpuCommand {
             Self::RenderPass(_) => BackendFeatures::RENDER_PASS,
         })];
         match self {
+            Self::ConvertNv12(conversion) => {
+                requirements.extend(
+                    [
+                        ImageFormat::R8Unorm,
+                        ImageFormat::Rg8Unorm,
+                        conversion.destination_format,
+                    ]
+                    .map(CapabilityRequirement::ImageFormat),
+                );
+                requirements.push(CapabilityRequirement::SampleCount(SampleCount::One));
+            }
+            Self::Blit(blit) => {
+                requirements.extend(blit.formats.map(CapabilityRequirement::ImageFormat));
+                requirements.push(CapabilityRequirement::SampleCount(SampleCount::One));
+            }
             Self::Resolve(resolve) => {
                 requirements.push(CapabilityRequirement::ImageFormat(resolve.format));
                 requirements.push(CapabilityRequirement::SampleCount(resolve.samples));
@@ -1403,11 +1675,13 @@ impl OperationSubmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandDescriptionError {
     InvalidImageResolve,
+    InvalidImageBlit,
     TessellationTopologyMismatch,
     CopySizeMismatch,
     ClearValueMismatch,
     NonFiniteClearValue,
     NonFiniteViewportTransform,
+    InvalidFragmentDepthTransform,
     EmptyViewport,
     EmptyDraw,
     IndexBufferMismatch,
@@ -1431,6 +1705,7 @@ pub enum CommandDescriptionError {
 impl Display for CommandDescriptionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidImageBlit => formatter.write_str("color blit requires distinct single-layer 2D texel rectangles"),
             Self::InvalidImageResolve => formatter.write_str("color resolve requires distinct images, matching regions and a multisampled source"),
             Self::TessellationTopologyMismatch => formatter.write_str("patch draw requires tessellation state and nonzero input control points; other topologies forbid it"),
             Self::CopySizeMismatch => {
@@ -1440,6 +1715,7 @@ impl Display for CommandDescriptionError {
                 formatter.write_str("clear value does not match its resource kind")
             }
             Self::NonFiniteClearValue => formatter.write_str("clear value is not finite"),
+            Self::InvalidFragmentDepthTransform => formatter.write_str("fragment depth transform requires finite coefficients and ordered bounds inside [0,1]"),
             Self::NonFiniteViewportTransform => {
                 formatter.write_str("viewport transform contains a non-finite component")
             }

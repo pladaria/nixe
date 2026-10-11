@@ -3,8 +3,17 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 #[path = "../test-support/hardware.rs"]
 mod hardware;
 
+#[path = "accelerated/compatible_attachments.rs"]
+mod compatible_attachments;
+
 #[path = "accelerated/compressed_textures.rs"]
 mod compressed_textures;
+
+#[path = "accelerated/image_aliases.rs"]
+mod image_aliases;
+
+#[path = "accelerated/nv12.rs"]
+mod nv12;
 
 #[path = "accelerated/resource_lifetime.rs"]
 mod resource_lifetime;
@@ -389,6 +398,74 @@ fn partial_float32_clear_writes_unblended_values() {
     assert_eq!(values, [0.25, 0.5, 0.75, 1.0]);
     backing.range().read(7 * 16, &mut pixel).unwrap();
     assert_eq!(pixel, [0; 16]);
+}
+
+#[test]
+fn packed_float_clear_preserves_hdr_precision_and_canonical_texel_layout() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(706),
+        NonCpuDeviceId::new(706),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    // Five-bit biased exponents and 6/6/5 mantissas, R in the low bits.
+    // Initial RGB = (1, 2, 0.5); leave a NaN in the region being replaced.
+    let initial = 0x3c0_u32 | (0x400 << 11) | (0x1c0 << 22);
+    let mut pixels = initial.to_le_bytes().repeat(64);
+    pixels[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let page = initialized_page(&pixels);
+    let (creations, backing, image, subresources) =
+        backed_color_image(ImageFormat::Rg11b10Ufloat, 8, 8, &[page]);
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rg11b10Ufloat,
+                4,
+                4,
+                [4.0, 0.25, 8.0, 0.0],
+                706,
+            ),
+        )
+        .unwrap();
+    let cleared = 0x440_u32 | (0x340 << 11) | (0x240 << 22);
+    let mut actual = [0; 256];
+    backing.range().read(0, &mut actual).unwrap();
+    for (index, bytes) in actual.chunks_exact(4).enumerate() {
+        let expected = if index % 8 < 4 && index / 8 < 4 {
+            cleared
+        } else {
+            initial
+        };
+        assert_eq!(u32::from_le_bytes(bytes.try_into().unwrap()), expected);
+    }
+    // The 11-bit channels retain six mantissa bits; blue retains five.
+    runtime
+        .runtime()
+        .submit(
+            &[],
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rg11b10Ufloat,
+                8,
+                8,
+                [1.015625, 1.03125, 1.03125, 0.0],
+                707,
+            ),
+        )
+        .unwrap();
+    let precise = 0x3c1_u32 | (0x3c2 << 11) | (0x1e1 << 22);
+    backing.range().read(0, &mut actual).unwrap();
+    assert_eq!(actual.as_slice(), precise.to_le_bytes().repeat(64));
 }
 
 #[test]
@@ -807,6 +884,15 @@ fn read_presented_rgba(
 
 #[test]
 fn opaque_presentation_requires_a_current_device_producer() {
+    check_opaque_presentation(false);
+}
+
+#[test]
+fn resident_only_storage_keeps_device_ownership_and_presentation_without_fabricated_cpu_texels() {
+    check_opaque_presentation(true);
+}
+
+fn check_opaque_presentation(resident_only: bool) {
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
         BackendInstanceId::new(707),
@@ -816,8 +902,18 @@ fn opaque_presentation_requires_a_current_device_producer() {
         return;
     };
     let page = initialized_page(&[0; 256]);
-    let (creations, backing, image, subresources) =
+    let (mut creations, backing, image, subresources) =
         backed_color_image(ImageFormat::Rgba8Unorm, 8, 8, std::slice::from_ref(&page));
+    if resident_only {
+        for creation in &mut creations {
+            if let BackendResourceCreateInfo::Image {
+                view: Some(view), ..
+            } = creation
+            {
+                *view = view.clone().with_resident_only_storage();
+            }
+        }
+    }
     let presentation = initialized.presentation_context();
     let runtime = RuntimeOwner::new(initialized.into_runtime());
     let request = PresentationImageRequest {
@@ -889,6 +985,22 @@ fn opaque_presentation_requires_a_current_device_producer() {
     let mut expected = [255, 0, 0, 255].repeat(64);
     expected[(3 * 8 + 2) * 4..(3 * 8 + 5) * 4].copy_from_slice(&[0, 0, 255, 255].repeat(3));
     assert_eq!(read_presented_rgba(&presentation, &resident), expected);
+    if resident_only {
+        let error = page.prepare_write().unwrap_err();
+        assert!(
+            error.to_string().contains("resident-only image storage"),
+            "{error}"
+        );
+        // An unsupported CPU materialization invalidates the page rather
+        // than publishing stale bytes as the device result.
+        assert!(
+            runtime
+                .runtime()
+                .acquire_presentable_image(request)
+                .is_err()
+        );
+        return;
+    }
     page.prepare_write().unwrap();
     let generation = page.content_generation();
     page.write_preflighted(0, &[0, 255, 0, 255], generation, generation.next().unwrap())
@@ -1302,6 +1414,158 @@ fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
     let mut bytes = [0; 64];
     destination_backing.range().read(0, &mut bytes).unwrap();
     assert_eq!(bytes, [0x3c; 64]);
+}
+
+#[test]
+fn fragmented_read_buffer_preserves_repeated_canonical_offsets() {
+    let _guard = accelerated_test_guard();
+    let device_id = NonCpuDeviceId::new(0x13);
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(0x13),
+        device_id,
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let source_page = initialized_page(&[0x3c; 64]);
+    let destination_page = initialized_page(&[0; 64]);
+    let description = GpuAllocationDescription::new(64, 4).unwrap();
+    let source_allocation = GpuAllocationId::new(3);
+    let destination_allocation = GpuAllocationId::new(4);
+    let middle = initialized_page(&[0x72; 64]);
+    let source_range = CanonicalBackingRange::new(
+        [
+            (source_page.clone(), 16),
+            (middle, 32),
+            (source_page.clone(), 16),
+        ]
+        .into_iter()
+        .map(|(page, size)| {
+            CanonicalBackingSegment::new(
+                page,
+                0,
+                size,
+                MemoryPermissions::READ_WRITE,
+                MappingGeneration::INITIAL,
+            )
+            .unwrap()
+        })
+        .collect(),
+    )
+    .unwrap();
+    let source_backing = BackingView::new(source_allocation, description, 0, source_range).unwrap();
+    assert!(source_backing.has_internal_aliases());
+    let destination_backing = backing(destination_allocation, description, &destination_page);
+    let source = BufferId::new(3);
+    let destination = BufferId::new(4);
+    let creations = [source_allocation, destination_allocation]
+        .into_iter()
+        .map(|id| BackendResourceCreateInfo::Allocation { id, description })
+        .chain(
+            [
+                (source, source_backing.clone()),
+                (destination, destination_backing.clone()),
+            ]
+            .into_iter()
+            .map(|(id, backing)| BackendResourceCreateInfo::Buffer {
+                id,
+                description: BufferDescription::new(64).unwrap(),
+                view: Some(
+                    BufferView::new(id, BufferDescription::new(64).unwrap(), 0, backing).unwrap(),
+                ),
+            }),
+        )
+        .collect::<Vec<_>>();
+    let copy = CopyOperation::buffer_to_buffer(
+        BufferRegion {
+            buffer: source,
+            range: BufferRange::new(0, 64).unwrap(),
+        },
+        BufferRegion {
+            buffer: destination,
+            range: BufferRange::new(0, 64).unwrap(),
+        },
+    )
+    .unwrap();
+    let submission = OperationSubmission::new(
+        FrontendSubmissionId::new(3),
+        vec![],
+        vec![GpuOperation::new(
+            GpuCommand::Copy(copy),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+    )
+    .unwrap();
+    runtime
+        .runtime()
+        .submit(&creations, &[], &submission)
+        .unwrap();
+    let mut bytes = [0; 64];
+    destination_backing.range().read(0, &mut bytes).unwrap();
+    assert_eq!(bytes[..16], [0x3c; 16]);
+    assert_eq!(bytes[16..48], [0x72; 32]);
+    assert_eq!(bytes[48..], [0x3c; 16]);
+    source_page.prepare_write().unwrap();
+    let generation = source_page.content_generation();
+    source_page
+        .write_preflighted(0, &[0x19; 16], generation, generation.next().unwrap())
+        .unwrap();
+    let second = OperationSubmission::new(
+        FrontendSubmissionId::new(4),
+        vec![],
+        vec![GpuOperation::new(
+            GpuCommand::Copy(
+                CopyOperation::buffer_to_buffer(
+                    BufferRegion {
+                        buffer: source,
+                        range: BufferRange::new(0, 64).unwrap(),
+                    },
+                    BufferRegion {
+                        buffer: destination,
+                        range: BufferRange::new(0, 64).unwrap(),
+                    },
+                )
+                .unwrap(),
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+    )
+    .unwrap();
+    runtime.runtime().submit(&[], &[], &second).unwrap();
+    destination_backing.range().read(0, &mut bytes).unwrap();
+    assert_eq!(bytes[..16], [0x19; 16]);
+    assert_eq!(bytes[16..48], [0x72; 32]);
+    assert_eq!(bytes[48..], [0x19; 16]);
+    let reversed = OperationSubmission::new(
+        FrontendSubmissionId::new(5),
+        vec![],
+        vec![GpuOperation::new(
+            GpuCommand::Copy(
+                CopyOperation::buffer_to_buffer(
+                    BufferRegion {
+                        buffer: destination,
+                        range: BufferRange::new(0, 64).unwrap(),
+                    },
+                    BufferRegion {
+                        buffer: source,
+                        range: BufferRange::new(0, 64).unwrap(),
+                    },
+                )
+                .unwrap(),
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+    )
+    .unwrap();
+    let error = runtime.runtime().submit(&[], &[], &reversed).unwrap_err();
+    assert!(error.to_string().contains("internally aliased"), "{error}");
 }
 
 #[test]
@@ -2954,4 +3218,284 @@ fn a_single_dirty_image_page_refreshes_only_that_upload_region() {
         };
         assert_eq!(pixel, expected, "pixel {index}");
     }
+}
+
+#[test]
+fn resident_color_conversion_preserves_hdr_values_and_implicit_alpha() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(991),
+        NonCpuDeviceId::new(991),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let page = initialized_page(&[0; 8 * 8 * 8]);
+    let (mut creations, backing, destination, subresources) =
+        backed_color_image(ImageFormat::Rgba16Float, 8, 8, &[page]);
+    let source = ImageId::new(992);
+    creations.push(BackendResourceCreateInfo::Image {
+        id: source,
+        description: ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent::new(8, 8, 1).unwrap(),
+            ImageFormat::Rg11b10Ufloat,
+            ImageKind::Color,
+            1,
+            1,
+            SampleCount::One,
+        )
+        .unwrap(),
+        view: None,
+    });
+    let region = |image| nixe_gpu::ImageRegion {
+        image,
+        subresources,
+        origin: nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 },
+        extent: ImageExtent::new(8, 8, 1).unwrap(),
+    };
+    for (serial, color, expected) in [
+        (
+            991,
+            [2.0, 0.25, 4.0, 0.0],
+            [0x4000_u16, 0x3400, 0x4400, 0x3c00],
+        ),
+        (992, [0.5, 8.0, 1.0, 0.0], [0x3800, 0x4800, 0x3c00, 0x3c00]),
+    ] {
+        let commands = [
+            GpuCommand::Clear(
+                ClearOperation::image(
+                    region(source),
+                    ImageKind::Color,
+                    ImageFormat::Rg11b10Ufloat,
+                    SampleCount::One,
+                    ClearValue::Color(color),
+                )
+                .unwrap(),
+            ),
+            GpuCommand::Blit(
+                nixe_gpu::BlitOperation::new(
+                    region(source),
+                    region(destination),
+                    [ImageFormat::Rg11b10Ufloat, ImageFormat::Rgba16Float],
+                    nixe_gpu::BlitFilter::Point,
+                )
+                .unwrap(),
+            ),
+        ];
+        let submission = OperationSubmission::new(
+            FrontendSubmissionId::new(serial),
+            vec![],
+            commands
+                .into_iter()
+                .map(|command| GpuOperation::new(command, [], [], CapabilityRequirements::none()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        runtime
+            .runtime()
+            .submit(
+                if serial == 991 { &creations } else { &[] },
+                &[],
+                &submission,
+            )
+            .unwrap();
+        let mut pixels = [0; 8 * 8 * 8];
+        backing.range().read(0, &mut pixels).unwrap();
+        for pixel in pixels.chunks_exact(8) {
+            for (component, value) in pixel.chunks_exact(2).zip(expected) {
+                assert_eq!(u16::from_le_bytes(component.try_into().unwrap()), value);
+            }
+        }
+    }
+    let input = ImageId::new(995);
+    let creation = BackendResourceCreateInfo::Image {
+        id: input,
+        description: ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent::new(2, 2, 1).unwrap(),
+            ImageFormat::Rgba8Unorm,
+            ImageKind::Color,
+            1,
+            1,
+            SampleCount::One,
+        )
+        .unwrap(),
+        view: None,
+    };
+    let mut commands = Vec::new();
+    for (x, y, color) in [
+        (0, 0, [1.0, 0.0, 0.0, 1.0]),
+        (1, 0, [0.0, 1.0, 0.0, 1.0]),
+        (0, 1, [0.0, 0.0, 1.0, 1.0]),
+        (1, 1, [1.0, 1.0, 1.0, 1.0]),
+    ] {
+        commands.push(GpuCommand::Clear(
+            ClearOperation::image(
+                nixe_gpu::ImageRegion {
+                    image: input,
+                    subresources,
+                    origin: nixe_gpu::ImageOrigin { x, y, z: 0 },
+                    extent: ImageExtent::new(1, 1, 1).unwrap(),
+                },
+                ImageKind::Color,
+                ImageFormat::Rgba8Unorm,
+                SampleCount::One,
+                ClearValue::Color(color),
+            )
+            .unwrap(),
+        ));
+    }
+    commands.push(GpuCommand::Blit(
+        nixe_gpu::BlitOperation::new(
+            nixe_gpu::ImageRegion {
+                image: input,
+                extent: ImageExtent::new(2, 2, 1).unwrap(),
+                ..region(input)
+            },
+            nixe_gpu::ImageRegion {
+                origin: nixe_gpu::ImageOrigin { x: 2, y: 3, z: 0 },
+                extent: ImageExtent::new(1, 1, 1).unwrap(),
+                ..region(destination)
+            },
+            [ImageFormat::Rgba8Unorm, ImageFormat::Rgba16Float],
+            nixe_gpu::BlitFilter::Linear,
+        )
+        .unwrap(),
+    ));
+    commands.push(GpuCommand::Blit(
+        nixe_gpu::BlitOperation::new(
+            nixe_gpu::ImageRegion {
+                image: input,
+                extent: ImageExtent::new(2, 2, 1).unwrap(),
+                ..region(input)
+            },
+            nixe_gpu::ImageRegion {
+                origin: nixe_gpu::ImageOrigin { x: 3, y: 3, z: 0 },
+                extent: ImageExtent::new(1, 1, 1).unwrap(),
+                ..region(destination)
+            },
+            [ImageFormat::Rgba8Unorm, ImageFormat::Rgba16Float],
+            nixe_gpu::BlitFilter::Linear,
+        )
+        .unwrap()
+        .with_sampling([0.75, 0.75], [0.5, 0.5])
+        .unwrap(),
+    ));
+    let submission = OperationSubmission::new(
+        FrontendSubmissionId::new(995),
+        vec![],
+        commands
+            .into_iter()
+            .map(|command| GpuOperation::new(command, [], [], CapabilityRequirements::none()))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    runtime
+        .runtime()
+        .submit(&[creation], &[], &submission)
+        .unwrap();
+    let mut pixels = [0; 8 * 8 * 8];
+    backing.range().read(0, &mut pixels).unwrap();
+    for (index, pixel) in pixels.chunks_exact(8).enumerate() {
+        let expected = if index == 3 * 8 + 2 {
+            [0x3800, 0x3800, 0x3800, 0x3c00]
+        } else if index == 3 * 8 + 3 {
+            [0x3900, 0x3400, 0x3400, 0x3c00]
+        } else {
+            [0x3800, 0x4800, 0x3c00, 0x3c00]
+        };
+        for (component, value) in pixel.chunks_exact(2).zip(expected) {
+            assert_eq!(
+                u16::from_le_bytes(component.try_into().unwrap()),
+                value,
+                "pixel {index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn resident_depth_stencil_copy_is_supported_by_the_physical_backend() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(993),
+        NonCpuDeviceId::new(993),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let subresources = ImageSubresourceRange {
+        plane: 0,
+        mip_level: 0,
+        base_layer: 0,
+        layer_count: 1,
+    };
+    let region = |image| nixe_gpu::ImageRegion {
+        image: ImageId::new(image),
+        subresources,
+        origin: nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 },
+        extent: ImageExtent::new(8, 8, 1).unwrap(),
+    };
+    let creations = [993, 994].map(|id| BackendResourceCreateInfo::Image {
+        id: ImageId::new(id),
+        description: ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent::new(8, 8, 1).unwrap(),
+            ImageFormat::Depth24UnormStencil8Uint,
+            ImageKind::DepthStencil,
+            1,
+            1,
+            SampleCount::One,
+        )
+        .unwrap(),
+        view: None,
+    });
+    let commands = [
+        GpuCommand::Clear(
+            ClearOperation::image(
+                region(993),
+                ImageKind::DepthStencil,
+                ImageFormat::Depth24UnormStencil8Uint,
+                SampleCount::One,
+                ClearValue::DepthStencil {
+                    depth: 0.375,
+                    stencil: 17,
+                },
+            )
+            .unwrap(),
+        ),
+        GpuCommand::Copy(CopyOperation::ImageToImage {
+            source: region(993),
+            destination: region(994),
+        }),
+        GpuCommand::Blit(
+            nixe_gpu::BlitOperation::new(
+                region(993),
+                nixe_gpu::ImageRegion {
+                    extent: ImageExtent::new(4, 4, 1).unwrap(),
+                    ..region(994)
+                },
+                [ImageFormat::Depth24UnormStencil8Uint; 2],
+                nixe_gpu::BlitFilter::Point,
+            )
+            .unwrap(),
+        ),
+    ];
+    let submission = OperationSubmission::new(
+        FrontendSubmissionId::new(993),
+        vec![],
+        commands
+            .into_iter()
+            .map(|command| GpuOperation::new(command, [], [], CapabilityRequirements::none()))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    runtime
+        .runtime()
+        .submit(&creations, &[], &submission)
+        .unwrap();
+    assert!(runtime.runtime().wait_for_completion().unwrap().is_some());
 }

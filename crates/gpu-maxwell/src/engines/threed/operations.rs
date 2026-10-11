@@ -271,21 +271,34 @@ impl MaxwellThreeDReportSemaphoreControl {
     }
 
     #[must_use]
-    pub const fn is_captured_release(self) -> bool {
-        self.raw == 0x1000_f010
+    pub const fn is_payload_write(self) -> bool {
+        // REPORT_NONE writes the programmed payload, with an optional PTIMER
+        // timestamp for the four-word structure. Counter queries, reductions,
+        // acquire/trap and awaken interrupts require distinct implementations.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3195-L3277
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/query_cache/types.h#L18-L20
+        matches!(
+            self.operation,
+            MaxwellThreeDReportSemaphoreOperation::Release
+                | MaxwellThreeDReportSemaphoreOperation::ReportOnly
+        ) && matches!(
+            self.pipeline_location,
+            MaxwellThreeDReportSemaphorePipelineLocation::All
+        ) && self.raw & !0x1000_f013 == 0
     }
 }
 
-/// One ordered one-word release to guest-visible GPU memory.
+/// One ordered payload report or release to guest-visible GPU memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDReportSemaphoreRelease {
+pub struct MaxwellThreeDReportSemaphoreWrite {
     address: MaxwellThreeDUnresolvedAddress,
     payload: u32,
+    structure_size: MaxwellThreeDReportSemaphoreStructureSize,
     source: MaxwellMethodSource,
     prior_work_pending: bool,
 }
 
-impl MaxwellThreeDReportSemaphoreRelease {
+impl MaxwellThreeDReportSemaphoreWrite {
     #[must_use]
     pub const fn address(self) -> MaxwellThreeDUnresolvedAddress {
         self.address
@@ -294,6 +307,11 @@ impl MaxwellThreeDReportSemaphoreRelease {
     #[must_use]
     pub const fn payload(self) -> u32 {
         self.payload
+    }
+
+    #[must_use]
+    pub const fn structure_size(self) -> MaxwellThreeDReportSemaphoreStructureSize {
+        self.structure_size
     }
 
     #[must_use]
@@ -613,7 +631,7 @@ pub enum MaxwellThreeDSynchronizationPlan {
         mode: MaxwellThreeDTiledCacheFlushMode,
         maintenance: CacheMaintenanceOperation,
     },
-    ReportSemaphoreRelease(MaxwellThreeDReportSemaphoreRelease),
+    ReportSemaphoreWrite(MaxwellThreeDReportSemaphoreWrite),
     IncrementSyncpoint {
         request: MaxwellThreeDSyncpointIncrement,
         completion: GuestTimelinePoint,
@@ -829,7 +847,7 @@ pub fn lower_maxwell_three_d_synchronization(
             ),
         },
         MaxwellThreeDSynchronizationTrigger::ReportSemaphore { control, source } => {
-            if !control.is_captured_release() {
+            if !control.is_payload_write() {
                 return Err(
                     MaxwellThreeDSynchronizationError::UnsupportedReportSemaphoreControl {
                         source,
@@ -845,10 +863,11 @@ pub fn lower_maxwell_three_d_synchronization(
                     MaxwellThreeDSynchronizationError::IncompleteReportSemaphoreState { source },
                 );
             };
-            Ok(MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(
-                MaxwellThreeDReportSemaphoreRelease {
+            Ok(MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(
+                MaxwellThreeDReportSemaphoreWrite {
                     address,
                     payload,
+                    structure_size: control.structure_size(),
                     source,
                     prior_work_pending,
                 },

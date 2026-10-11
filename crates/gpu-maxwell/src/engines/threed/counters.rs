@@ -38,6 +38,10 @@ impl MaxwellThreeDZPassPixelCountEnable {
 /// One validated performance-counter state transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDCounterStateWrite {
+    StatisticsEnable {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     ZPassPixelCountEnable {
         value: MaxwellThreeDZPassPixelCountEnable,
         source: MaxwellMethodSource,
@@ -47,10 +51,19 @@ pub enum MaxwellThreeDCounterStateWrite {
 /// Persistent performance-counter configuration on one `MAXWELL_B` engine.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDCounterState {
+    // The 16 per-stage enable bits affect instrumentation, not raster output.
+    // Reports/resets requiring those counters remain explicit execution gaps.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L887-L934
+    statistics_enable: MaxwellThreeDRegister<u32>,
     zpass_pixel_count_enable: MaxwellThreeDRegister<MaxwellThreeDZPassPixelCountEnable>,
 }
 
 impl MaxwellThreeDCounterState {
+    #[must_use]
+    pub const fn statistics_enable(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.statistics_enable
+    }
+
     #[must_use]
     pub const fn zpass_pixel_count_enable(
         &self,
@@ -60,6 +73,9 @@ impl MaxwellThreeDCounterState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDCounterStateWrite) {
         match write {
+            MaxwellThreeDCounterStateWrite::StatisticsEnable { value, source } => {
+                self.statistics_enable = MaxwellThreeDRegister::programmed(value, value, source);
+            }
             MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable { value, source } => {
                 self.zpass_pixel_count_enable =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);

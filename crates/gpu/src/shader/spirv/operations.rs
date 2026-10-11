@@ -222,6 +222,48 @@ impl Emitter {
                 let semantics = self.constant(spv::MemorySemantics::empty().bits());
                 self.b.control_barrier(execution, memory, semantics)?;
             }
+            ExtractBitfield32 {
+                destination,
+                value,
+                offset,
+                count,
+                signed,
+                reverse,
+            } => {
+                let mut base = self.read(*value)?;
+                if *reverse {
+                    base = self.b.bit_reverse(self.uint, None, base)?;
+                }
+                let position = self.read(*offset)?;
+                let raw_count = self.read(*count)?;
+                let zero = self.constant(0);
+                let limit = self.constant(32);
+                let inside = self.b.u_less_than(self.boolean, None, position, limit)?;
+                let position = self.b.select(self.uint, None, inside, position, limit)?;
+                let available = self.b.i_sub(self.uint, None, limit, position)?;
+                let smaller = self
+                    .b
+                    .u_less_than(self.boolean, None, raw_count, available)?;
+                let size = self
+                    .b
+                    .select(self.uint, None, smaller, raw_count, available)?;
+                let extracted = if *signed {
+                    let base = self.b.bitcast(self.int, None, base)?;
+                    let field = self
+                        .b
+                        .bit_field_s_extract(self.int, None, base, position, size)?;
+                    let shift = self.constant(31);
+                    let sign = self.b.shift_right_arithmetic(self.int, None, base, shift)?;
+                    let value = self.b.select(self.int, None, inside, field, sign)?;
+                    self.b.bitcast(self.uint, None, value)?
+                } else {
+                    self.b
+                        .bit_field_u_extract(self.uint, None, base, position, size)?
+                };
+                let empty = self.b.i_equal(self.boolean, None, raw_count, zero)?;
+                let value = self.b.select(self.uint, None, empty, zero, extracted)?;
+                self.write(*destination, value);
+            }
             Bitwise32 {
                 destination,
                 left,
@@ -327,6 +369,27 @@ impl Emitter {
                 left = self.b.select(self.uint, None, absorbing, zero, left)?;
                 right = self.b.select(self.uint, None, absorbing, zero, right)?;
                 let value = self.float_binary(left, right, *float_control, true)?;
+                self.write(*destination, value);
+            }
+            FloatMinMax32 {
+                destination,
+                left,
+                right,
+                minimum,
+                float_control,
+            } => {
+                self.require_float(*float_control)?;
+                let left = self.float_operand(self.read(*left)?, *float_control)?;
+                let right = self.float_operand(self.read(*right)?, *float_control)?;
+                let less = self.b.f_ord_less_than(self.boolean, None, left, right)?;
+                let greater = self.b.f_ord_greater_than(self.boolean, None, left, right)?;
+                let minimum = self.predicate(*minimum)?;
+                let select_left = self.b.select(self.boolean, None, minimum, less, greater)?;
+                let selected = self.b.select(self.float, None, select_left, left, right)?;
+                // min/max return the numeric operand when just one is NaN.
+                let right_nan = self.b.is_nan(self.boolean, None, right)?;
+                let selected = self.b.select(self.float, None, right_nan, left, selected)?;
+                let value = self.float_result(selected, *float_control)?;
                 self.write(*destination, value);
             }
             FusedMultiplyAdd32 {

@@ -6,8 +6,7 @@ use super::float::{apply_float_source_modifiers, prepare_float_register_source};
 use crate::MaxwellShaderStage;
 use nixe_gpu::{
     ShaderFloatControl, ShaderMathAccuracy, ShaderNanMode, ShaderOperation, ShaderPredicate,
-    ShaderRegister, ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation,
-    ShaderSpecialFunction,
+    ShaderRegister, ShaderRoundingMode, ShaderScalarType, ShaderSpecialFunction,
 };
 
 pub(super) const fn is_mufu(encoding: u64) -> bool {
@@ -28,9 +27,9 @@ enum MaxwellRangeReduction {
 pub(super) struct PendingRangeReduction {
     pub(super) offset: u32,
     pub(super) encoding: u64,
-    pub(super) source: ShaderSourceLocation,
     pub(super) predicate: ShaderPredicate,
-    destination: u8,
+    pub(super) fusion_valid: bool,
+    pub(super) destination: u8,
     input: ShaderRegister,
     mode: MaxwellRangeReduction,
     pub(super) preparation: Vec<ShaderOperation>,
@@ -121,8 +120,8 @@ pub(super) fn decode_range_reduction(
     Ok(PendingRangeReduction {
         offset,
         encoding,
-        source: ShaderSourceLocation::new(offset),
         predicate,
+        fusion_valid: true,
         destination,
         input,
         mode: if encoding & (1 << 39) == 0 {
@@ -135,12 +134,34 @@ pub(super) fn decode_range_reduction(
     })
 }
 
+pub(super) fn freeze_range_reduction_input(
+    range: &mut PendingRangeReduction,
+    stage: MaxwellShaderStage,
+    next: &mut u16,
+) -> Result<(), MaxwellShaderTranslationError> {
+    let destination = allocate_shader_temporary(
+        stage,
+        range.offset,
+        range.encoding,
+        "RRO input snapshot temporary overflow",
+        next,
+    )?;
+    range.preparation.push(ShaderOperation::Move32 {
+        destination,
+        source: range.input,
+        scalar_type: ShaderScalarType::Float32,
+    });
+    range.input = destination;
+    Ok(())
+}
+
 pub(super) fn is_compatible_mufu(
     range_reduction: &PendingRangeReduction,
     encoding: u64,
     predicate: ShaderPredicate,
 ) -> bool {
-    if !is_mufu(encoding)
+    if !range_reduction.fusion_valid
+        || !is_mufu(encoding)
         || predicate != range_reduction.predicate
         || ((encoding >> 8) & 0xff) as u8 != range_reduction.destination
         || encoding & ((1 << 46) | (1 << 48)) != 0
@@ -165,7 +186,7 @@ pub(super) fn decode_range_reduced_mufu(
             stage,
             instruction_offset: range_reduction.offset,
             encoding: range_reduction.encoding,
-            detail: "RRO result is not consumed by an adjacent compatible MUFU",
+            detail: "RRO result is not consumed by a compatible MUFU",
         });
     }
     let destination = (encoding & 0xff) as u8;

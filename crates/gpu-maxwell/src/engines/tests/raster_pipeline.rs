@@ -127,7 +127,7 @@ fn programmed_sm_timeout_is_preserved_while_preflight_reaches_draw_state_validat
 
     assert_eq!(
         result.err(),
-        Some(MaxwellLoweringError::IncompleteDraw("SET_CT_SELECT"))
+        Some(MaxwellLoweringError::ColorTargetRouteUnprogrammed { slot: 0, target: 0 })
     );
     let register = channel
         .three_d()
@@ -2657,6 +2657,14 @@ fn draw_resolves_common_and_per_target_blend_state_before_effects() {
         Err(MaxwellLoweringError::ShaderTranslationRequired)
     ));
 
+    for format in [0xca, 0xe0, 0xd5] {
+        program_color_target(&mut channel, 0, target, format);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellLoweringError::ShaderTranslationRequired)
+        ));
+    }
+
     program_three_d(&mut channel, 0x12e4, 1);
     program_three_d(&mut channel, 0x1360, 0);
     assert!(matches!(
@@ -4961,6 +4969,7 @@ fn point_rasterization_state_is_consumed_only_by_point_draws_and_never_by_clears
     ));
 
     bind_three_d(&mut passthrough);
+    program_three_d(&mut passthrough, 0x192c, 0);
     program_three_d(&mut passthrough, 0x121c, 0);
     program_three_d(&mut passthrough, 0x1618, 0);
     program_three_d(&mut passthrough, 0x1604, 0);

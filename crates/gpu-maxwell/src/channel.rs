@@ -702,7 +702,7 @@ mod tests {
         );
         assert_eq!(
             channel.three_d().viewport().z_clip_range().origin(),
-            crate::MaxwellThreeDRegisterOrigin::Unset
+            crate::MaxwellThreeDRegisterOrigin::VerifiedReset
         );
     }
 

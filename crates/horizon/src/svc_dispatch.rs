@@ -369,10 +369,12 @@ pub struct HorizonSvcDispatcher {
     application_language: Option<crate::SystemLanguage>,
     user_account_switch_locked: Option<bool>,
     save_data: Option<crate::SaveDataSystem>,
+    shared_fonts: crate::SharedFontSession,
     diagnostics: crate::HorizonDiagnostics,
     video_system: crate::VideoSystem,
     hid_system: crate::HidSystem,
     audio_backend: Option<std::sync::Arc<dyn nixe_audio::AudioBackend>>,
+    audio_renderers: crate::AudioRendererManagerSession,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
     reply_sent: BTreeSet<u64>,
     wait_deadlines: BTreeMap<(u64, u32), u64>,
@@ -520,10 +522,12 @@ impl HorizonSvcDispatcher {
             application_language: None,
             user_account_switch_locked: None,
             save_data: None,
+            shared_fonts: crate::SharedFontSession::default(),
             diagnostics: crate::HorizonDiagnostics::default(),
             video_system,
             hid_system: crate::HidSystem::new(),
             audio_backend: None,
+            audio_renderers: crate::AudioRendererManagerSession::default(),
             named_ports: BTreeMap::new(),
             reply_sent: BTreeSet::new(),
             wait_deadlines: BTreeMap::new(),
@@ -548,6 +552,13 @@ impl HorizonSvcDispatcher {
     #[must_use]
     pub fn with_user_account_switch_lock(mut self, locked: bool) -> Self {
         self.user_account_switch_locked = Some(locked);
+        self
+    }
+
+    /// Supplies caller-owned system font resources to pl:u.
+    #[must_use]
+    pub fn with_shared_fonts(mut self, shared_fonts: crate::SharedFontSession) -> Self {
+        self.shared_fonts = shared_fonts;
         self
     }
 
@@ -1249,6 +1260,14 @@ fn reject(
 }
 
 fn result(context: &mut ExceptionDispatchContext<'_>, value: HorizonKernelResult) {
+    // VIDEO_PROBE_BEGIN
+    if std::env::var_os("NIXE_VIDEO_AUDIT").is_some()
+        && !matches!(value, HorizonKernelResult::SUCCESS | HorizonKernelResult::TIMED_OUT | HorizonKernelResult::CANCELLED)
+    {
+        let r = context.thread().state().register_context();
+        log::debug!("VIDEO_PROBE kernel-error: thread={} pc={:#x} code={value:?} args={:x?}", context.thread().object().thread_id(), context.thread().state().pc(), &r.x[..4]);
+    }
+    // VIDEO_PROBE_END
     write_register(context.thread_mut().state_mut(), 0, u64::from(value.raw()));
 }
 

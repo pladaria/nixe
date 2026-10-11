@@ -49,7 +49,7 @@ fn can_copy(record: &ViewRecord, image: &MaxwellThreeDResolvedImage) -> bool {
         || requested.kind() != ImageKind::Color
         || description.dimension() != ImageDimension::Two
         || requested.dimension() != ImageDimension::Two
-        || description.format() != requested.format()
+        || !description.format().is_copy_compatible(requested.format())
         || description.samples() != SampleCount::One
         || requested.samples() != SampleCount::One
         || description.mip_levels() != 1
@@ -61,7 +61,14 @@ fn can_copy(record: &ViewRecord, image: &MaxwellThreeDResolvedImage) -> bool {
         || (u64::from(description.extent().width) * u64::from(bytes)).div_ceil(64)
             != (u64::from(requested.extent().width) * u64::from(bytes)).div_ceil(64)
         || *swizzle != image.view().swizzle()
-        || *guest_pte_kind != image.guest_layout().pte_kind()
+        || (*guest_pte_kind != image.guest_layout().pte_kind()
+            && !matches!(
+                record.key,
+                ViewKey::Image {
+                    guest_format: super::super::threed::MaxwellThreeDGuestImageFormat::Canonical(_),
+                    ..
+                }
+            ))
         || bindings.len() != 1
         || image.view().bindings().len() != 1
     {
@@ -69,7 +76,14 @@ fn can_copy(record: &ViewRecord, image: &MaxwellThreeDResolvedImage) -> bool {
     }
     let (subresources, layout, backing) = &bindings[0];
     let current = &image.view().bindings()[0];
-    matches!(layout, ImageMemoryLayout::BlockLinear(_))
+    (matches!(layout, ImageMemoryLayout::BlockLinear(_))
+        || matches!(
+            record.key,
+            ViewKey::Image {
+                guest_format: super::super::threed::MaxwellThreeDGuestImageFormat::Canonical(_),
+                ..
+            }
+        ))
         && *layout == current.layout()
         && *subresources == current.subresources()
         && same_canonical_backing(backing, current.backing())
@@ -117,11 +131,37 @@ pub(super) fn prepare(
     cache: &mut MaxwellLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
 ) -> Result<Option<ResourceDependency>, MaxwellLoweringError> {
+    prepare_from_producer(image, cache, creations, false)
+}
+
+pub(super) fn prepare_canonical_producer(
+    image: &MaxwellThreeDResolvedImage,
+    cache: &mut MaxwellLoweringCache,
+    creations: &mut Vec<BackendResourceCreateInfo>,
+) -> Result<Option<ResourceDependency>, MaxwellLoweringError> {
+    prepare_from_producer(image, cache, creations, true)
+}
+
+fn prepare_from_producer(
+    image: &MaxwellThreeDResolvedImage,
+    cache: &mut MaxwellLoweringCache,
+    creations: &mut Vec<BackendResourceCreateInfo>,
+    canonical_only: bool,
+) -> Result<Option<ResourceDependency>, MaxwellLoweringError> {
     let Some(producer) = cache
         .views
         .iter()
         .filter(|record| {
-            can_copy(record, image)
+            (!canonical_only
+                || matches!(
+                    record.key,
+                    ViewKey::Image {
+                        guest_format:
+                            super::super::threed::MaxwellThreeDGuestImageFormat::Canonical(_),
+                        ..
+                    }
+                ))
+                && can_copy(record, image)
                 && (record.materialization == ViewMaterialization::Direct
                     || (record.materialization == ViewMaterialization::CompressedColor
                         && cache.color_materializations.iter().any(|materialized| {
@@ -135,6 +175,13 @@ pub(super) fn prepare(
     let source = image_dependency(producer.dependency)?;
     let revision = producer.write_revision;
     let key = view_key(&MaxwellThreeDResolvedResource::Image(image.clone()));
+    if let Some(record) = cache.views.iter().find(|record| record.key == key)
+        && (record.dependency == ResourceDependency::Image(source)
+            || (record.materialization == (ViewMaterialization::CopiedColor { source, revision })
+                && copy_is_current(record, cache)))
+    {
+        return Ok(Some(record.dependency));
+    }
     let destination = if let Some(record) = cache.views.iter_mut().find(|record| record.key == key)
     {
         if !record

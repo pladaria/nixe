@@ -39,6 +39,25 @@ fn device_error(error: impl std::fmt::Display) -> WgpuBackendInitializationError
     WgpuBackendInitializationError::Device(format!("native Vulkan device: {error}").into())
 }
 
+/// The resident working set includes device-authoritative images which cannot
+/// be evicted as CPU texels. Budget against the physical local heap, leaving
+/// half for the driver, other applications, and transient command resources.
+/// https://docs.vulkan.org/refpages/latest/refpages/source/VkMemoryHeap.html
+pub(crate) fn residency_budget(device: &wgpu::Device) -> Option<u64> {
+    // SAFETY: the HAL guard retains this live device and its physical adapter.
+    let memory = unsafe {
+        let hal = device.as_hal::<wgpu::hal::api::Vulkan>()?;
+        hal.shared_instance()
+            .raw_instance()
+            .get_physical_device_memory_properties(hal.raw_physical_device())
+    };
+    memory.memory_heaps[..memory.memory_heap_count as usize]
+        .iter()
+        .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .map(|heap| heap.size / 2)
+        .max()
+}
+
 /// Creates the backend's sole logical device. None means the selected adapter
 /// cannot expose this native boundary; its ordinary wgpu path remains available.
 /// The descriptor is the existing adapter-supported wgpu request, not a second

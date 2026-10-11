@@ -92,15 +92,15 @@ fn native_waveforms_refresh_and_stop_on_retarget_and_worker_shutdown() {
     };
     output.select_controller(Some(controller.id)).unwrap();
     output
-        .send(
-            VibrationSide::Left,
-            VibrationValue {
+        .send_values([
+            Some(VibrationValue {
                 low_amplitude: 0.5,
                 low_frequency: 160.0,
                 high_amplitude: 0.5,
                 high_frequency: 320.0,
-            },
-        )
+            }),
+            Some(VibrationValue::default()),
+        ])
         .unwrap();
     let active = [0x10, 0, 0, 0x89, 0x40, 0x62, 0, 1, 0x40, 0x40];
     let stopped = [0x10, 0, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40];

@@ -54,8 +54,10 @@ pub(super) fn draw_color_outputs(
                 field: "SET_BLEND(i)",
             })?;
         if enabled {
-            // Float and 16-bit normalized formats consume additional Maxwell
-            // arithmetic controls; do not inherit host defaults for those.
+            // Native blend equations also operate on float attachments without
+            // UNORM clamping. Missing target components (including HDR alpha)
+            // are substituted by the host format's standard component rules.
+            // https://docs.vulkan.org/spec/latest/chapters/framebuffer.html#framebuffer-blending
             let format = resolved_image(resources, attachments.colors[slot].1)?
                 .description()
                 .format();
@@ -65,6 +67,8 @@ pub(super) fn draw_color_outputs(
                     | nixe_gpu::ImageFormat::Bgra8Unorm
                     | nixe_gpu::ImageFormat::Rgba8Srgb
                     | nixe_gpu::ImageFormat::Bgra8Srgb
+                    | nixe_gpu::ImageFormat::Rgba16Float
+                    | nixe_gpu::ImageFormat::Rg11b10Ufloat
             ) {
                 return Err(MaxwellLoweringError::UnsupportedBlendFormat { target, format });
             }

@@ -13,7 +13,9 @@ pub(crate) enum IpcWireError {
     ResponseCommit(DataAccessFault),
     GraphicsBackend(Box<str>),
     AudioBackend(Box<str>),
+    AudioRenderer(Box<str>),
     InputBackend(Box<str>),
+    SharedFont(Box<str>),
     ErrorApplet(Box<crate::ErrorAppletDiagnostic>),
     UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
@@ -75,8 +77,14 @@ impl std::fmt::Display for HorizonIpcFault {
             IpcWireError::AudioBackend(reason) => {
                 write!(formatter, "audio output failed: {reason}")
             }
+            IpcWireError::AudioRenderer(reason) => {
+                write!(formatter, "audio renderer failed: {reason}")
+            }
             IpcWireError::InputBackend(reason) => {
                 write!(formatter, "controller output failed: {reason}")
+            }
+            IpcWireError::SharedFont(reason) => {
+                write!(formatter, "shared font loading failed: {reason}")
             }
             IpcWireError::ErrorApplet(diagnostic) => {
                 write!(

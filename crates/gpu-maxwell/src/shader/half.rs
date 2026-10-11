@@ -11,6 +11,29 @@ pub(super) const fn is_half_multiply(encoding: u64) -> bool {
     encoding & 0xfff8_0000_0000_0000 == 0x5d08_0000_0000_0000
 }
 
+pub(super) const fn is_half_add(encoding: u64) -> bool {
+    encoding & 0xfff8_0000_0000_0000 == 0x5d10_0000_0000_0000
+        || encoding & 0xfe80_0000_0000_0000 == 0x7a00_0000_0000_0000
+        || encoding & 0xfe00_0000_0000_0000 == 0x2c00_0000_0000_0000
+}
+
+pub(super) fn decode_half_add(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next_temporary: &mut u16,
+) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+    decode_half_binary(
+        stage,
+        offset,
+        encoding,
+        register_count,
+        next_temporary,
+        true,
+    )
+}
+
 pub(super) fn decode_half_multiply(
     stage: MaxwellShaderStage,
     offset: u32,
@@ -18,17 +41,37 @@ pub(super) fn decode_half_multiply(
     register_count: u8,
     next_temporary: &mut u16,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+    decode_half_binary(
+        stage,
+        offset,
+        encoding,
+        register_count,
+        next_temporary,
+        false,
+    )
+}
+
+fn decode_half_binary(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next_temporary: &mut u16,
+    add: bool,
+) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     // HMUL2 register encoding and float/half swizzle/result modes:
     // https://github.com/envytools/envytools/blob/master/envydis/gm107.c#L1133-L1162
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_multiply.cpp
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_helper.cpp
-    let precision = (encoding >> 39) & 3;
-    if precision != 0 || encoding & (1 << 32) != 0 {
+    let immediate32 = add && encoding & 0xfe00_0000_0000_0000 == 0x2c00_0000_0000_0000;
+    let immediate = add && encoding & 0xfe80_0000_0000_0000 == 0x7a00_0000_0000_0000;
+    let precision = (encoding >> if immediate32 { 55 } else { 39 }) & if add { 1 } else { 3 };
+    if precision != 0 || encoding & (1 << if immediate || immediate32 { 52 } else { 32 }) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "HMUL2 FTZ/FMZ or saturation mode is not implemented",
+            detail: "half arithmetic FTZ/FMZ or saturation mode is not implemented",
         });
     }
     let raw_destination = encoding as u8;
@@ -46,17 +89,44 @@ pub(super) fn decode_half_multiply(
         next_temporary,
         &mut operations,
     )?;
-    let right = prepare_float_register_source(
-        stage,
-        offset,
-        encoding,
-        (encoding >> 20) as u8,
-        false,
-        false,
-        register_count,
-        next_temporary,
-        &mut operations,
-    )?;
+    let right = if immediate || immediate32 {
+        let destination = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "HADD2 immediate temporary overflow",
+            next_temporary,
+        )?;
+        // The compact immediate stores two signed half values with six zero
+        // mantissa bits; HADD2_32I carries the complete packed half pair.
+        // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_add.cpp
+        let bits = if immediate32 {
+            (encoding >> 20) as u32
+        } else {
+            (((encoding >> 20) as u32 & 0x1ff) << 6)
+                | (((encoding >> 29) as u32 & 1) << 15)
+                | (((encoding >> 30) as u32 & 0x1ff) << 22)
+                | (((encoding >> 56) as u32 & 1) << 31)
+        };
+        operations.push(ShaderOperation::MoveImmediate32 {
+            destination,
+            bits,
+            scalar_type: ShaderScalarType::Unsigned32,
+        });
+        destination
+    } else {
+        prepare_float_register_source(
+            stage,
+            offset,
+            encoding,
+            (encoding >> 20) as u8,
+            false,
+            false,
+            register_count,
+            next_temporary,
+            &mut operations,
+        )?
+    };
     let temporary = |next: &mut u16| {
         allocate_shader_temporary(
             stage,
@@ -66,7 +136,7 @@ pub(super) fn decode_half_multiply(
             next,
         )
     };
-    let merge = (encoding >> 49) & 3;
+    let merge = if immediate32 { 0 } else { (encoding >> 49) & 3 };
     let lanes: &[u8] = match merge {
         0 => &[0, 1],
         3 => &[1],
@@ -76,12 +146,25 @@ pub(super) fn decode_half_multiply(
     for (result_index, &lane) in lanes.iter().enumerate() {
         let mut operands = [ShaderRegister::new(0); 2];
         for (operand_index, (source, swizzle, absolute, negate)) in [
-            (left, (encoding >> 47) & 3, encoding & (1 << 44) != 0, false),
+            (
+                left,
+                if immediate32 {
+                    (encoding >> 53) & 3
+                } else {
+                    (encoding >> 47) & 3
+                },
+                !immediate32 && encoding & (1 << 44) != 0,
+                add && encoding & (1 << if immediate32 { 56 } else { 43 }) != 0,
+            ),
             (
                 right,
-                (encoding >> 28) & 3,
-                encoding & (1 << 30) != 0,
-                encoding & (1 << 31) != 0,
+                if immediate || immediate32 {
+                    0
+                } else {
+                    (encoding >> 28) & 3
+                },
+                !immediate && !immediate32 && encoding & (1 << 30) != 0,
+                !immediate && !immediate32 && encoding & (1 << 31) != 0,
             ),
         ]
         .into_iter()
@@ -115,12 +198,22 @@ pub(super) fn decode_half_multiply(
             )?;
         }
         let product = temporary(next_temporary)?;
-        operations.push(ShaderOperation::Multiply32 {
-            destination: product,
-            left: operands[0],
-            right: operands[1],
-            scalar_type: ShaderScalarType::Float32,
-            float_control: ShaderFloatControl::PRECISE,
+        operations.push(if add {
+            ShaderOperation::Add32 {
+                destination: product,
+                left: operands[0],
+                right: operands[1],
+                scalar_type: ShaderScalarType::Float32,
+                float_control: ShaderFloatControl::PRECISE,
+            }
+        } else {
+            ShaderOperation::Multiply32 {
+                destination: product,
+                left: operands[0],
+                right: operands[1],
+                scalar_type: ShaderScalarType::Float32,
+                float_control: ShaderFloatControl::PRECISE,
+            }
         });
         let rounded = temporary(next_temporary)?;
         // Two binary16 significands have an exact binary32 product; mixed F32
@@ -180,6 +273,191 @@ pub(super) fn decode_half_multiply(
             left: low,
             right: high,
             operation: ShaderBitwiseOperation::Or,
+        });
+    }
+    Ok(operations)
+}
+
+pub(super) const fn is_half_set_predicate(encoding: u64) -> bool {
+    encoding & 0xfff8_0000_0000_0000 == 0x5d20_0000_0000_0000
+}
+
+pub(super) fn decode_half_set_predicate(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next: &mut u16,
+) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+    use nixe_gpu::{ShaderFloatComparison as C, ShaderPredicate, ShaderPredicateSetOperation};
+    // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_set_predicate.cpp
+    let destinations = [((encoding >> 3) & 7) as u8, (encoding & 7) as u8];
+    if encoding & ((1 << 49) | (1 << 6)) != 0
+        || (destinations[0] == destinations[1] && destinations[0] != 7)
+    {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "HSETP2 lane conjunction, half FTZ or aliased predicate destinations are not implemented",
+        });
+    }
+    let comparison = match (encoding >> 35) & 15 {
+        1 => C::OrderedLess,
+        2 => C::OrderedEqual,
+        3 => C::OrderedLessOrEqual,
+        4 => C::OrderedGreater,
+        5 => C::OrderedNotEqual,
+        6 => C::OrderedGreaterOrEqual,
+        7 => C::IsNumber,
+        8 => C::IsNan,
+        9 => C::UnorderedLess,
+        10 => C::UnorderedEqual,
+        11 => C::UnorderedLessOrEqual,
+        12 => C::UnorderedGreater,
+        13 => C::UnorderedNotEqual,
+        14 => C::UnorderedGreaterOrEqual,
+        _ => {
+            return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                stage,
+                instruction_offset: offset,
+                encoding,
+                detail: "HSETP2 constant comparison is not implemented",
+            });
+        }
+    };
+    let set_operation = match (encoding >> 45) & 3 {
+        0 => ShaderPredicateSetOperation::And,
+        1 => ShaderPredicateSetOperation::Or,
+        2 => ShaderPredicateSetOperation::Xor,
+        _ => {
+            return Err(super::error::malformed(
+                stage,
+                offset,
+                encoding,
+                "HSETP2 reserved boolean operation",
+            ));
+        }
+    };
+    let accumulator = super::decode::decode_predicate_fields(encoding, 39, 42);
+    let mut operations = Vec::new();
+    let mut operands = [[ShaderRegister::new(0); 2]; 2];
+    for (lane, lane_operands) in operands.iter_mut().enumerate() {
+        for (index, (raw, swizzle, absolute, negate)) in [
+            (
+                (encoding >> 8) as u8,
+                (encoding >> 47) & 3,
+                encoding & (1 << 44) != 0,
+                encoding & (1 << 43) != 0,
+            ),
+            (
+                (encoding >> 20) as u8,
+                (encoding >> 28) & 3,
+                encoding & (1 << 30) != 0,
+                encoding & (1 << 31) != 0,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = prepare_float_register_source(
+                stage,
+                offset,
+                encoding,
+                raw,
+                false,
+                false,
+                register_count,
+                next,
+                &mut operations,
+            )?;
+            let value = if swizzle == 1 {
+                source
+            } else {
+                let destination = allocate_shader_temporary(
+                    stage,
+                    offset,
+                    encoding,
+                    "HSETP2 temporary overflow",
+                    next,
+                )?;
+                operations.push(ShaderOperation::UnpackHalf32 {
+                    destination,
+                    source,
+                    high: match swizzle {
+                        0 => lane == 1,
+                        2 => false,
+                        3 => true,
+                        _ => unreachable!(),
+                    },
+                });
+                destination
+            };
+            lane_operands[index] = apply_float_source_modifiers(
+                stage,
+                offset,
+                encoding,
+                value,
+                absolute,
+                negate,
+                next,
+                &mut operations,
+            )?;
+        }
+    }
+    // Freeze both comparisons before publishing either predicate. This also
+    // preserves the instruction guard when a destination aliases that guard.
+    let mut results = [ShaderRegister::new(0); 2];
+    for lane in 0..2 {
+        results[lane] = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "HSETP2 result temporary overflow",
+            next,
+        )?;
+        operations.push(ShaderOperation::CompareFloat32 {
+            destination: results[lane],
+            float_result: false,
+            left: operands[lane][0],
+            right: operands[lane][1],
+            comparison,
+            accumulator,
+            set_operation,
+            flush_denormals_to_zero: false,
+        });
+    }
+    let zero = allocate_shader_temporary(
+        stage,
+        offset,
+        encoding,
+        "HSETP2 zero temporary overflow",
+        next,
+    )?;
+    operations.push(ShaderOperation::MoveImmediate32 {
+        destination: zero,
+        bits: 0,
+        scalar_type: ShaderScalarType::Unsigned32,
+    });
+    let guard = super::decode::decode_predicate(encoding);
+    let order = if matches!(guard, ShaderPredicate::Register {register,..} if register == destinations[0])
+    {
+        [1, 0]
+    } else {
+        [0, 1]
+    };
+    for lane in order {
+        if destinations[lane] == 7 {
+            continue;
+        }
+        operations.push(ShaderOperation::SetPredicateInteger32 {
+            destinations: [Some(destinations[lane]), None],
+            left: results[lane],
+            right: zero,
+            signed: false,
+            comparison: nixe_gpu::ShaderIntegerComparison::NotEqual,
+            accumulator: ShaderPredicate::Always,
+            set_operation: ShaderPredicateSetOperation::And,
         });
     }
     Ok(operations)

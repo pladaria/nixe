@@ -22,6 +22,10 @@ impl Drop for Device {
 impl AudioDevice for Device {}
 
 impl AudioBackend for Backend {
+    fn output_layout(&self) -> Result<nixe_audio::ChannelLayout, nixe_audio::AudioError> {
+        Ok(nixe_audio::ChannelLayout::Stereo)
+    }
+
     fn open(&self, feed: AudioFeed) -> Result<Box<dyn AudioDevice>, AudioError> {
         *self.feed.lock().unwrap() = Some(feed);
         self.live.fetch_add(1, Ordering::SeqCst);
@@ -33,7 +37,7 @@ impl AudioBackend for Backend {
 // pointer descriptors and output-pointer size table are retained in auto-select
 // requests. libnx does not clear TLS alignment padding when reusing the buffer:
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L93-L146
-fn command(
+pub(super) fn command(
     cmd: u32,
     data: &[u8],
     send: Option<(u64, u64)>,
@@ -87,7 +91,7 @@ fn command(
     b
 }
 
-fn call(
+pub(super) fn call(
     process: &mut ScheduledProcess,
     dispatcher: &mut HorizonSvcDispatcher,
     handle: u32,
@@ -105,13 +109,13 @@ fn call(
     assert!(!special || read_guest_u32(process, tls.checked_add(8).unwrap()) != 0);
     read_guest_u32(process, tls.checked_add(24).unwrap())
 }
-fn data32(process: &ScheduledProcess) -> u32 {
+pub(super) fn data32(process: &ScheduledProcess) -> u32 {
     read_guest_u32(
         process,
         process.main_thread().tls_base.checked_add(32).unwrap(),
     )
 }
-fn handle(process: &ScheduledProcess) -> u32 {
+pub(super) fn handle(process: &ScheduledProcess) -> u32 {
     read_guest_u32(
         process,
         process.main_thread().tls_base.checked_add(12).unwrap(),
@@ -120,9 +124,14 @@ fn handle(process: &ScheduledProcess) -> u32 {
 
 #[test]
 fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
-    'variants: for (auto, invalid_release) in
-        [(false, false), (true, false), (false, true), (true, true)]
-    {
+    'variants: for (auto, invalid_release, channel_count) in [
+        (false, false, 2),
+        (true, false, 2),
+        (false, true, 2),
+        (true, true, 2),
+        (false, false, 6),
+        (true, false, 6),
+    ] {
         let (_dir, mut process) =
             fixture_process_with_svcs(&[&[0x1f][..], &[0x21; 100][..]].concat());
         let backend = Arc::new(Backend::default());
@@ -160,7 +169,11 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         let releases = base.checked_add(768).unwrap();
         write_guest_bytes(&process, base, &[0; 256]);
         let mut config = [0; 16];
-        put_u32(&mut config, 4, 0x0002_0000); // libnx's reserved high half.
+        put_u32(
+            &mut config,
+            4,
+            if channel_count == 2 { 0x0002_0000 } else { 6 },
+        ); // libnx's reserved high half.
         let open = command(
             if auto { 3 } else { 1 },
             &config,
@@ -215,7 +228,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                 &process,
                 process.main_thread().tls_base.checked_add(36).unwrap()
             ),
-            2
+            channel_count as u32
         );
         assert_eq!(
             read_guest_u32(&process, out_name),
@@ -244,9 +257,24 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         put_u64(&mut buffer, 32, u64::MAX);
         put_u64(&mut buffer, 8, samples.get());
         put_u64(&mut buffer, 16, 4096);
-        put_u64(&mut buffer, 24, 8);
+        put_u64(&mut buffer, 24, channel_count as u64 * 4);
         write_guest_bytes(&process, descriptor, &buffer);
-        write_guest_bytes(&process, samples, &[1, 0, 0xff, 0xff, 2, 0, 0xfe, 0xff]);
+        let first: Vec<i16> = (0..channel_count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    i as i16 + 1
+                } else {
+                    -(i as i16)
+                }
+            })
+            .collect();
+        let second: Vec<i16> = first.iter().map(|v| v * 2).collect();
+        let bytes: Vec<u8> = first
+            .iter()
+            .chain(&second)
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        write_guest_bytes(&process, samples, &bytes);
         let append = command(
             if auto { 7 } else { 3 },
             &123_u64.to_le_bytes(),
@@ -283,9 +311,9 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             [0xa5; 8]
         );
         let feed = backend.feed.lock().unwrap().clone().unwrap();
-        let mut pcm = [9; 2];
+        let mut pcm = vec![9; channel_count];
         feed.render(&mut pcm);
-        assert_eq!(pcm, [0, 0]);
+        assert_eq!(pcm, vec![0; channel_count]);
         for round in 0..2 {
             if round == 1 {
                 assert_eq!(call(&mut process, &mut dispatcher, audio, &append), 0);
@@ -309,10 +337,10 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                 153 | (2 << 9)
             );
             feed.render(&mut pcm);
-            assert_eq!(pcm, [1, -1]);
+            assert_eq!(pcm, first);
             assert!(!event.is_signalled());
             feed.render(&mut pcm);
-            assert_eq!(pcm, [2, -2]);
+            assert_eq!(pcm, second);
             assert!(event.is_signalled());
             if invalid_release {
                 // A release list starts in writable RAM but crosses into a

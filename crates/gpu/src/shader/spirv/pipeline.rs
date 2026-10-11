@@ -8,6 +8,7 @@ use crate::{PipelineStages, TessellationControl};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SpirvTessellationOptions {
     pub depth_clip_negative_one_to_one: bool,
+    pub vertex_position_transform: Option<crate::VertexPositionTransform>,
     pub input_control_points: u8,
     pub mode: TessellationMode,
     pub float32: SpirvFloat32Capabilities,
@@ -120,6 +121,7 @@ pub fn lower_tessellation_shaders_to_spirv(
     let evaluation = &linked_evaluation;
     let base = SpirvShaderOptions {
         depth_clip_negative_one_to_one: false,
+        vertex_position_transform: None,
         input_control_points: 0,
         tessellation_mode: None,
         float32: options.float32,
@@ -168,6 +170,7 @@ pub fn lower_tessellation_shaders_to_spirv(
                 input_control_points: output_control_points,
                 tessellation_mode: Some(options.mode),
                 depth_clip_negative_one_to_one: options.depth_clip_negative_one_to_one,
+                vertex_position_transform: options.vertex_position_transform,
                 ..base
             },
         )?,
@@ -213,6 +216,7 @@ pub fn lower_raster_shaders_to_spirv(
             fragment,
             SpirvShaderOptions {
                 depth_clip_negative_one_to_one: false,
+                vertex_position_transform: None,
                 ..options
             },
         )?,

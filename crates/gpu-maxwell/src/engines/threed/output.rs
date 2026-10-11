@@ -1131,6 +1131,20 @@ impl Default for MaxwellThreeDFixedFunctionState {
         // MME shadow reads; provenance and firmware table hash live in state.rs.
         for (register, method, value) in [
             (
+                MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable,
+                0x192c,
+                MaxwellThreeDFixedFunctionValue::ViewportScaleOffsetEnable(
+                    MaxwellThreeDViewportScaleOffsetEnable::Enabled,
+                ),
+            ),
+            (
+                MaxwellThreeDFixedFunctionRegister::ViewportClipControl,
+                0x193c,
+                MaxwellThreeDFixedFunctionValue::ClipControl(
+                    MaxwellThreeDViewportClipControl::parse(0x2c1c).unwrap(),
+                ),
+            ),
+            (
                 MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha,
                 0x133c,
                 MaxwellThreeDFixedFunctionValue::Boolean(true),

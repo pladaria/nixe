@@ -126,6 +126,8 @@ command_enum!(SelfControllerCommand {
     16 => SetOutOfFocusSuspendingEnabled,
     40 => CreateManagedDisplayLayer,
     44 => CreateManagedDisplaySeparableLayer,
+    62 => SetIdleTimeDetectionExtension,
+    63 => GetIdleTimeDetectionExtension,
     90 => GetAccumulatedSuspendedTickValue,
     91 => GetAccumulatedSuspendedTickChangedEvent,
 });

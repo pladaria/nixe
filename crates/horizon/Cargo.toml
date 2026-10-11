@@ -27,3 +27,7 @@ nixe-video.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 toml.workspace = true
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

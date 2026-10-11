@@ -260,6 +260,7 @@ fn operation_resource_scope_ignores_only_unconsumed_partial_color_targets() {
 #[test]
 fn operation_resource_scope_ignores_an_unreferenced_contradictory_vertex_stream() {
     let mut channel = three_d_channel();
+    program_three_d(&mut channel, 0x121c, 0);
     for (method, argument) in [
         (0x1c00, 0x1018),
         (0x1c04, 1),
@@ -446,8 +447,8 @@ fn captured_deko_basic_color_target_accepts_its_matching_c32_pte_kind() {
         .expect("captured color target must resolve as an image");
 
     assert_eq!(image.guest_layout().pte_kind(), 0xdb);
-    assert!(!image.guest_layout().requires_materialization());
-    assert!(image.guest_layout().has_direct_canonical_representation());
+    assert!(image.guest_layout().requires_materialization());
+    assert!(!image.guest_layout().has_direct_canonical_representation());
 }
 
 #[test]
@@ -928,8 +929,8 @@ fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot
     let plan = lower(full.operations()[0], &mut cache).unwrap();
     assert!(plan.resource_creations().iter().any(|creation| matches!(
         creation,
-        nixe_gpu::BackendResourceCreateInfo::Image { description, view: None, .. }
-            if description.dimension() == nixe_gpu::ImageDimension::Two
+        nixe_gpu::BackendResourceCreateInfo::Image { description, view: Some(view), .. }
+            if !view.has_canonical_texels() && description.dimension() == nixe_gpu::ImageDimension::Two
                 && description.extent().depth == 1
                 && description.array_layers() == 1
     )));
@@ -1168,7 +1169,7 @@ fn check_depth_2cz_materialization(
     .unwrap();
     assert!(plan.resource_creations().iter().any(|creation| matches!(
         creation,
-        nixe_gpu::BackendResourceCreateInfo::Image { view: None, .. }
+        nixe_gpu::BackendResourceCreateInfo::Image { view: Some(view), .. } if !view.has_canonical_texels()
     )));
     assert!(matches!(
         plan.submission().operations()[0].command(),

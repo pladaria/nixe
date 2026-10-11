@@ -549,6 +549,10 @@ impl MaxwellThreeDSmTimeoutCounterBit {
 /// One validated shader-execution register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderExecutionStateWrite {
+    StreamOutputEnable {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
     PixelShaderInterlockControl {
         value: MaxwellThreeDPixelShaderInterlockControl,
         source: MaxwellMethodSource,
@@ -619,6 +623,10 @@ pub enum MaxwellThreeDShaderExecutionStateWrite {
 /// Persistent shader-execution configuration on one `MAXWELL_B` channel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderExecutionState {
+    // Capture vertex outputs to memory (transform feedback), independently
+    // of rasterization. Disabled state requires no host capture resources.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L568-L571
+    stream_output_enable: MaxwellThreeDRegister<bool>,
     pixel_shader_interlock_control: MaxwellThreeDRegister<MaxwellThreeDPixelShaderInterlockControl>,
     opportunistic_early_z_hysteresis: MaxwellThreeDRegister<u8>,
     api_mandated_early_z: MaxwellThreeDRegister<MaxwellThreeDApiMandatedEarlyZ>,
@@ -635,6 +643,11 @@ pub struct MaxwellThreeDShaderExecutionState {
 }
 
 impl MaxwellThreeDShaderExecutionState {
+    #[must_use]
+    pub const fn stream_output_enable(&self) -> &MaxwellThreeDRegister<bool> {
+        &self.stream_output_enable
+    }
+
     #[must_use]
     pub const fn pixel_shader_interlock_control(
         &self,
@@ -729,6 +742,10 @@ impl MaxwellThreeDShaderExecutionState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderExecutionStateWrite) {
         match write {
+            MaxwellThreeDShaderExecutionStateWrite::StreamOutputEnable { value, source } => {
+                self.stream_output_enable =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
             MaxwellThreeDShaderExecutionStateWrite::PixelShaderInterlockControl {
                 value,
                 source,

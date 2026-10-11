@@ -73,7 +73,7 @@ impl PatchAddresses {
         }
     }
 
-    fn remove(&mut self, register: ShaderRegister) {
+    pub(super) fn remove(&mut self, register: ShaderRegister) {
         if let Some(values) = &mut self.values
             && let Some(value) = values.get_mut(usize::from(register.index()))
             && value.take().is_some()

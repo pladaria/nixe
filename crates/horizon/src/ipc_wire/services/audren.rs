@@ -1,0 +1,354 @@
+//! Audio-renderer configuration, updates and automatic execution.
+//!
+//! IPC and renderer state: https://switchbrew.org/wiki/Audio_services#audren:u
+//! Parameter layout: https://github.com/switchbrew/libnx/blob/master/nx/source/services/audren.c
+
+use super::prelude::*;
+
+use crate::audio_renderer::update::{HEADER_SIZE, UpdateError, UpdateLayout};
+use crate::audio_renderer::{PARAMETER_SIZE, RendererParameters};
+use crate::{AudioRendererManagerSession, AudioRendererSession};
+
+fn update_error(error: UpdateError, token: u32) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    match error {
+        UpdateError::Invalid => cmif_error(token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO),
+        UpdateError::Unsupported(detail) => Err(IpcWireError::AudioRenderer(detail)),
+        UpdateError::Mapping(error) => Err(IpcWireError::AudioRenderer(error.to_string().into())),
+    }
+}
+
+fn update_outputs(hipc: &HipcRequest<'_>, auto: bool) -> Result<[(u64, usize); 2], IpcWireError> {
+    let [status, performance] = hipc.receive_buffers.as_slice() else {
+        return Err(IpcWireError::Malformed(
+            "renderer update requires two output buffers",
+        ));
+    };
+    if status.mode == BufferMode::Invalid || performance.mode == BufferMode::Invalid {
+        return Err(IpcWireError::Malformed(
+            "renderer output buffer has an invalid mapping mode",
+        ));
+    }
+    let mut result = [(0, 0); 2];
+    let pointers = match &hipc.receive_statics {
+        ReceiveStatics::Entries(pointers) if auto && pointers.len() == 2 => Some(pointers),
+        ReceiveStatics::None if !auto => None,
+        _ => {
+            return Err(IpcWireError::Malformed(
+                "renderer update output pointer count is invalid",
+            ));
+        }
+    };
+    for (index, descriptor) in [status, performance].into_iter().enumerate() {
+        let address = descriptor.address;
+        let size = usize::try_from(descriptor.size)
+            .map_err(|_| IpcWireError::Malformed("renderer output size overflows"))?;
+        result[index] = if let Some(pointers) = pointers {
+            let pointer = &pointers[index];
+            match (
+                pointer.address != 0 || pointer.size != 0,
+                address != 0 || size != 0,
+            ) {
+                (true, false) if pointer.address != 0 => (pointer.address, pointer.size as usize),
+                (false, true) if address != 0 => (address, size),
+                (false, false) => (0, 0),
+                _ => {
+                    return Err(IpcWireError::Malformed(
+                        "renderer output has invalid auto-select descriptor sides",
+                    ));
+                }
+            }
+        } else {
+            (address, size)
+        };
+    }
+    Ok(result)
+}
+
+fn dispatch_update(
+    process: &ExceptionProcessContext<'_>,
+    session: &AudioRendererSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let auto = request.command_id == 10;
+    if hipc.pid.is_some()
+        || !hipc.copy_handles.is_empty()
+        || !hipc.move_handles.is_empty()
+        || !hipc.exchange_buffers.is_empty()
+        || (!auto && !hipc.send_statics.is_empty())
+    {
+        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+    }
+    let (input_address, input_size) = if auto {
+        one_auto_select_input(hipc)?
+    } else {
+        let descriptor = one_send_buffer(hipc)?;
+        (
+            descriptor.address,
+            usize::try_from(descriptor.size)
+                .map_err(|_| IpcWireError::Malformed("renderer input size overflows"))?,
+        )
+    };
+    let [(output_address, output_size), _performance] = update_outputs(hipc, auto)?;
+    if input_size < HEADER_SIZE {
+        return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO);
+    }
+    let mut header = [0; HEADER_SIZE];
+    read_bytes(
+        process,
+        GuestVirtualAddress::new(input_address),
+        &mut header,
+    )?;
+    let layout = match UpdateLayout::parse(&session.0.parameters, &header, input_size) {
+        Ok(layout) => layout,
+        Err(error) => return update_error(error, request.token),
+    };
+    if output_size != layout.output_size {
+        return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO);
+    }
+    crate::ipc_wire::io::validate_writable_ram_range(
+        process,
+        GuestVirtualAddress::new(output_address),
+        output_size,
+    )?;
+    let mut input = Vec::new();
+    input
+        .try_reserve_exact(input_size)
+        .map_err(|_| IpcWireError::HostResourceExhausted("reading an audio renderer update"))?;
+    input.resize(input_size, 0);
+    read_bytes(process, GuestVirtualAddress::new(input_address), &mut input)?;
+    let mut state = session.0.update.lock().unwrap();
+    if let Some(error) = &state.failure {
+        return Err(IpcWireError::AudioRenderer(error.clone()));
+    }
+    let output = match state.update(&session.0.parameters, &layout, &input, |address, size| {
+        process.canonical_memory().translate_canonical_range(
+            process.cpu().address_space_id(),
+            GuestVirtualAddress::new(address),
+            size,
+            nixe_memory::MemoryPermissions::NONE,
+        )
+    }) {
+        Ok(output) => output,
+        Err(error) => return update_error(error, request.token),
+    };
+    write_bytes(process, GuestVirtualAddress::new(output_address), &output)?;
+    session.0.event.clear();
+    semantic_success(request.token, false, &[], &[], &[], None)
+}
+
+pub(in crate::ipc_wire) fn dispatch_audio_renderer_manager(
+    process: &mut ExceptionProcessContext<'_>,
+    session: &AudioRendererManagerSession,
+    backend: Option<&std::sync::Arc<dyn nixe_audio::AudioBackend>>,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let command = request.command_id;
+    if matches!(command, 2 | 4) {
+        let required_size = if command == 2 { 8 } else { 16 };
+        if !request.has_payload_size(required_size) || has_ipc_descriptors(hipc) {
+            return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+        }
+        let (revision, aruid) = if command == 2 {
+            (
+                u32::from_le_bytes(*b"REV1"),
+                request_u64(request.data, 0).unwrap(),
+            )
+        } else {
+            (
+                request_u32(request.data, 0).unwrap(),
+                request_u64(request.data, 8).unwrap(),
+            )
+        };
+        let Some(revision) = crate::audio_renderer::revision_number(revision) else {
+            return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_REVISION);
+        };
+        let backend = backend.ok_or_else(|| {
+            IpcWireError::AudioBackend("IAudioDevice requires a host audio backend".into())
+        })?;
+        let device = session
+            .device(revision, aruid, backend.clone())
+            .map_err(|error| IpcWireError::AudioBackend(error.0.into_boxed_str()))?;
+        let handle = process
+            .handles_mut()
+            .insert(HorizonIpcObject::AudioDevice(device))
+            .map_err(|_| IpcWireError::HostResourceExhausted("opening an audio device session"))?;
+        log::debug!("opening audio device interface: revision={revision} aruid={aruid:#x}");
+        return semantic_success(request.token, false, &[], &[], &[], Some(handle));
+    }
+    if !matches!(command, 0 | 1) {
+        return unsupported_service_command("audren:u", request.command_id);
+    }
+    let opening = command == 0;
+    let required_size = if opening { 72 } else { PARAMETER_SIZE };
+    let invalid_descriptors = if opening {
+        hipc.pid.is_none()
+            || hipc.copy_handles.len() != 2
+            || !hipc.move_handles.is_empty()
+            || !hipc.send_buffers.is_empty()
+            || !hipc.receive_buffers.is_empty()
+            || !hipc.exchange_buffers.is_empty()
+            || !hipc.send_statics.is_empty()
+            || !matches!(hipc.receive_statics, ReceiveStatics::None)
+    } else {
+        has_ipc_descriptors(hipc)
+    };
+    if !request.has_payload_size(required_size) || invalid_descriptors {
+        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+    }
+    let params = RendererParameters::decode(request.data[..PARAMETER_SIZE].try_into().unwrap());
+    let Some(revision) = params.revision_number() else {
+        return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_REVISION);
+    };
+    if revision > 7 {
+        return Err(IpcWireError::UnsupportedService(
+            UnsupportedServiceOperation::CommandVariant {
+                service: "audren:u",
+                command_id: command,
+                detail: "work-memory layout for REV8 and later is not implemented",
+            },
+        ));
+    }
+    let Some(size) = params.work_buffer_size(revision) else {
+        return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
+    };
+    if opening {
+        let Some(work_memory) = process
+            .handles()
+            .get_as::<TransferMemoryObject>(hipc.copy_handles[0])
+            .cloned()
+        else {
+            return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_HANDLE);
+        };
+        let owner = hipc.copy_handles[1];
+        if owner != crate::CURRENT_PROCESS_HANDLE {
+            let Some(owner) = process
+                .handles()
+                .get_as::<nixe_runtime::ProcessObject>(owner)
+            else {
+                return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_HANDLE);
+            };
+            if owner.process_id() != process.process_id() {
+                return unsupported_variant(
+                    "audren:u",
+                    command,
+                    "renderer for another process is not implemented",
+                );
+            }
+        }
+        let work_size = request_u64(request.data, 56).unwrap();
+        if work_size > work_memory.size() || work_size < size {
+            return cmif_error(request.token, HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER);
+        }
+        if params.execution_mode != 0 || params.rendering_device != 0 {
+            return unsupported_variant(
+                "audren:u",
+                command,
+                "manual execution or a non-ADSP rendering device is not implemented",
+            );
+        }
+        // These are renderer constraints, not constraints on the sizing query.
+        if params.sample_rate != 48000 || params.samples != 240 {
+            return unsupported_variant(
+                "audren:u",
+                command,
+                "renderer rates other than 48000 Hz / 240 samples are not implemented",
+            );
+        }
+        let aruid = request_u64(request.data, 64).unwrap();
+        log::debug!(
+            "opening audio renderer: parameters={params:?} work-memory={work_size:#x} aruid={aruid:#x}"
+        );
+        let Some(renderer) = session
+            .open(params, work_memory, work_size, aruid, process.process_id())
+            .map_err(|error| IpcWireError::AudioRenderer(error.to_string().into_boxed_str()))?
+        else {
+            return cmif_error(request.token, HorizonIpcResult::AUDIO_OUT_OF_SESSIONS);
+        };
+        let handle = process
+            .handles_mut()
+            .insert(HorizonIpcObject::AudioRenderer(renderer))
+            .map_err(|_| {
+                IpcWireError::HostResourceExhausted("opening an audio renderer session")
+            })?;
+        return semantic_success(request.token, false, &[], &[], &[], Some(handle));
+    }
+    log::debug!(
+        "audio renderer work memory: sample-rate={} parameters={params:?} revision-number={revision} size={size:#x}",
+        params.sample_rate,
+    );
+    semantic_success(request.token, false, &size.to_le_bytes(), &[], &[], None)
+}
+
+fn unsupported_variant<T>(
+    service: &'static str,
+    command_id: u32,
+    detail: &'static str,
+) -> Result<T, IpcWireError> {
+    Err(IpcWireError::UnsupportedService(
+        UnsupportedServiceOperation::CommandVariant {
+            service,
+            command_id,
+            detail,
+        },
+    ))
+}
+
+pub(in crate::ipc_wire) fn dispatch_audio_renderer(
+    process: &mut ExceptionProcessContext<'_>,
+    session: &AudioRendererSession,
+    backend: Option<&std::sync::Arc<dyn nixe_audio::AudioBackend>>,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let command = request.command_id;
+    if matches!(command, 4 | 10) {
+        return dispatch_update(process, session, request, hipc);
+    }
+    if !matches!(command, 0..=3 | 5..=9) {
+        return unsupported_service_command("IAudioRenderer", command);
+    }
+    if has_ipc_descriptors(hipc) || (command == 8 && !request.has_payload_size(4)) {
+        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+    }
+    let state = &session.0;
+    if let Some(error) = &state.update.lock().unwrap().failure {
+        return Err(IpcWireError::AudioRenderer(error.clone()));
+    }
+    let value = match command {
+        0 => state.parameters.sample_rate,
+        1 => state.parameters.samples,
+        2 => state.parameters.mixes,
+        3 => u32::from(!state.update.lock().unwrap().started),
+        5 => {
+            let backend = backend.ok_or_else(|| {
+                IpcWireError::AudioRenderer("Start requires a host audio backend".into())
+            })?;
+            state
+                .start(backend.as_ref())
+                .map_err(IpcWireError::AudioRenderer)?;
+            return semantic_success(request.token, false, &[], &[], &[], None);
+        }
+        6 => {
+            state.stop();
+            return semantic_success(request.token, false, &[], &[], &[], None);
+        }
+        7 => {
+            let handle = process
+                .handles_mut()
+                .insert(state.event.clone())
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("copying an audio renderer event")
+                })?;
+            return semantic_success(request.token, false, &[], &[handle], &[], None);
+        }
+        8 => {
+            *state.rendering_time_limit.lock().unwrap() = request_u32(request.data, 0).unwrap();
+            return semantic_success(request.token, false, &[], &[], &[], None);
+        }
+        9 => *state.rendering_time_limit.lock().unwrap(),
+        _ => unreachable!(),
+    };
+    semantic_success(request.token, false, &value.to_le_bytes(), &[], &[], None)
+}

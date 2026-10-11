@@ -76,9 +76,11 @@ fn format(format: ImageFormat, float_depth24: bool) -> Result<vk::Format, Backen
     Ok(match format {
         ImageFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         ImageFormat::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
+        ImageFormat::R8Unorm => vk::Format::R8_UNORM,
         ImageFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
         ImageFormat::Bgra8Srgb => vk::Format::B8G8R8A8_SRGB,
         ImageFormat::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
+        ImageFormat::Rg11b10Ufloat => vk::Format::B10G11R11_UFLOAT_PACK32,
         ImageFormat::Depth16Unorm => vk::Format::D16_UNORM,
         ImageFormat::Depth24UnormStencil8Uint => {
             if float_depth24 {
@@ -323,7 +325,7 @@ impl NativePipeline {
         let samples = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let state = key.draw.depth_state;
-        let depth = vk::PipelineDepthStencilStateCreateInfo::default()
+        let mut depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(state.test_enabled)
             .depth_write_enable(state.test_enabled && state.write_enabled)
             .depth_compare_op(match state.compare {
@@ -336,6 +338,30 @@ impl NativePipeline {
                 DepthCompareOperation::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
                 DepthCompareOperation::Always => vk::CompareOp::ALWAYS,
             });
+        if let Some(stencil) = key.draw.stencil_state {
+            let face = |compare| vk::StencilOpState {
+                fail_op: vk::StencilOp::KEEP,
+                pass_op: vk::StencilOp::KEEP,
+                depth_fail_op: vk::StencilOp::KEEP,
+                compare_op: match compare {
+                    DepthCompareOperation::Never => vk::CompareOp::NEVER,
+                    DepthCompareOperation::Less => vk::CompareOp::LESS,
+                    DepthCompareOperation::Equal => vk::CompareOp::EQUAL,
+                    DepthCompareOperation::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
+                    DepthCompareOperation::Greater => vk::CompareOp::GREATER,
+                    DepthCompareOperation::NotEqual => vk::CompareOp::NOT_EQUAL,
+                    DepthCompareOperation::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
+                    DepthCompareOperation::Always => vk::CompareOp::ALWAYS,
+                },
+                compare_mask: u32::from(stencil.read_mask),
+                write_mask: 0,
+                reference: u32::from(stencil.reference),
+            };
+            depth = depth
+                .stencil_test_enable(true)
+                .front(face(stencil.front_compare))
+                .back(face(stencil.back_compare));
+        }
         let writes = [color_output(key.draw.color_outputs[0])];
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&writes);
         let dynamic_states = [

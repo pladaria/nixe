@@ -43,7 +43,11 @@ pub(crate) fn translate_compute_program(
         },
         None,
     )?;
-    let translated = translate_shader_binary(&binary, register_count, &BTreeMap::new())?;
+    let translated = translate_shader_binary(&binary, register_count, &BTreeMap::new()).inspect_err(|_| {
+        for bundle in binary.bundles() {
+            log::debug!("untranslated compute program: gpu-va={address:#x} offset={:#x} instructions={:016x?}", bundle.offset, bundle.instructions);
+        }
+    })?;
     // Cache the statically addressed constant-buffer requirements with the
     // translation; dispatch must not walk instructions to validate QMD sizes.
     let mut constant_buffer_extents = BTreeMap::<u8, u64>::new();

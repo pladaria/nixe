@@ -31,7 +31,9 @@ const CMIF_COMMAND_CLOSE: u16 = 2;
 pub(crate) struct HostSystems<'a> {
     pub video: &'a VideoSystem,
     pub audio_backend: Option<&'a std::sync::Arc<dyn nixe_audio::AudioBackend>>,
+    pub audio_renderers: &'a crate::AudioRendererManagerSession,
     pub hid: &'a HidSystem,
+    pub shared_fonts: &'a crate::SharedFontSession,
     pub settings: &'a SettingsEnvironment,
     pub application_language: Option<crate::SystemLanguage>,
     pub user_account_switch_locked: Option<bool>,
@@ -91,9 +93,14 @@ impl HorizonIpcObject {
             Self::AccountManagerForApplication(_) => "IManagerForApplication",
             Self::Bsd(_) => "bsd:u",
             Self::Ssl(_) => "ssl",
+            Self::Multimedia(_) => "mm:u",
             Self::AudioOutManager(_) => "audout:u",
             Self::AudioOut(_) => "IAudioOut",
+            Self::AudioRendererManager(_) => "audren:u",
+            Self::AudioRenderer(_) => "IAudioRenderer",
+            Self::AudioDevice(_) => "IAudioDevice",
             Self::Hid(_) => "hid",
+            Self::SharedFont(_) => "pl:u",
             Self::Irs(_) => "irs",
             Self::HidAppletResource(_) => "IAppletResource",
             Self::HidActiveVibrationDeviceList(_) => "IActiveVibrationDeviceList",
@@ -330,14 +337,44 @@ pub(crate) fn send_sync_request_from_buffer(
             services::dispatch_bsd(process, &session, request, &hipc)?
         }
         HorizonIpcObject::Ssl(session) => services::dispatch_ssl(&session, request, &hipc)?,
+        HorizonIpcObject::Multimedia(session) => {
+            services::dispatch_multimedia(&session, request, &hipc)?
+        }
         HorizonIpcObject::AudioOutManager(session) => {
             services::dispatch_audio_out_manager(process, &session, request, &hipc)?
         }
         HorizonIpcObject::AudioOut(session) => {
+            // VIDEO_PROBE_BEGIN
+            if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
+                log::debug!("VIDEO_PROBE audio-thread: thread={} command={} event={:?}", host_systems.caller_thread_id, request.command_id, session.event);
+            }
+            // VIDEO_PROBE_END
             services::dispatch_audio_out(process, &session, request, &hipc)?
+        }
+        HorizonIpcObject::AudioRendererManager(session) => {
+            services::dispatch_audio_renderer_manager(
+                process,
+                &session,
+                host_systems.audio_backend,
+                request,
+                &hipc,
+            )?
+        }
+        HorizonIpcObject::AudioRenderer(session) => services::dispatch_audio_renderer(
+            process,
+            &session,
+            host_systems.audio_backend,
+            request,
+            &hipc,
+        )?,
+        HorizonIpcObject::AudioDevice(session) => {
+            services::dispatch_audio_device(process, &session, request, &hipc)?
         }
         HorizonIpcObject::Hid(hid) => {
             services::dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?
+        }
+        HorizonIpcObject::SharedFont(session) => {
+            services::dispatch_shared_font(process, &session, request, &hipc)?
         }
         HorizonIpcObject::Irs(session) => {
             services::dispatch_irs(process, &session, request, &hipc)?

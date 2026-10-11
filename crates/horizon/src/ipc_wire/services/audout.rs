@@ -9,9 +9,9 @@
 //! https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L93-L146
 
 use super::prelude::*;
-use crate::audio::OUTPUT_FORMAT;
 use crate::ipc_wire::io::validate_writable_ram_range;
 use crate::{AudioOutManagerSession, AudioOutSession};
+use nixe_audio::PcmFormat;
 
 const NAME_SIZE: usize = 256;
 // https://github.com/skyline-emu/audio-core/blob/76440e0a3554433398c0ef03233f862a6e86f5ee/common/common.h
@@ -119,15 +119,17 @@ pub(in crate::ipc_wire) fn dispatch_audio_out_manager(
             // OpenAudioOut packs a u16 channel count followed by a reserved u16.
             // libnx passes 0x00020000: the actual channel count is zero (default).
             let channels = request_u32(request.data, 4).unwrap() & 0xffff;
-            if rate != 0 && rate != OUTPUT_FORMAT.sample_rate.get() {
+            if rate != 0 && rate != PcmFormat::STEREO_48KHZ.sample_rate.get() {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_SAMPLE_RATE);
             }
             if !matches!(channels, 0 | 2 | 6) {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_CHANNEL_COUNT);
             }
-            if channels == 6 {
-                return unsupported("audout:u", cmd, "six-channel PCM output is not implemented");
-            }
+            let format = if channels == 6 {
+                PcmFormat::SURROUND_48KHZ
+            } else {
+                PcmFormat::STEREO_48KHZ
+            };
             let (name_address, name_size) = input(hipc, cmd == 3)?;
             let (out_address, out_size) = output(hipc, cmd == 3)?;
             if name_size < NAME_SIZE || out_size < NAME_SIZE {
@@ -145,7 +147,7 @@ pub(in crate::ipc_wire) fn dispatch_audio_out_manager(
             name.fill(0);
             name[..9].copy_from_slice(b"DeviceOut");
             write_bytes(process, GuestVirtualAddress::new(out_address), &name)?;
-            let output = AudioOutSession::open(backend).map_err(audio_error)?;
+            let output = AudioOutSession::open(backend, format).map_err(audio_error)?;
             let handle = process
                 .handles_mut()
                 .insert(HorizonIpcObject::AudioOut(output))
@@ -154,8 +156,8 @@ pub(in crate::ipc_wire) fn dispatch_audio_out_manager(
                 })?;
             let mut data = Vec::with_capacity(16);
             for value in [
-                OUTPUT_FORMAT.sample_rate.get(),
-                OUTPUT_FORMAT.layout.channels() as u32,
+                format.sample_rate.get(),
+                format.layout.channels() as u32,
                 2,
                 1,
             ] {
@@ -227,12 +229,8 @@ pub(in crate::ipc_wire) fn dispatch_audio_out(
             if length > capacity || samples.checked_add(length).is_none() {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ADDRESS_INFO);
             }
-            if !length.is_multiple_of(OUTPUT_FORMAT.frame_bytes() as u64) {
-                return unsupported(
-                    "IAudioOut",
-                    cmd,
-                    "partial stereo PCM frames are not implemented",
-                );
+            if !length.is_multiple_of(audio.format().frame_bytes() as u64) {
+                return unsupported("IAudioOut", cmd, "partial PCM frames are not implemented");
             }
             let length = usize::try_from(length)
                 .map_err(|_| IpcWireError::Malformed("PCM data size overflows"))?;
@@ -255,6 +253,36 @@ pub(in crate::ipc_wire) fn dispatch_audio_out(
                         .map(|s| i16::from_le_bytes([s[0], s[1]])),
                 );
             }
+            // VIDEO_PROBE_BEGIN
+            if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
+                let channels = audio.format().layout.channels();
+                let peaks = (0..channels)
+                    .map(|c| {
+                        pcm.iter()
+                            .skip(c)
+                            .step_by(channels)
+                            .map(|x| i32::from(*x).abs())
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .collect::<Vec<_>>();
+                log::debug!(
+                    "VIDEO_PROBE audio-append: tag={} frames={} peaks={peaks:?}",
+                    request_u64(request.data, 0).unwrap(),
+                    pcm.len() / channels
+                );
+            }
+            if let Some(path) = std::env::var_os("NIXE_VIDEO_PCM") {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap();
+                let bytes = pcm.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>();
+                file.write_all(&bytes).unwrap();
+            }
+            // VIDEO_PROBE_END
             audio
                 .append(request_u64(request.data, 0).unwrap(), pcm)
                 .map_err(audio_error)?;
@@ -302,5 +330,15 @@ pub(in crate::ipc_wire) fn dispatch_audio_out(
         10 => data.extend_from_slice(&audio.played_frames().map_err(audio_error)?.to_le_bytes()),
         _ => unreachable!(),
     }
+    // VIDEO_PROBE_BEGIN
+    if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
+        log::debug!(
+            "VIDEO_PROBE audio-cmd: cmd={cmd} owned={:?} count={:?} played={:?} reply={data:?}",
+            audio.owned_buffer_count(),
+            audio.buffer_count(),
+            audio.played_frames()
+        );
+    }
+    // VIDEO_PROBE_END
     semantic_success(request.token, false, &data, &[], &[], None)
 }

@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn reconstructed_window_depth_is_a_real_fragment_depth_export() {
+    let original = shader(
+        ShaderStage::Fragment,
+        vec![],
+        vec![],
+        vec![],
+        vec![ShaderOperation::Exit],
+    );
+    let specialized = original
+        .with_fragment_depth_transform(
+            crate::FragmentDepthTransform::new(2.0, -1.0, 0.0, 1.0).unwrap(),
+        )
+        .unwrap();
+    let module = module(&specialized, graphics_options());
+    assert!(module.execution_modes.iter().any(|instruction| {
+        instruction
+            .operands
+            .contains(&Operand::ExecutionMode(spv::ExecutionMode::DepthReplacing))
+    }));
+    assert!(module.annotations.iter().any(|instruction| {
+        instruction
+            .operands
+            .contains(&Operand::BuiltIn(spv::BuiltIn::FragDepth))
+    }));
+    assert_eq!(ops(&module, spv::Op::FMul).len(), 1);
+    assert_eq!(ops(&module, spv::Op::FAdd).len(), 1);
+}
+
+#[test]
 fn negative_one_to_one_depth_conversion_occurs_after_guest_position_exports() {
     let ir = shader(
         ShaderStage::Vertex,

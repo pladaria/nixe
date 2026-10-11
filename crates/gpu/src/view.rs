@@ -200,6 +200,7 @@ pub struct ImageView {
     image: ImageId,
     swizzle: Swizzle,
     bindings: Box<[ImageSubresourceBinding]>,
+    canonical_texels: bool,
 }
 
 impl ImageView {
@@ -240,7 +241,23 @@ impl ImageView {
             image,
             swizzle,
             bindings,
+            canonical_texels: true,
         })
+    }
+
+    /// Retains canonical storage identity and device ownership when the byte
+    /// encoding cannot be imported/exported as ordinary texels (for example
+    /// compressed render-target storage or native multisample storage).
+    /// The frontend must materialize all consumed image contents on the device.
+    #[must_use]
+    pub fn with_resident_only_storage(mut self) -> Self {
+        self.canonical_texels = false;
+        self
+    }
+
+    #[must_use]
+    pub const fn has_canonical_texels(&self) -> bool {
+        self.canonical_texels
     }
 
     #[must_use]

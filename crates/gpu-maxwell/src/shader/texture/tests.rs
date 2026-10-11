@@ -165,6 +165,7 @@ fn texs_2d_implicit_lod_decodes_captured_split_rgba_operands() {
                 .into_boxed_slice(),
             coordinates: [ShaderRegister::new(1), ShaderRegister::new(0)],
             image_binding: 32,
+            lod: None,
             sampler_binding: 33,
         }
     );
@@ -202,6 +203,7 @@ fn texs_2d_array_implicit_lod_decodes_packed_layer_and_coordinates() {
             coordinates: [ShaderRegister::new(1), ShaderRegister::new(2)],
             array_index: ShaderRegister::new(0),
             image_binding: 32,
+            lod: None,
             sampler_binding: 33,
         }
     );
@@ -390,4 +392,204 @@ fn texs_half_results_pack_pairs_without_aliasing_sample_outputs() {
         2,
     );
     validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+}
+
+#[test]
+fn texs_explicit_zero_lod_preserves_sampling_semantics() {
+    for (selector, encoding) in [
+        (2_u64, 0xd830_0080_2007_0100_u64),
+        (8, 0xd8e0_1a4f_f027_0003),
+    ] {
+        let encoding = (encoding & !(15 << 53)) | (selector << 53);
+        let operations = decode_texture_access_simplified(
+            MaxwellShaderStage::Pixel,
+            8,
+            encoding,
+            4,
+            &mut BTreeMap::new(),
+            &mut 32,
+        )
+        .unwrap();
+        let ShaderOperation::MoveImmediate32 {
+            destination,
+            bits: 0,
+            scalar_type: nixe_gpu::ShaderScalarType::Float32,
+        } = operations[0]
+        else {
+            panic!("explicit LOD zero required")
+        };
+        match &operations[1] {
+            ShaderOperation::SampleTexture2D { lod, .. }
+            | ShaderOperation::SampleTexture2DArray { lod, .. } => {
+                assert_eq!(*lod, Some(destination))
+            }
+            other => panic!("unexpected sample {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn tex_packs_sparse_channels_and_shares_the_texs_descriptor() {
+    let mut bindings = BTreeMap::new();
+    let encoding = 0xc03a_0083_2ff7_0404;
+    let operations = decode_texture_sample(
+        MaxwellShaderStage::Pixel,
+        0x78,
+        encoding,
+        8,
+        &mut bindings,
+        &mut 32,
+    )
+    .unwrap();
+    assert_eq!(
+        operations,
+        vec![ShaderOperation::SampleTexture2D {
+            outputs: vec![
+                ShaderTextureSampleOutput::new(ShaderRegister::new(4), 1).unwrap(),
+                ShaderTextureSampleOutput::new(ShaderRegister::new(5), 2).unwrap(),
+            ]
+            .into_boxed_slice(),
+            coordinates: [ShaderRegister::new(4), ShaderRegister::new(5)],
+            image_binding: 32,
+            sampler_binding: 33,
+            lod: None,
+        }]
+    );
+    decode_texture_access_simplified(
+        MaxwellShaderStage::Pixel,
+        0x80,
+        0xd830_0080_2007_0100,
+        8,
+        &mut bindings,
+        &mut 32,
+    )
+    .unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[&8].constant_buffer_byte_offset, 32);
+    assert_eq!(bindings[&8].sampler_binding, Some(33));
+}
+
+#[test]
+fn tex_array_explicit_lod_reads_metadata_and_preserves_the_layer() {
+    let encoding = (0xc03a_0083_2ff7_0404 & !((7 << 28) | (7 << 55) | (255 << 20)))
+        | (3 << 28)
+        | (3 << 55)
+        | (7 << 20);
+    let operations = decode_texture_sample(
+        MaxwellShaderStage::Pixel,
+        0x78,
+        encoding,
+        8,
+        &mut BTreeMap::new(),
+        &mut 32,
+    )
+    .unwrap();
+    assert!(
+        matches!(&operations[0], ShaderOperation::SampleTexture2DArray {
+        coordinates, array_index, lod: Some(level), ..
+    } if *coordinates == [ShaderRegister::new(5), ShaderRegister::new(6)]
+        && *array_index == ShaderRegister::new(4) && *level == ShaderRegister::new(7))
+    );
+}
+
+#[test]
+fn tex_modifiers_fail_explicitly_and_lod_zero_does_not_read_rz_metadata() {
+    let encoding = 0xc03a_0083_2ff7_0404;
+    for word in [
+        encoding | (1 << 35),
+        encoding | (1 << 50),
+        encoding | (1 << 54),
+        encoding | (1 << 58),
+        encoding ^ (1 << 51),
+        encoding | (2 << 55),
+    ] {
+        assert!(matches!(
+            decode_texture_sample(
+                MaxwellShaderStage::Pixel,
+                0x78,
+                word,
+                8,
+                &mut BTreeMap::new(),
+                &mut 32
+            ),
+            Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { .. })
+        ));
+    }
+    let operations = decode_texture_sample(
+        MaxwellShaderStage::Pixel,
+        0x78,
+        encoding | (1 << 55),
+        8,
+        &mut BTreeMap::new(),
+        &mut 32,
+    )
+    .unwrap();
+    assert!(matches!(
+        operations[0],
+        ShaderOperation::MoveImmediate32 {
+            bits: 0,
+            scalar_type: ShaderScalarType::Float32,
+            ..
+        }
+    ));
+    assert!(matches!(operations[1], ShaderOperation::SampleTexture2D {
+        lod: Some(level), ..
+    } if level == ShaderRegister::new(32)));
+    assert!(
+        decode_texture_sample(
+            MaxwellShaderStage::Pixel,
+            0x78,
+            encoding,
+            5,
+            &mut BTreeMap::new(),
+            &mut 32
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn tex_translation_preserves_predicate_and_samples_before_aliased_writes() {
+    let mut header = [0_u32; 20];
+    header[0] = 0x0002_5462;
+    header[18] = 0xf;
+    let encoding = 0xc03a_0083_2ff7_0404;
+    let translated = translated_fixture_with_register_count(
+        MaxwellShaderStage::Pixel,
+        header,
+        &[
+            0,
+            0x0100_0000_0007_f004 | (u64::from(0.25_f32.to_bits()) << 20),
+            0x0100_0000_0007_f005 | (u64::from(0.75_f32.to_bits()) << 20),
+            0x5bb1_8380_0007_ff07 | (4 << 20),
+            0,
+            encoding & !(7 << 16),
+            0xe300_0000_0007_000f,
+        ],
+        8,
+    );
+    let sample = translated
+        .ir()
+        .instructions()
+        .iter()
+        .find(|instruction| {
+            matches!(
+                instruction.operation(),
+                ShaderOperation::SampleTexture2D { .. }
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        sample.predicate(),
+        nixe_gpu::ShaderPredicate::Register {
+            register: 0,
+            inverted: false
+        }
+    );
+    let module = lower_shader_ir_to_wgsl(&translated).unwrap();
+    validate_wgsl(&module);
+    let source = module.source();
+    let sample_position = source.find("textureSample(").unwrap();
+    assert!(source[sample_position..].contains("registers[4] ="));
+    assert!(source[sample_position..].contains("registers[5] ="));
 }

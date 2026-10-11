@@ -43,9 +43,10 @@ runtime. Unsupported instructions stop explicitly rather than falling back to
 the interpreter. The interpreter remains available as a separate CPU backend.
 
 Building requires a C++20 compiler, CMake and Boost headers, in addition to the
-Rust toolchain and existing graphics/audio dependencies. On Debian/Ubuntu these
-are provided by `build-essential cmake libboost-dev`. Native dependencies are
-built from the vendored tree; no CMake download step is required. The small
+Rust toolchain and graphics/audio dependencies. The NVDEC VP9 decoder links
+FFmpeg libraries through `pkg-config`. On Debian/Ubuntu the native build packages
+are `build-essential cmake libboost-dev pkg-config libavcodec-dev libavutil-dev`.
+Dynarmic dependencies are built from the vendored tree; no CMake download step is required. The small
 upstream adaptations are listed in [UPSTREAM.txt](vendor/dynarmic/UPSTREAM.txt).
 
 ## Running

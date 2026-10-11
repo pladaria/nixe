@@ -40,7 +40,8 @@ fn snap_grid_precision_rejects_reserved_bits_without_modifying_the_viewport() {
 
 #[test]
 fn vpc_performance_policy_preserves_all_four_bytes_without_pipeline_changes() {
-    let mut channel = three_d_channel();
+    let mut channel = channel();
+    bind_three_d(&mut channel);
     let before = channel.three_d().clone();
     for argument in [0, 0x1234_5678, u32::MAX] {
         let dispatch = dispatch_method(&mut channel, 0x0f14 / 4, argument).unwrap();
@@ -64,7 +65,8 @@ fn vpc_performance_policy_preserves_all_four_bytes_without_pipeline_changes() {
 
 #[test]
 fn delay_preserves_full_register_and_shadow_replay_without_execution_effects() {
-    let mut channel = three_d_channel();
+    let mut channel = channel();
+    bind_three_d(&mut channel);
     let before = channel.three_d().clone();
     for argument in [0, 1, 0x8000_0000, u32::MAX] {
         let dispatch = dispatch_method(&mut channel, 0x1a24 / 4, argument).unwrap();
@@ -822,11 +824,30 @@ fn three_d_report_semaphore_trigger_is_an_explicit_observable_boundary() {
     );
     assert!(matches!(
         lower_maxwell_three_d_synchronization(operation, None, true),
-        Ok(MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(release))
+        Ok(MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(release))
             if release.address().get() == 0x12_3456_7890
                 && release.payload() == 0xcafe_babe
                 && release.prior_work_pending()
     ));
+
+    let dispatch = dispatch_method(&mut channel, 0x1b0c / 4, 0xf002).unwrap();
+    assert!(matches!(lower_maxwell_three_d_synchronization(
+        dispatch.synchronization_operations()[0], None, true,
+    ), Ok(MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(report))
+        if report.payload() == 0xcafe_babe
+            && report.structure_size() == MaxwellThreeDReportSemaphoreStructureSize::FourWords
+            && report.prior_work_pending()));
+    for raw in [0xf001, 0xf003, 0x0080_f002, 0x0010_f002, 0x0002_f002] {
+        let dispatch = dispatch_method(&mut channel, 0x1b0c / 4, raw).unwrap();
+        assert!(matches!(
+            lower_maxwell_three_d_synchronization(
+                dispatch.synchronization_operations()[0],
+                None,
+                false,
+            ),
+            Err(MaxwellThreeDSynchronizationError::UnsupportedReportSemaphoreControl { .. })
+        ));
+    }
 
     let dispatch = dispatch_method(&mut channel, 0x1b0c / 4, 0).unwrap();
     assert!(matches!(
@@ -2210,6 +2231,39 @@ fn three_d_render_enable_modes_are_typed_and_engine_owned() {
 }
 
 #[test]
+fn render_enable_override_preserves_the_condition_and_selects_the_effective_mode() {
+    let mut channel = three_d_channel();
+    program_three_d(&mut channel, 0x1558, 2);
+    for (raw, effective) in [
+        (1, MaxwellThreeDRenderEnableMode::Enabled),
+        (2, MaxwellThreeDRenderEnableMode::Disabled),
+        (0, MaxwellThreeDRenderEnableMode::Conditional),
+    ] {
+        let dispatch = dispatch_method(&mut channel, 0x1944 / 4, raw).unwrap();
+        let state = channel.three_d().render_enable();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_RENDER_ENABLE_OVERRIDE"
+        );
+        assert_eq!(
+            state.mode().value(),
+            Some(&MaxwellThreeDRenderEnableMode::Conditional)
+        );
+        assert_eq!(state.override_mode().raw(), Some(raw));
+        assert_eq!(
+            state.override_mode().source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+        assert_eq!(state.execution_mode(), Some(effective));
+    }
+    for raw in [3, 4, u32::MAX] {
+        let before = channel.clone();
+        assert!(dispatch_method(&mut channel, 0x1944 / 4, raw).is_err());
+        assert_eq!(channel, before);
+    }
+}
+
+#[test]
 fn render_enable_control_is_typed_source_preserving_and_pipeline_neutral() {
     let mut channel = three_d_channel();
     let mode_before = *channel.three_d().render_enable().mode();
@@ -2832,10 +2886,10 @@ fn invalid_visible_call_limits_and_failed_packet_keeps_valid_prefix() {
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x0d64 / 4, &[15, 0]);
+    let decoded = incrementing_packet(0x0d64 / 4, &[15, 0x10000]);
     assert!(matches!(
         dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+        Err(MaxwellEngineDispatchError::InvalidMethodValue { source, defined_mask: 0xffff, .. })
             if source.method() == GpuMethodId(0x0d68)
     ));
     assert_eq!(channel.frontend(), frontend_before);
@@ -3242,6 +3296,90 @@ fn zcull_stats_enable_is_typed_source_preserving_isolated_three_d_state() {
 }
 
 #[test]
+fn stream_output_enable_is_retained_and_capture_stops_at_the_draw_boundary() {
+    let mut channel = three_d_channel();
+    for raw in [1, 0, 1] {
+        let dispatch = dispatch_method(&mut channel, 0x0744 / 4, raw).unwrap();
+        let register = channel.three_d().shader_execution().stream_output_enable();
+        assert_eq!(register.value(), Some(&(raw != 0)));
+        assert_eq!(
+            register.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+        assert!(dispatch.operations().is_empty());
+    }
+    for raw in [2, u32::MAX] {
+        let before = channel.clone();
+        assert!(dispatch_method(&mut channel, 0x0744 / 4, raw).is_err());
+        assert_eq!(channel, before);
+    }
+    let source = dispatch_method(&mut channel, 0x0744 / 4, 1)
+        .unwrap()
+        .methods()[0]
+        .method()
+        .source();
+    let resources =
+        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
+    let result = lower_maxwell_three_d_operation(
+        channel.three_d(),
+        &resources,
+        MaxwellThreeDOperationTrigger::DrawVertexArray {
+            source,
+            vertex_count: 3,
+        },
+        None,
+        FrontendSubmissionId::new(10),
+        Vec::new(),
+        &lowering_capabilities(BackendFeatures::empty()),
+        &mut MaxwellLoweringCache::default(),
+    );
+    assert!(matches!(
+        result,
+        Err(MaxwellLoweringError::UnsupportedStreamOutputSemantics)
+    ));
+    // Clearing attachments does not capture vertex outputs.
+    let result = lower_maxwell_three_d_operation(
+        channel.three_d(),
+        &resources,
+        MaxwellThreeDOperationTrigger::ClearSurface { source },
+        None,
+        FrontendSubmissionId::new(10),
+        Vec::new(),
+        &lowering_capabilities(BackendFeatures::empty()),
+        &mut MaxwellLoweringCache::default(),
+    );
+    assert!(!matches!(
+        result,
+        Err(MaxwellLoweringError::UnsupportedStreamOutputSemantics)
+    ));
+}
+
+#[test]
+fn statistics_counter_mask_is_retained_and_does_not_fabricate_counter_reports() {
+    let mut channel = three_d_channel();
+    for mask in [0, 1, 0x4000, 0xffff, 0] {
+        let dispatch = dispatch_method(&mut channel, 0x0d68 / 4, mask).unwrap();
+        let register = channel.three_d().counters().statistics_enable();
+        assert_eq!(register.value(), Some(&mask));
+        assert_eq!(
+            register.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+        assert!(dispatch.operations().is_empty());
+    }
+    for mask in [0x10000, u32::MAX] {
+        let before = channel.clone();
+        assert!(dispatch_method(&mut channel, 0x0d68 / 4, mask).is_err());
+        assert_eq!(channel, before);
+    }
+    let report = dispatch_method(&mut channel, 0x1b0c / 4, 0x0080_f002).unwrap();
+    assert!(matches!(
+        lower_maxwell_three_d_synchronization(report.synchronization_operations()[0], None, false,),
+        Err(MaxwellThreeDSynchronizationError::UnsupportedReportSemaphoreControl { .. })
+    ));
+}
+
+#[test]
 fn zpass_pixel_count_enable_is_typed_source_preserving_pipeline_neutral_state() {
     let mut channel = three_d_channel();
     let frontend_before = channel.frontend();
@@ -3373,7 +3511,7 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
     );
     assert_eq!(
         result.err(),
-        Some(MaxwellLoweringError::IncompleteDraw("SET_CT_SELECT"))
+        Some(MaxwellLoweringError::ColorTargetRouteUnprogrammed { slot: 0, target: 0 })
     );
     assert_eq!(
         channel.three_d().zcull().stats_enable().value(),
@@ -3417,7 +3555,7 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
     );
     assert_eq!(
         result.err(),
-        Some(MaxwellLoweringError::IncompleteDraw("SET_CT_SELECT"))
+        Some(MaxwellLoweringError::ColorTargetRouteUnprogrammed { slot: 0, target: 0 })
     );
     assert_eq!(
         channel.three_d().zcull().stats_enable().value(),

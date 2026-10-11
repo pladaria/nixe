@@ -49,11 +49,6 @@ pub enum MaxwellSubmissionExecutionStep {
         source: MaxwellResolvedRange,
         destination: MaxwellResolvedRange,
     },
-    PostCompletionWrite {
-        source: MaxwellMethodSource,
-        target: MaxwellResolvedRange,
-        value: [u8; 4],
-    },
     BackendOperation(GpuOperation),
     Gpu(MaxwellLoweredWork),
 }
@@ -778,21 +773,33 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
                         | MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches { .. }
                         | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
                         | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { .. }
-                        | MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_)
+                        | MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(_)
                         | MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
                 );
-                if let MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(release) = plan {
-                    let target = resolve_inline_target(
-                        self.address_space,
-                        release.address().get(),
-                        0,
-                        release.source(),
-                    )?;
+                if let MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(report) = plan {
+                    let short = report.structure_size()
+                        == crate::MaxwellThreeDReportSemaphoreStructureSize::OneWord;
+                    let target = self
+                        .address_space
+                        .address(report.address().get())
+                        .map_err(MaxwellGpuAccessError::Address)
+                        .and_then(|address| {
+                            self.address_space.resolve_range(
+                                address,
+                                if short { 4 } else { 16 },
+                                MemoryPermissions::WRITE,
+                            )
+                        })
+                        .map_err(|error| MaxwellSubmissionExecutionError::InlineAddress {
+                            source: report.source(),
+                            error,
+                        })?;
                     self.steps
-                        .push(MaxwellSubmissionExecutionStep::PostCompletionWrite {
-                            source: release.source(),
+                        .push(MaxwellSubmissionExecutionStep::SemaphoreRelease {
+                            source: report.source(),
                             target,
-                            value: release.payload().to_le_bytes(),
+                            payload: report.payload(),
+                            short,
                         });
                 } else if let Some(operation) = three_d_synchronization_operation(plan) {
                     self.steps
@@ -997,18 +1004,16 @@ impl MaxwellBackendSegment {
 ///
 /// Canonical command-processor writes remain at their exact command-order
 /// boundaries. Host snapshots of read-only inputs may be updated after host
-/// acceptance; writes to device-owned pages still wait. Post-completion writes
-/// are committed only after the last host
-/// segment, while guest timeline publication remains with the GPU owner.
+/// acceptance; writes to device-owned pages still wait. Reports and semaphore
+/// releases wait for preceding host work and publish at their command position,
+/// while guest timeline publication remains with the GPU owner.
 pub struct MaxwellBackendExecution {
     frontend: FrontendSubmissionId,
     predecessors: Box<[FrontendSubmissionId]>,
     steps: Vec<MaxwellSubmissionExecutionStep>,
     next_step: usize,
     pre_writes: CanonicalWriteBatch,
-    post_writes: CanonicalWriteBatch,
     pre_write_source: Option<CanonicalWriteSource>,
-    post_write_source: Option<MaxwellMethodSource>,
     creations: Vec<BackendResourceCreateInfo>,
     invalidations: Vec<ResourceDependency>,
     operations: Vec<GpuOperation>,
@@ -1028,10 +1033,7 @@ impl MaxwellBackendExecution {
     /// Completion writes and any unexecuted suffix keep that boundary closed.
     #[must_use]
     pub fn can_prepare_following(&self) -> bool {
-        self.sealed
-            && self.awaiting_resume
-            && self.next_step == self.steps.len()
-            && self.post_writes.is_empty()
+        self.sealed && self.awaiting_resume && self.next_step == self.steps.len()
     }
 
     #[must_use]
@@ -1051,9 +1053,7 @@ impl MaxwellBackendExecution {
             steps: Vec::new(),
             next_step: 0,
             pre_writes: CanonicalWriteBatch::new(),
-            post_writes: CanonicalWriteBatch::new(),
             pre_write_source: None,
-            post_write_source: None,
             creations: Vec::new(),
             invalidations: Vec::new(),
             operations: Vec::new(),
@@ -1254,18 +1254,6 @@ impl MaxwellBackendExecution {
                         Some(CanonicalWriteSource::MemoryCopy(operation.source()));
                     self.next_step += 1;
                 }
-                MaxwellSubmissionExecutionStep::PostCompletionWrite {
-                    source,
-                    target,
-                    value,
-                } => {
-                    stage_resolved_inline_write(target, value, *source, &mut self.post_writes)
-                        .map_err(|error| {
-                            MaxwellBackendExecutionError::Canonical(Box::new(error))
-                        })?;
-                    self.post_write_source = Some(*source);
-                    self.next_step += 1;
-                }
                 MaxwellSubmissionExecutionStep::Gpu(work) => {
                     commit_pending_backend_writes(
                         &mut self.pre_writes,
@@ -1297,11 +1285,6 @@ impl MaxwellBackendExecution {
                 CommandDescriptionError::EmptySubmission,
             ));
         }
-        commit_inline_batch(
-            std::mem::take(&mut self.post_writes),
-            self.post_write_source.take(),
-        )
-        .map_err(|error| MaxwellBackendExecutionError::Canonical(Box::new(error)))?;
         self.finished = true;
         Ok(None)
     }
@@ -1489,7 +1472,7 @@ fn three_d_synchronization_operation(
         MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface { .. }
         | MaxwellThreeDSynchronizationPlan::WaitForIdle { .. }
         | MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
-        | MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_) => return None,
+        | MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(_) => return None,
     };
     Some(cache_maintenance_operation(maintenance))
 }
@@ -1690,18 +1673,6 @@ fn memory_copy_buffer(
     })?;
     bytes.resize(size, 0);
     Ok(bytes)
-}
-
-fn commit_inline_batch(
-    writes: CanonicalWriteBatch,
-    source: Option<MaxwellMethodSource>,
-) -> Result<(), MaxwellCanonicalExecutionError> {
-    writes
-        .commit_ordered()
-        .map_err(|error| MaxwellCanonicalExecutionError::InlineWrite {
-            source: source.expect("a non-empty canonical write batch has an inline source"),
-            error,
-        })
 }
 
 fn stage_inline_write(
@@ -2142,66 +2113,118 @@ mod tests {
     }
 
     #[test]
-    fn captured_three_d_report_semaphore_release_writes_payload_after_prior_work() {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let mut address_space = address_space();
-        let mapping = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(1),
-                backing: allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        let address = mapping.offset().get();
-        let mut channel = MaxwellGpuChannel::new(
-            MaxwellChannelId::new(1),
-            MaxwellChannelOwner::new(1),
-            SWITCH_1_GM20B_PROFILE,
-        );
-        let bind = packet(0, 0, &[SWITCH_1_GM20B_PROFILE.classes().three_d().0]);
-        let release = packet(
-            0,
-            0x1b00 / 4,
-            &[
-                (address >> 32) as u32,
-                address as u32,
-                0xcafe_babe,
-                0x1000_f010,
-            ],
-        );
-        let plan = lower_test_pushbuffers(
-            &mut channel,
-            &[bind, release],
-            &address_space,
-            FrontendSubmissionId::new(2),
-            Vec::new(),
-            None,
-            &mut MaxwellLoweringCache::default(),
-        )
-        .unwrap();
-        assert!(matches!(
-            plan.steps(),
-            [MaxwellSubmissionExecutionStep::PostCompletionWrite {
-                source: _,
-                target,
-                value,
-            }] if *value == 0xcafe_babe_u32.to_le_bytes()
-                && target.offset().get() == address
-        ));
-
-        execute_canonical_test_plan(plan, 0).unwrap();
-        let mut bytes = [0_u8; 4];
-        allocation.read(0, &mut bytes).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes), 0xcafe_babe);
+    fn three_d_payload_reports_publish_at_command_order_with_completion_timestamp() {
+        for operation in [0, 2] {
+            for short in [false, true] {
+                for with_backend in [false, true] {
+                    let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+                    allocation.write(0, &[0xcc; 16]).unwrap();
+                    let mut address_space = address_space();
+                    let mapping = address_space
+                        .map(MaxwellMapRequest {
+                            allocation: MaxwellAllocationId::new(1),
+                            backing: allocation
+                                .backing_range(MemoryPermissions::READ_WRITE)
+                                .unwrap(),
+                            backing_offset: 0,
+                            size: 0x1000,
+                            allocation_alignment: 0x1000,
+                            page_size: 0,
+                            kind: 0,
+                            cacheable: false,
+                            permissions: MemoryPermissions::READ_WRITE,
+                            fixed_offset: None,
+                        })
+                        .unwrap();
+                    let address = mapping.offset().get();
+                    let mut channel = MaxwellGpuChannel::new(
+                        MaxwellChannelId::new(1),
+                        MaxwellChannelOwner::new(1),
+                        SWITCH_1_GM20B_PROFILE,
+                    );
+                    let mut packets = vec![packet(
+                        0,
+                        0,
+                        &[SWITCH_1_GM20B_PROFILE.classes().three_d().0],
+                    )];
+                    if with_backend {
+                        packets.push(packet(0, 0x0f7c / 4, &[0]));
+                    }
+                    let control = 0xf000 | operation | if short { 0x1000_0010 } else { 0 };
+                    packets.push(packet(
+                        0,
+                        0x1b00 / 4,
+                        &[(address >> 32) as u32, address as u32, 0xcafe_babe, control],
+                    ));
+                    if with_backend {
+                        packets.push(packet(0, 0x0f7c / 4, &[0]));
+                    }
+                    let plan = lower_test_pushbuffers(
+                        &mut channel,
+                        &packets,
+                        &address_space,
+                        FrontendSubmissionId::new(2),
+                        Vec::new(),
+                        None,
+                        &mut MaxwellLoweringCache::default(),
+                    )
+                    .unwrap();
+                    let timestamp = 0x1234_5678_9abc_def0;
+                    if with_backend {
+                        let mut execution = MaxwellBackendExecution::new(plan);
+                        let first = execution.next_segment(1).unwrap().unwrap();
+                        assert!(!first.submission().is_final_segment());
+                        assert!(!execution.can_prepare_following());
+                        let mut unchanged = [0; 16];
+                        allocation.read(0, &mut unchanged).unwrap();
+                        assert_eq!(unchanged, [0xcc; 16]);
+                        execution.resume_segment();
+                        // The report publishes after preceding work completes,
+                        // before the following GPU operation is submitted.
+                        let second = execution.next_segment(timestamp).unwrap().unwrap();
+                        assert!(second.submission().is_final_segment());
+                        let mut actual = [0; 16];
+                        allocation.read(0, &mut actual).unwrap();
+                        assert_eq!(&actual[..4], &0xcafe_babe_u32.to_le_bytes());
+                        if !short {
+                            assert_eq!(&actual[8..], &timestamp.to_le_bytes());
+                        }
+                        execution.resume_segment();
+                        assert!(execution.next_segment(timestamp + 1).unwrap().is_none());
+                    } else {
+                        execute_canonical_test_plan(plan, timestamp).unwrap();
+                    }
+                    let mut actual = [0; 16];
+                    allocation.read(0, &mut actual).unwrap();
+                    assert_eq!(&actual[..4], &0xcafe_babe_u32.to_le_bytes());
+                    if short {
+                        assert_eq!(&actual[4..], &[0xcc; 12]);
+                    } else {
+                        assert_eq!(&actual[4..8], &[0; 4]);
+                        assert_eq!(&actual[8..], &timestamp.to_le_bytes());
+                    }
+                    // A long report must resolve all 16 bytes, not only its payload.
+                    let tail = address + 0xff8;
+                    let report = packet(
+                        0,
+                        0x1b00 / 4,
+                        &[(tail >> 32) as u32, tail as u32, 1, 0xf002],
+                    );
+                    assert!(matches!(
+                        lower_test_pushbuffers(
+                            &mut channel,
+                            &[report],
+                            &address_space,
+                            FrontendSubmissionId::new(2),
+                            Vec::new(),
+                            None,
+                            &mut MaxwellLoweringCache::default(),
+                        ),
+                        Err(MaxwellSubmissionExecutionError::InlineAddress { .. })
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
@@ -3617,6 +3640,29 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+        for (method, value) in [(0x088c, 1), (0x08d0, 0x8000_0000), (0x08d8, 0x8000_0000)] {
+            let setup = packet(3, method / 4, &[value]);
+            dispatch_maxwell_engine_packet(&mut channel, frontend, &setup.packets()[0]).unwrap();
+        }
+        output.write(0, &[0xaa; 0x1000]).unwrap();
+        let plan = lower_test_pushbuffers(
+            &mut channel,
+            &[packet(3, 0x08dc / 4, &[0])],
+            &space,
+            frontend,
+            Vec::new(),
+            None,
+            &mut MaxwellLoweringCache::default(),
+        )
+        .unwrap();
+        execute_canonical_test_plan(plan, 0).unwrap();
+        output.read(0, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        for (method, value) in [(0x088c, 0), (0x08d0, 0), (0x08d8, 0)] {
+            let setup = packet(3, method / 4, &[value]);
+            dispatch_maxwell_engine_packet(&mut channel, frontend, &setup.packets()[0]).unwrap();
+        }
+
         // Fractional and scaled point blits must not become a byte copy.
         for (method, bad, good) in [(0x08d0, 1, 0), (0x08c4, 2, 1), (0x08b8, 17, 16)] {
             let setup = packet(3, method / 4, &[bad]);

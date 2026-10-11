@@ -280,7 +280,7 @@ struct PendingSubmission {
     token: BackendSubmissionToken,
     visibility: DeviceVisibilityPoint,
     invalidations: Box<[ResourceDependency]>,
-    retained_accesses: Box<[PreparedAccess]>,
+    _retained_accesses: Box<[PreparedAccess]>,
 }
 
 impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
@@ -326,7 +326,21 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
                 return Err(error);
             }
         };
-        let token = match self.backend.submit_resolved(submission, dependencies) {
+        let visibility = Arc::clone(&self.visibility);
+        let token = match self.backend.submit_resolved(submission, dependencies, &|| {
+            CanonicalBackingRange::publish_device_writes(
+                prepared
+                    .iter()
+                    .filter(|access| access.declaration.kind().writes())
+                    .map(|access| (&access.range, access.declaration)),
+                Arc::clone(&visibility),
+            )
+            .map_err(|error| {
+                crate::BackendDriverError::failure(format!(
+                    "canonical write acceptance failed: {error}"
+                ))
+            })
+        }) {
             Ok(token) => token,
             Err(error) => {
                 invalidate_prepared(&prepared);
@@ -339,22 +353,8 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
             token,
             visibility: point,
             invalidations: invalidations.into(),
-            retained_accesses: prepared.into_boxed_slice(),
+            _retained_accesses: prepared.into_boxed_slice(),
         };
-        if let Err(error) = CanonicalBackingRange::publish_device_writes(
-            pending
-                .retained_accesses
-                .iter()
-                .filter(|access| access.declaration.kind().writes())
-                .map(|access| (&access.range, access.declaration)),
-            Arc::clone(&self.visibility),
-        ) {
-            invalidate_prepared(&pending.retained_accesses);
-            // Acceptance is irreversible. Preserve the token and every original
-            // backing until real completion, including publication failures.
-            self.pending.push_back(pending);
-            return Err(BackendRuntimeError::Visibility(error.to_string().into()));
-        }
         self.pending.push_back(pending);
         #[cfg(feature = "performance-counters")]
         {
@@ -568,6 +568,7 @@ mod tests {
             if let Some(allocation) = write {
                 allocation.write(0, &[0x75]).unwrap();
             }
+            submission.accept_memory()?;
             self.state.lock().unwrap().accepted.push(submission.token());
             Ok(())
         }
@@ -611,13 +612,15 @@ mod tests {
     struct Cache {
         calls: AtomicUsize,
         fail_on: usize,
+        snapshots: Mutex<Vec<Vec<u8>>>,
     }
     impl VisibilityCoordinator for Cache {
         fn cache_cpu_page(
             &self,
             _: DeviceVisibilityRequest,
-            _: &[u8],
+            bytes: &[u8],
         ) -> Result<(), VisibilityCoordinatorError> {
+            self.snapshots.lock().unwrap().push(bytes.to_vec());
             if self.calls.fetch_add(1, Ordering::Relaxed) + 1 == self.fail_on {
                 Err(VisibilityCoordinatorError::new(
                     "injected second-page cache failure",
@@ -637,6 +640,7 @@ mod tests {
     struct Fixture {
         runtime: BackendRuntime<Driver>,
         state: Arc<Mutex<DriverState>>,
+        cache: Arc<Cache>,
         memory: CanonicalAllocation,
         range: CanonicalBackingRange,
         creations: Vec<BackendResourceCreateInfo>,
@@ -673,13 +677,14 @@ mod tests {
                     max_compute_workgroups: [0; 3],
                 },
             );
+            let cache = Arc::new(Cache {
+                fail_on: if fail_cache { 2 } else { 0 },
+                ..Cache::default()
+            });
             let runtime = BackendRuntime::new(
                 Backend::new(BackendInstanceId::new(1), capabilities, driver),
                 NonCpuDeviceId::new(1),
-                Arc::new(Cache {
-                    fail_on: if fail_cache { 2 } else { 0 },
-                    ..Cache::default()
-                }),
+                cache.clone(),
             );
             let allocation = GpuAllocationId::new(1);
             let allocation_description = GpuAllocationDescription::new(0x2000, 4).unwrap();
@@ -721,6 +726,7 @@ mod tests {
             Self {
                 runtime,
                 state,
+                cache,
                 memory,
                 range,
                 creations,
@@ -741,11 +747,11 @@ mod tests {
             let pending = &self.runtime.pending[0];
             assert_eq!(pending.token, token);
             assert_eq!(
-                pending.retained_accesses.len(),
+                pending._retained_accesses.len(),
                 2,
                 "read and write references remain independent"
             );
-            for access in &pending.retained_accesses {
+            for access in &pending._retained_accesses {
                 assert_eq!(access.range, self.range);
             }
             assert!(self.state.lock().unwrap().released.is_empty());
@@ -840,34 +846,26 @@ mod tests {
     }
 
     #[test]
-    fn publication_failure_preserves_accepted_token_and_original_backings() {
+    fn cpu_write_during_encoding_is_preserved_before_gpu_acceptance() {
         let mut fixture = Fixture::new(false);
         fixture.state.lock().unwrap().write_during_submit = Some(fixture.memory.clone());
-        let before = fixture.memory.pages()[0].content_generation();
-        let error = fixture.submit().unwrap_err().to_string();
-        assert!(error.contains("conflict"), "{error}");
-        let token = fixture.state.lock().unwrap().accepted[0];
+        let token = fixture.submit().unwrap();
         fixture.assert_retained(token);
         assert!(
-            fixture
-                .range
-                .segments()
-                .iter()
-                .all(|segment| segment.visibility_state() == VisibilityState::Invalid)
-        );
-        assert_eq!(
-            fixture.memory.pages()[0].content_generation(),
-            before.next().unwrap()
+            fixture.range.segments().iter().all(|segment| matches!(
+                segment.visibility_state(),
+                VisibilityState::GpuNewer { .. }
+            ))
         );
         assert!(
-            !fixture
-                .state
+            fixture
+                .cache
+                .snapshots
                 .lock()
                 .unwrap()
-                .calls
-                .contains(&Boundary::Destroy)
+                .iter()
+                .any(|bytes| bytes[0] == 0x75)
         );
-        fixture.creations.clear();
         fixture.runtime.teardown().unwrap();
         assert!(fixture.runtime.pending.is_empty());
         assert_eq!(fixture.state.lock().unwrap().released, [token]);

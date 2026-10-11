@@ -331,6 +331,7 @@ fn check_bindings(ctx: &Context, shared: bool) {
         &fs,
         SpirvTessellationOptions {
             depth_clip_negative_one_to_one: false,
+            vertex_position_transform: None,
             input_control_points: 3,
             mode: TessellationMode {
                 domain: TessellationDomain::Triangles,

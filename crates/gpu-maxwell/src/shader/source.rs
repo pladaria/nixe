@@ -51,9 +51,14 @@ impl MaxwellShaderTranslationInputs {
         self.programs.iter().all(|program| {
             program
                 .binary
-                .source_mappings
+                .indirect_tables
                 .iter()
-                .all(|mapping| address_space.retained_mapping_is_current(mapping))
+                .all(|table| table.current(address_space))
+                && program
+                    .binary
+                    .source_mappings
+                    .iter()
+                    .all(|mapping| address_space.retained_mapping_is_current(mapping))
                 && program
                     .binary
                     .source_cpu_writes
@@ -62,9 +67,29 @@ impl MaxwellShaderTranslationInputs {
         })
     }
 
+    pub(crate) fn indirect_bindings_current(
+        &self,
+        bindings: &crate::MaxwellThreeDShaderBindingState,
+    ) -> bool {
+        self.programs.iter().all(|program| {
+            program
+                .binary
+                .indirect_tables
+                .iter()
+                .all(|table| table.binding_current(bindings))
+        })
+    }
+
     pub(crate) fn staged_writes_are_irrelevant(&self, writes: &CanonicalWriteBatch) -> bool {
         self.programs.iter().all(|program| {
             let binary = &program.binary;
+            if !binary
+                .indirect_tables
+                .iter()
+                .all(|table| table.staged_current(writes))
+            {
+                return false;
+            }
             let size = MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64
                 + binary.bundles.len() as u64 * MAXWELL_SCHEDULE_BUNDLE_SIZE as u64;
             let end = binary.address.saturating_add(size);
@@ -84,6 +109,7 @@ impl MaxwellShaderTranslationInputs {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MaxwellShaderTranslationSource {
+    bindings: Arc<crate::MaxwellThreeDShaderBindingState>,
     programs: Box<[MaxwellShaderSourceProgram]>,
     texture_constant_buffer_slot: Option<u8>,
     vertex_input_types: Box<[(ShaderIoLocation, ShaderScalarType)]>,
@@ -115,8 +141,9 @@ impl Hash for MaxwellShaderTranslationSource {
 
 /// Allocation-free semantic lookup key for the frontend shader-source cache.
 /// Owned storage is materialized only after a miss or stale source snapshot.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct MaxwellShaderTranslationSourceKey {
+    pub(crate) bindings: Arc<crate::MaxwellThreeDShaderBindingState>,
     programs: [Option<MaxwellShaderSourceProgram>; MAXWELL_PIPELINE_SHADER_COUNT],
     program_count: usize,
     texture_constant_buffer_slot: Option<u8>,
@@ -141,6 +168,7 @@ impl MaxwellShaderTranslationSourceKey {
 
     pub(crate) fn materialize(&self) -> MaxwellShaderTranslationSource {
         MaxwellShaderTranslationSource {
+            bindings: Arc::clone(&self.bindings),
             programs: self.programs().collect(),
             texture_constant_buffer_slot: self.texture_constant_buffer_slot,
             vertex_input_types: self.vertex_input_types().collect(),
@@ -279,6 +307,7 @@ pub(crate) fn prepare_maxwell_shader_translation_source(
         vertex_input_count += 1;
     }
     Ok(MaxwellShaderTranslationSourceKey {
+        bindings: state.shader_bindings_snapshot(),
         programs,
         program_count,
         texture_constant_buffer_slot: bindings
@@ -299,7 +328,13 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
     let memory = MaxwellShaderMemoryView::new(address_space, staged_writes);
     let mut programs = Vec::with_capacity(source.programs.len());
     for program in &source.programs {
-        let binary = read_shader_binary(&memory, program.stage, program.address)?;
+        let mut binary = read_shader_binary(&memory, program.stage, program.address)?;
+        super::indirect::capture(
+            &mut binary,
+            &source.bindings,
+            program.effective_group,
+            &memory,
+        )?;
         validate_program_header(program.stage, binary.header())?;
         let vertex_input_types: &[(ShaderIoLocation, ShaderScalarType)] =
             if neutral_stage(program.stage) == ShaderStage::Vertex {

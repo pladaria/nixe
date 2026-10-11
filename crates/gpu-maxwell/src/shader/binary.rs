@@ -87,6 +87,7 @@ pub(crate) struct MaxwellShaderBinary {
     pub(super) address: u64,
     pub(super) metadata: MaxwellShaderMetadata,
     pub(super) bundles: Box<[MaxwellShaderInstructionBundle]>,
+    pub(super) indirect_tables: Box<[super::indirect::IndirectTable]>,
     pub(super) source_cpu_writes: Box<[CanonicalCpuWriteDependency]>,
     pub(super) source_mappings: Box<[crate::MaxwellGpuMapping]>,
 }
@@ -105,7 +106,9 @@ pub(super) enum MaxwellShaderMetadata {
 // follows only bytes which can affect translation.
 impl PartialEq for MaxwellShaderBinary {
     fn eq(&self, other: &Self) -> bool {
-        self.metadata == other.metadata && self.bundles == other.bundles
+        self.metadata == other.metadata
+            && self.bundles == other.bundles
+            && self.indirect_tables == other.indirect_tables
     }
 }
 
@@ -115,6 +118,7 @@ impl Hash for MaxwellShaderBinary {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.metadata.hash(state);
         self.bundles.hash(state);
+        self.indirect_tables.hash(state);
     }
 }
 
@@ -190,10 +194,10 @@ pub(super) struct MaxwellShaderMemoryView<'a> {
 }
 
 pub(super) struct MaxwellShaderRead {
-    bytes: Vec<u8>,
-    snapshot: CanonicalBackingRange,
-    cpu_writes: CanonicalCpuWriteDependency,
-    mappings: Vec<crate::MaxwellGpuMapping>,
+    pub(super) bytes: Vec<u8>,
+    pub(super) snapshot: CanonicalBackingRange,
+    pub(super) cpu_writes: CanonicalCpuWriteDependency,
+    pub(super) mappings: Vec<crate::MaxwellGpuMapping>,
 }
 
 impl<'a> MaxwellShaderMemoryView<'a> {
@@ -224,7 +228,7 @@ impl<'a> MaxwellShaderMemoryView<'a> {
         self.read(stage, address, size)
     }
 
-    fn read(
+    pub(super) fn read(
         &self,
         stage: MaxwellShaderStage,
         address: u64,
@@ -413,6 +417,7 @@ pub(super) fn read_shader_code(
                 address,
                 metadata,
                 bundles: bundles.into_boxed_slice(),
+                indirect_tables: Box::new([]),
                 source_cpu_writes: source_cpu_writes.into_boxed_slice(),
                 source_mappings: source_mappings.into_values().collect(),
             });

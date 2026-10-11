@@ -146,26 +146,11 @@ impl WgpuVisibilityCoordinator {
         Ok(())
     }
 
-    pub(crate) fn take_completed_page(
-        &self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
-        self.completed_page(request, false)
-    }
-
     pub(crate) fn copy_completed_page(
         &self,
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
-        self.completed_page(request, true)
-    }
-
-    fn completed_page(
-        &self,
-        request: CpuVisibilityRequest,
-        retain: bool,
-    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
-        let mut pages = self
+        let pages = self
             .pages
             .lock()
             .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
@@ -185,13 +170,10 @@ impl WgpuVisibilityCoordinator {
                 "wgpu page mirror has an unexpected size",
             ));
         }
-        if retain {
-            return Ok(page.bytes.clone());
-        }
-        Ok(pages
-            .remove(&request.page)
-            .expect("validated page remains present while locked")
-            .bytes)
+        // The caller may discard this result if a GPU owner advances while
+        // the readback is in flight. Only canonical publication acknowledges
+        // that the mirror can be released, never completion of the transfer.
+        Ok(page.bytes.clone())
     }
 
     pub(crate) fn mark_page_completed(
@@ -214,6 +196,24 @@ impl WgpuVisibilityCoordinator {
 }
 
 impl VisibilityCoordinator for WgpuVisibilityCoordinator {
+    fn release_cpu_page(
+        &self,
+        request: CpuVisibilityRequest,
+    ) -> Result<(), VisibilityCoordinatorError> {
+        let mut pages = self
+            .pages
+            .lock()
+            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
+        if pages.get(&request.page).is_some_and(|mirror| {
+            mirror
+                .completed
+                .is_some_and(|point| point <= request.visible_at)
+        }) {
+            pages.remove(&request.page);
+        }
+        Ok(())
+    }
+
     fn cache_cpu_page(
         &self,
         request: DeviceVisibilityRequest,
@@ -259,11 +259,63 @@ impl VisibilityCoordinator for WgpuVisibilityCoordinator {
             .and_then(|page| page.completed)
             .is_some_and(|completed| completed >= request.visible_at);
         if completed {
-            return self.take_completed_page(request);
+            return self.copy_completed_page(request);
         }
         let requester = self.requester.get().ok_or_else(|| {
             VisibilityCoordinatorError::new("wgpu visibility requester is not bound")
         })?;
         requester.make_cpu_visible(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+
+    #[test]
+    fn readback_mirrors_survive_retries_until_canonical_publication() {
+        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].page();
+        let coordinator = WgpuVisibilityCoordinator::new(NonCpuDeviceId::new(1));
+        let request = CpuVisibilityRequest {
+            page,
+            size: 4096,
+            device: coordinator.device(),
+            visible_at: DeviceVisibilityPoint::new(2),
+        };
+        coordinator
+            .cache_cpu_page(
+                DeviceVisibilityRequest {
+                    page,
+                    size: request.size,
+                    device: request.device,
+                    visible_at: DeviceVisibilityPoint::new(1),
+                },
+                &[0; 4096],
+            )
+            .unwrap();
+        coordinator.write_page_range(page, 0, &[0x11]).unwrap();
+        coordinator
+            .mark_page_completed(page, request.visible_at)
+            .unwrap();
+        assert_eq!(coordinator.make_cpu_visible(request).unwrap()[0], 0x11);
+        // Another CPU request or a newer device owner may race publication.
+        assert_eq!(coordinator.make_cpu_visible(request).unwrap()[0], 0x11);
+        let next = CpuVisibilityRequest {
+            visible_at: DeviceVisibilityPoint::new(4),
+            ..request
+        };
+        coordinator.write_page_range(page, 0, &[0x44]).unwrap();
+        coordinator
+            .mark_page_completed(page, next.visible_at)
+            .unwrap();
+        coordinator.release_cpu_page(request).unwrap();
+        assert_eq!(coordinator.make_cpu_visible(next).unwrap()[0], 0x44);
+        coordinator.release_cpu_page(next).unwrap();
+        assert!(coordinator.copy_completed_page(next).is_err());
     }
 }

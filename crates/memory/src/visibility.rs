@@ -74,11 +74,23 @@ pub trait VisibilityCoordinator: Send + Sync {
     ) -> Result<(), VisibilityCoordinatorError>;
 
     /// Returns the complete newest page contents after the required device
-    /// completion and host visibility operations.
+    /// completion and host visibility operations. Transfer completion alone
+    /// must not discard mirrors: the caller can reject a stale result and retry.
+    /// release_cpu_page acknowledges a successful canonical publication.
     fn make_cpu_visible(
         &self,
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, VisibilityCoordinatorError>;
+
+    /// Releases a completed device mirror after canonical publication succeeds.
+    /// Like cache_cpu_page, this is a bounded local cache operation under the
+    /// page lock. A stale readback must not release a newer device generation.
+    fn release_cpu_page(
+        &self,
+        _request: CpuVisibilityRequest,
+    ) -> Result<(), VisibilityCoordinatorError> {
+        Ok(())
+    }
 }
 
 /// Failure reported by an injected residency/visibility implementation.

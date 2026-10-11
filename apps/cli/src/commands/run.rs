@@ -223,6 +223,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         operation_mode: initial_operation_mode,
         time: time_environment,
         settings: settings_environment,
+        shared_fonts: nixe_horizon::SharedFontSession::new(config.system.font.clone()),
         application_language: plan.control_metadata().and_then(|control| {
             desired_application_language(
                 control.supported_languages(),
@@ -545,6 +546,7 @@ struct HorizonEnvironment {
     operation_mode: OperationMode,
     time: TimeEnvironment,
     settings: SettingsEnvironment,
+    shared_fonts: nixe_horizon::SharedFontSession,
     application_language: Option<SystemLanguage>,
     user_account_switch_locked: Option<bool>,
     save_data: Option<SaveDataSystem>,
@@ -703,10 +705,14 @@ fn execute(
         horizon_environment.settings,
         video_system,
     )
+    .with_shared_fonts(horizon_environment.shared_fonts)
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend)
     .with_vibration_output(host_input.vibration.clone());
     if let Some(save_data) = horizon_environment.save_data {
+        save_data
+            .prepare_for_launch()
+            .map_err(|error| format!("cannot prepare application save data: {error}"))?;
         dispatcher = dispatcher.with_save_data(save_data);
     }
     if let Some(locked) = horizon_environment.user_account_switch_locked {
@@ -819,6 +825,11 @@ fn execute(
                         log::info!(
                             "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
                         );
+                        // VIDEO_PROBE_BEGIN
+                        if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
+                            coordinator.video_wait_audit();
+                        }
+                        // VIDEO_PROBE_END
                         last_rate_completions = execution_completions;
                         last_rate_elapsed = elapsed;
                     }

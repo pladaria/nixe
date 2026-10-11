@@ -275,6 +275,7 @@ pub(crate) fn publish_device_pages(
         DeviceAccessDeclaration,
         Arc<RangeDeviceOwner>,
     )],
+    coordinator: &dyn VisibilityCoordinator,
 ) -> Result<(), VisibilityError> {
     // Aggregate physical changes, keeping completion-bound resource lifetimes
     // independent, as in Eden's dirty tracking and fence retirement policies.
@@ -292,6 +293,25 @@ pub(crate) fn publish_device_pages(
     let mut revoked = DirectProtectionBatch::default();
     for (index, (page, declaration, owner)) in pages.iter().enumerate() {
         match &states[index].visibility {
+            PageVisibility::CpuNewer => {
+                // Encoding runs outside CPU execution exclusion. Preserve CPU
+                // stores completed before acceptance, including bytes outside
+                // this resource's partial-page GPU writeback.
+                let mut bytes = vec![0; page.size()];
+                page.load_bytes_quiescent(0, &mut bytes);
+                coordinator
+                    .cache_cpu_page(
+                        DeviceVisibilityRequest {
+                            page: page.identity(),
+                            size: page.size(),
+                            device: declaration.device(),
+                            visible_at: declaration.device_visible_at(),
+                        },
+                        &bytes,
+                    )
+                    .map_err(VisibilityError::Coordinator)?;
+                revoked.collect(&mut states[index], |_| DirectProtection::None);
+            }
             PageVisibility::Clean => {
                 revoked.collect(&mut states[index], |_| DirectProtection::None)
             }
@@ -299,9 +319,7 @@ pub(crate) fn publish_device_pages(
                 if previous.device == declaration.device() && previous.point() <= owner.point() => {
             }
             PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
-            PageVisibility::CpuNewer
-            | PageVisibility::GpuNewer { .. }
-            | PageVisibility::Conflicting => {
+            PageVisibility::GpuNewer { .. } | PageVisibility::Conflicting => {
                 page.publish_visibility(&mut states[index], PageVisibility::Conflicting)?;
                 return Err(VisibilityError::ConflictingAccess);
             }
@@ -1283,14 +1301,19 @@ impl CanonicalBackingPage {
     }
 
     fn ensure_cpu_visible(&self) -> Result<(), VisibilityError> {
-        self.ensure_cpu_visible_with(&mut |coordinator, request| {
-            coordinator.make_cpu_visible(request)
-        })
+        self.ensure_cpu_visible_with(
+            &mut |coordinator, request| coordinator.make_cpu_visible(request),
+            false,
+        )
     }
 
+    // Device input snapshots may reconcile old GPU contents after the next
+    // writer has already prepared its mirrors. Keep those mirrors for that
+    // submission; ordinary CPU demands release only after publication wins.
     pub(crate) fn ensure_cpu_visible_with(
         &self,
         resolve: &mut crate::CpuVisibilityResolver<'_>,
+        retain_device_cache: bool,
     ) -> Result<(), VisibilityError> {
         loop {
             let (owner, visible_at, epoch, next_generation) = {
@@ -1377,6 +1400,12 @@ impl CanonicalBackingPage {
                 })?;
             crate::metrics::record_page(self.identity(), crate::metrics::Counter::CpuReadbacks);
             self.publish_visibility(&mut state, PageVisibility::Clean)?;
+            if !retain_device_cache {
+                owner
+                    .coordinator
+                    .release_cpu_page(request)
+                    .map_err(VisibilityError::Coordinator)?;
+            }
             return Ok(());
         }
     }
@@ -2810,6 +2839,7 @@ mod tests {
     struct RecordingCoordinator {
         uploads: Mutex<Vec<(DeviceVisibilityRequest, Box<[u8]>)>>,
         downloads: Mutex<Vec<CpuVisibilityRequest>>,
+        releases: Mutex<Vec<CpuVisibilityRequest>>,
         writeback: Mutex<Box<[u8]>>,
     }
 
@@ -2823,6 +2853,14 @@ mod tests {
     }
 
     impl VisibilityCoordinator for RecordingCoordinator {
+        fn release_cpu_page(
+            &self,
+            request: CpuVisibilityRequest,
+        ) -> Result<(), VisibilityCoordinatorError> {
+            self.releases.lock().unwrap().push(request);
+            Ok(())
+        }
+
         fn cache_cpu_page(
             &self,
             request: DeviceVisibilityRequest,
@@ -2884,10 +2922,79 @@ mod tests {
     }
 
     #[test]
+    fn only_committed_cpu_readbacks_release_device_mirrors() {
+        for next_point in [2, 4] {
+            for retain in [false, true] {
+                let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+                let range = allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap();
+                let recording = Arc::new(RecordingCoordinator::default());
+                let coordinator: Arc<dyn VisibilityCoordinator> = recording.clone();
+                let device = NonCpuDeviceId::new(1);
+                let first = DeviceAccessDeclaration::write(
+                    device,
+                    DeviceVisibilityPoint::new(1),
+                    DeviceVisibilityPoint::new(2),
+                )
+                .unwrap();
+                CanonicalBackingRange::prepare_resident_device_accesses(
+                    [(&range, first)],
+                    coordinator.clone(),
+                )
+                .unwrap();
+                CanonicalBackingRange::publish_device_writes(
+                    [(&range, first)],
+                    coordinator.clone(),
+                )
+                .unwrap();
+                let mut calls = 0;
+                allocation.pages()[0]
+                    .ensure_cpu_visible_with(
+                        &mut |_, request| {
+                            calls += 1;
+                            if calls == 1 {
+                                let next = DeviceAccessDeclaration::write(
+                                    device,
+                                    DeviceVisibilityPoint::new(2),
+                                    DeviceVisibilityPoint::new(next_point),
+                                )
+                                .unwrap();
+                                CanonicalBackingRange::publish_device_writes(
+                                    [(&range, next)],
+                                    coordinator.clone(),
+                                )
+                                .unwrap();
+                                Ok(vec![0x11; request.size].into_boxed_slice())
+                            } else {
+                                Ok(vec![0x44; request.size].into_boxed_slice())
+                            }
+                        },
+                        retain,
+                    )
+                    .unwrap();
+                assert_eq!(calls, 2);
+                let releases = recording.releases.lock().unwrap();
+                assert_eq!(releases.len(), usize::from(!retain));
+                if !retain {
+                    assert_eq!(
+                        releases[0].visible_at,
+                        DeviceVisibilityPoint::new(next_point)
+                    );
+                }
+                let mut byte = [0];
+                allocation.read(0, &mut byte).unwrap();
+                assert_eq!(byte, [0x44]);
+            }
+        }
+    }
+
+    #[test]
     fn cpu_store_between_preparation_and_publication_is_not_overwritten() {
         let memory = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
         let range = memory.backing_range(MemoryPermissions::READ_WRITE).unwrap();
-        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(RecordingCoordinator::default());
+        let recording = Arc::new(RecordingCoordinator::default());
+        let coordinator: Arc<dyn VisibilityCoordinator> = recording.clone();
         let write = DeviceAccessDeclaration::write(
             NonCpuDeviceId::new(1),
             crate::DeviceVisibilityPoint::new(1),
@@ -2900,9 +3007,17 @@ mod tests {
         )
         .unwrap();
         memory.write(0x1000, &[0x75]).unwrap();
+        CanonicalBackingRange::publish_device_writes([(&range, write)], coordinator).unwrap();
+        let uploads = recording.uploads.lock().unwrap();
+        assert_eq!(uploads.len(), 3);
+        assert_eq!(uploads.last().unwrap().0.page, memory.pages()[1].identity());
+        assert_eq!(uploads.last().unwrap().1[0], 0x75);
         assert_eq!(
-            CanonicalBackingRange::publish_device_writes([(&range, write)], coordinator),
-            Err(VisibilityError::ConflictingAccess)
+            memory.pages()[1].visibility_state(),
+            VisibilityState::GpuNewer {
+                device: write.device(),
+                visible_at: write.cpu_visible_at().unwrap(),
+            }
         );
         let mut byte = [0];
         memory.pages()[1].load_bytes_quiescent(0, &mut byte);

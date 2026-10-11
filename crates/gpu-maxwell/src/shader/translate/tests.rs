@@ -76,3 +76,51 @@ fn captured_vertex_families_translate_without_binary_identity_matching() {
     let module = nixe_gpu::lower_shader_ir_to_wgsl(&translated).unwrap();
     validate_wgsl(&module);
 }
+
+#[test]
+fn xy_position_exports_keep_default_homogeneous_coordinates_and_explicit_w_wins() {
+    use nixe_gpu::{ShaderEvaluationInputs, evaluate_shader_ir, lower_shader_ir_to_wgsl};
+    let mut header = [0_u32; 20];
+    header[0] = 0x0002_0461;
+    header[6] = 3; // Generic(0).xy input.
+    header[13] = 3 << 12; // Position.xy output.
+    let inputs = ShaderEvaluationInputs::default()
+        .with_interface_bits(ShaderIoLocation::Generic(0), 0, (-0.75_f32).to_bits())
+        .with_interface_bits(ShaderIoLocation::Generic(0), 1, 0.5_f32.to_bits());
+    for explicit_w in [false, true] {
+        if explicit_w {
+            header[13] = 0xf << 12;
+        }
+        let code = [
+            0,
+            0xeff0_ff80_0707_ff00, // AST Position.xy, R0-R1.
+            if explicit_w {
+                0xeff0_7f80_07c7_ff01
+            } else {
+                0xe300_0000_0007_000f
+            },
+            0xe300_0000_0007_000f,
+        ];
+        let shader = translated_fixture(MaxwellShaderStage::Vertex, header, &code);
+        let result = evaluate_shader_ir(&shader, &inputs, 64).unwrap();
+        for (component, expected) in [
+            (-0.75_f32).to_bits(),
+            0.5_f32.to_bits(),
+            0,
+            if explicit_w {
+                0.5_f32.to_bits()
+            } else {
+                1.0_f32.to_bits()
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                result.output_bits(ShaderIoLocation::Position, component as u8),
+                Some(expected)
+            );
+        }
+        validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+    }
+}

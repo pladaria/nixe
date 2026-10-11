@@ -58,6 +58,8 @@ impl WgpuBackendDriver {
         )?;
         let shader_handle =
             dependency_handle(dependencies, ResourceDependency::Shader(dispatch.shader))?;
+        let swizzles = self.sampled_swizzles(dependencies, &dispatch.descriptor_tables)?;
+        let fingerprint = nixe_gpu::cache_fingerprint(&(shader_handle, &swizzles));
         let cache_use = self.take_cache_use()?;
         let capacity = self.cache_configuration.pipeline_variants_per_resource();
         let Some(Resource::Pipeline {
@@ -71,7 +73,7 @@ impl WgpuBackendDriver {
         if description.kind != PipelineKind::Compute {
             return Err(unsupported("dispatch requires a compute pipeline"));
         }
-        if let Some(cached) = compute.get_mut(&shader_handle) {
+        if let Some(cached) = compute.get_mut(&fingerprint) {
             cached.last_used = cache_use;
             return Ok((cached.pipeline.clone(), cached.serial));
         }
@@ -104,6 +106,11 @@ impl WgpuBackendDriver {
                 "compute workgroup size exceeds host limits: {size:?}"
             )));
         }
+        let constants = swizzles.constants(neutral);
+        let constants = constants
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect::<Vec<_>>();
         let (module, _) = self.compiled_shader(shader_handle)?;
         let scope = self.device.push_error_scope(ErrorFilter::Validation);
         let pipeline = self
@@ -113,7 +120,10 @@ impl WgpuBackendDriver {
                 layout: None,
                 module: &module,
                 entry_point: Some("main"),
-                compilation_options: PipelineCompilationOptions::default(),
+                compilation_options: PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
                 cache: self.pipeline_cache.as_ref(),
             });
         self.capture_error_scope(scope)?;
@@ -132,7 +142,7 @@ impl WgpuBackendDriver {
             compute.remove(&key);
         }
         compute.insert(
-            shader_handle,
+            fingerprint,
             CachedComputePipeline {
                 pipeline: pipeline.clone(),
                 serial,

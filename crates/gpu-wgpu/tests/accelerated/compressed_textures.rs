@@ -1,12 +1,12 @@
 use super::*;
 use nixe_gpu::{
-    AddressMode, DescriptorKind, DescriptorTableBinding, DescriptorTableDescription,
-    DescriptorTableId, FilterMode, SamplerDescription, SamplerId, ShaderResourceAccess,
-    ShaderResourceKind, ShaderTextureSampleOutput,
+    AddressMode, ComponentSwizzle, DescriptorKind, DescriptorTableBinding,
+    DescriptorTableDescription, DescriptorTableId, FilterMode, SamplerDescription, SamplerId,
+    ShaderResourceAccess, ShaderResourceKind, ShaderTextureSampleOutput,
 };
 
 #[test]
-fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants() {
+fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_variants() {
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
         BackendInstanceId::new(720),
@@ -60,23 +60,66 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
             .unwrap(),
         ),
     });
+    let window_vertex_buffer = BufferId::new(721);
+    let window_allocation = GpuAllocationId::new(721);
+    let window_vertices = [0.0_f32, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 8.0, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    creations.push(BackendResourceCreateInfo::Allocation {
+        id: window_allocation,
+        description: allocation_description,
+    });
+    creations.push(BackendResourceCreateInfo::Buffer {
+        id: window_vertex_buffer,
+        description: vertex_description,
+        view: Some(
+            BufferView::new(
+                window_vertex_buffer,
+                vertex_description,
+                0,
+                backing(
+                    window_allocation,
+                    allocation_description,
+                    &initialized_page(&window_vertices),
+                ),
+            )
+            .unwrap(),
+        ),
+    });
     let vertex = ShaderId::new(720);
     let vertex_module = nixe_gpu::ShaderBackendModule::new(
         VerifiedShaderIr::verify(ShaderIr::new(
             ShaderStage::Vertex,
-            (0..3)
+            (0..2)
                 .map(|component| interface(ShaderIoLocation::Generic(0), component))
                 .collect(),
             (0..4)
                 .map(|component| interface(ShaderIoLocation::Position, component))
                 .collect(),
             vec![],
-            vec![
-                load_input(8, 0, 0, ShaderIoLocation::Generic(0), 3),
-                move_f32(16, 3, 1.0),
-                store_output(24, 0, ShaderIoLocation::Position, 4),
-                exit(32),
-            ],
+            (0..4)
+                .flat_map(|component| {
+                    [
+                        move_f32(0, 10, if component == 3 { 1.0 } else { 0.0 }),
+                        ShaderInstruction::new(
+                            ShaderSourceLocation::new(0),
+                            ShaderPredicate::Always,
+                            ShaderOperation::StoreOutput {
+                                sources: vec![ShaderRegister::new(10)].into_boxed_slice(),
+                                location: ShaderIoLocation::Position,
+                                first_component: component,
+                                scalar_type: ShaderScalarType::Float32,
+                            },
+                        ),
+                    ]
+                })
+                .chain([
+                    load_input(8, 0, 0, ShaderIoLocation::Generic(0), 2),
+                    store_output(24, 0, ShaderIoLocation::Position, 2),
+                    exit(32),
+                ])
+                .collect(),
         ))
         .unwrap(),
     );
@@ -120,13 +163,32 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
         .unwrap(),
     });
     let mut formats = vec![
-        ImageFormat::Bc1RgbUnorm,
-        ImageFormat::Bc1RgbaUnorm,
-        ImageFormat::Bc1RgbSrgb,
-        ImageFormat::Bc1RgbaSrgb,
+        (ImageFormat::Bc1RgbUnorm, Swizzle::IDENTITY),
+        (ImageFormat::Bc1RgbaUnorm, Swizzle::IDENTITY),
+        (ImageFormat::Bc1RgbSrgb, Swizzle::IDENTITY),
+        (ImageFormat::Bc1RgbaSrgb, Swizzle::IDENTITY),
+        (ImageFormat::Bc4RUnorm, Swizzle::IDENTITY),
+        (
+            ImageFormat::Bc4RUnorm,
+            Swizzle([
+                ComponentSwizzle::Red,
+                ComponentSwizzle::Red,
+                ComponentSwizzle::Red,
+                ComponentSwizzle::One,
+            ]),
+        ),
+        (
+            ImageFormat::Bc4RUnorm,
+            Swizzle([
+                ComponentSwizzle::One,
+                ComponentSwizzle::Red,
+                ComponentSwizzle::Zero,
+                ComponentSwizzle::Red,
+            ]),
+        ),
     ];
     if packed_supported {
-        formats.push(ImageFormat::Rgb565Unorm);
+        formats.push((ImageFormat::Rgb565Unorm, Swizzle::IDENTITY));
     }
     let mut serial = 720;
     for array in [false, true] {
@@ -140,7 +202,7 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
         });
         let layers = if array { 2 } else { 1 };
         let mut draws = Vec::new();
-        for (index, format) in formats.iter().copied().enumerate() {
+        for (index, (format, swizzle)) in formats.iter().copied().enumerate() {
             let id = 730 + index as u64 + if array { formats.len() as u64 } else { 0 };
             let allocation = GpuAllocationId::new(id);
             let image = ImageId::new(id);
@@ -156,6 +218,10 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
                     let offset = usize::from(layers - 1) * 512 + offset;
                     bytes[offset..offset + 2].copy_from_slice(&0xf800_u16.to_le_bytes());
                 }
+            } else if format == ImageFormat::Bc4RUnorm {
+                // Selector 2 in every texel; the eight-value palette yields 180.
+                bytes[selected..selected + 8]
+                    .copy_from_slice(&[200, 60, 0x92, 0x24, 0x49, 0x92, 0x24, 0x49]);
             } else {
                 bytes[selected..selected + 8]
                     .copy_from_slice(&[0, 0, 255, 255, 255, 255, 255, 255]);
@@ -185,7 +251,7 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
                     ImageView::new(
                         image,
                         description,
-                        Swizzle::IDENTITY,
+                        swizzle,
                         vec![(
                             ImageSubresourceRange {
                                 layer_count: layers,
@@ -222,33 +288,42 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
                 ]
                 .into_boxed_slice(),
             });
-            let prepared = Arc::new(
-                PreparedDraw::new(
-                    pipeline,
-                    render_pass,
-                    PrimitiveTopology::Triangles,
-                    vec![table],
-                    vec![
-                        VertexBufferLayout::new(
-                            BufferRegion {
-                                buffer: vertex_buffer,
-                                range: BufferRange::new(0, vertices.len() as u64).unwrap(),
-                            },
-                            12,
-                            VertexStepMode::Vertex,
-                            vec![VertexAttribute {
-                                format: VertexFormat::Float32x3,
-                                offset: 0,
-                                shader_location: 0,
-                            }],
-                        )
-                        .unwrap(),
-                    ],
-                    None,
-                )
-                .unwrap(),
-            );
-            draws.push((prepared, image, texture_page, selected));
+            let window_coordinates = index % 2 != 0;
+            let draw_vertex_buffer = if window_coordinates {
+                window_vertex_buffer
+            } else {
+                vertex_buffer
+            };
+            let mut prepared = PreparedDraw::new(
+                pipeline,
+                render_pass,
+                PrimitiveTopology::Triangles,
+                vec![table],
+                vec![
+                    VertexBufferLayout::new(
+                        BufferRegion {
+                            buffer: draw_vertex_buffer,
+                            range: BufferRange::new(0, vertices.len() as u64).unwrap(),
+                        },
+                        12,
+                        VertexStepMode::Vertex,
+                        vec![VertexAttribute {
+                            format: VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        }],
+                    )
+                    .unwrap(),
+                ],
+                None,
+            )
+            .unwrap();
+            if window_coordinates {
+                prepared.vertex_position_transform =
+                    Some(nixe_gpu::VertexPositionTransform::framebuffer(4, 4).unwrap());
+            }
+            let prepared = Arc::new(prepared);
+            draws.push((prepared, image, texture_page, selected, draw_vertex_buffer));
         }
         // Revisit the RGB and RGBA pipelines after their initial compilation.
         for (iteration, index) in (0..formats.len())
@@ -256,13 +331,13 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
             .take(formats.len() * 2)
             .enumerate()
         {
-            let (prepared, image, texture_page, selected) = &draws[index];
+            let (prepared, image, texture_page, selected, draw_vertex_buffer) = &draws[index];
             let colored = iteration >= formats.len();
             if colored {
                 // Mid-gray RGB565 endpoint, selector zero: sRGB must decode.
                 texture_page.prepare_write().unwrap();
                 let generation = texture_page.content_generation();
-                if formats[index] == ImageFormat::Rgb565Unorm {
+                if formats[index].0 == ImageFormat::Rgb565Unorm {
                     for (offset, value) in [154, 156, 202, 204].into_iter().zip([
                         (1_u16 << 11) | (3 << 5) | 5,
                         (2 << 11) | (3 << 5) | 6,
@@ -283,7 +358,12 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
                     texture_page
                         .write_preflighted(
                             *selected,
-                            &[0x10, 0x84, 0, 0, 0, 0, 0, 0],
+                            if formats[index].0 == ImageFormat::Bc4RUnorm {
+                                // Six-value palette, selector 6 is exactly zero.
+                                &[20, 220, 0xb6, 0x6d, 0xdb, 0xb6, 0x6d, 0xdb]
+                            } else {
+                                &[0x10, 0x84, 0, 0, 0, 0, 0, 0]
+                            },
                             generation,
                             generation.next().unwrap(),
                         )
@@ -343,7 +423,7 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
                             .unwrap(),
                         )],
                         [
-                            ResourceDependency::Buffer(vertex_buffer),
+                            ResourceDependency::Buffer(*draw_vertex_buffer),
                             ResourceDependency::Shader(vertex),
                             ResourceDependency::Shader(fragment),
                             ResourceDependency::Image(*image),
@@ -367,12 +447,19 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
             creations.clear();
             let mut pixels = [0; 64];
             target_backing.range().read(0, &mut pixels).unwrap();
-            let expected = if formats[index] == ImageFormat::Rgb565Unorm {
+            let expected = if formats[index].0 == ImageFormat::Rgb565Unorm {
                 if colored {
                     [12, 14, 45, 255]
                 } else {
                     [255, 0, 0, 255]
                 }
+            } else if formats[index].0 == ImageFormat::Bc4RUnorm {
+                let value = if colored { 0 } else { 180 };
+                formats[index].1.0.map(|channel| match channel {
+                    ComponentSwizzle::Red => value,
+                    ComponentSwizzle::Green | ComponentSwizzle::Blue | ComponentSwizzle::Zero => 0,
+                    ComponentSwizzle::Alpha | ComponentSwizzle::One => 255,
+                })
             } else if colored {
                 if index >= 2 {
                     [59_u8, 57, 59, 255]
@@ -384,7 +471,7 @@ fn bc1_sampling_preserves_alpha_srgb_block_layout_and_cached_pipeline_variants()
                     0,
                     0,
                     0,
-                    if formats[index].has_opaque_bc1_alpha() {
+                    if formats[index].0.has_opaque_bc1_alpha() {
                         255
                     } else {
                         0
@@ -423,6 +510,7 @@ fn sampled_fragment(array: bool) -> nixe_gpu::ShaderBackendModule {
             coordinates,
             array_index: ShaderRegister::new(6),
             image_binding: 0,
+            lod: None,
             sampler_binding: 1,
         }
     } else {
@@ -430,6 +518,7 @@ fn sampled_fragment(array: bool) -> nixe_gpu::ShaderBackendModule {
             outputs,
             coordinates,
             image_binding: 0,
+            lod: None,
             sampler_binding: 1,
         }
     };

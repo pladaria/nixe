@@ -13,9 +13,11 @@ mod cache;
 mod capability;
 mod color;
 mod command;
+mod conversion;
 pub use color::{
     BlendComponent, BlendFactor, BlendOperation, ColorBlendState, ColorOutputState, ColorWriteMask,
 };
+pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Conversion};
 mod diagnostics;
 mod presentation;
 mod resource;
@@ -56,13 +58,14 @@ pub use capability::{
 };
 pub use command::{
     AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BarrierOperation,
-    BufferRegion, CacheMaintenanceOperation, ClearOperation, ClearValue, CommandDescriptionError,
-    CopyOperation, CullMode, DepthCompareOperation, DepthState, DispatchOperation, DrawArguments,
-    DrawOperation, FrontFace, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
-    LineRasterization, OperationSubmission, PreparedDraw, PrimitiveTopology, QueryOperation,
-    RenderAttachment, RenderPassOperation, ResolveOperation, ScissorRect, TriangleRasterization,
-    VertexAttribute, VertexBufferLayout, VertexComponentCount, VertexComponentWidth, VertexFormat,
-    VertexStepMode, ViewportTransform,
+    BlitFilter, BlitOperation, BufferRegion, CacheMaintenanceOperation, ClearOperation, ClearValue,
+    CommandDescriptionError, CopyOperation, CullMode, DepthCompareOperation, DepthState,
+    DispatchOperation, DrawArguments, DrawOperation, FragmentDepthTransform, FrontFace, GpuCommand,
+    GpuOperation, ImageOrigin, ImageRegion, IndexType, LineRasterization, OperationSubmission,
+    PreparedDraw, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
+    ResolveOperation, ScissorRect, StencilTestState, TriangleRasterization, VertexAttribute,
+    VertexBufferLayout, VertexComponentCount, VertexComponentWidth, VertexFormat,
+    VertexPositionTransform, VertexStepMode, ViewportTransform,
 };
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,

@@ -90,19 +90,30 @@ impl VibrationOutput {
     }
 
     pub fn send(&self, side: VibrationSide, value: VibrationValue) -> Result<(), VibrationError> {
-        if !value.is_valid() {
+        let mut values = [None; 2];
+        values[match side {
+            VibrationSide::Left => 0,
+            VibrationSide::Right => 1,
+        }] = Some(value);
+        self.send_values(values)
+    }
+
+    /// Publish both actuator updates together; absent sides retain their force.
+    pub fn send_values(&self, values: [Option<VibrationValue>; 2]) -> Result<(), VibrationError> {
+        if values.into_iter().flatten().any(|value| !value.is_valid()) {
             return Err(VibrationError("invalid actuator frequency or amplitude"));
         }
         self.update(|state| {
-            let index = match side {
-                VibrationSide::Left => 0,
-                VibrationSide::Right => 1,
-            };
-            if state.values[index] == value {
-                return false;
+            let mut changed = false;
+            for (current, value) in state.values.iter_mut().zip(values) {
+                if let Some(value) = value
+                    && *current != value
+                {
+                    *current = value;
+                    changed = true;
+                }
             }
-            state.values[index] = value;
-            true
+            changed
         })
     }
 
@@ -170,6 +181,48 @@ pub(crate) fn vibration_channel() -> (VibrationOutput, VibrationReceiver) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_updates_both_actuators_and_rejects_invalid_force_without_publication() {
+        let (output, receiver) = vibration_channel();
+        let left = VibrationValue {
+            low_amplitude: 0.25,
+            low_frequency: 160.0,
+            ..Default::default()
+        };
+        let right = VibrationValue {
+            high_amplitude: 0.75,
+            high_frequency: 320.0,
+            ..Default::default()
+        };
+        output.send_values([Some(left), Some(right)]).unwrap();
+        assert_eq!(
+            receiver.take_latest().unwrap().unwrap().values,
+            [left, right]
+        );
+        assert!(receiver.take_latest().unwrap().is_none());
+        output.send_values([Some(left), Some(right)]).unwrap();
+        assert!(receiver.take_latest().unwrap().is_none());
+        output
+            .send_values([
+                Some(VibrationValue::default()),
+                Some(VibrationValue {
+                    high_frequency: f32::NAN,
+                    ..right
+                }),
+            ])
+            .unwrap_err();
+        assert!(receiver.take_latest().unwrap().is_none());
+        output
+            .send_values([Some(VibrationValue::default()), None])
+            .unwrap();
+        assert_eq!(
+            receiver.take_latest().unwrap().unwrap().values,
+            [VibrationValue::default(), right]
+        );
+        drop(receiver);
+        output.send_values([Some(left), Some(right)]).unwrap_err();
+    }
 
     #[test]
     fn independent_actuators_stop_and_do_not_follow_a_reconnected_device() {

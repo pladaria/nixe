@@ -30,11 +30,23 @@ initialization. The memory backend's requirements for native atomic accesses
 remain in force. Full Switch 2 instruction-set coverage is not provided by this
 upstream Dynarmic revision; unsupported instructions stop explicitly.
 
+## Video decoding
+
+NVDEC VP9 execution uses a persistent FFmpeg `libavcodec` context in the ordered
+Host1x worker. Building requires `pkg-config`, `libavcodec` 58 or newer, and
+`libavutil` development headers (`pkg-config libavcodec-dev libavutil-dev` on
+Debian/Ubuntu). Nixe reconstructs VP9 headers from the engine's picture and
+entropy tables and writes decoded NV12 surfaces into canonical guest memory.
+VIC applies the guest's color matrix, compositing and surface layout before its
+completion fence is signaled. The FFmpeg command-line executable is not used.
+Unsupported codec or VIC operations stop with the consumed engine state.
+
 ## Audio output
 
 `audout:u` uses SDL3 to open the host's default output when a guest opens
-`DeviceOut`. The emulated output is currently stereo signed-16-bit PCM at 48 kHz.
-SDL adapts this PCM stream to the physical device's format and sample rate.
+`DeviceOut`. Guest outputs accept stereo or six-channel signed-16-bit PCM at 48 kHz.
+The format belongs to each output session. SDL converts that stream to the
+physical device's channel layout, format and sample rate.
 SDL is initialized once on the application's main thread; input sampling and
 SDL's audio callback run independently. No audio feeder worker is required.
 
@@ -45,8 +57,8 @@ The optional `nixe.toml` setting is:
 output = "stereo"
 ```
 
-Omitting it selects the same stereo (2.0) mode. Other layouts, including 5.1,
-are rejected until their Horizon semantics and channel routing are implemented.
+Omitting it selects the same stereo (2.0) mode. Other configured layouts remain unsupported. A guest may explicitly open a
+six-channel AudioOut stream while the configured renderer output is stereo.
 The output layout and PCM format are explicit types shared by configuration and
 the host adapter, so future modes do not require another playback backend.
 
@@ -54,7 +66,7 @@ SDL consumes PCM on demand. Empty or stopped queues supply silence without
 manufacturing buffer completions. Stopping an active guest output releases its
 pending buffers; closing its last session handle destroys the SDL stream.
 Application shutdown closes any remaining streams before the SDL audio subsystem.
-Flush/volume commands and six-channel guest buffers remain unsupported.
+Flush and volume commands remain unsupported.
 
 See [SDL3 audio streams](https://wiki.libsdl.org/SDL3/SDL_AudioStream) for host
 format conversion and [SDL3 audio devices](https://wiki.libsdl.org/SDL3/CategoryAudio)

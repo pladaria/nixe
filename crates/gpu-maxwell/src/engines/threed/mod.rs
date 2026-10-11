@@ -93,9 +93,9 @@ pub use mme::{
 pub use operations::{
     MaxwellThreeDDecompressSurface, MaxwellThreeDFlushPendingWrites,
     MaxwellThreeDReportSemaphoreControl, MaxwellThreeDReportSemaphoreOperation,
-    MaxwellThreeDReportSemaphorePipelineLocation, MaxwellThreeDReportSemaphoreRelease,
-    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
-    MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDShaderCacheInvalidation,
+    MaxwellThreeDReportSemaphorePipelineLocation, MaxwellThreeDReportSemaphoreState,
+    MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDReportSemaphoreStructureSize,
+    MaxwellThreeDReportSemaphoreWrite, MaxwellThreeDShaderCacheInvalidation,
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
     MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
     MaxwellThreeDSyncpointIncrement, MaxwellThreeDTextureCacheInvalidation,
@@ -127,7 +127,8 @@ pub use output::{
 };
 pub use render_enable::{
     MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDRenderEnableMode,
-    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderEnableStateWrite,
+    MaxwellThreeDRenderEnableOverride, MaxwellThreeDRenderEnableState,
+    MaxwellThreeDRenderEnableStateWrite,
 };
 pub use render_targets::{
     MAXWELL_COLOR_TARGET_COUNT, MaxwellThreeDAttachmentReadiness, MaxwellThreeDClearState,
@@ -370,6 +371,7 @@ enum MethodAction {
     ViewportZClip,
     RenderEnableControl,
     RenderEnableMode,
+    RenderEnableOverride,
     PsOutputSampleMaskUsage,
     VisibleCallLimit,
     SmTimeoutCounterBit,
@@ -399,6 +401,8 @@ enum MethodAction {
     ClearReportValue,
     ZCullStatsEnable,
     ZPassPixelCountEnable,
+    StatisticsCounterEnable,
+    StreamOutputEnable,
     ZCullCriterion,
     ZCullEnable,
     ZCullBounds,
@@ -1112,6 +1116,18 @@ methods!(
     INVALIDATE_ZCULL => (
         0x1958, "INVALIDATE_ZCULL", 0, MethodAction::ZCullMaintenance
     ),
+    SET_STREAM_OUTPUT => (
+        0x0744,
+        "SET_STREAM_OUTPUT",
+        0x0000_0001,
+        MethodAction::StreamOutputEnable
+    ),
+    SET_STATISTICS_COUNTER => (
+        0x0d68,
+        "SET_STATISTICS_COUNTER",
+        0x0000_ffff,
+        MethodAction::StatisticsCounterEnable
+    ),
     SET_ZPASS_PIXEL_COUNT => (
         0x1514,
         "SET_ZPASS_PIXEL_COUNT",
@@ -1147,6 +1163,12 @@ methods!(
         "SET_ZCULL_BOUNDS",
         0x0000_0011,
         MethodAction::ZCullBounds
+    ),
+    SET_RENDER_ENABLE_OVERRIDE => (
+        0x1944,
+        "SET_RENDER_ENABLE_OVERRIDE",
+        0x0000_0003,
+        MethodAction::RenderEnableOverride
     ),
     SET_RENDER_ENABLE_C => (
         0x1558,
@@ -1222,6 +1244,7 @@ pub(super) fn preflight_mme_call<E>(
     })?;
     parameters.extend(methods.iter().map(|method| method.source().argument()));
     let program = candidate.mme().program();
+
     {
         let mut host = MmeDispatchHost {
             profile,
@@ -1302,9 +1325,10 @@ where
         }
         let source = self.source.emitted_by_mme(method, argument);
         let dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
-        // MME-emitted methods target the live register file directly and do
-        // not pass through pushbuffer shadow-RAM tracking/replay.
-        let prepared = preflight_with_shadow(self.profile, dispatch, self.candidate, false)
+        // MME sends use the same method path, including shadow tracking/replay,
+        // as pushbuffer writes. The interpreter and JIT both call CallMethod:
+        // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/video_core/macro.cpp#L664-L666
+        let prepared = preflight_with_shadow(self.profile, dispatch, self.candidate)
             .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
         if let Some(operation) = lower_pending_operation(prepared.operation, self.candidate) {
             (self.consume)(operation, self.candidate.operation_state())
@@ -1319,7 +1343,7 @@ pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
-    let prepared = preflight_with_shadow(profile, method, candidate, true)?;
+    let prepared = preflight_with_shadow(profile, method, candidate)?;
     let operation = lower_pending_operation(prepared.operation, candidate);
     Ok(AppliedMethod::new(
         prepared.method,
@@ -1351,7 +1375,6 @@ fn preflight_with_shadow(
     profile: MaxwellGpuProfile,
     mut method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
-    apply_shadow_ram: bool,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
     if is_mme_aperture(source.method()) {
@@ -1361,13 +1384,12 @@ fn preflight_with_shadow(
         });
     }
     let shadow_control = candidate.mme().shadow_ram_control().value().copied();
-    if apply_shadow_ram {
-        let effective_argument = candidate
-            .mme()
-            .resolve_shadow_argument(source.method(), source.argument())
-            .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
-        method = method.with_effective_argument(effective_argument);
-    }
+    let effective_argument = candidate
+        .mme()
+        .resolve_shadow_argument(source.method(), source.argument())
+        .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
+
+    method = method.with_effective_argument(effective_argument);
     let register_changed = candidate
         .raw_register(method.source().method())
         .is_none_or(|register| register.raw() != Some(method.source().argument()));
@@ -1376,11 +1398,9 @@ fn preflight_with_shadow(
         candidate.refresh_semantic_identities(register_changed);
         candidate.record_raw_register(prepared.method.source());
     }
-    if apply_shadow_ram {
-        candidate
-            .mme_mut()
-            .track_shadow_register(shadow_control, prepared.method.source());
-    }
+    candidate
+        .mme_mut()
+        .track_shadow_register(shadow_control, prepared.method.source());
     Ok(prepared)
 }
 
@@ -2234,6 +2254,19 @@ fn preflight_register(
                 candidate.apply(write);
                 state_write()
             }
+            MethodAction::RenderEnableOverride => {
+                let value = MaxwellThreeDRenderEnableOverride::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                candidate.apply(MaxwellThreeDStateWrite::RenderEnable(
+                    MaxwellThreeDRenderEnableStateWrite::Override { value, source },
+                ));
+                state_write()
+            }
             MethodAction::RenderEnableMode => {
                 let value = MaxwellThreeDRenderEnableMode::parse(source.argument()).ok_or(
                     MaxwellEngineDispatchError::InvalidMethodValue {
@@ -2708,6 +2741,24 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
+                state_write()
+            }
+            MethodAction::StreamOutputEnable => {
+                candidate.apply(MaxwellThreeDStateWrite::ShaderExecution(
+                    MaxwellThreeDShaderExecutionStateWrite::StreamOutputEnable {
+                        value: source.argument() != 0,
+                        source,
+                    },
+                ));
+                state_write()
+            }
+            MethodAction::StatisticsCounterEnable => {
+                candidate.apply(MaxwellThreeDStateWrite::Counter(
+                    MaxwellThreeDCounterStateWrite::StatisticsEnable {
+                        value: source.argument(),
+                        source,
+                    },
+                ));
                 state_write()
             }
             MethodAction::ZPassPixelCountEnable => {

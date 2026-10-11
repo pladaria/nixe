@@ -340,6 +340,44 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                     session.set_performance_mode_changed_notification(enabled);
                     applet_data(request.token, &[])
                 }
+                // https://switchbrew.org/wiki/Applet_Manager_services#SetIdleTimeDetectionExtension
+                // u32: Disabled (0), Extended (1), ExtendedUnsafe (2).
+                SelfControllerCommand::SetIdleTimeDetectionExtension => {
+                    let Some(bytes) = request.data.get(..4) else {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    };
+                    if request.data[4..].iter().any(|byte| *byte != 0) || has_ipc_descriptors(hipc)
+                    {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let extension = u32::from_le_bytes(bytes.try_into().expect("four-byte slice"));
+                    if extension > 2 {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    session.set_idle_time_detection_extension(extension);
+                    applet_data(request.token, &[])
+                }
+                SelfControllerCommand::GetIdleTimeDetectionExtension => {
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    applet_data(
+                        request.token,
+                        &session.idle_time_detection_extension().to_le_bytes(),
+                    )
+                }
                 SelfControllerCommand::SetFocusHandlingMode => {
                     let Some(mode) = request.data.get(..3) else {
                         return applet_error(

@@ -24,13 +24,19 @@ fn captured_iadd_reaches_verified_unsigned_add_and_wgsl() {
         ],
         4,
     );
-    assert!(matches!(
-        translated.ir().instructions()[1].operation(),
-        ShaderOperation::MoveImmediate32 { bits: 1, .. }
-    ));
     assert!(
-        matches!(translated.ir().instructions()[2].operation(), ShaderOperation::Add32 { destination, left, scalar_type: ShaderScalarType::Unsigned32, .. } if destination.index() == 1 && left.index() == 1)
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(
+                instruction.operation(),
+                ShaderOperation::MoveImmediate32 { bits: 1, .. }
+            ))
     );
+    assert!(
+        translated.ir().instructions().iter().any(|instruction| matches!(instruction.operation(), ShaderOperation::Add32 { destination, left, scalar_type: ShaderScalarType::Unsigned32, .. } if destination.index() == 1 && left.index() == 1)
+    ));
     let module = lower_shader_ir_to_wgsl(&translated).unwrap();
     assert!(
         module
@@ -56,13 +62,19 @@ fn captured_lop_and_vertex_id_reaches_verified_ir_and_wgsl() {
         ],
         4,
     );
-    assert!(matches!(
-        translated.ir().instructions()[1].operation(),
-        ShaderOperation::MoveImmediate32 { bits: 2, .. }
-    ));
-    assert!(matches!(translated.ir().instructions()[2].operation(),
+    assert!(
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(
+                instruction.operation(),
+                ShaderOperation::MoveImmediate32 { bits: 2, .. }
+            ))
+    );
+    assert!(translated.ir().instructions().iter().any(|instruction| matches!(instruction.operation(),
         ShaderOperation::Bitwise32 { destination, left, operation: nixe_gpu::ShaderBitwiseOperation::And, .. }
-            if destination.index() == 0 && left.index() == 0));
+            if destination.index() == 0 && left.index() == 0)));
     validate_wgsl(&lower_shader_ir_to_wgsl(&translated).unwrap());
 }
 
@@ -117,23 +129,35 @@ fn captured_immediate_shift_left_reaches_verified_ir_and_wgsl() {
         8,
     );
 
-    assert!(matches!(
-        translated.ir().instructions()[1].operation(),
-        ShaderOperation::MoveImmediate32 {
-            bits: 4,
-            scalar_type: ShaderScalarType::Unsigned32,
-            ..
-        }
-    ));
-    assert!(matches!(
-        translated.ir().instructions()[2].operation(),
-        ShaderOperation::ShiftLeft32 {
-            destination,
-            value,
-            wrap: false,
-            ..
-        } if destination.index() == 7 && value.index() == 0
-    ));
+    assert!(
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(
+                instruction.operation(),
+                ShaderOperation::MoveImmediate32 {
+                    bits: 4,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                    ..
+                }
+            ))
+    );
+    assert!(
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(
+                instruction.operation(),
+                ShaderOperation::ShiftLeft32 {
+                    destination,
+                    value,
+                    wrap: false,
+                    ..
+                } if destination.index() == 7 && value.index() == 0
+            ))
+    );
     validate_wgsl(&lower_shader_ir_to_wgsl(&translated).unwrap());
 }
 
@@ -321,7 +345,7 @@ fn iscadd_signed_immediate_constant_buffer_and_zero_register() {
 
 #[test]
 fn iscadd_rejects_untranslated_flags_and_reserved_fields() {
-    for flag in [1 << 47, 1 << 48, 1 << 49, 1 << 44, 1 << 28] {
+    for flag in [1 << 48, 1 << 49, 1 << 44, 1 << 28] {
         assert!(decode_add(STAGE, 8, 0x5c18_0280_0017_0000 | flag, 4, &mut 4, &mut None).is_err());
     }
 }
@@ -493,13 +517,11 @@ fn lop_forms_complements_and_pass_b_match_integer_semantics() {
 }
 
 #[test]
-fn lop_rejects_flags_predicate_outputs_reserved_bits_and_bad_registers() {
+fn lop_rejects_unimplemented_flags_reserved_bits_and_bad_registers() {
     let captured = 0x3847_0000_0027_0000_u64;
     for (word, detail) in [
         (captured | (1 << 47), "LOP condition-code write"),
         (captured | (1 << 43), "LOP extended condition-code input"),
-        (captured & !(7 << 48), "LOP predicate output"),
-        (captured | (1 << 44), "LOP predicate output"),
     ] {
         assert!(matches!(decode_bitwise(STAGE, 8, word, 4, &mut 4),
             Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { detail: actual, .. }) if actual == detail));

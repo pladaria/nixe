@@ -34,6 +34,7 @@ const SYSTEM_BUTTON_ENTRY_SIZE: usize = 0x18;
 const NPAD_STYLE_FULL_KEY: u32 = 1;
 const NPAD_DEVICE_TYPE_FULL_KEY: u32 = 1;
 const NPAD_ATTRIBUTE_CONNECTED: u32 = 1;
+const NPAD_JOY_ASSIGNMENT_DUAL: u32 = 0;
 const SIX_AXIS_ATTRIBUTE_CONNECTED: u32 = 1;
 const APPLET_FOOTER_SWITCH_PRO_CONTROLLER: u8 = 12;
 const STANDARD_GRAVITY: f32 = 9.806_65;
@@ -199,24 +200,25 @@ impl HidSystem {
         self.vibration_output = Some(output);
     }
 
-    pub(crate) fn send_vibration(
+    pub(crate) fn send_vibration_values(
         &self,
-        handle: u32,
-        value: nixe_input::VibrationValue,
+        values: &[(u32, nixe_input::VibrationValue)],
     ) -> Option<Result<(), nixe_input::VibrationError>> {
         let output = self.vibration_output.as_ref()?;
+        let mut actuators = [None; 2];
         // Only player one FullKey is currently published by this HID producer.
         // Valid handles for other Npads address disconnected actuators.
-        let [style, npad_id, _, _] = handle.to_le_bytes();
-        if !self.connected || style != 3 || npad_id != 0 {
-            return Some(Ok(()));
+        for &(handle, value) in values {
+            let [style, npad_id, device_index, _] = handle.to_le_bytes();
+            if self.connected && style == 3 && npad_id == 0 {
+                actuators[usize::from(device_index)] = Some(value);
+            }
         }
-        let side = match vibration_device_position(handle).expect("validated HID actuator") {
-            1 => nixe_input::VibrationSide::Left,
-            2 => nixe_input::VibrationSide::Right,
-            _ => unreachable!(),
-        };
-        Some(output.send(side, value))
+        Some(if actuators.iter().all(Option::is_none) {
+            Ok(())
+        } else {
+            output.send_values(actuators)
+        })
     }
 
     /// Controller-support applets use the same connection state published to HID.
@@ -257,12 +259,7 @@ impl HidSystem {
     }
 
     pub(crate) fn acquire_style_event(&self, id: u32) -> Option<ReadableEventObject> {
-        let index = match id {
-            0..=7 => id as usize,
-            0x10 => 8,
-            0x20 => 9,
-            _ => return None,
-        };
+        let index = npad_index(id)?;
         let (writable, readable) = self.style_events[index]
             .get_or_init(|| EventObject::create_pair_with_source(ExternalEventSource::Input));
         // Acquiring also signals the event so a client can inspect the initial
@@ -352,6 +349,21 @@ impl HidSystem {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .npad_joy_hold_type
+    }
+
+    pub(crate) fn set_npad_joy_assignment_mode_dual(&self, id: u32) -> Result<bool, HandleError> {
+        let Some(index) = npad_index(id) else {
+            return Ok(false);
+        };
+        // Assignment controls splitting/joining Joy-Con, not FullKey input.
+        // The supported FullKey producer cannot have a single Joy-Con to
+        // reconnect; publish the requested Dual mode in this Npad's metadata.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h
+        self.write_u32(
+            NPAD_OFFSET + index * NPAD_ENTRY_SIZE + 4,
+            NPAD_JOY_ASSIGNMENT_DUAL,
+        )?;
+        Ok(true)
     }
 
     pub(crate) fn set_six_axis_sensor_active(&self, handle: u32, active: bool) {
@@ -486,7 +498,7 @@ impl HidSystem {
         let style_changed = !self.connected;
         if style_changed {
             self.write_u32(NPAD_OFFSET, NPAD_STYLE_FULL_KEY)?;
-            self.write_u32(NPAD_OFFSET + 4, 0)?;
+            self.write_u32(NPAD_OFFSET + 4, NPAD_JOY_ASSIGNMENT_DUAL)?;
             self.write_u32(NPAD_OFFSET + 8, 0)?;
             self.write_u32(NPAD_OFFSET + 0x4188, NPAD_DEVICE_TYPE_FULL_KEY)?;
             self.write_u64(
@@ -608,6 +620,15 @@ fn put_turns(bytes: &mut [u8], offset: usize, radians: nixe_input::MotionVector)
     put_f32(bytes, offset, radians.x / std::f32::consts::TAU);
     put_f32(bytes, offset + 4, -radians.z / std::f32::consts::TAU);
     put_f32(bytes, offset + 8, radians.y / std::f32::consts::TAU);
+}
+
+fn npad_index(id: u32) -> Option<usize> {
+    match id {
+        0..=7 => Some(id as usize),
+        0x10 => Some(8),
+        0x20 => Some(9),
+        _ => None,
+    }
 }
 
 fn npad_buttons(state: &EmulatedControllerState) -> u64 {
@@ -843,6 +864,8 @@ mod tests {
         };
         hid.publish(Some(&state), Duration::from_millis(5)).unwrap();
 
+        assert!(hid.set_npad_joy_assignment_mode_dual(0).unwrap());
+        assert_eq!(read_u32(&memory, NPAD_OFFSET + 4), NPAD_JOY_ASSIGNMENT_DUAL);
         assert_eq!(read_u32(&memory, NPAD_OFFSET), NPAD_STYLE_FULL_KEY);
         assert_eq!(read_u64(&memory, NPAD_OFFSET + 0x38), 0);
         assert_eq!(read_u64(&memory, NPAD_OFFSET + 0x40), 1);

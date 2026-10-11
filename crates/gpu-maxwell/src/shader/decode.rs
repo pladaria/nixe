@@ -33,7 +33,7 @@ pub(super) fn allocate_shader_temporary(
     detail: &'static str,
     next_temporary: &mut u16,
 ) -> Result<ShaderRegister, MaxwellShaderTranslationError> {
-    if *next_temporary >= 256 {
+    if *next_temporary == u16::MAX {
         return Err(malformed(stage, offset, encoding, detail));
     }
     let register = ShaderRegister::new(*next_temporary);

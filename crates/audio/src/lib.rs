@@ -17,12 +17,15 @@ pub use host::{HostAudioBackend, HostAudioRuntime};
 pub enum ChannelLayout {
     #[default]
     Stereo,
+    /// Interleaved FL, FR, FC, LFE, BL, BR, matching SDL's 5.1 layout.
+    Surround51,
 }
 
 impl ChannelLayout {
     pub const fn channels(self) -> usize {
         match self {
             Self::Stereo => 2,
+            Self::Surround51 => 6,
         }
     }
 }
@@ -39,6 +42,11 @@ impl PcmFormat {
     pub const STEREO_48KHZ: Self = Self {
         sample_rate: std::num::NonZeroU32::new(48_000).unwrap(),
         layout: ChannelLayout::Stereo,
+    };
+
+    pub const SURROUND_48KHZ: Self = Self {
+        sample_rate: std::num::NonZeroU32::new(48_000).unwrap(),
+        layout: ChannelLayout::Surround51,
     };
 
     pub const fn frame_bytes(self) -> usize {
@@ -60,6 +68,9 @@ impl std::error::Error for AudioError {}
 pub trait AudioDevice: Send {}
 
 pub trait AudioBackend: Debug + Send + Sync {
+    /// Application speaker layout supported by this backend. SDL may convert it
+    /// to the physical device format, independently of the guest's channel count.
+    fn output_layout(&self) -> Result<ChannelLayout, AudioError>;
     fn open(&self, feed: AudioFeed) -> Result<Box<dyn AudioDevice>, AudioError>;
 }
 
@@ -181,6 +192,10 @@ impl AudioOutput {
         Ok(state)
     }
 
+    pub fn format(&self) -> PcmFormat {
+        self.feed.format
+    }
+
     pub fn started(&self) -> Result<bool, AudioError> {
         Ok(self.state()?.started)
     }
@@ -211,9 +226,7 @@ impl AudioOutput {
             .len()
             .is_multiple_of(self.feed.format.layout.channels())
         {
-            return Err(AudioError(
-                "PCM buffer must contain complete stereo frames".into(),
-            ));
+            return Err(AudioError("PCM buffer must contain complete frames".into()));
         }
         let mut state = self.state()?;
         state
@@ -255,6 +268,15 @@ impl AudioOutput {
         Ok(tags)
     }
 
+    /// Recover one consumed buffer's storage for a streaming producer. The
+    /// callback retains allocations; recycling happens outside the callback.
+    pub fn recycle_buffer(&self) -> Result<Option<Vec<i16>>, AudioError> {
+        let mut state = self.state()?;
+        let samples = state.released.pop_front().map(|buffer| buffer.samples);
+        (self.feed.event)(!state.released.is_empty());
+        Ok(samples)
+    }
+
     pub fn owned_buffer_count(&self) -> Result<usize, AudioError> {
         let state = self.state()?;
         Ok(state.queued.len() + state.released.len())
@@ -284,6 +306,9 @@ mod tests {
     struct Device;
     impl AudioDevice for Device {}
     impl AudioBackend for Backend {
+        fn output_layout(&self) -> Result<ChannelLayout, AudioError> {
+            Ok(ChannelLayout::Stereo)
+        }
         fn open(&self, feed: AudioFeed) -> Result<Box<dyn AudioDevice>, AudioError> {
             *self.0.lock().unwrap() = Some(feed);
             Ok(Box::new(Device))
@@ -357,6 +382,22 @@ mod tests {
         feed.render(&mut frame);
         assert_eq!(frame, [9, 10]);
         assert_eq!(output.released(1).unwrap(), [2]);
+    }
+
+    #[test]
+    fn streaming_producer_recycles_the_original_consumed_allocation() {
+        let (output, feed, _) = output();
+        let samples = vec![11, 22, 33, 44];
+        let allocation = samples.as_ptr();
+        output.append(1, samples).unwrap();
+        output.start().unwrap();
+        let mut pcm = [0; 4];
+        feed.render(&mut pcm);
+        let recycled = output.recycle_buffer().unwrap().unwrap();
+        assert_eq!(recycled.as_ptr(), allocation);
+        assert_eq!(recycled, pcm);
+        assert!(output.recycle_buffer().unwrap().is_none());
+        assert_eq!(output.owned_buffer_count().unwrap(), 0);
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub(super) fn live_instructions(
             continue;
         }
         let reason = match instruction.operation {
-            ShaderOperation::Branch { .. } => {
+            ShaderOperation::Branch { .. } | ShaderOperation::BranchTable { .. } => {
                 Some("guest control flow requires CFG structurization")
             }
             ShaderOperation::Exit if instruction.predicate != ShaderPredicate::Always => {
@@ -84,6 +84,9 @@ pub(super) fn live_instructions(
             | ShaderOperation::ShiftLeft32 { .. }
             | ShaderOperation::ShiftRightLogical32 { .. }
             | ShaderOperation::Bitwise32 { .. }
+            | ShaderOperation::ExtractBitfield32 { .. }
+            | ShaderOperation::CompareInteger32 { .. }
+            | ShaderOperation::CompareFloat32 { .. }
             | ShaderOperation::FloatMinMax32 { .. }
             | ShaderOperation::FusedMultiplyAdd32 { .. }
             | ShaderOperation::Reciprocal32 { .. }
@@ -97,7 +100,9 @@ pub(super) fn live_instructions(
             | ShaderOperation::SampleTexture2D { .. }
             | ShaderOperation::LoadTexture2D { .. }
             | ShaderOperation::SampleTexture2DArray { .. } => false,
-            ShaderOperation::Branch { .. } => unreachable!("branches rejected before liveness"),
+            ShaderOperation::Branch { .. } | ShaderOperation::BranchTable { .. } => {
+                unreachable!("branches rejected before liveness")
+            }
         };
         if !observable && !live_definition && predicates & predicate_definitions == 0 {
             continue;
@@ -128,6 +133,8 @@ pub(super) fn live_instructions(
         use_predicate(instruction.predicate);
         match instruction.operation {
             ShaderOperation::SetPredicateInteger32 { accumulator, .. }
+            | ShaderOperation::CompareInteger32 { accumulator, .. }
+            | ShaderOperation::CompareFloat32 { accumulator, .. }
             | ShaderOperation::SetPredicateFloat32 { accumulator, .. } => {
                 use_predicate(accumulator)
             }

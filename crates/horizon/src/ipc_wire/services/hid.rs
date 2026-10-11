@@ -16,8 +16,10 @@ enum HidCommand {
     ActivateNpadWithRevision,
     SetNpadJoyHoldType,
     GetNpadJoyHoldType,
+    SetNpadJoyAssignmentModeDual,
     GetVibrationDeviceInfo,
     SendVibrationValue,
+    SendVibrationValues,
     CreateActiveVibrationDeviceList,
 }
 
@@ -38,9 +40,11 @@ impl HidCommand {
             109 => Some(Self::ActivateNpadWithRevision),
             120 => Some(Self::SetNpadJoyHoldType),
             121 => Some(Self::GetNpadJoyHoldType),
+            124 => Some(Self::SetNpadJoyAssignmentModeDual),
             200 => Some(Self::GetVibrationDeviceInfo),
             201 => Some(Self::SendVibrationValue),
             203 => Some(Self::CreateActiveVibrationDeviceList),
+            206 => Some(Self::SendVibrationValues),
             _ => None,
         }
     }
@@ -85,35 +89,63 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let handle = request_u32(request.data, 0).unwrap();
-            if crate::hid::vibration_device_position(handle).is_none() {
+            let Some(value) = decode_vibration_value(&request.data[4..20]) else {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
-            }
-            let values = [4, 8, 12, 16].map(|offset| request_f32(request.data, offset).unwrap());
-            if values
-                .iter()
-                .any(|value| !value.is_finite() || *value < 0.0)
-            {
-                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
-            }
-            let value = nixe_input::VibrationValue {
-                low_amplitude: values[0],
-                low_frequency: values[1],
-                high_amplitude: values[2],
-                high_frequency: values[3],
             };
-            log::trace!("HID vibration request: handle={handle:#010x} value={value:?}");
-            if let Some(result) = hid_system.send_vibration(handle, value) {
-                result.map_err(|e| IpcWireError::InputBackend(e.to_string().into_boxed_str()))?;
-            } else if !value.is_stopped() {
-                return Err(IpcWireError::UnsupportedService(
-                    UnsupportedServiceOperation::CommandVariant {
-                        service: "hid",
-                        command_id: 201,
-                        detail: "nonzero vibration requires a host actuator backend",
-                    },
-                ));
+            send_vibration_values(hid_system, request, &[(handle, value)])
+        }
+        // ARUID and two pointer input arrays, without PID: handles (u32),
+        // then values (four f32s). Both arrays must contain the same count.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1081-L1092
+        HidCommand::SendVibrationValues => {
+            if !request.has_payload_size(8)
+                || hipc.pid.is_some()
+                || !hipc.copy_handles.is_empty()
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+                || hipc.receive_statics != ReceiveStatics::None
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            semantic_success(request.token, false, &[], &[], &[], None)
+            let [handles, values] = hipc.send_statics.as_slice() else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            if handles.index != 0 || values.index != 1 {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let handles_size = usize::from(handles.size);
+            let values_size = usize::from(values.size);
+            if !handles_size.is_multiple_of(4) || values_size != handles_size * 4 {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            let mut encoded_handles = vec![0; handles_size];
+            let mut encoded_values = vec![0; values_size];
+            if handles_size != 0 {
+                read_bytes(
+                    process,
+                    GuestVirtualAddress::new(handles.address),
+                    &mut encoded_handles,
+                )?;
+                read_bytes(
+                    process,
+                    GuestVirtualAddress::new(values.address),
+                    &mut encoded_values,
+                )?;
+            }
+            let mut updates = Vec::with_capacity(handles_size / 4);
+            for (handle, value) in encoded_handles
+                .chunks_exact(4)
+                .zip(encoded_values.chunks_exact(16))
+            {
+                let handle = u32::from_le_bytes(handle.try_into().unwrap());
+                let Some(value) = decode_vibration_value(value) else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                updates.push((handle, value));
+            }
+            send_vibration_values(hid_system, request, &updates)
         }
 
         // One u32 handle, no PID or descriptors. The output is two u32s:
@@ -300,6 +332,24 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                 )
             }
         }
+        // u32 Npad ID followed by aligned u64 ARUID, with PID and no buffers.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
+        HidCommand::SetNpadJoyAssignmentModeDual => {
+            if hipc.pid.is_none()
+                || !request.has_payload_size(16)
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let id = request_u32(request.data, 0).unwrap();
+            if !hid_system
+                .set_npad_joy_assignment_mode_dual(id)
+                .map_err(|_| IpcWireError::Internal("updating Npad assignment metadata"))?
+            {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
         HidCommand::ActivateNpad => {
             if hipc.pid.is_none() || request.data.len() < 8 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
@@ -409,6 +459,50 @@ pub(in crate::ipc_wire) fn dispatch_hid_active_vibration_device_list(
     }
     if !list.activate(handle) {
         return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+    }
+    semantic_success(request.token, false, &[], &[], &[], None)
+}
+
+fn decode_vibration_value(bytes: &[u8]) -> Option<nixe_input::VibrationValue> {
+    let values = [0, 4, 8, 12].map(|offset| request_f32(bytes, offset).unwrap());
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return None;
+    }
+    Some(nixe_input::VibrationValue {
+        low_amplitude: values[0],
+        low_frequency: values[1],
+        high_amplitude: values[2],
+        high_frequency: values[3],
+    })
+}
+
+fn send_vibration_values(
+    hid_system: &HidSystem,
+    request: CmifRequest<'_>,
+    values: &[(u32, nixe_input::VibrationValue)],
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if values
+        .iter()
+        .any(|(handle, _)| crate::hid::vibration_device_position(*handle).is_none())
+    {
+        return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+    }
+    for (handle, value) in values {
+        log::trace!("HID vibration request: handle={handle:#010x} value={value:?}");
+    }
+    if let Some(result) = hid_system.send_vibration_values(values) {
+        result.map_err(|e| IpcWireError::InputBackend(e.to_string().into_boxed_str()))?;
+    } else if values.iter().any(|(_, value)| !value.is_stopped()) {
+        return Err(IpcWireError::UnsupportedService(
+            UnsupportedServiceOperation::CommandVariant {
+                service: "hid",
+                command_id: request.command_id,
+                detail: "nonzero vibration requires a host actuator backend",
+            },
+        ));
     }
     semantic_success(request.token, false, &[], &[], &[], None)
 }

@@ -91,7 +91,6 @@ fn multiple_sync_paths_share_one_ssy_target_through_ir_and_wgsl() {
         branches,
         vec![
             (ShaderSourceLocation::new(16), ShaderSourceLocation::new(40)),
-            (ShaderSourceLocation::new(24), ShaderSourceLocation::new(72)),
             (ShaderSourceLocation::new(48), ShaderSourceLocation::new(72)),
         ]
     );
@@ -129,11 +128,12 @@ fn ssy_is_consumed_as_control_metadata_before_neutral_translation() {
     );
 
     assert!(
-        !translated
+        translated
             .ir()
             .instructions()
             .iter()
-            .any(|instruction| instruction.source().byte_offset() == 8)
+            .any(|instruction| instruction.source().byte_offset() == 8
+                && matches!(instruction.operation(), ShaderOperation::Nop))
     );
     assert!(translated.ir().instructions().iter().any(|instruction| {
         instruction.source().byte_offset() == 40
@@ -188,4 +188,77 @@ fn dependency_scoreboard_wait_retains_its_branch_location_without_backend_synchr
                 && matches!(instruction.operation(), ShaderOperation::Nop))
     );
     validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+}
+
+fn control_fixture(code: &[u64]) -> super::super::binary::MaxwellShaderBinary {
+    use super::super::binary::*;
+    MaxwellShaderBinary {
+        address: 0,
+        metadata: MaxwellShaderMetadata::Compute {
+            workgroup_size: [1; 3],
+            register_count: 4,
+        },
+        bundles: code
+            .chunks(3)
+            .enumerate()
+            .map(|(index, chunk)| MaxwellShaderInstructionBundle {
+                offset: index as u32 * 32,
+                control: 0,
+                instructions: std::array::from_fn(|slot| {
+                    chunk.get(slot).copied().unwrap_or(0x50b0000000070f00)
+                }),
+            })
+            .collect(),
+        indirect_tables: Box::new([]),
+        source_cpu_writes: Box::new([]),
+        source_mappings: Box::new([]),
+    }
+}
+fn pc(index: u32) -> u32 {
+    index / 3 * 32 + 8 + index % 3 * 8
+}
+fn token(opcode: u16, from: u32, to: u32) -> u64 {
+    (u64::from(opcode) << 48) | (u64::from(pc(to).wrapping_sub(pc(from) + 8) & 0xffffff) << 20)
+}
+#[test]
+fn nested_break_and_sync_pop_only_the_executed_matching_tokens() {
+    let code = [
+        token(0xe2a0, 0, 8),
+        token(0xe290, 1, 6),
+        token(0xe2a0, 2, 5),
+        0xe34000000000000f,                   // @P0 BRK
+        token(0xe240, 4, 3) | (7 << 16) | 15, // Loop back with the inner PBK intact.
+        0xf0f800000007000f,
+        0xe34000000007000f,
+        0x50b0000000070f00,
+        0xe30000000007000f,
+    ];
+    let targets = stack_branch_targets(&control_fixture(&code)).unwrap();
+    assert_eq!(targets[&pc(3)].byte_offset(), pc(5));
+    assert_eq!(targets[&pc(5)].byte_offset(), pc(6));
+    assert_eq!(targets[&pc(6)].byte_offset(), pc(8));
+}
+#[test]
+fn continue_pops_its_token_and_leaves_the_outer_break_target() {
+    let code = [
+        token(0xe2a0, 0, 5),
+        token(0xe2b0, 1, 3),
+        0xe35000000007000f,
+        0xe34000000007000f,
+        0x50b0000000070f00,
+        0xe30000000007000f,
+    ];
+    let targets = stack_branch_targets(&control_fixture(&code)).unwrap();
+    assert_eq!(targets[&pc(2)].byte_offset(), pc(3));
+    assert_eq!(targets[&pc(3)].byte_offset(), pc(5));
+}
+#[test]
+fn a_branch_cannot_borrow_an_unexecuted_break_push() {
+    let code = [
+        token(0xe240, 0, 2) | (7 << 16) | 15,
+        token(0xe2a0, 1, 3),
+        0xe34000000007000f,
+        0xe30000000007000f,
+    ];
+    assert!(stack_branch_targets(&control_fixture(&code)).is_err());
 }

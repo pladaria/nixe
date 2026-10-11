@@ -659,9 +659,12 @@ impl CanonicalCpuWriteDependency {
             }
             drop(transitions);
             for page in demands.values() {
-                page.ensure_cpu_visible_with(resolve).map_err(|error| {
-                    CanonicalRangeAccessError::Backing(crate::CanonicalPageError::Visibility(error))
-                })?;
+                page.ensure_cpu_visible_with(resolve, true)
+                    .map_err(|error| {
+                        CanonicalRangeAccessError::Backing(crate::CanonicalPageError::Visibility(
+                            error,
+                        ))
+                    })?;
             }
             pending = retry;
         }
@@ -1671,7 +1674,11 @@ impl CanonicalBackingRange {
             for transition in &mut transitions {
                 transition.commit();
             }
-            crate::backing::publish_device_pages(&transitions_required)?;
+            // CPU execution may resume while the backend encodes its inputs.
+            // Refresh untouched bytes and transfer authority under one lease
+            // at host acceptance, so a CPU store is ordered before or after
+            // the device write rather than creating an artificial conflict.
+            crate::backing::publish_device_pages(&transitions_required, coordinator.as_ref())?;
         }
         for (range, owner) in owners {
             *range

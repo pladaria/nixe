@@ -120,7 +120,7 @@ fn multiple_color_targets_preserve_slot_formats_blending_masks_and_sampling() {
         ImageFormat::Rgba16Float,
         ImageFormat::Rgba8Unorm,
         ImageFormat::Rgba16Float,
-        ImageFormat::Rgba16Float,
+        ImageFormat::Rg11b10Ufloat,
     ];
     for (index, format) in formats.into_iter().enumerate() {
         let id = ImageId::new(10 + index as u64);

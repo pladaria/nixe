@@ -53,14 +53,17 @@ enum ServiceKind {
     UserSettings,
     SystemSettings,
     Performance,
+    Multimedia,
     Applet,
     Hid,
+    SharedFont,
     Irs,
     Time,
     Account,
     Bsd,
     Ssl,
     AudioOut,
+    AudioRenderer,
     Vi(ViServiceKind),
     NvDrv,
     LogManager,
@@ -76,14 +79,17 @@ impl ServiceKind {
             b"set" => Some(Self::UserSettings),
             b"set:sys" => Some(Self::SystemSettings),
             b"apm" => Some(Self::Performance),
+            b"mm:u" => Some(Self::Multimedia),
             b"appletOE" => Some(Self::Applet),
             b"hid" => Some(Self::Hid),
+            b"pl:u" => Some(Self::SharedFont),
             b"irs" => Some(Self::Irs),
             b"time:u" => Some(Self::Time),
             b"acc:u0" => Some(Self::Account),
             b"bsd:u" => Some(Self::Bsd),
             b"ssl" => Some(Self::Ssl),
             b"audout:u" => Some(Self::AudioOut),
+            b"audren:u" => Some(Self::AudioRenderer),
             b"nvdrv" | b"nvdrv:a" | b"nvdrv:s" => Some(Self::NvDrv),
             b"lm" => Some(Self::LogManager),
             // Public ECTX application-writer service registration:
@@ -220,6 +226,9 @@ fn connect_service(
                     SystemSettingsSession::new(),
                 ))
         }
+        ServiceKind::Multimedia => process
+            .handles_mut()
+            .insert(HorizonIpcObject::Multimedia(manager.multimedia_session())),
         ServiceKind::Performance => {
             process
                 .handles_mut()
@@ -242,6 +251,9 @@ fn connect_service(
                     .handles_mut()
                     .insert(HorizonIpcObject::Hid(HidSession::new(memory)))
             }),
+        ServiceKind::SharedFont => process.handles_mut().insert(HorizonIpcObject::SharedFont(
+            host_systems.shared_fonts.clone(),
+        )),
         ServiceKind::Irs => host_systems
             .hid
             .infrared_session(process.memory())
@@ -271,6 +283,13 @@ fn connect_service(
             .insert(HorizonIpcObject::AudioOutManager(
                 crate::AudioOutManagerSession(host_systems.audio_backend.cloned()),
             )),
+        ServiceKind::AudioRenderer => {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::AudioRendererManager(
+                    host_systems.audio_renderers.clone(),
+                ))
+        }
         ServiceKind::Vi(kind) => {
             process
                 .handles_mut()

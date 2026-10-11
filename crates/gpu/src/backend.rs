@@ -4,6 +4,7 @@
 //! lifecycle validation. A concrete [`BackendDriver`] observes a resource or
 //! submission only after the complete request has passed those checks.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -280,9 +281,24 @@ pub struct AcceptedBackendSubmission<'a> {
     submission: &'a OperationSubmission,
     agreement: CapabilityAgreement,
     resources: ResolvedBackendResources<'a>,
+    before_acceptance: &'a dyn Fn() -> Result<(), BackendDriverError>,
+    memory_accepted: Cell<bool>,
 }
 
 impl AcceptedBackendSubmission<'_> {
+    /// Establishes canonical write authority after input snapshots and encoding,
+    /// immediately before irreversible host acceptance. Drivers must call this
+    /// once and perform no further fallible preparation after it succeeds.
+    pub fn accept_memory(&self) -> Result<(), BackendDriverError> {
+        if self.memory_accepted.get() {
+            return Err(BackendDriverError::failure(
+                "submission memory was accepted twice",
+            ));
+        }
+        (self.before_acceptance)()?;
+        self.memory_accepted.set(true);
+        Ok(())
+    }
     #[must_use]
     pub const fn token(&self) -> BackendSubmissionToken {
         self.token
@@ -591,7 +607,7 @@ impl<D: BackendDriver> Backend<D> {
         submission: &OperationSubmission,
     ) -> Result<BackendSubmissionToken, BackendError> {
         let entries = self.resolve_submission_dependencies(submission)?;
-        self.submit_resolved(submission, entries)
+        self.submit_resolved(submission, entries, &|| Ok(()))
     }
 
     pub(crate) fn resolve_submission_dependencies(
@@ -638,6 +654,7 @@ impl<D: BackendDriver> Backend<D> {
         &mut self,
         submission: &OperationSubmission,
         entries: Vec<(ResourceDependency, BackendResourceHandle)>,
+        before_acceptance: &dyn Fn() -> Result<(), BackendDriverError>,
     ) -> Result<BackendSubmissionToken, BackendError> {
         self.require_active()?;
         if self.accepted_frontends.contains(&submission.id()) {
@@ -719,10 +736,11 @@ impl<D: BackendDriver> Backend<D> {
             .try_reserve_exact(submission.operations().len())
             .map_err(|_| BackendError::ResourceExhausted)?;
         for access in plan.accesses() {
-            self.validate_access_target_with_handle(
-                access.target(),
-                entries[access.dependency_index()].1,
-            )?;
+            let handle = entries[access.dependency_index()].1;
+            self.validate_access_target_with_handle(access.target(), handle)?;
+            if access.mode().writes() {
+                self.validate_backing_write(handle)?;
+            }
         }
         for (operation_index, operation) in submission.operations().iter().enumerate() {
             let mut operation_shaders = [None; 6];
@@ -763,10 +781,16 @@ impl<D: BackendDriver> Backend<D> {
             submission,
             agreement,
             resources: resolved,
+            before_acceptance,
+            memory_accepted: Cell::new(false),
         };
         if let Err(error) = self.driver.submit(&accepted) {
             return Err(self.handle_driver_error(error));
         }
+        assert!(
+            accepted.memory_accepted.get(),
+            "backend accepted work without canonical authority"
+        );
         let record = SubmissionRecord {
             resources: entries
                 .iter()
@@ -1117,6 +1141,25 @@ impl<D: BackendDriver> Backend<D> {
         Ok(())
     }
 
+    fn validate_backing_write(&self, handle: BackendResourceHandle) -> Result<(), BackendError> {
+        let aliased = match &self.validate_resource_handle(handle)?.info {
+            BackendResourceCreateInfo::Buffer {
+                view: Some(view), ..
+            } => view.backing().has_internal_aliases(),
+            BackendResourceCreateInfo::Image {
+                view: Some(view), ..
+            } => view
+                .bindings()
+                .iter()
+                .any(|binding| binding.backing().has_internal_aliases()),
+            _ => false,
+        };
+        if aliased {
+            return Err(BackendError::InternallyAliasedWrite(handle));
+        }
+        Ok(())
+    }
+
     fn validate_access_target(&self, target: crate::AccessTarget) -> Result<(), BackendError> {
         let dependency = target.dependency();
         let handle = self.resolve_dependency(dependency)?;
@@ -1410,6 +1453,7 @@ pub enum BackendError {
     UnknownResource(ResourceDependency),
     AccessOutOfBounds(crate::AccessTarget),
     AccessOutsideBacking(crate::AccessTarget),
+    InternallyAliasedWrite(BackendResourceHandle),
     BackingAccess(Box<str>),
     DuplicateShaderStage {
         operation: usize,
@@ -1447,6 +1491,10 @@ pub enum BackendError {
 impl Display for BackendError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InternallyAliasedWrite(handle) => write!(
+                formatter,
+                "host writes to internally aliased canonical storage require coherent execution: {handle}"
+            ),
             Self::Capability(error) => error.fmt(formatter),
             Self::InvalidResource(error) => error.fmt(formatter),
             Self::DuplicateResource(resource) => write!(formatter, "duplicate {resource:?}"),
@@ -1658,6 +1706,7 @@ mod tests {
             submission: &AcceptedBackendSubmission<'_>,
         ) -> Result<(), BackendDriverError> {
             self.result()?;
+            submission.accept_memory()?;
             self.submissions.push(submission.token());
             Ok(())
         }

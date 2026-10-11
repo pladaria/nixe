@@ -221,7 +221,8 @@ impl MaxwellResolvedComputeLaunch {
                 .qmd
                 .constant_buffer(buffer.constant_buffer)
                 .map_err(|reason| buffer_error(buffer.binding, reason))?;
-            if u64::from(buffer.byte_offset) + 8 > cb_size {
+            let descriptor_bytes = if buffer.runtime_extent { 16 } else { 8 };
+            if u64::from(buffer.byte_offset) + descriptor_bytes > cb_size {
                 return Err(buffer_error(
                     buffer.binding,
                     "global pointer exceeds its constant buffer",
@@ -229,10 +230,10 @@ impl MaxwellResolvedComputeLaunch {
             }
             let range = resolve(
                 address + u64::from(buffer.byte_offset),
-                8,
+                descriptor_bytes,
                 MemoryPermissions::READ,
             )?;
-            let mut bytes = [0; 8];
+            let mut bytes = [0; 16];
             let mut copied = 0;
             for segment in range.segments() {
                 let end = copied + segment.size() as usize;
@@ -249,7 +250,22 @@ impl MaxwellResolvedComputeLaunch {
                     })?;
                 copied = end;
             }
-            let address = u64::from_le_bytes(bytes);
+            let address = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let size = if buffer.runtime_extent {
+                // NVN descriptor size is runtime state, not a compile-time
+                // bound on loop indices. Read it for every dispatch.
+                // https://github.com/eden-emulator/mirror/blob/master/src/video_core/buffer_cache/buffer_cache.h (StorageBufferBinding)
+                let declared = u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
+                if declared == 0 {
+                    return Err(buffer_error(
+                        buffer.binding,
+                        "NVN storage descriptor has zero size",
+                    ));
+                }
+                declared
+            } else {
+                size
+            };
             if address & 3 != 0 {
                 return Err(buffer_error(
                     buffer.binding,
@@ -258,7 +274,16 @@ impl MaxwellResolvedComputeLaunch {
             }
             resources.push((
                 buffer.binding,
-                resolve(address, size, MemoryPermissions::WRITE)?,
+                resolve(
+                    address,
+                    size,
+                    match (buffer.read, buffer.write) {
+                        (true, true) => MemoryPermissions::READ_WRITE,
+                        (true, false) => MemoryPermissions::READ,
+                        (false, true) => MemoryPermissions::WRITE,
+                        (false, false) => unreachable!("global binding must be accessed"),
+                    },
+                )?,
             ));
         }
         Ok(resources)

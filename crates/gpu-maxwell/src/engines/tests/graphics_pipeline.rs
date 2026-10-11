@@ -692,7 +692,8 @@ fn check_compressed_color_materialization(format: u32, kind: u8, zbc_mask: Optio
         }
     );
     assert_eq!(
-        view.is_some(),
+        view.as_ref()
+            .is_some_and(|view| view.has_canonical_texels()),
         kind == 0xfe,
         "opaque compressed kinds must not expose a generic byte representation"
     );
@@ -2116,6 +2117,143 @@ fn mme_macro_executes_captured_code_and_emits_validated_methods() {
             .and_then(MaxwellThreeDRegister::raw),
         Some(argument)
     );
+}
+
+#[test]
+fn mme_emitted_methods_track_replay_and_bypass_the_same_shadow_registers_as_pushbuffers() {
+    for mode in [0, 1, 2, 3] {
+        let mut channel = three_d_channel();
+        let macro_index = 5;
+        let method_dword = 0x192c / 4;
+        load_mme_program(
+            &mut channel,
+            macro_index,
+            &[
+                1 | (2 << 4) | (method_dword << 14),
+                (4 << 4) | (1 << 7) | (1 << 11),
+                0x11,
+            ],
+        );
+        program_three_d(&mut channel, 0x192c, 1);
+        program_three_d(&mut channel, 0x0124, mode);
+        dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
+        let register = channel
+            .three_d()
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable);
+        assert_eq!(register.raw(), Some(u32::from(mode == 3)), "mode {mode}");
+        let shadow = channel
+            .three_d_mut()
+            .mme()
+            .shadow_register(GpuMethodId(0x192c))
+            .and_then(MaxwellThreeDRegister::raw);
+        assert_eq!(shadow, Some(u32::from(mode >= 2)), "mode {mode}");
+        program_three_d(&mut channel, 0x0124, 3);
+        program_three_d(&mut channel, 0x192c, 0);
+        assert_eq!(
+            channel
+                .three_d()
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable)
+                .raw(),
+            shadow
+        );
+    }
+}
+
+#[test]
+fn mme_replay_restores_firmware_color_target_selection_after_temporary_override() {
+    let mut channel = three_d_channel();
+    let selection = channel.three_d().render_targets().color_target_selection();
+    assert_eq!(
+        selection.origin(),
+        MaxwellThreeDRegisterOrigin::VerifiedReset
+    );
+    assert_eq!(selection.raw(), Some(0x0fac_6881));
+    assert_eq!(selection.value().unwrap().raw(), 0x0fac_6881);
+    let macro_index = 5;
+    load_mme_program(
+        &mut channel,
+        macro_index,
+        &[
+            1 | (2 << 4) | ((0x121c / 4) << 14),
+            (4 << 4) | (1 << 7) | (1 << 11),
+            0x11,
+        ],
+    );
+    program_three_d(&mut channel, 0x0124, 2);
+    program_three_d(&mut channel, 0x121c, 0);
+    program_three_d(&mut channel, 0x0124, 3);
+    dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
+    assert_eq!(
+        channel
+            .three_d()
+            .render_targets()
+            .color_target_selection()
+            .raw(),
+        Some(0x0fac_6881)
+    );
+    assert_eq!(
+        channel
+            .three_d()
+            .render_targets()
+            .depth_target_count()
+            .raw(),
+        Some(1)
+    );
+    assert_eq!(
+        channel
+            .three_d()
+            .render_targets()
+            .depth_target_count()
+            .value(),
+        Some(&MaxwellThreeDDepthTargetCount::One)
+    );
+    program_three_d(&mut channel, 0x0124, 2);
+    program_three_d(&mut channel, 0x1538, 0);
+    program_three_d(&mut channel, 0x0124, 3);
+    program_three_d(&mut channel, 0x1538, 0);
+    assert_eq!(
+        channel
+            .three_d()
+            .render_targets()
+            .depth_target_count()
+            .raw(),
+        Some(1)
+    );
+}
+
+#[test]
+fn shadow_replay_restores_each_color_descriptor_field_to_verified_firmware_values() {
+    let mut channel = three_d_channel();
+    for target in 0..8 {
+        for (offset, expected) in [
+            (0, 0),
+            (4, 0),
+            (8, 0x400),
+            (0x0c, 0x300),
+            (0x10, if target == 0 { 0xcf } else { 0 }),
+            (0x14, 0x40),
+            (0x18, 1),
+            (0x1c, 0),
+            (0x20, 0),
+        ] {
+            let method = 0x0800 + target * 0x40 + offset;
+            program_three_d(&mut channel, 0x0124, 2);
+            program_three_d(&mut channel, method, 0);
+            program_three_d(&mut channel, 0x0124, 3);
+            program_three_d(&mut channel, method, 0);
+            assert_eq!(
+                channel
+                    .three_d_mut()
+                    .raw_register(GpuMethodId(method))
+                    .unwrap()
+                    .raw(),
+                Some(expected),
+                "{method:#x}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -3969,4 +4107,51 @@ fn opportunistic_early_z_threshold_retains_sources_and_rejects_reserved_encoding
     for raw in [20, 30, 32, u32::MAX] {
         assert!(dispatch_method(&mut channel, 0x204 / 4, raw).is_err());
     }
+}
+
+#[test]
+fn viewport_firmware_defaults_are_shared_by_live_state_and_shadow_replay() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    for (method, register, raw) in [
+        (
+            0x192c,
+            MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable,
+            1,
+        ),
+        (
+            0x193c,
+            MaxwellThreeDFixedFunctionRegister::ViewportClipControl,
+            0x2c1c,
+        ),
+    ] {
+        let value = channel.three_d().fixed_function().register(register);
+        assert_eq!(value.raw(), Some(raw));
+        assert_eq!(value.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+        assert!(value.source().is_none());
+        assert!(
+            channel
+                .three_d_mut()
+                .mme()
+                .shadow_register(GpuMethodId(method))
+                .is_none()
+        );
+    }
+    program_three_d(&mut channel, 0x0124, 3);
+    for (method, raw) in [(0x192c, 1), (0x193c, 0x2c1c)] {
+        let dispatch = dispatch_method(&mut channel, method / 4, 0).unwrap();
+        assert_eq!(dispatch.methods()[0].method().source().argument(), raw);
+    }
+    program_three_d(&mut channel, 0x0124, 0);
+    program_three_d(&mut channel, 0x192c, 0);
+    assert_eq!(
+        channel
+            .three_d()
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable)
+            .value(),
+        Some(&MaxwellThreeDFixedFunctionValue::ViewportScaleOffsetEnable(
+            MaxwellThreeDViewportScaleOffsetEnable::Disabled
+        ))
+    );
 }

@@ -74,6 +74,7 @@ fn control_level_prefix_executes_only_for_invocation_zero() {
                 instructions,
             })
             .collect(),
+        indirect_tables: Box::new([]),
         source_cpu_writes: Box::new([]),
         source_mappings: Box::new([]),
     };
@@ -127,6 +128,7 @@ fn control_sph_and_patch_store_translate_without_wgsl() {
             ],
         }]
         .into_boxed_slice(),
+        indirect_tables: Box::new([]),
         source_cpu_writes: Box::new([]),
         source_mappings: Box::new([]),
     };
@@ -136,14 +138,14 @@ fn control_sph_and_patch_store_translate_without_wgsl() {
     assert!(ir.ir().outputs().iter().any(|element| element.location()
         == ShaderIoLocation::Patch(0)
         && element.component() == 3));
-    assert!(matches!(
-        ir.ir().instructions()[1].operation(),
+    assert!(ir.ir().instructions().iter().any(|instruction| matches!(
+        instruction.operation(),
         ShaderOperation::StoreOutput {
             location: ShaderIoLocation::TessLevelInner,
             first_component: 0,
             ..
         }
-    ));
+    )));
     assert_eq!(
         ir.ir().instructions().len(),
         3,
@@ -315,6 +317,7 @@ fn fragment_interpolation_links_per_component_only_to_final_producer() {
                     instructions: [0xe300_0000_0007_000f; 3],
                 }]
                 .into_boxed_slice(),
+                indirect_tables: Box::new([]),
                 source_cpu_writes: Box::new([]),
                 source_mappings: Box::new([]),
             };

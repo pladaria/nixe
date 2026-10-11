@@ -48,6 +48,7 @@ impl PartialEq for PipelineKey {
                         .tessellation
                         .map(|t| (t.mode, t.input_control_points))
                     && self.draw.topology == other.draw.topology
+                    && self.draw.vertex_position_transform == other.draw.vertex_position_transform
                     && self
                         .draw
                         .viewport_transform
@@ -56,9 +57,18 @@ impl PartialEq for PipelineKey {
                             .draw
                             .viewport_transform
                             .is_some_and(|v| v.depth_clip_negative_one_to_one())
+                    && self
+                        .draw
+                        .viewport_transform
+                        .and_then(|v| v.fragment_depth_transform())
+                        == other
+                            .draw
+                            .viewport_transform
+                            .and_then(|v| v.fragment_depth_transform())
                     && self.draw.line_rasterization.map(|l| l.smooth)
                         == other.draw.line_rasterization.map(|l| l.smooth)
                     && self.draw.depth_state == other.draw.depth_state
+                    && self.draw.stencil_state == other.draw.stencil_state
                     && self.draw.front_face == other.draw.front_face
                     && self.draw.cull_mode == other.draw.cull_mode
                     && raster::key(self.draw.triangle_rasterization)
@@ -89,12 +99,18 @@ impl Hash for PipelineKey {
             .map(|t| (t.mode, t.input_control_points))
             .hash(h);
         self.draw.topology.hash(h);
+        self.draw.vertex_position_transform.hash(h);
         self.draw
             .viewport_transform
             .is_some_and(|v| v.depth_clip_negative_one_to_one())
             .hash(h);
+        self.draw
+            .viewport_transform
+            .and_then(|v| v.fragment_depth_transform())
+            .hash(h);
         self.draw.line_rasterization.map(|l| l.smooth).hash(h);
         self.draw.depth_state.hash(h);
+        self.draw.stencil_state.hash(h);
         self.draw.front_face.hash(h);
         self.draw.cull_mode.hash(h);
         raster::key(self.draw.triangle_rasterization).hash(h);
@@ -121,7 +137,7 @@ struct FrameKey {
 }
 
 pub(super) struct NativeCache {
-    capabilities: Option<crate::VulkanNativeCapabilities>,
+    pub(super) capabilities: Option<crate::VulkanNativeCapabilities>,
     pipelines: HashMap<PipelineKey, (Arc<NativePipeline>, u64)>,
     frames: HashMap<FrameKey, (Arc<NativeFrame>, u64)>,
     current: Option<(PipelineKey, Arc<NativePipeline>, u64)>,
@@ -759,6 +775,14 @@ impl WgpuBackendDriver {
         let vertex = modules[0].as_ref().unwrap().ir();
         let control = modules[1].as_ref().map(|m| m.ir());
         let fragment = modules[3].as_ref().unwrap().ir();
+        let specialized_fragment = draw
+            .prepared
+            .viewport_transform
+            .and_then(|v| v.fragment_depth_transform())
+            .map(|transform| fragment.with_fragment_depth_transform(transform))
+            .transpose()
+            .map_err(error)?;
+        let fragment = specialized_fragment.as_ref().unwrap_or(fragment);
         if tess.is_none()
             && fragment
                 .ir()
@@ -793,6 +817,7 @@ impl WgpuBackendDriver {
                     evaluation,
                     fragment,
                     nixe_gpu::SpirvTessellationOptions {
+                        vertex_position_transform: draw.prepared.vertex_position_transform,
                         depth_clip_negative_one_to_one: draw
                             .prepared
                             .viewport_transform
@@ -810,6 +835,7 @@ impl WgpuBackendDriver {
                 vertex,
                 fragment,
                 nixe_gpu::SpirvShaderOptions {
+                    vertex_position_transform: draw.prepared.vertex_position_transform,
                     depth_clip_negative_one_to_one: draw
                         .prepared
                         .viewport_transform

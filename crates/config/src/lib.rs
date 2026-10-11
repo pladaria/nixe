@@ -99,6 +99,10 @@ impl NixeConfig {
             system: SystemConfig {
                 preferred_languages: raw.system.preferred_languages,
                 keys: resolve_path(base_directory, raw.system.keys),
+                font: raw
+                    .system
+                    .font
+                    .map(|path| resolve_path(base_directory, path)),
                 initial_operation_mode: raw.system.initial_operation_mode,
                 time: TimeConfig {
                     mode: raw.system.time.mode,
@@ -185,6 +189,8 @@ pub struct SystemConfig {
     pub preferred_languages: Vec<NacpLanguage>,
     /// Directory containing caller-owned `prod.keys` and optional `title.keys`.
     pub keys: PathBuf,
+    /// TTF file supplied to applications through the shared-font service.
+    pub font: Option<PathBuf>,
     /// Operation mode reported to titles when the emulated system starts.
     pub initial_operation_mode: InitialOperationMode,
     /// Initial virtual-time policy.
@@ -460,6 +466,8 @@ struct RawSystemConfig {
     #[serde(deserialize_with = "deserialize_languages")]
     preferred_languages: Vec<NacpLanguage>,
     keys: PathBuf,
+    #[serde(default)]
+    font: Option<PathBuf>,
     initial_operation_mode: InitialOperationMode,
     #[serde(default)]
     time: RawTimeConfig,
@@ -767,6 +775,7 @@ mod tests {
                 [system]
                 preferred_languages = ["Spanish", "AmericanEnglish"]
                 keys = "./keys"
+                font = "./assets/Roboto-Regular.ttf"
                 initial_operation_mode = "docked"
             "#,
         );
@@ -786,6 +795,10 @@ mod tests {
             vec![NacpLanguage::Spanish, NacpLanguage::AmericanEnglish]
         );
         assert_eq!(config.system.keys, base.join("./keys"));
+        assert_eq!(
+            config.system.font,
+            Some(base.join("./assets/Roboto-Regular.ttf"))
+        );
         assert_eq!(
             config.system.initial_operation_mode,
             InitialOperationMode::Docked

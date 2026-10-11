@@ -102,6 +102,7 @@ fn binary_from_words(words: [u32; 20], code: &[[u64; 3]]) -> MaxwellShaderBinary
                 instructions: *instructions,
             })
             .collect(),
+        indirect_tables: Box::new([]),
         source_cpu_writes: Box::new([]),
         source_mappings: Box::new([]),
     }
@@ -184,6 +185,7 @@ fn native_chain_from_ir(
         &ir[3],
         nixe_gpu::SpirvTessellationOptions {
             depth_clip_negative_one_to_one: false,
+            vertex_position_transform: None,
             input_control_points: 3,
             mode: options.tessellation_mode.unwrap(),
             float32: options.float32,
@@ -264,6 +266,7 @@ fn native_options(control: bool) -> nixe_gpu::SpirvShaderOptions {
     use nixe_gpu::*;
     SpirvShaderOptions {
         depth_clip_negative_one_to_one: false,
+        vertex_position_transform: None,
         float64: SpirvFloat64Capabilities::default(),
         input_control_points: 3,
         tessellation_mode: (!control).then_some(TessellationMode {

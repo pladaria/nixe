@@ -1,6 +1,7 @@
 //! Switch `/dev/nvhost-ctrl` syncpoint and event ABI.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use nixe_gpu::{
@@ -214,6 +215,7 @@ pub(super) struct NvHostControl {
     devices: BTreeMap<NvDrvFileDescriptor, NvHostCtrlDevice>,
     direct_waits: BTreeMap<NvHostCtrlWaiterId, DirectWait>,
     next_timeline_instance: u64,
+    progress: Option<Arc<(Mutex<u64>, Condvar)>>,
 }
 
 impl Default for NvHostControl {
@@ -224,11 +226,30 @@ impl Default for NvHostControl {
             devices: BTreeMap::new(),
             direct_waits: BTreeMap::new(),
             next_timeline_instance: 1,
+            progress: None,
         }
     }
 }
 
 impl NvHostControl {
+    pub(super) fn host_progress(&mut self) -> Arc<(Mutex<u64>, Condvar)> {
+        Arc::clone(
+            self.progress
+                .get_or_insert_with(|| Arc::new((Mutex::new(0), Condvar::new()))),
+        )
+    }
+    pub(super) fn wake_on_execution_failure(&self) {
+        // Wake suspended IPC waits so the next nvdrv call reports the retained error.
+        for wait in self.direct_waits.values() {
+            wait.writable.signal();
+        }
+        for device in self.devices.values() {
+            for event in device.events.values() {
+                event.writable.signal();
+            }
+        }
+    }
+
     pub(super) fn open(&mut self, fd: NvDrvFileDescriptor) {
         let previous = self.devices.insert(fd, NvHostCtrlDevice::default());
         debug_assert!(previous.is_none());
@@ -687,10 +708,20 @@ impl NvHostControl {
                 slot
             }
         };
+        // VIDEO_PROBE_BEGIN
+        if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
+            log::debug!("VIDEO_PROBE nv-event-arm: kind={kind:?} fd={:?} slot={slot:?} id={id:?} current={current:?} target={threshold:?}", descriptor.fd());
+        }
+        // VIDEO_PROBE_END
         let event = device
             .events
             .get_mut(&slot)
             .ok_or(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))?;
+        // VIDEO_PROBE_BEGIN
+        if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() && event.armed.is_some() {
+            log::debug!("VIDEO_PROBE nv-event-rearm-busy: slot={slot:?} old={:?} new={:?}", event.armed, GuestTimelinePoint::new(id, threshold));
+        }
+        // VIDEO_PROBE_END
         event.readable.clear();
         event.armed = Some(GuestTimelinePoint::new(id, threshold));
 
@@ -733,6 +764,14 @@ impl NvHostControl {
     }
 
     fn signal_reached(&mut self, id: GuestSyncpointId, value: GuestSyncpointValue) {
+        if let Some(progress) = &self.progress {
+            let mut generation = progress
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *generation = generation.wrapping_add(1);
+            progress.1.notify_all();
+        }
         for wait in self.direct_waits.values() {
             if wait.target.syncpoint() == id && value.has_reached(wait.target.value()) {
                 wait.writable.signal();

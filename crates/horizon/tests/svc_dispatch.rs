@@ -2793,7 +2793,7 @@ fn hid_supported_style_set_round_trips_and_validates_get_requests() {
 #[test]
 fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation() {
     let mut instructions = vec![svc(0x1f)];
-    instructions.extend(std::iter::repeat_n(svc(0x21), 32));
+    instructions.extend(std::iter::repeat_n(svc(0x21), 64));
     let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::default();
     let name = process.main_thread().stack_bottom;
@@ -2897,15 +2897,139 @@ fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation()
         );
         assert_eq!(send(&get), (0, 1));
     }
+    let mut dual = set;
+    put_u32(&mut dual, 40, 124);
+    put_u64(&mut dual, 56, 0x1234); // ARUID, not the controller ID.
+    for id in [0, 7, 0x10, 0x20] {
+        put_u32(&mut dual, 48, id);
+        assert_eq!(send(&dual).0, 0);
+        assert_eq!(send(&get), (0, 1));
+    }
+    for id in [8, 0x11, u32::MAX] {
+        put_u32(&mut dual, 48, id);
+        assert_eq!(
+            send(&dual).0,
+            HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw()
+        );
+    }
+    let mut truncated_dual = dual;
+    put_u32(&mut truncated_dual, 4, 9 | (1 << 31));
+    let mut no_pid_dual = no_pid;
+    put_u32(&mut no_pid_dual, 24, 124);
+    for invalid in [truncated_dual, no_pid_dual] {
+        assert_eq!(
+            send(&invalid).0,
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+        );
+    }
     put_u64(&mut set, 56, 0);
     assert_eq!(send(&set).0, 0);
     assert_eq!(send(&get), (0, 0));
 }
 
 #[test]
+fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut font = vec![0; 32];
+    font[..4].copy_from_slice(&[0, 1, 0, 0]);
+    font[4..6].copy_from_slice(&1_u16.to_be_bytes());
+    font[20..24].copy_from_slice(&28_u32.to_be_bytes());
+    font[24..28].copy_from_slice(&4_u32.to_be_bytes());
+    font[28..].copy_from_slice(b"font");
+    fs::write(directory.path().join("font.ttf"), &font).unwrap();
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 12));
+    let (_process_directory, mut process) = fixture_process(&instructions);
+    let mut dispatcher = HorizonSvcDispatcher::default().with_shared_fonts(
+        nixe_horizon::SharedFontSession::new(Some(directory.path().join("font.ttf"))),
+    );
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+    let mut register = [0; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let mut request = [0; 0x100];
+    put_u32(&mut request, 0, 4);
+    put_u32(&mut request, 4, 10);
+    put_u32(&mut request, 16, 0x4943_4653);
+    put_u32(&mut request, 24, 1);
+    request[32..36].copy_from_slice(b"pl:u");
+    write_guest_bytes(&process, tls, &request);
+    state(&mut process).write_w(x(0), sm);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let service = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    request[32..].fill(0);
+    for (command, expected) in [(1, 1), (2, 32), (3, 8), (0, 0)] {
+        put_u32(&mut request, 24, command);
+        write_guest_bytes(&process, tls, &request);
+        state(&mut process).write_w(x(0), service);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+        if command != 0 {
+            assert_eq!(
+                read_guest_u32(&process, tls.checked_add(32).unwrap()),
+                expected
+            );
+        }
+    }
+    put_u32(&mut request, 24, 4);
+    put_u32(&mut request, 4, 8);
+    write_guest_bytes(&process, tls, &request);
+    state(&mut process).write_w(x(0), service);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(8).unwrap()), 2); // One copy handle.
+    let handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    let shared = process
+        .handles()
+        .get_as::<SharedMemoryObject>(handle)
+        .unwrap();
+    assert_eq!(shared.remote_permissions(), MemoryPermissions::READ);
+    let mut payload = [0; 32];
+    shared.read(8, &mut payload).unwrap();
+    assert_eq!(payload.as_slice(), font);
+    put_u32(&mut request, 24, 1);
+    put_u32(&mut request, 4, 9);
+    put_u32(&mut request, 32, u32::MAX);
+    write_guest_bytes(&process, tls, &request);
+    state(&mut process).write_w(x(0), service);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(24).unwrap()),
+        HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw()
+    );
+}
+
+#[test]
 fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut instructions = vec![svc(0x1f)];
-    instructions.extend(std::iter::repeat_n(svc(0x21), 58));
+    instructions.extend(std::iter::repeat_n(svc(0x21), 65));
     instructions.extend([svc(0x13), svc(0x14), svc(0x21)]);
     let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::new(
@@ -3072,6 +3196,44 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     );
     let self_controller_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
     assert_eq!(self_controller_object_id, 3);
+
+    let mut idle_query = get_self_controller;
+    put_u32(&mut idle_query, 20, self_controller_object_id);
+    put_u32(&mut idle_query, 40, 63);
+    for extension in [0_u32, 1, 2, 3] {
+        if extension != 0 {
+            let mut idle_set = idle_query;
+            put_u32(&mut idle_set, 4, 12);
+            idle_set[18..20].copy_from_slice(&24_u16.to_le_bytes());
+            put_u32(&mut idle_set, 40, 62);
+            put_u32(&mut idle_set, 48, extension);
+            write_guest_bytes(&process, tls, &idle_set);
+            state(&mut process).write_w(x(0), applet_handle);
+            assert_eq!(
+                dispatch_next(&mut process, &mut dispatcher),
+                ExceptionHandlingResult::Resumed
+            );
+            assert_eq!(
+                read_guest_u32(&process, tls.checked_add(40).unwrap()),
+                if extension == 3 {
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+                } else {
+                    0
+                }
+            );
+        }
+        write_guest_bytes(&process, tls, &idle_query);
+        state(&mut process).write_w(x(0), applet_handle);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(48).unwrap()),
+            extension.min(2)
+        );
+    }
 
     let mut set_restart_message = get_self_controller;
     put_u32(&mut set_restart_message, 4, 12);
@@ -6770,8 +6932,12 @@ fn notification_only_break_reports_success_without_terminating() {
     assert_eq!(dispatcher.coverage()[0].terminated, 0);
 }
 
+#[path = "svc_dispatch/auddev.rs"]
+mod auddev;
 #[path = "svc_dispatch/audout.rs"]
 mod audout;
+#[path = "svc_dispatch/audren.rs"]
+mod audren;
 
 #[path = "svc_dispatch/tipc.rs"]
 mod tipc;
@@ -6886,6 +7052,133 @@ fn vibration_stop_validates_its_device_and_does_not_hide_nonzero_force() {
                 UnsupportedServiceOperation::CommandVariant {
                     service: "hid",
                     command_id: 201,
+                    detail: "nonzero vibration requires a host actuator backend",
+                }
+            )),
+        })
+    );
+}
+
+#[test]
+fn batched_vibration_decodes_pointer_arrays_and_rejects_invalid_inputs() {
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 16));
+    let (_directory, mut process) = fixture_process(&instructions);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+    let mut register = [0; 256];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    assert_eq!(
+        audout::call(&mut process, &mut dispatcher, sm, &register),
+        0
+    );
+    assert_eq!(
+        audout::call(
+            &mut process,
+            &mut dispatcher,
+            sm,
+            &audout::command(1, b"hid\0\0\0\0\0", None, None, false, false)
+        ),
+        0
+    );
+    let hid = audout::handle(&process);
+    let handles = process
+        .main_thread()
+        .stack_bottom
+        .checked_add(0x100)
+        .unwrap();
+    let values = handles.checked_add(0x100).unwrap();
+    let request = |handle_size: u32, value_size: u32| {
+        let mut message = [0; 0x100];
+        put_u32(&mut message, 0, 4 | (2 << 16));
+        put_u32(&mut message, 4, 10);
+        for (offset, index, address, size) in [
+            (8, 0, handles.get(), handle_size),
+            (16, 1, values.get(), value_size),
+        ] {
+            put_u32(
+                &mut message,
+                offset,
+                index
+                    | (size << 16)
+                    | (((address >> 32) as u32 & 0xf) << 12)
+                    | (((address >> 36) as u32 & 0x3f) << 6),
+            );
+            put_u32(&mut message, offset + 4, address as u32);
+        }
+        put_u32(&mut message, 32, 0x4943_4653);
+        put_u32(&mut message, 40, 206);
+        put_u64(&mut message, 48, 1);
+        message
+    };
+    write_guest_bytes(&process, handles, &[3, 0, 0, 0, 3, 0, 1, 0]);
+    let mut forces = [0; 32];
+    for offset in [0, 16] {
+        put_u32(&mut forces, offset + 4, 160.0f32.to_bits());
+        put_u32(&mut forces, offset + 12, 320.0f32.to_bits());
+    }
+    write_guest_bytes(&process, values, &forces);
+    for (message, expected) in [
+        (request(8, 32), 0),
+        (request(0, 0), 0),
+        (
+            request(8, 16),
+            HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw(),
+        ),
+        (
+            request(7, 28),
+            HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw(),
+        ),
+        (
+            {
+                let mut message = request(8, 32);
+                message[16] = 0;
+                message
+            },
+            HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw(),
+        ),
+    ] {
+        assert_eq!(
+            audout::call(&mut process, &mut dispatcher, hid, &message),
+            expected
+        );
+    }
+    // The second entry is validated too, including the reserved handle byte.
+    write_guest_bytes(&process, handles.checked_add(7).unwrap(), &[1]);
+    assert_eq!(
+        audout::call(&mut process, &mut dispatcher, hid, &request(8, 32)),
+        HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw()
+    );
+    write_guest_bytes(&process, handles.checked_add(7).unwrap(), &[0]);
+    put_u32(&mut forces, 16, f32::NAN.to_bits());
+    write_guest_bytes(&process, values, &forces);
+    assert_eq!(
+        audout::call(&mut process, &mut dispatcher, hid, &request(8, 32)),
+        HorizonIpcResult::SF_PRECONDITION_VIOLATION.raw()
+    );
+    put_u32(&mut forces, 16, 0.5f32.to_bits());
+    write_guest_bytes(&process, values, &forces);
+    write_guest_bytes(&process, tls, &request(8, 32));
+    state(&mut process).write_w(x(0), hid);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {
+            immediate: 0x21,
+            fault: Box::new(HorizonIpcFault::unsupported_service(
+                UnsupportedServiceOperation::CommandVariant {
+                    service: "hid",
+                    command_id: 206,
                     detail: "nonzero vibration requires a host actuator backend",
                 }
             )),

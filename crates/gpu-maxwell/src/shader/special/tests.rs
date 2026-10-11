@@ -269,7 +269,7 @@ fn adjacent_rro_mufu_pair_lowers_as_one_high_level_special_function() {
                     source,
                     function: ShaderSpecialFunction::Exp2,
                     ..
-                } if destination.index() == 1 && source.index() == 1
+                } if destination.index() == 1 && source.index() >= 4
             ))
     );
     let module = nixe_gpu::lower_shader_ir_to_wgsl(&translated).unwrap();

@@ -906,7 +906,11 @@ impl Default for MaxwellThreeDRenderTargetState {
     fn default() -> Self {
         Self {
             color: Default::default(),
-            color_target_selection: Default::default(),
+            // Shared with MME replay; GM20B firmware provenance is in state.rs.
+            color_target_selection: MaxwellThreeDRegister::verified_reset(
+                0x0fac_6881,
+                MaxwellThreeDColorTargetSelection::parse(0x0fac_6881),
+            ),
             // GM20B's public context method table clears B197 dword 0x56e.
             // Provenance and hash are documented in verified_raw_register_reset.
             srgb_write: MaxwellThreeDRegister::verified_reset(0, Some(false)),
@@ -916,7 +920,10 @@ impl Default for MaxwellThreeDRenderTargetState {
             separate_fragment_data: Default::default(),
             render_target_layer: Default::default(),
             render_target_index_offset: Default::default(),
-            depth_target_count: Default::default(),
+            depth_target_count: MaxwellThreeDRegister::verified_reset(
+                1,
+                MaxwellThreeDDepthTargetCount::parse(1),
+            ),
             depth_stencil: Default::default(),
             clear: Default::default(),
         }

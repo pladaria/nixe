@@ -32,6 +32,7 @@ pub enum HorizonIpcObject {
     SemanticService(IpcSession),
     SystemSettings(SystemSettingsSession),
     UserSettings(UserSettingsSession),
+    Multimedia(crate::multimedia::MultimediaSession),
     PerformanceManager(PerformanceManagerSession),
     Performance(PerformanceSession),
     Applet(AppletSession),
@@ -42,7 +43,11 @@ pub enum HorizonIpcObject {
     Ssl(SslSession),
     AudioOutManager(crate::AudioOutManagerSession),
     AudioOut(crate::AudioOutSession),
+    AudioRendererManager(crate::AudioRendererManagerSession),
+    AudioRenderer(crate::AudioRendererSession),
+    AudioDevice(crate::AudioDeviceSession),
     Hid(HidSession),
+    SharedFont(crate::SharedFontSession),
     Irs(IrsSession),
     HidAppletResource(HidAppletResource),
     HidActiveVibrationDeviceList(HidActiveVibrationDeviceList),
@@ -81,6 +86,7 @@ pub enum SemanticIpcObject {
 pub struct ServiceManagerSession {
     registered: Arc<AtomicBool>,
     bsd: BsdServiceRegistry,
+    multimedia: crate::multimedia::MultimediaSession,
 }
 
 impl ServiceManagerSession {
@@ -88,6 +94,7 @@ impl ServiceManagerSession {
         Self {
             registered: Arc::new(AtomicBool::new(false)),
             bsd: BsdServiceRegistry::default(),
+            multimedia: crate::multimedia::MultimediaSession::default(),
         }
     }
 
@@ -97,6 +104,10 @@ impl ServiceManagerSession {
 
     pub(crate) fn is_registered(&self) -> bool {
         self.registered.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn multimedia_session(&self) -> crate::multimedia::MultimediaSession {
+        self.multimedia.clone()
     }
 
     pub(crate) fn bsd_session(&self) -> BsdSession {
@@ -1838,6 +1849,7 @@ struct AppletDomain {
     performance_mode_changed_notification: bool,
     cpu_boost_enabled: bool,
     restart_message_enabled: bool,
+    idle_time_detection_extension: u32,
     request_exit_to_library_applet_at_execute_next_program_enabled: bool,
     focus_policy: AppletFocusPolicy,
     foreground_rights_acquired: bool,
@@ -1898,6 +1910,7 @@ impl AppletSession {
                 performance_mode_changed_notification: false,
                 cpu_boost_enabled: false,
                 restart_message_enabled: false,
+                idle_time_detection_extension: 0,
                 request_exit_to_library_applet_at_execute_next_program_enabled: false,
                 focus_policy: AppletFocusPolicy::default(),
                 foreground_rights_acquired: false,
@@ -2441,6 +2454,22 @@ impl AppletSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         domain.performance_mode_changed_notification = enabled;
+    }
+
+    /// Application-local dimming/sleep policy. Nixe remains awake, while AM
+    /// queries still observe the caller's actual setting across session clones.
+    pub(crate) fn set_idle_time_detection_extension(&self, extension: u32) {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .idle_time_detection_extension = extension;
+    }
+
+    pub(crate) fn idle_time_detection_extension(&self) -> u32 {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .idle_time_detection_extension
     }
 
     pub(crate) fn set_restart_message_enabled(&self, enabled: bool) {

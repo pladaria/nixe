@@ -420,6 +420,7 @@ fn requested_device_features(adapter_features: wgpu::Features) -> wgpu::Features
         & (wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::PIPELINE_CACHE
             | wgpu::Features::IMMEDIATES
+            | wgpu::Features::RG11B10UFLOAT_RENDERABLE
             | wgpu::Features::TEXTURE_COMPRESSION_BC)
 }
 
@@ -515,10 +516,12 @@ fn cache_error(path: &Path, error: std::io::Error) -> WgpuBackendInitializationE
 
 fn required_features_for_image_format(format: ImageFormat) -> wgpu::Features {
     match format {
+        ImageFormat::Rg11b10Ufloat => wgpu::Features::RG11B10UFLOAT_RENDERABLE,
         ImageFormat::Bc1RgbUnorm
         | ImageFormat::Bc1RgbSrgb
         | ImageFormat::Bc1RgbaUnorm
-        | ImageFormat::Bc1RgbaSrgb => wgpu::Features::TEXTURE_COMPRESSION_BC,
+        | ImageFormat::Bc1RgbaSrgb
+        | ImageFormat::Bc4RUnorm => wgpu::Features::TEXTURE_COMPRESSION_BC,
         // The neutral format capability currently covers every supported use of
         // a format. Keep the float32 family out of that contract unless wgpu can
         // also represent its filtered sampled-image use exactly.
@@ -581,12 +584,13 @@ fn capabilities(
     )
 }
 
-const ALL_IMAGE_FORMATS: [ImageFormat; 21] = [
+const ALL_IMAGE_FORMATS: [ImageFormat; 23] = [
     ImageFormat::Rgb565Unorm,
     ImageFormat::Bc1RgbUnorm,
     ImageFormat::Bc1RgbSrgb,
     ImageFormat::Bc1RgbaUnorm,
     ImageFormat::Bc1RgbaSrgb,
+    ImageFormat::Bc4RUnorm,
     ImageFormat::R8Unorm,
     ImageFormat::Rg8Unorm,
     ImageFormat::Rgba8Unorm,
@@ -596,6 +600,7 @@ const ALL_IMAGE_FORMATS: [ImageFormat; 21] = [
     ImageFormat::R16Float,
     ImageFormat::Rg16Float,
     ImageFormat::Rgba16Float,
+    ImageFormat::Rg11b10Ufloat,
     ImageFormat::R32Float,
     ImageFormat::Rg32Float,
     ImageFormat::Rgba32Float,
@@ -686,6 +691,24 @@ mod tests {
     }
 
     #[test]
+    fn packed_unsigned_float_images_require_native_renderability() {
+        let feature = wgpu::Features::RG11B10UFLOAT_RENDERABLE;
+        assert_eq!(
+            required_features_for_image_format(ImageFormat::Rg11b10Ufloat),
+            feature
+        );
+        assert_eq!(requested_device_features(feature), feature);
+        assert_eq!(
+            driver::texture_format(ImageFormat::Rg11b10Ufloat),
+            Some(wgpu::TextureFormat::Rg11b10Ufloat)
+        );
+        assert!(
+            driver::required_texture_usages(ImageFormat::Rg11b10Ufloat)
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        );
+    }
+
+    #[test]
     fn bc1_formats_require_native_compression_but_not_render_attachment_usage() {
         assert_eq!(
             requested_device_features(wgpu::Features::TEXTURE_COMPRESSION_BC),
@@ -696,6 +719,7 @@ mod tests {
             ImageFormat::Bc1RgbSrgb,
             ImageFormat::Bc1RgbaUnorm,
             ImageFormat::Bc1RgbaSrgb,
+            ImageFormat::Bc4RUnorm,
         ] {
             assert_eq!(
                 required_features_for_image_format(format),

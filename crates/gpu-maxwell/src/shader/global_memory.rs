@@ -1,9 +1,9 @@
 //! Relocate proven constant-buffer-based 64-bit pointers into storage buffers.
 //! Numeric address arithmetic remains in IR when otherwise observable. Only
-//! global accesses with a proven base, aligned offset and dispatch bound can
-//! become a host buffer access. No shader fingerprints or fixed ABI slots.
+//! global accesses with a proven base become a host buffer access. Generic
+//! pointers use inferred dispatch bounds; NVN descriptors provide runtime size.
 //!
-//! STG fields: public UAM GM107 emitSTG/emitLDSTs/emitLDSTc.
+//! LDG/STG fields: public UAM GM107 emitSTG/emitLDSTs/emitLDSTc.
 //! https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
 use super::decode::{allocate_shader_temporary, decode_predicate, validate_register_range};
 use super::error::MaxwellShaderTranslationError;
@@ -17,12 +17,17 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 mod tests;
 
+pub(super) const fn is_load(encoding: u64) -> bool {
+    (encoding >> 48) & 0xfff8 == 0xeed0
+}
+
 pub(super) const fn is_store(encoding: u64) -> bool {
     (encoding >> 48) & 0xfff8 == 0xeed8
 }
 
 #[derive(Clone, Debug)]
 enum Bound {
+    Unknown,
     Constant(u32),
     Local(u8),
     Group(u8),
@@ -59,6 +64,9 @@ pub(crate) struct GlobalBufferBinding {
     pub constant_buffer: u8,
     pub byte_offset: u32,
     pub binding: u8,
+    pub read: bool,
+    pub write: bool,
+    pub runtime_extent: bool,
     accesses: Vec<(usize, u32)>,
 }
 
@@ -76,6 +84,7 @@ impl GlobalBufferBindings {
         let mut values = Vec::<u32>::with_capacity(self.bounds.len());
         for bound in &self.bounds {
             let value = match *bound {
+                Bound::Unknown => u32::MAX,
                 Bound::Constant(value) => value,
                 Bound::Local(component) => size[usize::from(component)].saturating_sub(1),
                 Bound::Group(component) => groups[usize::from(component)].saturating_sub(1),
@@ -94,37 +103,39 @@ impl GlobalBufferBindings {
                     .iter()
                     .map(|&(node, offset)| u64::from(values[node]) + u64::from(offset) + 4)
                     .max()
-                    .expect("binding is introduced by a store")
+                    .expect("binding is introduced by a global access")
             })
             .collect()
     }
 }
 
-#[derive(Default)]
 pub(super) struct GlobalMemory {
     values: BTreeMap<ShaderRegister, Value>,
     pub bindings: GlobalBufferBindings,
-    control_flow: bool,
+}
+
+impl Default for GlobalMemory {
+    fn default() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            bindings: GlobalBufferBindings {
+                buffers: Vec::new(),
+                bounds: vec![Bound::Unknown],
+            },
+        }
+    }
 }
 
 impl GlobalMemory {
-    pub(super) fn observe_control_flow(
-        &mut self,
-        offset: u32,
-        encoding: u64,
-    ) -> Result<(), MaxwellShaderTranslationError> {
-        // A later backward edge can invalidate an earlier store's inferred
-        // bounds. Reject both instruction orders until pointer joins exist.
-        if !self.bindings.buffers.is_empty() {
-            return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-                stage: MaxwellShaderStage::Compute,
-                instruction_offset: offset,
-                encoding,
-                detail: "global stores across control flow require pointer merge analysis",
-            });
-        }
-        self.control_flow = true;
-        Ok(())
+    /// Pointer facts belong to one basic block. A target or branch boundary
+    /// discards them, so a back edge cannot reuse a prior iteration's offset.
+    /// Local definitions can establish a new pointer in every loop iteration.
+    pub(super) fn begin_block(&mut self) {
+        self.values.clear();
+    }
+
+    pub(super) fn forget(&mut self, register: ShaderRegister) {
+        self.values.remove(&register);
     }
 
     fn offset(&mut self, bound: Bound, alignment: u32, constant: Option<u32>) -> Value {
@@ -150,7 +161,13 @@ impl GlobalMemory {
         while index < instructions.len() {
             let instruction = &instructions[index];
             let op = instruction.operation();
-            let get = |r: &ShaderRegister| self.values.get(r).copied();
+            let get = |r: &ShaderRegister| {
+                self.values.get(r).copied().or(Some(Value::Offset(Offset {
+                    node: 0,
+                    alignment: 0,
+                    constant: None,
+                })))
+            };
             let mut carry_value = None;
             let mut freeze = None;
             let value = if instruction.predicate() != ShaderPredicate::Always {
@@ -331,12 +348,33 @@ impl GlobalMemory {
         Ok(())
     }
 
+    pub(super) fn load(
+        &mut self,
+        offset: u32,
+        encoding: u64,
+        register_count: u8,
+        next: &mut u16,
+    ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+        self.access(offset, encoding, register_count, next, true)
+    }
+
     pub(super) fn store(
         &mut self,
         offset: u32,
         encoding: u64,
         register_count: u8,
         next: &mut u16,
+    ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+        self.access(offset, encoding, register_count, next, false)
+    }
+
+    fn access(
+        &mut self,
+        offset: u32,
+        encoding: u64,
+        register_count: u8,
+        next: &mut u16,
+        load: bool,
     ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
         let stage = MaxwellShaderStage::Compute;
         let error = |detail| MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -345,44 +383,93 @@ impl GlobalMemory {
             encoding,
             detail,
         };
-        if self.control_flow || decode_predicate(encoding) != ShaderPredicate::Always {
-            return Err(error(
-                "global stores across control flow require pointer merge analysis",
-            ));
+        if decode_predicate(encoding) != ShaderPredicate::Always {
+            return Err(error("predicated global access is not implemented"));
         }
-        if (encoding >> 48) & 7 != 4 || encoding & (1 << 45) == 0 {
-            return Err(error(
-                "STG requires scalar 32-bit data and a 64-bit address",
-            ));
+        let width = (encoding >> 48) & 7;
+        let words: u8 = match width {
+            4 => 1,
+            5 => 2,
+            6 => 4,
+            7 if load => 4,
+            _ => return Err(error("global access element width is not implemented")),
+        };
+        if encoding & (1 << 45) == 0 {
+            return Err(error("global access requires a 64-bit address"));
         }
-        if encoding & ((3 << 46) | (1 << 44)) != 0 {
+        // LDG cache policies alter caching, not the value or resource identity.
+        // Host storage loads execute under the dispatch's visibility barriers.
+        if encoding & (1 << 44) != 0 || (!load && encoding & (3 << 46) != 0) {
             return Err(error(
-                "STG cache modifier or reserved field is not supported",
+                "global access cache modifier or reserved field is not supported",
             ));
         }
         let displacement = ((encoding >> 20) & 0xff_ffff) as u32;
         if displacement & 0x80_0003 != 0 {
             return Err(error(
-                "STG requires a nonnegative word-aligned displacement",
+                "global access requires a nonnegative word-aligned displacement",
             ));
         }
         let address = (encoding >> 8) as u8;
         validate_register_range(stage, offset, encoding, address, 2, register_count)?;
-        let (Some(Value::Low(pointer)), Some(Value::High(high))) = (
-            self.values.get(&ShaderRegister::new(u16::from(address))),
-            self.values
-                .get(&ShaderRegister::new(u16::from(address) + 1)),
-        ) else {
+        if !address.is_multiple_of(2) {
             return Err(error(
-                "STG address has no proven constant-buffer base and dispatch-bounded offset",
-            ));
-        };
-        if pointer != high || pointer.offset.alignment < 2 {
-            return Err(error(
-                "STG address halves or relative alignment are not proven compatible",
+                "64-bit global address requires an even register pair",
             ));
         }
-        let pointer = *pointer;
+        let halves = (
+            self.values
+                .get(&ShaderRegister::new(u16::from(address)))
+                .copied(),
+            self.values
+                .get(&ShaderRegister::new(u16::from(address) + 1))
+                .copied(),
+        );
+        let mut prefix = Vec::new();
+        let pointer = match halves {
+            (Some(Value::Low(pointer)), Some(Value::High(high)))
+                if pointer == high
+                    && (pointer.offset.alignment >= 2
+                        || (pointer.constant_buffer == 0
+                            && (0x100..0x700).contains(&pointer.byte_offset)
+                            && pointer.byte_offset.is_multiple_of(16))) =>
+            {
+                pointer
+            }
+            (
+                Some(Value::BaseWord(cb, byte_offset)),
+                Some(Value::BaseWord(high_cb, high_offset)),
+            ) if cb == high_cb && byte_offset.checked_add(4) == Some(high_offset) => {
+                // A direct pair of consecutive constant-buffer words is a base
+                // pointer with zero relative offset, including aliased LDG Rd,[Rd].
+                let Value::Offset(relative) = self.offset(Bound::Constant(0), 32, Some(0)) else {
+                    unreachable!();
+                };
+                let frozen = allocate_shader_temporary(
+                    stage,
+                    offset,
+                    encoding,
+                    "global pointer temporary overflow",
+                    next,
+                )?;
+                prefix.push(ShaderOperation::MoveImmediate32 {
+                    destination: frozen,
+                    bits: 0,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                });
+                Pointer {
+                    constant_buffer: cb,
+                    byte_offset,
+                    offset: relative,
+                    frozen,
+                }
+            }
+            _ => {
+                return Err(error(
+                    "global address has no proven constant-buffer base and aligned dispatch-bounded offset",
+                ));
+            }
+        };
         let index = if let Some(index) = self.bindings.buffers.iter().position(|b| {
             b.constant_buffer == pointer.constant_buffer && b.byte_offset == pointer.byte_offset
         }) {
@@ -395,18 +482,56 @@ impl GlobalMemory {
                 constant_buffer: pointer.constant_buffer,
                 byte_offset: pointer.byte_offset,
                 binding,
+                read: false,
+                write: false,
+                runtime_extent: false,
                 accesses: Vec::new(),
             });
             index
         };
+        let mut nodes = vec![pointer.offset.node];
+        let mut runtime_extent = false;
+        while let Some(node) = nodes.pop() {
+            match self.bindings.bounds[node] {
+                Bound::Unknown => {
+                    runtime_extent = true;
+                    break;
+                }
+                Bound::Add(a, b) => nodes.extend([a, b]),
+                Bound::Shift(value, _) => nodes.push(value),
+                _ => {}
+            }
+        }
+        if runtime_extent
+            && !(pointer.constant_buffer == 0
+                && (0x100..0x700).contains(&pointer.byte_offset)
+                && pointer.byte_offset.is_multiple_of(16))
+        {
+            return Err(error(
+                "global access has no inferred bound or NVN size descriptor",
+            ));
+        }
         let buffer = &mut self.bindings.buffers[index];
-        buffer.accesses.push((pointer.offset.node, displacement));
+        buffer.runtime_extent |= runtime_extent;
+        buffer.read |= load;
+        buffer.write |= !load;
+        buffer
+            .accesses
+            .push((pointer.offset.node, displacement + 4 * u32::from(words - 1)));
         let binding = buffer.binding;
-        let mut temporary =
-            || allocate_shader_temporary(stage, offset, encoding, "STG temporary overflow", next);
+        let mut temporary = || {
+            allocate_shader_temporary(
+                stage,
+                offset,
+                encoding,
+                "global access temporary overflow",
+                next,
+            )
+        };
         let shift = temporary()?;
         let word_index = temporary()?;
-        let mut ops = vec![
+        let mut ops = prefix;
+        ops.extend([
             ShaderOperation::MoveImmediate32 {
                 destination: shift,
                 bits: 2,
@@ -418,7 +543,7 @@ impl GlobalMemory {
                 amount: shift,
                 wrap: false,
             },
-        ];
+        ]);
         if displacement != 0 {
             ops.push(ShaderOperation::MoveImmediate32 {
                 destination: shift,
@@ -435,23 +560,59 @@ impl GlobalMemory {
                 float_control: ShaderFloatControl::PRECISE,
             });
         }
-        let source = if encoding as u8 == 0xff {
-            let source = temporary()?;
+        let raw = encoding as u8;
+        if raw != 255 {
+            validate_register_range(stage, offset, encoding, raw, words, register_count)?;
+            if !raw.is_multiple_of(words) {
+                return Err(error(
+                    "global access data registers are not naturally aligned",
+                ));
+            }
+        }
+        if words > 1 {
             ops.push(ShaderOperation::MoveImmediate32 {
-                destination: source,
-                bits: 0,
+                destination: shift,
+                bits: 1,
                 scalar_type: ShaderScalarType::Unsigned32,
             });
-            source
-        } else {
-            validate_register_range(stage, offset, encoding, encoding as u8, 1, register_count)?;
-            ShaderRegister::new(u16::from(encoding as u8))
-        };
-        ops.push(ShaderOperation::StoreStorageBuffer32 {
-            source,
-            binding,
-            word_index,
-        });
+        }
+        for word in 0..words {
+            let register = if raw == 255 {
+                let register = temporary()?;
+                if !load {
+                    ops.push(ShaderOperation::MoveImmediate32 {
+                        destination: register,
+                        bits: 0,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    });
+                }
+                register
+            } else {
+                ShaderRegister::new(u16::from(raw) + u16::from(word))
+            };
+            ops.push(if load {
+                ShaderOperation::LoadStorageBuffer32 {
+                    destination: register,
+                    binding,
+                    word_index,
+                }
+            } else {
+                ShaderOperation::StoreStorageBuffer32 {
+                    source: register,
+                    binding,
+                    word_index,
+                }
+            });
+            if word + 1 < words {
+                ops.push(ShaderOperation::Add32 {
+                    destination: word_index,
+                    left: word_index,
+                    right: shift,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                    float_control: ShaderFloatControl::PRECISE,
+                });
+            }
+        }
         Ok(ops)
     }
 }

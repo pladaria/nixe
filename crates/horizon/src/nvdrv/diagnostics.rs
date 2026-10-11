@@ -129,6 +129,10 @@ pub enum UnsupportedNvDrvOperation {
         context: NvDrvErrorContext,
         boundary: Box<MaxwellFrontendDispatchBoundary>,
     },
+    Host1xExecution {
+        context: NvDrvErrorContext,
+        detail: Box<str>,
+    },
     GpuExecution {
         context: NvDrvErrorContext,
         frontend: FrontendSubmissionId,
@@ -154,9 +158,9 @@ impl UnsupportedNvDrvOperation {
             | Self::GpfifoMemory { .. }
             | Self::GpfifoScheduling { .. }
             | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
-            Self::ScheduledGpfifoSubmission { .. } | Self::GpuExecution { .. } => {
-                GraphicsGapKind::GpuPacket
-            }
+            Self::ScheduledGpfifoSubmission { .. }
+            | Self::GpuExecution { .. }
+            | Self::Host1xExecution { .. } => GraphicsGapKind::GpuPacket,
         }
     }
 }
@@ -227,6 +231,14 @@ impl Display for UnsupportedNvDrvOperation {
                 context.fd(),
                 context.reason(),
                 boundary
+            ),
+            Self::Host1xExecution { context, detail } => write!(
+                formatter,
+                "Host1x execution failed: device={} request={:#010x} fd={} detail=[{}]",
+                context.device().path(),
+                context.request(),
+                context.fd(),
+                detail
             ),
             Self::GpuExecution {
                 context,

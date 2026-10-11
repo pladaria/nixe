@@ -148,9 +148,14 @@ pub enum ImageFormat {
     Bc1RgbSrgb,
     Bc1RgbaUnorm,
     Bc1RgbaSrgb,
+    Bc4RUnorm,
     R16Float,
     Rg16Float,
     Rgba16Float,
+    /// Packed unsigned floats: R in bits 10:0, G in 21:11, B in 31:22;
+    /// five exponent bits per component, no sign bit, sampled alpha one.
+    /// https://registry.khronos.org/OpenGL/extensions/EXT/EXT_packed_float.txt
+    Rg11b10Ufloat,
     R32Float,
     Rg32Float,
     Rgba32Float,
@@ -161,13 +166,30 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
+    /// Raw texel copies preserve bytes across the linear/sRGB interpretation
+    /// of the same storage format; they do not perform a gamma conversion.
+    #[must_use]
+    pub const fn is_copy_compatible(self, other: Self) -> bool {
+        const fn linear(format: ImageFormat) -> ImageFormat {
+            match format {
+                ImageFormat::Rgba8Srgb => ImageFormat::Rgba8Unorm,
+                ImageFormat::Bgra8Srgb => ImageFormat::Bgra8Unorm,
+                _ => format,
+            }
+        }
+        linear(self) as u32 == linear(other) as u32
+    }
     /// Dimensions of one independently stored compression block, in texels.
     /// BC1 stores sixteen texels in eight bytes:
     /// https://registry.khronos.org/OpenGL/extensions/EXT/EXT_texture_compression_s3tc.txt
     #[must_use]
     pub const fn block_extent(self) -> [u32; 2] {
         match self {
-            Self::Bc1RgbUnorm | Self::Bc1RgbSrgb | Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => [4, 4],
+            Self::Bc1RgbUnorm
+            | Self::Bc1RgbSrgb
+            | Self::Bc1RgbaUnorm
+            | Self::Bc1RgbaSrgb
+            | Self::Bc4RUnorm => [4, 4],
             _ => [1, 1],
         }
     }
@@ -179,9 +201,11 @@ impl ImageFormat {
             return None;
         }
         match self {
-            Self::Bc1RgbUnorm | Self::Bc1RgbSrgb | Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => {
-                Some(8)
-            }
+            Self::Bc1RgbUnorm
+            | Self::Bc1RgbSrgb
+            | Self::Bc1RgbaUnorm
+            | Self::Bc1RgbaSrgb
+            | Self::Bc4RUnorm => Some(8),
             _ => self.plane_bytes_per_texel(plane),
         }
     }
@@ -218,7 +242,11 @@ impl ImageFormat {
             return None;
         }
         Some(match self {
-            Self::Bc1RgbUnorm | Self::Bc1RgbSrgb | Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => {
+            Self::Bc1RgbUnorm
+            | Self::Bc1RgbSrgb
+            | Self::Bc1RgbaUnorm
+            | Self::Bc1RgbaSrgb
+            | Self::Bc4RUnorm => {
                 return None;
             }
             Self::R8Unorm => 1,
@@ -228,6 +256,7 @@ impl ImageFormat {
             | Self::Bgra8Unorm
             | Self::Bgra8Srgb
             | Self::Rg16Float
+            | Self::Rg11b10Ufloat
             | Self::R32Float
             | Self::Depth24UnormStencil8Uint
             | Self::Depth32Float => 4,

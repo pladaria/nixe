@@ -13,9 +13,10 @@ use std::{
 
 use nixe_gpu::{
     AddressMode, BackingView, BlockLinearLayout, BufferDescription, BufferId, BufferView,
-    CanonicalBackingSpan, FilterMode, GpuAllocationDescription, GpuAllocationId, GpuVirtualAddress,
-    ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageId, ImageKind,
-    ImageMemoryLayout, ImageSubresourceRange, ImageView, SampleCount, SamplerDescription, Swizzle,
+    CanonicalBackingSpan, ComponentSwizzle, FilterMode, GpuAllocationDescription, GpuAllocationId,
+    GpuVirtualAddress, ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageId,
+    ImageKind, ImageMemoryLayout, ImageSubresourceRange, ImageView, SampleCount,
+    SamplerDescription, Swizzle,
 };
 use nixe_memory::{
     CanonicalBackingRange, CanonicalCpuWriteDependency, CanonicalRangeAccessError,
@@ -228,6 +229,8 @@ pub struct MaxwellThreeDPreservedImageLayout {
 /// Original Maxwell texel encoding retained independently of neutral component semantics.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellThreeDGuestImageFormat {
+    /// Canonical texels authored by another device frontend (for example VIC).
+    Canonical(ImageFormat),
     Color(MaxwellThreeDColorTargetFormat),
     DepthStencil(MaxwellThreeDDepthStencilFormat),
     Texture(u32),
@@ -279,14 +282,17 @@ impl MaxwellThreeDPreservedImageLayout {
     /// Returns whether guest bytes require Maxwell compression materialization.
     #[must_use]
     pub const fn requires_materialization(self) -> bool {
-        // SET_Z_COMPRESSION controls subsequent writes, not whether an
-        // existing 2CZ allocation contains compressed depth/stencil data.
+        // Attachment compression selectors control subsequent writes, not
+        // whether a compressed PTE kind contains compressed color/depth data.
         // deko3d selects these kinds at image allocation time independently
         // of binding the attachment (see the format-selection reference above).
         self.compression_enabled
             || matches!(
                 self.pte_kind,
-                MAXWELL_S8Z24_2CZ_KIND
+                MAXWELL_C32_2CRA_KIND
+                    | MAXWELL_C64_2CRA_KIND
+                    | MAXWELL_C128_2CR_KIND
+                    | MAXWELL_S8Z24_2CZ_KIND
                     | MAXWELL_Z24S8_2CZ_KIND
                     | MAXWELL_C32_MS4_2CBR_KIND
                     | MAXWELL_S8Z24_MS4_2CZ_KIND
@@ -295,8 +301,8 @@ impl MaxwellThreeDPreservedImageLayout {
     }
 
     /// Returns whether the guest bytes already have a direct canonical
-    /// representation. A 2CZ depth allocation is never directly importable:
-    /// disabling future compression does not decompress its existing bytes.
+    /// representation. Compressed color/depth kinds are not directly importable:
+    /// disabling future compression does not decompress their existing bytes.
     /// Generic 16Bx2 mappings are already canonical.
     #[must_use]
     pub const fn has_direct_canonical_representation(self) -> bool {
@@ -1098,7 +1104,10 @@ impl MaxwellThreeDResolvedResourceCache {
             address_space: address_space.id(),
             surfaces: request.images,
             destination_compression: request.destination_compression,
-            resolve: request.kind == crate::engines::twod::blit::BlitKind::Resolve,
+            resolve: matches!(
+                request.kind,
+                crate::engines::twod::blit::BlitKind::Downsample2x { .. }
+            ),
         };
         if let Some(entry) = self.blits.get(&key) {
             let generation = address_space.mapping_generation().get();
@@ -1119,11 +1128,55 @@ impl MaxwellThreeDResolvedResourceCache {
             } else {
                 MaxwellThreeDResourceRole::BlitDestination
             };
-            builder.sample_mode = Some(if index == 0 && key.resolve {
-                MaxwellThreeDSampleMode::Samples2x2
-            } else {
-                MaxwellThreeDSampleMode::Samples1x1
-            });
+            // Point copies preserve the packed texels, including depth/stencil.
+            // PTE kinds identify the resident representation even when 2D uses
+            // a four-byte color format for the raw copy.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/twod/cl902d.h
+            let address = address_space.address(surface.address).map_err(|error| {
+                MaxwellThreeDResourceError::Resolution {
+                    role,
+                    error: MaxwellGpuAccessError::Address(error),
+                }
+            })?;
+            let range = address_space
+                .resolve_range(
+                    address,
+                    1,
+                    if index == 0 {
+                        MemoryPermissions::READ
+                    } else {
+                        MemoryPermissions::WRITE
+                    },
+                )
+                .map_err(|error| MaxwellThreeDResourceError::Resolution { role, error })?;
+            let pte_kind = range.segments()[0].mapping().kind();
+            let (format, image_kind, guest_format) = match pte_kind {
+                MAXWELL_S8Z24_2CZ_KIND | MAXWELL_Z24S8_2CZ_KIND => (
+                    ImageFormat::Depth24UnormStencil8Uint,
+                    ImageKind::DepthStencil,
+                    MaxwellThreeDGuestImageFormat::DepthStencil(
+                        if pte_kind == MAXWELL_S8Z24_2CZ_KIND {
+                            MaxwellThreeDDepthStencilFormat::Stencil8Z24
+                        } else {
+                            MaxwellThreeDDepthStencilFormat::Z24Stencil8
+                        },
+                    ),
+                ),
+                _ => (
+                    color_image_format(surface.format, role)?,
+                    ImageKind::Color,
+                    MaxwellThreeDGuestImageFormat::Color(MaxwellThreeDColorTargetFormat::Color(
+                        surface.format,
+                    )),
+                ),
+            };
+            builder.sample_mode = Some(
+                if index == 0 && key.resolve && pte_kind == MAXWELL_C32_MS4_2CBR_KIND {
+                    MaxwellThreeDSampleMode::Samples2x2
+                } else {
+                    MaxwellThreeDSampleMode::Samples1x1
+                },
+            );
             let description = image_description(MaxwellImageDescriptionRequest {
                 dimension: ImageDimension::Two,
                 extent: ImageExtent {
@@ -1131,8 +1184,8 @@ impl MaxwellThreeDResolvedResourceCache {
                     height: surface.height,
                     depth: 1,
                 },
-                format: color_image_format(surface.format, role)?,
-                kind: ImageKind::Color,
+                format,
+                kind: image_kind,
                 layers: 1,
                 role,
             })?;
@@ -1156,9 +1209,7 @@ impl MaxwellThreeDResolvedResourceCache {
                 },
                 None,
                 0,
-                MaxwellThreeDGuestImageFormat::Color(MaxwellThreeDColorTargetFormat::Color(
-                    surface.format,
-                )),
+                guest_format,
                 if index == 0 {
                     matches!(
                         surface.layout,
@@ -1727,6 +1778,20 @@ impl<'a> ResourceBuilder<'a> {
             field: "format/component/swizzle",
             value: format_word,
         })?;
+        let sample_swizzle = if format == ImageFormat::Bc4RUnorm {
+            Swizzle(swizzle.map(|component| match component {
+                0 => ComponentSwizzle::Zero,
+                2 => ComponentSwizzle::Red,
+                3 => ComponentSwizzle::Green,
+                4 => ComponentSwizzle::Blue,
+                5 => ComponentSwizzle::Alpha,
+                7 => ComponentSwizzle::One,
+                _ => unreachable!("validated TIC component mapping"),
+            }))
+        } else {
+            // Existing format tuples include their native component mapping.
+            Swizzle::IDENTITY
+        };
         let header_version = ((words[2] >> 21) & 7) as u8;
         let texture_type = ((words[4] >> 23) & 0xf) as u8;
         let width = (words[4] & 0xffff) + 1;
@@ -1772,6 +1837,8 @@ impl<'a> ResourceBuilder<'a> {
             || sparse
             || !normalized
             || layer_base != 0
+            || (format == ImageFormat::Depth24UnormStencil8Uint
+                && required_dimension != MaxwellThreeDTextureDimension::Two)
         {
             log::debug!(
                 "unsupported Maxwell TIC shape: descriptor={descriptor_index} dimension={required_dimension:?} words={words:08x?}"
@@ -1844,9 +1911,13 @@ impl<'a> ResourceBuilder<'a> {
         // but refer to the same compressed allocation. Only texel formats
         // (not BC blocks) may use these color-compression families. Lowering
         // must supply an existing resident image; these bytes cannot be uploaded.
-        let compressed_kind = (block_width == 1 && block_height == 1)
-            .then(|| single_sample_compressed_color_kind(u64::from(bytes_per_block)))
-            .flatten();
+        let compressed_kind = if format == ImageFormat::Depth24UnormStencil8Uint {
+            Some(MAXWELL_Z24S8_2CZ_KIND)
+        } else {
+            (block_width == 1 && block_height == 1)
+                .then(|| single_sample_compressed_color_kind(u64::from(bytes_per_block)))
+                .flatten()
+        };
         let expected_kind = if pitch_linear {
             MAXWELL_PITCH_KIND
         } else {
@@ -1878,7 +1949,11 @@ impl<'a> ResourceBuilder<'a> {
                 depth: 1,
             },
             format,
-            kind: ImageKind::Color,
+            kind: if format == ImageFormat::Depth24UnormStencil8Uint {
+                ImageKind::DepthStencil
+            } else {
+                ImageKind::Color
+            },
             layers,
             role,
         })?;
@@ -1889,7 +1964,7 @@ impl<'a> ResourceBuilder<'a> {
         let view = ImageView::new(
             id,
             description,
-            Swizzle::IDENTITY,
+            sample_swizzle,
             vec![(
                 ImageSubresourceRange {
                     plane: 0,
@@ -1921,7 +1996,15 @@ impl<'a> ResourceBuilder<'a> {
                     compression_enabled: !pitch_linear
                         && actual_kind != MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
                 },
-                guest_format: MaxwellThreeDGuestImageFormat::Texture(format_word),
+                guest_format: if format == ImageFormat::Depth24UnormStencil8Uint {
+                    // TIC Z24S8 and SET_ZT_FORMAT describe the same packed texels.
+                    // Keep the storage encoding independent of texture selectors.
+                    MaxwellThreeDGuestImageFormat::DepthStencil(
+                        MaxwellThreeDDepthStencilFormat::Z24Stencil8,
+                    )
+                } else {
+                    MaxwellThreeDGuestImageFormat::Texture(format_word)
+                },
             },
         ));
         Ok(())
@@ -2496,6 +2579,8 @@ fn color_image_format(
         0xd0 => Ok(ImageFormat::Bgra8Srgb),
         0xd5 => Ok(ImageFormat::Rgba8Unorm),
         0xd6 => Ok(ImageFormat::Rgba8Srgb),
+        0xe0 => Ok(ImageFormat::Rg11b10Ufloat),
+        0xf3 => Ok(ImageFormat::R8Unorm),
         _ => Err(MaxwellThreeDResourceError::UnsupportedColorFormat { role, format }),
     }
 }
@@ -2537,6 +2622,14 @@ fn decode_sampled_texture_format(
         // five bits the observable red channel (packed RGB565).
         // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc
         (0x15, [2, 2, 2, 2], [4, 3, 2, 7], false) => Some(ImageFormat::Rgb565Unorm),
+        // Z24S8 uses unsigned stencil R and normalized depth G. Selecting G
+        // for RGB samples the depth aspect, with alpha forced to one.
+        (0x29, [4, 2, 2, 2], [3, 3, 3, 7], false) => Some(ImageFormat::Depth24UnormStencil8Uint),
+        (0x27, [2, 2, 2, 2], mapping, false)
+            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
+        {
+            Some(ImageFormat::Bc4RUnorm)
+        }
         (0x24, [2, 2, 2, 2], [2, 3, 4, 7], false) => Some(ImageFormat::Bc1RgbUnorm),
         (0x24, [2, 2, 2, 2], [2, 3, 4, 7], true) => Some(ImageFormat::Bc1RgbSrgb),
         (0x24, [2, 2, 2, 2], [2, 3, 4, 5], false) => Some(ImageFormat::Bc1RgbaUnorm),
@@ -2550,6 +2643,7 @@ fn decode_sampled_texture_format(
         (0x1b, [7, 7, 7, 7], [2, 0, 0, 7], false) => Some(ImageFormat::R16Float),
         (0x0c, [7, 7, 7, 7], [2, 3, 0, 7], false) => Some(ImageFormat::Rg16Float),
         (0x03, [7, 7, 7, 7], [2, 3, 4, 5], false) => Some(ImageFormat::Rgba16Float),
+        (0x21, [7, 7, 7, 7], [2, 3, 4, 7], false) => Some(ImageFormat::Rg11b10Ufloat),
         (0x0f, [7, 7, 7, 7], [2, 0, 0, 7], false) => Some(ImageFormat::R32Float),
         (0x04, [7, 7, 7, 7], [2, 3, 0, 7], false) => Some(ImageFormat::Rg32Float),
         (0x01, [7, 7, 7, 7], [2, 3, 4, 5], false) => Some(ImageFormat::Rgba32Float),
@@ -2568,13 +2662,14 @@ fn retained_backing(
     let allocation = first.mapping().allocation();
     let allocation_offset = first.backing_offset();
     let mut expected_offset = allocation_offset;
+    let mut contiguous = true;
     let mut canonical = Vec::new();
     let mut mappings = Vec::new();
     for segment in source.segments() {
         let mapping = segment.mapping();
-        if mapping.allocation() != allocation || segment.backing_offset() != expected_offset {
-            return Err(MaxwellThreeDResourceError::DiscontiguousAllocation);
-        }
+        contiguous &= mapping.allocation() == allocation
+            && segment.backing_offset() == expected_offset
+            && mapping.backing().size() == first.mapping().backing().size();
         mapping
             .backing()
             .snapshot_subrange_into(segment.backing_offset(), segment.size(), &mut canonical)
@@ -2582,7 +2677,7 @@ fn retained_backing(
         mappings.push(MaxwellThreeDMappingReference {
             mapping: mapping.id(),
             generation: mapping.generation(),
-            allocation,
+            allocation: mapping.allocation(),
             backing_offset: segment.backing_offset(),
             size: segment.size(),
             kind: mapping.kind(),
@@ -2595,37 +2690,50 @@ fn retained_backing(
         CanonicalBackingRange::new(canonical).map_err(MaxwellThreeDResourceError::Canonical)?;
     let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
         .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
-    let allocation_description = GpuAllocationDescription::new(allocation_size(source)?, 1)
+    // A GPU virtual resource may span independent nvmap objects. Its canonical
+    // scatter/gather range remains the authority for content and aliases; a
+    // separate logical allocation owns the assembled host view, without copying
+    // guest memory or pretending the constituent objects have one identity.
+    // Reserve the upper half for these frontend-owned logical allocations.
+    const LOGICAL_ALLOCATION_BASE: u64 = 1 << 63;
+    static NEXT_LOGICAL_ALLOCATION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(LOGICAL_ALLOCATION_BASE);
+    if source
+        .segments()
+        .iter()
+        .any(|segment| segment.mapping().allocation().get() >= LOGICAL_ALLOCATION_BASE)
+    {
+        return Err(MaxwellThreeDResourceError::ResourceExhausted);
+    }
+    let (allocation, allocation_size, allocation_offset) = if contiguous {
+        (
+            GpuAllocationId::new(allocation.get()),
+            first.mapping().backing().size(),
+            allocation_offset,
+        )
+    } else {
+        let id = NEXT_LOGICAL_ALLOCATION
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .map_err(|_| MaxwellThreeDResourceError::ResourceExhausted)?;
+        (GpuAllocationId::new(id), source.size(), 0)
+    };
+    let allocation_description = GpuAllocationDescription::new(allocation_size, 1)
         .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-    let backing = BackingView::new(
-        GpuAllocationId::new(allocation.get()),
-        allocation_description,
-        allocation_offset,
-        range,
-    )
-    .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+    let backing = BackingView::new(allocation, allocation_description, allocation_offset, range)
+        .map_err(|error| {
+            log::debug!("invalid retained backing: role={role:?} error={error}");
+            MaxwellThreeDResourceError::InvalidNeutralView { role }
+        })?;
     Ok(RetainedResourceBacking {
         backing,
         allocation_description,
         mappings: mappings.into(),
         cpu_writes,
     })
-}
-
-fn allocation_size(source: &MaxwellResolvedRange) -> Result<u64, MaxwellThreeDResourceError> {
-    let first = source
-        .segments()
-        .first()
-        .ok_or(MaxwellThreeDResourceError::ResourceExhausted)?;
-    let size = first.mapping().backing().size();
-    if source
-        .segments()
-        .iter()
-        .any(|segment| segment.mapping().backing().size() != size)
-    {
-        return Err(MaxwellThreeDResourceError::DiscontiguousAllocation);
-    }
-    Ok(size)
 }
 
 fn unresolved(upper: Option<&u8>, lower: Option<&u32>) -> Option<MaxwellThreeDUnresolvedAddress> {
@@ -2868,7 +2976,10 @@ fn contradictory_image_alias(
             MaxwellThreeDResolvedResource::Image(second),
         ) => {
             first.description != second.description
-                || first.guest_layout != second.guest_layout
+                || first.guest_layout.layout != second.guest_layout.layout
+                || first.guest_layout.pte_kind != second.guest_layout.pte_kind
+                || first.guest_layout.requires_materialization()
+                    != second.guest_layout.requires_materialization()
                 || first.guest_format != second.guest_format
         }
         _ => false,
@@ -2942,7 +3053,6 @@ pub enum MaxwellThreeDResourceError {
         field: &'static str,
         value: u32,
     },
-    DiscontiguousAllocation,
     ContradictoryAlias {
         first: MaxwellThreeDResourceRole,
         second: MaxwellThreeDResourceRole,
@@ -3048,8 +3158,6 @@ impl Display for MaxwellThreeDResourceError {
                 formatter,
                 "Maxwell sampler descriptor {descriptor} has unsupported {field}: value=0x{value:08x}"
             ),
-            Self::DiscontiguousAllocation => formatter
-                .write_str("one resource range crosses non-contiguous allocation identities"),
             Self::ContradictoryAlias { first, second } => write!(
                 formatter,
                 "aliased image resources have contradictory interpretations: first={first:?} second={second:?}"
@@ -3115,6 +3223,85 @@ mod tests {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         bytes
+    }
+
+    #[test]
+    fn virtual_resource_spans_independent_allocations_with_real_aliases() {
+        let mut space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let allocations = [
+            CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap(),
+            CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap(),
+        ];
+        let mappings: Vec<_> = allocations
+            .iter()
+            .enumerate()
+            .map(|(index, allocation)| {
+                space
+                    .map(MaxwellMapRequest {
+                        allocation: MaxwellAllocationId::new(index as u64 + 1),
+                        backing: allocation
+                            .backing_range(MemoryPermissions::READ_WRITE)
+                            .unwrap(),
+                        backing_offset: 0,
+                        size: 0x1000,
+                        allocation_alignment: 0x1000,
+                        page_size: 0,
+                        kind: 0,
+                        cacheable: true,
+                        permissions: MemoryPermissions::READ_WRITE,
+                        fixed_offset: None,
+                    })
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            mappings[1].offset().get(),
+            mappings[0].offset().get() + 0x1000
+        );
+        let role = MaxwellThreeDResourceRole::ConstantBuffer { group: 4, slot: 1 };
+        let source = space
+            .resolve_range(
+                space.address(mappings[0].offset().get() + 0xff0).unwrap(),
+                32,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        let mut cache = MaxwellThreeDRetainedBackingCache::default();
+        let retained = cache.retain(&source, role).unwrap();
+        assert_eq!(retained.allocation_description.size(), 32);
+        assert_eq!(retained.backing.allocation_offset(), 0);
+        assert_eq!(retained.mappings[0].allocation, mappings[0].allocation());
+        assert_eq!(retained.mappings[1].allocation, mappings[1].allocation());
+        let repeated = cache.retain(&source, role).unwrap();
+        assert_eq!(retained.backing.allocation(), repeated.backing.allocation());
+        for (index, mapping) in mappings.iter().enumerate() {
+            let half = space
+                .resolve_range(
+                    space
+                        .address(mapping.offset().get() + if index == 0 { 0xff0 } else { 0 })
+                        .unwrap(),
+                    16,
+                    MemoryPermissions::READ,
+                )
+                .unwrap();
+            let alias = cache.retain(&half, role).unwrap();
+            assert!(retained.backing.overlaps(&alias.backing));
+            allocations[index]
+                .write(if index == 0 { 0xff0 } else { 0 }, &[index as u8 + 1; 16])
+                .unwrap();
+        }
+        let mut actual = [0; 32];
+        retained.backing.range().read(0, &mut actual).unwrap();
+        assert_eq!(actual[..16], [1; 16]);
+        assert_eq!(actual[16..], [2; 16]);
+        assert!(!retained.cpu_writes.remains_current());
+        let fresh = cache.retain(&source, role).unwrap();
+        assert_eq!(fresh.backing.allocation(), retained.backing.allocation());
+        assert!(fresh.cpu_writes.remains_current());
     }
 
     #[test]
@@ -3268,6 +3455,30 @@ mod tests {
         };
 
         assert!(!layout.has_direct_canonical_representation());
+    }
+
+    #[test]
+    fn compressed_color_kinds_require_resident_content_with_either_write_selector() {
+        for pte_kind in [
+            super::MAXWELL_C32_2CRA_KIND,
+            super::MAXWELL_C64_2CRA_KIND,
+            super::MAXWELL_C128_2CR_KIND,
+        ] {
+            for compression_enabled in [false, true] {
+                let layout = MaxwellThreeDPreservedImageLayout {
+                    layout: ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                        block_width_log2: 0,
+                        block_height_log2: 4,
+                        block_depth_log2: 0,
+                        layer_stride: 0x20_0000,
+                    }),
+                    pte_kind,
+                    compression_enabled,
+                };
+                assert!(layout.requires_materialization());
+                assert!(!layout.has_direct_canonical_representation());
+            }
+        }
     }
 
     #[test]
@@ -3449,6 +3660,19 @@ mod tests {
     }
 
     #[test]
+    fn r8_target_and_texture_use_the_same_single_channel_storage() {
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/image_formats.h
+        let format =
+            super::color_image_format(0xf3, MaxwellThreeDResourceRole::ColorTarget(0)).unwrap();
+        assert_eq!(format, nixe_gpu::ImageFormat::R8Unorm);
+        assert_eq!(format.plane_bytes_per_block(0), Some(1));
+        assert_eq!(
+            decode_sampled_texture_format(0x1d, [2; 4], [2, 0, 0, 7], false, 0),
+            Some(format)
+        );
+    }
+
+    #[test]
     fn rgba16_float_target_and_texture_encodings_have_the_same_interpretation() {
         let target =
             super::color_image_format(0xca, MaxwellThreeDResourceRole::ColorTarget(0)).unwrap();
@@ -3462,6 +3686,32 @@ mod tests {
         for raw in [0xc8, 0xc9, 0xce] {
             assert!(
                 super::color_image_format(raw, MaxwellThreeDResourceRole::ColorTarget(0)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn packed_unsigned_float_target_and_texture_preserve_storage_and_opaque_alpha() {
+        // deko3d format_traits.inc: BF10GF11RF11, Float components, R,G,B,OneFloat.
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc
+        let target =
+            super::color_image_format(0xe0, MaxwellThreeDResourceRole::ColorTarget(0)).unwrap();
+        assert_eq!(target, nixe_gpu::ImageFormat::Rg11b10Ufloat);
+        assert_eq!(target.plane_bytes_per_texel(0), Some(4));
+        assert_eq!(
+            decode_sampled_texture_format(0x21, [7; 4], [2, 3, 4, 7], false, 0),
+            Some(target)
+        );
+        for (components, swizzle, srgb, reserved) in [
+            ([2; 4], [2, 3, 4, 7], false, 0),
+            ([7; 4], [4, 3, 2, 7], false, 0),
+            ([7; 4], [2, 3, 4, 5], false, 0),
+            ([7; 4], [2, 3, 4, 7], true, 0),
+            ([7; 4], [2, 3, 4, 7], false, 1),
+        ] {
+            assert_eq!(
+                decode_sampled_texture_format(0x21, components, swizzle, srgb, reserved),
+                None
             );
         }
     }
@@ -3680,6 +3930,31 @@ mod tests {
                 ..
             })
         ));
+        let mut bc4_words = words;
+        bc4_words[0] = 0x7492_4927;
+        let mut bc4_builder = super::ResourceBuilder::new(&address_space, None, None, None);
+        bc4_builder
+            .sampled_image(
+                super::MaxwellThreeDTextureReference::new(4, 0, 0),
+                MaxwellThreeDTextureDimension::Two,
+                0,
+                descriptor_bytes(bc4_words),
+            )
+            .unwrap();
+        let super::MaxwellThreeDResolvedResource::Image(bc4) = &bc4_builder.resources[0] else {
+            panic!("expected BC4 sampled image");
+        };
+        assert_eq!(bc4.description().format(), nixe_gpu::ImageFormat::Bc4RUnorm);
+        assert_eq!(
+            bc4.view().swizzle(),
+            nixe_gpu::Swizzle([
+                nixe_gpu::ComponentSwizzle::Red,
+                nixe_gpu::ComponentSwizzle::Red,
+                nixe_gpu::ComponentSwizzle::Red,
+                nixe_gpu::ComponentSwizzle::One,
+            ])
+        );
+        assert_eq!(bc4.view().bindings()[0].backing().range().size(), 0x8000);
         // Fetch-only access must not read a sampler descriptor or require its
         // selector. Even garbage TSC bits in the handle are irrelevant.
         allocation.write(0, &descriptor_bytes(words)).unwrap();

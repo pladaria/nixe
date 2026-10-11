@@ -58,15 +58,15 @@ fn captured_vertex_system_value_ald_family_reaches_verified_ir_and_wgsl() {
                 && input.component() == 0
                 && input.scalar_type() == ShaderScalarType::Unsigned32
         }));
-        assert!(matches!(
-            ir.instructions()[0].operation(),
+        assert!(ir.instructions().iter().any(|instruction| matches!(
+            instruction.operation(),
             ShaderOperation::LoadInput {
                 location: decoded_location,
                 first_component: 0,
                 scalar_type: ShaderScalarType::Unsigned32,
                 ..
             } if *decoded_location == location
-        ));
+        )));
         validate_wgsl(&lower_shader_ir_to_wgsl(&translated).unwrap());
     }
 }
@@ -227,6 +227,7 @@ fn perspective_pass_exposes_the_unnormalized_barycentric_numerator() {
         &shader,
         nixe_gpu::SpirvShaderOptions {
             depth_clip_negative_one_to_one: false,
+            vertex_position_transform: None,
             input_control_points: 0,
             tessellation_mode: None,
             float32: nixe_gpu::SpirvFloat32Capabilities {

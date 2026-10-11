@@ -28,6 +28,9 @@ fn channel() -> MaxwellGpuChannel {
 pub(super) fn three_d_channel() -> MaxwellGpuChannel {
     let mut channel = channel();
     bind_three_d(&mut channel);
+    // Synthetic tests which omit viewport coefficients explicitly select
+    // window coordinates. Tests of firmware resets use an untouched channel.
+    program_three_d(&mut channel, 0x192c, 0);
     channel
 }
 

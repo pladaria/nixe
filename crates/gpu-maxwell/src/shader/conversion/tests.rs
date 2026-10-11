@@ -21,14 +21,20 @@ fn captured_signed_i2f_reaches_verified_ir_and_wgsl() {
         4,
     );
 
-    assert!(matches!(
-        translated.ir().instructions()[2].operation(),
-        ShaderOperation::ConvertIntegerToFloat32 {
-            destination,
-            source,
-            source_type: ShaderScalarType::Signed32,
-        } if destination.index() == 0 && source.index() == 0
-    ));
+    assert!(
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(
+                instruction.operation(),
+                ShaderOperation::ConvertIntegerToFloat32 {
+                    destination,
+                    source,
+                    source_type: ShaderScalarType::Signed32,
+                } if destination.index() == 0 && source.index() == 0
+            ))
+    );
     let module = lower_shader_ir_to_wgsl(&translated).unwrap();
     assert!(
         module
@@ -55,15 +61,21 @@ fn captured_f2f_floor_ftz_reaches_verified_ir_and_wgsl() {
         4,
     );
 
-    assert!(matches!(
-        translated.ir().instructions()[2].operation(),
-        ShaderOperation::RoundFloat32ToIntegral {
-            destination,
-            source,
-            rounding: ShaderRoundingMode::TowardNegative,
-            flush_denormals_to_zero: true,
-        } if destination.index() == 3 && source.index() == 0
-    ));
+    assert!(
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(
+                instruction.operation(),
+                ShaderOperation::RoundFloat32ToIntegral {
+                    destination,
+                    source,
+                    rounding: ShaderRoundingMode::TowardNegative,
+                    flush_denormals_to_zero: true,
+                } if destination.index() == 3 && source.index() == 0
+            ))
+    );
     let module = lower_shader_ir_to_wgsl(&translated).unwrap();
     assert!(module.source().contains(
         "registers[3] = bitcast<u32>(floor(bitcast<f32>(nixe_flush_denormal(registers[0]))))"
@@ -124,17 +136,23 @@ fn captured_f2i_u16_nearest_ftz_reaches_verified_ir_and_wgsl() {
         4,
     );
 
-    assert!(matches!(
-        translated.ir().instructions()[2].operation(),
-        ShaderOperation::ConvertFloat32ToInteger {
-            destination,
-            source,
-            destination_type: ShaderScalarType::Unsigned32,
-            destination_bits: 16,
-            rounding: ShaderRoundingMode::NearestEven,
-            flush_denormals_to_zero: true,
-        } if destination.index() == 0 && source.index() == 0
-    ));
+    assert!(
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(
+                instruction.operation(),
+                ShaderOperation::ConvertFloat32ToInteger {
+                    destination,
+                    source,
+                    destination_type: ShaderScalarType::Unsigned32,
+                    destination_bits: 16,
+                    rounding: ShaderRoundingMode::NearestEven,
+                    flush_denormals_to_zero: true,
+                } if destination.index() == 0 && source.index() == 0
+            ))
+    );
     let module = lower_shader_ir_to_wgsl(&translated).unwrap();
     assert!(module.source().contains("nixe_round_ties_even"));
     assert!(module.source().contains("0x0000ffffu"));

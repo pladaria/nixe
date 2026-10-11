@@ -100,7 +100,11 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             &input.binary,
             input.register_count,
             &vertex_input_types,
-        )?);
+        ).inspect_err(|_| {
+            for bundle in input.binary.bundles() {
+                log::debug!("untranslated graphics program: stage={:?} gpu-va={:#x} offset={:#x} instructions={:016x?}", input.binary.stage(), input.binary.address, bundle.offset, bundle.instructions);
+            }
+        })?);
     }
 
     validate_graphics_stage_interfaces(&translated)?;
@@ -325,10 +329,12 @@ pub(super) fn finalize_shader_ir(
                     coordinates,
                     image_binding,
                     sampler_binding,
+                    lod,
                 } => ShaderOperation::SampleTexture2D {
                     outputs: outputs.clone(),
                     coordinates: *coordinates,
                     image_binding: remapped_binding(bindings, stage, *image_binding)?,
+                    lod: *lod,
                     sampler_binding: remapped_binding(bindings, stage, *sampler_binding)?,
                 },
                 ShaderOperation::SampleTexture2DArray {
@@ -337,11 +343,13 @@ pub(super) fn finalize_shader_ir(
                     array_index,
                     image_binding,
                     sampler_binding,
+                    lod,
                 } => ShaderOperation::SampleTexture2DArray {
                     outputs: outputs.clone(),
                     coordinates: *coordinates,
                     array_index: *array_index,
                     image_binding: remapped_binding(bindings, stage, *image_binding)?,
+                    lod: *lod,
                     sampler_binding: remapped_binding(bindings, stage, *sampler_binding)?,
                 },
                 operation => operation.clone(),

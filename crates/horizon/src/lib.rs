@@ -4,6 +4,11 @@
 //! layered on its process, mount, and extensible handle primitives.
 
 mod audio;
+mod audio_device;
+mod multimedia;
+pub use audio_device::AudioDeviceSession;
+mod audio_renderer;
+pub use audio_renderer::{AudioRendererManagerSession, AudioRendererSession};
 mod bsd;
 mod diagnostics;
 pub use audio::{AudioOutManagerSession, AudioOutSession};
@@ -18,6 +23,8 @@ mod nvdrv;
 mod object;
 mod parcel;
 mod save_data;
+mod shared_font;
+pub use shared_font::SharedFontSession;
 mod scheduler_profile;
 pub use save_data::SaveDataSystem;
 mod svc;
