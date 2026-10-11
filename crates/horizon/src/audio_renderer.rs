@@ -12,7 +12,9 @@ use nixe_runtime::{
 };
 use std::sync::{Arc, Mutex, Weak};
 mod render;
+mod resample;
 pub(crate) mod update;
+mod voice;
 mod worker;
 
 pub(crate) const PARAMETER_SIZE: usize = 0x34;
@@ -133,7 +135,7 @@ impl RendererParameters {
 #[derive(Clone, Debug, Default)]
 pub struct AudioRendererManagerSession {
     slots: Arc<Mutex<[Weak<AudioRendererState>; 2]>>,
-    devices: Arc<AudioDeviceState>,
+    pub(crate) devices: Arc<AudioDeviceState>,
 }
 
 #[derive(Clone, Debug)]

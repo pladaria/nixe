@@ -2,7 +2,8 @@
 //! Public field layout and fixed point rectangles:
 //! https://github.com/averne/FFmpeg/blob/caeec83b791be08ed43468a2ef426d6901d51c78/libavutil/vic_drv.h
 //! https://github.com/averne/FFmpeg/blob/caeec83b791be08ed43468a2ef426d6901d51c78/libavutil/hwcontext_nvtegra.c
-use super::video::{Mappings, gob_offset, read, region, word};
+use super::surface::Surface;
+use super::video::{Mappings, read, region, word};
 use nixe_memory::CanonicalWriteBatch;
 
 fn wide(bytes: &[u8], offset: usize) -> u64 {
@@ -44,156 +45,7 @@ impl Matrix {
         result
     }
 }
-struct Surface {
-    width: usize,
-    height: usize,
-    pitch: usize,
-    rows: usize,
-    kind: u32,
-    block_height: u32,
-    format: u32,
-}
-impl Surface {
-    fn gpu_image(
-        &self,
-        mappings: &Mappings,
-        address: u64,
-        format: nixe_gpu::ImageFormat,
-        plane: bool,
-    ) -> Result<nixe_gpu::ConversionImage, String> {
-        use nixe_gpu::*;
-        let (whole, offset) = region(mappings, address, self.length())?;
-        let (_, mapping) = mappings
-            .range(..=u32::try_from(address).map_err(|_| "VIC address exceeds 32 bits")?)
-            .next_back()
-            .ok_or("VIC mapping was lost")?;
-        let allocation =
-            GpuAllocationDescription::new(whole.size(), 1).map_err(|e| e.to_string())?;
-        let bytes = usize::from(
-            format
-                .plane_bytes_per_texel(0)
-                .ok_or("invalid VIC GPU image format")?,
-        );
-        // NVDEC may allocate a wider GOB stride than its visible source. Plane
-        // textures retain that stride; the validated source crop selects texels.
-        let width = if plane && self.kind == 1 {
-            self.pitch / bytes
-        } else {
-            self.width / if plane { bytes } else { 1 }
-        };
-        let description = ImageDescription::new(
-            ImageDimension::Two,
-            ImageExtent::new(width as u32, self.height as u32, 1).map_err(|e| e.to_string())?,
-            format,
-            ImageKind::Color,
-            1,
-            1,
-            SampleCount::One,
-        )
-        .map_err(|e| e.to_string())?;
-        let backing = BackingView::new(
-            GpuAllocationId::new(mapping.object.id().raw()),
-            allocation,
-            offset,
-            whole
-                .snapshot_subrange(offset, self.length() as u64)
-                .map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        let layout = if self.kind == 1 {
-            ImageMemoryLayout::BlockLinear(BlockLinearLayout {
-                block_width_log2: 0,
-                block_height_log2: self.block_height as u8,
-                block_depth_log2: 0,
-                layer_stride: self.length() as u64,
-            })
-        } else {
-            ImageMemoryLayout::PitchLinear {
-                row_pitch: self.pitch as u64,
-                layer_stride: self.length() as u64,
-            }
-        };
-        let view = ImageView::new(
-            ImageId::new(0),
-            description,
-            Swizzle::IDENTITY,
-            vec![(
-                ImageSubresourceRange {
-                    mip_level: 0,
-                    base_layer: 0,
-                    layer_count: 1,
-                    plane: 0,
-                },
-                layout,
-                backing,
-            )],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(ConversionImage {
-            description,
-            allocation,
-            view,
-        })
-    }
-    fn decode(bytes: &[u8], bytes_per_pixel: usize) -> Result<Self, String> {
-        let layout = word(bytes, 0);
-        let size = word(bytes, 4);
-        let allocation = word(bytes, 8);
-        let width = (size & 0x3fff) as usize + 1;
-        let height = (size >> 14 & 0x3fff) as usize + 1;
-        let pitch = ((allocation & 0x3fff) as usize + 1) * bytes_per_pixel;
-        let rows = (allocation >> 14 & 0x3fff) as usize + 1;
-        let kind = layout >> 11 & 15;
-        let block_height = layout >> 15 & 15;
-        if kind > 1 || block_height > 5 || width * bytes_per_pixel > pitch || height > rows {
-            return Err("invalid/unsupported VIC surface layout".into());
-        }
-        Ok(Self {
-            width,
-            height,
-            pitch: if kind == 1 {
-                pitch.next_multiple_of(64)
-            } else {
-                pitch.next_multiple_of(16)
-            },
-            rows,
-            kind,
-            block_height,
-            format: layout & 127,
-        })
-    }
-    fn length(&self) -> usize {
-        self.pitch
-            * if self.kind == 1 {
-                self.rows.next_multiple_of(8 << self.block_height)
-            } else {
-                self.rows
-            }
-    }
-    fn offset(&self, x: usize, y: usize) -> usize {
-        if self.kind == 1 {
-            gob_offset(x, y, self.pitch, self.block_height)
-        } else {
-            y * self.pitch + x
-        }
-    }
-    fn read_linear(&self, mappings: &Mappings, address: u64) -> Result<Vec<u8>, String> {
-        let stored = read(mappings, address, self.length())?;
-        if self.kind == 0 {
-            return Ok(stored);
-        }
-        let mut linear = vec![0; self.pitch * self.height];
-        for y in 0..self.height {
-            for x in (0..self.width).step_by(16) {
-                let count = (self.width - x).min(16);
-                let source = self.offset(x, y);
-                let target = y * self.pitch + x;
-                linear[target..target + count].copy_from_slice(&stored[source..source + count]);
-            }
-        }
-        Ok(linear)
-    }
-}
+
 fn factor(
     selector: u32,
     k1: i64,
@@ -427,9 +279,6 @@ fn write_opaque_nv12(
     mappings: &Mappings,
     address: u64,
 ) -> Result<(), String> {
-    // VIDEO_PROBE_BEGIN
-    let opaque_start = std::time::Instant::now();
-    // VIDEO_PROBE_END
     let matrix = Nv12Matrix::new(color);
     #[cfg(target_arch = "x86_64")]
     let simd = std::is_x86_feature_detected!("sse4.1");
@@ -438,10 +287,6 @@ fn write_opaque_nv12(
     backing
         .read(offset, &mut bytes)
         .map_err(|e| e.to_string())?;
-    // VIDEO_PROBE_BEGIN
-    let opaque_read_us = opaque_start.elapsed().as_micros();
-    let opaque_kernel_start = std::time::Instant::now();
-    // VIDEO_PROBE_END
     #[cfg(target_arch = "x86_64")]
     if simd {
         // SAFETY: the runtime feature check covers the complete raster loop.
@@ -484,23 +329,11 @@ fn write_opaque_nv12(
             }
         }
     }
-    // VIDEO_PROBE_BEGIN
-    let opaque_kernel_us = opaque_kernel_start.elapsed().as_micros();
-    let opaque_write_start = std::time::Instant::now();
-    // VIDEO_PROBE_END
     let mut writes = CanonicalWriteBatch::new();
     writes
         .stage(&backing, offset, &bytes)
         .map_err(|e| e.to_string())?;
     writes.commit_ordered().map_err(|e| e.to_string())?;
-    // VIDEO_PROBE_BEGIN
-    if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-        log::debug!(
-            "VIDEO_PROBE vic-stages: read={opaque_read_us} kernel={opaque_kernel_us} write={}",
-            opaque_write_start.elapsed().as_micros()
-        );
-    }
-    // VIDEO_PROBE_END
     Ok(())
 }
 
@@ -514,12 +347,6 @@ pub(super) fn execute_with_gpu(
     mappings: &Mappings,
     gpu: Option<&super::super::gpu_executor::NvDrvGpuExecutor>,
 ) -> Result<(), String> {
-    // VIDEO_PROBE_BEGIN
-    let gpu = gpu.filter(|_| std::env::var_os("NIXE_CPU_VIC").is_none());
-    // VIDEO_PROBE_END
-    // VIDEO_PROBE_BEGIN
-    let probe_start = std::time::Instant::now();
-    // VIDEO_PROBE_END
     let config = read(mappings, u64::from(registers[0x1c2]) << 8, 0x610)?;
     let output = Surface::decode(&config[0x20..0x30], 4)?;
     if !matches!(output.format, 31 | 32 | 35 | 36) {
@@ -651,21 +478,6 @@ pub(super) fn execute_with_gpu(
             factors >> 8 & 7,
             factors >> 12 & 7,
         ];
-        // VIDEO_PROBE_BEGIN
-        if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-            log::debug!(
-                "VIDEO_PROBE vic-config: dimensions={}x{} color={:?}/{}:{} gamut={:?}/{}:{} blend={selectors:?} constants={k1}/{k2} alpha={alpha}",
-                output.width,
-                output.height,
-                color.coefficients,
-                color.shift,
-                color.enabled,
-                gamut.coefficients,
-                gamut.shift,
-                gamut.enabled
-            );
-        }
-        // VIDEO_PROBE_END
         let x0 = dl.max(target_left);
         let x1 = dr.min(target_right).min(output.width - 1);
         let y0 = dt.max(target_top);
@@ -709,12 +521,6 @@ pub(super) fn execute_with_gpu(
                     _ => unreachable!(),
                 }
             };
-            // VIDEO_PROBE_BEGIN
-            if std::env::var_os("NIXE_VIC_NOOP").is_some() {
-                log::debug!("VIDEO_PROBE vic-noop");
-                return Ok(());
-            }
-            // VIDEO_PROBE_END
             if let Some(gpu) = gpu
                 && (output.kind == 0 || output.pitch == (output.width * 4).next_multiple_of(64))
             {
@@ -752,24 +558,6 @@ pub(super) fn execute_with_gpu(
                         ],
                     },
                 )?;
-                // VIDEO_PROBE_BEGIN
-                if std::env::var_os("NIXE_GPU_VIC_DELAY").is_some() {
-                    std::thread::sleep(std::time::Duration::from_millis(12));
-                }
-                if std::env::var_os("NIXE_GPU_VIC_READBACK").is_some() {
-                    let (backing, offset) = region(mappings, u64::from(registers[0x1c8]) << 8, output.length())?;
-                    let mut pixels = vec![0; output.length()];
-                    backing.read(offset, &mut pixels).map_err(|e| e.to_string())?;
-                }
-                if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-                    log::debug!(
-                        "VIDEO_PROBE vic-gpu: dimensions={}x{} us={}",
-                        output.width,
-                        output.height,
-                        probe_start.elapsed().as_micros()
-                    );
-                }
-                // VIDEO_PROBE_END
                 return Ok(());
             }
             let luma = input.read_linear(mappings, u64::from(registers[0x100 + slot * 24]) << 8)?;
@@ -789,16 +577,6 @@ pub(super) fn execute_with_gpu(
                 mappings,
                 u64::from(registers[0x1c8]) << 8,
             )?;
-            // VIDEO_PROBE_BEGIN
-            if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-                log::debug!(
-                    "VIDEO_PROBE vic-opaque: dimensions={}x{} us={}",
-                    output.width,
-                    output.height,
-                    probe_start.elapsed().as_micros()
-                );
-            }
-            // VIDEO_PROBE_END
             return Ok(());
         }
         if pixels.is_empty() {
@@ -897,16 +675,6 @@ pub(super) fn execute_with_gpu(
         .stage(&backing, offset, &bytes)
         .map_err(|e| e.to_string())?;
     writes.commit_ordered().map_err(|e| e.to_string())?;
-    // VIDEO_PROBE_BEGIN
-    if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-        log::debug!(
-            "VIDEO_PROBE vic: dimensions={}x{} us={}",
-            output.width,
-            output.height,
-            probe_start.elapsed().as_micros()
-        );
-    }
-    // VIDEO_PROBE_END
     log::trace!(
         "VIC output: dimensions={}x{} format={} layout={} block-height={}",
         output.width,

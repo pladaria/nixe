@@ -5,9 +5,7 @@ impl Emitter {
         use ShaderOperation::*;
         match operation {
             Nop => {}
-            LoadComputeBuiltin32 { .. }
-            | LoadStorageBuffer32 { .. }
-            | StoreStorageBuffer32 { .. } => {
+            LoadComputeBuiltin32 { .. } | StoreStorageBuffer32 { .. } => {
                 return Err(self.unsupported("compute operations require the WGSL compute backend"));
             }
             Undefined32 { destination } => {
@@ -72,7 +70,14 @@ impl Emitter {
                 destination,
                 source,
                 source_type,
+                rounding,
             } => {
+                if *rounding != ShaderRoundingMode::NearestEven {
+                    let source = self.read(*source)?;
+                    let bits = self.directed_integer_to_float(source, *source_type, *rounding)?;
+                    self.write(*destination, bits);
+                    return Ok(());
+                }
                 // Integer conversions cannot produce subnormals. Request RTE
                 // without requiring denormal preservation or emitting repairs.
                 // https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpConvertSToF
@@ -148,6 +153,15 @@ impl Emitter {
                 let value = self.load_interface(true, *location, *component, None)?;
                 self.write(*destination, value);
             }
+            LoadStorageBuffer32 {
+                destination,
+                binding,
+                word_index,
+            } => {
+                let word = self.read(*word_index)?;
+                let value = self.load_buffer_word(*binding, word)?;
+                self.write(*destination, value);
+            }
             LoadConstantBuffer32 {
                 destination,
                 binding,
@@ -159,7 +173,7 @@ impl Emitter {
                     return Err(self.unsupported("unaligned constant-buffer word load"));
                 }
                 let word = self.constant(byte_offset / 4);
-                let value = self.load_constant_buffer(*binding, word)?;
+                let value = self.load_buffer_word(*binding, word)?;
                 self.write(*destination, value);
             }
             LoadConstantBufferIndexed32 {
@@ -177,7 +191,7 @@ impl Emitter {
                 let word = self
                     .b
                     .shift_right_logical(self.uint, None, address, shift)?;
-                let value = self.load_constant_buffer(*binding, word)?;
+                let value = self.load_buffer_word(*binding, word)?;
                 self.write(*destination, value);
             }
             LoadControlPoint {
@@ -221,6 +235,59 @@ impl Emitter {
                 let memory = self.constant(spv::Scope::Invocation as u32);
                 let semantics = self.constant(spv::MemorySemantics::empty().bits());
                 self.b.control_barrier(execution, memory, semantics)?;
+            }
+            ShiftLeft32 {
+                destination,
+                value,
+                amount,
+                wrap,
+            }
+            | ShiftRight32 {
+                destination,
+                value,
+                amount,
+                wrap,
+                ..
+            } => {
+                let mut base = self.read(*value)?;
+                let raw_count = self.read(*amount)?;
+                let (right, signed, reverse) = match operation {
+                    ShiftRight32 {
+                        signed, reverse, ..
+                    } => (true, *signed, *reverse),
+                    _ => (false, false, false),
+                };
+                if reverse {
+                    base = self.b.bit_reverse(self.uint, None, base)?;
+                }
+                let mask = self.constant(31);
+                let count = self.b.bitwise_and(self.uint, None, raw_count, mask)?;
+                let zero = self.constant(0);
+                let (mut bits, clamped) = if signed {
+                    let base = self.b.bitcast(self.int, None, base)?;
+                    let shifted = self.b.shift_right_arithmetic(self.int, None, base, count)?;
+                    let sign = self.b.shift_right_arithmetic(self.int, None, base, mask)?;
+                    (
+                        self.b.bitcast(self.uint, None, shifted)?,
+                        self.b.bitcast(self.uint, None, sign)?,
+                    )
+                } else if right {
+                    (
+                        self.b.shift_right_logical(self.uint, None, base, count)?,
+                        zero,
+                    )
+                } else {
+                    (
+                        self.b.shift_left_logical(self.uint, None, base, count)?,
+                        zero,
+                    )
+                };
+                if !wrap {
+                    let limit = self.constant(32);
+                    let inside = self.b.u_less_than(self.boolean, None, raw_count, limit)?;
+                    bits = self.b.select(self.uint, None, inside, bits, clamped)?;
+                }
+                self.write(*destination, bits);
             }
             ExtractBitfield32 {
                 destination,

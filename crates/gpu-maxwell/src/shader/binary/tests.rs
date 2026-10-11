@@ -83,13 +83,7 @@ fn header_validation_rejects_stage_contradictions() {
 
 #[test]
 fn header_validation_rejects_unimplemented_semantic_flags() {
-    for (bit, feature) in [
-        (15, "pixel-kill"),
-        (16, "global-store"),
-        (26, "memory-load/store"),
-        (27, "FP64"),
-        (28, "stream-output"),
-    ] {
+    for (bit, feature) in [(16, "global-store"), (27, "FP64"), (28, "stream-output")] {
         let mut bytes = [0_u8; MAXWELL_SHADER_PROGRAM_HEADER_SIZE];
         let common = 0x0002_5462_u32 | (1 << bit);
         bytes[..4].copy_from_slice(&common.to_le_bytes());
@@ -102,6 +96,15 @@ fn header_validation_rejects_unimplemented_semantic_flags() {
             })
         );
     }
+}
+
+#[test]
+fn enabling_the_load_store_path_does_not_require_an_unsupported_instruction() {
+    let mut bytes = [0_u8; MAXWELL_SHADER_PROGRAM_HEADER_SIZE];
+    bytes[..4].copy_from_slice(&(0x0002_0461_u32 | (1 << 26)).to_le_bytes());
+    let header = decode_program_header(&bytes).unwrap();
+    assert!(header.bit(26));
+    validate_program_header(MaxwellShaderStage::Vertex, header).unwrap();
 }
 
 #[test]
@@ -188,7 +191,7 @@ fn shader_confirmation_distinguishes_neighboring_writes_from_changed_code() {
     let (allocation, space, address) = mapped_memory();
     let mut bytes = vec![0; MAXWELL_SHADER_PROGRAM_HEADER_SIZE];
     bytes[..4].copy_from_slice(&0x0002_0461_u32.to_le_bytes());
-    for word in [0_u64, 0xe300_0000_0000_0000, 0, 0] {
+    for word in [0_u64, 0xe300_0000_0007_000f, 0, 0] {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     allocation.write(0, &bytes).unwrap();

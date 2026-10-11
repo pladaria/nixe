@@ -9,7 +9,7 @@ use crate::{MaxwellShaderStage, MaxwellThreeDDirectlyAddressableMemory};
 use nixe_gpu::{
     ShaderBackendModule, ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation,
     ShaderIoLocation, ShaderIr, ShaderOperation, ShaderResourceAccess, ShaderResourceKind,
-    ShaderStage, VerifiedShaderIr,
+    ShaderScalarType, ShaderStage, VerifiedShaderIr,
 };
 use std::collections::BTreeMap;
 use std::hash::Hash;
@@ -22,6 +22,7 @@ pub(crate) struct MaxwellShaderTranslationKey {
     resource_binding_remap: Box<[(u8, u8)]>,
     linked_output_interpolation: Box<[((ShaderIoLocation, u8), ShaderInterpolation)]>,
     prune_raster_outputs: bool,
+    defaulted_fragment_inputs: Box<[(ShaderIoLocation, u8)]>,
 }
 
 /// One verified neutral program and its portable backend module.
@@ -33,6 +34,7 @@ pub(crate) struct MaxwellTranslatedShaderProgram {
     directly_addressable_memory: Option<MaxwellThreeDDirectlyAddressableMemory>,
     maximum_api_visible_calls: u16,
     texture_bindings: Box<[MaxwellTextureResourceBinding]>,
+    global_buffers: super::global_memory::GlobalBufferBindings,
 }
 
 impl MaxwellTranslatedShaderProgram {
@@ -62,6 +64,73 @@ impl MaxwellTranslatedShaderProgram {
             .resource_binding_remap
             .iter()
             .find_map(|(local, neutral)| (*neutral == neutral_binding).then_some(*local))
+    }
+
+    pub(crate) fn global_buffer(
+        &self,
+        binding: u8,
+    ) -> Option<&super::global_memory::GlobalBufferBinding> {
+        self.global_buffers
+            .buffers
+            .iter()
+            .find(|buffer| buffer.binding == binding)
+    }
+
+    pub(crate) fn buffer_size(&self, binding: u8) -> crate::engines::MaxwellShaderBufferSize {
+        use crate::engines::MaxwellShaderBufferSize;
+        if let Some((index, buffer)) = self
+            .global_buffers
+            .buffers
+            .iter()
+            .enumerate()
+            .find(|(_, b)| b.binding == binding)
+        {
+            return if buffer.runtime_extent {
+                MaxwellShaderBufferSize::Declared
+            } else {
+                MaxwellShaderBufferSize::Proven(
+                    self.global_buffers.byte_extents([1; 3], [1; 3])[index],
+                )
+            };
+        }
+        match self.constant_buffer_read_end(binding) {
+            u32::MAX => MaxwellShaderBufferSize::Declared,
+            size => MaxwellShaderBufferSize::Proven(u64::from(size)),
+        }
+    }
+
+    /// Only proven accesses limit imports. Unknown indexed loads retain the
+    /// declared binding size; BRX uses the same dominating bounds as capture.
+    /// https://github.com/eden-emulator/mirror/blob/master/src/video_core/buffer_cache/buffer_cache.h#L929-L935
+    pub(crate) fn constant_buffer_read_end(&self, binding: u8) -> u32 {
+        self.module
+            .ir()
+            .ir()
+            .instructions()
+            .iter()
+            .fold(0, |end, instruction| {
+                let read_end = match instruction.operation() {
+                    ShaderOperation::LoadConstantBuffer32 {
+                        binding: current,
+                        byte_offset,
+                        ..
+                    } if *current == binding => byte_offset.saturating_add(4),
+                    ShaderOperation::LoadConstantBufferIndexed32 {
+                        binding: current, ..
+                    } if *current == binding => self
+                        .key
+                        .input
+                        .binary
+                        .indirect_tables
+                        .iter()
+                        .filter(|table| table.load_offset == instruction.source().byte_offset())
+                        .map(|table| table.read_end)
+                        .max()
+                        .unwrap_or(u32::MAX),
+                    _ => 0,
+                };
+                end.max(read_end)
+            })
     }
 
     pub(crate) const fn module(&self) -> &ShaderBackendModule {
@@ -100,13 +169,10 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             &input.binary,
             input.register_count,
             &vertex_input_types,
-        ).inspect_err(|_| {
-            for bundle in input.binary.bundles() {
-                log::debug!("untranslated graphics program: stage={:?} gpu-va={:#x} offset={:#x} instructions={:016x?}", input.binary.stage(), input.binary.address, bundle.offset, bundle.instructions);
-            }
-        })?);
+        )?);
     }
 
+    let defaulted_fragment_inputs = specialize_unwritten_fragment_inputs(&mut translated);
     validate_graphics_stage_interfaces(&translated)?;
     let global_bindings = graphics_resource_bindings(inputs, &translated)?;
     let linked_interpolation = graphics_output_interpolation(&translated);
@@ -131,6 +197,9 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
     for (input, mut translated) in inputs.programs.iter().zip(translated) {
         let stage = input.binary.stage();
         let local_bindings = program_resource_bindings(input, &translated, &global_bindings)?;
+        for buffer in &mut translated.global_buffers.buffers {
+            buffer.binding = remapped_binding(&local_bindings, stage, buffer.binding)?;
+        }
         for texture in &mut translated.texture_bindings {
             texture.image_binding =
                 remapped_binding(&local_bindings, stage, texture.image_binding)?;
@@ -153,6 +222,32 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             ir = ir
                 .prune_raster_outputs(output_interpolation.iter().map(|(component, _)| *component));
         }
+        // Output pruning can eliminate every access to a constant buffer.
+        // Remove its declaration too, instead of importing an empty range or
+        // demanding an unused guest binding merely to build a host layout.
+        let used_constant_buffers: std::collections::BTreeSet<_> = ir
+            .ir()
+            .instructions()
+            .iter()
+            .filter_map(|instruction| match instruction.operation() {
+                ShaderOperation::LoadConstantBuffer32 { binding, .. }
+                | ShaderOperation::LoadConstantBufferIndexed32 { binding, .. } => Some(*binding),
+                _ => None,
+            })
+            .collect();
+        let resources: Vec<_> = ir
+            .ir()
+            .resources()
+            .iter()
+            .filter(|resource| {
+                resource.kind() != ShaderResourceKind::ConstantBuffer
+                    || used_constant_buffers.contains(&resource.binding())
+            })
+            .copied()
+            .collect();
+        if resources.len() != ir.ir().resources().len() {
+            ir = VerifiedShaderIr::verify(ir.ir().clone().with_resources(resources))?;
+        }
         if !translated.texture_bindings.is_empty() && input.texture_constant_buffer_slot.is_none() {
             return Err(MaxwellShaderTranslationError::IncompletePipelineBinding {
                 pipeline: input.pipeline,
@@ -165,6 +260,11 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             resource_binding_remap: local_bindings.into_iter().collect(),
             linked_output_interpolation: output_interpolation.into(),
             prune_raster_outputs,
+            defaulted_fragment_inputs: if stage == MaxwellShaderStage::Pixel {
+                defaulted_fragment_inputs.clone().into()
+            } else {
+                Box::new([])
+            },
         };
         programs.push(MaxwellTranslatedShaderProgram {
             fingerprint: nixe_gpu::cache_fingerprint(&key),
@@ -177,9 +277,112 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             directly_addressable_memory: None,
             maximum_api_visible_calls: 0,
             texture_bindings: translated.texture_bindings,
+            global_buffers: translated.global_buffers,
         });
     }
     Ok(programs)
+}
+
+/// Maxwell permits a fragment program to read a generic attribute that the
+/// preceding stage does not export. Specialize the disabled attribute before
+/// applying the neutral backend's stricter stage-interface contract.
+/// Eden uses (0, 0, 0, 1) for a disabled/unwritten generic attribute:
+/// https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp#L306-L315
+/// https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp#L1563-L1578
+fn specialize_unwritten_fragment_inputs(
+    programs: &mut [TranslatedShaderIr],
+) -> Vec<(ShaderIoLocation, u8)> {
+    let Some(fragment) = programs
+        .iter()
+        .position(|program| program.ir.stage() == ShaderStage::Fragment)
+    else {
+        return Vec::new();
+    };
+    let Some(producer) = [
+        ShaderStage::Geometry,
+        ShaderStage::TessellationEvaluation,
+        ShaderStage::Vertex,
+    ]
+    .into_iter()
+    .find_map(|stage| programs.iter().find(|program| program.ir.stage() == stage)) else {
+        return Vec::new();
+    };
+    let missing: Vec<_> = programs[fragment]
+        .ir
+        .inputs()
+        .iter()
+        .filter(|input| {
+            matches!(input.location(), ShaderIoLocation::Generic(_))
+                && input.scalar_type() == ShaderScalarType::Float32
+                && !producer
+                    .ir
+                    .outputs()
+                    .iter()
+                    .any(|output| output.location() == input.location())
+        })
+        .map(|input| (input.location(), input.component()))
+        .collect();
+    if missing.is_empty() {
+        return missing;
+    }
+    let ir = &programs[fragment].ir;
+    let mut instructions = Vec::with_capacity(ir.instructions().len());
+    for instruction in ir.instructions() {
+        let make = |operation| {
+            ShaderInstruction::new(instruction.source(), instruction.predicate(), operation)
+        };
+        let constant = |destination, component| ShaderOperation::MoveImmediate32 {
+            destination,
+            bits: if component == 3 { 1.0_f32.to_bits() } else { 0 },
+            scalar_type: ShaderScalarType::Float32,
+        };
+        match instruction.operation() {
+            ShaderOperation::InterpolateInput {
+                destination,
+                location,
+                component,
+                ..
+            } if missing.contains(&(*location, *component)) => {
+                instructions.push(make(constant(*destination, *component)));
+            }
+            ShaderOperation::LoadInput {
+                destinations,
+                location,
+                first_component,
+                scalar_type,
+            } if destinations.iter().enumerate().any(|(index, _)| {
+                missing.contains(&(*location, *first_component + index as u8))
+            }) =>
+            {
+                for (index, destination) in destinations.iter().enumerate() {
+                    let component = *first_component + index as u8;
+                    instructions.push(make(if missing.contains(&(*location, component)) {
+                        constant(*destination, component)
+                    } else {
+                        ShaderOperation::LoadInput {
+                            destinations: vec![*destination].into(),
+                            location: *location,
+                            first_component: component,
+                            scalar_type: *scalar_type,
+                        }
+                    }));
+                }
+            }
+            _ => instructions.push(instruction.clone()),
+        }
+    }
+    programs[fragment].ir = ShaderIr::new(
+        ir.stage(),
+        ir.inputs()
+            .iter()
+            .filter(|input| !missing.contains(&(input.location(), input.component())))
+            .copied()
+            .collect(),
+        ir.outputs().to_vec(),
+        ir.resources().to_vec(),
+        instructions,
+    );
+    missing
 }
 
 /// Maxwell records interpolation on fragment `IPA` inputs. Copy that linked
@@ -212,11 +415,13 @@ pub(super) fn graphics_output_interpolation(
 /// neutral backend exposes one descriptor namespace shared by all stages.
 /// Allocate one stable host binding for each `(group, kind, local binding)` and
 /// rewrite both the verified IR and texture metadata before WGSL lowering.
+type GraphicsResourceIdentity = (u8, ShaderResourceKind, u8, u32);
+
 fn graphics_resource_bindings(
     inputs: &MaxwellShaderTranslationInputs,
     programs: &[TranslatedShaderIr],
-) -> Result<BTreeMap<(u8, ShaderResourceKind, u8), u8>, MaxwellShaderTranslationError> {
-    let mut global = BTreeMap::<(u8, ShaderResourceKind, u8), u8>::new();
+) -> Result<BTreeMap<GraphicsResourceIdentity, u8>, MaxwellShaderTranslationError> {
+    let mut global = BTreeMap::<GraphicsResourceIdentity, u8>::new();
     for (input, program) in inputs.programs.iter().zip(programs) {
         let Some(group) = input.effective_group else {
             if program.ir.resources().is_empty() {
@@ -228,7 +433,7 @@ fn graphics_resource_bindings(
             });
         };
         for resource in program.ir.resources() {
-            let identity = (group, resource.kind(), resource.binding());
+            let identity = graphics_resource_identity(group, program, resource)?;
             if global.contains_key(&identity) {
                 continue;
             }
@@ -240,10 +445,43 @@ fn graphics_resource_bindings(
     Ok(global)
 }
 
+fn graphics_resource_identity(
+    group: u8,
+    program: &TranslatedShaderIr,
+    resource: &ShaderResourceAccess,
+) -> Result<GraphicsResourceIdentity, MaxwellShaderTranslationError> {
+    if resource.kind() == ShaderResourceKind::StorageBuffer {
+        let buffer = program
+            .global_buffers
+            .buffers
+            .iter()
+            .find(|buffer| buffer.binding == resource.binding())
+            .ok_or(MaxwellShaderTranslationError::MissingResourceBindingRemap {
+                stage: match program.ir.stage() {
+                    ShaderStage::Vertex => MaxwellShaderStage::Vertex,
+                    ShaderStage::Fragment => MaxwellShaderStage::Pixel,
+                    ShaderStage::Geometry => MaxwellShaderStage::Geometry,
+                    ShaderStage::TessellationControl => MaxwellShaderStage::TessellationInit,
+                    ShaderStage::TessellationEvaluation => MaxwellShaderStage::Tessellation,
+                    ShaderStage::Compute => MaxwellShaderStage::Compute,
+                },
+                binding: resource.binding(),
+            })?;
+        Ok((
+            group,
+            resource.kind(),
+            buffer.constant_buffer,
+            buffer.byte_offset,
+        ))
+    } else {
+        Ok((group, resource.kind(), resource.binding(), 0))
+    }
+}
+
 fn program_resource_bindings(
     input: &MaxwellShaderProgramTranslationInput,
     program: &TranslatedShaderIr,
-    global: &BTreeMap<(u8, ShaderResourceKind, u8), u8>,
+    global: &BTreeMap<GraphicsResourceIdentity, u8>,
 ) -> Result<BTreeMap<u8, u8>, MaxwellShaderTranslationError> {
     let Some(group) = input.effective_group else {
         return Ok(BTreeMap::new());
@@ -254,7 +492,7 @@ fn program_resource_bindings(
         .iter()
         .map(|resource| {
             global
-                .get(&(group, resource.kind(), resource.binding()))
+                .get(&graphics_resource_identity(group, program, resource)?)
                 .copied()
                 .ok_or(MaxwellShaderTranslationError::MissingResourceBindingRemap {
                     stage: input.binary.stage(),
@@ -312,6 +550,24 @@ pub(super) fn finalize_shader_ir(
                     base_byte_offset: *base_byte_offset,
                     dynamic_byte_offset: *dynamic_byte_offset,
                     scalar_type: *scalar_type,
+                },
+                ShaderOperation::LoadStorageBuffer32 {
+                    destination,
+                    binding,
+                    word_index,
+                } => ShaderOperation::LoadStorageBuffer32 {
+                    destination: *destination,
+                    binding: remapped_binding(bindings, stage, *binding)?,
+                    word_index: *word_index,
+                },
+                ShaderOperation::StoreStorageBuffer32 {
+                    source,
+                    binding,
+                    word_index,
+                } => ShaderOperation::StoreStorageBuffer32 {
+                    source: *source,
+                    binding: remapped_binding(bindings, stage, *binding)?,
+                    word_index: *word_index,
                 },
                 ShaderOperation::LoadTexture2D {
                     outputs,

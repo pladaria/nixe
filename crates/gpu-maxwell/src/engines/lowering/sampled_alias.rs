@@ -15,15 +15,17 @@ pub(super) fn copy_is_current(record: &ViewRecord, cache: &MaxwellLoweringCache)
     {
         return false;
     }
-    cache.views.iter().any(|producer| {
-        producer.dependency == ResourceDependency::Image(source)
-            && producer.write_revision == revision
-            && (producer.materialization == ViewMaterialization::Direct
-                || producer
-                    .cpu_writes
-                    .as_ref()
-                    .is_some_and(CanonicalCpuWriteDependency::remains_current))
-    })
+    cache
+        .views
+        .get(&ResourceDependency::Image(source))
+        .is_some_and(|producer| {
+            producer.write_revision == revision
+                && (producer.materialization == ViewMaterialization::Direct
+                    || producer
+                        .cpu_writes
+                        .as_ref()
+                        .is_some_and(CanonicalCpuWriteDependency::remains_current))
+        })
 }
 
 fn can_copy(record: &ViewRecord, image: &MaxwellThreeDResolvedImage) -> bool {
@@ -61,6 +63,9 @@ fn can_copy(record: &ViewRecord, image: &MaxwellThreeDResolvedImage) -> bool {
         || (u64::from(description.extent().width) * u64::from(bytes)).div_ceil(64)
             != (u64::from(requested.extent().width) * u64::from(bytes)).div_ceil(64)
         || *swizzle != image.view().swizzle()
+        // Unbacked copies have the neutral identity swizzle. Other selectors
+        // must retain a backed view so shader sampling receives their mapping.
+        || image.view().swizzle() != nixe_gpu::Swizzle::IDENTITY
         || (*guest_pte_kind != image.guest_layout().pte_kind()
             && !matches!(
                 record.key,
@@ -94,95 +99,45 @@ fn can_copy(record: &ViewRecord, image: &MaxwellThreeDResolvedImage) -> bool {
                 .is_some_and(CanonicalCpuWriteDependency::remains_current))
 }
 
-fn materialization_matches(materialized: &ColorRepresentationRecord, key: &ViewKey) -> bool {
-    let ViewKey::Image {
-        description,
-        swizzle,
-        guest_format,
-        guest_pte_kind,
-        guest_compression_enabled,
-        bindings,
-        ..
-    } = key
-    else {
-        return false;
-    };
-    materialized.description == *description
-        && materialized.swizzle == *swizzle
-        && materialized.guest_format == *guest_format
-        && materialized.guest_pte_kind == *guest_pte_kind
-        && materialized.guest_compression_enabled == *guest_compression_enabled
-        && materialized.bindings.len() == bindings.len()
-        && materialized.bindings.iter().zip(bindings).all(
-            |(recorded, (subresources, layout, backing))| {
-                recorded.subresources == *subresources
-                    && recorded.layout == *layout
-                    && same_canonical_backing(&recorded.backing, backing)
-            },
-        )
-        && materialized
-            .cpu_writes
-            .as_ref()
-            .is_some_and(CanonicalCpuWriteDependency::remains_current)
-}
-
 pub(super) fn prepare(
     image: &MaxwellThreeDResolvedImage,
     cache: &mut MaxwellLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
 ) -> Result<Option<ResourceDependency>, MaxwellLoweringError> {
-    prepare_from_producer(image, cache, creations, false)
-}
-
-pub(super) fn prepare_canonical_producer(
-    image: &MaxwellThreeDResolvedImage,
-    cache: &mut MaxwellLoweringCache,
-    creations: &mut Vec<BackendResourceCreateInfo>,
-) -> Result<Option<ResourceDependency>, MaxwellLoweringError> {
-    prepare_from_producer(image, cache, creations, true)
-}
-
-fn prepare_from_producer(
-    image: &MaxwellThreeDResolvedImage,
-    cache: &mut MaxwellLoweringCache,
-    creations: &mut Vec<BackendResourceCreateInfo>,
-    canonical_only: bool,
-) -> Result<Option<ResourceDependency>, MaxwellLoweringError> {
     let Some(producer) = cache
-        .views
-        .iter()
+        .image_views()
         .filter(|record| {
-            (!canonical_only
-                || matches!(
-                    record.key,
-                    ViewKey::Image {
-                        guest_format:
-                            super::super::threed::MaxwellThreeDGuestImageFormat::Canonical(_),
-                        ..
-                    }
-                ))
-                && can_copy(record, image)
+            can_copy(record, image)
                 && (record.materialization == ViewMaterialization::Direct
                     || (record.materialization == ViewMaterialization::CompressedColor
-                        && cache.color_materializations.iter().any(|materialized| {
-                            materialization_matches(materialized, &record.key)
+                        && record.uninitialized_color_regions.iter().all(|region| {
+                            // The sampled width may exclude the producer's GOB
+                            // padding. Require only the texels this copy reads,
+                            // not initialization of its unused storage extent.
+                            region[0] >= image.description().extent().width
+                                || region[1] >= image.description().extent().height
+                                || region[2] == 0
+                                || region[3] == 0
                         })))
         })
         .max_by_key(|record| record.write_revision)
     else {
         return Ok(None);
     };
+    if producer.key.same_domain_as_image(image) {
+        return Ok(Some(producer.dependency));
+    }
     let source = image_dependency(producer.dependency)?;
     let revision = producer.write_revision;
     let key = view_key(&MaxwellThreeDResolvedResource::Image(image.clone()));
-    if let Some(record) = cache.views.iter().find(|record| record.key == key)
+    if let Some(record) = cache.image_views().find(|record| record.key == key)
         && (record.dependency == ResourceDependency::Image(source)
             || (record.materialization == (ViewMaterialization::CopiedColor { source, revision })
                 && copy_is_current(record, cache)))
     {
         return Ok(Some(record.dependency));
     }
-    let destination = if let Some(record) = cache.views.iter_mut().find(|record| record.key == key)
+    let destination = if let Some(record) = cache.image_views_mut().find(|record| record.key == key)
     {
         if !record
             .cpu_writes
@@ -200,16 +155,19 @@ fn prepare_from_producer(
             description: image.description(),
             view: None,
         });
-        cache.views.push(ViewRecord {
-            key,
-            dependency: ResourceDependency::Image(id),
-            materialization: ViewMaterialization::CopiedColor { source, revision },
-            cpu_writes: Some(capture_copy_cpu_writes(image)?),
-            write_revision: 0,
-            last_used: 0,
-            uninitialized_color_regions: Vec::new(),
-            uninitialized_depth_stencil_regions: Default::default(),
-        });
+        cache.views.insert(
+            ResourceDependency::Image(id),
+            ViewRecord {
+                key,
+                dependency: ResourceDependency::Image(id),
+                materialization: ViewMaterialization::CopiedColor { source, revision },
+                cpu_writes: Some(capture_copy_cpu_writes(image)?),
+                write_revision: 0,
+                last_used: 0,
+                uninitialized_color_regions: Vec::new(),
+                uninitialized_depth_stencil_regions: Default::default(),
+            },
+        );
         id
     };
     let region = |image_id| ImageRegion {

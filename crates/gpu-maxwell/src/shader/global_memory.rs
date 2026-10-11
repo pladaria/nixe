@@ -25,7 +25,7 @@ pub(super) const fn is_store(encoding: u64) -> bool {
     (encoding >> 48) & 0xfff8 == 0xeed8
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Bound {
     Unknown,
     Constant(u32),
@@ -59,7 +59,7 @@ enum Value {
     Carry(Pointer),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GlobalBufferBinding {
     pub constant_buffer: u8,
     pub byte_offset: u32,
@@ -70,7 +70,7 @@ pub(crate) struct GlobalBufferBinding {
     accesses: Vec<(usize, u32)>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GlobalBufferBindings {
     pub buffers: Vec<GlobalBufferBinding>,
     bounds: Vec<Bound>,
@@ -110,13 +110,21 @@ impl GlobalBufferBindings {
 }
 
 pub(super) struct GlobalMemory {
+    stage: MaxwellShaderStage,
     values: BTreeMap<ShaderRegister, Value>,
     pub bindings: GlobalBufferBindings,
 }
 
 impl Default for GlobalMemory {
     fn default() -> Self {
+        Self::new(MaxwellShaderStage::Compute)
+    }
+}
+
+impl GlobalMemory {
+    pub(super) fn new(stage: MaxwellShaderStage) -> Self {
         Self {
+            stage,
             values: BTreeMap::new(),
             bindings: GlobalBufferBindings {
                 buffers: Vec::new(),
@@ -256,7 +264,7 @@ impl GlobalMemory {
                             };
                             if let Some((constant_buffer, byte_offset, offset, source)) = base {
                                 let frozen = allocate_shader_temporary(
-                                    MaxwellShaderStage::Compute,
+                                    self.stage,
                                     instruction.source().byte_offset(),
                                     encoding,
                                     "global pointer offset temporary overflow",
@@ -376,13 +384,16 @@ impl GlobalMemory {
         next: &mut u16,
         load: bool,
     ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
-        let stage = MaxwellShaderStage::Compute;
+        let stage = self.stage;
         let error = |detail| MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
             detail,
         };
+        if !load && stage != MaxwellShaderStage::Compute {
+            return Err(error("graphics global stores are not implemented"));
+        }
         if decode_predicate(encoding) != ShaderPredicate::Always {
             return Err(error("predicated global access is not implemented"));
         }
@@ -466,7 +477,7 @@ impl GlobalMemory {
             }
             _ => {
                 return Err(error(
-                    "global address has no proven constant-buffer base and aligned dispatch-bounded offset",
+                    "global address has no proven constant-buffer base and aligned bounded offset",
                 ));
             }
         };
@@ -537,11 +548,13 @@ impl GlobalMemory {
                 bits: 2,
                 scalar_type: ShaderScalarType::Unsigned32,
             },
-            ShaderOperation::ShiftRightLogical32 {
+            ShaderOperation::ShiftRight32 {
                 destination: word_index,
                 value: pointer.frozen,
                 amount: shift,
                 wrap: false,
+                signed: false,
+                reverse: false,
             },
         ]);
         if displacement != 0 {

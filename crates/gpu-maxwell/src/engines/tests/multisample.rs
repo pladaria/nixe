@@ -427,11 +427,47 @@ fn two_d_affine_scaling_preserves_fractional_coordinates_and_bounds() {
                 filter: nixe_gpu::BlitFilter::Linear,
                 first: [1 << 31; 2],
                 step: [0xc0000000; 2],
+                destination_origin: nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 },
+                extent: nixe_gpu::ImageExtent::new(16, 16, 1).unwrap(),
             }
         );
         two_d_write(&mut channel, 0x08c4, 1).unwrap();
         assert!(two_d_write(&mut channel, 0x08dc, 0).is_err());
     }
+}
+
+#[test]
+fn two_d_affine_sampling_accepts_bounded_partial_destination_rectangles() {
+    use crate::engines::twod::blit::BlitKind;
+    let mut channel = two_d_channel();
+    program_resolve(&mut channel, 0x10000, 0x20000);
+    for (method, argument) in [
+        (0x088c, 0x10),
+        (0x08b0, 3),
+        (0x08b4, 4),
+        (0x08b8, 8),
+        (0x08bc, 8),
+        (0x08c0, 0xc0000000),
+        (0x08c4, 0),
+        (0x08c8, 0xc0000000),
+        (0x08cc, 0),
+        (0x08d0, 0),
+        (0x08d8, 0),
+    ] {
+        two_d_write(&mut channel, method, argument).unwrap();
+    }
+    assert_eq!(
+        launch(&mut channel).kind,
+        BlitKind::Scale {
+            filter: nixe_gpu::BlitFilter::Linear,
+            first: [1 << 31; 2],
+            step: [0xc0000000; 2],
+            destination_origin: nixe_gpu::ImageOrigin { x: 3, y: 4, z: 0 },
+            extent: nixe_gpu::ImageExtent::new(8, 8, 1).unwrap(),
+        }
+    );
+    two_d_write(&mut channel, 0x08b4, 9).unwrap();
+    assert!(two_d_write(&mut channel, 0x08dc, 0).is_err());
 }
 
 #[test]
@@ -466,4 +502,44 @@ fn four_sample_targets_reject_single_sample_kinds_and_short_storage() {
             Err(MaxwellThreeDResourceError::ContradictoryState { .. })
         ));
     }
+}
+
+#[test]
+fn two_d_negative_increments_flip_inside_the_source_and_reject_out_of_bounds_endpoints() {
+    use crate::engines::twod::blit::BlitKind;
+    let mut channel = two_d_channel();
+    program_resolve(&mut channel, 0x10000, 0x20000);
+    for (method, argument) in [
+        (0x0248, 16),
+        (0x024c, 16),
+        (0x0218, 16),
+        (0x021c, 16),
+        (0x08b8, 16),
+        (0x08bc, 16),
+        (0x088c, 0x10),
+        (0x08c0, 0),
+        (0x08c4, u32::MAX),
+        (0x08c8, 0),
+        (0x08cc, u32::MAX),
+        (0x08d0, 0),
+        (0x08d4, 15),
+        (0x08d8, 0),
+    ] {
+        two_d_write(&mut channel, method, argument).unwrap();
+    }
+    let dispatch = two_d_write(&mut channel, 0x08dc, 15).unwrap();
+    let [MaxwellEngineOperation::TwoDBlit(blit)] = dispatch.ordered_operations() else {
+        panic!("blit")
+    };
+    assert_eq!(
+        blit.kind,
+        BlitKind::Scale {
+            filter: nixe_gpu::BlitFilter::Linear,
+            first: [(15 << 32) + (1 << 31); 2],
+            step: [-(1 << 32); 2],
+            destination_origin: nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 },
+            extent: nixe_gpu::ImageExtent::new(16, 16, 1).unwrap(),
+        }
+    );
+    assert!(two_d_write(&mut channel, 0x08dc, 14).is_err());
 }

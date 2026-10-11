@@ -26,8 +26,8 @@ pub(crate) const ACTIVE_DEVICE: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct AudioDeviceState {
-    // Device gains are shared across manager/device connections and renderers,
-    // including renderers created after the volume was set.
+    // Device gains are shared across manager/device connections, renderers and
+    // AudioOut, including streams created after the volume was set.
     volumes: [AtomicU32; 4],
 }
 

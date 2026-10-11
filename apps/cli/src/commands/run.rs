@@ -825,11 +825,6 @@ fn execute(
                         log::info!(
                             "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
                         );
-                        // VIDEO_PROBE_BEGIN
-                        if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-                            coordinator.video_wait_audit();
-                        }
-                        // VIDEO_PROBE_END
                         last_rate_completions = execution_completions;
                         last_rate_elapsed = elapsed;
                     }

@@ -9,6 +9,7 @@ performance-counters = ["nixe-gpu/performance-counters", "nixe-memory/performanc
 
 [dependencies]
 log.workspace = true
+rustc-hash.workspace = true
 nixe-gpu.workspace = true
 nixe-memory.workspace = true
 

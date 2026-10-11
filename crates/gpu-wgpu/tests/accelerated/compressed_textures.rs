@@ -7,6 +7,17 @@ use nixe_gpu::{
 
 #[test]
 fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_variants() {
+    sampling(None);
+}
+
+#[test]
+fn clamp_to_border_sampling_preserves_transparent_black_opaque_black_and_white() {
+    for border in [[0; 4], [0, 0, 0, 1.0_f32.to_bits()], [1.0_f32.to_bits(); 4]] {
+        sampling(Some(border));
+    }
+}
+
+fn sampling(border: Option<[u32; 4]>) {
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
         BackendInstanceId::new(720),
@@ -149,18 +160,24 @@ fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_varian
         description: pass_description.clone(),
     });
     let sampler = SamplerId::new(720);
+    let mut description = SamplerDescription::new(
+        FilterMode::Linear,
+        FilterMode::Linear,
+        FilterMode::Nearest,
+        [if border.is_some() {
+            AddressMode::ClampToBorder
+        } else {
+            AddressMode::ClampToEdge
+        }; 3],
+        0.0,
+        0.0,
+        1.0,
+    )
+    .unwrap();
+    description.border_color = border;
     creations.push(BackendResourceCreateInfo::Sampler {
         id: sampler,
-        description: SamplerDescription::new(
-            FilterMode::Linear,
-            FilterMode::Linear,
-            FilterMode::Nearest,
-            [AddressMode::ClampToEdge; 3],
-            0.0,
-            0.0,
-            1.0,
-        )
-        .unwrap(),
+        description,
     });
     let mut formats = vec![
         (ImageFormat::Bc1RgbUnorm, Swizzle::IDENTITY),
@@ -187,37 +204,104 @@ fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_varian
             ]),
         ),
     ];
+    formats.push((
+        ImageFormat::Rg8Unorm,
+        Swizzle([
+            ComponentSwizzle::Red,
+            ComponentSwizzle::Red,
+            ComponentSwizzle::Red,
+            ComponentSwizzle::Green,
+        ]),
+    ));
+    formats.push((
+        ImageFormat::R8Unorm,
+        Swizzle([
+            ComponentSwizzle::One,
+            ComponentSwizzle::One,
+            ComponentSwizzle::One,
+            ComponentSwizzle::Red,
+        ]),
+    ));
     if packed_supported {
         formats.push((ImageFormat::Rgb565Unorm, Swizzle::IDENTITY));
     }
+    formats.push((
+        ImageFormat::Bc5RgUnorm,
+        Swizzle([
+            ComponentSwizzle::Red,
+            ComponentSwizzle::Red,
+            ComponentSwizzle::Red,
+            ComponentSwizzle::Green,
+        ]),
+    ));
+    formats.extend([
+        (ImageFormat::Astc8x8Unorm, Swizzle::IDENTITY),
+        (ImageFormat::Astc8x8Srgb, Swizzle::IDENTITY),
+        (ImageFormat::Astc5x4Unorm, Swizzle::IDENTITY),
+        (ImageFormat::Astc5x4Srgb, Swizzle::IDENTITY),
+    ]);
+    if border.is_some() {
+        formats = vec![(ImageFormat::Bc1RgbaUnorm, Swizzle::IDENTITY)];
+    }
     let mut serial = 720;
-    for array in [false, true] {
-        let fragment = ShaderId::new(if array { 722 } else { 721 });
+    for (variant, (array, layers)) in [(false, 1_u16), (true, 1), (true, 2)]
+        .into_iter()
+        .enumerate()
+    {
+        let fragment = ShaderId::new(721 + variant as u64);
         creations.push(BackendResourceCreateInfo::Shader {
             id: fragment,
             description: ShaderDescription {
                 stage: ShaderStage::Fragment,
             },
-            module: sampled_fragment(array),
+            module: sampled_fragment(array, border.is_some()),
         });
-        let layers = if array { 2 } else { 1 };
         let mut draws = Vec::new();
         for (index, (format, swizzle)) in formats.iter().copied().enumerate() {
-            let id = 730 + index as u64 + if array { formats.len() as u64 } else { 0 };
+            let id = 730 + index as u64 + variant as u64 * formats.len() as u64;
             let allocation = GpuAllocationId::new(id);
             let image = ImageId::new(id);
             let table = DescriptorTableId::new(id);
             // Two rows of two BC1 blocks. The bottom-right block is selected.
             // In a 64-byte x 8-row GOB, block (1,1) starts at byte 24.
             let mut bytes = vec![0; usize::from(layers) * 512];
-            let selected = usize::from(layers - 1) * 512 + 24;
-            if format == ImageFormat::Rgb565Unorm {
+            let selected = usize::from(layers - 1) * 512
+                + if format.astc_profile().is_some() || format == ImageFormat::Bc5RgUnorm {
+                    48
+                } else {
+                    24
+                };
+            if format.astc_profile().is_some() {
+                // Three blocks per row, including clipped right/bottom edges.
+                // All unused blocks are green, so a GOB addressing mistake is visible.
+                for y in 0..3 {
+                    for x in 0..3 {
+                        let offset = usize::from(layers - 1) * 512
+                            + ((x / 2) * 256 + (x % 2) * 32 + (y / 2) * 64 + (y % 2) * 16);
+                        bytes[offset..offset + 16]
+                            .copy_from_slice(&astc_constant([0, 255, 0, 255]));
+                    }
+                }
+                bytes[selected..selected + 16].copy_from_slice(&astc_constant([128, 64, 32, 255]));
+            } else if format == ImageFormat::R8Unorm {
+                for offset in [149, 150, 197, 198] {
+                    bytes[usize::from(layers - 1) * 512 + offset] = 73;
+                }
+            } else if format == ImageFormat::Rg8Unorm {
+                for offset in [154, 156, 202, 204] {
+                    let offset = usize::from(layers - 1) * 512 + offset;
+                    bytes[offset..offset + 2].copy_from_slice(&[73, 191]);
+                }
+            } else if format == ImageFormat::Rgb565Unorm {
                 // UV .75 samples texels (5,5), (6,5), (5,6), (6,6).
                 // Distinct endpoint channels expose RGB/BGR swaps and filtering.
                 for offset in [154, 156, 202, 204] {
                     let offset = usize::from(layers - 1) * 512 + offset;
                     bytes[offset..offset + 2].copy_from_slice(&0xf800_u16.to_le_bytes());
                 }
+            } else if format == ImageFormat::Bc5RgUnorm {
+                bytes[selected..selected + 16]
+                    .copy_from_slice(&[73, 0, 0, 0, 0, 0, 0, 0, 191, 0, 0, 0, 0, 0, 0, 0]);
             } else if format == ImageFormat::Bc4RUnorm {
                 // Selector 2 in every texel; the eight-value palette yields 180.
                 bytes[selected..selected + 8]
@@ -232,7 +316,20 @@ fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_varian
             let image_backing = backing(allocation, allocation_description, &texture_page);
             let description = ImageDescription::new(
                 ImageDimension::Two,
-                ImageExtent::new(8, 8, 1).unwrap(),
+                ImageExtent::new(
+                    if format.astc_profile().is_some() || format == ImageFormat::Bc5RgUnorm {
+                        format.block_extent()[0] * 2 + 1
+                    } else {
+                        8
+                    },
+                    if format.astc_profile().is_some() || format == ImageFormat::Bc5RgUnorm {
+                        format.block_extent()[1] * 2 + 1
+                    } else {
+                        8
+                    },
+                    1,
+                )
+                .unwrap(),
                 format,
                 ImageKind::Color,
                 1,
@@ -328,16 +425,49 @@ fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_varian
         // Revisit the RGB and RGBA pipelines after their initial compilation.
         for (iteration, index) in (0..formats.len())
             .cycle()
-            .take(formats.len() * 2)
+            .take(formats.len() * 3)
             .enumerate()
         {
             let (prepared, image, texture_page, selected, draw_vertex_buffer) = &draws[index];
-            let colored = iteration >= formats.len();
+            let colored = iteration >= formats.len() * 2;
             if colored {
                 // Mid-gray RGB565 endpoint, selector zero: sRGB must decode.
                 texture_page.prepare_write().unwrap();
                 let generation = texture_page.content_generation();
-                if formats[index].0 == ImageFormat::Rgb565Unorm {
+                if formats[index].0.astc_profile().is_some() {
+                    texture_page
+                        .write_preflighted(
+                            *selected,
+                            &astc_constant([0, 0, 255, 255]),
+                            generation,
+                            generation.next().unwrap(),
+                        )
+                        .unwrap();
+                } else if formats[index].0 == ImageFormat::Bc5RgUnorm {
+                    texture_page
+                        .write_preflighted(
+                            *selected,
+                            &[149, 0, 0, 0, 0, 0, 0, 0, 37, 0, 0, 0, 0, 0, 0, 0],
+                            generation,
+                            generation.next().unwrap(),
+                        )
+                        .unwrap();
+                } else if formats[index].0 == ImageFormat::R8Unorm {
+                    for offset in [149, 150, 197, 198] {
+                        let generation = texture_page.content_generation();
+                        texture_page
+                            .write_preflighted(
+                                usize::from(layers - 1) * 512 + offset,
+                                &[149],
+                                generation,
+                                generation.next().unwrap(),
+                            )
+                            .unwrap();
+                    }
+                } else if matches!(
+                    formats[index].0,
+                    ImageFormat::Rgb565Unorm | ImageFormat::Rg8Unorm
+                ) {
                     for (offset, value) in [154, 156, 202, 204].into_iter().zip([
                         (1_u16 << 11) | (3 << 5) | 5,
                         (2 << 11) | (3 << 5) | 6,
@@ -348,7 +478,12 @@ fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_varian
                         texture_page
                             .write_preflighted(
                                 usize::from(layers - 1) * 512 + offset,
-                                &value.to_le_bytes(),
+                                &if formats[index].0 == ImageFormat::Rg8Unorm {
+                                    u16::from_le_bytes([149, 37])
+                                } else {
+                                    value
+                                }
+                                .to_le_bytes(),
                                 generation,
                                 generation.next().unwrap(),
                             )
@@ -447,7 +582,28 @@ fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_varian
             creations.clear();
             let mut pixels = [0; 64];
             target_backing.range().read(0, &mut pixels).unwrap();
-            let expected = if formats[index].0 == ImageFormat::Rgb565Unorm {
+            let expected = if let Some(border) = border {
+                border.map(|bits| (f32::from_bits(bits) * 255.0) as u8)
+            } else if let Some(srgb) = formats[index].0.astc_profile() {
+                if colored {
+                    [0, 0, 255, 255]
+                } else if srgb {
+                    [55, 13, 4, 255]
+                } else {
+                    [128, 64, 32, 255]
+                }
+            } else if formats[index].0 == ImageFormat::R8Unorm {
+                [255, 255, 255, if colored { 149 } else { 73 }]
+            } else if matches!(
+                formats[index].0,
+                ImageFormat::Rg8Unorm | ImageFormat::Bc5RgUnorm
+            ) {
+                if colored {
+                    [149, 149, 149, 37]
+                } else {
+                    [73, 73, 73, 191]
+                }
+            } else if formats[index].0 == ImageFormat::Rgb565Unorm {
                 if colored {
                     [12, 14, 45, 255]
                 } else {
@@ -496,7 +652,7 @@ fn interface(location: ShaderIoLocation, component: u8) -> ShaderInterfaceElemen
     ShaderInterfaceElement::new(location, component, ShaderScalarType::Float32, None).unwrap()
 }
 
-fn sampled_fragment(array: bool) -> nixe_gpu::ShaderBackendModule {
+fn sampled_fragment(array: bool, outside: bool) -> nixe_gpu::ShaderBackendModule {
     let outputs = (0..4)
         .map(|component| {
             ShaderTextureSampleOutput::new(ShaderRegister::new(2 + u16::from(component)), component)
@@ -544,7 +700,7 @@ fn sampled_fragment(array: bool) -> nixe_gpu::ShaderBackendModule {
                 ShaderResourceAccess::new(1, ShaderResourceKind::Sampler, true, false).unwrap(),
             ],
             vec![
-                move_f32(8, 0, 0.75),
+                move_f32(8, 0, if outside { 1.25 } else { 0.75 }),
                 move_f32(16, 1, 0.75),
                 ShaderInstruction::new(
                     ShaderSourceLocation::new(24),
@@ -566,4 +722,16 @@ fn sampled_fragment(array: bool) -> nixe_gpu::ShaderBackendModule {
         ))
         .unwrap(),
     )
+}
+
+fn astc_constant(rgba: [u8; 4]) -> [u8; 16] {
+    // LDR void-extent block: constant UNORM16 RGBA, unrestricted extent.
+    let mut block = [0xff; 16];
+    block[0] = 0xfc;
+    block[1] = 0xfd;
+    for (channel, value) in rgba.into_iter().enumerate() {
+        block[8 + channel * 2..10 + channel * 2]
+            .copy_from_slice(&(u16::from(value) * 257).to_le_bytes());
+    }
+    block
 }

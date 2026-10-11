@@ -107,11 +107,13 @@ impl Expansion<'_> {
                 wrap: false,
             }
         } else {
-            ShaderOperation::ShiftRightLogical32 {
+            ShaderOperation::ShiftRight32 {
                 destination,
                 value,
                 amount,
                 wrap: false,
+                signed: false,
+                reverse: false,
             }
         });
         Ok(destination)

@@ -23,7 +23,7 @@ mod sampler_cache_tests;
 
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::{Display, Formatter},
     sync::Arc,
 };
@@ -262,6 +262,21 @@ impl MaxwellThreeDTranslatedShader {
     }
 }
 
+/// The binding source supplies declared sizes when no smaller bound is proved.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum MaxwellShaderBufferSize {
+    Proven(u64),
+    Declared,
+}
+impl MaxwellShaderBufferSize {
+    fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Proven(a), Self::Proven(b)) => Self::Proven(a.max(b)),
+            _ => Self::Declared,
+        }
+    }
+}
+
 /// Shader-declared use of one already resolved frontend resource.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDShaderResourceUse {
@@ -270,6 +285,7 @@ pub struct MaxwellThreeDShaderResourceUse {
     kind: DescriptorKind,
     stages: PipelineStages,
     usage: Option<ResourceUsage>,
+    buffer_size: MaxwellShaderBufferSize,
 }
 
 impl MaxwellThreeDShaderResourceUse {
@@ -292,6 +308,7 @@ impl MaxwellThreeDShaderResourceUse {
             kind,
             stages,
             usage,
+            buffer_size: MaxwellShaderBufferSize::Declared,
         })
     }
     #[must_use]
@@ -307,6 +324,7 @@ pub struct MaxwellThreeDTranslatedShaders {
     identity: Arc<()>,
     shaders: Box<[MaxwellThreeDTranslatedShader]>,
     resources: Box<[MaxwellThreeDShaderResourceUse]>,
+    buffer_sizes: Box<[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)]>,
 }
 
 impl MaxwellThreeDTranslatedShaders {
@@ -334,8 +352,23 @@ impl MaxwellThreeDTranslatedShaders {
         Ok(Self {
             identity: Arc::new(()),
             shaders: shaders.into_boxed_slice(),
+            buffer_sizes: resources
+                .iter()
+                .filter_map(|resource| {
+                    matches!(
+                        resource.role,
+                        MaxwellThreeDResourceRole::ConstantBuffer { .. }
+                            | MaxwellThreeDResourceRole::StorageBuffer { .. }
+                    )
+                    .then_some((resource.role, resource.buffer_size))
+                })
+                .collect(),
             resources: resources.into_boxed_slice(),
         })
+    }
+
+    pub(crate) fn buffer_sizes(&self) -> &[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)] {
+        &self.buffer_sizes
     }
     #[must_use]
     pub fn shaders(&self) -> &[MaxwellThreeDTranslatedShader] {
@@ -509,11 +542,32 @@ impl ViewKey {
 }
 
 impl MaxwellLoweringCache {
+    // Resource identities provide direct lookups. Image-only queries exclude
+    // the many slices retained for constant-buffer rings; ordered iteration
+    // preserves the existing choice among equivalent image representations.
+    fn image_views(&self) -> impl Iterator<Item = &ViewRecord> {
+        self.views
+            .range(
+                ResourceDependency::Image(ImageId::new(0))
+                    ..=ResourceDependency::Image(ImageId::new(u64::MAX)),
+            )
+            .map(|(_, record)| record)
+    }
+
+    fn image_views_mut(&mut self) -> impl Iterator<Item = &mut ViewRecord> {
+        self.views
+            .range_mut(
+                ResourceDependency::Image(ImageId::new(0))
+                    ..=ResourceDependency::Image(ImageId::new(u64::MAX)),
+            )
+            .map(|(_, record)| record)
+    }
+
     pub(crate) fn inline_image_word(
         &self,
         target: &crate::MaxwellResolvedRange,
-        hint: Option<usize>,
-    ) -> Result<Option<(usize, ImageRegion)>, MaxwellLoweringError> {
+        hint: Option<ResourceDependency>,
+    ) -> Result<Option<(ResourceDependency, ImageRegion)>, MaxwellLoweringError> {
         let [segment] = target.segments() else {
             return Ok(None);
         };
@@ -529,12 +583,16 @@ impl MaxwellLoweringCache {
                     <= bindings[0].2.allocation_offset() + bindings[0].2.range().size()
         };
         let index = hint
-            .filter(|index| self.views.get(*index).is_some_and(&matches))
-            .or_else(|| self.views.iter().position(matches));
+            .filter(|index| self.views.get(index).is_some_and(&matches))
+            .or_else(|| {
+                self.image_views()
+                    .find(|record| matches(record))
+                    .map(|record| record.dependency)
+            });
         let Some(index) = index else {
             return Ok(None);
         };
-        let record = &self.views[index];
+        let record = &self.views[&index];
         let ViewKey::Image {
             description,
             bindings,
@@ -608,8 +666,7 @@ impl MaxwellLoweringCache {
         for (destination, bytes) in uploads {
             if let Some(record) = self
                 .views
-                .iter_mut()
-                .find(|record| record.dependency == ResourceDependency::Image(destination.image))
+                .get_mut(&ResourceDependency::Image(destination.image))
             {
                 record.write_revision = revision;
                 let incomplete = !record.uninitialized_color_regions.is_empty();
@@ -1037,7 +1094,11 @@ pub struct MaxwellLoweringCache {
         nixe_gpu::GpuAllocationId,
         nixe_gpu::GpuAllocationDescription,
     )>,
-    views: Vec<ViewRecord>,
+    views: BTreeMap<ResourceDependency, ViewRecord>,
+    // A physical interval narrows buffer lookup to its mapping aliases. The
+    // candidate still verifies canonical bytes and exact mapping lifetime.
+    buffer_views_by_range:
+        rustc_hash::FxHashMap<(nixe_gpu::GpuAllocationId, u64, u64), Vec<ResourceDependency>>,
     color_materializations: Vec<ColorRepresentationRecord>,
     image_alias_copies: Vec<GpuOperation>,
     graphics_pipeline: Option<PipelineId>,
@@ -1052,7 +1113,7 @@ pub struct MaxwellLoweringCache {
     shader_state: Option<ShaderStateRecord>,
     shader_translations: FingerprintCache<ShaderTranslationRecord>,
     retired_resources: Vec<ResourceDependency>,
-    accesses: Vec<(AccessTarget, AccessScope)>,
+    accesses: rustc_hash::FxHashMap<AccessTarget, AccessScope>,
     resolved_resources: super::threed::MaxwellThreeDResolvedResourceCache,
     resource_roles: Vec<MaxwellThreeDResourceRole>,
     mme_methods: Vec<crate::MaxwellMethodDispatch>,
@@ -1073,7 +1134,8 @@ impl MaxwellLoweringCache {
             revision: 0,
             next_identity: 1,
             allocations: Vec::new(),
-            views: Vec::new(),
+            views: BTreeMap::new(),
+            buffer_views_by_range: rustc_hash::FxHashMap::default(),
             color_materializations: Vec::new(),
             image_alias_copies: Vec::new(),
             graphics_pipeline: None,
@@ -1088,7 +1150,7 @@ impl MaxwellLoweringCache {
             shader_state: None,
             shader_translations: FingerprintCache::default(),
             retired_resources: Vec::new(),
-            accesses: Vec::new(),
+            accesses: rustc_hash::FxHashMap::default(),
             resolved_resources: super::threed::MaxwellThreeDResolvedResourceCache::default(),
             resource_roles: Vec::new(),
             mme_methods: Vec::new(),
@@ -1380,6 +1442,24 @@ impl MaxwellLoweringCache {
                             Some(ResourceUsage::StorageBuffer),
                         )
                     }
+                    ShaderResourceKind::StorageBuffer
+                        if resource.readable() && !resource.writable() =>
+                    {
+                        let buffer = program
+                            .global_buffer(resource.binding())
+                            .ok_or(MaxwellLoweringError::InvalidTranslatedShaders)?;
+                        (
+                            MaxwellThreeDResourceRole::StorageBuffer {
+                                group: program
+                                    .bind_group()
+                                    .ok_or(MaxwellLoweringError::InvalidTranslatedShaders)?,
+                                slot: buffer.constant_buffer,
+                                byte_offset: buffer.byte_offset,
+                            },
+                            DescriptorKind::Buffer,
+                            Some(ResourceUsage::StorageBuffer),
+                        )
+                    }
                     ShaderResourceKind::SampledImage | ShaderResourceKind::SampledImage2DArray
                         if resource.readable() && !resource.writable() =>
                     {
@@ -1447,14 +1527,19 @@ impl MaxwellLoweringCache {
                         return Err(MaxwellLoweringError::InvalidTranslatedShaders);
                     }
                     existing.stages = existing.stages.union(stages);
+                    existing.buffer_size = existing
+                        .buffer_size
+                        .union(program.buffer_size(resource.binding()));
                 } else {
-                    resources.push(MaxwellThreeDShaderResourceUse::new(
+                    let mut usage = MaxwellThreeDShaderResourceUse::new(
                         role,
                         resource.binding(),
                         kind,
                         stages,
                         usage,
-                    )?);
+                    )?;
+                    usage.buffer_size = program.buffer_size(resource.binding());
+                    resources.push(usage);
                 }
             }
         }
@@ -1526,9 +1611,15 @@ pub struct MaxwellLoweredWork {
     invalidations: Box<[ResourceDependency]>,
     submission: OperationSubmission,
     dirty_images: Arc<[usize]>,
+    canonical_accesses: Box<[nixe_gpu::BackingView]>,
+    unknown_canonical_accesses: bool,
 }
 
 impl MaxwellLoweredWork {
+    pub(crate) fn canonical_accesses(&self) -> (&[nixe_gpu::BackingView], bool) {
+        (&self.canonical_accesses, self.unknown_canonical_accesses)
+    }
+
     #[must_use]
     pub fn resource_creations(&self) -> &[BackendResourceCreateInfo] {
         &self.creations
@@ -1617,8 +1708,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
                     && prepared.sampled_aliases.iter().all(|dependency| {
                         cache
                             .views
-                            .iter()
-                            .find(|record| record.dependency == *dependency)
+                            .get(dependency)
                             .is_some_and(|record| sampled_alias::copy_is_current(record, cache))
                     })
             })
@@ -2147,6 +2237,30 @@ fn finish_lowered_work(
     trim_samplers(cache, &operations, &mut invalidations);
     let submission = OperationSubmission::new(submission, predecessors, operations)
         .map_err(MaxwellLoweringError::Command)?;
+    // Retain physical coverage while resource identities are still available.
+    // Read and write hazards must use canonical bytes, including VA aliases.
+    let mut canonical_accesses = Vec::new();
+    let mut unknown_canonical_accesses = false;
+    for access in submission.access_plan().accesses() {
+        let dependency = access.target().dependency();
+        if matches!(
+            dependency,
+            ResourceDependency::Buffer(_) | ResourceDependency::Image(_)
+        ) {
+            if let Some(view) = cache.views.get(&dependency) {
+                for index in 0..view.key.backing_count() {
+                    canonical_accesses.push(
+                        view.key
+                            .backing(index)
+                            .expect("bounded backing index")
+                            .clone(),
+                    );
+                }
+            } else {
+                unknown_canonical_accesses = true;
+            }
+        }
+    }
     cache.revision = cache
         .revision
         .checked_add(1)
@@ -2156,6 +2270,8 @@ fn finish_lowered_work(
         invalidations: invalidations.into_boxed_slice(),
         submission,
         dirty_images,
+        canonical_accesses: canonical_accesses.into_boxed_slice(),
+        unknown_canonical_accesses,
     })
 }
 
@@ -2407,7 +2523,7 @@ fn validate_compressed_depth_materialization(
     if !consumes_depth && !consumes_stencil {
         return Ok(());
     }
-    if cache.views.iter().any(|record| {
+    if cache.views.values().any(|record| {
         record.remains_current_for_image(image)
             && record
                 .materialization
@@ -2505,27 +2621,28 @@ fn record_clear_materialization(
         let index = resource_index(resources, MaxwellThreeDResourceRole::DepthStencilTarget)?;
         let position = cache
             .views
-            .iter()
-            .position(|record| record.key.matches_resource(&resources.resources()[index]))
+            .values()
+            .find(|record| record.key.matches_resource(&resources.resources()[index]))
+            .map(|record| record.dependency)
             .ok_or(MaxwellLoweringError::InvalidResolvedView {
                 role: MaxwellThreeDResourceRole::DepthStencilTarget,
             })?;
-        let materialization = cache.views[position].materialization;
+        let record = cache
+            .views
+            .get_mut(&position)
+            .expect("resolved depth view exists");
+        let materialization = record.materialization;
         if let ViewMaterialization::CompressedDepthStencil { depth, stencil } = materialization {
             if surface.depth() {
-                cache.views[position].uninitialized_depth_stencil_regions[0].clear();
+                record.uninitialized_depth_stencil_regions[0].clear();
             }
             if surface.stencil() {
-                cache.views[position].uninitialized_depth_stencil_regions[1].clear();
+                record.uninitialized_depth_stencil_regions[1].clear();
             }
             let depth = depth || surface.depth();
             let stencil = stencil || surface.stencil();
             if materialization != (ViewMaterialization::CompressedDepthStencil { depth, stencil }) {
-                cache
-                    .views
-                    .get_mut(position)
-                    .expect("depth view position came from the same cache")
-                    .materialization =
+                record.materialization =
                     ViewMaterialization::CompressedDepthStencil { depth, stencil };
             }
         }
@@ -2555,8 +2672,7 @@ fn record_image_write(
 ) {
     let revision = cache.revision.saturating_add(1);
     if let Some(record) = cache
-        .views
-        .iter_mut()
+        .image_views_mut()
         .find(|record| record.key.same_domain_as_image(image))
     {
         record.write_revision = revision;
@@ -2568,8 +2684,7 @@ fn record_color_materialization(
     cache: &mut MaxwellLoweringCache,
 ) {
     if let Some(record) = cache
-        .views
-        .iter_mut()
+        .image_views_mut()
         .find(|record| record.key.same_domain_as_image(image))
     {
         record.uninitialized_color_regions.clear();
@@ -3313,8 +3428,7 @@ fn prepare_resources(
             // the initialized representation is still resident and no CPU write
             // has invalidated it. Never create a blank texture or import bytes.
             let resident = cache
-                .views
-                .iter()
+                .image_views()
                 .find(|record| record.remains_current_for_image(image));
             if let Some(record) = resident
                 && (sampled_alias::copy_is_current(record, cache)
@@ -3345,20 +3459,7 @@ fn prepare_resources(
         let image = resolved_image(resources, *index)?;
         if image.access() == super::threed::MaxwellThreeDResourceAccess::Read
             && !image.guest_layout().requires_materialization()
-            && !cache.views.iter().any(|record| {
-                record.key.matches_resource(resource)
-                    && matches!(
-                        record.key,
-                        ViewKey::Image {
-                            guest_format: super::threed::MaxwellThreeDGuestImageFormat::Canonical(
-                                _
-                            ),
-                            ..
-                        }
-                    )
-            })
-            && let Some(dependency) =
-                sampled_alias::prepare_canonical_producer(image, cache, creations)?
+            && let Some(dependency) = sampled_alias::prepare(image, cache, creations)?
         {
             result[*index] = Some(dependency);
             continue;
@@ -3379,7 +3480,7 @@ fn prepare_resources(
             }
         }
 
-        if let Some(record) = cache.views.iter().find(|record| {
+        if let Some(record) = cache.image_views().find(|record| {
             record.key.matches_resource(resource)
                 && (!image.guest_layout().requires_materialization()
                     || record.remains_current_for_image(image))
@@ -3393,16 +3494,18 @@ fn prepare_resources(
         // validation above has already rejected any operation requiring an
         // unmaterialized aspect, and remains_current_for_image rejects CPU
         // writes or a changed image domain.
-        if let MaxwellThreeDResolvedResource::Image(image) = resource
-            && image.guest_layout().requires_materialization()
-            && let Some(position) = cache
-                .views
-                .iter()
-                .position(|record| record.remains_current_for_image(image))
-        {
+        let retained = if image.guest_layout().requires_materialization() {
+            cache
+                .image_views()
+                .find(|record| record.remains_current_for_image(image))
+                .map(|record| record.dependency)
+        } else {
+            None
+        };
+        if let Some(position) = retained {
             let record = cache
                 .views
-                .get_mut(position)
+                .get_mut(&position)
                 .expect("materialized view position came from the same cache");
             record.key = view_key(resource);
             result[*index] = Some(record.dependency);
@@ -3454,31 +3557,35 @@ fn prepare_resources(
             ),
         });
         let dependency = ResourceDependency::Image(id);
-        cache.views.push(ViewRecord {
-            key,
+        cache.views.insert(
             dependency,
-            materialization,
-            cpu_writes,
-            write_revision: 0,
-            last_used: 0,
-            uninitialized_depth_stencil_regions: if matches!(
+            ViewRecord {
+                key,
+                dependency,
                 materialization,
-                ViewMaterialization::CompressedDepthStencil { .. }
-            ) {
-                let extent = image.description().extent();
-                std::array::from_fn(|_| vec![[0, 0, extent.width, extent.height]])
-            } else {
-                Default::default()
+                cpu_writes,
+                write_revision: 0,
+                last_used: 0,
+                uninitialized_depth_stencil_regions: if matches!(
+                    materialization,
+                    ViewMaterialization::CompressedDepthStencil { .. }
+                ) {
+                    let extent = image.description().extent();
+                    std::array::from_fn(|_| vec![[0, 0, extent.width, extent.height]])
+                } else {
+                    Default::default()
+                },
+                uninitialized_color_regions: if materialization
+                    == ViewMaterialization::CompressedColor
+                    && !image.guest_layout().has_direct_canonical_representation()
+                {
+                    let extent = image.description().extent();
+                    vec![[0, 0, extent.width, extent.height]]
+                } else {
+                    Vec::new()
+                },
             },
-            uninitialized_color_regions: if materialization == ViewMaterialization::CompressedColor
-                && !image.guest_layout().has_direct_canonical_representation()
-            {
-                let extent = image.description().extent();
-                vec![[0, 0, extent.width, extent.height]]
-            } else {
-                Vec::new()
-            },
-        });
+        );
         result[*index] = Some(dependency);
     }
     Ok(result)
@@ -3493,7 +3600,7 @@ fn retire_overlapping_views(
 ) {
     let invalidated = cache
         .views
-        .iter()
+        .values()
         .filter(|record| {
             // Read-only direct views may coexist: each submission imports the
             // current canonical bytes before reading its host representation.
@@ -3517,29 +3624,6 @@ fn retire_overlapping_views(
         })
         .map(|record| record.dependency)
         .collect::<Vec<_>>();
-    // VIDEO_PROBE_BEGIN
-    if !invalidated.is_empty() && std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-        for record in cache
-            .views
-            .iter()
-            .filter(|r| invalidated.contains(&r.dependency))
-        {
-            let image = |key: &ViewKey| match key {
-                ViewKey::Image { description, .. } => {
-                    Some((description.extent(), description.format()))
-                }
-                _ => None,
-            };
-            log::debug!(
-                "VIDEO_PROBE overlap-retirement: incoming={:?} writable={writable} old={:?} write={} materialization={:?}",
-                image(key),
-                image(&record.key),
-                record.write_revision,
-                record.materialization
-            );
-        }
-    }
-    // VIDEO_PROBE_END
     retire_view_dependencies(&invalidated, cache, invalidations);
 }
 
@@ -3548,13 +3632,23 @@ fn retire_view_dependencies(
     cache: &mut MaxwellLoweringCache,
     invalidations: &mut Vec<ResourceDependency>,
 ) {
-    if !invalidated.is_empty() {
-        cache.prepared_draw = None;
+    if invalidated.is_empty() {
+        return;
     }
+    cache.prepared_draw = None;
     cache
         .views
-        .retain(|record| !invalidated.contains(&record.dependency));
-    cache.accesses.retain(|(target, _)| {
+        .retain(|dependency, _| !invalidated.contains(dependency));
+    if invalidated
+        .iter()
+        .any(|dependency| matches!(dependency, ResourceDependency::Buffer(_)))
+    {
+        cache.buffer_views_by_range.retain(|_, dependencies| {
+            dependencies.retain(|dependency| !invalidated.contains(dependency));
+            !dependencies.is_empty()
+        });
+    }
+    cache.accesses.retain(|target, _| {
         !invalidated
             .iter()
             .any(|dependency| dependency_matches_target(*dependency, *target))
@@ -3572,6 +3666,9 @@ fn retire_descriptors_for_resources(
     cache: &mut MaxwellLoweringCache,
     invalidations: &mut Vec<ResourceDependency>,
 ) {
+    if invalidated.is_empty() {
+        return;
+    }
     let invalidated_descriptors = cache
         .descriptors
         .iter()
@@ -3604,21 +3701,22 @@ fn retire_descriptors_for_resources(
 // Buffer slices and sampled image representations are derived read-only views.
 // Bound their metadata and host residency without evicting canonical guest bytes.
 // Device-written and opaque representations remain pinned until reconciled.
-const MAX_CACHED_READ_ONLY_VIEWS: usize = 256;
-
 fn trim_read_only_views(
     cache: &mut MaxwellLoweringCache,
     operations: &[GpuOperation],
     invalidations: &mut Vec<ResourceDependency>,
 ) {
-    let limit = cache.resource_cache_limit().min(MAX_CACHED_READ_ONLY_VIEWS);
+    // Constant-buffer rings can exceed 256 slices even when their whole working
+    // set fits the configured budget. A second, smaller hidden cap repeatedly
+    // destroys their descriptor tables and host bind groups on every ring wrap.
+    let limit = cache.resource_cache_limit();
     if cache.views.len() <= limit {
         return;
     }
     let eligible = |record: &&ViewRecord| {
         record.materialization == ViewMaterialization::Direct && record.write_revision == 0
     };
-    let count = cache.views.iter().filter(eligible).count();
+    let count = cache.views.values().filter(eligible).count();
     if count <= limit {
         return;
     }
@@ -3638,7 +3736,7 @@ fn trim_read_only_views(
     }
     let mut candidates = cache
         .views
-        .iter()
+        .values()
         .filter(eligible)
         .filter(|record| !protected.contains(&record.dependency))
         .map(|record| (record.last_used, record.dependency))
@@ -3653,15 +3751,6 @@ fn trim_read_only_views(
         .take(retire_count)
         .map(|(_, dependency)| dependency)
         .collect::<Vec<_>>();
-    // VIDEO_PROBE_BEGIN
-    if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-        log::debug!(
-            "VIDEO_PROBE buffer-lru: count={count} limit={limit} retired={} descriptors={}",
-            retired.len(),
-            cache.descriptors.len()
-        );
-    }
-    // VIDEO_PROBE_END
     retire_view_dependencies(&retired, cache, invalidations);
 }
 
@@ -4504,12 +4593,11 @@ fn lower_draw(
             .flatten()
             .copied()
             .filter(|dependency| {
-                cache.views.iter().any(|record| {
-                    record.dependency == *dependency
-                        && matches!(
-                            record.materialization,
-                            ViewMaterialization::CopiedColor { .. }
-                        )
+                cache.views.get(dependency).is_some_and(|record| {
+                    matches!(
+                        record.materialization,
+                        ViewMaterialization::CopiedColor { .. }
+                    )
                 })
             })
             .collect(),
@@ -4569,10 +4657,7 @@ fn sequence_with_transitions(
     for command in commands {
         let mut transitions = Vec::new();
         for access in command.accesses() {
-            if let Some((_, before)) = cache
-                .accesses
-                .iter()
-                .find(|(target, _)| *target == access.target())
+            if let Some(before) = cache.accesses.get(&access.target())
                 && *before != access.scope()
             {
                 transitions.push(
@@ -4596,31 +4681,14 @@ fn sequence_with_transitions(
             if matches!(
                 dependency,
                 ResourceDependency::Buffer(_) | ResourceDependency::Image(_)
-            ) && let Some(record) = cache
-                .views
-                .iter_mut()
-                .find(|record| record.dependency == dependency)
+            ) && let Some(record) = cache.views.get_mut(&dependency)
             {
                 record.last_used = cache.revision.saturating_add(1);
                 if access.scope().mode().writes() {
                     record.write_revision = cache.revision.saturating_add(1);
                 }
             }
-            let previous = cache
-                .accesses
-                .iter()
-                .find(|(target, _)| *target == access.target())
-                .map(|(_, scope)| *scope);
-            if previous.is_some_and(|scope| scope != access.scope()) {
-                let (_, scope) = cache
-                    .accesses
-                    .iter_mut()
-                    .find(|(target, _)| *target == access.target())
-                    .expect("access found immediately before mutation");
-                *scope = access.scope();
-            } else if previous.is_none() {
-                cache.accesses.push((access.target(), access.scope()));
-            }
+            cache.accesses.insert(access.target(), access.scope());
         }
         result.push(command);
     }

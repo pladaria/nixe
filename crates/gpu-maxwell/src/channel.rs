@@ -437,6 +437,12 @@ impl MaxwellGpuChannel {
         &mut self.three_d
     }
 
+    pub(crate) const fn three_d_with_profile_mut(
+        &mut self,
+    ) -> (&MaxwellGpuProfile, &mut MaxwellThreeDFrontendState) {
+        (&self.profile, &mut self.three_d)
+    }
+
     /// Resets frontend class selection at a verified channel-reset boundary.
     /// Closing a channel normally drops the complete object instead.
     pub fn reset_subchannel_bindings(&mut self) {

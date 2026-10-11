@@ -158,8 +158,14 @@ fn integer_nv12_conversion_is_exact_resident_and_preserves_canonical_padding() {
         .enumerate()
         {
             // Reuse the same planes and destination after an actual CPU write.
-            let y_data = luma.iter().map(|v| v.wrapping_add(iteration as u8 * 37)).collect::<Vec<_>>();
-            let uv_data = uv.iter().map(|v| v.wrapping_sub(iteration as u8 * 41)).collect::<Vec<_>>();
+            let y_data = luma
+                .iter()
+                .map(|v| v.wrapping_add(iteration as u8 * 37))
+                .collect::<Vec<_>>();
+            let uv_data = uv
+                .iter()
+                .map(|v| v.wrapping_sub(iteration as u8 * 41))
+                .collect::<Vec<_>>();
             luma_memory.write(0, &y_data).unwrap();
             chroma_memory.write(0, &uv_data).unwrap();
             output_memory.write(0, &[0xa5; 256]).unwrap();
@@ -194,12 +200,53 @@ fn integer_nv12_conversion_is_exact_resident_and_preserves_canonical_padding() {
                     CapabilityRequirements::none(),
                 ),
             ];
+            let mut uploads = Vec::new();
+            if iteration < 2 {
+                for (region, pitch, data) in
+                    [(chroma_region, 16, &uv_data), (luma_region, 16, &y_data)]
+                {
+                    let row_bytes = region.extent.width as usize
+                        * if region.image == luma_region.image {
+                            1
+                        } else {
+                            2
+                        };
+                    let bytes: Vec<u8> = (0..region.extent.height as usize)
+                        .flat_map(|row| data[row * pitch..row * pitch + row_bytes].iter().copied())
+                        .collect();
+                    uploads.push(GpuOperation::new(
+                        GpuCommand::UploadImage {
+                            destination: region,
+                            bytes: bytes.into(),
+                        },
+                        [],
+                        [],
+                        CapabilityRequirements::none(),
+                    ));
+                }
+            }
             #[cfg(feature = "performance-counters")]
             let before = nixe_gpu::metrics::snapshot()
                 .into_iter()
                 .find(|(name, _)| *name == "ImageReadbackBytes")
                 .unwrap()
                 .1;
+            if !uploads.is_empty() {
+                runtime
+                    .runtime()
+                    .submit(
+                        &all,
+                        &[],
+                        &OperationSubmission::new(
+                            FrontendSubmissionId::new(10_000 + serial),
+                            vec![],
+                            uploads,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                all.clear();
+            }
             runtime
                 .runtime()
                 .submit(
@@ -269,6 +316,117 @@ fn integer_nv12_conversion_is_exact_resident_and_preserves_canonical_padding() {
                 assert_eq!(&copied[y * 40..y * 40 + 28], &expected[y * 40..y * 40 + 28]);
             }
             serial += 1;
+        }
+    }
+    runtime.runtime().teardown().unwrap();
+}
+
+#[test]
+fn decoded_plane_uploads_preserve_gob_padding_and_cpu_alias_writes() {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(846),
+        NonCpuDeviceId::new(846),
+        Default::default(),
+    ) else {
+        return;
+    };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    for (id, format, texture_width, visible_width, height, length, bpp) in [
+        (901, ImageFormat::R8Unorm, 128, 67, 37, 8192, 1),
+        (902, ImageFormat::Rg8Unorm, 64, 34, 19, 4096, 2),
+    ] {
+        let (mut creations, memory, mut region) =
+            image(id, format, texture_width, height, 128, &vec![0xa5; length]);
+        for creation in &mut creations {
+            if let BackendResourceCreateInfo::Image {
+                id,
+                description,
+                view: Some(view),
+            } = creation
+            {
+                let binding = &view.bindings()[0];
+                *view = ImageView::new(
+                    *id,
+                    *description,
+                    Swizzle::IDENTITY,
+                    vec![(
+                        binding.subresources(),
+                        ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                            block_width_log2: 0,
+                            block_height_log2: 2,
+                            block_depth_log2: 0,
+                            layer_stride: length as u64,
+                        }),
+                        binding.backing().clone(),
+                    )],
+                )
+                .unwrap();
+            }
+        }
+        region.extent.width = visible_width;
+        let offset = |x: usize, y: usize| {
+            (y / 32) * 128 * 32
+                + (x / 64) * 512 * 4
+                + (y % 32 / 8) * 512
+                + (x % 64 / 32) * 256
+                + (y % 8 / 2) * 64
+                + (x % 32 / 16) * 32
+                + (y % 2) * 16
+                + x % 16
+        };
+        let mut expected = vec![0xa5; length];
+        for iteration in 0..2 {
+            if iteration == 1 {
+                let padding = offset(100, 0);
+                memory.write(padding, &[0x3b]).unwrap();
+                expected[padding] = 0x3b;
+            }
+            let bytes = (0..visible_width as usize * bpp * height as usize)
+                .map(|i| (i * 7 + iteration * 41) as u8)
+                .collect::<Vec<_>>();
+            for y in 0..height as usize {
+                for x in 0..visible_width as usize * bpp {
+                    expected[offset(x, y)] = bytes[y * visible_width as usize * bpp + x];
+                }
+            }
+            runtime
+                .runtime()
+                .submit(
+                    &creations,
+                    &[],
+                    &OperationSubmission::new(
+                        FrontendSubmissionId::new(id * 2 + iteration as u64),
+                        vec![],
+                        vec![GpuOperation::new(
+                            GpuCommand::UploadImage {
+                                destination: region,
+                                bytes: bytes.into(),
+                            },
+                            [],
+                            [],
+                            CapabilityRequirements::none(),
+                        )],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            creations.clear();
+            let mut actual = vec![0; length];
+            memory.read(0, &mut actual).unwrap();
+            let differences = actual
+                .iter()
+                .zip(&expected)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| (i, *a, *b))
+                .collect::<Vec<_>>();
+            assert!(
+                differences.is_empty(),
+                "format={format:?} iteration={iteration} mismatches={} first={:?}",
+                differences.len(),
+                &differences[..differences.len().min(10)]
+            );
         }
     }
     runtime.runtime().teardown().unwrap();

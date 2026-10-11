@@ -3,6 +3,7 @@
 //! Public ABI: https://switchbrew.org/wiki/NV_services#NVHOST_IOCTL_CHANNEL_SUBMIT
 //! Cross-check: https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/nvdrv/devices/nvhost_nvdec_common.cpp
 
+mod surface;
 mod vic;
 mod video;
 mod worker;

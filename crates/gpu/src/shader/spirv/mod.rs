@@ -23,6 +23,7 @@ pub use pipeline::{
 };
 mod float;
 mod half;
+mod integer_conversion;
 pub use default_control::{
     SpirvDefaultControlOptions, SpirvDefaultControlShader,
     lower_default_tessellation_control_to_spirv,
@@ -245,12 +246,13 @@ struct Emitter {
     registers: Vec<Option<u32>>,
     predicates: [Option<u32>; 8],
     interfaces: BTreeMap<(bool, ShaderIoLocation, u8), interface::Element>,
-    constant_buffers: [Option<u32>; 256],
-    constant_word_pointer: Option<u32>,
+    readonly_buffers: [Option<u32>; 256],
+    buffer_word_pointer: Option<u32>,
     variables: Vec<u32>,
     float_modes: bool,
     repair_float: Option<u32>,
     fma_extension: bool,
+    glsl_import: Option<u32>,
 }
 
 impl Emitter {
@@ -287,12 +289,13 @@ impl Emitter {
             registers: Vec::new(),
             predicates: [None; 8],
             interfaces: BTreeMap::new(),
-            constant_buffers: [None; 256],
-            constant_word_pointer: None,
+            readonly_buffers: [None; 256],
+            buffer_word_pointer: None,
             variables: Vec::new(),
             float_modes: false,
             repair_float: None,
             fma_extension: false,
+            glsl_import: None,
         }
     }
 

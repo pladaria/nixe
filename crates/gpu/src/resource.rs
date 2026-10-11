@@ -163,6 +163,39 @@ pub enum ImageFormat {
     Depth24UnormStencil8Uint,
     Depth32Float,
     Depth32FloatStencil8Uint,
+    // ASTC LDR 2D footprints; each block occupies 16 bytes.
+    // https://registry.khronos.org/OpenGL/extensions/KHR/KHR_texture_compression_astc_ldr.txt
+    Astc4x4Unorm,
+    Astc4x4Srgb,
+    Astc5x4Unorm,
+    Astc5x4Srgb,
+    Astc5x5Unorm,
+    Astc5x5Srgb,
+    Astc6x5Unorm,
+    Astc6x5Srgb,
+    Astc6x6Unorm,
+    Astc6x6Srgb,
+    Astc8x5Unorm,
+    Astc8x5Srgb,
+    Astc8x6Unorm,
+    Astc8x6Srgb,
+    Astc8x8Unorm,
+    Astc8x8Srgb,
+    Astc10x5Unorm,
+    Astc10x5Srgb,
+    Astc10x6Unorm,
+    Astc10x6Srgb,
+    Astc10x8Unorm,
+    Astc10x8Srgb,
+    Astc10x10Unorm,
+    Astc10x10Srgb,
+    Astc12x10Unorm,
+    Astc12x10Srgb,
+    Astc12x12Unorm,
+    Astc12x12Srgb,
+    /// Two independent BC4 UNORM channels in a 16-byte 4x4 block.
+    /// https://registry.khronos.org/OpenGL/extensions/ARB/ARB_texture_compression_rgtc.txt
+    Bc5RgUnorm,
 }
 
 impl ImageFormat {
@@ -189,7 +222,22 @@ impl ImageFormat {
             | Self::Bc1RgbSrgb
             | Self::Bc1RgbaUnorm
             | Self::Bc1RgbaSrgb
-            | Self::Bc4RUnorm => [4, 4],
+            | Self::Bc4RUnorm
+            | Self::Bc5RgUnorm => [4, 4],
+            Self::Astc4x4Unorm | Self::Astc4x4Srgb => [4, 4],
+            Self::Astc5x4Unorm | Self::Astc5x4Srgb => [5, 4],
+            Self::Astc5x5Unorm | Self::Astc5x5Srgb => [5, 5],
+            Self::Astc6x5Unorm | Self::Astc6x5Srgb => [6, 5],
+            Self::Astc6x6Unorm | Self::Astc6x6Srgb => [6, 6],
+            Self::Astc8x5Unorm | Self::Astc8x5Srgb => [8, 5],
+            Self::Astc8x6Unorm | Self::Astc8x6Srgb => [8, 6],
+            Self::Astc8x8Unorm | Self::Astc8x8Srgb => [8, 8],
+            Self::Astc10x5Unorm | Self::Astc10x5Srgb => [10, 5],
+            Self::Astc10x6Unorm | Self::Astc10x6Srgb => [10, 6],
+            Self::Astc10x8Unorm | Self::Astc10x8Srgb => [10, 8],
+            Self::Astc10x10Unorm | Self::Astc10x10Srgb => [10, 10],
+            Self::Astc12x10Unorm | Self::Astc12x10Srgb => [12, 10],
+            Self::Astc12x12Unorm | Self::Astc12x12Srgb => [12, 12],
             _ => [1, 1],
         }
     }
@@ -206,7 +254,45 @@ impl ImageFormat {
             | Self::Bc1RgbaUnorm
             | Self::Bc1RgbaSrgb
             | Self::Bc4RUnorm => Some(8),
+            Self::Bc5RgUnorm => Some(16),
+            format if format.astc_profile().is_some() => Some(16),
             _ => self.plane_bytes_per_texel(plane),
+        }
+    }
+
+    /// Whether this is an ASTC LDR format and whether its RGB channels use sRGB.
+    #[must_use]
+    pub const fn astc_profile(self) -> Option<bool> {
+        match self {
+            Self::Astc4x4Unorm
+            | Self::Astc5x4Unorm
+            | Self::Astc5x5Unorm
+            | Self::Astc6x5Unorm
+            | Self::Astc6x6Unorm
+            | Self::Astc8x5Unorm
+            | Self::Astc8x6Unorm
+            | Self::Astc8x8Unorm
+            | Self::Astc10x5Unorm
+            | Self::Astc10x6Unorm
+            | Self::Astc10x8Unorm
+            | Self::Astc10x10Unorm
+            | Self::Astc12x10Unorm
+            | Self::Astc12x12Unorm => Some(false),
+            Self::Astc4x4Srgb
+            | Self::Astc5x4Srgb
+            | Self::Astc5x5Srgb
+            | Self::Astc6x5Srgb
+            | Self::Astc6x6Srgb
+            | Self::Astc8x5Srgb
+            | Self::Astc8x6Srgb
+            | Self::Astc8x8Srgb
+            | Self::Astc10x5Srgb
+            | Self::Astc10x6Srgb
+            | Self::Astc10x8Srgb
+            | Self::Astc10x10Srgb
+            | Self::Astc12x10Srgb
+            | Self::Astc12x12Srgb => Some(true),
+            _ => None,
         }
     }
 
@@ -246,7 +332,36 @@ impl ImageFormat {
             | Self::Bc1RgbSrgb
             | Self::Bc1RgbaUnorm
             | Self::Bc1RgbaSrgb
-            | Self::Bc4RUnorm => {
+            | Self::Bc4RUnorm
+            | Self::Bc5RgUnorm
+            | Self::Astc4x4Unorm
+            | Self::Astc4x4Srgb
+            | Self::Astc5x4Unorm
+            | Self::Astc5x4Srgb
+            | Self::Astc5x5Unorm
+            | Self::Astc5x5Srgb
+            | Self::Astc6x5Unorm
+            | Self::Astc6x5Srgb
+            | Self::Astc6x6Unorm
+            | Self::Astc6x6Srgb
+            | Self::Astc8x5Unorm
+            | Self::Astc8x5Srgb
+            | Self::Astc8x6Unorm
+            | Self::Astc8x6Srgb
+            | Self::Astc8x8Unorm
+            | Self::Astc8x8Srgb
+            | Self::Astc10x5Unorm
+            | Self::Astc10x5Srgb
+            | Self::Astc10x6Unorm
+            | Self::Astc10x6Srgb
+            | Self::Astc10x8Unorm
+            | Self::Astc10x8Srgb
+            | Self::Astc10x10Unorm
+            | Self::Astc10x10Srgb
+            | Self::Astc12x10Unorm
+            | Self::Astc12x10Srgb
+            | Self::Astc12x12Unorm
+            | Self::Astc12x12Srgb => {
                 return None;
             }
             Self::R8Unorm => 1,
@@ -432,6 +547,8 @@ pub struct SamplerDescription {
     pub mag_filter: FilterMode,
     pub mip_filter: FilterMode,
     pub address_modes: [AddressMode; 3],
+    /// Raw RGBA float bits, consumed only by ClampToBorder addressing.
+    pub border_color: Option<[u32; 4]>,
     pub lod_min: f32,
     pub lod_max: f32,
     pub max_anisotropy: f32,
@@ -459,6 +576,7 @@ impl SamplerDescription {
             mag_filter,
             mip_filter,
             address_modes,
+            border_color: None,
             lod_min,
             lod_max,
             max_anisotropy,

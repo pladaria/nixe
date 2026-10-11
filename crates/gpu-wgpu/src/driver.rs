@@ -47,12 +47,15 @@ use crate::{
 
 mod blit;
 mod color;
+mod compressed;
 mod compute;
 mod conversion;
 mod multisample;
 #[cfg(not(target_os = "macos"))]
 #[path = "native/vulkan/draw.rs"]
 mod native_draw;
+#[cfg(feature = "performance-counters")]
+mod timings;
 
 // WebGPU and Maxwell expose at most eight simultaneous color attachments.
 const MAX_COLOR_ATTACHMENTS: usize = 8;
@@ -960,6 +963,7 @@ enum PendingWriteback {
     },
     Image {
         staging: Buffer,
+        demanded_page: CanonicalPageId,
         backing: nixe_memory::CanonicalBackingRange,
         host_row_pitch: u32,
         canonical_layout: ImageMemoryLayout,
@@ -1276,6 +1280,8 @@ fn vertex_entry_point(
 
 /// Accelerated implementation retained behind [`nixe_gpu::Backend`].
 pub(crate) struct WgpuBackendDriver {
+    #[cfg(feature = "performance-counters")]
+    timings: Option<timings::Timings>,
     backend: nixe_gpu::BackendInstanceId,
     device: Device,
     queue: Queue,
@@ -1308,6 +1314,7 @@ pub(crate) struct WgpuBackendDriver {
     upload_bytes: u64,
     upload_canonical: Vec<u8>,
     upload_rgb565: Vec<u8>,
+    block_decoder: compressed::BlockDecoder,
     vertex_pull_binding_key: Vec<(u32, BackendResourceHandle)>,
     draw_bind_groups: Vec<Vec<BindGroup>>,
     compatible_color_attachments: Vec<(usize, Texture)>,
@@ -1374,7 +1381,11 @@ impl WgpuBackendDriver {
             .unwrap_or(512 * 1024 * 1024)
             .min(MAX_RESIDENT_RESOURCE_BYTES);
         log::debug!("GPU residency budget: {resident_resource_budget} bytes");
+        #[cfg(feature = "performance-counters")]
+        let timings = timings::Timings::new(&device, &queue);
         Self {
+            #[cfg(feature = "performance-counters")]
+            timings,
             #[cfg(not(target_os = "macos"))]
             native: native_draw::NativeCache::new(native_vulkan),
             backend,
@@ -1404,6 +1415,7 @@ impl WgpuBackendDriver {
             upload_bytes: 0,
             upload_canonical: Vec::new(),
             upload_rgb565: Vec::new(),
+            block_decoder: compressed::BlockDecoder::default(),
             vertex_pull_binding_key: Vec::new(),
             draw_bind_groups: Vec::new(),
             compatible_color_attachments: Vec::new(),
@@ -1478,6 +1490,10 @@ impl WgpuBackendDriver {
             self.queue.submit(std::mem::take(&mut self.queued_commands))
         };
         self.upload_staging.recall();
+        #[cfg(feature = "performance-counters")]
+        if let Some(timings) = &mut self.timings {
+            timings.submitted();
+        }
         nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostQueueSubmissions, 1);
         let tokens = std::mem::take(&mut self.queued_submissions);
         for token in &tokens {
@@ -1511,6 +1527,7 @@ impl WgpuBackendDriver {
         self.upload_staging = StagingBelt::new(self.device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         self.upload_canonical = Vec::new();
         self.upload_rgb565 = Vec::new();
+        self.block_decoder = compressed::BlockDecoder::default();
         self.vertex_pull_binding_key = Vec::new();
         self.draw_bind_groups = Vec::new();
         self.compatible_color_attachments.clear();
@@ -1633,7 +1650,8 @@ impl WgpuBackendDriver {
             let first = &submission.operations()[access.first_operation()];
             let conversion_overwrite = matches!(first.command(), GpuCommand::ConvertNv12(conversion)
                 if conversion.destination.target() == access.target());
-            if !access.mode().reads() && !conversion_overwrite {
+            let host_image_upload = matches!(first.command(), GpuCommand::UploadImage { destination, .. } if destination.target() == access.target());
+            if !access.mode().reads() && !conversion_overwrite && !host_image_upload {
                 continue;
             }
             let handle = dependencies.indexed(access.dependency_index());
@@ -1660,6 +1678,9 @@ impl WgpuBackendDriver {
                             first.command()
                         {
                             image_region_is_full(*description, *target)?
+                        } else if let GpuCommand::UploadImage { destination, .. } = first.command()
+                        {
+                            image_region_is_full(*description, *destination)?
                         } else {
                             conversion_overwrite
                         };
@@ -1777,7 +1798,10 @@ impl WgpuBackendDriver {
             return Ok(());
         }
         for access in submission.access_plan().accesses() {
-            if !access.mode().reads() {
+            let first = &submission.operations()[access.first_operation()];
+            if !access.mode().reads()
+                && !matches!(first.command(), GpuCommand::UploadImage { destination, .. } if destination.target() == access.target())
+            {
                 continue;
             }
             let handle = dependencies.indexed(access.dependency_index());
@@ -2059,6 +2083,18 @@ impl WgpuBackendDriver {
             let host_block_bytes =
                 host_bytes_per_block(description.format(), domain.subresources.plane)?;
             for region in regions {
+                if compressed::decoded_texture_format(description).is_some() {
+                    self.upload_decoded_region(
+                        &texture,
+                        description,
+                        &domain,
+                        &canonical,
+                        region,
+                        columns,
+                        encoder,
+                    )?;
+                    continue;
+                }
                 let row_pitch = align_u32(
                     region
                         .width
@@ -2188,12 +2224,11 @@ impl WgpuBackendDriver {
                     image_region_is_full(*description, *destination)?;
                     if description.samples() != SampleCount::One
                         || description.format().block_extent() != [1, 1]
-                        || destination.extent.height != 1
                         || destination.extent.depth != 1
                         || destination.subresources.layer_count != 1
                     {
                         return Err(unsupported(
-                            "inline image upload requires a single uncompressed row",
+                            "inline image upload requires a single uncompressed 2D layer",
                         ));
                     }
                     let bpp = usize::from(
@@ -2212,10 +2247,20 @@ impl WgpuBackendDriver {
                             "inline image upload requires native color texels",
                         ));
                     }
-                    if bytes.len() != destination.extent.width as usize * bpp {
+                    let row_bytes = destination.extent.width as usize * bpp;
+                    if bytes.len() != row_bytes * destination.extent.height as usize {
                         return Err(unsupported("inline image upload byte count"));
                     }
+                    let row_pitch = align_u32(
+                        u32::try_from(row_bytes)
+                            .map_err(|_| unsupported("inline image upload row size"))?,
+                        wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+                    )? as usize;
                     let texture = texture.clone();
+                    nixe_gpu::metrics::record(
+                        nixe_gpu::metrics::Counter::ImageUploadedBytes,
+                        bytes.len() as u64,
+                    );
                     self.stage_texture_upload(
                         &mut encoder,
                         TexelCopyTextureInfo {
@@ -2228,19 +2273,23 @@ impl WgpuBackendDriver {
                             },
                             aspect: TextureAspect::All,
                         },
-                        bytes.len(),
+                        row_pitch * destination.extent.height as usize,
                         TexelCopyBufferLayout {
                             offset: 0,
-                            bytes_per_row: None,
+                            bytes_per_row: Some(row_pitch as u32),
                             rows_per_image: None,
                         },
                         Extent3d {
                             width: destination.extent.width,
-                            height: 1,
+                            height: destination.extent.height,
                             depth_or_array_layers: 1,
                         },
                         |mut mapped| {
-                            mapped.copy_from_slice(bytes);
+                            for (row, source) in bytes.chunks_exact(row_bytes).enumerate() {
+                                mapped
+                                    .slice(row * row_pitch..row * row_pitch + row_bytes)
+                                    .copy_from_slice(source);
+                            }
                             Ok(())
                         },
                     )?;
@@ -2490,6 +2539,13 @@ impl WgpuBackendDriver {
                         "image copy requires distinct single-sample 2D images of copy-compatible formats",
                     ));
                 }
+                if compressed::decoded_texture_format(*source_description).is_some()
+                    || compressed::decoded_texture_format(*destination_description).is_some()
+                {
+                    return Err(unsupported(
+                        "device copies to decoded compressed textures require original compressed block preservation",
+                    ));
+                }
                 image_region_is_full(*source_description, *source)?;
                 image_region_is_full(*destination_description, *destination)?;
                 let info = |texture, region: &ImageRegion| TexelCopyTextureInfo {
@@ -2571,6 +2627,11 @@ impl WgpuBackendDriver {
                 };
                 let texture = texture.clone();
                 let description = *description;
+                if compressed::decoded_texture_format(description).is_some() {
+                    return Err(unsupported(
+                        "clearing decoded compressed textures requires original compressed block preservation",
+                    ));
+                }
                 if description.format() == ImageFormat::Rgb565Unorm {
                     return Err(unsupported(
                         "RGB565 clear without packed-format quantization",
@@ -3353,6 +3414,7 @@ impl WgpuBackendDriver {
             dependencies,
             &draw.prepared.descriptor_tables,
             prepared.serial,
+            &[prepared.location.vertex, prepared.location.fragment],
             |group| prepared.pipeline.get_bind_group_layout(group),
             groups,
         )?;
@@ -3364,6 +3426,7 @@ impl WgpuBackendDriver {
         dependencies: &ResolvedBackendResources,
         tables: &[nixe_gpu::DescriptorTableId],
         pipeline_serial: u64,
+        shaders: &[BackendResourceHandle],
         layout: impl Fn(u32) -> wgpu::BindGroupLayout,
         groups: &mut Vec<BindGroup>,
     ) -> Result<(), BackendDriverError> {
@@ -3418,6 +3481,7 @@ impl WgpuBackendDriver {
                                     binding.binding,
                                     texture.create_view(&sampled_texture_view_descriptor(
                                         *description,
+                                        self.sampled_image_kind(shaders, binding.binding)?,
                                     )),
                                 )),
                                 _ => Err(kind_mismatch(handle)),
@@ -3591,6 +3655,38 @@ impl WgpuBackendDriver {
             self.vertex_pull_binding_key = key;
         }
         Ok(())
+    }
+
+    fn sampled_image_kind(
+        &self,
+        shaders: &[BackendResourceHandle],
+        binding: u8,
+    ) -> Result<nixe_gpu::ShaderResourceKind, BackendDriverError> {
+        let mut kind = None;
+        for &shader in shaders {
+            let Resource::Shader { neutral, .. } = self.resource(shader)? else {
+                return Err(kind_mismatch(shader));
+            };
+            if let Some(resource) = neutral.ir().ir().resources().iter().find(|resource| {
+                resource.binding() == binding
+                    && matches!(
+                        resource.kind(),
+                        nixe_gpu::ShaderResourceKind::SampledImage
+                            | nixe_gpu::ShaderResourceKind::SampledImage2DArray
+                            | nixe_gpu::ShaderResourceKind::SampledDepthImage
+                    )
+            }) {
+                if kind.is_some_and(|previous| previous != resource.kind()) {
+                    return Err(unsupported(
+                        "conflicting sampled-image dimensions across shader stages",
+                    ));
+                }
+                kind = Some(resource.kind());
+            }
+        }
+        kind.ok_or_else(|| {
+            unsupported("sampled image is absent from the graphics shader interface")
+        })
     }
 
     fn sampled_swizzles(
@@ -4217,6 +4313,7 @@ impl WgpuBackendDriver {
         encoder: &mut CommandEncoder,
         handle: BackendResourceHandle,
         binding_index: usize,
+        demanded_page: CanonicalPageId,
         output: &mut Vec<PendingWriteback>,
     ) -> Result<(), BackendDriverError> {
         let (texture, description) = match self.resource(handle)? {
@@ -4245,6 +4342,15 @@ impl WgpuBackendDriver {
             .and_then(|content| content.image_domains.get(binding_index))
             .cloned()
             .ok_or_else(|| unsupported("missing image writeback domain"))?;
+        #[cfg(feature = "performance-counters")]
+        if let Some(timings) = &self.timings {
+            timings.image_readback(description);
+        }
+        if compressed::decoded_texture_format(description).is_some() {
+            return Err(unsupported(
+                "device writes to decoded compressed textures require original compressed block preservation",
+            ));
+        }
         if description.format() == ImageFormat::Rgb565Unorm {
             return Err(unsupported(
                 "RGB565 device writes without packed-format quantization",
@@ -4304,6 +4410,7 @@ impl WgpuBackendDriver {
         );
         output.push(PendingWriteback::Image {
             staging,
+            demanded_page,
             backing: domain.backing,
             host_row_pitch,
             canonical_layout: domain.layout,
@@ -4371,6 +4478,7 @@ impl WgpuBackendDriver {
                 }
                 PendingWriteback::Image {
                     backing,
+                    demanded_page,
                     host_row_pitch,
                     canonical_layout,
                     bytes_per_texel,
@@ -4379,25 +4487,24 @@ impl WgpuBackendDriver {
                     depth_or_layers,
                     ..
                 } => {
-                    let mut canonical =
-                        vec![0; usize_from_u64(backing.size(), "image backing size",)?];
                     self.visibility
-                        .read_backing(backing, &mut canonical)
-                        .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-                    write_linear_image_to_canonical(
-                        &mapped,
-                        &mut canonical,
-                        *canonical_layout,
-                        ImageCopyShape {
-                            width: *width,
-                            height: *height,
-                            layers: *depth_or_layers,
-                            bytes_per_texel: *bytes_per_texel,
-                            host_row_pitch: *host_row_pitch,
-                        },
-                    )?;
-                    self.visibility
-                        .write_backing(backing, &canonical)
+                        .update_cached_backing(backing, *demanded_page, |canonical| {
+                            write_linear_image_to_canonical(
+                                &mapped,
+                                canonical,
+                                *canonical_layout,
+                                ImageCopyShape {
+                                    width: *width,
+                                    height: *height,
+                                    layers: *depth_or_layers,
+                                    bytes_per_texel: *bytes_per_texel,
+                                    host_row_pitch: *host_row_pitch,
+                                },
+                            )
+                            .map_err(|error| {
+                                nixe_memory::VisibilityCoordinatorError::new(error.to_string())
+                            })
+                        })
                         .map_err(|error| BackendDriverError::failure(error.to_string()))?;
                 }
             }
@@ -4983,7 +5090,7 @@ impl WgpuBackendDriver {
             BackendResourceCreateInfo::Image {
                 description, view, ..
             } => {
-                let plan = if description.samples() == SampleCount::One {
+                let mut plan = if description.samples() == SampleCount::One {
                     image_texture_plan(
                         description.format(),
                         view.as_ref()
@@ -4997,6 +5104,9 @@ impl WgpuBackendDriver {
                             .is_some_and(|view| view.has_canonical_texels()),
                     )?
                 };
+                if let Some(format) = compressed::decoded_texture_format(*description) {
+                    plan.format = format;
+                }
                 Resource::Image {
                     texture: self.device.create_texture(&TextureDescriptor {
                         label: Some("Nixe neutral image"),
@@ -5027,21 +5137,33 @@ impl WgpuBackendDriver {
                     native_initialized: false,
                 }
             }
-            BackendResourceCreateInfo::Sampler { description, .. } => Resource::Sampler {
-                sampler: self.device.create_sampler(&wgpu::SamplerDescriptor {
-                    label: Some("Nixe neutral sampler"),
-                    address_mode_u: address_mode(description.address_modes[0]),
-                    address_mode_v: address_mode(description.address_modes[1]),
-                    address_mode_w: address_mode(description.address_modes[2]),
-                    mag_filter: filter_mode(description.mag_filter),
-                    min_filter: filter_mode(description.min_filter),
-                    mipmap_filter: mip_filter_mode(description.mip_filter),
-                    lod_min_clamp: description.lod_min,
-                    lod_max_clamp: description.lod_max,
-                    anisotropy_clamp: description.max_anisotropy as u16,
-                    ..Default::default()
-                }),
-            },
+            BackendResourceCreateInfo::Sampler { description, .. } => {
+                let border_color = sampler_border_color(description)?;
+                if border_color.is_some()
+                    && !self
+                        .device
+                        .features()
+                        .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER)
+                {
+                    return Err(unsupported("host adapter lacks clamp-to-border addressing"));
+                }
+                Resource::Sampler {
+                    sampler: self.device.create_sampler(&wgpu::SamplerDescriptor {
+                        label: Some("Nixe neutral sampler"),
+                        address_mode_u: address_mode(description.address_modes[0]),
+                        address_mode_v: address_mode(description.address_modes[1]),
+                        address_mode_w: address_mode(description.address_modes[2]),
+                        mag_filter: filter_mode(description.mag_filter),
+                        min_filter: filter_mode(description.min_filter),
+                        mipmap_filter: mip_filter_mode(description.mip_filter),
+                        lod_min_clamp: description.lod_min,
+                        lod_max_clamp: description.lod_max,
+                        anisotropy_clamp: description.max_anisotropy as u16,
+                        border_color,
+                        ..Default::default()
+                    }),
+                }
+            }
             BackendResourceCreateInfo::Shader { module, .. } => Resource::Shader {
                 module: None,
                 neutral: module.clone(),
@@ -5182,11 +5304,16 @@ impl WgpuBackendDriver {
         Ok(())
     }
 
+    #[cfg_attr(feature = "performance-counters", track_caller)]
     fn materialize_cpu_page(
         &mut self,
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, BackendDriverError> {
         self.flush_queued_commands();
+        #[cfg(feature = "performance-counters")]
+        if let Some(timings) = &self.timings {
+            timings.readback_request(std::panic::Location::caller());
+        }
         let mut demanded = Vec::new();
         for candidate in self.page_resources.get(request.page) {
             let record = self.resource_record(candidate.handle)?;
@@ -5210,9 +5337,13 @@ impl WgpuBackendDriver {
                     )?,
                     DemandedWriteback::Image {
                         handle, binding, ..
-                    } => {
-                        self.encode_image_writeback(&mut encoder, handle, binding, &mut writebacks)?
-                    }
+                    } => self.encode_image_writeback(
+                        &mut encoder,
+                        handle,
+                        binding,
+                        request.page,
+                        &mut writebacks,
+                    )?,
                 }
             }
             {
@@ -5341,25 +5472,7 @@ impl BackendDriver for WgpuBackendDriver {
         info: &BackendResourceCreateInfo,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
-        if let BackendResourceCreateInfo::Image { description, .. } = info {
-            let [bw, bh] = description.format().block_extent();
-            if !description.extent().width.is_multiple_of(bw)
-                || !description.extent().height.is_multiple_of(bh)
-            {
-                return Err(unsupported(
-                    "compressed base image extent is not block-aligned",
-                ));
-            }
-        }
         if let BackendResourceCreateInfo::Sampler { description, .. } = info {
-            if description
-                .address_modes
-                .contains(&nixe_gpu::AddressMode::ClampToBorder)
-            {
-                return Err(unsupported(
-                    "clamp-to-border sampler without a neutral border color",
-                ));
-            }
             if description.max_anisotropy.fract() != 0.0 || description.max_anisotropy > 16.0 {
                 return Err(unsupported("sampler anisotropy outside exact wgpu range"));
             }
@@ -5465,7 +5578,16 @@ impl BackendDriver for WgpuBackendDriver {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Nixe neutral submission"),
             });
+        #[cfg(feature = "performance-counters")]
+        let timing_sample = self
+            .timings
+            .as_mut()
+            .and_then(|timings| timings.begin(&self.device, &mut encoder, accepted.submission()));
         self.upload_inputs(accepted, dependencies, &mut encoder)?;
+        #[cfg(feature = "performance-counters")]
+        if let Some(sample) = &timing_sample {
+            sample.uploaded(&mut encoder);
+        }
         let EncodedSubmission {
             last: encoder,
             segments,
@@ -5474,6 +5596,12 @@ impl BackendDriver for WgpuBackendDriver {
             #[cfg(not(target_os = "macos"))]
             native_blit_textures,
         } = self.encode_submission(accepted, dependencies, encoder)?;
+        #[cfg(feature = "performance-counters")]
+        let mut encoder = encoder;
+        #[cfg(feature = "performance-counters")]
+        if let Some(sample) = timing_sample {
+            self.timings.as_mut().unwrap().finish(sample, &mut encoder);
+        }
         // Finish fallible write tracking and superseded-resource bookkeeping
         // before host acceptance. An error after queue.submit would otherwise
         // make the neutral backend treat accepted GPU work as rejected.
@@ -5756,6 +5884,35 @@ pub(crate) const fn texture_format(format: ImageFormat) -> Option<TextureFormat>
         ImageFormat::Bc1RgbUnorm | ImageFormat::Bc1RgbaUnorm => TextureFormat::Bc1RgbaUnorm,
         ImageFormat::Bc1RgbSrgb | ImageFormat::Bc1RgbaSrgb => TextureFormat::Bc1RgbaUnormSrgb,
         ImageFormat::Bc4RUnorm => TextureFormat::Bc4RUnorm,
+        ImageFormat::Bc5RgUnorm => TextureFormat::Bc5RgUnorm,
+        ImageFormat::Astc4x4Unorm
+        | ImageFormat::Astc5x4Unorm
+        | ImageFormat::Astc5x5Unorm
+        | ImageFormat::Astc6x5Unorm
+        | ImageFormat::Astc6x6Unorm
+        | ImageFormat::Astc8x5Unorm
+        | ImageFormat::Astc8x6Unorm
+        | ImageFormat::Astc8x8Unorm
+        | ImageFormat::Astc10x5Unorm
+        | ImageFormat::Astc10x6Unorm
+        | ImageFormat::Astc10x8Unorm
+        | ImageFormat::Astc10x10Unorm
+        | ImageFormat::Astc12x10Unorm
+        | ImageFormat::Astc12x12Unorm => TextureFormat::Rgba16Float,
+        ImageFormat::Astc4x4Srgb
+        | ImageFormat::Astc5x4Srgb
+        | ImageFormat::Astc5x5Srgb
+        | ImageFormat::Astc6x5Srgb
+        | ImageFormat::Astc6x6Srgb
+        | ImageFormat::Astc8x5Srgb
+        | ImageFormat::Astc8x6Srgb
+        | ImageFormat::Astc8x8Srgb
+        | ImageFormat::Astc10x5Srgb
+        | ImageFormat::Astc10x6Srgb
+        | ImageFormat::Astc10x8Srgb
+        | ImageFormat::Astc10x10Srgb
+        | ImageFormat::Astc12x10Srgb
+        | ImageFormat::Astc12x12Srgb => TextureFormat::Rgba8UnormSrgb,
         ImageFormat::R8Unorm => TextureFormat::R8Unorm,
         ImageFormat::Rg8Unorm => TextureFormat::Rg8Unorm,
         ImageFormat::Rgba8Unorm => TextureFormat::Rgba8Unorm,
@@ -5924,11 +6081,14 @@ fn texture_view_descriptor(range: ImageSubresourceRange) -> TextureViewDescripto
 
 fn sampled_texture_view_descriptor(
     description: ImageDescription,
+    kind: nixe_gpu::ShaderResourceKind,
 ) -> TextureViewDescriptor<'static> {
     let dimension = match description.dimension() {
         ImageDimension::One => TextureViewDimension::D1,
-        ImageDimension::Two if description.array_layers() == 1 => TextureViewDimension::D2,
-        ImageDimension::Two => TextureViewDimension::D2Array,
+        ImageDimension::Two if kind == nixe_gpu::ShaderResourceKind::SampledImage2DArray => {
+            TextureViewDimension::D2Array
+        }
+        ImageDimension::Two => TextureViewDimension::D2,
         ImageDimension::Three => TextureViewDimension::D3,
         ImageDimension::Cube if description.array_layers() == 6 => TextureViewDimension::Cube,
         ImageDimension::Cube => TextureViewDimension::CubeArray,
@@ -5939,7 +6099,11 @@ fn sampled_texture_view_descriptor(
         base_mip_level: 0,
         mip_level_count: Some(u32::from(description.mip_levels())),
         base_array_layer: 0,
-        array_layer_count: Some(u32::from(description.array_layers())),
+        array_layer_count: Some(if dimension == TextureViewDimension::D2 {
+            1
+        } else {
+            u32::from(description.array_layers())
+        }),
         aspect: if description.kind() == nixe_gpu::ImageKind::DepthStencil {
             TextureAspect::DepthOnly
         } else {
@@ -6385,7 +6549,18 @@ fn estimated_resident_bytes(info: &BackendResourceCreateInfo) -> Result<u64, Bac
             let bytes_per_block =
                 (0..description.format().plane_count()).try_fold(0_u64, |total, plane| {
                     total
-                        .checked_add(host_bytes_per_block(description.format(), plane)? as u64)
+                        .checked_add(
+                            if let Some(format) = compressed::decoded_texture_format(*description) {
+                                let [bw, bh] = description.format().block_extent();
+                                u64::from(bw)
+                                    * u64::from(bh)
+                                    * u64::from(format.block_copy_size(None).ok_or_else(|| {
+                                        unsupported("decoded texture residency format")
+                                    })?)
+                            } else {
+                                host_bytes_per_block(description.format(), plane)? as u64
+                            },
+                        )
                         .ok_or_else(|| unsupported("image residency size overflow"))
                 })?;
             let mut blocks = 0_u64;
@@ -6436,6 +6611,9 @@ fn host_bytes_per_block(format: ImageFormat, plane: u8) -> Result<usize, Backend
         .ok_or_else(|| unsupported("image plane format"))?;
     Ok(if format == ImageFormat::Rgb565Unorm {
         16
+    } else if let Some(srgb) = format.astc_profile() {
+        let [width, height] = format.block_extent();
+        (width * height) as usize * if srgb { 4 } else { 8 }
     } else {
         usize::from(canonical)
     })
@@ -6966,6 +7144,33 @@ fn mip_filter_mode(mode: nixe_gpu::FilterMode) -> wgpu::MipmapFilterMode {
     }
 }
 
+fn sampler_border_color(
+    description: &nixe_gpu::SamplerDescription,
+) -> Result<Option<wgpu::SamplerBorderColor>, BackendDriverError> {
+    if !description
+        .address_modes
+        .contains(&nixe_gpu::AddressMode::ClampToBorder)
+    {
+        return Ok(None);
+    }
+    let bits = description
+        .border_color
+        .ok_or_else(|| unsupported("clamp-to-border sampler has no explicit border color"))?;
+    let one = 1.0_f32.to_bits();
+    let color = if bits == [0; 4] {
+        wgpu::SamplerBorderColor::TransparentBlack
+    } else if bits == [0, 0, 0, one] {
+        wgpu::SamplerBorderColor::OpaqueBlack
+    } else if bits == [one; 4] {
+        wgpu::SamplerBorderColor::OpaqueWhite
+    } else {
+        return Err(BackendDriverError::failure(format!(
+            "custom sampler border color is unavailable on the WGPU backend: rgba-f32-bits={bits:08x?}"
+        )));
+    };
+    Ok(Some(color))
+}
+
 fn address_mode(mode: nixe_gpu::AddressMode) -> wgpu::AddressMode {
     match mode {
         nixe_gpu::AddressMode::Repeat => wgpu::AddressMode::Repeat,
@@ -7445,7 +7650,10 @@ mod tests {
         )
         .unwrap();
 
-        let view = sampled_texture_view_descriptor(description);
+        let view = sampled_texture_view_descriptor(
+            description,
+            nixe_gpu::ShaderResourceKind::SampledImage2DArray,
+        );
         assert_eq!(view.dimension, Some(TextureViewDimension::D2Array));
         assert_eq!(view.array_layer_count, Some(7));
     }

@@ -199,7 +199,7 @@ impl BlitOperation {
     ) -> Result<Self, CommandDescriptionError> {
         if self.formats.iter().any(|format| format.is_depth_stencil())
             || origin.iter().any(|value| !value.is_finite())
-            || step.iter().any(|value| !value.is_finite() || *value <= 0.0)
+            || step.iter().any(|value| !value.is_finite() || *value == 0.0)
         {
             return Err(CommandDescriptionError::InvalidImageBlit);
         }
@@ -211,7 +211,12 @@ impl BlitOperation {
                 self.destination.extent.height,
             ][axis];
             let last = origin[axis] + (count - 1) as f32 * step[axis];
-            if origin[axis] < low || origin[axis] >= high || !last.is_finite() || last >= high {
+            if origin[axis] < low
+                || origin[axis] >= high
+                || !last.is_finite()
+                || last < low
+                || last >= high
+            {
                 return Err(CommandDescriptionError::InvalidImageBlit);
             }
         }

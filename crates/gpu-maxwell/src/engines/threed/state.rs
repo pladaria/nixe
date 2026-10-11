@@ -932,10 +932,10 @@ impl MaxwellThreeDViewportState {
     }
 }
 
-/// Typed 3D state retained by an operation after its triggering method.
-///
-/// Frontend-only register and MME state deliberately live outside this value,
-/// so queued operations do not retain or copy command-decoding state.
+/// Live typed state owned by one channel's frontend. Operations consume it by
+/// borrowing during lowering; queued backend work retains lowered values.
+/// Only shader bindings are shared with the translation cache. Other domains
+/// have one owner and require no copy-on-write check on each register write.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDState {
     // Revisions are local to one register-file lifetime. Retain a namespace
@@ -949,26 +949,26 @@ pub struct MaxwellThreeDState {
     texture_revision: u64,
     sample_mode_revision: u64,
     shader_revision: u64,
-    render_targets: Arc<MaxwellThreeDRenderTargetState>,
-    fixed_function: Arc<MaxwellThreeDFixedFunctionState>,
-    vertex_input: Arc<MaxwellThreeDVertexInputState>,
+    render_targets: Box<MaxwellThreeDRenderTargetState>,
+    fixed_function: Box<MaxwellThreeDFixedFunctionState>,
+    vertex_input: Box<MaxwellThreeDVertexInputState>,
     shader_bindings: Arc<MaxwellThreeDShaderBindingState>,
-    raster: Arc<MaxwellThreeDRasterState>,
-    viewport: Arc<MaxwellThreeDViewportState>,
-    render_enable: Arc<MaxwellThreeDRenderEnableState>,
-    shader_execution: Arc<MaxwellThreeDShaderExecutionState>,
-    color_reduction: Arc<MaxwellThreeDColorReductionState>,
-    constant_color_rendering: Arc<MaxwellThreeDConstantColorRenderingState>,
-    coverage: Arc<MaxwellThreeDCoverageState>,
-    line: Arc<MaxwellThreeDLineState>,
-    zcull: Arc<MaxwellThreeDZCullState>,
-    l2_cache: Arc<MaxwellThreeDL2CacheState>,
-    report_semaphore: Arc<MaxwellThreeDReportSemaphoreState>,
-    counters: Arc<MaxwellThreeDCounterState>,
-    falcon: Arc<MaxwellThreeDFalconState>,
-    instrumentation: Arc<MaxwellThreeDInstrumentationState>,
-    inline_to_memory: Arc<MaxwellThreeDInlineToMemoryState>,
-    tiled_cache: Arc<MaxwellThreeDTiledCacheState>,
+    raster: Box<MaxwellThreeDRasterState>,
+    viewport: Box<MaxwellThreeDViewportState>,
+    render_enable: Box<MaxwellThreeDRenderEnableState>,
+    shader_execution: Box<MaxwellThreeDShaderExecutionState>,
+    color_reduction: Box<MaxwellThreeDColorReductionState>,
+    constant_color_rendering: Box<MaxwellThreeDConstantColorRenderingState>,
+    coverage: Box<MaxwellThreeDCoverageState>,
+    line: Box<MaxwellThreeDLineState>,
+    zcull: Box<MaxwellThreeDZCullState>,
+    l2_cache: Box<MaxwellThreeDL2CacheState>,
+    report_semaphore: Box<MaxwellThreeDReportSemaphoreState>,
+    counters: Box<MaxwellThreeDCounterState>,
+    falcon: Box<MaxwellThreeDFalconState>,
+    instrumentation: Box<MaxwellThreeDInstrumentationState>,
+    inline_to_memory: Box<MaxwellThreeDInlineToMemoryState>,
+    tiled_cache: Box<MaxwellThreeDTiledCacheState>,
 }
 
 /// Retained identity of the state domains which determine resource bindings.
@@ -1236,6 +1236,7 @@ impl MaxwellThreeDState {
                 matches!(
                     role,
                     MaxwellThreeDResourceRole::ConstantBuffer { .. }
+                        | MaxwellThreeDResourceRole::StorageBuffer { .. }
                         | MaxwellThreeDResourceRole::SampledImage { .. }
                         | MaxwellThreeDResourceRole::Sampler(_)
                 )
@@ -1409,7 +1410,9 @@ impl MaxwellThreeDState {
 
 impl MaxwellThreeDFrontendState {
     pub(super) fn refresh_semantic_identities(&mut self, register_changed: bool) {
-        if !register_changed {
+        // Binding consumes the selector's address and size, not just the raw
+        // enable/slot word. apply() compares that effective binding separately.
+        if !register_changed && !self.resource_semantic_writes.constant_buffers {
             return;
         }
         if !self.resource_semantic_writes.any() && !self.shader_semantic_write {
@@ -1443,62 +1446,81 @@ impl MaxwellThreeDFrontendState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDStateWrite) {
         self.resource_semantic_writes = write.resource_semantic_writes();
+        if let MaxwellThreeDStateWrite::ShaderBinding(
+            MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
+                group,
+                slot,
+                enabled,
+                address,
+                size,
+                ..
+            },
+        ) = write
+        {
+            let previous = self.operation_state().shader_bindings().groups()[group as usize]
+                .constant_buffers()[slot as usize];
+            self.resource_semantic_writes.constant_buffers = previous.is_none_or(|previous| {
+                previous.enabled() != enabled
+                    || previous.address() != address
+                    || previous.size() != size
+            });
+        }
         self.resource_semantic_writes.draw_state = write.affects_prepared_draw();
         self.shader_semantic_write = write.affects_shader_translation();
         match write {
             MaxwellThreeDStateWrite::PointSize { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).point_size =
+                self.operation_state_mut().raster.point_size =
                     MaxwellThreeDRegister::programmed(value.bits(), value, source);
             }
             MaxwellThreeDStateWrite::InlineToMemory(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().inline_to_memory).apply(write);
+                self.operation_state_mut().inline_to_memory.apply(write);
             }
             MaxwellThreeDStateWrite::AttributePointSize { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).attribute_point_size =
+                self.operation_state_mut().raster.attribute_point_size =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::PointSpriteEnable { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).point_sprite_enable =
+                self.operation_state_mut().raster.point_sprite_enable =
                     MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDStateWrite::AntiAliasedPointEnable { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).anti_aliased_point_enable =
+                self.operation_state_mut().raster.anti_aliased_point_enable =
                     MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDStateWrite::PointSpriteSelect { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).point_sprite_select =
+                self.operation_state_mut().raster.point_sprite_select =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::PointCenterMode { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).point_center_mode =
+                self.operation_state_mut().raster.point_center_mode =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::EdgeFlag { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).edge_flag =
+                self.operation_state_mut().raster.edge_flag =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::AlphaFraction { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).alpha_fraction =
+                self.operation_state_mut().raster.alpha_fraction =
                     MaxwellThreeDRegister::programmed(u32::from(value.raw()), value, source);
             }
             MaxwellThreeDStateWrite::RasterBoundingBox { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).bounding_box =
+                self.operation_state_mut().raster.bounding_box =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::FillViaTriangle { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).fill_via_triangle =
+                self.operation_state_mut().raster.fill_via_triangle =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::ConservativeRaster { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).conservative_raster =
+                self.operation_state_mut().raster.conservative_raster =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::PolygonSmoothEnable { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).polygon_smooth_enable =
+                self.operation_state_mut().raster.polygon_smooth_enable =
                     MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDStateWrite::PolygonStippleEnable { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).polygon_stipple_enable =
+                self.operation_state_mut().raster.polygon_stipple_enable =
                     MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDStateWrite::PolygonStipplePattern {
@@ -1506,68 +1528,65 @@ impl MaxwellThreeDFrontendState {
                 value,
                 source,
             } => {
-                Arc::make_mut(&mut self.operation_state_mut().raster).polygon_stipple_pattern
-                    [word as usize] = MaxwellThreeDRegister::programmed(value, value, source);
+                self.operation_state_mut().raster.polygon_stipple_pattern[word as usize] =
+                    MaxwellThreeDRegister::programmed(value, value, source);
             }
             MaxwellThreeDStateWrite::ViewportZClip { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().viewport).z_clip_range =
+                self.operation_state_mut().viewport.z_clip_range =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::ViewportPixelCenter { value, source } => {
-                Arc::make_mut(&mut self.operation_state_mut().viewport).pixel_center =
+                self.operation_state_mut().viewport.pixel_center =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::RenderTarget(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().render_targets).apply(write);
+                self.operation_state_mut().render_targets.apply(write);
             }
             MaxwellThreeDStateWrite::FixedFunction(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().fixed_function).apply(write);
+                self.operation_state_mut().fixed_function.apply(write);
             }
             MaxwellThreeDStateWrite::VertexInput(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().vertex_input).apply(write);
+                self.operation_state_mut().vertex_input.apply(write);
             }
             MaxwellThreeDStateWrite::ShaderBinding(write) => {
                 Arc::make_mut(&mut self.operation_state_mut().shader_bindings).apply(write);
             }
             MaxwellThreeDStateWrite::RenderEnable(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().render_enable).apply(write)
+                self.operation_state_mut().render_enable.apply(write)
             }
             MaxwellThreeDStateWrite::ShaderExecution(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().shader_execution).apply(write)
+                self.operation_state_mut().shader_execution.apply(write)
             }
             MaxwellThreeDStateWrite::ColorReduction(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().color_reduction).apply(write)
+                self.operation_state_mut().color_reduction.apply(write)
             }
             MaxwellThreeDStateWrite::ConstantColorRendering(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().constant_color_rendering)
+                self.operation_state_mut()
+                    .constant_color_rendering
                     .apply(write);
             }
             MaxwellThreeDStateWrite::Coverage(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().coverage).apply(write)
+                self.operation_state_mut().coverage.apply(write)
             }
-            MaxwellThreeDStateWrite::Line(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().line).apply(write)
-            }
-            MaxwellThreeDStateWrite::ZCull(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().zcull).apply(write)
-            }
+            MaxwellThreeDStateWrite::Line(write) => self.operation_state_mut().line.apply(write),
+            MaxwellThreeDStateWrite::ZCull(write) => self.operation_state_mut().zcull.apply(write),
             MaxwellThreeDStateWrite::L2Cache(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().l2_cache).apply(write)
+                self.operation_state_mut().l2_cache.apply(write)
             }
             MaxwellThreeDStateWrite::ReportSemaphore(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().report_semaphore).apply(write)
+                self.operation_state_mut().report_semaphore.apply(write)
             }
             MaxwellThreeDStateWrite::Counter(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().counters).apply(write)
+                self.operation_state_mut().counters.apply(write)
             }
             MaxwellThreeDStateWrite::Instrumentation(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().instrumentation).apply(write)
+                self.operation_state_mut().instrumentation.apply(write)
             }
             MaxwellThreeDStateWrite::TiledCache(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().tiled_cache).apply(write)
+                self.operation_state_mut().tiled_cache.apply(write)
             }
             MaxwellThreeDStateWrite::FalconMaskedRegister(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().falcon).apply(write);
+                self.operation_state_mut().falcon.apply(write);
                 let completion = MaxwellThreeDMmeStateWrite::ShadowScratch {
                     index: MaxwellThreeDMmeShadowScratchIndex::new(0),
                     value: 1,

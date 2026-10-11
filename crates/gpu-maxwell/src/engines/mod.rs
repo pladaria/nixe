@@ -8,6 +8,7 @@ mod compute;
 mod dma_copy;
 mod inline_to_memory;
 mod lowering;
+pub(crate) use lowering::MaxwellShaderBufferSize;
 pub(crate) mod memory_copy;
 mod spa;
 mod threed;
@@ -286,9 +287,14 @@ pub(crate) struct MaxwellEngineEvent<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellHostSynchronizationOperation {
     operation: MaxwellHostSynchronizationKind,
+    source: MaxwellMethodSource,
 }
 
 impl MaxwellHostSynchronizationOperation {
+    pub(crate) const fn source(self) -> MaxwellMethodSource {
+        self.source
+    }
+
     #[must_use]
     pub const fn operation(self) -> MaxwellHostSynchronizationKind {
         self.operation
@@ -834,7 +840,10 @@ fn preflight_host_method(method: MaxwellMethodDispatch, host: MaxwellHostMethod)
                 "SEMAPHORED",
             ),
             Some(PendingEngineOperation::HostSynchronization(
-                MaxwellHostSynchronizationOperation { operation },
+                MaxwellHostSynchronizationOperation {
+                    operation,
+                    source: method.source(),
+                },
             )),
         ),
         MaxwellHostMethod::SetReference => AppliedMethod::new(
@@ -848,6 +857,7 @@ fn preflight_host_method(method: MaxwellMethodDispatch, host: MaxwellHostMethod)
             Some(PendingEngineOperation::HostSynchronization(
                 MaxwellHostSynchronizationOperation {
                     operation: MaxwellHostSynchronizationKind::WaitForIdle { all: true },
+                    source: method.source(),
                 },
             )),
         ),
@@ -862,6 +872,7 @@ fn preflight_host_method(method: MaxwellMethodDispatch, host: MaxwellHostMethod)
             Some(PendingEngineOperation::HostSynchronization(
                 MaxwellHostSynchronizationOperation {
                     operation: MaxwellHostSynchronizationKind::WaitForIdle { all },
+                    source: method.source(),
                 },
             )),
         ),
@@ -894,7 +905,10 @@ fn preflight_host_method(method: MaxwellMethodDispatch, host: MaxwellHostMethod)
                 "MEM_OP_B",
             ),
             Some(PendingEngineOperation::HostSynchronization(
-                MaxwellHostSynchronizationOperation { operation },
+                MaxwellHostSynchronizationOperation {
+                    operation,
+                    source: method.source(),
+                },
             )),
         ),
     }
@@ -1008,7 +1022,6 @@ fn dispatch_class_method(
     method: MaxwellMethodDispatch,
 ) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
     let classes = channel.profile().classes();
-    let profile = channel.profile();
     let class = method.class();
     if class == compute::CLASS {
         return compute::preflight(class, method, channel.compute_mut());
@@ -1020,7 +1033,8 @@ fn dispatch_class_method(
         return inline_to_memory::preflight(method, channel.inline_to_memory_mut());
     }
     if class == threed::CLASS {
-        return threed::preflight(profile, method, channel.three_d_mut());
+        let (profile, state) = channel.three_d_with_profile_mut();
+        return threed::preflight(profile, method, state);
     }
     if class == twod::CLASS {
         return twod::preflight(method, channel.two_d_mut());

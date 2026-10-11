@@ -73,10 +73,16 @@ fn shader(operator: u8) -> VerifiedShaderIr {
             addend: R::new(4),
             float_control: control,
         },
-        3 | 4 => Op::ConvertIntegerToFloat32 {
+        3 | 4 | 9..=14 => Op::ConvertIntegerToFloat32 {
+            rounding: match operator {
+                9 | 10 => ShaderRoundingMode::TowardZero,
+                11 | 12 => ShaderRoundingMode::TowardNegative,
+                13 | 14 => ShaderRoundingMode::TowardPositive,
+                _ => ShaderRoundingMode::NearestEven,
+            },
             destination: R::new(5),
             source: R::new(2),
-            source_type: if operator == 3 {
+            source_type: if operator == 3 || (operator >= 9 && operator % 2 == 1) {
                 Ty::Signed32
             } else {
                 Ty::Unsigned32
@@ -96,6 +102,20 @@ fn shader(operator: u8) -> VerifiedShaderIr {
         8 => Op::PackHalf32 {
             destination: R::new(5),
             source: R::new(2),
+        },
+        15..=22 => Op::ShiftRight32 {
+            destination: R::new(5),
+            value: R::new(2),
+            amount: R::new(3),
+            signed: (operator - 15) & 1 != 0,
+            reverse: (operator - 15) & 2 != 0,
+            wrap: (operator - 15) & 4 != 0,
+        },
+        23 | 24 => Op::ShiftLeft32 {
+            destination: R::new(5),
+            value: R::new(2),
+            amount: R::new(3),
+            wrap: operator == 24,
         },
         _ => unreachable!(),
     });
@@ -150,6 +170,11 @@ fn cases() -> Vec<[u32; 3]> {
         0xfeff_fffd,
     ] {
         cases.push([bits, 0, 0]);
+    }
+    for value in [0, 1, 0x8000_0000, 0x7654_3210, u32::MAX] {
+        for amount in [0, 1, 2, 16, 31, 32, 33, 63, 64, u32::MAX] {
+            cases.push([value, amount, 0]);
+        }
     }
     // Signed zeros, subnormal inputs, cancellation, rounding boundary, Inf/NaN.
     let special = [
@@ -430,13 +455,12 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
         contents: &vertices,
         usage: wgpu::BufferUsages::VERTEX,
     });
-    for (operator, wgsl) in
-        (0..9)
-            .map(|op| (op, false))
-            .chain([(5, true), (6, true), (7, true), (8, true)])
+    for (operator, wgsl) in (0..25)
+        .map(|op| (op, false))
+        .chain((5..25).map(|op| (op, true)))
     {
         let conversion_cases;
-        let cases = if operator >= 6 {
+        let cases = if (6..=8).contains(&operator) {
             conversion_cases = if operator < 8 {
                 (0..65536_u32)
                     .map(|i| [i | ((65535 - i) << 16), 0, 0])

@@ -65,10 +65,8 @@ pub(crate) struct MaxwellShaderProgramHeader {
     sph_type: u8,
     version: u8,
     pub(super) stage: MaxwellShaderStage,
-    kills_pixels: bool,
     does_global_store: bool,
     sass_version: u8,
-    does_load_or_store: bool,
     does_fp64: bool,
     stream_out_mask: u8,
 }
@@ -356,6 +354,7 @@ pub(super) fn read_shader_code(
         0
     };
     let mut bundles = Vec::new();
+    let mut furthest_target = 0_u32;
     let code_address =
         address
             .checked_add(header_size as u64)
@@ -396,10 +395,35 @@ pub(super) fn read_shader_code(
             control: words[0],
             instructions: [words[1], words[2], words[3]],
         };
-        let exits = bundle
-            .instructions
-            .iter()
-            .any(|instruction| instruction >> 48 == 0xe300);
+        // A conditional EXIT only ends lanes taking that predicate. Forward
+        // branch/stack targets can also lead past an earlier unconditional EXIT.
+        // Retain the bounded lexical extent of every discovered direct target;
+        // CFG discovery below excludes unreachable instructions in that extent.
+        // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/control_flow.cpp (AnalyzeInst)
+        let mut exits = false;
+        for (slot, &word) in bundle.instructions.iter().enumerate() {
+            use super::control_flow::{
+                decode_shader_control_target, is_branch, is_exit, is_loop_push, is_set_sync_point,
+            };
+            use super::decode::decode_predicate;
+            use nixe_gpu::ShaderPredicate;
+            let offset = bundle.offset + 8 + slot as u32 * 8;
+            if is_set_sync_point(word)
+                || is_loop_push(word)
+                || (is_branch(word) && decode_predicate(word) != ShaderPredicate::Never)
+            {
+                let target =
+                    decode_shader_control_target(stage, offset, word, max_code_bytes as u32)?;
+                furthest_target = furthest_target.max(target.byte_offset());
+            }
+            if is_exit(word)
+                && decode_predicate(word) == ShaderPredicate::Always
+                && offset >= furthest_target
+            {
+                exits = true;
+                break;
+            }
+        }
         bundles.push(bundle);
         if exits {
             if source_cpu_writes
@@ -502,10 +526,8 @@ pub(super) fn decode_program_header(
         sph_type: (common & 0x1f) as u8,
         version: ((common >> 5) & 0x1f) as u8,
         stage,
-        kills_pixels: common & (1 << 15) != 0,
         does_global_store: common & (1 << 16) != 0,
         sass_version: ((common >> 17) & 0xf) as u8,
-        does_load_or_store: common & (1 << 26) != 0,
         does_fp64: common & (1 << 27) != 0,
         stream_out_mask: (common >> 28) as u8,
     })
@@ -552,10 +574,12 @@ pub(super) fn validate_program_header(
             version: header.sass_version,
         });
     }
+    // DoesLoadOrStore enables the ISA load/store path; setting it does not
+    // require any particular memory instruction. Validate consumed opcodes,
+    // rather than rejecting a shader merely for enabling this power domain.
+    // https://download.nvidia.com/open-gpu-doc/Shader-Program-Header/1/Shader-Program-Header.html#CommonWord0
     for (enabled, feature) in [
-        (header.kills_pixels, "pixel-kill"),
         (header.does_global_store, "global-store"),
-        (header.does_load_or_store, "memory-load/store"),
         (header.does_fp64, "FP64"),
         (header.stream_out_mask != 0, "stream-output"),
     ] {

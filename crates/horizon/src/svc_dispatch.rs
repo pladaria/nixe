@@ -1260,14 +1260,6 @@ fn reject(
 }
 
 fn result(context: &mut ExceptionDispatchContext<'_>, value: HorizonKernelResult) {
-    // VIDEO_PROBE_BEGIN
-    if std::env::var_os("NIXE_VIDEO_AUDIT").is_some()
-        && !matches!(value, HorizonKernelResult::SUCCESS | HorizonKernelResult::TIMED_OUT | HorizonKernelResult::CANCELLED)
-    {
-        let r = context.thread().state().register_context();
-        log::debug!("VIDEO_PROBE kernel-error: thread={} pc={:#x} code={value:?} args={:x?}", context.thread().object().thread_id(), context.thread().state().pc(), &r.x[..4]);
-    }
-    // VIDEO_PROBE_END
     write_register(context.thread_mut().state_mut(), 0, u64::from(value.raw()));
 }
 

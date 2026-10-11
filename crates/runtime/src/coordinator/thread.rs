@@ -232,21 +232,28 @@ impl RuntimeCoordinator {
         process_id: ProcessId,
         addresses: &[u64],
     ) -> Result<(), ThreadOperationError> {
+        let process = self
+            .processes
+            .get(&process_id)
+            .ok_or(ThreadOperationError::Internal)?;
+        let previous_count = self.priority_donations.len();
         self.priority_donations.retain(|donation| {
             !addresses.contains(&donation.key)
                 || self
                     .scheduler
                     .thread(donation.owner)
                     .is_none_or(|owner| owner.process != process_id)
+                || (process.address_waits().owner(donation.key) == Some(donation.owner)
+                    && process
+                        .address_waits()
+                        .pending_threads(donation.key)
+                        .any(|waiter| waiter == donation.waiter))
         });
-        let process = self
-            .processes
-            .get(&process_id)
-            .ok_or(ThreadOperationError::Internal)?;
+        let mut changed = self.priority_donations.len() != previous_count;
         for address in addresses {
             if let Some(owner) = process.address_waits().owner(*address) {
                 for waiter in process.address_waits().pending_threads(*address) {
-                    self.priority_donations.insert(PriorityDonation {
+                    changed |= self.priority_donations.insert(PriorityDonation {
                         owner,
                         waiter,
                         key: *address,
@@ -254,8 +261,12 @@ impl RuntimeCoordinator {
                 }
             }
         }
-        self.recompute_effective_priorities()
-            .map_err(|_| ThreadOperationError::Internal)?;
+        // An uncontended lock handoff changes no donation edge. Keep the
+        // established priorities without rebuilding every process's graph.
+        if changed {
+            self.recompute_effective_priorities()
+                .map_err(|_| ThreadOperationError::Internal)?;
+        }
         // New waiters may have unchanged scheduler priorities. Initialize them
         // too, rather than relying only on priority-change notifications.
         let process = self

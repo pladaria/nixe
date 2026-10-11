@@ -124,16 +124,18 @@ pub(super) fn handle(process: &ScheduledProcess) -> u32 {
 
 #[test]
 fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
-    'variants: for (auto, invalid_release, channel_count) in [
-        (false, false, 2),
-        (true, false, 2),
-        (false, true, 2),
-        (true, true, 2),
-        (false, false, 6),
-        (true, false, 6),
+    'variants: for (auto, invalid_release, channel_count, device_gain) in [
+        (false, false, 2, false),
+        (true, false, 2, false),
+        (false, true, 2, false),
+        (true, true, 2, false),
+        (false, false, 6, false),
+        (true, false, 6, false),
+        (false, false, 2, true),
+        (true, false, 6, true),
     ] {
         let (_dir, mut process) =
-            fixture_process_with_svcs(&[&[0x1f][..], &[0x21; 100][..]].concat());
+            fixture_process_with_svcs(&[&[0x1f][..], &[0x21; 128][..]].concat());
         let backend = Arc::new(Backend::default());
         let mut dispatcher = HorizonSvcDispatcher::default().with_audio_backend(backend.clone());
         let service_name = process.main_thread().stack_bottom;
@@ -163,6 +165,55 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         );
         let manager = handle(&process);
         let base = process.main_thread().stack_bottom;
+        let device = if device_gain {
+            assert_eq!(
+                call(
+                    &mut process,
+                    &mut dispatcher,
+                    sm,
+                    &command(1, b"audren:u", None, None, false, false)
+                ),
+                0
+            );
+            let renderer_manager = handle(&process);
+            let mut params = [0; 16];
+            params[..4].copy_from_slice(b"REV7");
+            params[8..].copy_from_slice(&1_u64.to_le_bytes());
+            assert_eq!(
+                call(
+                    &mut process,
+                    &mut dispatcher,
+                    renderer_manager,
+                    &command(4, &params, None, None, false, false)
+                ),
+                0
+            );
+            let device = handle(&process);
+            write_guest_bytes(
+                &process,
+                base.checked_add(2048).unwrap(),
+                b"AudioTvOutput\0",
+            );
+            assert_eq!(
+                call(
+                    &mut process,
+                    &mut dispatcher,
+                    device,
+                    &command(
+                        if auto { 7 } else { 1 },
+                        &1.85_f32.to_le_bytes(),
+                        Some((base.get() + 2048, 256)),
+                        None,
+                        auto,
+                        false
+                    )
+                ),
+                0
+            );
+            Some(device)
+        } else {
+            None
+        };
         let out_name = base.checked_add(256).unwrap();
         let descriptor = base.checked_add(512).unwrap();
         let samples = base.checked_add(4096).unwrap();
@@ -259,16 +310,9 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         put_u64(&mut buffer, 16, 4096);
         put_u64(&mut buffer, 24, channel_count as u64 * 4);
         write_guest_bytes(&process, descriptor, &buffer);
-        let first: Vec<i16> = (0..channel_count)
-            .map(|i| {
-                if i % 2 == 0 {
-                    i as i16 + 1
-                } else {
-                    -(i as i16)
-                }
-            })
-            .collect();
-        let second: Vec<i16> = first.iter().map(|v| v * 2).collect();
+        let first: Vec<i16> =
+            [10000, -10000, 20000, -20000, 30000, -30000][..channel_count].to_vec();
+        let second: Vec<i16> = first.iter().map(|v| v / 2).collect();
         let bytes: Vec<u8> = first
             .iter()
             .chain(&second)
@@ -316,6 +360,26 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         assert_eq!(pcm, vec![0; channel_count]);
         for round in 0..2 {
             if round == 1 {
+                // Existing streams must observe a later device update, including
+                // when their manager was opened before the gain was configured.
+                if let Some(device) = device {
+                    assert_eq!(
+                        call(
+                            &mut process,
+                            &mut dispatcher,
+                            device,
+                            &command(
+                                if auto { 7 } else { 1 },
+                                &0.5_f32.to_le_bytes(),
+                                Some((base.get() + 2048, 256)),
+                                None,
+                                auto,
+                                false
+                            )
+                        ),
+                        0
+                    );
+                }
                 assert_eq!(call(&mut process, &mut dispatcher, audio, &append), 0);
             }
             assert_eq!(
@@ -337,10 +401,21 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                 153 | (2 << 9)
             );
             feed.render(&mut pcm);
-            assert_eq!(pcm, first);
+            let (expected_first, expected_second): (&[i16], &[i16]) = match (device_gain, round) {
+                (true, 0) => (
+                    &[18500, -18500, 32767, -32768, 32767, -32768],
+                    &[9250, -9250, 18500, -18500, 27750, -27750],
+                ),
+                (true, _) => (
+                    &[5000, -5000, 10000, -10000, 15000, -15000],
+                    &[2500, -2500, 5000, -5000, 7500, -7500],
+                ),
+                (false, _) => (&first, &second),
+            };
+            assert_eq!(pcm, expected_first[..channel_count]);
             assert!(!event.is_signalled());
             feed.render(&mut pcm);
-            assert_eq!(pcm, second);
+            assert_eq!(pcm, expected_second[..channel_count]);
             assert!(event.is_signalled());
             if invalid_release {
                 // A release list starts in writable RAM but crosses into a

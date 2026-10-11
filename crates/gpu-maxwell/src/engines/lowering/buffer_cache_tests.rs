@@ -19,7 +19,7 @@ fn prepare_slice_access(
     offset: u64,
     writable: bool,
 ) -> ResourceDependency {
-    let allocation = GpuAllocationDescription::new(0x1000, 1).unwrap();
+    let allocation = GpuAllocationDescription::new(bytes.size() as u64, 1).unwrap();
     let canonical = bytes.backing_range(MemoryPermissions::READ_WRITE).unwrap();
     let backing = BackingView::new(
         GpuAllocationId::new(1),
@@ -43,6 +43,24 @@ fn prepare_slice_access(
 }
 
 #[test]
+fn equal_logical_intervals_preserve_canonical_identity_and_retirement() {
+    let first_bytes = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+    let second_bytes = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+    let mut cache = MaxwellLoweringCache::default();
+    // Both views use the same logical allocation interval. Their retained
+    // physical pages are different and must never share a backend buffer.
+    let first = prepare_slice(&mut cache, &first_bytes, 0);
+    let second = prepare_slice(&mut cache, &second_bytes, 0);
+    assert_ne!(first, second);
+    assert_eq!(prepare_slice(&mut cache, &first_bytes, 0), first);
+    assert_eq!(prepare_slice(&mut cache, &second_bytes, 0), second);
+
+    retire_view_dependencies(&[first], &mut cache, &mut Vec::new());
+    assert_ne!(prepare_slice(&mut cache, &first_bytes, 0), first);
+    assert_eq!(prepare_slice(&mut cache, &second_bytes, 0), second);
+}
+
+#[test]
 fn overlapping_read_only_slices_reuse_views_but_writes_reconcile_aliases() {
     let bytes = CanonicalAllocation::zeroed(4096, 4096).unwrap();
     let mut cache = MaxwellLoweringCache::default();
@@ -54,17 +72,17 @@ fn overlapping_read_only_slices_reuse_views_but_writes_reconcile_aliases() {
 
     finish(&mut cache, vec![copy(first, overlapping)]);
     let read = prepare_slice(&mut cache, &bytes, 16);
-    assert!(cache.views.iter().any(|view| view.dependency == first));
-    assert!(cache.views.iter().any(|view| view.dependency == read));
+    assert!(cache.views.values().any(|view| view.dependency == first));
+    assert!(cache.views.values().any(|view| view.dependency == read));
     assert!(
         !cache
             .views
-            .iter()
+            .values()
             .any(|view| view.dependency == overlapping)
     );
     let write = prepare_slice_access(&mut cache, &bytes, 8, true);
     assert_eq!(cache.views.len(), 1);
-    assert_eq!(cache.views[0].dependency, write);
+    assert_eq!(cache.views.first_key_value().unwrap().1.dependency, write);
 }
 
 fn region(dependency: ResourceDependency) -> BufferRegion {
@@ -141,7 +159,7 @@ fn read_only_buffer_eviction_preserves_gpu_writes_current_descriptors_and_recent
         assert!(
             cache
                 .views
-                .iter()
+                .values()
                 .any(|record| record.dependency == preserved)
         );
         assert!(!work.invalidations.contains(&preserved));
@@ -165,7 +183,7 @@ fn read_only_buffer_eviction_preserves_gpu_writes_current_descriptors_and_recent
     assert!(
         cache
             .views
-            .iter()
+            .values()
             .find(|record| record.dependency == written)
             .unwrap()
             .write_revision
@@ -210,7 +228,7 @@ fn read_only_ring_eviction_leaves_room_without_exceeding_the_cache_budget() {
     assert_eq!(
         cache
             .views
-            .iter()
+            .values()
             .filter(|view| view.write_revision == 0)
             .count(),
         15
@@ -224,11 +242,140 @@ fn read_only_ring_eviction_leaves_room_without_exceeding_the_cache_budget() {
     let next = prepare_slice(&mut cache, &bytes, 288);
     let work = finish(&mut cache, vec![copy(next, destination)]);
     assert_eq!(work.invalidations.len(), 2);
-    assert!(cache.views.iter().any(|view| view.dependency == next));
+    assert!(cache.views.values().any(|view| view.dependency == next));
     assert!(
         cache
             .views
-            .iter()
+            .values()
             .any(|view| view.dependency == destination)
     );
+}
+
+#[test]
+fn configured_budget_retains_constant_buffer_rings_larger_than_256_views() {
+    let bytes = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let mut cache =
+        MaxwellLoweringCache::new(GpuCacheConfiguration::new(512, 512, 1, 1, 1).unwrap());
+    let destination = prepare_slice_access(&mut cache, &bytes, 0xf000, true);
+    let mut ring = Vec::new();
+    for index in 0..384 {
+        let view = prepare_slice(&mut cache, &bytes, index * 32);
+        assert!(
+            finish(&mut cache, vec![copy(view, destination)])
+                .invalidations
+                .is_empty()
+        );
+        ring.push(view);
+    }
+    for (index, expected) in ring.into_iter().enumerate() {
+        let actual = prepare_slice(&mut cache, &bytes, index as u64 * 32);
+        assert_eq!(actual, expected);
+        assert!(
+            finish(&mut cache, vec![copy(actual, destination)])
+                .invalidations
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn inline_ring_writes_batch_only_when_pending_canonical_accesses_are_disjoint() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    use crate::{
+        MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
+        MaxwellGpuAddressSpace, MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
+    };
+    use crate::{MaxwellBackendExecution, MaxwellSubmissionExecutionStep};
+    for write_offset in [0, 32] {
+        let bytes = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        bytes.write(0, &[1; 16]).unwrap();
+        let mut cache = MaxwellLoweringCache::default();
+        let read = prepare_slice(&mut cache, &bytes, 0);
+        let written = prepare_slice(&mut cache, &bytes, 16);
+        let later = prepare_slice(&mut cache, &bytes, write_offset);
+        let later_written = prepare_slice(&mut cache, &bytes, 48);
+        let first_work = finish(&mut cache, vec![copy(read, written)]);
+        let later_work = finish(&mut cache, vec![copy(later, later_written)]);
+        assert!(!first_work.canonical_accesses().1);
+        let mut space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        // A different logical allocation and VA still name the same physical bytes.
+        let mapping = space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(99),
+                backing: bytes.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+                backing_offset: 0,
+                size: 4096,
+                allocation_alignment: 4096,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let target = space
+            .resolve_range(
+                nixe_gpu::GpuVirtualAddress::try_new(mapping.offset().get() + write_offset, 40)
+                    .unwrap(),
+                16,
+                MemoryPermissions::WRITE,
+            )
+            .unwrap();
+        let mut channel = three_d_channel();
+        program_three_d(&mut channel, 0x2380, 16);
+        let source = channel
+            .three_d()
+            .shader_bindings()
+            .selector()
+            .size()
+            .source()
+            .unwrap();
+        let mut execution = MaxwellBackendExecution::begin(FrontendSubmissionId::new(10), None);
+        execution.append_steps(vec![
+            MaxwellSubmissionExecutionStep::Gpu(first_work),
+            MaxwellSubmissionExecutionStep::InlineWrite {
+                source,
+                target,
+                value: vec![2; 16],
+            },
+        ]);
+        // A streaming producer can deliver the following draw in a later prefix.
+        let prefix = execution.next_segment(0).unwrap();
+        let mut actual = [0; 16];
+        bytes.read(write_offset as usize, &mut actual).unwrap();
+        if write_offset == 0 {
+            let prefix = prefix.expect("an overlapping write must capture its predecessor");
+            assert!(!prefix.submission().is_final_segment());
+            assert_eq!(
+                actual, [1; 16],
+                "the earlier read must retain its original version"
+            );
+            execution.resume_segment();
+        } else {
+            assert!(
+                prefix.is_none(),
+                "disjoint streamed slices must not split a batch"
+            );
+            assert_eq!(actual, [0; 16]);
+        }
+        execution.append_steps(vec![MaxwellSubmissionExecutionStep::Gpu(later_work)]);
+        execution.seal();
+        let segment = execution.next_segment(0).unwrap().unwrap();
+        assert!(segment.submission().is_final_segment());
+        let copies = segment
+            .submission()
+            .operations()
+            .iter()
+            .filter(|op| matches!(op.command(), GpuCommand::Copy(_)))
+            .count();
+        assert_eq!(copies, if write_offset == 0 { 1 } else { 2 });
+        bytes.read(write_offset as usize, &mut actual).unwrap();
+        assert_eq!(actual, [2; 16]);
+        execution.resume_segment();
+        assert!(execution.next_segment(0).unwrap().is_none());
+    }
 }

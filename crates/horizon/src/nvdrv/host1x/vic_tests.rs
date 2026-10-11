@@ -1,4 +1,5 @@
 use super::super::Mapping;
+use super::super::video::gob_offset;
 use super::*;
 use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
 use nixe_memory::{AddressSpaceId, CanonicalAllocation, GuestVirtualAddress, MemoryPermissions};

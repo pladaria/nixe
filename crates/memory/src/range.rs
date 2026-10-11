@@ -1198,6 +1198,22 @@ impl CanonicalBackingRange {
         })
     }
 
+    /// Iterates the segments intersecting a checked logical subrange.
+    /// The offset is the segment's start in this range, before clipping.
+    pub fn subrange_segments(
+        &self,
+        offset: u64,
+        size: u64,
+    ) -> Result<impl Iterator<Item = (u64, &CanonicalBackingSegment)>, CanonicalRangeError> {
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalRangeError::RangeOverflow)?;
+        if size == 0 || end > self.size {
+            return Err(CanonicalRangeError::InvalidSubrange);
+        }
+        Ok(self.segments_between(offset, end))
+    }
+
     /// Observes whether a retained subrange needs no device readback. This does
     /// not acquire a lease; callers still perform the normal checked access.
     pub fn subrange_is_cpu_visible(

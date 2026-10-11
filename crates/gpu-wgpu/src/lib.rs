@@ -416,12 +416,18 @@ async fn initialize_backend_async(
 }
 
 fn requested_device_features(adapter_features: wgpu::Features) -> wgpu::Features {
-    adapter_features
+    let features = adapter_features
         & (wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::PIPELINE_CACHE
             | wgpu::Features::IMMEDIATES
             | wgpu::Features::RG11B10UFLOAT_RENDERABLE
-            | wgpu::Features::TEXTURE_COMPRESSION_BC)
+            | wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
+    #[cfg(feature = "performance-counters")]
+    let features = features
+        | (adapter_features
+            & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS));
+    features
 }
 
 const PIPELINE_CACHE_MAGIC: &[u8] = b"NIXE-WGPU-CACHE\x01";
@@ -521,7 +527,8 @@ fn required_features_for_image_format(format: ImageFormat) -> wgpu::Features {
         | ImageFormat::Bc1RgbSrgb
         | ImageFormat::Bc1RgbaUnorm
         | ImageFormat::Bc1RgbaSrgb
-        | ImageFormat::Bc4RUnorm => wgpu::Features::TEXTURE_COMPRESSION_BC,
+        | ImageFormat::Bc4RUnorm
+        | ImageFormat::Bc5RgUnorm => wgpu::Features::TEXTURE_COMPRESSION_BC,
         // The neutral format capability currently covers every supported use of
         // a format. Keep the float32 family out of that contract unless wgpu can
         // also represent its filtered sampled-image use exactly.
@@ -584,7 +591,7 @@ fn capabilities(
     )
 }
 
-const ALL_IMAGE_FORMATS: [ImageFormat; 23] = [
+const ALL_IMAGE_FORMATS: [ImageFormat; 52] = [
     ImageFormat::Rgb565Unorm,
     ImageFormat::Bc1RgbUnorm,
     ImageFormat::Bc1RgbSrgb,
@@ -608,6 +615,35 @@ const ALL_IMAGE_FORMATS: [ImageFormat; 23] = [
     ImageFormat::Depth24UnormStencil8Uint,
     ImageFormat::Depth32Float,
     ImageFormat::Depth32FloatStencil8Uint,
+    ImageFormat::Astc4x4Unorm,
+    ImageFormat::Astc4x4Srgb,
+    ImageFormat::Astc5x4Unorm,
+    ImageFormat::Astc5x4Srgb,
+    ImageFormat::Astc5x5Unorm,
+    ImageFormat::Astc5x5Srgb,
+    ImageFormat::Astc6x5Unorm,
+    ImageFormat::Astc6x5Srgb,
+    ImageFormat::Astc6x6Unorm,
+    ImageFormat::Astc6x6Srgb,
+    ImageFormat::Astc8x5Unorm,
+    ImageFormat::Astc8x5Srgb,
+    ImageFormat::Astc8x6Unorm,
+    ImageFormat::Astc8x6Srgb,
+    ImageFormat::Astc8x8Unorm,
+    ImageFormat::Astc8x8Srgb,
+    ImageFormat::Astc10x5Unorm,
+    ImageFormat::Astc10x5Srgb,
+    ImageFormat::Astc10x6Unorm,
+    ImageFormat::Astc10x6Srgb,
+    ImageFormat::Astc10x8Unorm,
+    ImageFormat::Astc10x8Srgb,
+    ImageFormat::Astc10x10Unorm,
+    ImageFormat::Astc10x10Srgb,
+    ImageFormat::Astc12x10Unorm,
+    ImageFormat::Astc12x10Srgb,
+    ImageFormat::Astc12x12Unorm,
+    ImageFormat::Astc12x12Srgb,
+    ImageFormat::Bc5RgUnorm,
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -709,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn bc1_formats_require_native_compression_but_not_render_attachment_usage() {
+    fn bc_formats_require_native_compression_but_not_render_attachment_usage() {
         assert_eq!(
             requested_device_features(wgpu::Features::TEXTURE_COMPRESSION_BC),
             wgpu::Features::TEXTURE_COMPRESSION_BC
@@ -720,6 +756,7 @@ mod tests {
             ImageFormat::Bc1RgbaUnorm,
             ImageFormat::Bc1RgbaSrgb,
             ImageFormat::Bc4RUnorm,
+            ImageFormat::Bc5RgUnorm,
         ] {
             assert_eq!(
                 required_features_for_image_format(format),

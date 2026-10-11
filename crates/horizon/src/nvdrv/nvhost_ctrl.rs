@@ -708,20 +708,10 @@ impl NvHostControl {
                 slot
             }
         };
-        // VIDEO_PROBE_BEGIN
-        if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-            log::debug!("VIDEO_PROBE nv-event-arm: kind={kind:?} fd={:?} slot={slot:?} id={id:?} current={current:?} target={threshold:?}", descriptor.fd());
-        }
-        // VIDEO_PROBE_END
         let event = device
             .events
             .get_mut(&slot)
             .ok_or(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))?;
-        // VIDEO_PROBE_BEGIN
-        if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() && event.armed.is_some() {
-            log::debug!("VIDEO_PROBE nv-event-rearm-busy: slot={slot:?} old={:?} new={:?}", event.armed, GuestTimelinePoint::new(id, threshold));
-        }
-        // VIDEO_PROBE_END
         event.readable.clear();
         event.armed = Some(GuestTimelinePoint::new(id, threshold));
 

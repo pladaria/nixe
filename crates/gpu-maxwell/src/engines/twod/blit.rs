@@ -38,8 +38,10 @@ pub(crate) enum BlitSurfaceLayout {
 pub(crate) enum BlitKind {
     Scale {
         filter: nixe_gpu::BlitFilter,
-        first: [u64; 2],
-        step: [u64; 2],
+        first: [i64; 2],
+        step: [i64; 2],
+        destination_origin: nixe_gpu::ImageOrigin,
+        extent: nixe_gpu::ImageExtent,
     },
     Downsample2x {
         filter: nixe_gpu::BlitFilter,
@@ -260,37 +262,55 @@ impl MaxwellTwoDBlitState {
             // point. CENTER coordinates put texel centers at integers; convert
             // to the corner-coordinate convention used by neutral blits.
             // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/twod/cl902d.h
-            if self.parameters[..4]
-                .iter()
-                .map(|r| r.value().copied())
-                .ne([0, 0, dst.width, dst.height].map(Some))
+            let destination_origin = nixe_gpu::ImageOrigin {
+                x: get(&self.parameters[0])?,
+                y: get(&self.parameters[1])?,
+                z: 0,
+            };
+            let extent = nixe_gpu::ImageExtent {
+                width: get(&self.parameters[2])?,
+                height: get(&self.parameters[3])?,
+                depth: 1,
+            };
+            if extent.width == 0
+                || extent.height == 0
+                || destination_origin
+                    .x
+                    .checked_add(extent.width)
+                    .is_none_or(|end| end > dst.width)
+                || destination_origin
+                    .y
+                    .checked_add(extent.height)
+                    .is_none_or(|end| end > dst.height)
             {
                 return Err(error(
                     source,
-                    "scaled 2D blit requires a nonempty full destination rectangle",
+                    "scaled 2D destination rectangle is empty or exceeds its surface",
                 ));
             }
-            let fixed = |slot: usize| -> Result<u64, MaxwellEngineDispatchError> {
-                let high = get(&self.parameters[slot + 1])?;
-                if high & 0x8000_0000 != 0 {
-                    return Err(error(
-                        source,
-                        "negative 2D scaling or source coordinates are not implemented",
-                    ));
-                }
-                Ok((u64::from(high) << 32) | u64::from(get(&self.parameters[slot])?))
+            let fixed = |slot: usize| -> Result<i64, MaxwellEngineDispatchError> {
+                Ok(((u64::from(get(&self.parameters[slot + 1])?) << 32)
+                    | u64::from(get(&self.parameters[slot])?)) as i64)
             };
             let step = [fixed(4)?, fixed(6)?];
-            let adjustment = if mode & 1 == 0 { 1_u64 << 31 } else { 0 };
-            let first = [fixed(8)? + adjustment, fixed(10)? + adjustment];
+            let adjustment = if mode & 1 == 0 { 1_i64 << 31 } else { 0 };
+            let first = [
+                fixed(8)?.checked_add(adjustment),
+                fixed(10)?.checked_add(adjustment),
+            ];
+            let [Some(first_x), Some(first_y)] = first else {
+                return Err(error(source, "scaled 2D source coordinate overflows"));
+            };
+            let first = [first_x, first_y];
             for axis in 0..2 {
-                let count = [dst.width, dst.height][axis];
-                let limit = u64::from([src.width, src.height][axis]) << 32;
+                let count = [extent.width, extent.height][axis];
+                let limit = i128::from([src.width, src.height][axis]) << 32;
+                let last = i128::from(first[axis]) + i128::from(step[axis]) * i128::from(count - 1);
                 if step[axis] == 0
-                    || step[axis]
-                        .checked_mul(u64::from(count - 1))
-                        .and_then(|distance| first[axis].checked_add(distance))
-                        .is_none_or(|last| last >= limit)
+                    || i128::from(first[axis]) < 0
+                    || i128::from(first[axis]) >= limit
+                    || last < 0
+                    || last >= limit
                 {
                     return Err(error(source, "scaled 2D samples exceed the source surface"));
                 }
@@ -299,6 +319,8 @@ impl MaxwellTwoDBlitState {
                 filter,
                 first,
                 step,
+                destination_origin,
+                extent,
             }
         };
         Ok(PendingEngineOperation::TwoDBlit(MaxwellTwoDBlitOperation {

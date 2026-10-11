@@ -2793,6 +2793,7 @@ fn interpolated_vertex_module(
                 destination: ShaderRegister::new(8),
                 source: ShaderRegister::new(8),
                 source_type: ShaderScalarType::Unsigned32,
+                rounding: nixe_gpu::ShaderRoundingMode::NearestEven,
             },
         ));
         instructions.push(move_f32(80, 9, 1.0 / 16.0));
@@ -3383,6 +3384,24 @@ fn resident_color_conversion_preserves_hdr_values_and_implicit_alpha() {
         .with_sampling([0.75, 0.75], [0.5, 0.5])
         .unwrap(),
     ));
+    commands.push(GpuCommand::Blit(
+        nixe_gpu::BlitOperation::new(
+            nixe_gpu::ImageRegion {
+                extent: ImageExtent::new(2, 2, 1).unwrap(),
+                ..region(input)
+            },
+            nixe_gpu::ImageRegion {
+                origin: nixe_gpu::ImageOrigin { x: 4, y: 3, z: 0 },
+                extent: ImageExtent::new(2, 2, 1).unwrap(),
+                ..region(destination)
+            },
+            [ImageFormat::Rgba8Unorm, ImageFormat::Rgba16Float],
+            nixe_gpu::BlitFilter::Point,
+        )
+        .unwrap()
+        .with_sampling([1.5, 1.5], [-1.0, -1.0])
+        .unwrap(),
+    ));
     let submission = OperationSubmission::new(
         FrontendSubmissionId::new(995),
         vec![],
@@ -3403,6 +3422,14 @@ fn resident_color_conversion_preserves_hdr_values_and_implicit_alpha() {
             [0x3800, 0x3800, 0x3800, 0x3c00]
         } else if index == 3 * 8 + 3 {
             [0x3900, 0x3400, 0x3400, 0x3c00]
+        } else if index == 3 * 8 + 4 {
+            [0x3c00; 4]
+        } else if index == 3 * 8 + 5 {
+            [0, 0, 0x3c00, 0x3c00]
+        } else if index == 4 * 8 + 4 {
+            [0, 0x3c00, 0, 0x3c00]
+        } else if index == 4 * 8 + 5 {
+            [0x3c00, 0, 0, 0x3c00]
         } else {
             [0x3800, 0x4800, 0x3c00, 0x3c00]
         };

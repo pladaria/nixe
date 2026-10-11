@@ -75,6 +75,11 @@ fn bounded_table_tracks_only_its_bytes_and_binding_identity() {
     )
     .unwrap();
     let table = &binary.indirect_tables[0];
+    assert_eq!(table.load_offset, 40);
+    assert_eq!(
+        table.read_end, 12,
+        "include repeated entries, not only distinct BRX targets"
+    );
     assert_eq!(
         table.targets.as_ref(),
         [

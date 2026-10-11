@@ -344,11 +344,6 @@ pub(crate) fn send_sync_request_from_buffer(
             services::dispatch_audio_out_manager(process, &session, request, &hipc)?
         }
         HorizonIpcObject::AudioOut(session) => {
-            // VIDEO_PROBE_BEGIN
-            if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-                log::debug!("VIDEO_PROBE audio-thread: thread={} command={} event={:?}", host_systems.caller_thread_id, request.command_id, session.event);
-            }
-            // VIDEO_PROBE_END
             services::dispatch_audio_out(process, &session, request, &hipc)?
         }
         HorizonIpcObject::AudioRendererManager(session) => {

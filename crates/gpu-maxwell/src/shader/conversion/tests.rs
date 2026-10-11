@@ -32,6 +32,7 @@ fn captured_signed_i2f_reaches_verified_ir_and_wgsl() {
                     destination,
                     source,
                     source_type: ShaderScalarType::Signed32,
+                    rounding: nixe_gpu::ShaderRoundingMode::NearestEven,
                 } if destination.index() == 0 && source.index() == 0
             ))
     );
@@ -290,6 +291,7 @@ fn integer_to_float_decodes_register_immediate_and_constant_buffer_forms() {
             destination,
             source,
             source_type: ShaderScalarType::Unsigned32,
+            rounding: nixe_gpu::ShaderRoundingMode::NearestEven,
         }] if destination.index() == 2 && source.index() == 3
     ));
 
@@ -344,9 +346,8 @@ fn integer_to_float_decodes_register_immediate_and_constant_buffer_forms() {
 }
 
 #[test]
-fn integer_to_float_rejects_unrepresented_width_rounding_and_modifiers() {
+fn integer_to_float_rejects_unrepresented_width_and_modifiers() {
     for (modifier, detail) in [
-        (1_u64 << 39, "I2F directed rounding mode"),
         (1_u64 << 45, "I2F integer source negation"),
         (1_u64 << 49, "I2F integer source absolute value"),
     ] {
@@ -370,7 +371,7 @@ fn integer_to_float_rejects_unrepresented_width_rounding_and_modifiers() {
             0x5cb8_0000_0037_0902,
             "I2F destination width other than F32",
         ),
-        (0x5cb8_0000_0037_0602, "I2F source width other than 32 bits"),
+        (0x5cb8_0000_0037_0e02, "I2F 64-bit source"),
     ] {
         let mut next_temporary = 8;
         assert!(matches!(
@@ -386,5 +387,211 @@ fn integer_to_float_rejects_unrepresented_width_rounding_and_modifiers() {
                 ..
             }) if actual == detail
         ));
+    }
+}
+
+#[test]
+fn integer_to_float_directed_rounding_preserves_inexact_large_values() {
+    use nixe_gpu::*;
+    for (mode, rounding) in [
+        (1, ShaderRoundingMode::TowardNegative),
+        (2, ShaderRoundingMode::TowardPositive),
+        (3, ShaderRoundingMode::TowardZero),
+    ] {
+        for (signed, bits, expected) in [
+            (
+                false,
+                u32::MAX,
+                if mode == 2 { 0x4f800000 } else { 0x4f7fffff },
+            ),
+            (
+                true,
+                0x80000001,
+                if mode == 1 { 0xcf000000 } else { 0xceffffff },
+            ),
+            (true, 0x80000000, 0xcf000000),
+            (false, 0, 0),
+            (
+                false,
+                0x01000001,
+                if mode == 2 { 0x4b800001 } else { 0x4b800000 },
+            ),
+        ] {
+            let word = 0x5cb8_0000_0007_0a00 | (mode << 39) | (u64::from(signed) << 13);
+            let decoded =
+                decode_integer_to_float(MaxwellShaderStage::Pixel, 8, word, 1, &mut 1).unwrap();
+            assert!(
+                matches!(decoded.operations.last(), Some(ShaderOperation::ConvertIntegerToFloat32 { rounding: r, .. }) if *r == rounding)
+            );
+            let mut operations = vec![ShaderOperation::MoveImmediate32 {
+                destination: ShaderRegister::new(0),
+                bits,
+                scalar_type: ShaderScalarType::Unsigned32,
+            }];
+            operations.extend(decoded.operations);
+            operations.push(ShaderOperation::StoreOutput {
+                sources: vec![ShaderRegister::new(0)].into(),
+                location: ShaderIoLocation::Color(0),
+                first_component: 0,
+                scalar_type: ShaderScalarType::Float32,
+            });
+            operations.push(ShaderOperation::Exit);
+            let ir = VerifiedShaderIr::verify(ShaderIr::new(
+                ShaderStage::Fragment,
+                vec![],
+                vec![
+                    ShaderInterfaceElement::new(
+                        ShaderIoLocation::Color(0),
+                        0,
+                        ShaderScalarType::Float32,
+                        None,
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+                operations
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, op)| {
+                        ShaderInstruction::new(
+                            ShaderSourceLocation::new(i as u32 * 8),
+                            ShaderPredicate::Always,
+                            op,
+                        )
+                    })
+                    .collect(),
+            ))
+            .unwrap();
+            validate_wgsl(&lower_shader_ir_to_wgsl(&ir).unwrap());
+            assert_eq!(
+                evaluate_shader_ir(&ir, &ShaderEvaluationInputs::default(), 16)
+                    .unwrap()
+                    .output_bits(ShaderIoLocation::Color(0), 0),
+                Some(expected),
+                "{mode} {bits:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn integer_to_float_narrow_sources_preserve_selectors_and_sign_extension() {
+    use nixe_gpu::*;
+    for width in [8_u32, 16] {
+        for selector in 0..4_u32 {
+            for signed in [false, true] {
+                let base = 0x5cb8_0000_0007_0200
+                    | (u64::from(width == 16) << 10)
+                    | (u64::from(selector) << 41)
+                    | (u64::from(signed) << 13);
+                if width == 16 && selector % 2 != 0 {
+                    assert!(
+                        decode_integer_to_float(MaxwellShaderStage::Pixel, 8, base, 1, &mut 1)
+                            .is_err()
+                    );
+                    continue;
+                }
+                for input in [
+                    0_u32,
+                    1,
+                    0x7fff_ffff,
+                    0x8000_0000,
+                    0x0123_4567,
+                    0x89ab_cdef,
+                    u32::MAX,
+                ] {
+                    for form in [0x5cb8_u64, 0x4cb8, 0x38b8] {
+                        let word = (base & !(0xffff << 48))
+                            | (form << 48)
+                            | if form == 0x4cb8 {
+                                2 << 34
+                            } else if form == 0x38b8 {
+                                (u64::from(input & 0x7ffff) << 20)
+                                    | (u64::from(input & 0x80000 != 0) << 56)
+                            } else {
+                                0
+                            };
+                        let raw = if form == 0x38b8 {
+                            ((input as i32) << 12 >> 12) as u32
+                        } else {
+                            input
+                        };
+                        let extracted = raw >> (selector * 8);
+                        let expected = if signed {
+                            ((extracted << (32 - width)) as i32 >> (32 - width)) as f32
+                        } else {
+                            (extracted & (u32::MAX >> (32 - width))) as f32
+                        };
+                        let decoded =
+                            decode_integer_to_float(MaxwellShaderStage::Pixel, 8, word, 1, &mut 1)
+                                .unwrap();
+                        let mut operations = vec![ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(0),
+                            bits: input,
+                            scalar_type: ShaderScalarType::Unsigned32,
+                        }];
+                        operations.extend(decoded.operations);
+                        operations.push(ShaderOperation::StoreOutput {
+                            sources: vec![ShaderRegister::new(0)].into(),
+                            location: ShaderIoLocation::Color(0),
+                            first_component: 0,
+                            scalar_type: ShaderScalarType::Float32,
+                        });
+                        operations.push(ShaderOperation::Exit);
+                        let ir = VerifiedShaderIr::verify(ShaderIr::new(
+                            ShaderStage::Fragment,
+                            vec![],
+                            vec![
+                                ShaderInterfaceElement::new(
+                                    ShaderIoLocation::Color(0),
+                                    0,
+                                    ShaderScalarType::Float32,
+                                    None,
+                                )
+                                .unwrap(),
+                            ],
+                            decoded
+                                .constant_buffer_binding
+                                .into_iter()
+                                .map(|binding| {
+                                    ShaderResourceAccess::new(
+                                        binding,
+                                        ShaderResourceKind::ConstantBuffer,
+                                        true,
+                                        false,
+                                    )
+                                    .unwrap()
+                                })
+                                .collect(),
+                            operations
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, op)| {
+                                    ShaderInstruction::new(
+                                        ShaderSourceLocation::new(i as u32 * 8),
+                                        ShaderPredicate::Always,
+                                        op,
+                                    )
+                                })
+                                .collect(),
+                        ))
+                        .unwrap();
+                        let result = evaluate_shader_ir(
+                            &ir,
+                            &ShaderEvaluationInputs::default()
+                                .with_constant_buffer_bits(2, 0, input),
+                            32,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            result.output_bits(ShaderIoLocation::Color(0), 0),
+                            Some(expected.to_bits()),
+                            "width={width}, selector={selector}, word={word:016x}, input={input:08x}"
+                        );
+                        validate_wgsl(&lower_shader_ir_to_wgsl(&ir).unwrap());
+                    }
+                }
+            }
+        }
     }
 }

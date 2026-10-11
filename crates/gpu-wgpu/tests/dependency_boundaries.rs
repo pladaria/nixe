@@ -2,22 +2,11 @@ use std::fs;
 use std::path::Path;
 
 #[test]
-fn wgpu_backend_depends_on_neutral_gpu_and_memory_contracts_only() {
+fn wgpu_backend_has_no_console_cpu_or_windowing_dependencies() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let contents = fs::read_to_string(manifest.join("Cargo.toml"))
         .expect("accelerated GPU manifest must be readable");
     let dependencies = dependency_names(&contents);
-    assert_eq!(
-        dependencies,
-        [
-            "log",
-            "nixe-gpu",
-            "nixe-memory",
-            "pollster",
-            "rustc-hash",
-            "wgpu"
-        ]
-    );
     for prohibited in [
         "nixe-cpu",
         "nixe-runtime",

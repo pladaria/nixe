@@ -442,6 +442,7 @@ pub enum ShaderOperation {
         destination: ShaderRegister,
         source: ShaderRegister,
         source_type: ShaderScalarType,
+        rounding: ShaderRoundingMode,
     },
     RoundFloat32ToIntegral {
         destination: ShaderRegister,
@@ -534,11 +535,13 @@ pub enum ShaderOperation {
         amount: ShaderRegister,
         wrap: bool,
     },
-    ShiftRightLogical32 {
+    ShiftRight32 {
         destination: ShaderRegister,
         value: ShaderRegister,
         amount: ShaderRegister,
         wrap: bool,
+        signed: bool,
+        reverse: bool,
     },
     /// Extracts a field, extending the source sign bit when a signed field
     /// extends beyond bit 31. A zero count always returns zero.
@@ -679,6 +682,8 @@ pub enum ShaderOperation {
         value: ShaderRegister,
         targets: Box<[(u32, ShaderSourceLocation)]>,
     },
+    /// Terminates a fragment invocation without attachment output.
+    Discard,
     Exit,
 }
 
@@ -920,9 +925,14 @@ impl ShaderEvaluationInputs {
 pub struct ShaderEvaluationResult {
     outputs: std::collections::BTreeMap<(ShaderIoLocation, u8), u32>,
     control_points: std::collections::BTreeMap<(u32, ShaderIoLocation, u8), u32>,
+    discarded: bool,
 }
 
 impl ShaderEvaluationResult {
+    #[must_use]
+    pub const fn discarded(&self) -> bool {
+        self.discarded
+    }
     #[must_use]
     pub fn control_point_bits(
         &self,
@@ -1097,12 +1107,29 @@ pub fn evaluate_shader_ir(
                 destination,
                 source,
                 source_type,
+                rounding,
             } => {
                 let bits = register_bits(&registers, *source)?;
                 let value = match source_type {
                     ShaderScalarType::Signed32 => (bits as i32) as f32,
                     ShaderScalarType::Unsigned32 => bits as f32,
                     _ => unreachable!("verified integer-to-float source is 32-bit integer"),
+                };
+                let exact = match source_type {
+                    ShaderScalarType::Signed32 => f64::from(bits as i32),
+                    _ => f64::from(bits),
+                };
+                let rounded = f64::from(value);
+                let value = match rounding {
+                    ShaderRoundingMode::TowardNegative if rounded > exact => value.next_down(),
+                    ShaderRoundingMode::TowardPositive if rounded < exact => value.next_up(),
+                    ShaderRoundingMode::TowardZero if exact > 0.0 && rounded > exact => {
+                        value.next_down()
+                    }
+                    ShaderRoundingMode::TowardZero if exact < 0.0 && rounded < exact => {
+                        value.next_up()
+                    }
+                    _ => value,
                 };
                 registers[destination.index() as usize] = Some(value.to_bits());
             }
@@ -1291,20 +1318,33 @@ pub fn evaluate_shader_ir(
                 amount,
                 wrap,
             }
-            | ShaderOperation::ShiftRightLogical32 {
+            | ShaderOperation::ShiftRight32 {
                 destination,
                 value,
                 amount,
                 wrap,
+                ..
             } => {
-                let value = register_bits(&registers, *value)?;
+                let mut value = register_bits(&registers, *value)?;
                 let amount = register_bits(&registers, *amount)?;
+                let (right, signed, reverse) = match instruction.operation {
+                    ShaderOperation::ShiftRight32 {
+                        signed, reverse, ..
+                    } => (true, signed, reverse),
+                    _ => (false, false, false),
+                };
+                if reverse {
+                    value = value.reverse_bits();
+                }
                 let shifted = if !*wrap && amount >= 32 {
-                    0
-                } else if matches!(
-                    instruction.operation,
-                    ShaderOperation::ShiftRightLogical32 { .. }
-                ) {
+                    if signed {
+                        ((value as i32) >> 31) as u32
+                    } else {
+                        0
+                    }
+                } else if signed {
+                    ((value as i32) >> (amount & 31)) as u32
+                } else if right {
                     value >> (amount & 31)
                 } else {
                     value << (amount & 31)
@@ -1619,6 +1659,11 @@ pub fn evaluate_shader_ir(
                     .ok_or(ShaderEvaluationError::InvalidIndirectBranch(bits))?
                     .1;
                 pc = targets[&target];
+            }
+            ShaderOperation::Discard => {
+                result.outputs.clear();
+                result.discarded = true;
+                return Ok(result);
             }
             ShaderOperation::Exit => return Ok(result),
         }
@@ -2046,6 +2091,11 @@ fn lower_shader_ir_to_wgsl_impl(
             return min(bits, 0x3f800000u);\n\
         }\n",
         );
+    }
+    if ir.instructions.iter().any(|i| matches!(i.operation,
+        ShaderOperation::ConvertIntegerToFloat32 { rounding, .. } if rounding != ShaderRoundingMode::NearestEven
+    )) {
+        source.push_str(include_str!("shader/integer_conversion.wgsl"));
     }
     if let Some((layouts, bind_group)) = vertex_pulling {
         emit_wgsl_vertex_pull_resources(&mut source, layouts, bind_group, quad_flat);
@@ -2671,7 +2721,7 @@ fn emit_wgsl_resources(
     ir: &ShaderIr,
 ) -> Result<(), ShaderBackendLoweringError> {
     for resource in &ir.resources {
-        if resource.kind == ShaderResourceKind::StorageBuffer && ir.stage == ShaderStage::Compute {
+        if resource.kind == ShaderResourceKind::StorageBuffer {
             let access = if resource.writable {
                 "read_write"
             } else {
@@ -2975,6 +3025,7 @@ fn emit_wgsl_operation(
             destination,
             source: operand,
             source_type,
+            rounding,
         } => {
             let integer = match source_type {
                 ShaderScalarType::Signed32 => {
@@ -2987,6 +3038,20 @@ fn emit_wgsl_operation(
                     ));
                 }
             };
+            if *rounding != ShaderRoundingMode::NearestEven {
+                let mode = match rounding {
+                    ShaderRoundingMode::TowardNegative => 1,
+                    ShaderRoundingMode::TowardPositive => 2,
+                    _ => 3,
+                };
+                source.push_str(&format!(
+                    "  registers[{}] = nixe_integer_to_float(registers[{}], {}, {mode}u);\n",
+                    destination.index(),
+                    operand.index(),
+                    *source_type == ShaderScalarType::Signed32
+                ));
+                return Ok(());
+            }
             source.push_str(&format!(
                 "  registers[{}] = bitcast<u32>(f32({integer}));\n",
                 destination.index()
@@ -3289,29 +3354,49 @@ fn emit_wgsl_operation(
             amount,
             wrap,
         }
-        | ShaderOperation::ShiftRightLogical32 {
+        | ShaderOperation::ShiftRight32 {
             destination,
             value,
             amount,
             wrap,
+            ..
         } => {
-            let operator = if matches!(
-                instruction.operation,
-                ShaderOperation::ShiftRightLogical32 { .. }
-            ) {
-                ">>"
-            } else {
-                "<<"
+            let (right, signed, reverse) = match instruction.operation {
+                ShaderOperation::ShiftRight32 {
+                    signed, reverse, ..
+                } => (true, signed, reverse),
+                _ => (false, false, false),
             };
-            let shifted = format!(
-                "registers[{}] {operator} (registers[{}] & 31u)",
-                value.index(),
-                amount.index()
-            );
+            let operator = if right { ">>" } else { "<<" };
+            let value = format!("registers[{}]", value.index());
+            let value = if reverse {
+                format!("reverseBits({value})")
+            } else {
+                value
+            };
+            let value = if signed {
+                format!("bitcast<i32>({value})")
+            } else {
+                value
+            };
+            let shifted = format!("{value} {operator} (registers[{}] & 31u)", amount.index());
+            let clamped = if signed {
+                format!("{value} >> 31u")
+            } else {
+                "0u".to_owned()
+            };
             let expression = if *wrap {
                 shifted
             } else {
-                format!("select(0u, {shifted}, registers[{}] < 32u)", amount.index())
+                format!(
+                    "select({clamped}, {shifted}, registers[{}] < 32u)",
+                    amount.index()
+                )
+            };
+            let expression = if signed {
+                format!("bitcast<u32>({expression})")
+            } else {
+                expression
             };
             source.push_str(&format!(
                 "  registers[{}] = {expression};\n",
@@ -3681,6 +3766,7 @@ fn emit_wgsl_operation(
         ShaderOperation::Branch { .. } | ShaderOperation::BranchTable { .. } => {
             return Err(ShaderBackendLoweringError::ControlFlow(instruction.source));
         }
+        ShaderOperation::Discard => source.push_str("  discard;\n"),
         ShaderOperation::Exit => source.push_str(&format!("  {return_statement}\n")),
     }
     Ok(())
@@ -3958,6 +4044,7 @@ pub enum ShaderVerificationError {
         reason: &'static str,
     },
     FragmentDepthTransform(&'static str),
+    InvalidDiscardStage,
     EmptyProgram,
     MissingExit,
     DuplicateInterfaceElement {
@@ -4009,6 +4096,7 @@ pub enum ShaderVerificationError {
 impl Display for ShaderVerificationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidDiscardStage => formatter.write_str("fragment discard is only valid in a fragment shader"),
             Self::InvalidBranchTable { source } => write!(formatter, "indirect branch at {source:?} requires nonempty unique case keys"),
             Self::AliasedCarryDestinations { source } => write!(formatter, "shader sum and carry destinations alias at byte offset 0x{:x}", source.byte_offset()),
             Self::InvalidTessellationMetadata => formatter.write_str("shader IR requires nonzero output control-point count exactly for the control stage"),
@@ -4258,7 +4346,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::FloatMultiplyZero32 { destination, .. }
             | ShaderOperation::Add32 { destination, .. }
             | ShaderOperation::ShiftLeft32 { destination, .. }
-            | ShaderOperation::ShiftRightLogical32 { destination, .. }
+            | ShaderOperation::ShiftRight32 { destination, .. }
             | ShaderOperation::ExtractBitfield32 { destination, .. }
             | ShaderOperation::Bitwise32 { destination, .. }
             | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
@@ -4592,7 +4680,12 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     continue;
                 }
             }
-            ShaderOperation::Exit => {
+            ShaderOperation::Discard | ShaderOperation::Exit => {
+                if matches!(instruction.operation, ShaderOperation::Discard)
+                    && ir.stage != ShaderStage::Fragment
+                {
+                    return Err(ShaderVerificationError::InvalidDiscardStage);
+                }
                 has_reachable_exit = true;
                 if !conditional {
                     continue;
@@ -4707,7 +4800,7 @@ fn visit_operation_destinations(
         | ShaderOperation::FloatMultiplyZero32 { destination, .. }
         | ShaderOperation::Add32 { destination, .. }
         | ShaderOperation::ShiftLeft32 { destination, .. }
-        | ShaderOperation::ShiftRightLogical32 { destination, .. }
+        | ShaderOperation::ShiftRight32 { destination, .. }
         | ShaderOperation::ExtractBitfield32 { destination, .. }
         | ShaderOperation::Bitwise32 { destination, .. }
         | ShaderOperation::CompareInteger32 { destination, .. }
@@ -4817,7 +4910,7 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
             ..
         } => vec![*value, *offset, *count],
         ShaderOperation::ShiftLeft32 { value, amount, .. }
-        | ShaderOperation::ShiftRightLogical32 { value, amount, .. } => vec![*value, *amount],
+        | ShaderOperation::ShiftRight32 { value, amount, .. } => vec![*value, *amount],
         ShaderOperation::FloatMinMax32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::FloatAbsolute32 { source, .. }
         | ShaderOperation::FloatNegate32 { source, .. }

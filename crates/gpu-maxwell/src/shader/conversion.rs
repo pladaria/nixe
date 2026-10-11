@@ -329,28 +329,28 @@ pub(super) fn decode_integer_to_float(
             detail: "I2F destination width other than F32",
         });
     }
-    if (encoding >> 10) & 0x3 != 2 {
+    let source_bits = 8_u32 << ((encoding >> 10) & 3);
+    if source_bits == 64 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "I2F source width other than 32 bits",
+            detail: "I2F 64-bit source",
         });
     }
-    if (encoding >> 39) & 0x3 != 0 {
-        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-            stage,
-            instruction_offset: offset,
-            encoding,
-            detail: "I2F directed rounding mode",
-        });
-    }
-    if (encoding >> 41) & 0x3 != 0 {
+    let rounding = match (encoding >> 39) & 3 {
+        0 => ShaderRoundingMode::NearestEven,
+        1 => ShaderRoundingMode::TowardNegative,
+        2 => ShaderRoundingMode::TowardPositive,
+        _ => ShaderRoundingMode::TowardZero,
+    };
+    let selector = ((encoding >> 41) & 3) as u32;
+    if selector * 8 + source_bits > 32 || (source_bits == 16 && !selector.is_multiple_of(2)) {
         return Err(malformed(
             stage,
             offset,
             encoding,
-            "I2F encodes a reserved sub-operation",
+            "I2F source selector is incompatible with its width",
         ));
     }
     if encoding & (1 << 45) != 0 {
@@ -379,8 +379,25 @@ pub(super) fn decode_integer_to_float(
     let mut operations = Vec::with_capacity(2);
     let (source, constant_buffer_binding) = if opcode == 0x5cb8 {
         let source = ((encoding >> 20) & 0xff) as u8;
-        validate_register_range(stage, offset, encoding, source, 1, register_count)?;
-        (ShaderRegister::new(u16::from(source)), None)
+        let source = if source == 255 {
+            let temporary = allocate_shader_temporary(
+                stage,
+                offset,
+                encoding,
+                "I2F zero source overflow",
+                next_temporary,
+            )?;
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination: temporary,
+                bits: 0,
+                scalar_type: source_type,
+            });
+            temporary
+        } else {
+            validate_register_range(stage, offset, encoding, source, 1, register_count)?;
+            ShaderRegister::new(u16::from(source))
+        };
+        (source, None)
     } else {
         let temporary = allocate_shader_temporary(
             stage,
@@ -415,10 +432,55 @@ pub(super) fn decode_integer_to_float(
             (temporary, None)
         }
     };
+    // Narrow operands select bytes (8-bit) or aligned halfwords (16-bit),
+    // then sign/zero extend before conversion. 32-bit operands need no extraction.
+    // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/integer_floating_point_conversion.cpp
+    let source = if source_bits < 32 {
+        let position = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "I2F selector overflow",
+            next_temporary,
+        )?;
+        let count = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "I2F width overflow",
+            next_temporary,
+        )?;
+        let extended = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "I2F extracted source overflow",
+            next_temporary,
+        )?;
+        for (destination, bits) in [(position, selector * 8), (count, source_bits)] {
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination,
+                bits,
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
+        }
+        operations.push(ShaderOperation::ExtractBitfield32 {
+            destination: extended,
+            value: source,
+            offset: position,
+            count,
+            signed: source_type == ShaderScalarType::Signed32,
+            reverse: false,
+        });
+        extended
+    } else {
+        source
+    };
     operations.push(ShaderOperation::ConvertIntegerToFloat32 {
         destination: ShaderRegister::new(u16::from(destination)),
         source,
         source_type,
+        rounding,
     });
     Ok(DecodedIntegerToFloat {
         operations,

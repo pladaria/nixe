@@ -19,30 +19,24 @@ pub(super) const fn is_loop_branch(encoding: u64) -> bool {
 /// particular, a break cannot inherit a PBK from a branch it did not execute.
 /// Different paths may share a token branch only when its destination agrees.
 /// https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/control_flow.cpp (Stack::Pop)
-pub(super) fn stack_branch_targets(
+pub(super) struct ShaderControlFlow {
+    pub(super) reachable: std::collections::BTreeSet<u32>,
+    pub(super) stack_targets: std::collections::BTreeMap<u32, ShaderSourceLocation>,
+}
+
+pub(super) fn discover_shader_control_flow(
     binary: &super::binary::MaxwellShaderBinary,
-) -> Result<std::collections::BTreeMap<u32, ShaderSourceLocation>, MaxwellShaderTranslationError> {
+) -> Result<ShaderControlFlow, MaxwellShaderTranslationError> {
     use super::decode::decode_predicate;
     use nixe_gpu::ShaderPredicate;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let stage = binary.stage();
     let size = (binary.bundles().len() * MAXWELL_SCHEDULE_BUNDLE_SIZE) as u32;
     let mut code = Vec::new();
-    'code: for bundle in binary.bundles() {
+    for bundle in binary.bundles() {
         for (slot, encoding) in bundle.instructions.iter().copied().enumerate() {
             code.push((bundle.offset + 8 + slot as u32 * 8, encoding));
-            if is_exit(encoding) && decode_predicate(encoding) == ShaderPredicate::Always {
-                break 'code;
-            }
         }
-    }
-    if !code.iter().any(|(_, word)| {
-        is_loop_push(*word)
-            || is_loop_branch(*word)
-            || is_set_sync_point(*word)
-            || is_synchronize(*word)
-    }) {
-        return Ok(BTreeMap::new());
     }
     let locations: BTreeMap<_, _> = code
         .iter()
@@ -52,11 +46,13 @@ pub(super) fn stack_branch_targets(
     let mut pending = VecDeque::from([(0usize, Vec::<(u16, u32)>::new())]);
     let mut visited = BTreeSet::new();
     let mut targets = BTreeMap::new();
+    let mut reachable = BTreeSet::new();
     while let Some((index, mut stack)) = pending.pop_front() {
         if index >= code.len() || !visited.insert((index, stack.clone())) {
             continue;
         }
         let (offset, encoding) = code[index];
+        reachable.insert(offset);
         if stack.len() > 64 || visited.len() > code.len() * 64 {
             return Err(malformed(
                 stage,
@@ -66,7 +62,7 @@ pub(super) fn stack_branch_targets(
             ));
         }
         let predicate = decode_predicate(encoding);
-        if encoding >> 48 == 0xe250 {
+        if encoding >> 48 == 0xe250 && predicate != ShaderPredicate::Never {
             let table = binary
                 .indirect_tables
                 .iter()
@@ -89,6 +85,9 @@ pub(super) fn stack_branch_targets(
                     )
                 })?;
                 pending.push_back((destination, stack.clone()));
+            }
+            if predicate != ShaderPredicate::Always {
+                pending.push_back((index + 1, stack));
             }
             continue;
         }
@@ -175,7 +174,10 @@ pub(super) fn stack_branch_targets(
             }
         }
     }
-    Ok(targets)
+    Ok(ShaderControlFlow {
+        reachable,
+        stack_targets: targets,
+    })
 }
 
 pub(super) const fn is_exit(encoding: u64) -> bool {

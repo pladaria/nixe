@@ -1247,7 +1247,7 @@ pub(super) fn preflight_mme_call<E>(
 
     {
         let mut host = MmeDispatchHost {
-            profile,
+            profile: &profile,
             source,
             candidate,
             consume,
@@ -1286,7 +1286,7 @@ pub(super) fn preflight_mme_call<E>(
 }
 
 struct MmeDispatchHost<'a, E, F> {
-    profile: MaxwellGpuProfile,
+    profile: &'a MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     candidate: &'a mut MaxwellThreeDFrontendState,
     consume: &'a mut F,
@@ -1339,7 +1339,7 @@ where
 }
 
 pub(super) fn preflight(
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
@@ -1372,7 +1372,7 @@ fn lower_pending_operation(
 }
 
 fn preflight_with_shadow(
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     mut method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
@@ -1405,7 +1405,7 @@ fn preflight_with_shadow(
 }
 
 fn preflight_register(
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {

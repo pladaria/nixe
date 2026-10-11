@@ -1,5 +1,4 @@
-//! Scalar mix commands and stereo device output. Voices/effects are rejected by
-//! RequestUpdate until their decoding and stateful processing are implemented.
+//! Voice decoding, scalar mix commands and stereo device output.
 //!
 //! Integer mix buffers, Q15/Q23 gains and device saturation:
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/mix/mix.cpp
@@ -16,6 +15,7 @@ pub(super) struct RenderBuffers {
     samples: Vec<i32>,
     offsets: Vec<usize>,
     order: Vec<(usize, usize)>,
+    voice_scratch: super::voice::VoiceScratch,
 }
 
 fn gain(sample: i32, volume: f32, precision: u32) -> Result<i32, Box<str>> {
@@ -23,11 +23,15 @@ fn gain(sample: i32, volume: f32, precision: u32) -> Result<i32, Box<str>> {
     if !scaled.is_finite() || scaled.abs() >= (1_u64 << 63) as f32 {
         return Err("rendering: mix gain cannot be represented in fixed point".into());
     }
-    let raw = i128::from(sample) * i128::from(scaled as i64);
+    Ok(fixed_gain(sample, scaled as i64, precision))
+}
+
+pub(super) fn fixed_gain(sample: i32, gain: i64, precision: u32) -> i32 {
+    let raw = i128::from(sample) * i128::from(gain);
     // Match Common::FixedPoint::to_int, including negative fractional samples.
     // https://github.com/eden-emulator/mirror/blob/master/src/common/fixed_point.h
     let rounded = raw + ((raw & ((1_i128 << precision) - 1)) >> 1);
-    Ok((rounded >> precision) as i32)
+    (rounded >> precision) as i32
 }
 
 // Host adaptation after the guest device command's s16 saturation. Channel
@@ -50,35 +54,50 @@ impl RenderBuffers {
             samples: vec![0; params.mixes as usize * params.samples as usize],
             offsets: vec![0; params.submixes as usize + 1],
             order: Vec::with_capacity(params.submixes as usize + 1),
+            voice_scratch: super::voice::VoiceScratch::default(),
         }
     }
 
     pub(super) fn render(
         &mut self,
-        state: &RendererUpdateState,
+        state: &mut RendererUpdateState,
         params: &RendererParameters,
         pcm: &mut [i16],
         volume: f32,
     ) -> Result<bool, Box<str>> {
-        // Every command list starts by clearing the mix buffers; voice commands
-        // will populate them before mixing once voice execution is supported.
         self.samples.fill(0);
+        self.prepare_mixes(state, params)?;
+        let samples = params.samples as usize;
+        for voice in &mut state.voices {
+            let id = voice.mix_id();
+            let Some(mix) = state.mixes.get(id).and_then(Option::as_ref) else {
+                continue;
+            };
+            let buffers = word(mix.as_slice(), 8) as usize;
+            voice.render(
+                params.revision_number().unwrap(),
+                &mut self.voice_scratch,
+                samples,
+                &state.resources,
+                &state.previous_resources,
+                &mut self.samples
+                    [self.offsets[id] * samples..(self.offsets[id] + buffers) * samples],
+                buffers,
+            )?;
+        }
+        for (previous, current) in state.previous_resources.iter_mut().zip(&state.resources) {
+            for (i, value) in previous.iter_mut().enumerate() {
+                *value = f32::from_bits(word(current, 4 + i * 4));
+            }
+        }
         self.mix_and_output(state, params, pcm, volume)
     }
 
-    fn mix_and_output(
+    fn prepare_mixes(
         &mut self,
         state: &RendererUpdateState,
         params: &RendererParameters,
-        pcm: &mut [i16],
-        volume: f32,
-    ) -> Result<bool, Box<str>> {
-        let samples = params.samples as usize;
-        let precision = if params.revision_number().unwrap() >= 7 {
-            23
-        } else {
-            15
-        };
+    ) -> Result<(), Box<str>> {
         let mut offset = 0;
         self.order.clear();
         for (id, mix) in state.mixes.iter().enumerate() {
@@ -113,6 +132,22 @@ impl RenderBuffers {
         // No allocation and no comparison closure holding mutable graph state.
         self.order
             .sort_unstable_by_key(|&(_, depth)| std::cmp::Reverse(depth));
+        Ok(())
+    }
+
+    fn mix_and_output(
+        &mut self,
+        state: &RendererUpdateState,
+        params: &RendererParameters,
+        pcm: &mut [i16],
+        volume: f32,
+    ) -> Result<bool, Box<str>> {
+        let samples = params.samples as usize;
+        let precision = if params.revision_number().unwrap() >= 7 {
+            23
+        } else {
+            15
+        };
         for &(id, _) in &self.order {
             let mix = state.mixes[id].as_ref().unwrap();
             let count = word(mix.as_slice(), 8) as usize;
@@ -267,6 +302,7 @@ mod tests {
         sink[0x124] = 1; // Reverse the final mix channels.
         state.sinks = vec![sink];
         let mut buffers = RenderBuffers::new(&params);
+        buffers.prepare_mixes(&state, &params).unwrap();
         buffers.samples[6..].copy_from_slice(&[40000, -40000, 3, 6, -6, 65536]);
         let mut pcm = [0; 6];
         assert!(
@@ -292,7 +328,7 @@ mod tests {
         );
         assert_eq!(pcm, [5, 32767, -5, -32768, 32767, 1]);
         // A new block clears stale samples instead of repeating the last block.
-        assert!(buffers.render(&state, &params, &mut pcm, 1.0).unwrap());
+        assert!(buffers.render(&mut state, &params, &mut pcm, 1.0).unwrap());
         assert_eq!(pcm, [0; 6]);
     }
     #[test]

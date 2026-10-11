@@ -137,7 +137,12 @@ impl NvDec {
             .to_string_lossy()
             .into_owned()
     }
-    pub(super) fn execute(&mut self, registers: &[u32], mappings: &Mappings) -> Result<(), String> {
+    pub(super) fn execute(
+        &mut self,
+        registers: &[u32],
+        mappings: &Mappings,
+        gpu: Option<&super::super::gpu_executor::NvDrvGpuExecutor>,
+    ) -> Result<(), String> {
         if registers[0x80] != 9 {
             return Err(format!("unsupported NVDEC codec {:#x}", registers[0x80]));
         }
@@ -215,9 +220,6 @@ impl NvDec {
         log::trace!(
             "NVDEC VP9 input: origin={origin} dimensions={width}x{height} bytes={length} pitch={luma_pitch}/{chroma_pitch} block-height={block_height}"
         );
-        // VIDEO_PROBE_BEGIN
-        let probe_start = std::time::Instant::now();
-        // VIDEO_PROBE_END
         let result = unsafe {
             nixe_nvdec_send(
                 self.decoder,
@@ -271,19 +273,11 @@ impl NvDec {
             {
                 return Err("NVDEC output dimensions/planes do not match submitted surface".into());
             }
-            // VIDEO_PROBE_BEGIN
-            let probe_decode_us = probe_start.elapsed().as_micros();
-            let probe_write = std::time::Instant::now();
-            // VIDEO_PROBE_END
-            output.write(planes, strides)?;
-            // VIDEO_PROBE_BEGIN
-            if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-                log::debug!(
-                    "VIDEO_PROBE nvdec: origin={decoded_origin} dimensions={decoded_width}x{decoded_height} decode-us={probe_decode_us} write-us={}",
-                    probe_write.elapsed().as_micros()
-                );
+            if let Some(gpu) = gpu {
+                output.upload(planes, strides, gpu)?;
+            } else {
+                output.write(planes, strides)?;
             }
-            // VIDEO_PROBE_END
             log::trace!(
                 "NVDEC VP9 output: origin={decoded_origin} dimensions={decoded_width}x{decoded_height}"
             );
@@ -295,6 +289,84 @@ impl NvDec {
     }
 }
 impl Output {
+    fn upload(
+        &self,
+        planes: [*const u8; 3],
+        strides: [i32; 3],
+        gpu: &super::super::gpu_executor::NvDrvGpuExecutor,
+    ) -> Result<(), String> {
+        let surface = |chroma| super::surface::Surface {
+            width: if chroma {
+                self.width.div_ceil(2) * 2
+            } else {
+                self.width
+            },
+            height: if chroma {
+                self.height.div_ceil(2)
+            } else {
+                self.height
+            },
+            pitch: if chroma {
+                self.chroma_pitch
+            } else {
+                self.luma_pitch
+            },
+            rows: if chroma {
+                self.height.div_ceil(2)
+            } else {
+                self.height
+            },
+            kind: 1,
+            block_height: self.block_height,
+            format: 68,
+        };
+        let images = [
+            surface(false).gpu_image(
+                &self.mappings,
+                self.luma,
+                nixe_gpu::ImageFormat::R8Unorm,
+                true,
+            )?,
+            surface(true).gpu_image(
+                &self.mappings,
+                self.chroma,
+                nixe_gpu::ImageFormat::Rg8Unorm,
+                true,
+            )?,
+        ];
+        let bytes = self.linear_planes(planes, strides);
+        gpu.upload_decoded_planes(
+            images,
+            bytes,
+            [self.width as u32, self.width.div_ceil(2) as u32],
+        )
+    }
+
+    // The FFI frame is borrowed only until the next receive. Own linear planes
+    // across the frontend/backend queues without swizzling canonical memory.
+    fn linear_planes(&self, planes: [*const u8; 3], strides: [i32; 3]) -> [Arc<[u8]>; 2] {
+        let mut luma = vec![0; self.width * self.height];
+        let chroma_width = self.width.div_ceil(2);
+        let mut uv = vec![0; chroma_width * 2 * self.height.div_ceil(2)];
+        for (y, row) in luma.chunks_exact_mut(self.width).enumerate() {
+            // SAFETY: receive validates positive strides and complete plane
+            // dimensions; this copy finishes before the next receive.
+            row.copy_from_slice(unsafe {
+                std::slice::from_raw_parts(planes[0].add(y * strides[0] as usize), self.width)
+            });
+        }
+        for (y, row) in uv.chunks_exact_mut(chroma_width * 2).enumerate() {
+            for x in 0..chroma_width {
+                // SAFETY: both chroma planes have the validated row extents.
+                unsafe {
+                    row[x * 2] = *planes[1].add(y * strides[1] as usize + x);
+                    row[x * 2 + 1] = *planes[2].add(y * strides[2] as usize + x);
+                }
+            }
+        }
+        [luma.into(), uv.into()]
+    }
+
     fn write(&self, planes: [*const u8; 3], strides: [i32; 3]) -> Result<(), String> {
         let mut writes = CanonicalWriteBatch::new();
         for chroma in [false, true] {
@@ -405,7 +477,7 @@ mod tests {
             .map(|i| (255usize.wrapping_sub(i * 5)) as u8)
             .collect::<Vec<_>>();
         allocation.write(0, &vec![0xa5; 0x10000]).unwrap();
-        Output {
+        let output = Output {
             mappings,
             luma: 0x2000,
             chroma: 0x5000,
@@ -414,9 +486,10 @@ mod tests {
             luma_pitch: 128,
             chroma_pitch: 128,
             block_height: 2,
-        }
-        .write([y.as_ptr(), u.as_ptr(), v.as_ptr()], [73, 37, 39])
-        .unwrap();
+        };
+        let planes = [y.as_ptr(), u.as_ptr(), v.as_ptr()];
+        let linear = output.linear_planes(planes, [73, 37, 39]);
+        output.write(planes, [73, 37, 39]).unwrap();
         for chroma in [false, true] {
             let rows = if chroma { height.div_ceil(2) } else { height };
             let w = if chroma { width.div_ceil(2) * 2 } else { width };
@@ -438,6 +511,15 @@ mod tests {
                 .read(if chroma { 0x4000 } else { 0x1000 }, &mut actual)
                 .unwrap();
             assert_eq!(actual, expected);
+            let pitch = if chroma { width.div_ceil(2) * 2 } else { width };
+            for row in 0..rows {
+                for x in 0..w {
+                    assert_eq!(
+                        linear[usize::from(chroma)][row * pitch + x],
+                        expected[gob_offset(x, row, 128, 2)]
+                    );
+                }
+            }
         }
     }
 

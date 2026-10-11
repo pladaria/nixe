@@ -612,3 +612,178 @@ fn bitfield_extract_preserves_sign_reversal_boundaries_and_operand_aliases() {
         }
     }
 }
+
+#[test]
+fn i2i_converts_selected_lanes_modifiers_and_saturates_without_aliasing() {
+    // Expected raw register bits include narrow wrapping conversions and the
+    // full signed saturation result, as defined by Maxwell rather than Rust casts.
+    for (src, selector, src_signed, dst, dst_signed, abs, neg, sat, input, expected) in [
+        (0, 0, true, 2, true, false, false, false, 0x80, 0xffff_ff80),
+        (0, 0, true, 0, true, false, false, false, 0x80, 0x80),
+        (0, 3, true, 1, false, true, false, false, 0x8000_007f, 0x80),
+        (
+            1,
+            2,
+            true,
+            2,
+            true,
+            false,
+            false,
+            false,
+            0xff80_00aa,
+            0xffff_ff80,
+        ),
+        (
+            1,
+            0,
+            false,
+            2,
+            false,
+            false,
+            false,
+            false,
+            0xabcd_8001,
+            0x8001,
+        ),
+        (2, 0, true, 0, true, false, false, false, 200, 200),
+        (2, 0, true, 0, true, false, false, true, 200, 127),
+        (
+            2,
+            0,
+            true,
+            0,
+            true,
+            false,
+            false,
+            true,
+            0xffff_ff7f,
+            0xffff_ff80,
+        ),
+        (2, 0, true, 0, false, false, false, true, u32::MAX, 0),
+        (2, 0, false, 0, true, false, false, true, u32::MAX, 127),
+        (2, 0, false, 1, false, false, false, true, u32::MAX, 0xffff),
+        (
+            2,
+            0,
+            false,
+            2,
+            true,
+            false,
+            false,
+            true,
+            u32::MAX,
+            0x7fff_ffff,
+        ),
+        (0, 0, true, 1, true, false, false, false, 0xff, 0xffff),
+        (0, 0, true, 1, true, false, false, true, 0xff, u32::MAX),
+        (1, 0, true, 1, true, true, false, false, 0x8000, 0x8000),
+        (
+            2,
+            0,
+            true,
+            2,
+            true,
+            true,
+            false,
+            false,
+            0x8000_0000,
+            0x8000_0000,
+        ),
+        (2, 0, false, 2, false, true, false, false, u32::MAX, 1),
+        (
+            2,
+            0,
+            true,
+            2,
+            true,
+            true,
+            true,
+            false,
+            0xffff_fff6,
+            0xffff_fff6,
+        ),
+        (
+            0,
+            1,
+            false,
+            2,
+            false,
+            false,
+            true,
+            false,
+            0x12ab,
+            0xffff_ffee,
+        ),
+        (2, 0, true, 0, false, true, true, true, 10, 0),
+    ] {
+        let fields = (dst << 8)
+            | (src << 10)
+            | (u64::from(dst_signed) << 12)
+            | (u64::from(src_signed) << 13)
+            | (selector << 41)
+            | (u64::from(neg) << 45)
+            | (u64::from(abs) << 49)
+            | (u64::from(sat) << 50);
+        let word = 0x5ce0_0000_0017_0000 | fields;
+        let ops = integer::decode_integer_to_integer(MaxwellShaderStage::Pixel, 8, word, 2, &mut 2)
+            .unwrap()
+            .operations;
+        assert_eq!(
+            evaluate(ops, &[0, input], vec![]),
+            expected,
+            "{word:#018x} {input:#x}"
+        );
+        // In-place source/destination conversion must consume the old value.
+        let alias = 0x5ce0_0000_0007_0000 | fields;
+        let ops =
+            integer::decode_integer_to_integer(MaxwellShaderStage::Pixel, 8, alias, 1, &mut 1)
+                .unwrap()
+                .operations;
+        assert_eq!(evaluate(ops, &[input], vec![]), expected);
+    }
+}
+
+#[test]
+fn i2i_immediate_constant_buffer_and_zero_operands_decode_by_family() {
+    for (word, expected) in [
+        (0x38e0_0000_0077_3a00, 7),
+        (0x39e0_007f_fff7_3a00, u32::MAX),
+        (0x5ce0_0000_0ff7_3a00, 0),
+    ] {
+        assert!(integer::is_integer_to_integer(word));
+        let decoded =
+            integer::decode_integer_to_integer(MaxwellShaderStage::Pixel, 8, word, 1, &mut 1)
+                .unwrap();
+        assert_eq!(decoded.constant_buffer_binding, None);
+        assert_eq!(evaluate(decoded.operations, &[42], vec![]), expected);
+    }
+    let decoded = integer::decode_integer_to_integer(
+        MaxwellShaderStage::Pixel,
+        8,
+        0x4ce0_0008_0047_3a00,
+        1,
+        &mut 1,
+    )
+    .unwrap();
+    assert_eq!(decoded.constant_buffer_binding, Some(2));
+    assert!(decoded.operations.iter().any(|op| matches!(
+        op,
+        ShaderOperation::LoadConstantBuffer32 {
+            binding: 2,
+            byte_offset: 16,
+            ..
+        }
+    )));
+    for (fields, detail) in [
+        (1 << 47, "I2I condition-code output"),
+        (3 << 8, "I2I 64-bit operand"),
+        (
+            1 << 41,
+            "I2I source selector is incompatible with its width",
+        ),
+    ] {
+        assert!(matches!(integer::decode_integer_to_integer(
+            MaxwellShaderStage::Pixel, 8, 0x5ce0_0000_0007_3a00 | fields, 1, &mut 1,
+        ), Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { detail: actual, .. }) if actual == detail));
+    }
+}

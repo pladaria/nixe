@@ -233,7 +233,9 @@ fn nested_break_and_sync_pop_only_the_executed_matching_tokens() {
         0x50b0000000070f00,
         0xe30000000007000f,
     ];
-    let targets = stack_branch_targets(&control_fixture(&code)).unwrap();
+    let targets = discover_shader_control_flow(&control_fixture(&code))
+        .unwrap()
+        .stack_targets;
     assert_eq!(targets[&pc(3)].byte_offset(), pc(5));
     assert_eq!(targets[&pc(5)].byte_offset(), pc(6));
     assert_eq!(targets[&pc(6)].byte_offset(), pc(8));
@@ -248,7 +250,9 @@ fn continue_pops_its_token_and_leaves_the_outer_break_target() {
         0x50b0000000070f00,
         0xe30000000007000f,
     ];
-    let targets = stack_branch_targets(&control_fixture(&code)).unwrap();
+    let targets = discover_shader_control_flow(&control_fixture(&code))
+        .unwrap()
+        .stack_targets;
     assert_eq!(targets[&pc(2)].byte_offset(), pc(3));
     assert_eq!(targets[&pc(3)].byte_offset(), pc(5));
 }
@@ -260,5 +264,92 @@ fn a_branch_cannot_borrow_an_unexecuted_break_push() {
         0xe34000000007000f,
         0xe30000000007000f,
     ];
-    assert!(stack_branch_targets(&control_fixture(&code)).is_err());
+    assert!(discover_shader_control_flow(&control_fixture(&code)).is_err());
+}
+
+#[test]
+fn conditional_exit_keeps_both_paths_and_exports_only_the_selected_result() {
+    use nixe_gpu::*;
+    let mov = |reg: u64, bits: u32| 0x0100_0000_0007_f000 | (u64::from(bits) << 20) | reg;
+    let mut header = [0_u32; 20];
+    header[0] = 0x0006_5462;
+    header[18] = 1;
+    for flag in [0, 1] {
+        let program = translated_fixture(
+            MaxwellShaderStage::Pixel,
+            header,
+            &[
+                0,
+                mov(0, 1.0_f32.to_bits()),
+                mov(1, flag),
+                0x5b64_0380_0ff7_0107,
+                0,
+                0xe300_0000_0000_000f,
+                mov(0, 2.0_f32.to_bits()),
+                0xe300_0000_0007_000f,
+            ],
+        );
+        let exits: Vec<_> = program
+            .ir()
+            .instructions()
+            .iter()
+            .filter(|i| matches!(i.operation(), ShaderOperation::Exit))
+            .collect();
+        assert_eq!(exits.len(), 2);
+        assert!(matches!(
+            exits[0].predicate(),
+            ShaderPredicate::Register {
+                register: 0,
+                inverted: false
+            }
+        ));
+        assert_eq!(
+            evaluate_shader_ir(&program, &ShaderEvaluationInputs::default(), 64)
+                .unwrap()
+                .output_bits(ShaderIoLocation::Color(0), 0),
+            Some(if flag == 0 { 1.0_f32 } else { 2.0_f32 }.to_bits())
+        );
+        validate_wgsl(&lower_shader_ir_to_wgsl(&program).unwrap());
+    }
+}
+
+#[test]
+fn branch_to_code_after_an_earlier_exit_skips_unreachable_unknown_instructions() {
+    use nixe_gpu::*;
+    let mov = |bits: u32| 0x0100_0000_0007_f000 | (u64::from(bits) << 20);
+    let mut header = [0_u32; 20];
+    header[0] = 0x0006_5462;
+    header[18] = 1;
+    let program = translated_fixture(
+        MaxwellShaderStage::Pixel,
+        header,
+        &[
+            0,
+            mov(1.0_f32.to_bits()),
+            0x5b64_0380_0ff7_0007,
+            0xe240_0000_0288_000f,
+            0,
+            0xe300_0000_0007_000f,
+            0xf123_0000_0007_0000,
+            0xf123_0000_0007_0000,
+            0,
+            mov(2.0_f32.to_bits()),
+            0xe300_0000_0007_000f,
+            0xf123_0000_0007_0000,
+        ],
+    );
+    assert!(
+        !program
+            .ir()
+            .instructions()
+            .iter()
+            .any(|i| [0x30, 0x38, 0x58].contains(&i.source().byte_offset()))
+    );
+    assert_eq!(
+        evaluate_shader_ir(&program, &ShaderEvaluationInputs::default(), 64)
+            .unwrap()
+            .output_bits(ShaderIoLocation::Color(0), 0),
+        Some(2.0_f32.to_bits())
+    );
+    validate_wgsl(&lower_shader_ir_to_wgsl(&program).unwrap());
 }

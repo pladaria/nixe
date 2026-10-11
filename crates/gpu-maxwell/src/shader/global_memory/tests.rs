@@ -87,7 +87,7 @@ fn aliased_pointer_is_frozen_before_add_and_repeated_stores_share_a_binding() {
             ShaderOperation::StoreStorageBuffer32 { binding: 32, .. }
         ));
         assert!(
-            matches!(&operations[1], ShaderOperation::ShiftRightLogical32 { value, .. } if *value == r(20))
+            matches!(&operations[1], ShaderOperation::ShiftRight32 { value, .. } if *value == r(20))
         );
     }
     assert_eq!(memory.bindings.buffers.len(), 1);
@@ -106,7 +106,7 @@ fn displacement_keeps_address_carry_instead_of_wrapping_a_byte_offset() {
     );
     assert!(matches!(
         operations[1],
-        ShaderOperation::ShiftRightLogical32 { .. }
+        ShaderOperation::ShiftRight32 { .. }
     ));
     assert!(matches!(
         operations[2],
@@ -295,7 +295,7 @@ fn wide_global_accesses_expand_consecutive_words_with_one_frozen_address() {
         assert!(!memory.bindings.buffers[0].runtime_extent);
         assert!(
             ops.iter()
-                .filter(|op| matches!(op, ShaderOperation::ShiftRightLogical32 { .. }))
+                .filter(|op| matches!(op, ShaderOperation::ShiftRight32 { .. }))
                 .count()
                 == 1
         );

@@ -1,4 +1,3 @@
-use super::super::error::MaxwellShaderTranslationError;
 use super::super::source::prepare_maxwell_shader_translation_source;
 use super::super::test_support::{
     canonical_shader_writes, mapped_memory, program_three_d, translate_maxwell_shader_programs,
@@ -98,14 +97,9 @@ fn enabled_vertex_and_fragment_interfaces_are_linked_before_backend_lowering() {
     allocation
         .write(0x100, &program_bytes(fragment_header))
         .unwrap();
-    assert!(matches!(
-        translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]),
-        Err(MaxwellShaderTranslationError::StageInterfaceMismatch {
-            location: ShaderIoLocation::Generic(1),
-            component: 0,
-            ..
-        })
-    ));
+    let unwritten =
+        translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+    assert!(unwritten[1].module.ir().ir().inputs().is_empty());
     // The same vertex program must keep the attribute when a new fragment
     // program consumes it. Linked inputs belong to shader cache identity.
     fragment_header[6] = 2 << 16;
@@ -124,6 +118,103 @@ fn enabled_vertex_and_fragment_interfaces_are_linked_before_backend_lowering() {
             .iter()
             .any(|i| i.location() == ShaderIoLocation::Generic(2))
     );
+}
+
+#[test]
+fn unwritten_fragment_varyings_use_maxwell_defaults_and_specialize_cache_identity() {
+    let (allocation, address_space, address) = mapped_memory();
+    let mut vertex_header = [0_u32; 20];
+    vertex_header[0] = 0x0002_0461;
+    let mut fragment_header = [0_u32; 20];
+    fragment_header[0] = 0x0002_5462;
+    fragment_header[6] = (1 << 8) | (1 << 14); // Generic(1).x and .w, constant.
+    fragment_header[18] = 3; // R0-R1 -> red/green.
+    let vertex_code = [0, 0xe300_0000_0007_000f_u64, 0, 0];
+    let fragment_code = [
+        0,
+        0xe0c3_ff89_0077_ff00_u64, // IPA.SC R0, Generic(1).x.
+        0xe0c3_ff89_c077_ff01_u64, // IPA.SC R1, Generic(1).w.
+        0xe300_0000_0007_000f,
+    ];
+    let write_program = |offset, header: [u32; 20], code: &[u64]| {
+        allocation
+            .write(
+                offset,
+                &header
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .chain(code.iter().copied().flat_map(u64::to_le_bytes))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+    };
+    write_program(0, vertex_header, &vertex_code);
+    write_program(0x100, fragment_header, &fragment_code);
+    let mut channel = MaxwellGpuChannel::new(
+        MaxwellChannelId::new(1),
+        MaxwellChannelOwner::new(1),
+        SWITCH_1_GM20B_PROFILE,
+    );
+    program_three_d(
+        &mut channel,
+        0,
+        SWITCH_1_GM20B_PROFILE.classes().three_d().0,
+    );
+    program_three_d(&mut channel, 0x2140, 0x50);
+    for (method, argument) in [
+        (0x1608, (address >> 32) as u32),
+        (0x160c, address as u32),
+        (0x2000, 0x11),
+        (0x2004, 0),
+        (0x200c, 4),
+        (0x2040, 0x51),
+        (0x2044, 0x100),
+        (0x204c, 4),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let defaults =
+        translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+    let fragment = defaults[1].module.ir();
+    assert!(fragment.ir().inputs().is_empty());
+    for (register, expected) in [(0, 0), (1, 1.0_f32.to_bits())] {
+        assert!(
+            fragment
+                .ir()
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(
+                    instruction.operation(),
+                    ShaderOperation::MoveImmediate32 { destination, bits, .. }
+                        if destination.index() == register && *bits == expected
+                ))
+        );
+    }
+    validate_wgsl(&lower_shader_ir_to_wgsl(fragment).unwrap());
+    // The fragment binary is unchanged. A different producer exporting this
+    // varying must use interpolation instead of reusing the constant variant.
+    vertex_header[13] = 1 << 20;
+    write_program(0, vertex_header, &vertex_code);
+    assert!(matches!(
+        translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]),
+        Err(MaxwellShaderTranslationError::StageInterfaceMismatch {
+            location: ShaderIoLocation::Generic(1),
+            component: 3,
+            ..
+        })
+    ));
+    vertex_header[13] |= 1 << 23;
+    write_program(0, vertex_header, &vertex_code);
+    let exported =
+        translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+    assert_ne!(defaults[1].fingerprint(), exported[1].fingerprint());
+    assert_eq!(exported[1].module.ir().ir().inputs().len(), 2);
+    validate_wgsl(&lower_shader_ir_to_wgsl(exported[1].module.ir()).unwrap());
+    vertex_header[13] = 0;
+    write_program(0, vertex_header, &vertex_code);
+    let revisited =
+        translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+    assert_eq!(defaults[1].fingerprint(), revisited[1].fingerprint());
 }
 
 #[test]
@@ -389,19 +480,34 @@ fn reset_stage_groups_receive_distinct_neutral_resource_bindings() {
     let (allocation, address_space, address) = mapped_memory();
     let mut vertex_header = [0_u32; 20];
     vertex_header[0] = 0x0002_0461;
+    vertex_header[13] = 1; // Position.x makes the vertex buffer load observable.
     let mut fragment_header = [0_u32; 20];
     fragment_header[0] = 0x0002_5462;
+    fragment_header[18] = 1; // R0 -> red.
     let mov = 0x0100_0000_0007_f000_u64 | (u64::from(1.0_f32.to_bits()) << 20);
-    let fadd_cbuf = 0x4c58_0000_0007_0001_u64;
+    let fadd_cbuf = 0x4c58_0000_0007_0000_u64;
     let exit = 0xe300_0000_0007_000f_u64;
     let program_bytes = |header: [u32; 20]| {
         header
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .chain(
-                [0, mov, fadd_cbuf, exit]
-                    .into_iter()
-                    .flat_map(u64::to_le_bytes),
+                [
+                    0,
+                    mov,
+                    fadd_cbuf,
+                    if header[13] == 1 {
+                        0xeff0_7f80_0707_ff00
+                    } else {
+                        exit
+                    },
+                    0,
+                    exit,
+                    0,
+                    0,
+                ]
+                .into_iter()
+                .flat_map(u64::to_le_bytes),
             )
             .collect::<Vec<_>>()
     };
@@ -440,6 +546,10 @@ fn reset_stage_groups_receive_distinct_neutral_resource_bindings() {
     assert_eq!(translated[1].bind_group(), Some(4));
     assert_eq!(translated[0].resources()[0].binding(), 0);
     assert_eq!(translated[1].resources()[0].binding(), 1);
+    // Required byte extents follow the linked bindings, including a stage
+    // whose local c0 was remapped to neutral binding 1.
+    assert_eq!(translated[0].constant_buffer_read_end(0), 4);
+    assert_eq!(translated[1].constant_buffer_read_end(1), 4);
     assert!(
         lower_shader_ir_to_wgsl(translated[0].module().ir())
             .unwrap()
@@ -463,5 +573,131 @@ fn reset_stage_groups_receive_distinct_neutral_resource_bindings() {
     assert_eq!(
         lowered.resources()[1].role(),
         crate::MaxwellThreeDResourceRole::ConstantBuffer { group: 4, slot: 0 }
+    );
+
+    // Once the result no longer reaches rasterization, neither its load nor
+    // the declaration may demand a guest buffer or produce a zero-sized import.
+    vertex_header[13] = 0;
+    allocation.write(0, &program_bytes(vertex_header)).unwrap();
+    let pruned = translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+    assert!(pruned[0].resources().is_empty());
+    let lowered = MaxwellLoweringCache::default()
+        .stage_shader_translations(&pruned)
+        .unwrap();
+    assert_eq!(lowered.resources().len(), 1);
+    assert_eq!(
+        lowered.resources()[0].role(),
+        crate::MaxwellThreeDResourceRole::ConstantBuffer { group: 4, slot: 0 }
+    );
+}
+use super::super::error::MaxwellShaderTranslationError;
+
+#[test]
+fn graphics_ldg_uses_distinct_stage_bindings_and_coexists_with_textures() {
+    let (allocation, space, address) = mapped_memory();
+    let ldc = 0xef95_0000_0007_ff00 | (0x110 << 20); // R0:R1 = c0[0x110].
+    let ldg = 0xeed4_a000_0007_0000; // Aliased B32 load R0,[R0:R1].
+    let exit = 0xe300_0000_0007_000f;
+    let mut vh = [0_u32; 20];
+    vh[0] = 0x0402_0461;
+    vh[13] = 1;
+    let mut ph = [0_u32; 20];
+    ph[0] = 0x0402_5462;
+    ph[18] = 1;
+    for (offset, header, code) in [
+        (0, vh, [0, ldc, ldg, 0xeff0_7f80_0707_ff00, 0, exit, 0, 0]),
+        (
+            0x100,
+            ph,
+            [0, ldc, ldg, 0xda50_1a40_2077_0604, 0, exit, 0, 0],
+        ),
+    ] {
+        allocation
+            .write(
+                offset,
+                &header
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .chain(code.into_iter().flat_map(u64::to_le_bytes))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+    }
+    let mut channel = MaxwellGpuChannel::new(
+        MaxwellChannelId::new(1),
+        MaxwellChannelOwner::new(1),
+        SWITCH_1_GM20B_PROFILE,
+    );
+    program_three_d(
+        &mut channel,
+        0,
+        SWITCH_1_GM20B_PROFILE.classes().three_d().0,
+    );
+    for (method, argument) in [
+        (0x1608, (address >> 32) as u32),
+        (0x160c, address as u32),
+        (0x2040, 0x11),
+        (0x2044, 0),
+        (0x204c, 8),
+        (0x2140, 0x51),
+        (0x2144, 0x100),
+        (0x214c, 8),
+        (0x2608, 0),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let translated = translate_maxwell_shader_programs(channel.three_d(), &space, &[]).unwrap();
+    let global_bindings: Vec<_> = translated
+        .iter()
+        .map(|p| {
+            p.resources()
+                .iter()
+                .find(|r| r.kind() == ShaderResourceKind::StorageBuffer)
+                .unwrap()
+                .binding()
+        })
+        .collect();
+    assert_ne!(global_bindings[0], global_bindings[1]);
+    assert!(
+        translated[0]
+            .resources()
+            .iter()
+            .all(|r| r.kind() != ShaderResourceKind::ConstantBuffer),
+        "dead pointer arithmetic must not bind a CB"
+    );
+    for program in &translated {
+        validate_wgsl(&lower_shader_ir_to_wgsl(program.module().ir()).unwrap());
+    }
+    let pixel = &translated[1];
+    let image_binding = pixel
+        .resources()
+        .iter()
+        .find(|r| r.kind() == ShaderResourceKind::SampledImage)
+        .unwrap()
+        .binding();
+    assert_ne!(global_bindings[1], image_binding);
+    let staged = MaxwellLoweringCache::default()
+        .stage_shader_translations(&translated)
+        .unwrap();
+    let globals: Vec<_> = staged
+        .resources()
+        .iter()
+        .map(|r| r.role())
+        .filter(|r| matches!(r, crate::MaxwellThreeDResourceRole::StorageBuffer { .. }))
+        .collect();
+    assert_eq!(
+        globals,
+        [
+            crate::MaxwellThreeDResourceRole::StorageBuffer {
+                group: 0,
+                slot: 0,
+                byte_offset: 0x110
+            },
+            crate::MaxwellThreeDResourceRole::StorageBuffer {
+                group: 4,
+                slot: 0,
+                byte_offset: 0x110
+            },
+        ]
     );
 }

@@ -218,6 +218,48 @@ fn buffer_shader() -> VerifiedShaderIr {
 }
 
 #[test]
+fn graphics_storage_loads_use_read_only_word_addressed_native_descriptors() {
+    for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
+        let location = if stage == ShaderStage::Vertex {
+            ShaderIoLocation::Generic(0)
+        } else {
+            ShaderIoLocation::Color(0)
+        };
+        let ir = shader(
+            stage,
+            vec![],
+            vec![interface(location, 0, ShaderScalarType::Unsigned32)],
+            vec![
+                ShaderResourceAccess::new(7, ShaderResourceKind::StorageBuffer, true, false)
+                    .unwrap(),
+            ],
+            vec![
+                immediate(0, 3),
+                ShaderOperation::LoadStorageBuffer32 {
+                    destination: ShaderRegister(1),
+                    binding: 7,
+                    word_index: ShaderRegister(0),
+                },
+                output(1, location, ShaderScalarType::Unsigned32),
+                ShaderOperation::Exit,
+            ],
+        );
+        let text = module(&ir, graphics_options()).disassemble();
+        for required in [
+            "Binding 7",
+            "DescriptorSet 0",
+            "NonWritable",
+            "ArrayStride 4",
+            "OpAccessChain",
+            "OpLoad",
+        ] {
+            assert!(text.contains(required), "{stage:?}: {required}: {text}");
+        }
+        lower_shader_ir_to_wgsl(&ir).unwrap();
+    }
+}
+
+#[test]
 fn constant_buffer_abi_is_global_read_only_word_addressed_and_lazy() {
     let ir = buffer_shader();
     let module = module(&ir, graphics_options());

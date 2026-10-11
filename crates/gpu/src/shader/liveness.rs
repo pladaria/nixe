@@ -61,6 +61,7 @@ pub(super) fn live_instructions(
             | ShaderOperation::StoreStorageBuffer32 { .. }
             | ShaderOperation::StoreControlPoint { .. }
             | ShaderOperation::PatchBarrier
+            | ShaderOperation::Discard
             | ShaderOperation::Exit => true,
             ShaderOperation::Undefined32 { .. }
             | ShaderOperation::LoadComputeBuiltin32 { .. }
@@ -82,7 +83,7 @@ pub(super) fn live_instructions(
             | ShaderOperation::Add32 { .. }
             | ShaderOperation::AddCarry32 { .. }
             | ShaderOperation::ShiftLeft32 { .. }
-            | ShaderOperation::ShiftRightLogical32 { .. }
+            | ShaderOperation::ShiftRight32 { .. }
             | ShaderOperation::Bitwise32 { .. }
             | ShaderOperation::ExtractBitfield32 { .. }
             | ShaderOperation::CompareInteger32 { .. }

@@ -19,6 +19,7 @@ fn float(register: u16) -> O {
         destination: R::new(register),
         source: R::new(register),
         source_type: T::Unsigned32,
+        rounding: nixe_gpu::ShaderRoundingMode::NearestEven,
     }
 }
 fn multiply(destination: u16, left: u16, right: u16) -> O {

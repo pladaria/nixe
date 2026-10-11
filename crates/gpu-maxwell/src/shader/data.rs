@@ -56,14 +56,16 @@ pub(super) fn decode_constant_buffer_load(
         }
     };
     validate_register_range(stage, offset, encoding, destination, words, register_count)?;
-    validate_register_range(
-        stage,
-        offset,
-        encoding,
-        dynamic_byte_offset,
-        1,
-        register_count,
-    )?;
+    if dynamic_byte_offset != 255 {
+        validate_register_range(
+            stage,
+            offset,
+            encoding,
+            dynamic_byte_offset,
+            1,
+            register_count,
+        )?;
+    }
     let address_mode = ((encoding >> 44) & 0x3) as u8;
     if address_mode != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -75,8 +77,35 @@ pub(super) fn decode_constant_buffer_load(
     }
     let binding = ((encoding >> 36) & 0x1f) as u8;
     let base_byte_offset = ((encoding >> 20) & 0xffff) as u16 as i16 as i32;
+    if dynamic_byte_offset == 255 && base_byte_offset >= 0 {
+        return Ok(DecodedConstantBufferLoad {
+            operations: (0..words)
+                .map(|word| ShaderOperation::LoadConstantBuffer32 {
+                    destination: ShaderRegister::new(u16::from(destination) + u16::from(word)),
+                    binding,
+                    byte_offset: base_byte_offset as u32 + u32::from(word) * 4,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                })
+                .collect(),
+            constant_buffer_binding: binding,
+        });
+    }
     let mut operations = Vec::with_capacity(usize::from(words) + 1);
     let mut dynamic_register = ShaderRegister::new(u16::from(dynamic_byte_offset));
+    if dynamic_byte_offset == 255 {
+        dynamic_register = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "LDC zero address temporary overflow",
+            next_temporary,
+        )?;
+        operations.push(ShaderOperation::MoveImmediate32 {
+            destination: dynamic_register,
+            bits: 0,
+            scalar_type: ShaderScalarType::Unsigned32,
+        });
+    }
     if words > 1 && (destination..destination + words).contains(&dynamic_byte_offset) {
         // Every word uses the address from before any destination is written.
         let temporary = allocate_shader_temporary(

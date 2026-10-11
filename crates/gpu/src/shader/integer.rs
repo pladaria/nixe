@@ -147,11 +147,13 @@ mod tests {
                         instruction(ShaderPredicate::Always, immediate(1, amount)),
                         instruction(
                             ShaderPredicate::Always,
-                            ShaderOperation::ShiftRightLogical32 {
+                            ShaderOperation::ShiftRight32 {
                                 destination: ShaderRegister::new(0),
                                 value: ShaderRegister::new(0),
                                 amount: ShaderRegister::new(1),
                                 wrap,
+                                signed: false,
+                                reverse: false,
                             },
                         ),
                         instruction(ShaderPredicate::Always, store(0, 0)),

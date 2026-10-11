@@ -141,13 +141,14 @@ pub(in crate::ipc_wire) fn dispatch_audio_out_manager(
             if end != 0 && &name[..end] != b"DeviceOut" {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_NOT_FOUND);
             }
-            let Some(backend) = session.0.as_deref() else {
+            let Some(backend) = session.backend.as_deref() else {
                 return unsupported("audout:u", cmd, "no host audio backend is configured");
             };
             name.fill(0);
             name[..9].copy_from_slice(b"DeviceOut");
             write_bytes(process, GuestVirtualAddress::new(out_address), &name)?;
-            let output = AudioOutSession::open(backend, format).map_err(audio_error)?;
+            let output = AudioOutSession::open(backend, format, session.devices.clone())
+                .map_err(audio_error)?;
             let handle = process
                 .handles_mut()
                 .insert(HorizonIpcObject::AudioOut(output))
@@ -240,6 +241,10 @@ pub(in crate::ipc_wire) fn dispatch_audio_out(
             // Read in bounded chunks; the host callback never touches process memory.
             // Ownership lasts until GetReleasedAudioOutBuffer returns the tag.
             let mut bytes = [0; 4096];
+            // AudioOut and the renderer feed the same console device. Apply
+            // its gain when queuing PCM, as the common Eden sink does for both:
+            // https://github.com/eden-emulator/mirror/blob/master/src/audio_core/sink/sink_stream.cpp
+            let volume = session.devices.volume(crate::audio_device::ACTIVE_DEVICE);
             for cursor in (0..length).step_by(bytes.len()) {
                 let count = bytes.len().min(length - cursor);
                 read_bytes(
@@ -247,42 +252,16 @@ pub(in crate::ipc_wire) fn dispatch_audio_out(
                     GuestVirtualAddress::new(samples + cursor as u64),
                     &mut bytes[..count],
                 )?;
-                pcm.extend(
-                    bytes[..count]
-                        .chunks_exact(2)
-                        .map(|s| i16::from_le_bytes([s[0], s[1]])),
-                );
+                pcm.extend(bytes[..count].chunks_exact(2).map(|s| {
+                    let sample = i16::from_le_bytes([s[0], s[1]]);
+                    if volume == 1.0 {
+                        sample
+                    } else {
+                        ((f32::from(sample) * volume) as i32)
+                            .clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                    }
+                }));
             }
-            // VIDEO_PROBE_BEGIN
-            if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-                let channels = audio.format().layout.channels();
-                let peaks = (0..channels)
-                    .map(|c| {
-                        pcm.iter()
-                            .skip(c)
-                            .step_by(channels)
-                            .map(|x| i32::from(*x).abs())
-                            .max()
-                            .unwrap_or(0)
-                    })
-                    .collect::<Vec<_>>();
-                log::debug!(
-                    "VIDEO_PROBE audio-append: tag={} frames={} peaks={peaks:?}",
-                    request_u64(request.data, 0).unwrap(),
-                    pcm.len() / channels
-                );
-            }
-            if let Some(path) = std::env::var_os("NIXE_VIDEO_PCM") {
-                use std::io::Write;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .unwrap();
-                let bytes = pcm.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>();
-                file.write_all(&bytes).unwrap();
-            }
-            // VIDEO_PROBE_END
             audio
                 .append(request_u64(request.data, 0).unwrap(), pcm)
                 .map_err(audio_error)?;
@@ -330,15 +309,5 @@ pub(in crate::ipc_wire) fn dispatch_audio_out(
         10 => data.extend_from_slice(&audio.played_frames().map_err(audio_error)?.to_le_bytes()),
         _ => unreachable!(),
     }
-    // VIDEO_PROBE_BEGIN
-    if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-        log::debug!(
-            "VIDEO_PROBE audio-cmd: cmd={cmd} owned={:?} count={:?} played={:?} reply={data:?}",
-            audio.owned_buffer_count(),
-            audio.buffer_count(),
-            audio.played_frames()
-        );
-    }
-    // VIDEO_PROBE_END
     semantic_success(request.token, false, &data, &[], &[], None)
 }

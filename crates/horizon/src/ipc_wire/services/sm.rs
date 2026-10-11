@@ -281,7 +281,10 @@ fn connect_service(
         ServiceKind::AudioOut => process
             .handles_mut()
             .insert(HorizonIpcObject::AudioOutManager(
-                crate::AudioOutManagerSession(host_systems.audio_backend.cloned()),
+                crate::AudioOutManagerSession {
+                    backend: host_systems.audio_backend.cloned(),
+                    devices: host_systems.audio_renderers.devices.clone(),
+                },
             )),
         ServiceKind::AudioRenderer => {
             process

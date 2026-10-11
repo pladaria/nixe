@@ -121,7 +121,6 @@ pub enum MaxwellHostSynchronizationKind {
         payload: u32,
         short: bool,
         wait: bool,
-        source: MaxwellMethodSource,
     },
     /// Discard cached system-memory reads before later channel work proceeds.
     L2SysmemInvalidate { operand_high: u8 },
@@ -488,7 +487,6 @@ fn dispatch_method(
                 payload,
                 short: source.argument & (1 << 24) != 0,
                 wait: source.argument & (1 << 20) == 0,
-                source,
             })
         };
         return Ok(MaxwellMethodDispatch {

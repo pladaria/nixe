@@ -1,4 +1,77 @@
 use super::*;
+use crate::engines::MaxwellShaderBufferSize;
+use nixe_memory::CanonicalWriteBatch;
+
+#[test]
+fn repeated_constant_buffer_bind_consumes_the_current_selector() {
+    let mut address_space = resource_address_space();
+    let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let mapping = map_resource(
+        &mut address_space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        83,
+        0,
+    );
+    let base = mapping.offset().get();
+    let mut channel = three_d_channel();
+    let role = MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 };
+    let mut cache = MaxwellLoweringCache::default();
+    for (method, argument) in [
+        (0x2380, 16),
+        (0x2384, (base >> 32) as u32),
+        (0x2388, base as u32),
+        (0x2410, 1),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let first = cache
+        .resolved_resources_mut()
+        .resolve(channel.three_d(), &address_space, &[role], None, false, 8)
+        .unwrap();
+    let first_identity = channel.three_d().resource_state_identity(&[role], false);
+    let shaders = channel.three_d().shader_state_identity();
+
+    // The selector is not a binding until BIND_GROUP_CONSTANT_BUFFER consumes it.
+    program_three_d(&mut channel, 0x2388, (base + 0x100) as u32);
+    assert!(first_identity.matches(channel.three_d()));
+    program_three_d(&mut channel, 0x2410, 1);
+    let second = cache
+        .resolved_resources_mut()
+        .resolve(channel.three_d(), &address_space, &[role], None, false, 8)
+        .unwrap();
+    let MaxwellThreeDResolvedResource::Buffer(buffer) = &second.resources()[0] else {
+        panic!("expected constant buffer");
+    };
+    assert_eq!(buffer.source().offset().get(), base + 0x100);
+    assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    assert!(!first_identity.matches(channel.three_d()));
+    assert!(shaders.matches(channel.three_d()));
+
+    let second_identity = channel.three_d().resource_state_identity(&[role], false);
+    program_three_d(&mut channel, 0x2410, 1);
+    assert!(second_identity.matches(channel.three_d()));
+    let repeated = cache
+        .resolved_resources_mut()
+        .resolve(channel.three_d(), &address_space, &[role], None, false, 8)
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&second, &repeated));
+
+    program_three_d(&mut channel, 0x2380, 32);
+    assert!(second_identity.matches(channel.three_d()));
+    program_three_d(&mut channel, 0x2410, 1);
+    let resized = cache
+        .resolved_resources_mut()
+        .resolve(channel.three_d(), &address_space, &[role], None, false, 8)
+        .unwrap();
+    let MaxwellThreeDResolvedResource::Buffer(buffer) = &resized.resources()[0] else {
+        panic!("expected constant buffer");
+    };
+    assert_eq!(buffer.description().size(), 32);
+    assert!(!second_identity.matches(channel.three_d()));
+    assert!(shaders.matches(channel.three_d()));
+}
 
 #[test]
 fn resource_cache_does_not_alias_equal_revision_counters_from_different_channels() {
@@ -5080,4 +5153,253 @@ fn srgb_write_selects_linear_or_srgb_color_attachment_views() {
         }
     }
     assert!(dispatch_method(&mut channel, 0x15b8 / 4, 2).is_err());
+}
+
+#[test]
+fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
+    let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let mut space = resource_address_space();
+    let mapping = map_resource(
+        &mut space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        91,
+        0,
+    );
+    let address = mapping.offset().get();
+    let mut channel = three_d_channel();
+    for (method, argument) in [
+        (0x2380, 0x10000),
+        (0x2384, (address >> 32) as u32),
+        (0x2388, address as u32),
+        (0x2410, 1),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let role = MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 };
+    let mut cache = super::super::threed::MaxwellThreeDResolvedResourceCache::default();
+    let first = cache
+        .resolve_with_buffer_sizes(
+            channel.three_d(),
+            &space,
+            &[role],
+            &[(role, MaxwellShaderBufferSize::Proven(0x40))],
+            None,
+            false,
+            8,
+        )
+        .unwrap();
+    for end in [0x40_u64, 0x80, 0x40] {
+        let resolved = cache
+            .resolve_with_buffer_sizes(
+                channel.three_d(),
+                &space,
+                &[role],
+                &[(role, MaxwellShaderBufferSize::Proven(end))],
+                None,
+                false,
+                8,
+            )
+            .unwrap();
+        let [MaxwellThreeDResolvedResource::Buffer(buffer)] = resolved.resources() else {
+            panic!("expected one constant buffer")
+        };
+        assert_eq!(buffer.view().size(), end);
+        if end == 0x40 {
+            assert!(std::sync::Arc::ptr_eq(&first, &resolved));
+        }
+    }
+    assert!(
+        cache
+            .resolve_with_buffer_sizes(
+                channel.three_d(),
+                &space,
+                &[role],
+                &[(role, MaxwellShaderBufferSize::Declared)],
+                None,
+                false,
+                8
+            )
+            .is_err(),
+        "an unbounded indexed access must retain the invalid declared domain"
+    );
+    assert!(
+        cache
+            .resolve_with_buffer_sizes(
+                channel.three_d(),
+                &space,
+                &[role],
+                &[(role, MaxwellShaderBufferSize::Proven(0x1004))],
+                None,
+                false,
+                8
+            )
+            .is_err(),
+        "consumed unmapped bytes must still fail"
+    );
+    assert!(
+        cache
+            .resolve(channel.three_d(), &space, &[role], None, false, 8)
+            .is_err(),
+        "complete role inspection has no shader proof"
+    );
+}
+
+#[test]
+fn graphics_storage_descriptor_tracks_pointer_size_staged_writes_and_remapping() {
+    let mut space = resource_address_space();
+    let cb = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let data = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let cb_mapping = map_resource(
+        &mut space,
+        cb.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+        92,
+        0,
+    );
+    let data_mapping = map_resource(
+        &mut space,
+        data.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+        93,
+        0,
+    );
+    let descriptor = |address: u64, size: u32| {
+        address
+            .to_le_bytes()
+            .into_iter()
+            .chain(size.to_le_bytes())
+            .chain([0; 4])
+            .collect::<Vec<_>>()
+    };
+    cb.write(0x110, &descriptor(data_mapping.offset().get(), 128))
+        .unwrap();
+    let mut channel = three_d_channel();
+    for (method, argument) in [
+        (0x2380, 0x200),
+        (0x2384, (cb_mapping.offset().get() >> 32) as u32),
+        (0x2388, cb_mapping.offset().get() as u32),
+        (0x2410, 1),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let role = MaxwellThreeDResourceRole::StorageBuffer {
+        group: 0,
+        slot: 0,
+        byte_offset: 0x110,
+    };
+    let sizes = [(role, MaxwellShaderBufferSize::Declared)];
+    let mut cache = super::super::threed::MaxwellThreeDResolvedResourceCache::default();
+    let first = cache
+        .resolve_with_buffer_sizes(channel.three_d(), &space, &[role], &sizes, None, false, 8)
+        .unwrap();
+    let repeated = cache
+        .resolve_with_buffer_sizes(channel.three_d(), &space, &[role], &sizes, None, false, 8)
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &repeated));
+    let buffer = |resources: &MaxwellThreeDResolvedResources| {
+        let [MaxwellThreeDResolvedResource::Buffer(buffer)] = resources.resources() else {
+            panic!("expected one storage buffer")
+        };
+        (buffer.source().offset().get(), buffer.view().size())
+    };
+    assert_eq!(buffer(&first), (data_mapping.offset().get(), 128));
+    let mut staged = CanonicalWriteBatch::new();
+    staged
+        .stage(
+            &cb.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+            0x110,
+            &descriptor(data_mapping.offset().get() + 64, 32),
+        )
+        .unwrap();
+    let overlay = cache
+        .resolve_with_buffer_sizes(
+            channel.three_d(),
+            &space,
+            &[role],
+            &sizes,
+            Some(&staged),
+            false,
+            8,
+        )
+        .unwrap();
+    assert_eq!(buffer(&overlay), (data_mapping.offset().get() + 64, 32));
+    let restored = cache
+        .resolve_with_buffer_sizes(channel.three_d(), &space, &[role], &sizes, None, false, 8)
+        .unwrap();
+    assert_eq!(buffer(&restored), (data_mapping.offset().get(), 128));
+    let bounded = cache
+        .resolve_with_buffer_sizes(
+            channel.three_d(),
+            &space,
+            &[role],
+            &[(role, MaxwellShaderBufferSize::Proven(4))],
+            None,
+            false,
+            8,
+        )
+        .unwrap();
+    assert_eq!(buffer(&bounded), (data_mapping.offset().get(), 4));
+    cb.write(0x118, &0_u32.to_le_bytes()).unwrap();
+    assert!(
+        cache
+            .resolve_with_buffer_sizes(channel.three_d(), &space, &[role], &sizes, None, false, 8)
+            .is_err()
+    );
+    let before_remap = cache
+        .resolve_with_buffer_sizes(
+            channel.three_d(),
+            &space,
+            &[role],
+            &[(role, MaxwellShaderBufferSize::Proven(4))],
+            None,
+            false,
+            8,
+        )
+        .unwrap();
+    // Replacing the CB mapping must invalidate the pointer dependency even
+    // when neither the old canonical bytes nor the storage target was changed.
+    let replacement = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    replacement
+        .write(0x110, &descriptor(data_mapping.offset().get() + 128, 64))
+        .unwrap();
+    space.unmap(cb_mapping.offset()).unwrap();
+    space
+        .reserve(1, 0x1000, 1, cb_mapping.offset().get())
+        .unwrap();
+    space
+        .map(MaxwellMapRequest {
+            allocation: MaxwellAllocationId::new(94),
+            backing: replacement
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+            backing_offset: 0,
+            size: 0x1000,
+            allocation_alignment: 0x1000,
+            page_size: 0,
+            kind: 0,
+            cacheable: true,
+            permissions: MemoryPermissions::READ_WRITE,
+            fixed_offset: Some(cb_mapping.offset()),
+        })
+        .unwrap();
+    let remapped_bounded = cache
+        .resolve_with_buffer_sizes(
+            channel.three_d(),
+            &space,
+            &[role],
+            &[(role, MaxwellShaderBufferSize::Proven(4))],
+            None,
+            false,
+            8,
+        )
+        .unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&before_remap, &remapped_bounded));
+    assert_eq!(
+        buffer(&remapped_bounded),
+        (data_mapping.offset().get() + 128, 4)
+    );
+    let remapped = cache
+        .resolve_with_buffer_sizes(channel.three_d(), &space, &[role], &sizes, None, false, 8)
+        .unwrap();
+    assert_eq!(buffer(&remapped), (data_mapping.offset().get() + 128, 64));
 }

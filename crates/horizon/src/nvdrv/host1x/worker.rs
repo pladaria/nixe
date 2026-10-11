@@ -95,7 +95,7 @@ impl Worker {
                                                     if let std::collections::btree_map::Entry::Vacant(entry) = decoders.entry(job.descriptor.fd()) {
                                                         entry.insert(video::NvDec::new()?);
                                                     }
-                                                    decoders.get_mut(&job.descriptor.fd()).unwrap().execute(registers, &job.mappings)?;
+                                                    decoders.get_mut(&job.descriptor.fd()).unwrap().execute(registers, &job.mappings, gpu.as_deref())?;
                                                 }
                                                 NvDrvDeviceKind::HostVic => {
                                                     super::vic::execute_with_gpu(registers, &job.mappings, gpu.as_deref())?

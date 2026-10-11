@@ -77,20 +77,32 @@ pub(super) fn prepare_buffer(
         backing: backing.clone(),
         mappings,
     };
-    if let Some(record) = cache.views.iter().find(|record| match &record.key {
-        ViewKey::Buffer {
-            description: current,
-            buffer_offset,
-            backing: old,
-            mappings: old_mappings,
-        } => {
-            *current == description
-                && *buffer_offset == 0
-                && same_canonical_backing(old, &backing)
-                && matches!(&key, ViewKey::Buffer { mappings, .. } if mappings == old_mappings)
-        }
-        _ => false,
-    }) {
+    let interval = (
+        backing.allocation(),
+        backing.allocation_offset(),
+        description.size(),
+    );
+    if let Some(record) = cache
+        .buffer_views_by_range
+        .get(&interval)
+        .into_iter()
+        .flatten()
+        .filter_map(|dependency| cache.views.get(dependency))
+        .find(|record| match &record.key {
+            ViewKey::Buffer {
+                description: current,
+                buffer_offset,
+                backing: old,
+                mappings: old_mappings,
+            } => {
+                *current == description
+                    && *buffer_offset == 0
+                    && same_canonical_backing(old, &backing)
+                    && matches!(&key, ViewKey::Buffer { mappings, .. } if mappings == old_mappings)
+            }
+            _ => false,
+        })
+    {
         return Ok(record.dependency);
     }
     let allocation = backing.allocation();
@@ -117,15 +129,23 @@ pub(super) fn prepare_buffer(
         view: Some(view),
     });
     let dependency = ResourceDependency::Buffer(id);
-    cache.views.push(ViewRecord {
-        key,
+    cache.views.insert(
         dependency,
-        materialization: ViewMaterialization::Direct,
-        cpu_writes: None,
-        write_revision: 0,
-        last_used: 0,
-        uninitialized_color_regions: Vec::new(),
-        uninitialized_depth_stencil_regions: Default::default(),
-    });
+        ViewRecord {
+            key,
+            dependency,
+            materialization: ViewMaterialization::Direct,
+            cpu_writes: None,
+            write_revision: 0,
+            last_used: 0,
+            uninitialized_color_regions: Vec::new(),
+            uninitialized_depth_stencil_regions: Default::default(),
+        },
+    );
+    cache
+        .buffer_views_by_range
+        .entry(interval)
+        .or_default()
+        .push(dependency);
     Ok(dependency)
 }

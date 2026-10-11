@@ -643,7 +643,7 @@ pub struct MaxwellThreeDMmeState {
     start_addresses: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>>,
     shadow_ram_control: MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl>,
     mutable_method_control: MaxwellThreeDRegister<MaxwellThreeDMutableMethodControl>,
-    shadow_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
+    shadow_registers: Box<[Option<MaxwellThreeDRegister<u32>>]>,
     shadow_scratch: BTreeMap<u8, MaxwellThreeDRegister<u32>>,
 }
 
@@ -671,7 +671,7 @@ impl Default for MaxwellThreeDMmeState {
                 Some(MaxwellThreeDMmeShadowRamControl::MethodTrack),
             ),
             mutable_method_control: MaxwellThreeDRegister::default(),
-            shadow_registers: BTreeMap::new(),
+            shadow_registers: vec![None; 0x1000].into_boxed_slice(),
             shadow_scratch: BTreeMap::new(),
         }
     }
@@ -749,7 +749,10 @@ impl MaxwellThreeDMmeState {
 
     #[must_use]
     pub fn shadow_register(&self, method: GpuMethodId) -> Option<&MaxwellThreeDRegister<u32>> {
-        self.shadow_registers.get(&method.0)
+        if !method.0.is_multiple_of(4) {
+            return None;
+        }
+        self.shadow_registers.get((method.0 / 4) as usize)?.as_ref()
     }
 
     pub(super) fn resolve_shadow_argument(
@@ -785,8 +788,9 @@ impl MaxwellThreeDMmeState {
         // distinction is intentionally not guessed here. MME call/data writes
         // bypass this path entirely.
         if control.is_some_and(|mode| mode.tracks()) {
-            self.shadow_registers.insert(
-                source.method().0,
+            // PFIFO/MME methods index the same fixed 12-bit register file as
+            // the live state. Keep validity and provenance without tree lookups.
+            self.shadow_registers[(source.method().0 / 4) as usize] = Some(
                 MaxwellThreeDRegister::programmed(source.argument(), source.argument(), source),
             );
         }

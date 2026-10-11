@@ -5,8 +5,8 @@ use super::binary::{
     MaxwellShaderBinary, MaxwellShaderMetadata,
 };
 use super::control_flow::{
-    decode_shader_control_target, is_branch, is_dependency_barrier, is_exit, is_loop_branch,
-    is_loop_push, is_set_sync_point, is_synchronize, stack_branch_targets,
+    decode_shader_control_target, discover_shader_control_flow, is_branch, is_dependency_barrier,
+    is_exit, is_loop_branch, is_loop_push, is_set_sync_point, is_synchronize,
     validate_dependency_barrier,
 };
 use super::conversion::{
@@ -28,7 +28,7 @@ use super::half::{
     decode_half_add, decode_half_multiply, decode_half_set_predicate, is_half_add,
     is_half_multiply, is_half_set_predicate,
 };
-use super::integer::{decode_shift_left, is_shift_left};
+use super::integer::{decode_shift_left, decode_shift_right, is_shift_left, is_shift_right};
 use super::interface::{
     append_implicit_outputs, decode_attribute_load, decode_attribute_store, decode_header_inputs,
     decode_header_outputs, decode_interpolate, is_attribute_load, is_attribute_store,
@@ -76,23 +76,25 @@ pub(super) fn translate_shader_binary(
     // The reciprocal/IPA fusion below uses straight-line register definitions.
     // Branching programs retain the explicit arithmetic rather than assuming
     // a definition dominates every path into the interpolation instruction.
-    // Stop at the first unconditional EXIT: UAM places an unreachable trap
-    // branch in the remaining slots of that same scheduling bundle.
+    let flow = discover_shader_control_flow(binary)?;
     let straight_line_fragment = stage == MaxwellShaderStage::Pixel
-        && !binary
-            .bundles()
-            .iter()
-            .flat_map(|bundle| bundle.instructions)
-            .take_while(|&encoding| {
-                !(is_exit(encoding) && decode_predicate(encoding) == ShaderPredicate::Always)
-            })
-            .any(|encoding| {
-                is_branch(encoding)
-                    || is_synchronize(encoding)
-                    || encoding >> 48 == 0xe250
-                    || is_loop_branch(encoding)
-                    || is_loop_push(encoding)
-            });
+        && !binary.bundles().iter().any(|bundle| {
+            bundle
+                .instructions
+                .iter()
+                .enumerate()
+                .any(|(slot, &encoding)| {
+                    flow.reachable
+                        .contains(&(bundle.offset + 8 + slot as u32 * 8))
+                        && (is_branch(encoding)
+                            || is_synchronize(encoding)
+                            || encoding >> 48 == 0xe250
+                            || is_loop_branch(encoding)
+                            || is_loop_push(encoding)
+                            || (is_exit(encoding)
+                                && decode_predicate(encoding) != ShaderPredicate::Always))
+                })
+        });
     let (mut inputs, mut outputs) = match binary.metadata {
         MaxwellShaderMetadata::Graphics(header) => (
             decode_header_inputs(header, vertex_input_types)?,
@@ -127,21 +129,22 @@ pub(super) fn translate_shader_binary(
             explicitly_stored.insert((ShaderIoLocation::Position, component));
         }
     }
-    let stack_targets = stack_branch_targets(binary)?;
+    let stack_targets = &flow.stack_targets;
     let mut pending_range_reductions = BTreeMap::<u8, super::special::PendingRangeReduction>::new();
-    let mut exited = false;
     let mut patch_addresses = patch_address::PatchAddresses::default();
     let mut integer_carry = None;
-    let mut global_memory =
-        (stage == MaxwellShaderStage::Compute).then(global_memory::GlobalMemory::default);
+    let mut global_memory = global_memory::GlobalMemory::new(stage);
     let code_size = u32::try_from(binary.bundles().len() * MAXWELL_SCHEDULE_BUNDLE_SIZE)
         .expect("bounded Maxwell shader code size fits u32");
 
     let mut block_targets = BTreeSet::new();
-    'targets: for bundle in binary.bundles() {
+    for bundle in binary.bundles() {
         for (slot, encoding) in bundle.instructions.iter().copied().enumerate() {
-            if is_exit(encoding) && decode_predicate(encoding) == ShaderPredicate::Always {
-                break 'targets;
+            if !flow
+                .reachable
+                .contains(&(bundle.offset + 8 + slot as u32 * 8))
+            {
+                continue;
             }
             if is_branch(encoding) || is_set_sync_point(encoding) || is_loop_push(encoding) {
                 let offset = bundle.offset + 8 + slot as u32 * 8;
@@ -160,24 +163,26 @@ pub(super) fn translate_shader_binary(
     );
     block_targets.extend(stack_targets.values().map(|target| target.byte_offset()));
 
-    'bundles: for bundle in binary.bundles() {
+    for bundle in binary.bundles() {
         for (slot, encoding) in bundle.instructions.iter().copied().enumerate() {
             let offset = bundle.offset
                 + MAXWELL_SCHEDULE_CONTROL_SIZE as u32
                 + (slot * MAXWELL_INSTRUCTION_SIZE) as u32;
+            if !flow.reachable.contains(&offset) {
+                continue;
+            }
             let source = ShaderSourceLocation::new(offset);
             let predicate = decode_predicate(encoding);
             let translated_start = instructions.len();
-            if let Some(memory) = &mut global_memory
-                && (block_targets.contains(&offset)
-                    || is_branch(encoding)
-                    || is_set_sync_point(encoding)
-                    || is_loop_push(encoding)
-                    || encoding >> 48 == 0xe250
-                    || is_loop_branch(encoding)
-                    || is_synchronize(encoding))
+            if block_targets.contains(&offset)
+                || is_branch(encoding)
+                || is_set_sync_point(encoding)
+                || is_loop_push(encoding)
+                || encoding >> 48 == 0xe250
+                || is_loop_branch(encoding)
+                || is_synchronize(encoding)
             {
-                memory.begin_block();
+                global_memory.begin_block();
             }
 
             if block_targets.contains(&offset)
@@ -192,24 +197,34 @@ pub(super) fn translate_shader_binary(
                     range.fusion_valid = false;
                 }
             }
-            if is_exit(encoding) {
-                if matches!(
-                    stage,
-                    MaxwellShaderStage::TessellationInit
-                        | MaxwellShaderStage::Tessellation
-                        | MaxwellShaderStage::Compute
-                ) && predicate != ShaderPredicate::Always
-                {
-                    return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-                        stage,
-                        instruction_offset: offset,
-                        encoding,
-                        detail: "conditional EXIT requires complete shader control-flow discovery",
-                    });
+            // SM50 KIL has no data operands; its execution predicate controls
+            // fragment termination. The header enables KIL independently.
+            // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs (OpKill)
+            if encoding >> 48 == 0xe330 {
+                if stage != MaxwellShaderStage::Pixel || !binary.header().bit(15) {
+                    return Err(unsupported_instruction(binary, offset, encoding));
                 }
+                let predicate_bits = 0xf_u64 << 16;
+                if encoding & !(0xffff_u64 << 48 | predicate_bits) != 0xf {
+                    return Err(malformed(
+                        stage,
+                        offset,
+                        encoding,
+                        "unsupported KIL operand fields",
+                    ));
+                }
+                instructions.push(ShaderInstruction::new(
+                    source,
+                    predicate,
+                    ShaderOperation::Discard,
+                ));
+                continue;
+            }
+            if is_exit(encoding) {
                 append_implicit_outputs(
                     neutral_stage,
                     source,
+                    predicate,
                     &outputs,
                     &explicitly_stored,
                     &mut instructions,
@@ -220,8 +235,7 @@ pub(super) fn translate_shader_binary(
                     ShaderOperation::Exit,
                 ));
                 patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
-                exited = true;
-                break 'bundles;
+                continue;
             }
 
             if encoding >> 48 == 0xe250 {
@@ -342,15 +356,13 @@ pub(super) fn translate_shader_binary(
                 patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
                 let destination = nixe_gpu::ShaderRegister::new(u16::from(range.destination));
                 patch_addresses.remove(destination);
-                if let Some(memory) = &mut global_memory {
-                    memory.observe(
-                        &mut instructions,
-                        translated_start,
-                        encoding,
-                        &mut next_temporary,
-                    )?;
-                    memory.forget(destination);
-                }
+                global_memory.observe(
+                    &mut instructions,
+                    translated_start,
+                    encoding,
+                    &mut next_temporary,
+                )?;
+                global_memory.forget(destination);
                 pending_range_reductions.insert(range.destination, range);
                 continue;
             }
@@ -374,13 +386,15 @@ pub(super) fn translate_shader_binary(
                 let operation = if global_memory::is_store(encoding)
                     || global_memory::is_load(encoding)
                 {
-                    let memory = global_memory
-                        .as_mut()
-                        .ok_or_else(|| unsupported_instruction(binary, offset, encoding))?;
                     let operations = if global_memory::is_load(encoding) {
-                        memory.load(offset, encoding, register_count, &mut next_temporary)?
+                        global_memory.load(offset, encoding, register_count, &mut next_temporary)?
                     } else {
-                        memory.store(offset, encoding, register_count, &mut next_temporary)?
+                        global_memory.store(
+                            offset,
+                            encoding,
+                            register_count,
+                            &mut next_temporary,
+                        )?
                     };
                     append_expanded_operations(&mut instructions, source, predicate, operations);
                     break 'instruction;
@@ -482,14 +496,14 @@ pub(super) fn translate_shader_binary(
                         decoded.operations,
                     );
                     break 'instruction;
-                } else if is_shift_left(encoding) {
-                    let decoded = decode_shift_left(
-                        stage,
-                        offset,
-                        encoding,
-                        register_count,
-                        &mut next_temporary,
-                    )?;
+                } else if is_shift_left(encoding) || is_shift_right(encoding) {
+                    let decoder = if is_shift_right(encoding) {
+                        decode_shift_right
+                    } else {
+                        decode_shift_left
+                    };
+                    let decoded =
+                        decoder(stage, offset, encoding, register_count, &mut next_temporary)?;
                     if let Some(binding) = decoded.constant_buffer_binding {
                         constant_buffer_bindings.insert(binding);
                     }
@@ -765,7 +779,8 @@ pub(super) fn translate_shader_binary(
                             .map(|operation| ShaderInstruction::new(source, predicate, operation)),
                     );
                     break 'instruction;
-                } else if integer::is_bitfield_extract(encoding)
+                } else if integer::is_integer_to_integer(encoding)
+                    || integer::is_bitfield_extract(encoding)
                     || integer::is_bitfield_insert(encoding)
                     || integer::is_integer_min_max(encoding)
                     || integer::is_bitwise(encoding)
@@ -784,7 +799,9 @@ pub(super) fn translate_shader_binary(
                             &mut integer_carry,
                         )?
                     } else {
-                        let decode = if integer::is_bitfield_extract(encoding) {
+                        let decode = if integer::is_integer_to_integer(encoding) {
+                            integer::decode_integer_to_integer
+                        } else if integer::is_bitfield_extract(encoding) {
                             integer::decode_bitfield_extract
                         } else if integer::is_bitfield_insert(encoding) {
                             integer::decode_bitfield_insert
@@ -895,21 +912,14 @@ pub(super) fn translate_shader_binary(
                 }
             }
             patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
-            if let Some(memory) = &mut global_memory {
-                memory.observe(
-                    &mut instructions,
-                    translated_start,
-                    encoding,
-                    &mut next_temporary,
-                )?;
-            }
+            global_memory.observe(
+                &mut instructions,
+                translated_start,
+                encoding,
+                &mut next_temporary,
+            )?;
         }
     }
-    debug_assert!(
-        exited,
-        "bounded reader only returns programs containing EXIT"
-    );
-
     let mut resources = constant_buffer_bindings
         .into_iter()
         .map(|binding| {
@@ -917,9 +927,48 @@ pub(super) fn translate_shader_binary(
                 .expect("read-only constant-buffer access is valid")
         })
         .collect::<Vec<_>>();
-    let global_buffers = global_memory
-        .map(|memory| memory.bindings)
-        .unwrap_or_default();
+    let mut global_buffers = global_memory.bindings;
+    // Texture pairs occupy local bindings starting at 32. Place storage
+    // bindings after the complete texture set before verification/linking.
+    if !global_buffers.buffers.is_empty() && !texture_bindings.is_empty() {
+        let shift = u8::try_from(texture_bindings.len() * 2)
+            .map_err(|_| MaxwellShaderTranslationError::ResourceBindingExhausted)?;
+        for buffer in &mut global_buffers.buffers {
+            buffer.binding = buffer
+                .binding
+                .checked_add(shift)
+                .ok_or(MaxwellShaderTranslationError::ResourceBindingExhausted)?;
+        }
+        for instruction in &mut instructions {
+            let operation = match instruction.operation() {
+                ShaderOperation::LoadStorageBuffer32 {
+                    destination,
+                    binding,
+                    word_index,
+                } => ShaderOperation::LoadStorageBuffer32 {
+                    destination: *destination,
+                    binding: binding
+                        .checked_add(shift)
+                        .ok_or(MaxwellShaderTranslationError::ResourceBindingExhausted)?,
+                    word_index: *word_index,
+                },
+                ShaderOperation::StoreStorageBuffer32 {
+                    source,
+                    binding,
+                    word_index,
+                } => ShaderOperation::StoreStorageBuffer32 {
+                    source: *source,
+                    binding: binding
+                        .checked_add(shift)
+                        .ok_or(MaxwellShaderTranslationError::ResourceBindingExhausted)?,
+                    word_index: *word_index,
+                },
+                _ => continue,
+            };
+            *instruction =
+                ShaderInstruction::new(instruction.source(), instruction.predicate(), operation);
+        }
+    }
     for buffer in &global_buffers.buffers {
         resources.push(
             ShaderResourceAccess::new(
@@ -1058,6 +1107,7 @@ fn append_expanded_operations(
 
 const fn is_supported_family(encoding: u64) -> bool {
     is_exit(encoding)
+        || encoding >> 48 == 0xe330
         || global_memory::is_load(encoding)
         || global_memory::is_store(encoding)
         || tessellation::is_system_register_read(encoding)
@@ -1073,6 +1123,7 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_move_immediate(encoding)
         || is_move(encoding)
         || is_shift_left(encoding)
+        || is_shift_right(encoding)
         || is_integer_to_float(encoding)
         || is_float_to_float(encoding)
         || is_float_to_integer(encoding)

@@ -22,6 +22,10 @@ impl WgpuBackendDriver {
             dependencies,
             &dispatch.descriptor_tables,
             serial,
+            &[dependency_handle(
+                dependencies,
+                ResourceDependency::Shader(dispatch.shader),
+            )?],
             |group| pipeline.get_bind_group_layout(group),
             &mut groups,
         );

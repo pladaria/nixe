@@ -270,7 +270,7 @@ pub(crate) struct MaxwellSubmissionPlanner<'a> {
     driver_completion_increments: u32,
     staged_memory_writes: CanonicalWriteBatch,
     inline_write_pending: bool,
-    inline_image_hint: Option<usize>,
+    inline_image_hint: Option<ResourceDependency>,
     inline_image_uploads: Vec<(nixe_gpu::ImageRegion, Vec<u8>)>,
 }
 
@@ -431,8 +431,8 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
                         payload,
                         short,
                         wait,
-                        source,
                     } => {
+                        let source = operation.source();
                         let target =
                             self.address_space
                                 .address(address)
@@ -485,8 +485,8 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
             }
             PendingEngineOperation::ComputeInlineToMemory(upload) => {
                 // Both FLUSH_DISABLE and FLUSH_ONLY use coherent canonical writes.
-                // Backend execution finishes any preceding segment before these
-                // writes and commits them before the following backend operation;
+                // Backend execution captures preceding overlapping accesses before
+                // these writes and commits them before the following operation;
                 // write-only initialization commits before returning completion.
                 // This also satisfies enabled SYSMEMBAR without an extra host wait
                 // or per-upload flush command. Neither mode releases a semaphore.
@@ -688,10 +688,11 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
                     let resources = self
                         .cache
                         .resolved_resources_mut()
-                        .resolve(
+                        .resolve_with_buffer_sizes(
                             three_d,
                             self.address_space,
                             &required_roles,
+                            translated.buffer_sizes(),
                             Some(&self.staged_memory_writes),
                             false,
                             resource_cache_limit,
@@ -1017,6 +1018,8 @@ pub struct MaxwellBackendExecution {
     creations: Vec<BackendResourceCreateInfo>,
     invalidations: Vec<ResourceDependency>,
     operations: Vec<GpuOperation>,
+    canonical_accesses: Vec<nixe_gpu::BackingView>,
+    unknown_canonical_accesses: bool,
     batchable_render_pass_begin: Option<usize>,
     segments: BackendSegmentCursor,
     completion: Option<GuestTimelinePoint>,
@@ -1057,6 +1060,8 @@ impl MaxwellBackendExecution {
             creations: Vec::new(),
             invalidations: Vec::new(),
             operations: Vec::new(),
+            canonical_accesses: Vec::new(),
+            unknown_canonical_accesses: false,
             batchable_render_pass_begin: None,
             segments: BackendSegmentCursor {
                 next: FrontendSubmissionSegment::FIRST,
@@ -1162,7 +1167,7 @@ impl MaxwellBackendExecution {
         }
 
         while self.next_step < self.steps.len() {
-            if backend_step_requires_prior_completion(&self.steps[self.next_step])
+            if self.step_requires_submission(&self.steps[self.next_step])
                 && let Some(segment) = self.take_segment()?
             {
                 if matches!(
@@ -1225,6 +1230,12 @@ impl MaxwellBackendExecution {
                         &mut self.pre_write_source,
                     )?;
                     self.batchable_render_pass_begin = None;
+                    // Ordering-only cache commands consume no canonical input
+                    // bytes. Real accesses without retained coverage stay conservative.
+                    self.unknown_canonical_accesses |= !matches!(
+                        operation.command(),
+                        GpuCommand::Barrier(_) | GpuCommand::CacheMaintenance(_)
+                    ) || !operation.accesses().is_empty();
                     self.operations.push(operation.clone());
                     self.segments.remaining_operations -= 1;
                     self.next_step += 1;
@@ -1259,6 +1270,9 @@ impl MaxwellBackendExecution {
                         &mut self.pre_writes,
                         &mut self.pre_write_source,
                     )?;
+                    let (accesses, unknown) = work.canonical_accesses();
+                    self.canonical_accesses.extend_from_slice(accesses);
+                    self.unknown_canonical_accesses |= unknown;
                     self.creations.extend_from_slice(work.resource_creations());
                     self.invalidations
                         .extend_from_slice(work.resource_invalidations());
@@ -1289,6 +1303,45 @@ impl MaxwellBackendExecution {
         Ok(None)
     }
 
+    fn step_requires_submission(&self, step: &MaxwellSubmissionExecutionStep) -> bool {
+        let MaxwellSubmissionExecutionStep::InlineWrite { target, .. } = step else {
+            return backend_step_requires_prior_completion(step);
+        };
+        if self.unknown_canonical_accesses {
+            return true;
+        }
+        for mapping in target.segments() {
+            let range = mapping.mapping().backing();
+            if range.subrange_is_cpu_visible(mapping.backing_offset(), mapping.size()) != Ok(true) {
+                return true;
+            }
+            let Ok(segments) = range.subrange_segments(mapping.backing_offset(), mapping.size())
+            else {
+                return true;
+            };
+            let end = mapping.backing_offset() + mapping.size();
+            for (logical_start, segment) in segments {
+                let start =
+                    segment.offset() + mapping.backing_offset().saturating_sub(logical_start);
+                let stop = segment.offset() + (end - logical_start).min(segment.size());
+                for access in &self.canonical_accesses {
+                    let spans = access.canonical_spans();
+                    let first =
+                        spans.partition_point(|span| span.ends_before(segment.page(), start));
+                    if spans.get(first).is_some_and(|span| {
+                        span.first_page() <= segment.page()
+                            && (span.first_page() != segment.page() || span.first_offset() < stop)
+                    }) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Unrelated ring slices can be committed together: no earlier operation
+        // consumes the changed bytes, and existing device owners need no readback.
+        false
+    }
+
     fn take_segment(
         &mut self,
     ) -> Result<Option<MaxwellBackendSegment>, MaxwellBackendExecutionError> {
@@ -1305,6 +1358,8 @@ impl MaxwellBackendExecution {
             std::mem::take(&mut self.operations),
         )
         .map_err(MaxwellBackendExecutionError::InvalidSubmission)?;
+        self.canonical_accesses.clear();
+        self.unknown_canonical_accesses = false;
         self.batchable_render_pass_begin = None;
         self.awaiting_resume = true;
         self.submitted_any = true;
@@ -1353,7 +1408,6 @@ fn backend_step_requires_prior_completion(step: &MaxwellSubmissionExecutionStep)
         MaxwellSubmissionExecutionStep::WaitForIdle
             | MaxwellSubmissionExecutionStep::SemaphoreRelease { .. }
             | MaxwellSubmissionExecutionStep::NotificationWrite { .. }
-            | MaxwellSubmissionExecutionStep::InlineWrite { .. }
             | MaxwellSubmissionExecutionStep::MemoryCopy { .. }
     )
 }
@@ -1916,6 +1970,24 @@ mod tests {
             mapping: MaxwellMappingId::new(1),
             generation: MappingGeneration::new(1),
         }
+    }
+
+    fn buffer_read_operation(offset: u64, size: u64) -> GpuOperation {
+        GpuOperation::new(
+            GpuCommand::Copy(nixe_gpu::CopyOperation::BufferToBuffer {
+                source: nixe_gpu::BufferRegion {
+                    buffer: nixe_gpu::BufferId::new(1),
+                    range: nixe_gpu::BufferRange::new(offset, size).unwrap(),
+                },
+                destination: nixe_gpu::BufferRegion {
+                    buffer: nixe_gpu::BufferId::new(2),
+                    range: nixe_gpu::BufferRange::new(0, size).unwrap(),
+                },
+            }),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )
     }
 
     fn address_space() -> MaxwellGpuAddressSpace {
@@ -2492,22 +2564,22 @@ mod tests {
     }
 
     #[test]
-    fn compute_inline_flush_modes_commit_between_backend_segments_without_extra_work() {
-        inline_flush_modes_commit_between_backend_segments(
+    fn compute_inline_flush_modes_preserve_uploads_without_extra_segments() {
+        inline_flush_modes_preserve_uploads(
             SWITCH_1_GM20B_PROFILE.classes().compute().0,
             &[0x01, 0x11, 0x41, 0x51],
         );
     }
 
     #[test]
-    fn three_d_inline_flush_modes_commit_between_backend_segments_without_extra_work() {
-        inline_flush_modes_commit_between_backend_segments(
+    fn three_d_inline_flush_modes_preserve_uploads_without_extra_segments() {
+        inline_flush_modes_preserve_uploads(
             SWITCH_1_GM20B_PROFILE.classes().three_d().0,
             &[0x01, 0x11, 0x41, 0x51, 0x1001, 0x1011, 0x1041, 0x1051],
         );
     }
 
-    fn inline_flush_modes_commit_between_backend_segments(class: u32, launches: &[u32]) {
+    fn inline_flush_modes_preserve_uploads(class: u32, launches: &[u32]) {
         let subchannel = u32::from(class == SWITCH_1_GM20B_PROFILE.classes().compute().0);
         // Match the observed 0x340-byte upload, including a packet boundary in
         // the payload. Data is synthetic; command and visibility paths are real.
@@ -2590,18 +2662,12 @@ mod tests {
 
                 if with_backend {
                     let mut execution = MaxwellBackendExecution::new(plan);
-                    let prefix = execution.next_segment(0).unwrap().unwrap();
-                    assert_eq!(prefix.submission().operations().len(), 1);
-                    assert!(execution.can_continue_after_submission());
-                    assert!(!execution.can_prepare_following());
-                    // Acceptance must first capture preceding read inputs.
-                    allocation.read(0, &mut bytes).unwrap();
-                    assert!(bytes.iter().all(|byte| *byte == 0));
-                    execution.resume_segment();
-                    let suffix = execution.next_segment(0).unwrap().unwrap();
-                    assert_eq!(suffix.submission().operations().len(), 1);
+                    let segment = execution.next_segment(0).unwrap().unwrap();
+                    assert_eq!(segment.submission().operations().len(), 2);
+                    assert!(segment.submission().is_final_segment());
                     assert!(execution.can_prepare_following());
-                    // All payload bytes are coherent before the next GPU segment.
+                    // Cache invalidations have no byte inputs. The upload commits
+                    // before this ordered batch without manufacturing a read boundary.
                     allocation.read(0, &mut bytes).unwrap();
                     assert_eq!(bytes, expected);
                     execution.resume_segment();
@@ -3021,7 +3087,7 @@ mod tests {
                 packet(0, 0x2390 / 4, &[0x1234_5678]),
                 packet(0, 0x0f74 / 4, &[0]),
             ]);
-            let plan = lower_test_pushbuffers(
+            let mut plan = lower_test_pushbuffers(
                 &mut channel,
                 &packets,
                 &address_space,
@@ -3031,6 +3097,8 @@ mod tests {
                 &mut MaxwellLoweringCache::default(),
             )
             .unwrap();
+            plan.steps[0] =
+                MaxwellSubmissionExecutionStep::BackendOperation(buffer_read_operation(0x1000, 4));
             let mut execution = MaxwellBackendExecution::new(plan);
             assert!(execution.next_segment(0).unwrap().is_some());
             if device_owned {
@@ -3331,7 +3399,7 @@ mod tests {
             let invalidate = packet(0, 0x1288 / 4, &[0]);
             pushbuffers.push(invalidate);
         }
-        let plan = lower_test_pushbuffers(
+        let mut plan = lower_test_pushbuffers(
             &mut channel,
             &pushbuffers,
             &address_space,
@@ -3341,6 +3409,12 @@ mod tests {
             &mut MaxwellLoweringCache::default(),
         )
         .unwrap();
+
+        for step in &mut plan.steps {
+            if let MaxwellSubmissionExecutionStep::BackendOperation(operation) = step {
+                *operation = buffer_read_operation(0, 4);
+            }
+        }
 
         let mut observed = Vec::new();
         let mut execution = MaxwellBackendExecution::begin(frontend, plan.completion());

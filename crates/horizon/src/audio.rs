@@ -5,16 +5,24 @@ use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
-pub struct AudioOutManagerSession(pub(crate) Option<Arc<dyn AudioBackend>>);
+pub struct AudioOutManagerSession {
+    pub(crate) backend: Option<Arc<dyn AudioBackend>>,
+    pub(crate) devices: Arc<crate::audio_device::AudioDeviceState>,
+}
 
 #[derive(Clone, Debug)]
 pub struct AudioOutSession {
     pub(crate) output: Arc<Mutex<AudioOutput>>,
     pub(crate) event: ReadableEventObject,
+    pub(crate) devices: Arc<crate::audio_device::AudioDeviceState>,
 }
 
 impl AudioOutSession {
-    pub(crate) fn open(backend: &dyn AudioBackend, format: PcmFormat) -> Result<Self, AudioError> {
+    pub(crate) fn open(
+        backend: &dyn AudioBackend,
+        format: PcmFormat,
+        devices: Arc<crate::audio_device::AudioDeviceState>,
+    ) -> Result<Self, AudioError> {
         let (signal, event) = EventObject::create_pair_with_source(ExternalEventSource::Device);
         let output = AudioOutput::open(
             backend,
@@ -30,6 +38,7 @@ impl AudioOutSession {
         Ok(Self {
             output: Arc::new(Mutex::new(output)),
             event,
+            devices,
         })
     }
 }

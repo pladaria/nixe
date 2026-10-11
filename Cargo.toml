@@ -24,7 +24,7 @@ members = [
     "crates/video-winit",
     "tools/xtask",
 ]
-exclude = ["crates/vendor/ruzstd-zbic", "fuzz"]
+exclude = ["crates/vendor/zstd-sys-zbic", "fuzz"]
 resolver = "3"
 
 [workspace.package]
@@ -45,7 +45,6 @@ mimalloc = { version = "0.1.52", default-features = false }
 pollster = "0.4"
 rustc-hash = "1.1.0"
 png = "0.18.1"
-ruzstd-zbic = { path = "crates/vendor/ruzstd-zbic" }
 sanitize-filename = "0.6"
 sdl3 = { version = "=0.18.4", features = [
     "build-from-source",
@@ -97,3 +96,6 @@ inherits = "release"
 # Line tables retain source attribution for profilers without embedding the
 # much larger full DWARF type and variable information used by debuggers.
 debug = 1
+
+[patch.crates-io]
+zstd-sys = { path = "crates/vendor/zstd-sys-zbic" }

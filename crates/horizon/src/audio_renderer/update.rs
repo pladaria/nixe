@@ -18,7 +18,7 @@ pub(super) fn word(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
 }
 
-fn wide(data: &[u8], offset: usize) -> u64 {
+pub(super) fn wide(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
@@ -136,15 +136,17 @@ impl UpdateLayout {
 }
 
 #[derive(Debug)]
-struct MemoryPool {
-    address: u64,
-    backing: CanonicalBackingRange,
+pub(super) struct MemoryPool {
+    pub(super) address: u64,
+    pub(super) backing: CanonicalBackingRange,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct RendererUpdateState {
     pools: Vec<Option<MemoryPool>>,
-    resources: Vec<[u8; 0x70]>,
+    pub(super) resources: Vec<[u8; 0x70]>,
+    pub(super) previous_resources: Vec<[f32; 24]>,
+    pub(super) voices: Vec<super::voice::Voice>,
     pub(super) mixes: Vec<Option<Box<[u8; MIX_SIZE]>>>,
     pub(super) sinks: Vec<[u8; 0x140]>,
     pub(crate) started: bool,
@@ -214,10 +216,10 @@ impl RendererUpdateState {
                         }
                         Err(error) => return Err(UpdateError::Mapping(error)),
                     },
-                    // Supported updates have no in-use voice/effect buffers.
-                    2 if self.pools[i].as_ref().is_some_and(|pool| {
-                        pool.address == address && pool.backing.size() == size
-                    }) =>
+                    2 if !self.voices.iter().any(|voice| voice.uses_pool(i))
+                        && self.pools[i].as_ref().is_some_and(|pool| {
+                            pool.address == address && pool.backing.size() == size
+                        }) =>
                     {
                         self.pools[i] = None;
                         3 // Detached.
@@ -231,6 +233,10 @@ impl RendererUpdateState {
         put_word(&mut output, 8, (pool_count * 0x10) as u32);
 
         self.resources.resize(params.voices as usize, [0; 0x70]);
+        self.previous_resources
+            .resize(params.voices as usize, [0.0; 24]);
+        self.voices
+            .resize_with(params.voices as usize, super::voice::Voice::default);
         for (stored, data) in self
             .resources
             .iter_mut()
@@ -241,13 +247,37 @@ impl RendererUpdateState {
                 stored[4..0x64].copy_from_slice(&data[4..0x64]);
             }
         }
-        for (i, voice) in input[layout.voices.clone()].chunks_exact(0x170).enumerate() {
+        for voice in &mut self.voices {
+            voice.deactivate();
+        }
+        for voice in input[layout.voices.clone()].chunks_exact(0x170) {
             if voice[9] != 0 {
-                return Err(UpdateError::Unsupported(format!("RequestUpdate: voice slot {i} is in use (id={}, format={}, channels={}); voice updates are not implemented", word(voice, 0), voice[11], word(voice, 24)).into()));
+                let id = word(voice, 0) as usize;
+                let Some(state) = self.voices.get_mut(id) else {
+                    return Err(UpdateError::Invalid);
+                };
+                state.update(
+                    voice,
+                    id,
+                    self.resources.len(),
+                    revision,
+                    &self.pools,
+                    self.force_mapping,
+                    &translate,
+                    &mut output[cursor..cursor + 0x10],
+                )?;
+                if voice[8] != 0 {
+                    for channel in 0..word(voice, 24) as usize {
+                        let resource = word(voice, 0x140 + channel * 4) as usize;
+                        for (i, value) in self.previous_resources[resource].iter_mut().enumerate() {
+                            *value = f32::from_bits(word(&self.resources[resource], 4 + i * 4));
+                        }
+                    }
+                }
             }
+            cursor += 0x10;
         }
         put_word(&mut output, 12, params.voices * 0x10);
-        cursor += params.voices as usize * 0x10; // Unused voices have no played samples or consumed buffers.
         for (i, effect) in input[layout.effects.clone()].chunks_exact(0xc0).enumerate() {
             if effect[0] != 0 {
                 const NAMES: [&str; 10] = [
@@ -375,7 +405,7 @@ impl RendererUpdateState {
         }
         cursor += 0x10; // No performance history storage was requested.
         put_word(&mut output, 4, 0xb0);
-        cursor += 0xb0; // No voice/effect mapping errors in the supported inactive graph.
+        cursor += 0xb0; // Attachments were resolved to retained canonical memory.
         if revision >= 5 {
             put_word(&mut output, 40, 0x10);
             output[cursor..cursor + 8].copy_from_slice(&self.frames.to_le_bytes());
@@ -509,6 +539,75 @@ mod tests {
     }
 
     #[test]
+    fn active_voice_update_renders_attached_pcm_and_reports_consumption_on_the_wire() {
+        let params = params();
+        let mut data = packet(true);
+        let layout = layout(&data).unwrap();
+        let memory = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        memory
+            .write(
+                0,
+                &[100_i16, -200, 300, -400]
+                    .into_iter()
+                    .flat_map(i16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        data[0x50..0x58].copy_from_slice(&0x1000_u64.to_le_bytes());
+        data[0x58..0x60].copy_from_slice(&4096_u64.to_le_bytes());
+        put_word(&mut data, 0x60, 4);
+        let resource = layout.resources.start;
+        put_word(&mut data, resource + 4, 1_f32.to_bits());
+        put_word(&mut data, resource + 8, 1_f32.to_bits());
+        data[resource + 0x64] = 1;
+        let voice = &mut data[layout.voices.clone()];
+        voice[8] = 1;
+        voice[9] = 1;
+        voice[11] = 2;
+        for (offset, value) in [
+            (12, 48000),
+            (24, 1),
+            (0x1c, 1_f32.to_bits()),
+            (0x20, 1_f32.to_bits()),
+            (0x3c, 1),
+            (0x5c, u32::MAX),
+            (0x74, 4),
+        ] {
+            put_word(voice, offset, value);
+        }
+        voice[0x60..0x68].copy_from_slice(&0x1000_u64.to_le_bytes());
+        voice[0x68..0x70].copy_from_slice(&8_u64.to_le_bytes());
+        voice[0x15c] = 2;
+        for i in 1..4 {
+            voice[0x7a + i * 0x38] = 1;
+        }
+        let mut state = RendererUpdateState::default();
+        state
+            .update(&params, &layout, &data, |address, size| {
+                assert_eq!((address, size), (0x1000, 4096));
+                Ok(memory.backing_range(MemoryPermissions::READ_WRITE).unwrap())
+            })
+            .unwrap();
+        let mut pcm = vec![0; 480];
+        let mut renderer = super::super::render::RenderBuffers::new(&params);
+        assert!(renderer.render(&mut state, &params, &mut pcm, 1.0).unwrap());
+        assert_eq!(&pcm[..8], &[100, 100, -200, -200, 300, 300, -400, -400]);
+        assert!(pcm[8..].iter().all(|&sample| sample == 0));
+        put_word(&mut data, 0x60, 0);
+        data[layout.voices.start + 8] = 0;
+        data[layout.voices.start + 0x7a] = 1;
+        let output = state
+            .update(&params, &layout, &data, |_, _| {
+                panic!("attached buffers must not be remapped")
+            })
+            .unwrap();
+        assert_eq!(wide(&output, 0x90), 4);
+        assert_eq!(word(&output, 0x98), 1);
+        renderer.render(&mut state, &params, &mut pcm, 1.0).unwrap();
+        assert!(pcm.iter().all(|&sample| sample == 0));
+    }
+
+    #[test]
     fn pool_attachment_retains_real_bytes_and_detach_checks_identity() {
         let memory = CanonicalAllocation::zeroed(4096, 4096).unwrap();
         memory.write(0, &[0xab]).unwrap();
@@ -569,11 +668,6 @@ mod tests {
         assert!(matches!(layout(&data), Err(UpdateError::Invalid)));
         let mut data = packet(true);
         let voice = 0x40 + 0x10 + 5 * 0x20 + 0x70;
-        data[voice + 9] = 1;
-        assert!(
-            matches!(RendererUpdateState::default().update(&params(), &layout(&data).unwrap(), &data, |_, _| panic!()), Err(UpdateError::Unsupported(detail)) if detail.contains("voice slot 0"))
-        );
-        data[voice + 9] = 0;
         data[voice + 0x170] = 4;
         assert!(
             matches!(RendererUpdateState::default().update(&params(), &layout(&data).unwrap(), &data, |_, _| panic!()), Err(UpdateError::Unsupported(detail)) if detail.contains("Reverb"))

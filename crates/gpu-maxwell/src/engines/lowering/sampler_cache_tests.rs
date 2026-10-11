@@ -91,6 +91,12 @@ fn sampler_identity_includes_every_effective_filter_lod_and_address_field() {
     changed = base;
     changed.max_anisotropy = 2.0;
     variants.push(changed);
+    for border in [[0; 4], [0, 0, 0, 1.0_f32.to_bits()], [1.0_f32.to_bits(); 4]] {
+        changed = base;
+        changed.address_modes = [AddressMode::ClampToBorder; 3];
+        changed.border_color = Some(border);
+        variants.push(changed);
+    }
     let mut creations = Vec::new();
     let ids = variants
         .iter()

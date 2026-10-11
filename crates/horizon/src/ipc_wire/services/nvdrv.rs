@@ -307,11 +307,6 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
             let (event, error) = service
                 .query_event(NvDrvFileDescriptor::new(fd), event_id, process.process_id())
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
-            // VIDEO_PROBE_BEGIN
-            if std::env::var_os("NIXE_VIDEO_AUDIT").is_some() {
-                log::debug!("VIDEO_PROBE nv-query: thread={caller_thread_id} fd={fd} event_id={event_id:#x} result={error} event={event:?}");
-            }
-            // VIDEO_PROBE_END
             let handle = if let Some(event) = event {
                 Some(process.handles_mut().insert(event).map_err(|_| {
                     IpcWireError::HostResourceExhausted("installing an nvdrv event handle")

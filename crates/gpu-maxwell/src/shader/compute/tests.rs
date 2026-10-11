@@ -124,25 +124,45 @@ fn headerless_code_reads_canonical_staged_bytes_through_a_gpu_va_alias() {
 }
 
 #[test]
-fn compute_rejects_conditional_exit_instead_of_truncating_the_program() {
+fn compute_continues_after_conditional_exit_and_retains_the_final_exit() {
     let (allocation, address_space, address) = super::super::test_support::mapped_memory();
     allocation
-        .write(0, &bytes(&[0, 0xe300_0000_0000_000f, 0, 0]))
+        .write(
+            0,
+            &bytes(&[
+                0,
+                0x0100_0000_0017_f000,
+                0x5b64_0380_0ff7_0007,
+                0xe300_0000_0000_000f,
+                0,
+                0x0100_0000_0027_f000,
+                0xe300_0000_0007_000f,
+                0,
+            ]),
+        )
         .unwrap();
-    assert!(matches!(
-        translate_compute_program(
-            &address_space,
-            &CanonicalWriteBatch::new(),
-            address,
-            1,
-            [32, 1, 1]
-        ),
-        Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-            instruction_offset: 8,
-            detail: "conditional EXIT requires complete shader control-flow discovery",
-            ..
-        })
-    ));
+    let program = translate_compute_program(
+        &address_space,
+        &CanonicalWriteBatch::new(),
+        address,
+        1,
+        [32, 1, 1],
+    )
+    .unwrap();
+    assert_eq!(
+        program
+            .module
+            .ir()
+            .ir()
+            .instructions()
+            .iter()
+            .filter(|i| matches!(i.operation(), ShaderOperation::Exit))
+            .count(),
+        2
+    );
+    super::super::test_support::validate_wgsl(
+        &nixe_gpu::lower_shader_ir_to_wgsl(program.module.ir()).unwrap(),
+    );
 }
 
 pub(super) fn sinewave_kernel() -> MaxwellComputeProgram {

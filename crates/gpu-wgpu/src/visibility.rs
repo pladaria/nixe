@@ -35,44 +35,51 @@ impl WgpuVisibilityCoordinator {
         self.device
     }
 
-    pub(crate) fn write_backing(
+    /// A texture readback covers an entire layer, but only still-cached pages
+    /// belong to this device's visibility transaction. CPU-published pages have
+    /// already released their mirrors and must never be written back again.
+    /// Hold the mirror lock across padding preservation and format conversion:
+    /// publication/release of another page cannot split those two operations.
+    pub(crate) fn update_cached_backing(
         &self,
         backing: &nixe_memory::CanonicalBackingRange,
-        bytes: &[u8],
+        required_page: CanonicalPageId,
+        update: impl FnOnce(&mut [u8]) -> Result<(), VisibilityCoordinatorError>,
     ) -> Result<(), VisibilityCoordinatorError> {
-        if bytes.len() != backing.size() as usize {
-            return Err(VisibilityCoordinatorError::new(
-                "backend writeback size does not match the canonical backing view",
-            ));
-        }
         let mut pages = self
             .pages
             .lock()
             .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
-        let mut source = 0_usize;
+        if !pages.contains_key(&required_page) {
+            return Err(VisibilityCoordinatorError::new(
+                "demanded GPU page has no prepared mirror",
+            ));
+        }
+        let size = usize::try_from(backing.size())
+            .map_err(|_| VisibilityCoordinatorError::new("image backing size overflows usize"))?;
+        let mut bytes = vec![0; size];
+        let mut position = 0;
         for segment in backing.segments() {
-            let size = usize::try_from(segment.size())
-                .map_err(|_| VisibilityCoordinatorError::new("segment size overflows usize"))?;
-            let offset = usize::try_from(segment.offset())
-                .map_err(|_| VisibilityCoordinatorError::new("segment offset overflows usize"))?;
-            let page = pages.get_mut(&segment.page()).ok_or_else(|| {
-                VisibilityCoordinatorError::new(
-                    "GPU writeback reached a page which was not prepared for device access",
-                )
-            })?;
-            let end = offset
-                .checked_add(size)
-                .ok_or_else(|| VisibilityCoordinatorError::new("page range overflows"))?;
-            let source_end = source
-                .checked_add(size)
-                .ok_or_else(|| VisibilityCoordinatorError::new("source range overflows"))?;
-            if end > page.bytes.len() || source_end > bytes.len() {
-                return Err(VisibilityCoordinatorError::new(
-                    "GPU writeback exceeds its prepared canonical page",
-                ));
+            let size = segment.size() as usize;
+            let offset = segment.offset() as usize;
+            if let Some(page) = pages.get(&segment.page()) {
+                let source = page.bytes.get(offset..offset + size).ok_or_else(|| {
+                    VisibilityCoordinatorError::new("image exceeds its prepared canonical page")
+                })?;
+                bytes[position..position + size].copy_from_slice(source);
             }
-            page.bytes[offset..end].copy_from_slice(&bytes[source..source_end]);
-            source = source_end;
+            position += size;
+        }
+        update(&mut bytes)?;
+        position = 0;
+        for segment in backing.segments() {
+            let size = segment.size() as usize;
+            let offset = segment.offset() as usize;
+            if let Some(page) = pages.get_mut(&segment.page()) {
+                page.bytes[offset..offset + size]
+                    .copy_from_slice(&bytes[position..position + size]);
+            }
+            position += size;
         }
         Ok(())
     }
@@ -109,41 +116,6 @@ impl WgpuVisibilityCoordinator {
         self.requester.set(requester).map_err(|_| {
             VisibilityCoordinatorError::new("wgpu visibility requester is already bound")
         })
-    }
-
-    pub(crate) fn read_backing(
-        &self,
-        backing: &nixe_memory::CanonicalBackingRange,
-        output: &mut [u8],
-    ) -> Result<(), VisibilityCoordinatorError> {
-        if output.len() != backing.size() as usize {
-            return Err(VisibilityCoordinatorError::new(
-                "backend mirror read size does not match the canonical backing view",
-            ));
-        }
-        let pages = self
-            .pages
-            .lock()
-            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
-        let mut destination = 0_usize;
-        for segment in backing.segments() {
-            let size = usize::try_from(segment.size())
-                .map_err(|_| VisibilityCoordinatorError::new("segment size overflows usize"))?;
-            let offset = usize::try_from(segment.offset())
-                .map_err(|_| VisibilityCoordinatorError::new("segment offset overflows usize"))?;
-            let page = pages.get(&segment.page()).ok_or_else(|| {
-                VisibilityCoordinatorError::new("canonical page has no device mirror")
-            })?;
-            let end = offset
-                .checked_add(size)
-                .ok_or_else(|| VisibilityCoordinatorError::new("page range overflows"))?;
-            let destination_end = destination
-                .checked_add(size)
-                .ok_or_else(|| VisibilityCoordinatorError::new("destination range overflows"))?;
-            output[destination..destination_end].copy_from_slice(&page.bytes[offset..end]);
-            destination = destination_end;
-        }
-        Ok(())
     }
 
     pub(crate) fn copy_completed_page(
@@ -272,6 +244,58 @@ impl VisibilityCoordinator for WgpuVisibilityCoordinator {
 mod tests {
     use super::*;
     use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+
+    #[test]
+    fn image_readback_updates_only_device_pages_and_preserves_their_padding() {
+        let allocation = CanonicalAllocation::zeroed(8192, 4096).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let coordinator = WgpuVisibilityCoordinator::new(NonCpuDeviceId::new(1));
+        let point = DeviceVisibilityPoint::new(2);
+        for segment in range.segments() {
+            coordinator
+                .cache_cpu_page(
+                    DeviceVisibilityRequest {
+                        page: segment.page(),
+                        size: 4096,
+                        device: coordinator.device(),
+                        visible_at: point,
+                    },
+                    &[0xaa; 4096],
+                )
+                .unwrap();
+        }
+        let first = range.segments()[0].page();
+        let second = range.segments()[1].page();
+        let request = |page| CpuVisibilityRequest {
+            page,
+            size: 4096,
+            device: coordinator.device(),
+            visible_at: point,
+        };
+        coordinator.mark_page_completed(first, point).unwrap();
+        coordinator.release_cpu_page(request(first)).unwrap();
+        // A whole-layer texture copy contains data for the CPU-published first
+        // page too. Only the second page may consume it, retaining row padding.
+        coordinator
+            .update_cached_backing(&range, second, |bytes| {
+                bytes[..16].fill(0x11);
+                bytes[4096..4112].fill(0x22);
+                Ok(())
+            })
+            .unwrap();
+        coordinator.mark_page_completed(second, point).unwrap();
+        let bytes = coordinator.copy_completed_page(request(second)).unwrap();
+        assert_eq!(&bytes[..16], &[0x22; 16]);
+        assert!(bytes[16..].iter().all(|b| *b == 0xaa));
+        assert!(coordinator.copy_completed_page(request(first)).is_err());
+        assert!(
+            coordinator
+                .update_cached_backing(&range, first, |_| Ok(()))
+                .is_err()
+        );
+    }
 
     #[test]
     fn readback_mirrors_survive_retries_until_canonical_publication() {

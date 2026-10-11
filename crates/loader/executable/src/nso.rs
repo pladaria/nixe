@@ -517,12 +517,17 @@ fn load_segment(storage: &StorageRef, segment: RawSegment) -> Result<StorageRef,
         NsoSegmentCompression::Lz4 => lz4_flex::block::decompress_into(&encoded, &mut decoded)
             .map_err(|error| invalid(format!("{} LZ4 data is invalid: {error}", segment.name)))?,
         NsoSegmentCompression::Zbic => {
-            let mut decoder = ruzstd_zbic::decoding::FrameDecoder::new();
-            decoder
-                .decode_all(&encoded, &mut decoded)
-                .map_err(|error| {
-                    invalid(format!("{} ZBIC data is invalid: {error}", segment.name))
-                })?
+            // The bundled zstd-sys extension selects BIC entropy tables per frame.
+            // https://github.com/Atmosphere-NX/Atmosphere/tree/master/libraries/libstratosphere/source/ro
+            if !encoded.starts_with(b"ZBIC") {
+                return Err(invalid(format!(
+                    "{} ZBIC data has invalid frame magic",
+                    segment.name
+                )));
+            }
+            zstd::bulk::decompress_to_buffer(&encoded, decoded.as_mut_slice()).map_err(|error| {
+                invalid(format!("{} ZBIC data is invalid: {error}", segment.name))
+            })?
         }
     };
     if decoded_size != expected {
@@ -810,6 +815,54 @@ mod tests {
             .collect();
         decoded[..8].fill(0);
         (decoded, encoded)
+    }
+
+    #[test]
+    fn native_zstd_keeps_standard_and_zbic_frames_independent_and_checks_truncation() {
+        let (plain, encoded) = zbic_fixture();
+        let standard = zstd::stream::encode_all(plain.as_slice(), 3).unwrap();
+        let mut decoder = zstd::bulk::Decompressor::new().unwrap();
+        let mut output = vec![0; plain.len()];
+        for frame in [&standard, &encoded, &standard, &encoded] {
+            assert_eq!(
+                decoder
+                    .decompress_to_buffer(frame, output.as_mut_slice())
+                    .unwrap(),
+                plain.len()
+            );
+            assert_eq!(output, plain);
+        }
+        for size in 1..encoded.len() {
+            assert!(
+                decoder
+                    .decompress_to_buffer(&encoded[..size], output.as_mut_slice())
+                    .is_err(),
+                "prefix {size}"
+            );
+        }
+        let joined = [&standard[..], &encoded[..], &standard[..]].concat();
+        // Exercise partial alternate magic and variant transitions in streaming input.
+        struct ByteReader<'a>(&'a [u8]);
+        impl std::io::Read for ByteReader<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.0.len().min(out.len()).min(1);
+                out[..count].copy_from_slice(&self.0[..count]);
+                self.0 = &self.0[count..];
+                Ok(count)
+            }
+        }
+        assert_eq!(
+            zstd::stream::decode_all(ByteReader(&joined)).unwrap(),
+            plain.repeat(3)
+        );
+        let mut wrong_magic = encoded.clone();
+        wrong_magic[..4].copy_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]);
+        // Changing the magic cannot turn a BIC frame into a standard entropy frame.
+        assert!(
+            decoder
+                .decompress_to_buffer(&wrong_magic, output.as_mut_slice())
+                .is_err()
+        );
     }
 
     fn load(bytes: Vec<u8>) -> Result<NsoImage, LoadError> {

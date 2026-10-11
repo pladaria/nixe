@@ -86,7 +86,7 @@ impl RendererWorker {
                         {
                             let mut state = update.lock().unwrap();
                             let has_sink = buffers.render(
-                                &state,
+                                &mut state,
                                 &params,
                                 &mut pcm,
                                 devices.volume(crate::audio_device::ACTIVE_DEVICE),

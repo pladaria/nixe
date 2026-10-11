@@ -13,6 +13,8 @@ pub(super) struct IndirectTable {
     pub offset: u32,
     pub register: u8,
     pub targets: Box<[(u32, ShaderSourceLocation)]>,
+    pub load_offset: u32,
+    pub read_end: u32,
     group: u8,
     slot: u8,
     buffer_address: u64,
@@ -27,6 +29,8 @@ impl PartialEq for IndirectTable {
         self.offset == other.offset
             && self.register == other.register
             && self.targets == other.targets
+            && self.load_offset == other.load_offset
+            && self.read_end == other.read_end
     }
 }
 impl Eq for IndirectTable {}
@@ -35,6 +39,8 @@ impl Hash for IndirectTable {
         self.offset.hash(state);
         self.register.hash(state);
         self.targets.hash(state);
+        self.load_offset.hash(state);
+        self.read_end.hash(state);
     }
 }
 impl IndirectTable {
@@ -245,6 +251,8 @@ pub(super) fn capture(
             offset,
             register,
             targets: targets.into(),
+            load_offset: code[load_index].0,
+            read_end: table_offset as u32 + byte_count,
             group,
             slot,
             buffer_address,

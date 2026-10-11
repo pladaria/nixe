@@ -214,6 +214,7 @@ pub(super) fn preload_vertex_inputs(
 pub(super) fn append_implicit_outputs(
     stage: ShaderStage,
     source: ShaderSourceLocation,
+    predicate: ShaderPredicate,
     outputs: &[ShaderInterfaceElement],
     explicitly_stored: &BTreeSet<(ShaderIoLocation, u8)>,
     instructions: &mut Vec<ShaderInstruction>,
@@ -239,14 +240,14 @@ pub(super) fn append_implicit_outputs(
             next_undefined_register = next_undefined_register.saturating_sub(1);
             instructions.push(ShaderInstruction::new(
                 source,
-                ShaderPredicate::Always,
+                predicate,
                 ShaderOperation::Undefined32 {
                     destination: register,
                 },
             ));
             instructions.push(ShaderInstruction::new(
                 source,
-                ShaderPredicate::Always,
+                predicate,
                 ShaderOperation::StoreOutput {
                     sources: vec![register].into_boxed_slice(),
                     location: output.location(),
@@ -284,7 +285,7 @@ pub(super) fn append_implicit_outputs(
         };
         instructions.push(ShaderInstruction::new(
             source,
-            ShaderPredicate::Always,
+            predicate,
             ShaderOperation::StoreOutput {
                 sources: vec![ShaderRegister::new(register)].into_boxed_slice(),
                 location: output.location(),

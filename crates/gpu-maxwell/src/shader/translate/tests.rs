@@ -124,3 +124,34 @@ fn xy_position_exports_keep_default_homogeneous_coordinates_and_explicit_w_wins(
         validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
     }
 }
+
+#[test]
+fn fragment_kill_respects_its_predicate_and_discards_attachment_output() {
+    use nixe_gpu::{ShaderEvaluationInputs, evaluate_shader_ir, lower_shader_ir_to_wgsl};
+    let mut header = [0_u32; 20];
+    header[0] = 0x0002_d462;
+    header[18] = 1;
+    for killed in [false, true] {
+        let shader = translated_fixture(
+            MaxwellShaderStage::Pixel,
+            header,
+            &[
+                0,
+                0x0103_f800_0007_f000, // MOV32I R0, 1.0
+                if killed {
+                    0xe330_0000_0007_000f
+                } else {
+                    0xe330_0000_000f_000f
+                },
+                0xe300_0000_0007_000f,
+            ],
+        );
+        let result = evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 64).unwrap();
+        assert_eq!(result.discarded(), killed);
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Color(0), 0),
+            (!killed).then_some(1_f32.to_bits())
+        );
+        validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+    }
+}

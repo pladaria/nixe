@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 log.workspace = true
 lz4_flex.workspace = true
-ruzstd-zbic.workspace = true
+zstd.workspace = true
 nixe-loader-storage.workspace = true
 
 [dev-dependencies]

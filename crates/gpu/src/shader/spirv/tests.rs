@@ -117,6 +117,7 @@ fn integer_to_float_uses_signedness_and_rte_without_denormal_repair() {
                 destination: ShaderRegister(1),
                 source: ShaderRegister(0),
                 source_type,
+                rounding: ShaderRoundingMode::NearestEven,
             },
             store(1),
             ShaderOperation::Exit,

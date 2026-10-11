@@ -1,6 +1,9 @@
 //! Maxwell integer instruction decoding. ISA fields follow the public GM107
 //! emitter, not instruction samples:
 //! https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L2084-L2130
+mod conversion;
+pub(super) use conversion::{decode_integer_to_integer, is_integer_to_integer};
+
 use super::decode::{allocate_shader_temporary, decode_predicate_fields, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use crate::MaxwellShaderStage;
@@ -15,7 +18,29 @@ pub(super) const fn is_shift_left(encoding: u64) -> bool {
     matches!(opcode, 0x5c48 | 0x4c48) || opcode & 0xfeff == 0x3848
 }
 
-pub(super) struct DecodedShiftLeft {
+pub(super) const fn is_shift_right(encoding: u64) -> bool {
+    let opcode = (encoding >> 48) as u16;
+    matches!(opcode & 0xfffe, 0x5c28 | 0x4c28) || opcode & 0xfefe == 0x3828
+}
+
+pub(super) fn decode_shift_right(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next_temporary: &mut u16,
+) -> Result<DecodedShift, MaxwellShaderTranslationError> {
+    decode_shift(
+        stage,
+        offset,
+        encoding,
+        register_count,
+        next_temporary,
+        true,
+    )
+}
+
+pub(super) struct DecodedShift {
     pub(super) operations: Vec<ShaderOperation>,
     pub(super) constant_buffer_binding: Option<u8>,
 }
@@ -26,20 +51,71 @@ pub(super) fn decode_shift_left(
     encoding: u64,
     register_count: u8,
     next_temporary: &mut u16,
-) -> Result<DecodedShiftLeft, MaxwellShaderTranslationError> {
+) -> Result<DecodedShift, MaxwellShaderTranslationError> {
+    decode_shift(
+        stage,
+        offset,
+        encoding,
+        register_count,
+        next_temporary,
+        false,
+    )
+}
+
+fn decode_shift(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next_temporary: &mut u16,
+    right: bool,
+) -> Result<DecodedShift, MaxwellShaderTranslationError> {
     // Operand forms and the wrap-count bit follow Mesa NAK's pinned SM50 SHL
     // encoder:
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L1695-L1722
     let destination = (encoding & 0xff) as u8;
     let value = ((encoding >> 8) & 0xff) as u8;
-    validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-    validate_register_range(stage, offset, encoding, value, 1, register_count)?;
+    let mut operations = Vec::with_capacity(4);
+    let destination = if destination == 255 {
+        allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "shift discarded destination overflow",
+            next_temporary,
+        )?
+    } else {
+        validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
+        ShaderRegister::new(u16::from(destination))
+    };
+    let value = if value == 255 {
+        let zero = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "shift zero source overflow",
+            next_temporary,
+        )?;
+        operations.push(ShaderOperation::MoveImmediate32 {
+            destination: zero,
+            bits: 0,
+            scalar_type: ShaderScalarType::Unsigned32,
+        });
+        zero
+    } else {
+        validate_register_range(stage, offset, encoding, value, 1, register_count)?;
+        ShaderRegister::new(u16::from(value))
+    };
     if encoding & (1 << 47) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "SHL condition-code write",
+            detail: if right {
+                "SHR condition-code write"
+            } else {
+                "SHL condition-code write"
+            },
         });
     }
     if encoding & (1 << 43) != 0 {
@@ -47,25 +123,45 @@ pub(super) fn decode_shift_left(
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "SHL extended carry input",
+            detail: if right {
+                "SHR extended carry input"
+            } else {
+                "SHL extended carry input"
+            },
         });
     }
 
-    let opcode = (encoding >> 48) as u16;
-    let mut operations = Vec::with_capacity(2);
-    let (amount, constant_buffer_binding) = if opcode == 0x5c48 {
+    let opcode = ((encoding >> 48) as u16) & if right { 0xfffe } else { 0xffff };
+    let (amount, constant_buffer_binding) = if opcode == if right { 0x5c28 } else { 0x5c48 } {
         let amount = ((encoding >> 20) & 0xff) as u8;
-        validate_register_range(stage, offset, encoding, amount, 1, register_count)?;
-        (ShaderRegister::new(u16::from(amount)), None)
+        let amount = if amount == 255 {
+            let zero = allocate_shader_temporary(
+                stage,
+                offset,
+                encoding,
+                "shift zero count overflow",
+                next_temporary,
+            )?;
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination: zero,
+                bits: 0,
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
+            zero
+        } else {
+            validate_register_range(stage, offset, encoding, amount, 1, register_count)?;
+            ShaderRegister::new(u16::from(amount))
+        };
+        (amount, None)
     } else {
         let temporary = allocate_shader_temporary(
             stage,
             offset,
             encoding,
-            "SHL operand temporary register overflow",
+            "shift operand temporary register overflow",
             next_temporary,
         )?;
-        if opcode == 0x4c48 {
+        if opcode == if right { 0x4c28 } else { 0x4c48 } {
             let binding = ((encoding >> 34) & 0x1f) as u8;
             let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
             operations.push(ShaderOperation::LoadConstantBuffer32 {
@@ -90,13 +186,29 @@ pub(super) fn decode_shift_left(
             (temporary, None)
         }
     };
-    operations.push(ShaderOperation::ShiftLeft32 {
-        destination: ShaderRegister::new(u16::from(destination)),
-        value: ShaderRegister::new(u16::from(value)),
-        amount,
-        wrap: encoding & (1 << 39) != 0,
+    // SHR's signed and BREV modifiers apply before the shift. Clamped
+    // arithmetic counts >=32 retain the sign; wrapped counts use the low 5 bits.
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L1725
+    // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/integer_shift_right.cpp
+    let wrap = encoding & (1 << 39) != 0;
+    operations.push(if right {
+        ShaderOperation::ShiftRight32 {
+            destination,
+            value,
+            amount,
+            wrap,
+            signed: encoding & (1 << 48) != 0,
+            reverse: encoding & (1 << 40) != 0,
+        }
+    } else {
+        ShaderOperation::ShiftLeft32 {
+            destination,
+            value,
+            amount,
+            wrap,
+        }
     });
-    Ok(DecodedShiftLeft {
+    Ok(DecodedShift {
         operations,
         constant_buffer_binding,
     })
@@ -210,11 +322,13 @@ pub(super) fn decode_bitfield_extract(
             right: mask,
             operation: ShaderBitwiseOperation::And,
         },
-        ShaderOperation::ShiftRightLogical32 {
+        ShaderOperation::ShiftRight32 {
             destination: count,
             value: control,
             amount: eight,
             wrap: false,
+            signed: false,
+            reverse: false,
         },
         ShaderOperation::Bitwise32 {
             destination: count,
@@ -340,11 +454,13 @@ pub(super) fn decode_bitfield_insert(
             right: mask8,
             operation: ShaderBitwiseOperation::And,
         },
-        ShaderOperation::ShiftRightLogical32 {
+        ShaderOperation::ShiftRight32 {
             destination: count,
             value: control,
             amount: eight,
             wrap: false,
+            signed: false,
+            reverse: false,
         },
         ShaderOperation::Bitwise32 {
             destination: count,
@@ -780,32 +896,25 @@ pub(super) fn decode_add(
     // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L1648-L1685
     let shifted = is_shift_add(encoding);
     let long = (encoding >> 48) & 0xfe00 == 0x1c00;
-    for (mask, detail) in [
-        (
-            if long { 1 << 54 } else { 1 << 50 },
-            "IADD signed saturation",
-        ),
-        (
-            if long { 0 } else { 3 << 48 },
-            if shifted {
-                "ISCADD negated operands"
-            } else {
-                "IADD negated operands"
-            },
-        ),
-    ] {
-        if encoding & mask != 0 {
-            return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-                stage,
-                instruction_offset: offset,
-                encoding,
-                detail,
-            });
-        }
+    if encoding & (1 << if long { 54 } else { 50 }) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "IADD signed saturation",
+        });
     }
     let opcode = (encoding >> 48) as u16;
-    let register = opcode == 0x5c10 || opcode == 0x5c18;
-    let constant = opcode == 0x4c10 || opcode == 0x4c18;
+    let register = if shifted {
+        opcode & 0xfffc == 0x5c18
+    } else {
+        opcode & 0xfff8 == 0x5c10
+    };
+    let constant = if shifted {
+        opcode & 0xfffc == 0x4c18
+    } else {
+        opcode & 0xfff8 == 0x4c10
+    };
     let operand_mask = if long {
         u64::from(u32::MAX) << 20
     } else if register {
@@ -865,9 +974,9 @@ pub(super) fn decode_add(
             Ok(ShaderRegister::new(u16::from(raw)))
         }
     };
-    let left = operand((encoding >> 8) as u8, &mut operations)?;
+    let mut left = operand((encoding >> 8) as u8, &mut operations)?;
     let mut constant_buffer_binding = None;
-    let right = if register {
+    let mut right = if register {
         operand((encoding >> 20) as u8, &mut operations)?
     } else {
         let destination = temporary()?;
@@ -899,23 +1008,90 @@ pub(super) fn decode_add(
         }
         destination
     };
-    let left = if long && encoding & (1 << 56) != 0 {
-        let zero = temporary()?;
-        let destination = temporary()?;
+    let carry_input = !shifted && encoding & (1 << if long { 53 } else { 43 }) != 0;
+    let carry_output = encoding & (1 << if long { 52 } else { 47 }) != 0;
+    let neg_left = encoding & (1 << if long { 56 } else { 49 }) != 0;
+    let neg_right = !long && encoding & (1 << 48) != 0;
+    let plus_one = if long {
+        (encoding >> 55) & 3 == 3
+    } else {
+        neg_left && neg_right
+    };
+    // IADD.PO negates A and adds one; ISCADD.PO and IADD32I.PO keep A.
+    // .X uses one's complement instead of arithmetic negation, allowing
+    // multiword subtraction with the previous carry as the low +1 bit.
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L1291
+    // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/integer_add.cpp
+    if !shifted && plus_one && (carry_input || carry_output) {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "IADD.PO with condition codes or extended carry",
+        });
+    }
+    for (value, negated) in [
+        (&mut left, neg_left && (!plus_one || (!shifted && !long))),
+        (&mut right, neg_right && !plus_one),
+    ] {
+        if negated {
+            let ones = temporary()?;
+            let adjusted = temporary()?;
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination: ones,
+                bits: u32::MAX,
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
+            operations.push(if carry_input {
+                ShaderOperation::Bitwise32 {
+                    destination: adjusted,
+                    left: *value,
+                    right: ones,
+                    operation: ShaderBitwiseOperation::Xor,
+                }
+            } else {
+                ShaderOperation::Multiply32 {
+                    destination: adjusted,
+                    left: *value,
+                    right: ones,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                    float_control: ShaderFloatControl::PRECISE,
+                }
+            });
+            *value = adjusted;
+        }
+    }
+    let mut po_carry = None;
+    if plus_one {
+        let one = temporary()?;
+        let adjusted = temporary()?;
         operations.push(ShaderOperation::MoveImmediate32 {
-            destination: zero,
-            bits: u32::MAX,
+            destination: one,
+            bits: 1,
             scalar_type: ShaderScalarType::Unsigned32,
         });
-        operations.push(ShaderOperation::Multiply32 {
-            destination,
-            left: zero,
-            right: left,
-            scalar_type: ShaderScalarType::Unsigned32,
-            float_control: ShaderFloatControl::PRECISE,
-        });
-        destination
-    } else if shifted && (encoding >> 39) & 31 != 0 {
+        if carry_output {
+            let carry = temporary()?;
+            operations.push(ShaderOperation::AddCarry32 {
+                destination: adjusted,
+                carry_out: carry,
+                left: right,
+                right: one,
+                carry_in: None,
+            });
+            po_carry = Some(carry);
+        } else {
+            operations.push(ShaderOperation::Add32 {
+                destination: adjusted,
+                left: right,
+                right: one,
+                scalar_type: ShaderScalarType::Unsigned32,
+                float_control: ShaderFloatControl::PRECISE,
+            });
+        }
+        right = adjusted;
+    }
+    let left = if shifted && (encoding >> 39) & 31 != 0 {
         let amount = temporary()?;
         let destination = temporary()?;
         operations.push(ShaderOperation::MoveImmediate32 {
@@ -933,8 +1109,6 @@ pub(super) fn decode_add(
     } else {
         left
     };
-    let carry_input = !shifted && encoding & (1 << if long { 53 } else { 43 }) != 0;
-    let carry_output = encoding & (1 << if long { 52 } else { 47 }) != 0;
     // IADD.X reads the unsigned carry from the previous CC definition. Do not
     // fabricate reset flags. Predication of the resulting IR preserves the
     // previous carry on a false path, and the verifier checks reaching defs.
@@ -970,6 +1144,14 @@ pub(super) fn decode_add(
             right,
             carry_in,
         });
+        if let Some(previous) = po_carry {
+            operations.push(ShaderOperation::Bitwise32 {
+                destination: carry_out,
+                left: carry_out,
+                right: previous,
+                operation: ShaderBitwiseOperation::Or,
+            });
+        }
     } else {
         operations.push(ShaderOperation::Add32 {
             destination,

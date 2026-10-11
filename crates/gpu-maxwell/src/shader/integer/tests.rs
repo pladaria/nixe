@@ -345,9 +345,52 @@ fn iscadd_signed_immediate_constant_buffer_and_zero_register() {
 
 #[test]
 fn iscadd_rejects_untranslated_flags_and_reserved_fields() {
-    for flag in [1 << 48, 1 << 49, 1 << 44, 1 << 28] {
+    for flag in [1 << 45, 1 << 44, 1 << 28] {
         assert!(decode_add(STAGE, 8, 0x5c18_0280_0017_0000 | flag, 4, &mut 4, &mut None).is_err());
     }
+}
+
+#[test]
+fn iscadd_negation_and_plus_one_preserve_wrapping_aliases_and_carry() {
+    for shift in 0..32 {
+        for (a, b) in [
+            (0_u32, u32::MAX),
+            (0x80000001, 17),
+            (0xffffffff, 0xfffffffe),
+            (7, 3),
+        ] {
+            for (neg_a, neg_b) in [(false, true), (true, false), (true, true)] {
+                let encoding = 0x5c18_0000_0017_0000
+                    | (u64::from(shift) << 39)
+                    | (u64::from(neg_a) << 49)
+                    | (u64::from(neg_b) << 48);
+                let decoded = decode_add(STAGE, 8, encoding, 4, &mut 4, &mut None).unwrap();
+                let (left, right) = if neg_a && neg_b {
+                    (a, b.wrapping_add(1))
+                } else {
+                    (
+                        if neg_a { a.wrapping_neg() } else { a },
+                        if neg_b { b.wrapping_neg() } else { b },
+                    )
+                };
+                assert_eq!(
+                    evaluate_integer(decoded, a, b),
+                    left.wrapping_shl(shift).wrapping_add(right)
+                );
+            }
+        }
+    }
+    // .PO.CC must retain the carry from B+1 even if the final addition has none.
+    let mut next = 4;
+    let mut carry = None;
+    let mut decoded =
+        decode_add(STAGE, 8, 0x5c1b_8000_0017_0000, 4, &mut next, &mut carry).unwrap();
+    decoded.operations.push(ShaderOperation::Move32 {
+        destination: ShaderRegister::new(0),
+        source: carry.unwrap(),
+        scalar_type: ShaderScalarType::Unsigned32,
+    });
+    assert_eq!(evaluate_integer(decoded, 0, u32::MAX), 1);
 }
 
 fn evaluate_lop(encoding: u64, left: u32, right: u32) -> u32 {
@@ -458,8 +501,6 @@ fn iadd_rejects_unrepresented_modifiers_and_invalid_registers() {
     for (modifier, detail) in [
         (1 << 43, "IADD.X has no translated carry definition"),
         (1 << 50, "IADD signed saturation"),
-        (1 << 48, "IADD negated operands"),
-        (1 << 49, "IADD negated operands"),
     ] {
         assert!(is_add(captured | modifier));
         assert!(
@@ -596,4 +637,137 @@ fn isetp_register_immediate_and_constant_forms() {
             ..
         })
     ));
+}
+
+#[test]
+fn shift_right_forms_modifiers_boundaries_and_aliased_destination() {
+    for value in [0_u32, 1, 0x8000_0000, 0x7654_3210, u32::MAX] {
+        for count in [0_u32, 1, 7, 31, 32, 33, 63, u32::MAX] {
+            for flags in 0..8_u64 {
+                let signed = flags & 1 != 0;
+                let reverse = flags & 2 != 0;
+                let wrap = flags & 4 != 0;
+                let modifiers =
+                    ((flags & 1) << 48) | (((flags >> 1) & 1) << 40) | (((flags >> 2) & 1) << 39);
+                let base = if reverse { value.reverse_bits() } else { value };
+                let expected = if signed {
+                    ((base as i32) >> if wrap { count & 31 } else { count.min(31) }) as u32
+                } else if !wrap && count >= 32 {
+                    0
+                } else {
+                    base >> (count & 31)
+                };
+                let immediate = (u64::from(count & 0x7ffff) << 20)
+                    | if count & 0x80000 != 0 { 1 << 56 } else { 0 };
+                for word in [
+                    0x5c28_0000_0017_0000,
+                    0x4c28_0008_0037_0000,
+                    0x3828_0000_0007_0000 | immediate,
+                ] {
+                    let word = word | modifiers;
+                    assert!(is_shift_right(word));
+                    let decoded = decode_shift_right(STAGE, 8, word, 4, &mut 4).unwrap();
+                    let result = evaluate_integer(
+                        DecodedIntegerOperation {
+                            operations: decoded.operations,
+                            constant_buffer_binding: decoded.constant_buffer_binding,
+                        },
+                        value,
+                        count,
+                    );
+                    assert_eq!(
+                        result, expected,
+                        "value={value:08x}, count={count}, word={word:016x}"
+                    );
+                }
+            }
+        }
+    }
+    for word in [
+        0x5c28_0000_0ff7_0000,
+        0x5c28_0000_0017_ff00,
+        0x3828_0000_0017_00ff,
+    ] {
+        let decoded = decode_shift_right(STAGE, 8, word, 4, &mut 4).unwrap();
+        let result = evaluate_integer(
+            DecodedIntegerOperation {
+                operations: decoded.operations,
+                constant_buffer_binding: decoded.constant_buffer_binding,
+            },
+            16,
+            1,
+        );
+        assert_eq!(
+            result,
+            if word as u8 == 255 {
+                16
+            } else if (word >> 8) as u8 == 255 {
+                0
+            } else {
+                16
+            }
+        );
+    }
+    for flag in [1 << 47, 1 << 43] {
+        assert!(decode_shift_right(STAGE, 8, 0x3828_0000_0007_0000 | flag, 4, &mut 4).is_err());
+    }
+}
+
+#[test]
+fn iadd_negation_plus_one_and_extended_complement() {
+    for left in [0_u32, 1, 0x8000_0000, u32::MAX] {
+        for right in [0_u32, 1, 0x7654_3210, u32::MAX] {
+            for flags in 1..4_u64 {
+                let expected = match flags {
+                    1 => left.wrapping_sub(right),
+                    2 => right.wrapping_sub(left),
+                    _ => right.wrapping_sub(left).wrapping_add(1),
+                };
+                for word in [0x5c10_0000_0017_0000, 0x4c10_0008_0037_0000] {
+                    assert_eq!(evaluate_iadd(word | (flags << 48), left, right), expected);
+                }
+            }
+            for carry in 0..=1_u32 {
+                for word in [
+                    0x5c11_0800_0017_0000,
+                    0x5c12_0800_0017_0000,
+                    0x1d20_0000_0007_0000 | (u64::from(right) << 20),
+                ] {
+                    let mut decoded =
+                        decode_add(STAGE, 8, word, 4, &mut 4, &mut Some(ShaderRegister::new(2)))
+                            .unwrap();
+                    decoded.operations.insert(
+                        0,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(2),
+                            bits: carry,
+                            scalar_type: ShaderScalarType::Unsigned32,
+                        },
+                    );
+                    let expected = if word >> 48 == 0x5c11 {
+                        left.wrapping_add(!right)
+                    } else {
+                        (!left).wrapping_add(right)
+                    }
+                    .wrapping_add(carry);
+                    assert_eq!(
+                        evaluate_integer(decoded, left, right),
+                        expected,
+                        "word={word:016x}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            evaluate_iadd(0x1d80_0000_0057_0000, left, 0),
+            left.wrapping_add(6)
+        );
+        assert_eq!(
+            evaluate_iadd(0x1d00_0000_0057_0000, left, 0),
+            5_u32.wrapping_sub(left)
+        );
+    }
+    for flag in [1 << 47, 1 << 43] {
+        assert!(decode_add(STAGE, 8, 0x5c13_0000_0017_0000 | flag, 4, &mut 4, &mut None).is_err());
+    }
 }

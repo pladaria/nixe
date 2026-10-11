@@ -58,11 +58,8 @@ pub(super) fn verify(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             ShaderOperation::StoreStorageBuffer32 { binding, .. } => Some((binding, true)),
             _ => None,
         };
-        if let Some((binding, write)) = access {
-            if ir.stage != ShaderStage::Compute {
-                return Err(invalid("storage operations require the compute stage"));
-            }
-            if !ir.resources.iter().any(|resource| {
+        if let Some((binding, write)) = access
+            && !ir.resources.iter().any(|resource| {
                 resource.binding == binding
                     && resource.kind == ShaderResourceKind::StorageBuffer
                     && if write {
@@ -70,12 +67,12 @@ pub(super) fn verify(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     } else {
                         resource.readable
                     }
-            }) {
-                return Err(ShaderVerificationError::UndeclaredResourceAccess {
-                    source: instruction.source,
-                    binding,
-                });
-            }
+            })
+        {
+            return Err(ShaderVerificationError::UndeclaredResourceAccess {
+                source: instruction.source,
+                binding,
+            });
         }
     }
     Ok(())

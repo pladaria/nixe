@@ -23,23 +23,28 @@ impl Emitter {
             }
             let binding = match instruction.operation {
                 ShaderOperation::LoadConstantBuffer32 { binding, .. }
-                | ShaderOperation::LoadConstantBufferIndexed32 { binding, .. } => binding,
+                | ShaderOperation::LoadConstantBufferIndexed32 { binding, .. }
+                | ShaderOperation::LoadStorageBuffer32 { binding, .. } => binding,
                 _ => continue,
             };
-            if self.constant_buffers[usize::from(binding)].is_some() {
+            if self.readonly_buffers[usize::from(binding)].is_some() {
                 continue;
             }
             let resource = declarations[usize::from(binding)];
             if !resource.is_some_and(|r| {
-                r.kind == ShaderResourceKind::ConstantBuffer && r.readable && !r.writable
+                matches!(
+                    r.kind,
+                    ShaderResourceKind::ConstantBuffer | ShaderResourceKind::StorageBuffer
+                ) && r.readable
+                    && !r.writable
             }) {
                 return Err(SpirvShaderError::Instruction {
                     source: instruction.source,
-                    reason: "native constant-buffer descriptor must be declared read-only",
+                    reason: "native buffer descriptor must be declared read-only",
                 });
             }
             let block = *block_type.get_or_insert_with(|| {
-                self.constant_word_pointer = Some(self.b.type_pointer(
+                self.buffer_word_pointer = Some(self.b.type_pointer(
                     None,
                     spv::StorageClass::StorageBuffer,
                     self.uint,
@@ -78,18 +83,18 @@ impl Emitter {
                 spv::Decoration::Binding,
                 [Operand::LiteralBit32(u32::from(binding))],
             );
-            self.constant_buffers[usize::from(binding)] = Some(variable);
+            self.readonly_buffers[usize::from(binding)] = Some(variable);
             bindings.push(*resource.expect("validated read-only descriptor"));
         }
         bindings.sort_unstable_by_key(|resource| resource.binding);
         Ok(bindings.into_boxed_slice())
     }
 
-    pub(super) fn load_constant_buffer(&mut self, binding: u8, word: u32) -> Result<u32> {
-        let buffer = self.constant_buffers[usize::from(binding)]
-            .ok_or_else(|| self.unsupported("missing native constant-buffer descriptor"))?;
+    pub(super) fn load_buffer_word(&mut self, binding: u8, word: u32) -> Result<u32> {
+        let buffer = self.readonly_buffers[usize::from(binding)]
+            .ok_or_else(|| self.unsupported("missing native read-only buffer descriptor"))?;
         let pointer = self
-            .constant_word_pointer
+            .buffer_word_pointer
             .expect("declared buffer has a scalar pointer type");
         let zero = self.constant(0);
         let address = self.b.access_chain(pointer, None, buffer, [zero, word])?;

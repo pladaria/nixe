@@ -44,8 +44,7 @@ impl MaxwellLoweringCache {
         .map_err(MaxwellLoweringError::Command)?;
         let record = self
             .views
-            .iter_mut()
-            .find(|v| v.dependency == ResourceDependency::Image(target.image))
+            .get_mut(&ResourceDependency::Image(target.image))
             .expect("prepared solid rectangle view exists");
         if request.zeta {
             if let ViewMaterialization::CompressedDepthStencil { .. } = record.materialization {
@@ -99,7 +98,7 @@ impl MaxwellLoweringCache {
         // initialized by 3D work. CPU writes invalidate this resident evidence.
         if (source.guest_layout().requires_materialization()
             && !source.guest_layout().has_direct_canonical_representation())
-            && !self.views.iter().any(|view| {
+            && !self.image_views().any(|view| {
                 view.remains_current_for_image(source)
                     && (!matches!(
                         view.materialization,
@@ -140,17 +139,22 @@ impl MaxwellLoweringCache {
                 filter,
                 first,
                 step,
+                destination_origin,
+                extent,
             } => {
                 if source.description().samples() != nixe_gpu::SampleCount::One {
                     return Err(MaxwellLoweringError::UnsupportedBlit(
                         "affine sampling of multisampled images is not implemented",
                     ));
                 }
-                let fixed_to_float = |value: u64| (value as f64 / 4294967296.0) as f32;
+                let fixed_to_float = |value: i64| (value as f64 / 4294967296.0) as f32;
+                let mut dst = region(1, destination)?;
+                dst.origin = destination_origin;
+                dst.extent = extent;
                 GpuCommand::Blit(
                     nixe_gpu::BlitOperation::new(
                         region(0, source)?,
-                        region(1, destination)?,
+                        dst,
                         [
                             source.description().format(),
                             destination.description().format(),
@@ -207,37 +211,6 @@ impl MaxwellLoweringCache {
                 src.extent = extent;
                 dst.origin = origins[1];
                 dst.extent = extent;
-                let record = self
-                    .views
-                    .iter_mut()
-                    .find(|record| record.dependency == ResourceDependency::Image(dst.image))
-                    .expect("prepared destination view exists");
-                subtract_initialized_rect(
-                    &mut record.uninitialized_color_regions,
-                    [
-                        dst.origin.x,
-                        dst.origin.y,
-                        dst.origin.x + extent.width,
-                        dst.origin.y + extent.height,
-                    ],
-                );
-                if let ViewMaterialization::CompressedDepthStencil { .. } = record.materialization {
-                    for regions in &mut record.uninitialized_depth_stencil_regions {
-                        subtract_initialized_rect(
-                            regions,
-                            [
-                                dst.origin.x,
-                                dst.origin.y,
-                                dst.origin.x + extent.width,
-                                dst.origin.y + extent.height,
-                            ],
-                        );
-                    }
-                    record.materialization = ViewMaterialization::CompressedDepthStencil {
-                        depth: record.uninitialized_depth_stencil_regions[0].is_empty(),
-                        stencil: record.uninitialized_depth_stencil_regions[1].is_empty(),
-                    };
-                }
                 if matches!(
                     request.kind,
                     super::super::twod::blit::BlitKind::Convert { .. }
@@ -262,42 +235,49 @@ impl MaxwellLoweringCache {
                 }
             }
         };
-        if matches!(
-            request.kind,
-            super::super::twod::blit::BlitKind::Downsample2x { .. }
-                | super::super::twod::blit::BlitKind::Scale { .. }
-        ) {
-            let dependency =
-                ResourceDependency::Image(image_dependency(binding_at(resources, &bindings, 1)?)?);
-            let record = self
-                .views
-                .iter_mut()
-                .find(|record| record.dependency == dependency)
-                .expect("prepared blit destination");
-            record.uninitialized_color_regions.clear();
+        let (origin, extent) = match request.kind {
+            super::super::twod::blit::BlitKind::Scale {
+                destination_origin,
+                extent,
+                ..
+            } => (destination_origin, extent),
+            super::super::twod::blit::BlitKind::Copy { origins, extent }
+            | super::super::twod::blit::BlitKind::Convert { origins, extent } => {
+                (origins[1], extent)
+            }
+            super::super::twod::blit::BlitKind::Downsample2x { .. } => (
+                ImageOrigin { x: 0, y: 0, z: 0 },
+                destination.description().extent(),
+            ),
+        };
+        let dependency =
+            ResourceDependency::Image(image_dependency(binding_at(resources, &bindings, 1)?)?);
+        let record = self
+            .views
+            .get_mut(&dependency)
+            .expect("prepared blit destination");
+        let rect = [
+            origin.x,
+            origin.y,
+            origin.x + extent.width,
+            origin.y + extent.height,
+        ];
+        subtract_initialized_rect(&mut record.uninitialized_color_regions, rect);
+        if let ViewMaterialization::CompressedDepthStencil { .. } = record.materialization {
             for regions in &mut record.uninitialized_depth_stencil_regions {
-                regions.clear();
+                subtract_initialized_rect(regions, rect);
             }
-            if matches!(
-                record.materialization,
-                ViewMaterialization::CompressedDepthStencil { .. }
-            ) {
-                record.materialization = ViewMaterialization::CompressedDepthStencil {
-                    depth: true,
-                    stencil: true,
-                };
-            }
+            record.materialization = ViewMaterialization::CompressedDepthStencil {
+                depth: record.uninitialized_depth_stencil_regions[0].is_empty(),
+                stencil: record.uninitialized_depth_stencil_regions[1].is_empty(),
+            };
         }
         record_image_write(destination, self);
         if destination.description().kind() == nixe_gpu::ImageKind::Color
-            && (matches!(
-                request.kind,
-                super::super::twod::blit::BlitKind::Downsample2x { .. }
-                    | super::super::twod::blit::BlitKind::Scale { .. }
-            ) || self.views.iter().any(|record| {
+            && self.image_views().any(|record| {
                 record.remains_current_for_image(destination)
                     && record.uninitialized_color_regions.is_empty()
-            }))
+            })
         {
             record_color_materialization(destination, self);
         }
@@ -560,8 +540,7 @@ mod depth_rect_tests {
                 })
                 .unwrap();
             let record = cache
-                .views
-                .iter()
+                .image_views()
                 .find(|r| r.dependency == ResourceDependency::Image(target))
                 .unwrap();
             assert_eq!(

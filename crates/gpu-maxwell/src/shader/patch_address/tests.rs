@@ -450,20 +450,6 @@ fn internal_addresses_cannot_escape_or_silently_change_addressing_modes() {
         ),
         (
             true,
-            0,
-            0,
-            0xe2400fffff87000f,
-            "patch address across control-flow requires address merge analysis",
-        ),
-        (
-            true,
-            0,
-            0,
-            0xe30000000000000f,
-            "conditional EXIT requires complete shader control-flow discovery",
-        ),
-        (
-            true,
             4,
             1,
             0x5b00000000200100,

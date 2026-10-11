@@ -10,6 +10,25 @@ use nixe_gpu::{
 };
 
 #[test]
+fn zero_address_ldc_preserves_static_multiword_offsets_and_bounds() {
+    for (memory_type, words) in [(4_u64, 1), (5, 2), (6, 4)] {
+        let encoding = 0xef90_0010_1107_ff00 | (memory_type << 48);
+        let mut next = 4;
+        let decoded =
+            decode_constant_buffer_load(MaxwellShaderStage::Vertex, 8, encoding, 4, &mut next)
+                .unwrap();
+        assert_eq!(decoded.constant_buffer_binding, 1);
+        assert_eq!(next, 4, "a static address needs no temporary");
+        assert_eq!(decoded.operations.len(), words);
+        for (word, op) in decoded.operations.iter().enumerate() {
+            assert!(matches!(op, ShaderOperation::LoadConstantBuffer32 {
+                destination, binding: 1, byte_offset, ..
+            } if destination.index() == word as u16 && *byte_offset == 0x110 + word as u32 * 4));
+        }
+    }
+}
+
+#[test]
 fn captured_indexed_constant_buffer_load_reaches_verified_ir_and_wgsl() {
     let mut header = [0_u32; 20];
     header[0] = 0x0006_0461;
