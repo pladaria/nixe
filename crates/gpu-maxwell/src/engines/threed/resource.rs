@@ -320,6 +320,22 @@ impl MaxwellThreeDPreservedImageLayout {
     pub const fn has_direct_canonical_representation(self) -> bool {
         !self.requires_materialization() || self.pte_kind == MAXWELL_GENERIC_BLOCK_LINEAR_KIND
     }
+
+    /// Whether the emulated host image can retain canonical texels. Single-sample
+    /// color compression is represented by resident pixels, with demanded CPU
+    /// visibility exporting those pixels through the ordinary block-linear
+    /// swizzle. It does not require reproducing the hardware's compression tags.
+    /// This is separate from importing previously unmaterialized guest storage.
+    /// Depth/stencil packing and multisample storage retain their own boundaries.
+    /// https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/util.cpp#L920-L1020
+    #[must_use]
+    pub const fn supports_canonical_texel_storage(self) -> bool {
+        self.has_direct_canonical_representation()
+            || matches!(
+                self.pte_kind,
+                MAXWELL_C32_2CRA_KIND | MAXWELL_C64_2CRA_KIND | MAXWELL_C128_2CR_KIND
+            )
+    }
 }
 
 /// Image interpretation published only after complete snapshot validation.
@@ -1055,6 +1071,7 @@ impl MaxwellThreeDResolvedResourceCache {
         address_space: &MaxwellGpuAddressSpace,
         limit: usize,
     ) -> Result<Arc<MaxwellThreeDResolvedResources>, MaxwellThreeDResourceError> {
+        self.retained_backings.set_view_limit(limit);
         let key = SolidImageKey {
             address_space: address_space.id(),
             surface: request.destination,
@@ -1185,6 +1202,7 @@ impl MaxwellThreeDResolvedResourceCache {
         address_space: &MaxwellGpuAddressSpace,
         limit: usize,
     ) -> Result<Arc<MaxwellThreeDResolvedResources>, MaxwellThreeDResourceError> {
+        self.retained_backings.set_view_limit(limit);
         let key = ColorBlitKey {
             address_space: address_space.id(),
             surfaces: request.images,
@@ -1360,6 +1378,7 @@ impl MaxwellThreeDResolvedResourceCache {
         inspect_complete_state: bool,
         limit: usize,
     ) -> Result<Arc<MaxwellThreeDResolvedResources>, MaxwellThreeDResourceError> {
+        self.retained_backings.set_view_limit(limit);
         if let Some(index) = self.current
             && self.entry_matches(
                 index,
@@ -1591,36 +1610,154 @@ struct RetainedBackingCacheEntry {
     retained: RetainedResourceBacking,
 }
 
-/// Owner-local topology cache derived from stable Maxwell mappings. CPU writes
-/// refresh content observations without rebuilding immutable page layouts.
+// Cache consumed view descriptions independently of unrelated draw-state domains.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ResolvedViewDefinition {
+    Buffer {
+        address: MaxwellThreeDUnresolvedAddress,
+        size: u64,
+    },
+    Sampled([u8; 32]),
+    Attachment {
+        address: MaxwellThreeDUnresolvedAddress,
+        description: ImageDescription,
+        layout: MaxwellThreeDImageLayout,
+        array_pitch_dwords: Option<u32>,
+        selected_layer: u16,
+        guest_format: MaxwellThreeDGuestImageFormat,
+        compression_enabled: bool,
+        row_pitch_bytes: Option<u32>,
+        sample_mode: Option<MaxwellThreeDSampleMode>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ResolvedViewKey {
+    address_space: crate::MaxwellAddressSpaceId,
+    role: MaxwellThreeDResourceRole,
+    definition: ResolvedViewDefinition,
+}
+
+#[derive(Debug)]
+struct CachedResolvedView {
+    key: ResolvedViewKey,
+    resource: MaxwellThreeDResolvedResource,
+    mapping_generation: u64,
+    referenced: bool,
+}
+
+/// Owner-local mapping topology and resource-view cache. Descriptor bytes are
+/// still read in submission order; views are keyed by their actual descriptions.
 #[derive(Debug, Default)]
 pub(crate) struct MaxwellThreeDRetainedBackingCache {
     entries: BTreeMap<RetainedBackingKey, Arc<RetainedBackingCacheEntry>>,
+    views: HashMap<ResolvedViewKey, usize>,
+    view_entries: Vec<CachedResolvedView>,
+    view_limit: usize,
+    view_clock: usize,
 }
 
 impl MaxwellThreeDRetainedBackingCache {
+    fn view(
+        &mut self,
+        key: &ResolvedViewKey,
+        address_space: &MaxwellGpuAddressSpace,
+    ) -> Option<MaxwellThreeDResolvedResource> {
+        let entry = &mut self.view_entries[*self.views.get(key)?];
+        // Buffer interpretation is independent of its contents. Descriptor
+        // readers and backend uploads observe the live canonical bytes; do not
+        // arm another CPU-write dependency merely to recreate buffer metadata.
+        if let MaxwellThreeDResolvedResource::Image(image) = &entry.resource
+            && !image.cpu_writes.remains_current()
+        {
+            return None;
+        }
+        let generation = address_space.mapping_generation().get();
+        if entry.mapping_generation != generation {
+            if entry
+                .resource
+                .source()
+                .segments()
+                .iter()
+                .any(|segment| !address_space.retained_mapping_is_current(segment.mapping()))
+            {
+                return None;
+            }
+            entry.mapping_generation = generation;
+        }
+        entry.referenced = true;
+        Some(entry.resource.clone())
+    }
+
+    fn set_view_limit(&mut self, limit: usize) {
+        if self.view_limit == limit {
+            return;
+        }
+        self.view_limit = limit;
+        if self.view_entries.len() > limit {
+            self.view_entries.truncate(limit);
+            self.views.clear();
+            self.views.extend(
+                self.view_entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| (entry.key, index)),
+            );
+            self.view_clock = 0;
+        }
+    }
+
+    fn remember_view(
+        &mut self,
+        key: ResolvedViewKey,
+        resource: MaxwellThreeDResolvedResource,
+        address_space: &MaxwellGpuAddressSpace,
+    ) {
+        if self.view_limit == 0 {
+            return;
+        }
+        let entry = CachedResolvedView {
+            key,
+            resource,
+            mapping_generation: address_space.mapping_generation().get(),
+            referenced: true,
+        };
+        if let Some(&index) = self.views.get(&key) {
+            self.view_entries[index] = entry;
+            return;
+        }
+        let index = if self.view_entries.len() < self.view_limit {
+            let index = self.view_entries.len();
+            self.view_entries.push(entry);
+            index
+        } else {
+            // Clock replacement avoids a full HashMap scan for every transient
+            // constant-buffer view. Hits only set a bit; misses amortize scans.
+            while self.view_entries[self.view_clock].referenced {
+                self.view_entries[self.view_clock].referenced = false;
+                self.view_clock = (self.view_clock + 1) % self.view_entries.len();
+            }
+            let index = self.view_clock;
+            self.views.remove(&self.view_entries[index].key);
+            self.view_entries[index] = entry;
+            self.view_clock = (index + 1) % self.view_entries.len();
+            index
+        };
+        self.views.insert(key, index);
+    }
+
     fn retain(
         &mut self,
         source: &MaxwellResolvedRange,
         role: MaxwellThreeDResourceRole,
     ) -> Result<RetainedResourceBacking, MaxwellThreeDResourceError> {
         let key = RetainedBackingKey::from(source);
-        let retained = if let Some(entry) = self.entries.get(&key)
+        if let Some(entry) = self.entries.get(&key)
             && entry.source == *source
         {
-            if entry.retained.cpu_writes.remains_current() {
-                return Ok(entry.retained.clone());
-            }
-            let mut retained = entry.retained.clone();
-            // Existing images must keep their old observation so opaque
-            // contents are still invalidated. Only the resolver gets a fresh
-            // dependency; backing identity and mapping topology stay shared.
-            retained.cpu_writes = CanonicalCpuWriteDependency::capture(retained.backing.range())
-                .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
-            retained
-        } else {
-            retained_backing(source, role)?
-        };
+            return Ok(entry.retained.clone());
+        }
+        let retained = retained_backing(source, role)?;
         self.entries.insert(
             key,
             Arc::new(RetainedBackingCacheEntry {
@@ -1637,7 +1774,6 @@ struct RetainedResourceBacking {
     backing: BackingView,
     allocation_description: GpuAllocationDescription,
     mappings: Arc<[MaxwellThreeDMappingReference]>,
-    cpu_writes: CanonicalCpuWriteDependency,
 }
 
 struct MaxwellImageDescriptionRequest {
@@ -1650,6 +1786,38 @@ struct MaxwellImageDescriptionRequest {
 }
 
 impl<'a> ResourceBuilder<'a> {
+    fn reuse_view(&mut self, key: &ResolvedViewKey) -> Result<bool, MaxwellThreeDResourceError> {
+        let Some(cache) = self.retained_backings.as_deref_mut() else {
+            return Ok(false);
+        };
+        let Some(resource) = cache.view(key, self.address_space) else {
+            return Ok(false);
+        };
+        let id = resource_id(self.resources.len())?;
+        let resource = match resource {
+            MaxwellThreeDResolvedResource::Image(mut image) => {
+                image.view = image.view.with_image(ImageId::new(id));
+                MaxwellThreeDResolvedResource::Image(image)
+            }
+            MaxwellThreeDResolvedResource::Buffer(mut buffer) => {
+                buffer.view = buffer.view.with_buffer(BufferId::new(id));
+                MaxwellThreeDResolvedResource::Buffer(buffer)
+            }
+        };
+        self.resources.push(resource);
+        Ok(true)
+    }
+
+    fn remember_last_view(&mut self, key: ResolvedViewKey) {
+        if let Some(cache) = self.retained_backings.as_deref_mut() {
+            cache.remember_view(
+                key,
+                self.resources.last().unwrap().clone(),
+                self.address_space,
+            );
+        }
+    }
+
     fn new(
         address_space: &'a MaxwellGpuAddressSpace,
         sample_mode: Option<MaxwellThreeDSampleMode>,
@@ -1684,6 +1852,14 @@ impl<'a> ResourceBuilder<'a> {
         address: MaxwellThreeDUnresolvedAddress,
         size: u64,
     ) -> Result<(), MaxwellThreeDResourceError> {
+        let key = ResolvedViewKey {
+            address_space: self.address_space.id(),
+            role,
+            definition: ResolvedViewDefinition::Buffer { address, size },
+        };
+        if self.reuse_view(&key)? {
+            return Ok(());
+        }
         let source = self.resolve(address, size, MemoryPermissions::READ, role)?;
         let retained = self.retained_backing(&source, role)?;
         let allocation_description = retained.allocation_description;
@@ -1703,6 +1879,7 @@ impl<'a> ResourceBuilder<'a> {
                 mappings: retained.mappings,
             },
         ));
+        self.remember_last_view(key);
         Ok(())
     }
 
@@ -1996,6 +2173,14 @@ impl<'a> ResourceBuilder<'a> {
             texture: texture_reference,
             dimension: required_dimension,
         };
+        let key = ResolvedViewKey {
+            address_space: self.address_space.id(),
+            role,
+            definition: ResolvedViewDefinition::Sampled(bytes),
+        };
+        if self.reuse_view(&key)? {
+            return Ok(());
+        }
         let format_word = words[0];
         let image_format = (format_word & 0x7f) as u8;
         let components = [7, 10, 13, 16].map(|shift| ((format_word >> shift) & 7) as u8);
@@ -2209,7 +2394,8 @@ impl<'a> ResourceBuilder<'a> {
         })?;
         let retained = self.retained_backing(&source, role)?;
         let allocation_description = retained.allocation_description;
-        let cpu_writes = retained.cpu_writes.clone();
+        let cpu_writes = CanonicalCpuWriteDependency::capture(retained.backing.range())
+            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
         let id = ImageId::new(resource_id(self.resources.len())?);
         let view = ImageView::new(
             id,
@@ -2257,6 +2443,7 @@ impl<'a> ResourceBuilder<'a> {
                 },
             },
         ));
+        self.remember_last_view(key);
         Ok(())
     }
 
@@ -2454,6 +2641,24 @@ impl<'a> ResourceBuilder<'a> {
         compression_enabled: bool,
         row_pitch_bytes: Option<u32>,
     ) -> Result<(), MaxwellThreeDResourceError> {
+        let key = ResolvedViewKey {
+            address_space: self.address_space.id(),
+            role,
+            definition: ResolvedViewDefinition::Attachment {
+                address,
+                description,
+                layout,
+                array_pitch_dwords,
+                selected_layer,
+                guest_format,
+                compression_enabled,
+                row_pitch_bytes,
+                sample_mode: self.sample_mode,
+            },
+        };
+        if self.reuse_view(&key)? {
+            return Ok(());
+        }
         let samples = match self
             .sample_mode
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?
@@ -2663,7 +2868,8 @@ impl<'a> ResourceBuilder<'a> {
         }
         let retained = self.retained_backing(&source, role)?;
         let allocation_description = retained.allocation_description;
-        let cpu_writes = retained.cpu_writes.clone();
+        let cpu_writes = CanonicalCpuWriteDependency::capture(retained.backing.range())
+            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
         let image_id = ImageId::new(resource_id(self.resources.len())?);
         let view = ImageView::new(
             image_id,
@@ -2703,6 +2909,7 @@ impl<'a> ResourceBuilder<'a> {
                 guest_format,
             },
         ));
+        self.remember_last_view(key);
         Ok(())
     }
 
@@ -2990,8 +3197,6 @@ fn retained_backing(
     }
     let range =
         CanonicalBackingRange::new(canonical).map_err(MaxwellThreeDResourceError::Canonical)?;
-    let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
-        .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
     // A GPU virtual resource may span independent nvmap objects. Its canonical
     // scatter/gather range remains the authority for content and aliases; a
     // separate logical allocation owns the assembled host view, without copying
@@ -3034,7 +3239,6 @@ fn retained_backing(
         backing,
         allocation_description,
         mappings: mappings.into(),
-        cpu_writes,
     })
 }
 
@@ -3632,10 +3836,8 @@ mod tests {
         retained.backing.range().read(0, &mut actual).unwrap();
         assert_eq!(actual[..16], [1; 16]);
         assert_eq!(actual[16..], [2; 16]);
-        assert!(!retained.cpu_writes.remains_current());
         let fresh = cache.retain(&source, role).unwrap();
         assert_eq!(fresh.backing.allocation(), retained.backing.allocation());
-        assert!(fresh.cpu_writes.remains_current());
     }
 
     #[test]
@@ -3773,6 +3975,7 @@ mod tests {
 
         assert!(layout.requires_materialization());
         assert!(layout.has_direct_canonical_representation());
+        assert!(layout.supports_canonical_texel_storage());
     }
 
     #[test]
@@ -3789,6 +3992,7 @@ mod tests {
         };
 
         assert!(!layout.has_direct_canonical_representation());
+        assert!(!layout.supports_canonical_texel_storage());
     }
 
     #[test]
@@ -3811,6 +4015,7 @@ mod tests {
                 };
                 assert!(layout.requires_materialization());
                 assert!(!layout.has_direct_canonical_representation());
+                assert!(layout.supports_canonical_texel_storage());
             }
         }
     }
@@ -4477,7 +4682,216 @@ mod tests {
     }
 
     #[test]
-    fn retained_backing_cache_tracks_dirty_physical_pages() {
+    fn resource_metadata_reuse_reidentifies_views_and_observes_writes_and_remaps() {
+        use super::{
+            ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageId, ImageKind,
+            MaxwellThreeDGuestImageFormat, MaxwellThreeDImageLayout, MaxwellThreeDResolvedResource,
+            MaxwellThreeDSampleMode, MaxwellThreeDUnresolvedAddress, ResolvedViewDefinition,
+            ResolvedViewKey, ResourceBuilder, SampleCount,
+        };
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let mut space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let map = |space: &mut MaxwellGpuAddressSpace, allocation: &CanonicalAllocation, id| {
+            let backing = allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap();
+            space
+                .map(MaxwellMapRequest {
+                    allocation: MaxwellAllocationId::new(id),
+                    size: backing.size(),
+                    backing,
+                    backing_offset: 0,
+                    allocation_alignment: 0x1000,
+                    page_size: 0,
+                    kind: 0,
+                    cacheable: true,
+                    permissions: MemoryPermissions::READ_WRITE,
+                    fixed_offset: None,
+                })
+                .unwrap()
+        };
+        let mapping = map(&mut space, &allocation, 1);
+        let description = ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            ImageFormat::Rgba8Unorm,
+            ImageKind::Color,
+            1,
+            1,
+            SampleCount::One,
+        )
+        .unwrap();
+        let role = MaxwellThreeDResourceRole::ColorTarget(0);
+        let key = ResolvedViewKey {
+            address_space: space.id(),
+            role,
+            definition: ResolvedViewDefinition::Attachment {
+                address: MaxwellThreeDUnresolvedAddress::new(
+                    (mapping.offset().get() >> 32) as u8,
+                    mapping.offset().get() as u32,
+                ),
+                description,
+                layout: MaxwellThreeDImageLayout::PitchLinear,
+                array_pitch_dwords: None,
+                selected_layer: 0,
+                guest_format: MaxwellThreeDGuestImageFormat::Canonical(ImageFormat::Rgba8Unorm),
+                compression_enabled: false,
+                row_pitch_bytes: Some(16),
+                sample_mode: Some(MaxwellThreeDSampleMode::Samples1x1),
+            },
+        };
+        let mut cache = MaxwellThreeDRetainedBackingCache {
+            view_limit: 2,
+            ..Default::default()
+        };
+        let image = |space: &MaxwellGpuAddressSpace,
+                     cache: &mut MaxwellThreeDRetainedBackingCache,
+                     prefix: bool| {
+            let mut builder = ResourceBuilder::new(
+                space,
+                Some(MaxwellThreeDSampleMode::Samples1x1),
+                None,
+                Some(cache),
+            );
+            if prefix {
+                builder
+                    .buffer(
+                        MaxwellThreeDResourceRole::VertexStream(0),
+                        MaxwellThreeDUnresolvedAddress::new(
+                            0,
+                            mapping.offset().get() as u32 + 0x200,
+                        ),
+                        16,
+                    )
+                    .unwrap();
+            }
+            builder
+                .image(
+                    role,
+                    MaxwellThreeDUnresolvedAddress::new(0, mapping.offset().get() as u32),
+                    description,
+                    MaxwellThreeDImageLayout::PitchLinear,
+                    None,
+                    0,
+                    MaxwellThreeDGuestImageFormat::Canonical(ImageFormat::Rgba8Unorm),
+                    false,
+                    Some(16),
+                )
+                .unwrap();
+            let MaxwellThreeDResolvedResource::Image(image) = builder.resources.pop().unwrap()
+            else {
+                unreachable!()
+            };
+            image
+        };
+        let first = image(&space, &mut cache, false);
+        let second = image(&space, &mut cache, true);
+        assert_eq!(second.view.image(), ImageId::new(2));
+        assert!(Arc::ptr_eq(&first.mappings, &second.mappings));
+        assert_eq!(cache.views.len(), 2);
+        let buffer_key = ResolvedViewKey {
+            address_space: space.id(),
+            role: MaxwellThreeDResourceRole::VertexStream(0),
+            definition: ResolvedViewDefinition::Buffer {
+                address: MaxwellThreeDUnresolvedAddress::new(
+                    0,
+                    mapping.offset().get() as u32 + 0x200,
+                ),
+                size: 16,
+            },
+        };
+        allocation.write(0x200, &[0x7a]).unwrap();
+        let Some(MaxwellThreeDResolvedResource::Buffer(buffer)) = cache.view(&buffer_key, &space)
+        else {
+            panic!("buffer contents invalidated immutable metadata");
+        };
+        let mut byte = [0];
+        super::read_backing_bytes(buffer.view.backing().range(), 0, &mut byte, None).unwrap();
+        assert_eq!(byte, [0x7a]);
+        allocation.write(0, &[1]).unwrap();
+        assert!(cache.view(&key, &space).is_none());
+        let refreshed = image(&space, &mut cache, false);
+        assert!(!first.cpu_writes.remains_current());
+        assert!(refreshed.cpu_writes.remains_current());
+        space.unmap(mapping.offset()).unwrap();
+        let replacement = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let remapped = map(&mut space, &replacement, 2);
+        assert_eq!(remapped.offset(), mapping.offset());
+        assert!(cache.view(&key, &space).is_none());
+        let fresh = image(&space, &mut cache, false);
+        assert!(!Arc::ptr_eq(&refreshed.mappings, &fresh.mappings));
+        // Capacity changes and eviction must not leave an old key pointing at
+        // a different view. Contents remain live when buffer metadata is reused.
+        cache.set_view_limit(1);
+        assert!(cache.view(&key, &space).is_some());
+        assert!(cache.view(&buffer_key, &space).is_none());
+        {
+            let mut builder = ResourceBuilder::new(
+                &space,
+                Some(MaxwellThreeDSampleMode::Samples1x1),
+                None,
+                Some(&mut cache),
+            );
+            builder
+                .buffer(
+                    MaxwellThreeDResourceRole::VertexStream(0),
+                    MaxwellThreeDUnresolvedAddress::new(0, mapping.offset().get() as u32 + 0x200),
+                    16,
+                )
+                .unwrap();
+        }
+        assert_eq!(cache.views.len(), 1);
+        assert!(cache.view(&key, &space).is_none());
+        assert!(cache.view(&buffer_key, &space).is_some());
+        image(&space, &mut cache, false);
+        assert!(cache.view(&buffer_key, &space).is_none());
+        assert!(cache.view(&key, &space).is_some());
+        nixe_memory::CanonicalBackingRange::invalidate_visibility_ranges([fresh.view.bindings()
+            [0]
+        .backing()
+        .range()])
+        .unwrap();
+        let mut builder = ResourceBuilder::new(
+            &space,
+            Some(MaxwellThreeDSampleMode::Samples1x1),
+            None,
+            None,
+        );
+        let error = builder
+            .image(
+                role,
+                MaxwellThreeDUnresolvedAddress::new(0, mapping.offset().get() as u32),
+                description,
+                MaxwellThreeDImageLayout::PitchLinear,
+                None,
+                0,
+                MaxwellThreeDGuestImageFormat::Canonical(ImageFormat::Rgba8Unorm),
+                false,
+                Some(16),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MaxwellThreeDResourceError::CanonicalAccess(
+                nixe_memory::CanonicalRangeAccessError::Backing(
+                    nixe_memory::CanonicalPageError::Visibility(
+                        nixe_memory::VisibilityError::InvalidState
+                    )
+                )
+            )
+        ));
+    }
+
+    #[test]
+    fn retained_backing_cache_reuses_topology_across_writes_and_remaps() {
         let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
         let mut address_space =
             MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
@@ -4542,8 +4956,10 @@ mod tests {
                 .range()
                 .shares_layout(after_overlapping_write.backing.range())
         );
-        assert!(!first.cpu_writes.remains_current());
-        assert!(after_overlapping_write.cpu_writes.remains_current());
+        assert_eq!(
+            read_descriptor_bytes(after_overlapping_write.backing.range(), 0, None).unwrap()[0],
+            2
+        );
 
         address_space.unmap(mapping.offset()).unwrap();
         let replacement = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
@@ -4572,23 +4988,6 @@ mod tests {
         assert!(!Arc::ptr_eq(
             &after_overlapping_write.mappings,
             &after_remap.mappings
-        ));
-
-        // Failure to arm is not a usable resource without a dependency.
-        nixe_memory::CanonicalBackingRange::invalidate_visibility_ranges([first.backing.range()])
-            .unwrap();
-        let error = MaxwellThreeDRetainedBackingCache::default()
-            .retain(&source, role)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            MaxwellThreeDResourceError::CanonicalAccess(
-                nixe_memory::CanonicalRangeAccessError::Backing(
-                    nixe_memory::CanonicalPageError::Visibility(
-                        nixe_memory::VisibilityError::InvalidState
-                    )
-                )
-            )
         ));
     }
 }

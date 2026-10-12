@@ -3551,6 +3551,8 @@ fn prepare_resources(
             view: Some(
                 if image.guest_layout().has_direct_canonical_representation() {
                     view
+                } else if image.guest_layout().supports_canonical_texel_storage() {
+                    view.with_device_initialized_texels()
                 } else {
                     view.with_resident_only_storage()
                 },

@@ -93,7 +93,7 @@ impl Worker {
                                             match job.descriptor.kind() {
                                                 NvDrvDeviceKind::HostNvDec => {
                                                     if let std::collections::btree_map::Entry::Vacant(entry) = decoders.entry(job.descriptor.fd()) {
-                                                        entry.insert(video::NvDec::new()?);
+                                                        entry.insert(video::NvDec::new(gpu.as_deref().and_then(|gpu| gpu.image_device()))?);
                                                     }
                                                     decoders.get_mut(&job.descriptor.fd()).unwrap().execute(registers, &job.mappings, gpu.as_deref())?;
                                                 }

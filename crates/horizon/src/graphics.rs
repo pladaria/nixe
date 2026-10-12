@@ -617,6 +617,7 @@ impl VideoSystem {
                 binder_id,
                 slot: request.slot,
                 acquire_fences: request.input.acquire_fences,
+                swap_interval: request.input.swap_interval,
                 presentation,
             });
             Ok(())
@@ -654,10 +655,45 @@ impl VideoSystem {
         if ticks.crossed != 0 {
             state.vsync_event.signal();
         }
-        for _ in 0..ticks.crossed {
-            let Some(pending) = state.pending_frames.front() else {
-                break;
-            };
+        if ticks.crossed == 0
+            && !state
+                .pending_frames
+                .iter()
+                .any(|frame| frame.swap_interval == 0)
+        {
+            return Ok(0);
+        }
+        let display_sequence = state.display_clock.sequence();
+        for queue in state.queues.values_mut() {
+            queue.blocked_this_advance = false;
+        }
+        // The current frame sets its producer's minimum residence time. Keep
+        // VI at 60 Hz; throttle acquisition per producer, not the whole display.
+        // Never replay historical presents after a host pause. Interval zero
+        // has no refresh wait, but still requires the real acquire dependency.
+        // https://raw.githubusercontent.com/eden-emulator/mirror/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/service/nvnflinger/hardware_composer.cpp
+        for _ in 0..state.pending_frames.len() {
+            let pending = state.pending_frames.front().unwrap();
+            let binder_id = pending.binder_id;
+            let queue = state
+                .queues
+                .get(&binder_id)
+                .ok_or(FramebufferError::Malformed(
+                    "pending frame lost its producer",
+                ))?;
+            if queue.blocked_this_advance
+                || queue.next_acquire_sequence > display_sequence
+                || (ticks.crossed == 0 && pending.swap_interval != 0)
+            {
+                state
+                    .queues
+                    .get_mut(&binder_id)
+                    .unwrap()
+                    .blocked_this_advance = true;
+                let pending = state.pending_frames.pop_front().unwrap();
+                state.pending_frames.push_back(pending);
+                continue;
+            }
             if pending.presentation.is_none()
                 && !pending.acquire_fences.iter().all(|fence| {
                     state
@@ -666,12 +702,28 @@ impl VideoSystem {
                         .unwrap_or(false)
                 })
             {
-                break;
+                state
+                    .queues
+                    .get_mut(&binder_id)
+                    .unwrap()
+                    .blocked_this_advance = true;
+                let pending = state.pending_frames.pop_front().unwrap();
+                state.pending_frames.push_back(pending);
+                continue;
             }
             let image = match &pending.presentation {
                 Some(presentation) => match presentation.image.try_recv() {
                     Ok(result) => Some(result.map_err(FramebufferError::Backend)?),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        state
+                            .queues
+                            .get_mut(&binder_id)
+                            .unwrap()
+                            .blocked_this_advance = true;
+                        let pending = state.pending_frames.pop_front().unwrap();
+                        state.pending_frames.push_back(pending);
+                        continue;
+                    }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         return Err(FramebufferError::Backend(
                             "GPU resident-image reply was lost".into(),
@@ -681,6 +733,12 @@ impl VideoSystem {
                 None => None,
             };
             let pending = state.pending_frames.pop_front().unwrap();
+            state
+                .queues
+                .get_mut(&binder_id)
+                .unwrap()
+                .next_acquire_sequence =
+                display_sequence.saturating_add(u64::from(pending.swap_interval));
             if let Some(presentation) = pending.presentation {
                 let sequence = state.next_frame_sequence;
                 state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
@@ -706,7 +764,7 @@ impl VideoSystem {
                     "latched resident frame from Binder producer {} slot {} at VSync {}",
                     pending.binder_id,
                     pending.slot,
-                    ticks.latest_sequence
+                    display_sequence
                 );
             } else if let Some(queue) = state.queues.get_mut(&pending.binder_id) {
                 let _ = queue.release(pending.slot);
@@ -714,7 +772,7 @@ impl VideoSystem {
                     "discarded headless frame from Binder producer {} slot {} at VSync {}",
                     pending.binder_id,
                     pending.slot,
-                    ticks.latest_sequence
+                    display_sequence
                 );
             }
         }
@@ -836,6 +894,8 @@ struct BufferQueue {
     strong_references: i64,
     slots: BTreeMap<i32, BufferSlot>,
     available_event: BufferQueueAvailabilityEvent,
+    next_acquire_sequence: u64,
+    blocked_this_advance: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -849,6 +909,7 @@ struct PendingFrame {
     binder_id: i32,
     slot: i32,
     acquire_fences: Box<[NvFence]>,
+    swap_interval: u32,
     presentation: Option<PendingPresentation>,
 }
 
@@ -894,6 +955,8 @@ impl BufferQueue {
             strong_references: 0,
             slots: BTreeMap::new(),
             available_event: BufferQueueAvailabilityEvent::new(binder_id),
+            next_acquire_sequence: 0,
+            blocked_this_advance: false,
         }
     }
 
@@ -1058,6 +1121,8 @@ impl BufferQueue {
                 };
                 if status == 0 {
                     self.connected_api = None;
+                    self.next_acquire_sequence = 0;
+                    self.blocked_this_advance = false;
                     self.slots.clear();
                     self.available_event.clear();
                 }
@@ -1828,11 +1893,18 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
+                .queues
+                .insert(1, BufferQueue::new(1));
+            video
+                .state
+                .lock()
+                .unwrap()
                 .pending_frames
                 .push_back(PendingFrame {
                     binder_id: 1,
                     slot: 0,
                     acquire_fences: Box::default(),
+                    swap_interval: 1,
                     presentation: Some(PendingPresentation {
                         image: receiver,
                         crop: frame_crop(CropRect {
@@ -2166,11 +2238,15 @@ mod tests {
                 -22
             );
             assert_eq!(queue.connected_api, Some(api));
+            queue.next_acquire_sequence = 100;
+            queue.blocked_this_advance = true;
             assert_eq!(
                 status(queue.transact(11, &disconnect(api)).unwrap(), false),
                 0
             );
             assert_eq!(queue.connected_api, None);
+            assert_eq!(queue.next_acquire_sequence, 0);
+            assert!(!queue.blocked_this_advance);
             assert_eq!(
                 status(queue.transact(11, &disconnect(api)).unwrap(), false),
                 -19
@@ -2384,6 +2460,125 @@ mod tests {
             video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
             SlotOwnership::Free
         );
+    }
+
+    fn queue_headless_test_frame(
+        video: &VideoSystem,
+        binder_id: i32,
+        buffer: &GraphicBuffer,
+        slot: i32,
+        swap_interval: u32,
+        acquire_fences: Box<[NvFence]>,
+    ) {
+        video
+            .state
+            .lock()
+            .unwrap()
+            .queues
+            .get_mut(&binder_id)
+            .unwrap()
+            .slots
+            .insert(
+                slot,
+                BufferSlot {
+                    ownership: SlotOwnership::Queueing,
+                    buffer: buffer.clone(),
+                    flattened_buffer: Box::default(),
+                    presentation_source: None,
+                    release_fences: Box::default(),
+                },
+            );
+        video
+            .queue_graphic_buffer(
+                binder_id,
+                QueuedBufferRequest {
+                    slot,
+                    buffer: buffer.clone(),
+                    presentation_source: None,
+                    input: QueueBufferInput {
+                        timestamp: 0,
+                        auto_timestamp: true,
+                        crop: CropRect {
+                            left: 0,
+                            top: 0,
+                            right: 4,
+                            bottom: 4,
+                        },
+                        scaling_mode: 0,
+                        transform: 0,
+                        sticky_transform: 0,
+                        swap_interval,
+                        acquire_fences,
+                    },
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn swap_interval_holds_the_previous_frame_without_throttling_other_producers() {
+        let (video, binder, buffer) = configure_rgba_nvmap(VideoSystem::default());
+        let other = video.create_layer(DEFAULT_DISPLAY_ID).unwrap().binder_id;
+        queue_headless_test_frame(&video, binder, &buffer, 0, 2, Box::default());
+        queue_headless_test_frame(&video, binder, &buffer, 1, 1, Box::default());
+        queue_headless_test_frame(&video, binder, &buffer, 2, 1, Box::default());
+        queue_headless_test_frame(&video, other, &buffer, 0, 1, Box::default());
+        queue_headless_test_frame(&video, other, &buffer, 1, 1, Box::default());
+        let ownership =
+            |producer, slot| video.state.lock().unwrap().queues[&producer].slots[&slot].ownership;
+        assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
+        assert_eq!(ownership(binder, 0), SlotOwnership::Free);
+        assert_eq!(ownership(binder, 1), SlotOwnership::Queued);
+        assert_eq!(ownership(other, 0), SlotOwnership::Free);
+        assert_eq!(video.advance(Duration::from_millis(34)).unwrap(), 1);
+        assert_eq!(ownership(binder, 1), SlotOwnership::Queued);
+        assert_eq!(ownership(other, 1), SlotOwnership::Free);
+        assert_eq!(video.advance(Duration::from_millis(51)).unwrap(), 1);
+        assert_eq!(ownership(binder, 1), SlotOwnership::Free);
+        assert_eq!(ownership(binder, 2), SlotOwnership::Queued);
+        assert_eq!(video.advance(Duration::from_millis(68)).unwrap(), 1);
+        assert_eq!(ownership(binder, 2), SlotOwnership::Free);
+    }
+
+    #[test]
+    fn zero_swap_interval_does_not_wait_for_refresh_but_keeps_real_acquire_fences() {
+        let (video, binder, buffer) = configure_rgba_nvmap(VideoSystem::default());
+        let syncpoint = GuestSyncpointId::new(11);
+        video.nvdrv().install_test_timeline(syncpoint);
+        queue_headless_test_frame(
+            &video,
+            binder,
+            &buffer,
+            0,
+            0,
+            vec![NvFence {
+                point: GuestTimelinePoint::new(syncpoint, GuestSyncpointValue::new(1)),
+            }]
+            .into_boxed_slice(),
+        );
+        assert_eq!(video.advance(Duration::ZERO).unwrap(), 0);
+        assert_eq!(
+            video.state.lock().unwrap().queues[&binder].slots[&0].ownership,
+            SlotOwnership::Queued
+        );
+        video.nvdrv().advance_test_timeline(syncpoint);
+        assert_eq!(video.advance(Duration::from_millis(1)).unwrap(), 0);
+        assert_eq!(
+            video.state.lock().unwrap().queues[&binder].slots[&0].ownership,
+            SlotOwnership::Free
+        );
+    }
+
+    #[test]
+    fn a_long_host_pause_does_not_replay_missed_refreshes_as_a_present_burst() {
+        let (video, binder, buffer) = configure_rgba_nvmap(VideoSystem::default());
+        queue_headless_test_frame(&video, binder, &buffer, 0, 3, Box::default());
+        queue_headless_test_frame(&video, binder, &buffer, 1, 1, Box::default());
+        queue_headless_test_frame(&video, binder, &buffer, 2, 1, Box::default());
+        assert_eq!(video.advance(Duration::from_secs(1)).unwrap(), 60);
+        assert_eq!(video.state.lock().unwrap().pending_frames.len(), 2);
+        assert_eq!(video.advance(Duration::from_millis(1050)).unwrap(), 3);
+        assert_eq!(video.state.lock().unwrap().pending_frames.len(), 1);
     }
 
     #[test]

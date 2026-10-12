@@ -224,6 +224,11 @@ impl DisplayClock {
     }
 
     #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
     pub const fn period(&self) -> Duration {
         self.period
     }

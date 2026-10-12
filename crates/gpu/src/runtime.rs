@@ -45,6 +45,10 @@ impl BackendExecutionCompletion {
 
 /// Object-safe backend selected and owned by the application composition root.
 pub trait NeutralBackendRuntime: Send {
+    fn external_image_device(&self) -> Option<[u8; 16]> {
+        None
+    }
+
     fn capabilities(&self) -> &BackendCapabilities;
 
     /// Accepts one neutral transaction without waiting for host completion.
@@ -284,6 +288,9 @@ struct PendingSubmission {
 }
 
 impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
+    fn external_image_device(&self) -> Option<[u8; 16]> {
+        self.backend.driver().external_image_device()
+    }
     fn capabilities(&self) -> &BackendCapabilities {
         self.backend.capabilities()
     }

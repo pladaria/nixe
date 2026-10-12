@@ -17,6 +17,8 @@
 
 
 
+struct AVPacket;
+
 namespace Tegra {
 
 namespace Decoders {
@@ -120,15 +122,10 @@ public:
     VP9(VP9&&) = delete;
     VP9& operator=(VP9&&) = delete;
 
-    [[nodiscard]] std::span<const u8> ComposeFrame(const PictureInfo& picture, const EntropyProbs& entropy,
-        std::span<const u8> tiles, const std::array<u64,4>& offsets, u64 origin);
+    [[nodiscard]] int ComposeFrame(const PictureInfo& picture, const EntropyProbs& entropy,
+        std::span<const u8> tiles, const std::array<u64,4>& offsets, u64 origin, AVPacket* packet);
 
 private:
-    /// Returns a const span to the composed frame data.
-    [[nodiscard]] std::span<const u8> GetFrameBytes() const {
-        return frame_scratch;
-    }
-
     /// Generates compressed header probability updates in the bitstream writer
     template <typename T, std::size_t N>
     void WriteProbabilityUpdate(VpxRangeEncoder& writer, const std::array<T, N>& new_prob,
@@ -169,7 +166,6 @@ private:
     std::array<s8, 4> loop_filter_ref_deltas{};
     std::array<s8, 2> loop_filter_mode_deltas{};
 
-    std::vector<u8> frame_scratch;
     EntropyProbs current_entropy{};
     std::array<u64,8> reference_offsets{};
 

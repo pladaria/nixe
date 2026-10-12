@@ -15,7 +15,14 @@ fn main() {
         .file("native/nvdec/vp9.cpp")
         .file("native/nvdec/decoder.cpp")
         .compile("nixe_nvdec");
-    for file in ["vp9.cpp", "vp9.h", "types.h", "decoder.cpp"] {
+    for file in [
+        "vp9.cpp",
+        "vp9.h",
+        "types.h",
+        "decoder.cpp",
+        "cuda_transfer.h",
+        "dynlink_cuda.h",
+    ] {
         println!("cargo:rerun-if-changed=native/nvdec/{file}");
     }
 }

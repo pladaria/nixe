@@ -1,6 +1,6 @@
 //! Integer NV12 conversion into ordinary, canonically backed resident images.
 use super::*;
-use nixe_gpu::{Nv12ColorTransform, Nv12Conversion};
+use nixe_gpu::{ImageExtent, Nv12ColorTransform, Nv12Conversion};
 
 #[derive(Default)]
 pub(super) struct ConversionCache {
@@ -72,19 +72,18 @@ impl WgpuBackendDriver {
             dependencies,
             ResourceDependency::Image(conversion.destination.image),
         )?;
-        let mut views = Vec::with_capacity(2);
-        let mut extents = Vec::with_capacity(2);
-        for ((handle, region), format) in sources
+        let mut extents = [ImageExtent {
+            width: 0,
+            height: 0,
+            depth: 1,
+        }; 2];
+        for (index, ((handle, region), format)) in sources
             .into_iter()
             .zip([conversion.luma, conversion.chroma])
             .zip([ImageFormat::R8Unorm, ImageFormat::Rg8Unorm])
+            .enumerate()
         {
-            let Resource::Image {
-                texture,
-                description,
-                ..
-            } = self.resource(handle)?
-            else {
+            let Resource::Image { description, .. } = self.resource(handle)? else {
                 return Err(kind_mismatch(handle));
             };
             if description.format() != format
@@ -98,8 +97,7 @@ impl WgpuBackendDriver {
                     "NV12 source must be a complete single-sample 2D plane",
                 ));
             }
-            extents.push(description.extent());
-            views.push(texture.create_view(&Default::default()));
+            extents[index] = description.extent();
         }
         let Resource::Image { description, .. } = self.resource(destination)? else {
             return Err(kind_mismatch(destination));
@@ -213,32 +211,41 @@ impl WgpuBackendDriver {
             transform: t,
         };
         if !self.conversions.bindings.contains_key(&key) {
-            let mut parameters = Vec::with_capacity(80);
-            for c in t.coefficients.iter().flatten() {
-                parameters.extend_from_slice(&c.to_le_bytes());
-            }
-            for c in [
-                t.source_origin[0],
-                t.source_origin[1],
-                t.shift,
-                u32::from(t.enabled),
-            ] {
-                parameters.extend_from_slice(&c.to_le_bytes());
-            }
-            for c in [t.clamp[0], t.clamp[1], i32::from(t.alpha), 0] {
-                parameters.extend_from_slice(&c.to_le_bytes());
-            }
+            let views = sources.map(|handle| {
+                let Resource::Image { texture, .. } = self.resource(handle).unwrap() else {
+                    unreachable!("NV12 source was validated above")
+                };
+                texture.create_view(&Default::default())
+            });
+            let parameters = [
+                t.coefficients[0],
+                t.coefficients[1],
+                t.coefficients[2],
+                [
+                    t.source_origin[0] as i32,
+                    t.source_origin[1] as i32,
+                    t.shift as i32,
+                    i32::from(t.enabled),
+                ],
+                [t.clamp[0], t.clamp[1], i32::from(t.alpha), 0],
+            ];
             let buffer = self.device.create_buffer(&BufferDescriptor {
                 label: Some("Nixe immutable NV12 parameters"),
                 size: 80,
                 usage: BufferUsages::UNIFORM,
                 mapped_at_creation: true,
             });
-            buffer
-                .slice(..)
-                .get_mapped_range_mut()
-                .map_err(|e| BackendDriverError::failure(e.to_string()))?
-                .copy_from_slice(&parameters);
+            {
+                let mut mapped = buffer
+                    .slice(..)
+                    .get_mapped_range_mut()
+                    .map_err(|e| BackendDriverError::failure(e.to_string()))?;
+                for (index, value) in parameters.into_iter().flatten().enumerate() {
+                    mapped
+                        .slice(index * 4..index * 4 + 4)
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
             buffer.unmap();
             let binding = self.device.create_bind_group(&BindGroupDescriptor {
                 label: Some("Nixe NV12 binding"),
@@ -294,6 +301,135 @@ impl WgpuBackendDriver {
         pass.set_pipeline(&self.conversions.pipelines[&conversion.destination_format]);
         pass.set_bind_group(0, &self.conversions.bindings[&key], &[]);
         pass.draw(0..3, 0..1);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl WgpuBackendDriver {
+    pub(super) fn encode_device_video(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        dependencies: &ResolvedBackendResources<'_>,
+        destinations: [ImageRegion; 2],
+        frame: &nixe_gpu::DeviceImageFrame,
+        token: BackendSubmissionToken,
+    ) -> Result<(), BackendDriverError> {
+        let uuid = self
+            .video_device
+            .ok_or_else(|| unsupported("external device memory unavailable"))?;
+        let limit = self.device.limits().max_texture_dimension_2d;
+        if frame.width == 0 || frame.height == 0 || frame.width > limit || frame.height > limit {
+            return Err(unsupported("device video dimensions"));
+        }
+        for (plane, destination) in destinations.iter().enumerate() {
+            let handle =
+                dependency_handle(dependencies, ResourceDependency::Image(destination.image))?;
+            let Resource::Image { description, .. } = self.resource(handle)? else {
+                return Err(kind_mismatch(handle));
+            };
+            image_region_is_full(*description, *destination)?;
+            let (width, height, format) = if plane == 0 {
+                (frame.width, frame.height, ImageFormat::R8Unorm)
+            } else {
+                (
+                    frame.width.div_ceil(2),
+                    frame.height.div_ceil(2),
+                    ImageFormat::Rg8Unorm,
+                )
+            };
+            if description.format() != format
+                || description.samples() != SampleCount::One
+                || description.dimension() != ImageDimension::Two
+                || description.array_layers() != 1
+                || description.mip_levels() != 1
+                || destination.subresources.layer_count != 1
+                || destination.subresources.plane != 0
+                || destination.extent
+                    != (ImageExtent {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+            {
+                return Err(unsupported("device NV12 destination layout"));
+            }
+        }
+        let pitch = u64::from(frame.width.div_ceil(2) * 2).next_multiple_of(256);
+        let chroma_offset = pitch * u64::from(frame.height);
+        let size = chroma_offset + pitch * u64::from(frame.height.div_ceil(2));
+        let reusable = self.video_buffers.iter().position(|buffer| {
+            buffer.size == size
+                && buffer.pending.is_none_or(|token| {
+                    self.submissions
+                        .get(&token)
+                        .is_none_or(|submission| submission.completed)
+                })
+        });
+        let index = if let Some(index) = reusable {
+            index
+        } else {
+            self.video_buffers
+                .push(crate::native::vulkan::video::VideoBuffer::new(
+                    &self.device,
+                    size,
+                    frame,
+                    pitch,
+                    chroma_offset,
+                )?);
+            self.video_buffers.len() - 1
+        };
+        let buffer = &mut self.video_buffers[index];
+        if reusable.is_some() {
+            frame
+                .source
+                .copy_nv12(nixe_gpu::ExternalImageBuffer {
+                    fd: buffer.fd(),
+                    semaphore_fd: buffer.semaphore_fd(),
+                    allocation_size: buffer.allocation_size,
+                    device_uuid: uuid,
+                    row_pitch: pitch,
+                    chroma_offset,
+                    initialize: false,
+                })
+                .map_err(BackendDriverError::failure)?;
+        }
+        buffer.wait_cuda(&self.device, &self.queue_access)?;
+        buffer.pending = Some(token);
+        let source = buffer.buffer.clone();
+        for (plane, destination) in destinations.into_iter().enumerate() {
+            let handle =
+                dependency_handle(dependencies, ResourceDependency::Image(destination.image))?;
+            let Resource::Image { texture, .. } = self.resource(handle)? else {
+                return Err(kind_mismatch(handle));
+            };
+            let (width, height) = (destination.extent.width, destination.extent.height);
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &source,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: if plane == 0 { 0 } else { chroma_offset },
+                        bytes_per_row: Some(pitch as u32),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: u32::from(destination.subresources.mip_level),
+                    origin: wgpu::Origin3d {
+                        x: destination.origin.x,
+                        y: destination.origin.y,
+                        z: u32::from(destination.subresources.base_layer),
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         Ok(())
     }
 }

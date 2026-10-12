@@ -43,15 +43,15 @@ use nixe_gpu::{
     BufferRange, BufferRegion, BufferView, CapabilityRequirements, ClearOperation, ClearValue,
     CopyOperation, DrawArguments, DrawOperation, FrontendSubmissionId, GpuAllocationDescription,
     GpuAllocationId, GpuCommand, GpuOperation, ImageDescription, ImageDimension, ImageExtent,
-    ImageFormat, ImageId, ImageKind, ImageMemoryLayout, ImageSubresourceRange, ImageView,
-    NeutralBackendRuntime, OperationSubmission, PipelineDescription, PipelineId, PipelineKind,
-    PreparedDraw, PresentationImageFormat, PresentationImageRequest, PrimitiveTopology,
-    RenderAttachment, RenderPassAttachmentDescription, RenderPassDescription, RenderPassId,
-    RenderPassOperation, ResourceDependency, SampleCount, ShaderDescription, ShaderId,
-    ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
-    ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType, ShaderSourceLocation,
-    ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexStepMode, ViewportTransform,
+    ImageFormat, ImageId, ImageKind, ImageMemoryLayout, ImageOrigin, ImageRegion,
+    ImageSubresourceRange, ImageView, NeutralBackendRuntime, OperationSubmission,
+    PipelineDescription, PipelineId, PipelineKind, PreparedDraw, PresentationImageFormat,
+    PresentationImageRequest, PrimitiveTopology, RenderAttachment, RenderPassAttachmentDescription,
+    RenderPassDescription, RenderPassId, RenderPassOperation, ResourceDependency, SampleCount,
+    ShaderDescription, ShaderId, ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation,
+    ShaderIoLocation, ShaderIr, ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType,
+    ShaderSourceLocation, ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, resident_texture};
 use nixe_memory::{
@@ -398,6 +398,125 @@ fn partial_float32_clear_writes_unblended_values() {
     assert_eq!(values, [0.25, 0.5, 0.75, 1.0]);
     backing.range().read(7 * 16, &mut pixel).unwrap();
     assert_eq!(pixel, [0; 16]);
+}
+
+#[test]
+fn block_linear_color_readback_preserves_padding_and_later_cpu_writes() {
+    check_block_linear_color_readback(false);
+}
+
+#[test]
+fn device_initialized_color_readback_preserves_padding_and_later_cpu_writes() {
+    check_block_linear_color_readback(true);
+}
+
+fn check_block_linear_color_readback(device_initialized: bool) {
+    let _guard = accelerated_test_guard();
+    let Some(initialized) = initialize_backend(
+        BackendInstanceId::new(0x709),
+        NonCpuDeviceId::new(0x709),
+        WgpuBackendConfiguration::default(),
+    ) else {
+        return;
+    };
+    let page = initialized_page(&[0xa5; 4096]);
+    let (mut creations, backing, image, subresources) =
+        backed_color_image(ImageFormat::Rgba8Unorm, 17, 10, std::slice::from_ref(&page));
+    let BackendResourceCreateInfo::Image {
+        description, view, ..
+    } = &mut creations[1]
+    else {
+        unreachable!()
+    };
+    *view = Some(
+        ImageView::new(
+            image,
+            *description,
+            Swizzle::IDENTITY,
+            vec![(
+                subresources,
+                ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                    block_width_log2: 0,
+                    block_height_log2: 1,
+                    block_depth_log2: 0,
+                    layer_stride: 2048,
+                }),
+                backing.clone(),
+            )],
+        )
+        .unwrap(),
+    );
+    if device_initialized {
+        *view = view.take().map(ImageView::with_device_initialized_texels);
+    }
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    runtime
+        .runtime()
+        .submit(
+            &creations,
+            &[],
+            &color_clear_submission(
+                image,
+                subresources,
+                ImageFormat::Rgba8Unorm,
+                17,
+                10,
+                [1.0, 0.0, 0.0, 1.0],
+                0x709,
+            ),
+        )
+        .unwrap();
+    let mut bytes = [0; 4096];
+    backing.range().read(0, &mut bytes).unwrap();
+    // Cross both a 64-byte GOB column and an 8-row GOB boundary.
+    // (x=16,y=9) is at 1024 + 512 + 16; (x=0,y=9) at 512 + 16.
+    assert_eq!(&bytes[..4], &[255, 0, 0, 255]);
+    assert_eq!(&bytes[528..532], &[255, 0, 0, 255]);
+    assert_eq!(&bytes[1552..1556], &[255, 0, 0, 255]);
+    assert_eq!(&bytes[1028..1032], &[0xa5; 4]); // Width padding.
+    assert_eq!(&bytes[2048..], &[0xa5; 2048]); // Allocation padding.
+
+    page.prepare_write().unwrap();
+    let generation = page.content_generation();
+    page.write_preflighted(0, &[0, 255, 0, 255], generation, generation.next().unwrap())
+        .unwrap();
+    let clear = ClearOperation::image(
+        ImageRegion {
+            image,
+            subresources,
+            origin: ImageOrigin { x: 16, y: 9, z: 0 },
+            extent: ImageExtent::new(1, 1, 1).unwrap(),
+        },
+        ImageKind::Color,
+        ImageFormat::Rgba8Unorm,
+        SampleCount::One,
+        ClearValue::Color([0.0, 0.0, 1.0, 1.0]),
+    )
+    .unwrap();
+    runtime
+        .runtime()
+        .submit(
+            &[],
+            &[],
+            &OperationSubmission::new(
+                FrontendSubmissionId::new(0x70a),
+                vec![],
+                vec![GpuOperation::new(
+                    GpuCommand::Clear(clear),
+                    [],
+                    [],
+                    CapabilityRequirements::none(),
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    backing.range().read(0, &mut bytes).unwrap();
+    assert_eq!(&bytes[..4], &[0, 255, 0, 255]);
+    assert_eq!(&bytes[528..532], &[255, 0, 0, 255]);
+    assert_eq!(&bytes[1552..1556], &[0, 0, 255, 255]);
+    assert_eq!(&bytes[1028..1032], &[0xa5; 4]);
+    assert_eq!(&bytes[2048..], &[0xa5; 2048]);
 }
 
 #[test]

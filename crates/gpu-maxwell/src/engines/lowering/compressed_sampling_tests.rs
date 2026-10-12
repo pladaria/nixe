@@ -146,7 +146,8 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         .unwrap()[target_index];
         assert!(creations.iter().any(|creation| matches!(
             creation,
-            BackendResourceCreateInfo::Image { view: Some(view), .. } if !view.has_canonical_texels()
+            BackendResourceCreateInfo::Image { view: Some(view), .. }
+                if view.has_canonical_texels() && !view.can_initialize_from_canonical_texels()
         )));
         creations.clear();
         // Disabling future compression does not make existing compressed

@@ -1301,6 +1301,10 @@ pub(crate) struct WgpuBackendDriver {
     partial_clear_pipelines: HashMap<PartialClearPipelineKey, RenderPipeline>,
     blits: blit::BlitCache,
     conversions: conversion::ConversionCache,
+    #[cfg(target_os = "linux")]
+    video_buffers: Vec<crate::native::vulkan::video::VideoBuffer>,
+    #[cfg(target_os = "linux")]
+    video_device: Option<[u8; 16]>,
     partial_clear_parameters: PartialClearParameters,
     submissions: HashMap<BackendSubmissionToken, HostSubmission>,
     queued_commands: Vec<wgpu::CommandBuffer>,
@@ -1354,6 +1358,8 @@ impl WgpuBackendDriver {
         } = execution;
         #[cfg(target_os = "macos")]
         let _ = native_vulkan;
+        #[cfg(target_os = "linux")]
+        let video_device = crate::native::vulkan::video::device_uuid(&device);
         let device_loss = Arc::new(Mutex::new(None));
         let callback_state = Arc::clone(&device_loss);
         device.set_device_lost_callback(move |reason, message| {
@@ -1402,6 +1408,10 @@ impl WgpuBackendDriver {
             partial_clear_pipelines: HashMap::default(),
             blits: blit::BlitCache::default(),
             conversions: conversion::ConversionCache::default(),
+            #[cfg(target_os = "linux")]
+            video_buffers: Vec::new(),
+            #[cfg(target_os = "linux")]
+            video_device,
             partial_clear_parameters,
             submissions: HashMap::default(),
             queued_commands: Vec::new(),
@@ -1527,6 +1537,8 @@ impl WgpuBackendDriver {
         self.upload_staging = StagingBelt::new(self.device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         self.upload_canonical = Vec::new();
         self.upload_rgb565 = Vec::new();
+        #[cfg(target_os = "linux")]
+        self.video_buffers.clear();
         self.block_decoder = compressed::BlockDecoder::default();
         self.vertex_pull_binding_key = Vec::new();
         self.draw_bind_groups = Vec::new();
@@ -1650,7 +1662,8 @@ impl WgpuBackendDriver {
             let first = &submission.operations()[access.first_operation()];
             let conversion_overwrite = matches!(first.command(), GpuCommand::ConvertNv12(conversion)
                 if conversion.destination.target() == access.target());
-            let host_image_upload = matches!(first.command(), GpuCommand::UploadImage { destination, .. } if destination.target() == access.target());
+            let host_image_upload = matches!(first.command(), GpuCommand::UploadImage { destination, .. } if destination.target() == access.target())
+                || matches!(first.command(), GpuCommand::ImportDecodedPlanes { destinations, .. } if destinations.iter().any(|region| region.target() == access.target()));
             if !access.mode().reads() && !conversion_overwrite && !host_image_upload {
                 continue;
             }
@@ -1681,6 +1694,16 @@ impl WgpuBackendDriver {
                         } else if let GpuCommand::UploadImage { destination, .. } = first.command()
                         {
                             image_region_is_full(*description, *destination)?
+                        } else if let GpuCommand::ImportDecodedPlanes { destinations, .. } =
+                            first.command()
+                        {
+                            image_region_is_full(
+                                *description,
+                                *destinations
+                                    .iter()
+                                    .find(|region| region.target() == access.target())
+                                    .expect("matching decoded destination"),
+                            )?
                         } else {
                             conversion_overwrite
                         };
@@ -1701,7 +1724,17 @@ impl WgpuBackendDriver {
                         {
                             continue;
                         }
-                        if !view.has_canonical_texels() {
+                        // Initial import and demanded export are independent:
+                        // a device-initialized color image can be read back and
+                        // subsequently modified by the CPU without becoming a
+                        // disposable replica of its initial canonical bytes.
+                        // Eden likewise separates CpuModified/GpuModified and
+                        // only refreshes CPU writes or downloads on demand:
+                        // https://git.eden-emu.dev/eden-emu/eden/src/commit/67bada77f8a43a90da2e94e89b8e7da73c256989/src/video_core/texture_cache/texture_cache.h
+                        if !view.has_canonical_texels()
+                            || (!view.can_initialize_from_canonical_texels()
+                                && !content.initialized[index])
+                        {
                             if dependency.remains_current() {
                                 // The frontend supplies a resident producer; retaining
                                 // ownership does not make its opaque encoding importable.
@@ -1801,6 +1834,7 @@ impl WgpuBackendDriver {
             let first = &submission.operations()[access.first_operation()];
             if !access.mode().reads()
                 && !matches!(first.command(), GpuCommand::UploadImage { destination, .. } if destination.target() == access.target())
+                && !matches!(first.command(), GpuCommand::ImportDecodedPlanes { destinations, .. } if destinations.iter().any(|region| region.target() == access.target()))
             {
                 continue;
             }
@@ -2207,6 +2241,24 @@ impl WgpuBackendDriver {
                 GpuCommand::Copy(copy) => self.encode_copy(&mut encoder, dependencies, copy)?,
                 GpuCommand::ConvertNv12(conversion) => {
                     self.encode_nv12_conversion(&mut encoder, dependencies, conversion)?
+                }
+                GpuCommand::ImportDecodedPlanes {
+                    destinations,
+                    frame,
+                } => {
+                    #[cfg(target_os = "linux")]
+                    self.encode_device_video(
+                        &mut encoder,
+                        dependencies,
+                        *destinations,
+                        frame,
+                        accepted.token(),
+                    )?;
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = (destinations, frame);
+                        return Err(unsupported("device-resident NV12 transfer is unavailable"));
+                    }
                 }
                 GpuCommand::UploadImage { destination, bytes } => {
                     let handle = dependency_handle(
@@ -4327,9 +4379,9 @@ impl WgpuBackendDriver {
                     .as_ref()
                     .is_some_and(|view| !view.has_canonical_texels())
                 {
-                    return Err(unsupported(
-                        "CPU visibility of resident-only image storage requires its native encoding",
-                    ));
+                    return Err(unsupported(&format!(
+                        "CPU visibility of resident-only image storage requires its native encoding: handle={handle} description={description:?} binding={binding_index} demanded-page={demanded_page:?}"
+                    )));
                 }
                 (texture.clone(), *description)
             }
@@ -4658,7 +4710,7 @@ impl WgpuBackendDriver {
             else {
                 continue;
             };
-            if !view.has_canonical_texels() {
+            if !view.can_initialize_from_canonical_texels() {
                 continue;
             }
             let Some(content) = slot.record.content.as_mut() else {
@@ -5466,6 +5518,17 @@ impl WgpuBackendDriver {
 }
 
 impl BackendDriver for WgpuBackendDriver {
+    fn external_image_device(&self) -> Option<[u8; 16]> {
+        #[cfg(target_os = "linux")]
+        {
+            self.video_device
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     fn create_resource(
         &mut self,
         handle: BackendResourceHandle,

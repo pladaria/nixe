@@ -97,6 +97,14 @@ pub(crate) fn create_device(
         }
         let mut extensions = hal.required_device_extensions(descriptor.required_features);
         let supported = hal.physical_device_capabilities();
+        #[cfg(target_os = "linux")]
+        if properties.vendor_id == 0x10de
+            && supported.supports_extension(ash::khr::external_memory_fd::NAME)
+            && supported.supports_extension(ash::khr::external_semaphore_fd::NAME)
+        {
+            add_extension(&mut extensions, ash::khr::external_memory_fd::NAME);
+            add_extension(&mut extensions, ash::khr::external_semaphore_fd::NAME);
+        }
         let float_controls = properties.api_version >= vk::API_VERSION_1_2
             || supported.supports_extension(ash::khr::shader_float_controls::NAME);
         let mut floats = vk::PhysicalDeviceFloatControlsProperties::default();

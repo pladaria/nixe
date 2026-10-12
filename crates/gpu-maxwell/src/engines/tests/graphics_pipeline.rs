@@ -558,7 +558,7 @@ fn compression_threshold_reserved_values_and_failed_packet_keeps_valid_prefix() 
 
 #[test]
 fn compressed_color_clears_materialize_resident_images_and_generic_writeback() {
-    for (format, kind) in [(0xd5, 0xfe), (0xca, 0xfe), (0xca, 0xe9)] {
+    for (format, kind) in [(0xd5, 0xfe), (0xd5, 0xdb), (0xca, 0xfe), (0xca, 0xe9)] {
         check_compressed_color_materialization(format, kind, None);
     }
 }
@@ -691,11 +691,10 @@ fn check_compressed_color_materialization(format: u32, kind: u8, zbc_mask: Optio
             ImageFormat::Rgba8Unorm
         }
     );
-    assert_eq!(
+    assert!(
         view.as_ref()
             .is_some_and(|view| view.has_canonical_texels()),
-        kind == 0xfe,
-        "opaque compressed kinds must not expose a generic byte representation"
+        "materialized single-sample color must support canonical texel readback"
     );
     assert!(matches!(
         plan.submission().operations()[0].command(),

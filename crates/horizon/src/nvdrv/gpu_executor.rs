@@ -116,6 +116,14 @@ struct GpuFrontendWork {
     clock: nixe_runtime::VirtualClock,
 }
 
+enum DecodedPlaneData {
+    Linear {
+        bytes: [Arc<[u8]>; 2],
+        visible_widths: [u32; 2],
+    },
+    Device(nixe_gpu::DeviceImageFrame),
+}
+
 #[allow(
     clippy::large_enum_variant,
     reason = "retained deliveries are bounded by shared permits"
@@ -123,8 +131,7 @@ struct GpuFrontendWork {
 enum GpuFrontendMessage {
     DecodedPlanes {
         images: Box<[nixe_gpu::ConversionImage; 2]>,
-        bytes: [Arc<[u8]>; 2],
-        visible_widths: [u32; 2],
+        data: DecodedPlaneData,
         reply: mpsc::SyncSender<Result<(), Box<str>>>,
     },
     ConvertNv12 {
@@ -341,15 +348,12 @@ enum GpuExecutorMessage {
     },
 }
 
-fn wake_gpu_owner(sender: &mpsc::SyncSender<GpuExecutorMessage>) -> bool {
-    match sender.try_send(GpuExecutorMessage::Wake) {
-        Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
-        Err(mpsc::TrySendError::Disconnected(_)) => false,
-    }
+fn wake_gpu_owner(sender: &mpsc::Sender<GpuExecutorMessage>) -> bool {
+    sender.send(GpuExecutorMessage::Wake).is_ok()
 }
 
 struct GpuVisibilityRequester {
-    sender: mpsc::SyncSender<GpuExecutorMessage>,
+    sender: mpsc::Sender<GpuExecutorMessage>,
 }
 
 impl BackendVisibilityRequester for GpuVisibilityRequester {
@@ -368,12 +372,13 @@ impl BackendVisibilityRequester for GpuVisibilityRequester {
     }
 }
 
-/// Bounded frontend and backend workers owned by one GPU session.
+/// Workers with submission admission bounded by one GPU session.
 pub(super) struct NvDrvGpuExecutor {
     frontend_sender: Mutex<Option<mpsc::SyncSender<GpuFrontendMessage>>>,
     frontend_worker: Mutex<Option<JoinHandle<()>>>,
     frontend_stopped: Arc<AtomicBool>,
-    sender: Mutex<Option<mpsc::SyncSender<GpuExecutorMessage>>>,
+    sender: Mutex<Option<mpsc::Sender<GpuExecutorMessage>>>,
+    image_device: Option<[u8; 16]>,
     failure: Arc<Mutex<Option<GpuExecutorFailure>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     budget: Arc<GpuWorkBudget>,
@@ -399,7 +404,14 @@ impl NvDrvGpuExecutor {
         mut backend: Option<Box<dyn NeutralBackendRuntime>>,
         configuration: GpuCacheConfiguration,
     ) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(MAX_GPU_SUBMISSIONS_IN_FLIGHT);
+        let image_device = backend
+            .as_deref()
+            .and_then(NeutralBackendRuntime::external_image_device);
+        // GpuWorkBudget limits admitted submissions through real completion.
+        // Each admitted pushbuffer delivers many small Append messages; applying
+        // that submission limit again to prefixes stalls lowering on GPU waits.
+        // Visibility and conversion requests also retain synchronous replies.
+        let (sender, receiver) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let budget = Arc::new(GpuWorkBudget::default());
         let requester: Arc<dyn BackendVisibilityRequester> = Arc::new(GpuVisibilityRequester {
@@ -519,12 +531,23 @@ impl NvDrvGpuExecutor {
                         },
                         GpuFrontendMessage::DecodedPlanes {
                             images,
-                            bytes,
-                            visible_widths,
+                            data,
                             reply,
                         } => {
-                            match cache.lower_decoded_plane_uploads(*images, bytes, visible_widths)
-                            {
+                            let lowered = match data {
+                                DecodedPlaneData::Device(frame) => {
+                                    cache.lower_device_plane_uploads(*images, frame)
+                                }
+                                DecodedPlaneData::Linear {
+                                    bytes,
+                                    visible_widths,
+                                } => cache.lower_decoded_plane_uploads(
+                                    *images,
+                                    bytes,
+                                    visible_widths,
+                                ),
+                            };
+                            match lowered {
                                 Ok(work) => backend_sender
                                     .send(GpuExecutorMessage::ConvertedWork {
                                         work: Box::new(work),
@@ -573,6 +596,7 @@ impl NvDrvGpuExecutor {
             })
             .expect("failed to create the dedicated GPU frontend owner");
         Self {
+            image_device,
             frontend_sender: Mutex::new(Some(frontend_sender)),
             frontend_worker: Mutex::new(Some(frontend_worker)),
             frontend_stopped,
@@ -681,14 +705,45 @@ impl NvDrvGpuExecutor {
         sender
             .send(GpuFrontendMessage::DecodedPlanes {
                 images: Box::new(images),
-                bytes,
-                visible_widths,
+                data: DecodedPlaneData::Linear {
+                    bytes,
+                    visible_widths,
+                },
                 reply,
             })
             .map_err(|_| "GPU frontend stopped before decoded plane upload")?;
         result
             .recv()
             .map_err(|_| "GPU decoded plane upload reply was lost")?
+            .map_err(|e| e.to_string())
+    }
+
+    pub(super) fn image_device(&self) -> Option<[u8; 16]> {
+        self.image_device
+    }
+    pub(super) fn upload_device_planes(
+        &self,
+        images: [nixe_gpu::ConversionImage; 2],
+        frame: nixe_gpu::DeviceImageFrame,
+    ) -> Result<(), String> {
+        self.require_healthy().map_err(|e| e.to_string())?;
+        let sender = self
+            .frontend_sender
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("GPU frontend is torn down")?;
+        let (reply, result) = mpsc::sync_channel(1);
+        sender
+            .send(GpuFrontendMessage::DecodedPlanes {
+                images: Box::new(images),
+                data: DecodedPlaneData::Device(frame),
+                reply,
+            })
+            .map_err(|_| "GPU frontend stopped before device plane transfer")?;
+        result
+            .recv()
+            .map_err(|_| "GPU device plane transfer reply lost")?
             .map_err(|e| e.to_string())
     }
 
@@ -830,7 +885,7 @@ impl Drop for NvDrvGpuExecutor {
 fn stream_gpu_work(
     work: GpuFrontendWork,
     cache: &mut MaxwellLoweringCache,
-    sender: &mpsc::SyncSender<GpuExecutorMessage>,
+    sender: &mpsc::Sender<GpuExecutorMessage>,
 ) -> Result<(), GpuExecutorFailure> {
     let GpuFrontendWork { submission, clock } = work;
     let GpuSubmission {
@@ -1577,7 +1632,7 @@ mod tests {
             ),
         )]);
         execution.seal();
-        let (sender, receiver) = mpsc::sync_channel(3);
+        let (sender, receiver) = mpsc::channel();
         sender
             .send(GpuExecutorMessage::Submission(GpuWork {
                 clock: nixe_runtime::VirtualClock::default(),
@@ -1698,7 +1753,7 @@ mod tests {
                 [1, 1],
             )
             .unwrap();
-        let (sender, receiver) = mpsc::sync_channel(3);
+        let (sender, receiver) = mpsc::channel();
         let (conversion_reply, converted) = mpsc::sync_channel(1);
         sender
             .send(GpuExecutorMessage::ConvertedWork {
@@ -1770,12 +1825,12 @@ mod tests {
     }
 
     #[test]
-    fn progress_wake_is_coalesced_and_nonblocking_when_the_queue_is_full() {
+    fn progress_wake_is_coalesced() {
         let budget = GpuWorkBudget::default();
         assert_eq!(budget.request_progress(), Some(true));
         assert_eq!(budget.request_progress(), Some(false));
 
-        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (sender, _receiver) = mpsc::channel();
         sender.send(GpuExecutorMessage::Wake).unwrap();
         assert!(wake_gpu_owner(&sender));
         assert!(budget.take_progress_request());
@@ -1783,9 +1838,9 @@ mod tests {
     }
 
     #[test]
-    fn saturated_owner_queue_cannot_block_teardown() {
+    fn queued_owner_messages_cannot_block_teardown() {
         let budget = Arc::new(GpuWorkBudget::default());
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::channel();
         sender.send(GpuExecutorMessage::Wake).unwrap();
 
         budget.stop();

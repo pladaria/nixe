@@ -326,6 +326,10 @@ impl AcceptedBackendSubmission<'_> {
 /// distinguished from an ordinary backend failure so [`Backend`] can enter a
 /// deterministic terminal state and discard every neutral ownership record.
 pub trait BackendDriver {
+    fn external_image_device(&self) -> Option<[u8; 16]> {
+        None
+    }
+
     fn create_resource(
         &mut self,
         handle: BackendResourceHandle,

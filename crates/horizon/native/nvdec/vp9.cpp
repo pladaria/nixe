@@ -7,6 +7,11 @@
 #include <algorithm> // for std::copy
 #include <bit>
 #include <numeric>
+#include <limits>
+#include <utility>
+extern "C" {
+#include <libavcodec/packet.h>
+}
 
 
 
@@ -574,7 +579,7 @@ std::vector<u8> VP9::ComposeCompressedHeader() {
         }
     }
     writer.End();
-    return writer.GetBuffer();
+    return std::move(writer.GetBuffer());
 }
 
 VpxBitStreamWriter VP9::ComposeUncompressedHeader() {
@@ -758,8 +763,8 @@ VpxBitStreamWriter VP9::ComposeUncompressedHeader() {
     return uncomp_writer;
 }
 
-std::span<const u8> VP9::ComposeFrame(const PictureInfo& picture, const EntropyProbs& entropy,
-    std::span<const u8> tiles, const std::array<u64,4>& offsets, u64 origin) {
+int VP9::ComposeFrame(const PictureInfo& picture, const EntropyProbs& entropy,
+    std::span<const u8> tiles, const std::array<u64,4>& offsets, u64 origin, AVPacket* packet) {
     current_picture_info=picture;
     current_entropy=entropy;
     current_frame_info=picture.Convert();
@@ -778,14 +783,20 @@ std::span<const u8> VP9::ComposeFrame(const PictureInfo& picture, const EntropyP
 
     uncomp_writer.WriteU(static_cast<s32>(compressed_header.size()), 16);
     uncomp_writer.Flush();
-    std::vector<u8> uncompressed_header = uncomp_writer.GetByteArray();
+    const auto& uncompressed_header = uncomp_writer.GetByteArray();
 
-    // Write headers and frame to buffer
-    frame_scratch.resize(uncompressed_header.size() + compressed_header.size() + bitstream.size());
-    std::copy(uncompressed_header.begin(), uncompressed_header.end(), frame_scratch.begin());
-    std::copy(compressed_header.begin(), compressed_header.end(), frame_scratch.begin() + uncompressed_header.size());
-    std::copy(bitstream.begin(), bitstream.end(), frame_scratch.begin() + uncompressed_header.size() + compressed_header.size());
-    return GetFrameBytes();
+    // Compose directly into FFmpeg's refcounted, padded packet storage.
+    // https://ffmpeg.org/doxygen/trunk/group__lavc__packet.html
+    const size_t size = uncompressed_header.size() + compressed_header.size() + bitstream.size();
+    if (size > static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::runtime_error("NVDEC reconstructed VP9 packet exceeds codec size limit");
+    const int result = av_new_packet(packet, static_cast<int>(size));
+    if (result < 0) return result;
+    auto* output = packet->data;
+    output = std::copy(uncompressed_header.begin(), uncompressed_header.end(), output);
+    output = std::copy(compressed_header.begin(), compressed_header.end(), output);
+    std::copy(bitstream.begin(), bitstream.end(), output);
+    return 0;
 }
 
 VpxRangeEncoder::VpxRangeEncoder() {

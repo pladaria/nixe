@@ -41,6 +41,13 @@ impl BufferView {
     pub const fn buffer(&self) -> BufferId {
         self.buffer
     }
+    /// Reidentifies the same backing range in another resource list.
+    #[must_use]
+    pub fn with_buffer(mut self, buffer: BufferId) -> Self {
+        self.buffer = buffer;
+        self
+    }
+
     #[must_use]
     pub const fn buffer_offset(&self) -> u64 {
         self.buffer_offset
@@ -200,7 +207,14 @@ pub struct ImageView {
     image: ImageId,
     swizzle: Swizzle,
     bindings: Box<[ImageSubresourceBinding]>,
-    canonical_texels: bool,
+    storage: ImageStorage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageStorage {
+    CanonicalTexels,
+    DeviceInitializedTexels,
+    ResidentOnly,
 }
 
 impl ImageView {
@@ -241,7 +255,7 @@ impl ImageView {
             image,
             swizzle,
             bindings,
-            canonical_texels: true,
+            storage: ImageStorage::CanonicalTexels,
         })
     }
 
@@ -251,19 +265,42 @@ impl ImageView {
     /// The frontend must materialize all consumed image contents on the device.
     #[must_use]
     pub fn with_resident_only_storage(mut self) -> Self {
-        self.canonical_texels = false;
+        self.storage = ImageStorage::ResidentOnly;
         self
     }
 
+    /// Requires device initialization, but allows logical texels to be exported
+    /// when the CPU actually consumes them and reimported after a CPU write.
+    #[must_use]
+    pub fn with_device_initialized_texels(mut self) -> Self {
+        self.storage = ImageStorage::DeviceInitializedTexels;
+        self
+    }
+
+    /// Whether canonical bytes can initialize a new host image without a producer.
+    #[must_use]
+    pub const fn can_initialize_from_canonical_texels(&self) -> bool {
+        matches!(self.storage, ImageStorage::CanonicalTexels)
+    }
+
+    /// Whether device-written logical texels can be exported to canonical memory.
     #[must_use]
     pub const fn has_canonical_texels(&self) -> bool {
-        self.canonical_texels
+        !matches!(self.storage, ImageStorage::ResidentOnly)
     }
 
     #[must_use]
     pub const fn image(&self) -> ImageId {
         self.image
     }
+    /// Reidentifies the same storage and component interpretation in another
+    /// resource list. No binding or storage policy changes.
+    #[must_use]
+    pub fn with_image(mut self, image: ImageId) -> Self {
+        self.image = image;
+        self
+    }
+
     #[must_use]
     pub const fn swizzle(&self) -> Swizzle {
         self.swizzle

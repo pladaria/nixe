@@ -87,6 +87,39 @@ impl MaxwellLoweringCache {
         )
     }
 
+    pub fn lower_device_plane_uploads(
+        &mut self,
+        images: [ConversionImage; 2],
+        frame: nixe_gpu::DeviceImageFrame,
+    ) -> Result<MaxwellLoweredWork, MaxwellLoweringError> {
+        let PreparedImages {
+            creations,
+            invalidations,
+            regions,
+        } = self.prepare_producer_images(images.into_iter().map(|image| (image, true)))?;
+        let mut destinations = [regions[0], regions[1]];
+        destinations[0].extent.width = frame.width;
+        destinations[1].extent.width = frame.width.div_ceil(2);
+        let frontend = FrontendSubmissionId::new(u64::MAX - self.revision);
+        finish_lowered_work(
+            self,
+            frontend,
+            Vec::new(),
+            creations,
+            invalidations,
+            [GpuOperation::new(
+                GpuCommand::ImportDecodedPlanes {
+                    destinations,
+                    frame,
+                },
+                [],
+                [],
+                CapabilityRequirements::none(),
+            )],
+            Arc::from([]),
+        )
+    }
+
     fn prepare_producer_images(
         &mut self,
         images: impl IntoIterator<Item = (ConversionImage, bool)>,
@@ -129,10 +162,16 @@ impl MaxwellLoweringCache {
                 mappings: Arc::from([]),
             };
             let id = if let Some(record) = self.image_views_mut().find(|record| record.key == key) {
-                record.cpu_writes = Some(
-                    nixe_memory::CanonicalCpuWriteDependency::capture(binding.backing().range())
-                        .map_err(|_| MaxwellLoweringError::ResourceExhausted)?,
-                );
+                if !record
+                    .cpu_writes
+                    .as_ref()
+                    .is_some_and(CanonicalCpuWriteDependency::remains_current)
+                {
+                    record.cpu_writes = Some(
+                        CanonicalCpuWriteDependency::capture(binding.backing().range())
+                            .map_err(|_| MaxwellLoweringError::ResourceExhausted)?,
+                    );
+                }
                 image_dependency(record.dependency)?
             } else {
                 retire_overlapping_views(

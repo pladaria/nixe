@@ -18,6 +18,8 @@ pub use color::{
     BlendComponent, BlendFactor, BlendOperation, ColorBlendState, ColorOutputState, ColorWriteMask,
 };
 pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Conversion};
+mod device_image;
+pub use device_image::{DeviceImageFrame, DeviceImageSource, ExternalImageBuffer};
 mod diagnostics;
 mod presentation;
 mod resource;

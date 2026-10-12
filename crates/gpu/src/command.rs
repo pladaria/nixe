@@ -1267,6 +1267,10 @@ impl RenderPassOperation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum GpuCommand {
     ConvertNv12(crate::Nv12Conversion),
+    ImportDecodedPlanes {
+        destinations: [ImageRegion; 2],
+        frame: crate::DeviceImageFrame,
+    },
     Copy(CopyOperation),
     /// Ordered host-authored texels, copied through backend staging storage.
     UploadImage {
@@ -1387,6 +1391,19 @@ impl GpuCommand {
                     ),
                 ),
             ],
+            Self::ImportDecodedPlanes { destinations, .. } => destinations
+                .iter()
+                .map(|region| {
+                    ResourceAccess::new(
+                        region.target(),
+                        scope(
+                            PipelineStages::COPY,
+                            AccessMode::Write,
+                            ResourceUsage::TransferDestination,
+                        ),
+                    )
+                })
+                .collect(),
             Self::Copy(copy) => copy_accesses(copy),
             Self::UploadImage { destination, .. } => vec![ResourceAccess::new(
                 destination.target(),
@@ -1466,6 +1483,7 @@ impl GpuCommand {
             Self::Copy(_)
             | Self::ConvertNv12(_)
             | Self::UploadImage { .. }
+            | Self::ImportDecodedPlanes { .. }
             | Self::Resolve(_)
             | Self::Blit(_)
             | Self::Clear(_) => {
@@ -1516,7 +1534,10 @@ impl GpuCommand {
     fn capability_requirements(&self) -> CapabilityRequirements {
         let mut requirements = vec![CapabilityRequirement::Features(match self {
             Self::ConvertNv12(_) => BackendFeatures::COPY,
-            Self::Copy(_) | Self::Blit(_) | Self::UploadImage { .. } => BackendFeatures::COPY,
+            Self::Copy(_)
+            | Self::Blit(_)
+            | Self::UploadImage { .. }
+            | Self::ImportDecodedPlanes { .. } => BackendFeatures::COPY,
             Self::Resolve(_) => BackendFeatures::RESOLVE,
             Self::Clear(_) => BackendFeatures::CLEAR,
             Self::Draw(draw) if draw.arguments.is_indexed() => {
