@@ -301,6 +301,24 @@ impl NativePipeline {
                 nixe_gpu::FrontFace::Clockwise => vk::FrontFace::CLOCKWISE,
             })
             .line_width(1.0);
+        if let Some(bias) = key.depth.and(key.draw.depth_bias) {
+            let constant = f32::from_bits(bias.constant_bits);
+            let slope = f32::from_bits(bias.slope_scale_bits);
+            let clamp = f32::from_bits(bias.clamp_bits);
+            if !constant.is_finite() || !slope.is_finite() || !clamp.is_finite() {
+                return Err(unsupported("non-finite native polygon depth bias"));
+            }
+            if clamp != 0.0 && !capabilities.raster.depth_bias_clamp {
+                return Err(unsupported(
+                    "native polygon depth bias requires depthBiasClamp",
+                ));
+            }
+            raster = raster
+                .depth_bias_enable(true)
+                .depth_bias_constant_factor(constant)
+                .depth_bias_slope_factor(slope)
+                .depth_bias_clamp(clamp);
+        }
         if let TriangleRasterization::Wireframe { smooth, .. } = key.draw.triangle_rasterization {
             // Explicit mode, never implementation-dependent DEFAULT lines.
             // https://docs.vulkan.org/spec/latest/chapters/primsrast.html#primsrast-lines-smooth
@@ -339,11 +357,11 @@ impl NativePipeline {
                 DepthCompareOperation::Always => vk::CompareOp::ALWAYS,
             });
         if let Some(stencil) = key.draw.stencil_state {
-            let face = |compare| vk::StencilOpState {
-                fail_op: vk::StencilOp::KEEP,
-                pass_op: vk::StencilOp::KEEP,
-                depth_fail_op: vk::StencilOp::KEEP,
-                compare_op: match compare {
+            let face = |state: nixe_gpu::StencilFaceState| vk::StencilOpState {
+                fail_op: stencil_operation(state.fail),
+                pass_op: stencil_operation(state.pass),
+                depth_fail_op: stencil_operation(state.depth_fail),
+                compare_op: match state.compare {
                     DepthCompareOperation::Never => vk::CompareOp::NEVER,
                     DepthCompareOperation::Less => vk::CompareOp::LESS,
                     DepthCompareOperation::Equal => vk::CompareOp::EQUAL,
@@ -353,14 +371,14 @@ impl NativePipeline {
                     DepthCompareOperation::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
                     DepthCompareOperation::Always => vk::CompareOp::ALWAYS,
                 },
-                compare_mask: u32::from(stencil.read_mask),
-                write_mask: 0,
-                reference: u32::from(stencil.reference),
+                compare_mask: u32::from(state.read_mask),
+                write_mask: u32::from(state.write_mask),
+                reference: u32::from(state.reference),
             };
             depth = depth
                 .stencil_test_enable(true)
-                .front(face(stencil.front_compare))
-                .back(face(stencil.back_compare));
+                .front(face(stencil.front))
+                .back(face(stencil.back));
         }
         let writes = [color_output(key.draw.color_outputs[0])];
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&writes);
@@ -409,5 +427,19 @@ impl NativePipeline {
         };
         drop(modules);
         Ok(Arc::new(p))
+    }
+}
+
+fn stencil_operation(op: nixe_gpu::StencilOperation) -> vk::StencilOp {
+    use nixe_gpu::StencilOperation as O;
+    match op {
+        O::Keep => vk::StencilOp::KEEP,
+        O::Zero => vk::StencilOp::ZERO,
+        O::Replace => vk::StencilOp::REPLACE,
+        O::IncrementClamp => vk::StencilOp::INCREMENT_AND_CLAMP,
+        O::DecrementClamp => vk::StencilOp::DECREMENT_AND_CLAMP,
+        O::Invert => vk::StencilOp::INVERT,
+        O::IncrementWrap => vk::StencilOp::INCREMENT_AND_WRAP,
+        O::DecrementWrap => vk::StencilOp::DECREMENT_AND_WRAP,
     }
 }

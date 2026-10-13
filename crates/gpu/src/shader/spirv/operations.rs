@@ -5,6 +5,18 @@ impl Emitter {
         use ShaderOperation::*;
         match operation {
             Nop => {}
+            QuadShuffle32 { .. } | FloatQuadSwizzleAdd32 { .. } => {
+                return Err(
+                    self.unsupported("fragment quad exchange requires the host quad backend")
+                );
+            }
+            QueryTextureLevels { .. } => {
+                return Err(self.unsupported("image queries require the WGSL texture backend"));
+            }
+            FusedMultiplyAddHalf32 { .. } => {
+                return Err(self
+                    .unsupported("direct half FMA is not implemented by native SPIR-V lowering"));
+            }
             LoadComputeBuiltin32 { .. } | StoreStorageBuffer32 { .. } => {
                 return Err(self.unsupported("compute operations require the WGSL compute backend"));
             }
@@ -490,6 +502,70 @@ impl Emitter {
                 };
                 let value = self.float_result(value, *float_control)?;
                 self.write(*destination, value);
+            }
+            Select32 {
+                destination,
+                condition,
+                when_true,
+                when_false,
+            } => {
+                let bits = self.read(*condition)?;
+                let zero = self.constant(0);
+                let condition = self.b.i_not_equal(self.boolean, None, bits, zero)?;
+                let yes = self.read(*when_true)?;
+                let no = self.read(*when_false)?;
+                let result = self.b.select(self.uint, None, condition, yes, no)?;
+                self.write(*destination, result);
+            }
+            SetPredicatesFromBits {
+                source,
+                first_bit,
+                write_mask,
+            } => {
+                let bits = self.read(*source)?;
+                let zero = self.constant(0);
+                for index in 0..7_u8 {
+                    if write_mask & (1 << index) != 0 {
+                        let mask = self.constant(1 << (first_bit + index));
+                        let bit = self.b.bitwise_and(self.uint, None, bits, mask)?;
+                        let value = self.b.i_not_equal(self.boolean, None, bit, zero)?;
+                        self.predicates[usize::from(index)] = Some(value);
+                    }
+                }
+            }
+            SetPredicateBoolean {
+                destinations,
+                inputs,
+                operations,
+            } => {
+                let a = self.predicate(inputs[0])?;
+                let b = self.predicate(inputs[1])?;
+                let c = self.predicate(inputs[2])?;
+                for (index, destination) in destinations.iter().enumerate() {
+                    if let Some(destination) = destination {
+                        let first = if index == 0 {
+                            a
+                        } else {
+                            self.b.logical_not(self.boolean, None, a)?
+                        };
+                        let mut value = first;
+                        for (operation, operand) in operations.iter().zip([b, c]) {
+                            value = match operation {
+                                ShaderPredicateSetOperation::And => {
+                                    self.b.logical_and(self.boolean, None, value, operand)?
+                                }
+                                ShaderPredicateSetOperation::Or => {
+                                    self.b.logical_or(self.boolean, None, value, operand)?
+                                }
+                                ShaderPredicateSetOperation::Xor => {
+                                    self.b
+                                        .logical_not_equal(self.boolean, None, value, operand)?
+                                }
+                            };
+                        }
+                        self.predicates[usize::from(*destination)] = Some(value);
+                    }
+                }
             }
             SetPredicateInteger32 {
                 destinations,

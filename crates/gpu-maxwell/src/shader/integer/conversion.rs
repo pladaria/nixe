@@ -13,6 +13,7 @@ pub(in crate::shader) fn decode_integer_to_integer(
     encoding: u64,
     register_count: u8,
     next: &mut u16,
+    flags: &mut IntegerConditionCodes,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     // Operand fields: Mesa SM50 OpI2I and UAM GM107 emitI2I.
     // Narrow destination values are zero-extended, even for signed destinations;
@@ -25,9 +26,6 @@ pub(in crate::shader) fn decode_integer_to_integer(
         encoding,
         detail,
     };
-    if encoding & (1 << 47) != 0 {
-        return Err(error("I2I condition-code output"));
-    }
     let destination_bits = 8_u32 << ((encoding >> 8) & 3);
     let source_bits = 8_u32 << ((encoding >> 10) & 3);
     if destination_bits == 64 || source_bits == 64 {
@@ -203,6 +201,51 @@ pub(in crate::shader) fn decode_integer_to_integer(
             reverse: false,
         });
     }
+    if encoding & (1 << 47) != 0 {
+        // I2I.CC tests the converted word (even when discarded to RZ),
+        // then clears carry/overflow. All operations inherit ISA predication.
+        // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/integer_to_integer_conversion.cpp
+        let z = flag_register(&mut flags.zero, &mut temp)?;
+        let s = flag_register(&mut flags.sign, &mut temp)?;
+        let c = flag_register(&mut flags.carry, &mut temp)?;
+        let o = flag_register(&mut flags.overflow, &mut temp)?;
+        ops.extend([
+            ShaderOperation::CompareInteger32 {
+                destination: z,
+                float_result: false,
+                left: destination,
+                right: zero,
+                signed: false,
+                comparison: ShaderIntegerComparison::Equal,
+                accumulator: ShaderPredicate::Always,
+                set_operation: ShaderPredicateSetOperation::And,
+            },
+            ShaderOperation::Bitwise32 {
+                destination: z,
+                left: z,
+                right: one,
+                operation: ShaderBitwiseOperation::And,
+            },
+            ShaderOperation::ExtractBitfield32 {
+                destination: s,
+                value: destination,
+                offset: thirty_one,
+                count: one,
+                signed: false,
+                reverse: false,
+            },
+            ShaderOperation::Move32 {
+                destination: c,
+                source: zero,
+                scalar_type: ShaderScalarType::Unsigned32,
+            },
+            ShaderOperation::Move32 {
+                destination: o,
+                source: zero,
+                scalar_type: ShaderScalarType::Unsigned32,
+            },
+        ]);
+    }
     Ok(DecodedIntegerOperation {
         operations: ops,
         constant_buffer_binding: binding,
@@ -277,4 +320,16 @@ fn immediate(
         scalar_type: ShaderScalarType::Unsigned32,
     });
     Ok(destination)
+}
+
+fn flag_register(
+    flag: &mut Option<ShaderRegister>,
+    temp: &mut impl FnMut() -> Result<ShaderRegister, MaxwellShaderTranslationError>,
+) -> Result<ShaderRegister, MaxwellShaderTranslationError> {
+    if let Some(register) = *flag {
+        return Ok(register);
+    }
+    let register = temp()?;
+    *flag = Some(register);
+    Ok(register)
 }

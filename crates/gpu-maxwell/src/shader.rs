@@ -18,6 +18,7 @@ mod integer;
 mod interface;
 mod link;
 mod patch_address;
+mod quad;
 mod source;
 mod special;
 mod tessellation;

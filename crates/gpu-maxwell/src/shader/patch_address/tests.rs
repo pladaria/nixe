@@ -134,7 +134,7 @@ fn graphics_chain_with_control(control: MaxwellShaderBinary) -> Vec<VerifiedShad
         .iter()
         .zip([4, 5, 16, 4])
         .map(|(binary, registers)| {
-            translate_shader_binary(binary, registers, &BTreeMap::new()).unwrap()
+            translate_shader_binary(binary, registers, &BTreeMap::new(), false).unwrap()
         })
         .collect();
     validate_graphics_stage_interfaces(&programs).unwrap();
@@ -231,8 +231,12 @@ fn translate(
     code: &[[u64; 3]],
 ) -> Result<VerifiedShaderIr, MaxwellShaderTranslationError> {
     let binary = binary(control, code);
-    let translated =
-        translate_shader_binary(&binary, if control { 5 } else { 16 }, &BTreeMap::new())?;
+    let translated = translate_shader_binary(
+        &binary,
+        if control { 5 } else { 16 },
+        &BTreeMap::new(),
+        false,
+    )?;
     finalize_shader_ir(translated.ir, binary.stage(), &BTreeMap::new(), &[])
 }
 
@@ -257,7 +261,8 @@ fn inputs() -> ShaderEvaluationInputs {
 fn complete_control_and_evaluation_interfaces_link() {
     let programs =
         [(true, CONTROL, 5), (false, EVALUATION, 16)].map(|(control, code, registers)| {
-            translate_shader_binary(&binary(control, code), registers, &BTreeMap::new()).unwrap()
+            translate_shader_binary(&binary(control, code), registers, &BTreeMap::new(), false)
+                .unwrap()
         });
     validate_graphics_stage_interfaces(&programs).unwrap();
 }
@@ -554,7 +559,7 @@ fn address_proof_is_independent_of_guest_register_numbers() {
         }
     }
     let binary = binary(true, &code);
-    let translated = translate_shader_binary(&binary, 13, &BTreeMap::new()).unwrap();
+    let translated = translate_shader_binary(&binary, 13, &BTreeMap::new(), false).unwrap();
     let ir = finalize_shader_ir(translated.ir, binary.stage(), &BTreeMap::new(), &[]).unwrap();
     for vertex in 0..3 {
         let result = evaluate_shader_ir(

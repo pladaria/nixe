@@ -159,6 +159,7 @@ pub(super) fn decode_system_register(
     encoding: u64,
     register_count: u8,
     inputs: &mut Vec<ShaderInterfaceElement>,
+    y_negate: bool,
 ) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
     if encoding & !0xffff_0000_0fff_00ff != 0 {
         return Err(malformed(
@@ -167,6 +168,19 @@ pub(super) fn decode_system_register(
             encoding,
             "S2R reserved field is nonzero",
         ));
+    }
+    if ((encoding >> 20) & 0xff) == 0x12 && stage == MaxwellShaderStage::Pixel {
+        // Maxwell's floating SR_Y_DIRECTION encodes window-coordinate origin.
+        // https://github.com/envytools/envytools/blob/master/envydis/gm107.c
+        // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/move_special_register.cpp
+        validate_register_range(stage, offset, encoding, encoding as u8, 1, register_count)?;
+        return Ok(ShaderOperation::MoveImmediate32 {
+            destination: ShaderRegister::new(u16::from(encoding as u8)),
+            bits: (if y_negate { -1.0_f32 } else { 1.0_f32 }).to_bits(),
+            // S2R returns the register's raw bits; subsequent instructions
+            // choose their interpretation, rather than converting the float.
+            scalar_type: ShaderScalarType::Unsigned32,
+        });
     }
     // S2R selector: public GM107 emitSYS/emitS2R, not a shader fingerprint.
     // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L267-L274

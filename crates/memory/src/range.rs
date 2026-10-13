@@ -1296,6 +1296,19 @@ impl CanonicalBackingRange {
     /// neither required nor reconstructed, so aliases and unmapped-but-retained
     /// storage preserve the same byte identity.
     pub fn read(&self, offset: u64, output: &mut [u8]) -> Result<(), CanonicalRangeAccessError> {
+        self.read_with_resolver(offset, output, &mut |coordinator, request| {
+            coordinator.make_cpu_visible(request)
+        })
+    }
+
+    /// Reads with explicit visibility routing, allowing a device owner to
+    /// resolve its own writes inline. The resolver runs outside memory locks.
+    pub fn read_with_resolver(
+        &self,
+        offset: u64,
+        output: &mut [u8],
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<(), CanonicalRangeAccessError> {
         let output_size =
             u64::try_from(output.len()).map_err(|_| CanonicalRangeAccessError::RangeOverflow)?;
         let end = offset
@@ -1341,7 +1354,7 @@ impl CanonicalBackingRange {
                 {
                     segment
                         .backing
-                        .prepare_cpu_access()
+                        .prepare_cpu_access_with(resolve)
                         .map_err(CanonicalRangeAccessError::Backing)?;
                 }
             }

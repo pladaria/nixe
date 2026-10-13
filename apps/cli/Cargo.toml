@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 sdl3.workspace = true
 nixe-audio.workspace = true
+nixe-applets.workspace = true
 ctrlc.workspace = true
 log.workspace = true
 mimalloc.workspace = true

@@ -1254,15 +1254,29 @@ fn advance_backend_work(
         let execution = &mut work.execution;
         let pending = &mut work.pending;
         let frontend = execution.frontend();
-        match execution
-            .next_segment(nixe_gpu_maxwell::maxwell_gpu_timestamp(
-                work.clock.scheduler_time_ns(),
-            ))
+        let segment = execution
+            .next_segment_with_resolver(
+                nixe_gpu_maxwell::maxwell_gpu_timestamp(work.clock.scheduler_time_ns()),
+                &mut |_coordinator, request| {
+                    // Canonical operations belong to this session's single backend.
+                    // Its owner can resolve directly while other threads use the inbox.
+                    backend
+                        .as_deref_mut()
+                        .ok_or_else(|| {
+                            VisibilityCoordinatorError::new(
+                                "canonical GPU read requires an accelerated backend",
+                            )
+                        })?
+                        .make_cpu_visible(request)
+                        .map_err(|error| VisibilityCoordinatorError::new(error.to_string()))
+                },
+            )
             .map_err(|error| GpuExecutorFailure {
                 boundary: None,
                 frontend,
                 detail: error.to_string().into(),
-            })? {
+            })?;
+        match segment {
             Some(segment) => {
                 let backend = backend.as_deref_mut().ok_or_else(|| GpuExecutorFailure {
                     boundary: None,

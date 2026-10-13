@@ -405,6 +405,15 @@ fn evaluate_iadd(encoding: u64, left: u32, right: u32) -> u32 {
 }
 
 fn evaluate_integer(decoded: DecodedIntegerOperation, left: u32, right: u32) -> u32 {
+    evaluate_integer_with_third(decoded, left, right, 0)
+}
+
+fn evaluate_integer_with_third(
+    decoded: DecodedIntegerOperation,
+    left: u32,
+    right: u32,
+    third: u32,
+) -> u32 {
     let resources = decoded
         .constant_buffer_binding
         .into_iter()
@@ -425,6 +434,11 @@ fn evaluate_integer(decoded: DecodedIntegerOperation, left: u32, right: u32) -> 
             scalar_type: ShaderScalarType::Unsigned32,
         },
     ];
+    operations.push(ShaderOperation::MoveImmediate32 {
+        destination: ShaderRegister::new(2),
+        bits: third,
+        scalar_type: ShaderScalarType::Unsigned32,
+    });
     operations.extend(decoded.operations);
     operations.extend([
         ShaderOperation::StoreOutput {
@@ -770,4 +784,638 @@ fn iadd_negation_plus_one_and_extended_complement() {
     for flag in [1 << 47, 1 << 43] {
         assert!(decode_add(STAGE, 8, 0x5c13_0000_0017_0000 | flag, 4, &mut 4, &mut None).is_err());
     }
+}
+
+#[test]
+fn psetp_truth_tables_negations_aliases_and_instruction_predicate() {
+    let combine = |a: bool, b: bool, op| match op {
+        0 => a && b,
+        1 => a || b,
+        2 => a ^ b,
+        _ => unreachable!(),
+    };
+    for sources in [[0_u64, 1, 2], [7, 1, 2], [0, 7, 7]] {
+        for state in 0..8_u32 {
+            for invert in 0..8_u64 {
+                for first in 0..3_u64 {
+                    for second in 0..3_u64 {
+                        for destinations in [[0_u64, 1], [1, 0], [2, 0], [7, 0], [0, 7]] {
+                            for guard in [
+                                ShaderPredicate::Always,
+                                ShaderPredicate::Register {
+                                    register: 0,
+                                    inverted: false,
+                                },
+                                ShaderPredicate::Register {
+                                    register: 0,
+                                    inverted: true,
+                                },
+                            ] {
+                                let word = 0x5090_0000_0007_0000
+                                    | (destinations[0] << 3)
+                                    | destinations[1]
+                                    | (sources[0] << 12)
+                                    | ((invert & 1) << 15)
+                                    | (first << 24)
+                                    | (sources[1] << 29)
+                                    | (((invert >> 1) & 1) << 32)
+                                    | (sources[2] << 39)
+                                    | (((invert >> 2) & 1) << 42)
+                                    | (second << 45);
+                                let decoded = decode_predicate_boolean(STAGE, 8, word).unwrap();
+                                let old = [state & 1 != 0, state & 2 != 0, state & 4 != 0];
+                                let mut ops = vec![(
+                                    ShaderPredicate::Always,
+                                    ShaderOperation::MoveImmediate32 {
+                                        destination: ShaderRegister::new(0),
+                                        bits: 0,
+                                        scalar_type: ShaderScalarType::Unsigned32,
+                                    },
+                                )];
+                                for (index, value) in old.iter().enumerate() {
+                                    ops.push((
+                                        ShaderPredicate::Always,
+                                        ShaderOperation::SetPredicateInteger32 {
+                                            destinations: [Some(index as u8), None],
+                                            left: ShaderRegister::new(0),
+                                            right: ShaderRegister::new(0),
+                                            signed: false,
+                                            comparison: if *value {
+                                                ShaderIntegerComparison::True
+                                            } else {
+                                                ShaderIntegerComparison::False
+                                            },
+                                            accumulator: ShaderPredicate::Always,
+                                            set_operation: ShaderPredicateSetOperation::And,
+                                        },
+                                    ));
+                                }
+                                ops.push((guard, decoded));
+                                for index in 0..3_u8 {
+                                    ops.push((
+                                        ShaderPredicate::Always,
+                                        ShaderOperation::CompareInteger32 {
+                                            destination: ShaderRegister::new(0),
+                                            float_result: false,
+                                            left: ShaderRegister::new(0),
+                                            right: ShaderRegister::new(0),
+                                            signed: false,
+                                            comparison: ShaderIntegerComparison::True,
+                                            accumulator: ShaderPredicate::Register {
+                                                register: index,
+                                                inverted: false,
+                                            },
+                                            set_operation: ShaderPredicateSetOperation::And,
+                                        },
+                                    ));
+                                    ops.push((
+                                        ShaderPredicate::Always,
+                                        ShaderOperation::StoreOutput {
+                                            sources: vec![ShaderRegister::new(0)].into(),
+                                            location: ShaderIoLocation::Color(0),
+                                            first_component: index,
+                                            scalar_type: ShaderScalarType::Unsigned32,
+                                        },
+                                    ));
+                                }
+                                ops.push((ShaderPredicate::Always, ShaderOperation::Exit));
+                                let shader = VerifiedShaderIr::verify(ShaderIr::new(
+                                    ShaderStage::Fragment,
+                                    vec![],
+                                    (0..3)
+                                        .map(|component| {
+                                            ShaderInterfaceElement::new(
+                                                ShaderIoLocation::Color(0),
+                                                component,
+                                                ShaderScalarType::Unsigned32,
+                                                None,
+                                            )
+                                            .unwrap()
+                                        })
+                                        .collect(),
+                                    vec![],
+                                    ops.into_iter()
+                                        .enumerate()
+                                        .map(|(i, (predicate, operation))| {
+                                            ShaderInstruction::new(
+                                                ShaderSourceLocation::new(i as u32 * 8),
+                                                predicate,
+                                                operation,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ))
+                                .unwrap();
+                                let mut expected = old;
+                                let enabled = match guard {
+                                    ShaderPredicate::Always => true,
+                                    ShaderPredicate::Register { inverted, .. } => old[0] ^ inverted,
+                                    _ => unreachable!(),
+                                };
+                                if enabled {
+                                    let values = sources
+                                        .map(|p| if p == 7 { true } else { old[p as usize] });
+                                    let [a, b, c] = std::array::from_fn(|i| {
+                                        values[i] ^ (invert & (1 << i) != 0)
+                                    });
+                                    for (i, destination) in destinations.into_iter().enumerate() {
+                                        if destination != 7 {
+                                            expected[destination as usize] = combine(
+                                                combine(if i == 0 { a } else { !a }, b, first),
+                                                c,
+                                                second,
+                                            );
+                                        }
+                                    }
+                                }
+                                let result = nixe_gpu::evaluate_shader_ir(
+                                    &shader,
+                                    &nixe_gpu::ShaderEvaluationInputs::default(),
+                                    32,
+                                )
+                                .unwrap();
+                                for (i, value) in expected.iter().enumerate() {
+                                    assert_eq!(
+                                        result.output_bits(ShaderIoLocation::Color(0), i as u8),
+                                        Some(if *value { u32::MAX } else { 0 }),
+                                        "{word:016x} state={state} guard={guard:?}"
+                                    );
+                                }
+                                if state == 0
+                                    && invert == 0
+                                    && sources == [0, 1, 2]
+                                    && destinations == [0, 1]
+                                {
+                                    validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn psetp_captured_encoding_and_reserved_fields() {
+    let word = 0x5090_0380_e007_9007;
+    assert!(is_predicate_boolean(word));
+    assert!(matches!(
+        decode_predicate_boolean(STAGE, 0x18, word).unwrap(),
+        ShaderOperation::SetPredicateBoolean {
+            destinations: [Some(0), None],
+            inputs: [
+                ShaderPredicate::Register {
+                    register: 1,
+                    inverted: true
+                },
+                ShaderPredicate::Always,
+                ShaderPredicate::Always
+            ],
+            operations: [
+                ShaderPredicateSetOperation::And,
+                ShaderPredicateSetOperation::And
+            ],
+        }
+    ));
+    for field in [
+        1 << 6,
+        1 << 8,
+        1 << 20,
+        1 << 27,
+        1 << 33,
+        1 << 43,
+        1 << 47,
+        3 << 24,
+        3 << 45,
+    ] {
+        assert!(
+            decode_predicate_boolean(STAGE, 8, word | field).is_err(),
+            "{field:x}"
+        );
+    }
+    assert!(decode_predicate_boolean(STAGE, 8, word & !7).is_err());
+}
+
+#[test]
+fn psetp_vertex_program_reaches_verified_wgsl() {
+    let mut header = [0_u32; 20];
+    header[0] = 0x0006_0461;
+    header[13] = 0x0000_8000;
+    let translated = translated_fixture_with_register_count(
+        MaxwellShaderStage::Vertex,
+        header,
+        &[
+            0,
+            0x5b64_0380_0ff7_000f,
+            0x5090_0380_e007_9007,
+            0xe300_0000_0007_000f,
+        ],
+        4,
+    );
+    assert!(
+        translated
+            .ir()
+            .instructions()
+            .iter()
+            .any(|i| matches!(i.operation(), ShaderOperation::SetPredicateBoolean { .. }))
+    );
+    validate_wgsl(&lower_shader_ir_to_wgsl(&translated).unwrap());
+}
+
+#[test]
+fn r2p_selected_bytes_masks_preservation_and_predication() {
+    for byte in 0..4_u64 {
+        for mask in 0..128_u64 {
+            for bits in [
+                0_u32,
+                u32::MAX,
+                0x12345678,
+                0xa5a5a5a5,
+                0x01020408,
+                0x80402010,
+            ] {
+                for old in [0_u8, 0x7f, 0x55] {
+                    for inverted in [None, Some(false), Some(true)] {
+                        let word = 0x38f0_0000_0007_0000 | (mask << 20) | (byte << 41);
+                        let decoded =
+                            decode_register_to_predicate(STAGE, 0x238, word, 2, &mut 2).unwrap();
+                        let guard = inverted.map_or(ShaderPredicate::Always, |inverted| {
+                            ShaderPredicate::Register {
+                                register: 0,
+                                inverted,
+                            }
+                        });
+                        let mut ops = vec![(
+                            ShaderPredicate::Always,
+                            ShaderOperation::MoveImmediate32 {
+                                destination: ShaderRegister::new(0),
+                                bits,
+                                scalar_type: ShaderScalarType::Unsigned32,
+                            },
+                        )];
+                        for index in 0..7_u8 {
+                            ops.push((
+                                ShaderPredicate::Always,
+                                ShaderOperation::SetPredicateInteger32 {
+                                    destinations: [Some(index), None],
+                                    left: ShaderRegister::new(0),
+                                    right: ShaderRegister::new(0),
+                                    signed: false,
+                                    comparison: if old & (1 << index) != 0 {
+                                        ShaderIntegerComparison::True
+                                    } else {
+                                        ShaderIntegerComparison::False
+                                    },
+                                    accumulator: ShaderPredicate::Always,
+                                    set_operation: ShaderPredicateSetOperation::And,
+                                },
+                            ));
+                        }
+                        ops.extend(decoded.into_iter().map(|op| (guard, op)));
+                        for index in 0..7_u8 {
+                            ops.push((
+                                ShaderPredicate::Always,
+                                ShaderOperation::CompareInteger32 {
+                                    destination: ShaderRegister::new(1),
+                                    float_result: false,
+                                    left: ShaderRegister::new(0),
+                                    right: ShaderRegister::new(0),
+                                    signed: false,
+                                    comparison: ShaderIntegerComparison::True,
+                                    accumulator: ShaderPredicate::Register {
+                                        register: index,
+                                        inverted: false,
+                                    },
+                                    set_operation: ShaderPredicateSetOperation::And,
+                                },
+                            ));
+                            ops.push((
+                                ShaderPredicate::Always,
+                                ShaderOperation::StoreOutput {
+                                    sources: vec![ShaderRegister::new(1)].into(),
+                                    location: ShaderIoLocation::Color(index / 4),
+                                    first_component: index % 4,
+                                    scalar_type: ShaderScalarType::Unsigned32,
+                                },
+                            ));
+                        }
+                        ops.push((ShaderPredicate::Always, ShaderOperation::Exit));
+                        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+                            ShaderStage::Fragment,
+                            vec![],
+                            (0..7_u8)
+                                .map(|i| {
+                                    ShaderInterfaceElement::new(
+                                        ShaderIoLocation::Color(i / 4),
+                                        i % 4,
+                                        ShaderScalarType::Unsigned32,
+                                        None,
+                                    )
+                                    .unwrap()
+                                })
+                                .collect(),
+                            vec![],
+                            ops.into_iter()
+                                .enumerate()
+                                .map(|(i, (predicate, operation))| {
+                                    ShaderInstruction::new(
+                                        ShaderSourceLocation::new(i as u32 * 8),
+                                        predicate,
+                                        operation,
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        ))
+                        .unwrap();
+                        let enabled = inverted.is_none_or(|invert| (old & 1 != 0) ^ invert);
+                        let mask = if enabled { mask as u8 } else { 0 };
+                        let expected = (old & !mask) | (((bits >> (byte * 8)) as u8) & mask);
+                        let result = nixe_gpu::evaluate_shader_ir(
+                            &shader,
+                            &nixe_gpu::ShaderEvaluationInputs::default(),
+                            64,
+                        )
+                        .unwrap();
+                        for i in 0..7_u8 {
+                            assert_eq!(
+                                result.output_bits(ShaderIoLocation::Color(i / 4), i % 4),
+                                Some(if expected & (1 << i) != 0 {
+                                    u32::MAX
+                                } else {
+                                    0
+                                }),
+                                "{word:016x} bits={bits:08x} old={old:02x} guard={guard:?}"
+                            );
+                        }
+                        if mask == 127 && bits == 0 && old == 0 {
+                            validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn r2p_captured_zero_source_and_reserved_fields() {
+    let word = 0x38f0_0000_0037_0700;
+    assert!(is_register_to_predicate(word));
+    assert!(
+        matches!(decode_register_to_predicate(STAGE, 0x238, word, 8, &mut 8).unwrap().as_slice(), [ShaderOperation::SetPredicatesFromBits { source, first_bit: 0, write_mask: 3 }] if source.index() == 7)
+    );
+    assert!(matches!(
+        decode_register_to_predicate(STAGE, 8, word | 0xff00, 8, &mut 8)
+            .unwrap()
+            .as_slice(),
+        [
+            ShaderOperation::MoveImmediate32 { bits: 0, .. },
+            ShaderOperation::SetPredicatesFromBits { .. }
+        ]
+    ));
+    for bits in [1, 1 << 43, 1 << 47] {
+        assert!(decode_register_to_predicate(STAGE, 8, word | bits, 8, &mut 8).is_err());
+    }
+    assert!(decode_register_to_predicate(STAGE, 8, word | (1 << 40), 8, &mut 8).is_err());
+    // Higher immediate bits, including sign extension, cannot write PT or general registers.
+    assert!(matches!(
+        decode_register_to_predicate(STAGE, 8, word | (0x7ffff << 20) | (1 << 56), 8, &mut 8)
+            .unwrap()[0],
+        ShaderOperation::SetPredicatesFromBits {
+            write_mask: 127,
+            ..
+        }
+    ));
+    let mut header = [0; 20];
+    header[0] = 0x0006_0461;
+    header[13] = 0xf << 12;
+    let shader = translated_fixture_with_register_count(
+        MaxwellShaderStage::Vertex,
+        header,
+        &[0, word, 0xe300_0000_0007_000f],
+        8,
+    );
+    validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+}
+
+#[test]
+fn icmp_signed_unsigned_truth_tables_aliases_and_all_operand_forms() {
+    let compare = |value: u32, signed: bool, mode| {
+        let value = if signed {
+            i64::from(value as i32)
+        } else {
+            i64::from(value)
+        };
+        match mode {
+            0 => false,
+            1 => value < 0,
+            2 => value == 0,
+            3 => value <= 0,
+            4 => value > 0,
+            5 => value != 0,
+            6 => value >= 0,
+            7 => true,
+            _ => unreachable!(),
+        }
+    };
+    for (opcode, operand) in [
+        (0x5b40_u64, 1 << 20),
+        (0x3640, 0x7ffff << 20 | 1 << 56),
+        (0x4b40, 2 << 34 | 3 << 20),
+        (0x5340, 2 << 34 | 3 << 20),
+    ] {
+        for mode in 0..8_u64 {
+            for signed in [false, true] {
+                for tested in [0_u32, 1, u32::MAX, 0x80000000, 0x7fffffff] {
+                    for destination in [0_u8, 1, 2, 255] {
+                        let left = 0x7fc01234; // Preserve raw NaN payload bits, without float comparison.
+                        let right = if opcode == 0x5340 { tested } else { 0x81234567 };
+                        let third = if opcode == 0x5340 { 0x89abcdef } else { tested };
+                        let word = opcode << 48
+                            | (mode << 49)
+                            | (u64::from(signed) << 48)
+                            | (2 << 39)
+                            | operand
+                            | (7 << 16)
+                            | u64::from(destination);
+                        assert!(is_integer_compare(word));
+                        let mut decoded =
+                            decode_integer_compare(STAGE, 8, word, 4, &mut 4).unwrap();
+                        if destination != 0 && destination != 255 {
+                            decoded.operations.push(ShaderOperation::Move32 {
+                                destination: ShaderRegister::new(0),
+                                source: ShaderRegister::new(u16::from(destination)),
+                                scalar_type: ShaderScalarType::Unsigned32,
+                            });
+                        }
+                        let no = match opcode {
+                            0x3640 => u32::MAX,
+                            0x5340 => third,
+                            _ => right,
+                        };
+                        let expected = if destination == 255 || compare(tested, signed, mode) {
+                            left
+                        } else {
+                            no
+                        };
+                        assert_eq!(
+                            evaluate_integer_with_third(decoded, left, right, third),
+                            expected,
+                            "{word:016x} tested={tested:x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn icmp_captured_zero_source_reaches_gpu_selection() {
+    let word = 0x364d_0b00_0017_ff19;
+    let decoded = decode_integer_compare(STAGE, 0x508, word, 32, &mut 32).unwrap();
+    assert!(matches!(
+        &decoded.operations[decoded.operations.len() - 2],
+        ShaderOperation::CompareInteger32 {
+            signed: true,
+            comparison: ShaderIntegerComparison::GreaterOrEqual,
+            ..
+        }
+    ));
+    assert!(
+        matches!(decoded.operations.last().unwrap(), ShaderOperation::Select32 { destination, .. } if destination.index() == 25)
+    );
+    assert!(decode_integer_compare(STAGE, 8, word | (1 << 47), 32, &mut 32).is_err());
+    assert!(
+        decode_integer_compare(STAGE, 8, 0x5b40_0000_0017_0000 | (1 << 28), 32, &mut 32).is_err()
+    );
+    let mut header = [0; 20];
+    header[0] = 0x0006_0461;
+    header[13] = 0xf << 12;
+    let shader = translated_fixture_with_register_count(
+        MaxwellShaderStage::Vertex,
+        header,
+        &[0, word, 0xeff0_7f80_0707_ff19, 0xe300_0000_0007_000f],
+        32,
+    );
+    let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+    assert!(module.source().contains("= select(registers["));
+    validate_wgsl(&module);
+}
+
+#[test]
+fn iadd3_halves_negations_shifts_and_aliases_preserve_wrapping_sums() {
+    let half = |v: u32, h| match h {
+        0 => v,
+        1 => v & 65535,
+        2 => v >> 16,
+        _ => unreachable!(),
+    };
+    for ha in 0..3_u64 {
+        for hb in 0..3_u64 {
+            for hc in 0..3_u64 {
+                for shift in 0..3_u64 {
+                    for negations in 0..8_u64 {
+                        for values in [
+                            [0_u32; 3],
+                            [u32::MAX, u32::MAX, 0],
+                            [0x12345678, 0x89abcdef, 0x80000000],
+                            [1, 2, u32::MAX],
+                            [0xffff0000, 0xffff, 0x76543210],
+                        ] {
+                            for destination in [0_u8, 1, 2, 255] {
+                                let word = 0x5cc0_0000_0017_0000
+                                    | (2 << 39)
+                                    | (ha << 35)
+                                    | (hb << 33)
+                                    | (hc << 31)
+                                    | (shift << 37)
+                                    | ((negations & 1) << 51)
+                                    | (((negations >> 1) & 1) << 50)
+                                    | (((negations >> 2) & 1) << 49)
+                                    | u64::from(destination);
+                                let mut decoded =
+                                    decode_add_three(STAGE, 8, word, 4, &mut 4).unwrap();
+                                if destination != 0 && destination != 255 {
+                                    decoded.operations.push(ShaderOperation::Move32 {
+                                        destination: ShaderRegister::new(0),
+                                        source: ShaderRegister::new(u16::from(destination)),
+                                        scalar_type: ShaderScalarType::Unsigned32,
+                                    });
+                                }
+                                let parts = [ha, hb, hc]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, h)| {
+                                        let v = half(values[i], h);
+                                        if negations & (1 << i) != 0 {
+                                            v.wrapping_neg()
+                                        } else {
+                                            v
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                let sum = u64::from(parts[0]) + u64::from(parts[1]);
+                                let sum = match shift {
+                                    0 => sum as u32,
+                                    1 => (sum >> 16) as u32,
+                                    2 => (sum as u32) << 16,
+                                    _ => unreachable!(),
+                                };
+                                let expected = if destination == 255 {
+                                    values[0]
+                                } else {
+                                    sum.wrapping_add(parts[2])
+                                };
+                                assert_eq!(
+                                    evaluate_integer_with_third(
+                                        decoded, values[0], values[1], values[2]
+                                    ),
+                                    expected,
+                                    "{word:016x} values={values:x?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn iadd3_immediate_constant_zero_sources_and_captured_negated_sum() {
+    for (word, rhs) in [
+        (0x38c0_0100_0057_0000, 5_u32),
+        (0x39c0_0100_0057_0000, 0xfff80005),
+        (0x4cc0_0108_0037_0000, 77),
+    ] {
+        assert!(is_add_three(word));
+        let decoded = decode_add_three(STAGE, 8, word, 4, &mut 4).unwrap();
+        assert_eq!(
+            evaluate_integer_with_third(decoded, 17, if word >> 48 == 0x4cc0 { 77 } else { 0 }, 42),
+            17_u32.wrapping_add(rhs).wrapping_add(42)
+        );
+    }
+    let word = 0x5cc6_0c80_0227_ff18;
+    let decoded = decode_add_three(STAGE, 0x570, word, 40, &mut 40).unwrap();
+    assert!(matches!(
+        decoded.operations[0],
+        ShaderOperation::MoveImmediate32 { bits: 0, .. }
+    ));
+    for bits in [1 << 47, 1 << 48, 1 << 28, 3 << 35, 3 << 37] {
+        assert!(decode_add_three(STAGE, 8, word | bits, 40, &mut 40).is_err());
+    }
+    let mut header = [0; 20];
+    header[0] = 0x0006_0461;
+    header[13] = 0xf << 12;
+    let shader = translated_fixture_with_register_count(
+        MaxwellShaderStage::Vertex,
+        header,
+        &[0, word, 0xeff0_7f80_0707_ff18, 0xe300_0000_0007_000f],
+        40,
+    );
+    validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
 }

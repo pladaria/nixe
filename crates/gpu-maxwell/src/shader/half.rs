@@ -1,4 +1,7 @@
-//! Packed half multiply with explicit operand swizzles and result conversion.
+//! Packed half arithmetic with explicit operand swizzles and result conversion.
+mod fma;
+pub(super) use fma::{decode_half_fused_multiply_add, is_half_fused_multiply_add};
+
 use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::MaxwellShaderTranslationError;
 use super::float::{apply_float_source_modifiers, prepare_float_register_source};
@@ -9,12 +12,21 @@ use nixe_gpu::{
 
 pub(super) const fn is_half_multiply(encoding: u64) -> bool {
     encoding & 0xfff8_0000_0000_0000 == 0x5d08_0000_0000_0000
+        || encoding & 0xfe80_0000_0000_0000 == 0x7800_0000_0000_0000
+        || encoding & 0xfe80_0000_0000_0000 == 0x7880_0000_0000_0000
+        || encoding & 0xfe00_0000_0000_0000 == 0x2a00_0000_0000_0000
 }
 
 pub(super) const fn is_half_add(encoding: u64) -> bool {
     encoding & 0xfff8_0000_0000_0000 == 0x5d10_0000_0000_0000
         || encoding & 0xfe80_0000_0000_0000 == 0x7a00_0000_0000_0000
+        || encoding & 0xfe80_0000_0000_0000 == 0x7a80_0000_0000_0000
         || encoding & 0xfe00_0000_0000_0000 == 0x2c00_0000_0000_0000
+}
+
+pub(super) struct DecodedHalfBinary {
+    pub(super) operations: Vec<ShaderOperation>,
+    pub(super) constant_buffer_binding: Option<u8>,
 }
 
 pub(super) fn decode_half_add(
@@ -23,7 +35,7 @@ pub(super) fn decode_half_add(
     encoding: u64,
     register_count: u8,
     next_temporary: &mut u16,
-) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+) -> Result<DecodedHalfBinary, MaxwellShaderTranslationError> {
     decode_half_binary(
         stage,
         offset,
@@ -40,7 +52,7 @@ pub(super) fn decode_half_multiply(
     encoding: u64,
     register_count: u8,
     next_temporary: &mut u16,
-) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+) -> Result<DecodedHalfBinary, MaxwellShaderTranslationError> {
     decode_half_binary(
         stage,
         offset,
@@ -58,20 +70,43 @@ fn decode_half_binary(
     register_count: u8,
     next_temporary: &mut u16,
     add: bool,
-) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+) -> Result<DecodedHalfBinary, MaxwellShaderTranslationError> {
     // HMUL2 register encoding and float/half swizzle/result modes:
     // https://github.com/envytools/envytools/blob/master/envydis/gm107.c#L1133-L1162
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_multiply.cpp
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_helper.cpp
-    let immediate32 = add && encoding & 0xfe00_0000_0000_0000 == 0x2c00_0000_0000_0000;
-    let immediate = add && encoding & 0xfe80_0000_0000_0000 == 0x7a00_0000_0000_0000;
+    let immediate32 = encoding & 0xfe00_0000_0000_0000
+        == if add {
+            0x2c00_0000_0000_0000
+        } else {
+            0x2a00_0000_0000_0000
+        };
+    let immediate = encoding & 0xfe80_0000_0000_0000
+        == if add {
+            0x7a00_0000_0000_0000
+        } else {
+            0x7800_0000_0000_0000
+        };
+    let constant_buffer = encoding & 0xfe80_0000_0000_0000
+        == if add {
+            0x7a80_0000_0000_0000
+        } else {
+            0x7880_0000_0000_0000
+        };
     let precision = (encoding >> if immediate32 { 55 } else { 39 }) & if add { 1 } else { 3 };
-    if precision != 0 || encoding & (1 << if immediate || immediate32 { 52 } else { 32 }) != 0 {
+    let saturate = encoding
+        & (1 << if immediate || immediate32 || constant_buffer {
+            52
+        } else {
+            32
+        })
+        != 0;
+    if precision != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "half arithmetic FTZ/FMZ or saturation mode is not implemented",
+            detail: "half arithmetic FTZ/FMZ mode is not implemented",
         });
     }
     let raw_destination = encoding as u8;
@@ -89,7 +124,23 @@ fn decode_half_binary(
         next_temporary,
         &mut operations,
     )?;
-    let right = if immediate || immediate32 {
+    let constant_buffer_binding = constant_buffer.then_some(((encoding >> 34) & 0x1f) as u8);
+    let right = if let Some(binding) = constant_buffer_binding {
+        let destination = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "half constant buffer temporary overflow",
+            next_temporary,
+        )?;
+        operations.push(ShaderOperation::LoadConstantBuffer32 {
+            destination,
+            binding,
+            byte_offset: (((encoding >> 20) & 0x3fff) as u32) * 4,
+            scalar_type: ShaderScalarType::Float32,
+        });
+        destination
+    } else if immediate || immediate32 {
         let destination = allocate_shader_temporary(
             stage,
             offset,
@@ -154,43 +205,37 @@ fn decode_half_binary(
                     (encoding >> 47) & 3
                 },
                 !immediate32 && encoding & (1 << 44) != 0,
-                add && encoding & (1 << if immediate32 { 56 } else { 43 }) != 0,
+                (add || immediate || constant_buffer)
+                    && encoding & (1 << if immediate32 { 56 } else { 43 }) != 0,
             ),
             (
                 right,
-                if immediate || immediate32 {
+                if constant_buffer {
+                    1
+                } else if immediate || immediate32 {
                     0
                 } else {
                     (encoding >> 28) & 3
                 },
-                !immediate && !immediate32 && encoding & (1 << 30) != 0,
-                !immediate && !immediate32 && encoding & (1 << 31) != 0,
+                !immediate
+                    && !immediate32
+                    && encoding & (1 << if constant_buffer { 54 } else { 30 }) != 0,
+                !immediate
+                    && !immediate32
+                    && (add || !constant_buffer)
+                    && encoding & (1 << if constant_buffer { 56 } else { 31 }) != 0,
             ),
         ]
         .into_iter()
         .enumerate()
         {
-            let value = if swizzle == 1 {
-                source
-            } else {
-                let unpacked = temporary(next_temporary)?;
-                operations.push(ShaderOperation::UnpackHalf32 {
-                    destination: unpacked,
-                    source,
-                    high: match swizzle {
-                        0 => lane == 1,
-                        2 => false,
-                        3 => true,
-                        _ => unreachable!(),
-                    },
-                });
-                unpacked
-            };
-            operands[operand_index] = apply_float_source_modifiers(
+            operands[operand_index] = prepare_half_lane(
                 stage,
                 offset,
                 encoding,
-                value,
+                source,
+                swizzle,
+                lane,
                 absolute,
                 negate,
                 next_temporary,
@@ -204,7 +249,13 @@ fn decode_half_binary(
                 left: operands[0],
                 right: operands[1],
                 scalar_type: ShaderScalarType::Float32,
-                float_control: ShaderFloatControl::PRECISE,
+                float_control: ShaderFloatControl::new(
+                    nixe_gpu::ShaderRoundingMode::NearestEven,
+                    nixe_gpu::ShaderNanMode::Propagate,
+                    false,
+                    false,
+                    saturate,
+                ),
             }
         } else {
             ShaderOperation::Multiply32 {
@@ -212,7 +263,13 @@ fn decode_half_binary(
                 left: operands[0],
                 right: operands[1],
                 scalar_type: ShaderScalarType::Float32,
-                float_control: ShaderFloatControl::PRECISE,
+                float_control: ShaderFloatControl::new(
+                    nixe_gpu::ShaderRoundingMode::NearestEven,
+                    nixe_gpu::ShaderNanMode::Propagate,
+                    false,
+                    false,
+                    saturate,
+                ),
             }
         });
         let rounded = temporary(next_temporary)?;
@@ -224,6 +281,82 @@ fn decode_half_binary(
         });
         results[result_index] = rounded;
     }
+    merge_half_results(
+        stage,
+        offset,
+        encoding,
+        destination,
+        merge,
+        &results[..lanes.len()],
+        next_temporary,
+        &mut operations,
+    )?;
+    Ok(DecodedHalfBinary {
+        operations,
+        constant_buffer_binding,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_half_lane(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    source: ShaderRegister,
+    swizzle: u64,
+    lane: u8,
+    absolute: bool,
+    negate: bool,
+    next: &mut u16,
+    operations: &mut Vec<ShaderOperation>,
+) -> Result<ShaderRegister, MaxwellShaderTranslationError> {
+    let value = if swizzle == 1 {
+        source
+    } else {
+        let destination = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "half operand temporary overflow",
+            next,
+        )?;
+        operations.push(ShaderOperation::UnpackHalf32 {
+            destination,
+            source,
+            high: match swizzle {
+                0 => lane == 1,
+                2 => false,
+                3 => true,
+                _ => unreachable!(),
+            },
+        });
+        destination
+    };
+    apply_float_source_modifiers(
+        stage, offset, encoding, value, absolute, negate, next, operations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_half_results(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    destination: ShaderRegister,
+    merge: u64,
+    results: &[ShaderRegister],
+    next_temporary: &mut u16,
+    operations: &mut Vec<ShaderOperation>,
+) -> Result<(), MaxwellShaderTranslationError> {
+    let temporary = |next: &mut u16| {
+        allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "half merge temporary overflow",
+            next,
+        )
+    };
     if merge == 1 {
         operations.push(ShaderOperation::UnpackHalf32 {
             destination,
@@ -241,7 +374,7 @@ fn decode_half_binary(
         if merge == 0 || merge == 3 {
             operations.push(ShaderOperation::ShiftLeft32 {
                 destination: high,
-                value: results[lanes.len() - 1],
+                value: results[results.len() - 1],
                 amount: shift,
                 wrap: false,
             });
@@ -275,7 +408,7 @@ fn decode_half_binary(
             operation: ShaderBitwiseOperation::Or,
         });
     }
-    Ok(operations)
+    Ok(())
 }
 
 pub(super) const fn is_half_set_predicate(encoding: u64) -> bool {
@@ -470,6 +603,113 @@ mod tests {
         ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderIr, ShaderPredicate,
         ShaderSourceLocation, ShaderStage, VerifiedShaderIr,
     };
+
+    #[test]
+    fn constant_buffer_half_arithmetic_reads_f32_and_preserves_merged_lane() {
+        for (word, input, constant, expected, add) in [
+            (
+                0x7a85_0804_0027_ff00,
+                0x4000_0000,
+                1.25_f32,
+                0x4000_3d00,
+                true,
+            ),
+            (
+                0x78c5_1804_0027_0000,
+                0x4000_bc00,
+                -2.0_f32,
+                0x4000_c000,
+                false,
+            ),
+        ] {
+            let decode = if add {
+                decode_half_add
+            } else {
+                decode_half_multiply
+            };
+            let decoded = decode(MaxwellShaderStage::Pixel, 8, word, 4, &mut 4).unwrap();
+            assert_eq!(decoded.constant_buffer_binding, Some(1));
+            let mut ops = vec![ShaderOperation::MoveImmediate32 {
+                destination: ShaderRegister::new(0),
+                bits: input,
+                scalar_type: ShaderScalarType::Unsigned32,
+            }];
+            ops.extend(decoded.operations);
+            ops.push(ShaderOperation::StoreOutput {
+                sources: vec![ShaderRegister::new(0)].into(),
+                location: ShaderIoLocation::Color(0),
+                first_component: 0,
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
+            ops.push(ShaderOperation::Exit);
+            let ir = VerifiedShaderIr::verify(ShaderIr::new(
+                ShaderStage::Fragment,
+                vec![],
+                vec![
+                    ShaderInterfaceElement::new(
+                        ShaderIoLocation::Color(0),
+                        0,
+                        ShaderScalarType::Unsigned32,
+                        None,
+                    )
+                    .unwrap(),
+                ],
+                vec![
+                    nixe_gpu::ShaderResourceAccess::new(
+                        1,
+                        nixe_gpu::ShaderResourceKind::ConstantBuffer,
+                        true,
+                        false,
+                    )
+                    .unwrap(),
+                ],
+                ops.into_iter()
+                    .enumerate()
+                    .map(|(i, op)| {
+                        ShaderInstruction::new(
+                            ShaderSourceLocation::new(i as u32 * 8),
+                            ShaderPredicate::Always,
+                            op,
+                        )
+                    })
+                    .collect(),
+            ))
+            .unwrap();
+            let result = nixe_gpu::evaluate_shader_ir(
+                &ir,
+                &nixe_gpu::ShaderEvaluationInputs::default().with_constant_buffer_bits(
+                    1,
+                    8,
+                    constant.to_bits(),
+                ),
+                128,
+            )
+            .unwrap();
+            assert_eq!(
+                result.output_bits(ShaderIoLocation::Color(0), 0),
+                Some(expected)
+            );
+            super::super::test_support::validate_wgsl(
+                &nixe_gpu::lower_shader_ir_to_wgsl(&ir).unwrap(),
+            );
+
+            // The instruction translator must declare the consumed uniform binding.
+            let mut header = [0; 20];
+            header[0] = 0x0002_0461;
+            header[4] = 0x000f_f000;
+            header[6] = 0x0000_0077;
+            header[13] = 0x0007_f000;
+            let translated = super::super::test_support::translated_fixture(
+                MaxwellShaderStage::Vertex,
+                header,
+                &[0, word, 0xe300_0000_0007_000f],
+            );
+            assert_eq!(translated.ir().resources(), ir.ir().resources());
+            super::super::test_support::validate_wgsl(
+                &nixe_gpu::lower_shader_ir_to_wgsl(&translated).unwrap(),
+            );
+        }
+    }
     #[test]
     fn hmul2_float_output_retains_half_result_rounding_and_operand_aliasing() {
         let mut code = vec![
@@ -493,7 +733,8 @@ mod tests {
                 5,
                 &mut 5,
             )
-            .unwrap(),
+            .unwrap()
+            .operations,
         );
         code.push(ShaderOperation::StoreOutput {
             sources: vec![ShaderRegister::new(1)].into(),
@@ -546,5 +787,76 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn saturated_half_add_preserves_clamp_nan_infinity_and_half_rounding() {
+        // Captured compact-immediate HADD2.SAT.F32: 1.0 - R7, F32 output.
+        let word = 0x7a12883c0f070711;
+        for (input, expected) in [
+            (-2.0, 1.0),
+            (2.0, 0.0),
+            (0.25, 0.75),
+            (f32::NAN, 0.0),
+            (f32::INFINITY, 0.0),
+            (f32::NEG_INFINITY, 1.0),
+            (0.33333, f32::from_bits(0x3f2aa000)),
+        ] {
+            let mut ops = vec![ShaderOperation::MoveImmediate32 {
+                destination: ShaderRegister::new(7),
+                bits: input.to_bits(),
+                scalar_type: ShaderScalarType::Float32,
+            }];
+            ops.extend(
+                decode_half_add(MaxwellShaderStage::Pixel, 8, word, 32, &mut 32)
+                    .unwrap()
+                    .operations,
+            );
+            ops.push(ShaderOperation::StoreOutput {
+                sources: vec![ShaderRegister::new(17)].into_boxed_slice(),
+                location: ShaderIoLocation::Color(0),
+                first_component: 0,
+                scalar_type: ShaderScalarType::Float32,
+            });
+            ops.push(ShaderOperation::Exit);
+            let ir = VerifiedShaderIr::verify(ShaderIr::new(
+                ShaderStage::Fragment,
+                vec![],
+                vec![
+                    ShaderInterfaceElement::new(
+                        ShaderIoLocation::Color(0),
+                        0,
+                        ShaderScalarType::Float32,
+                        None,
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+                ops.into_iter()
+                    .enumerate()
+                    .map(|(i, op)| {
+                        ShaderInstruction::new(
+                            ShaderSourceLocation::new(i as u32 * 8),
+                            ShaderPredicate::Always,
+                            op,
+                        )
+                    })
+                    .collect(),
+            ))
+            .unwrap();
+            let result = nixe_gpu::evaluate_shader_ir(
+                &ir,
+                &nixe_gpu::ShaderEvaluationInputs::default(),
+                128,
+            )
+            .unwrap();
+            assert_eq!(
+                result.output_bits(ShaderIoLocation::Color(0), 0),
+                Some(expected.to_bits()),
+                "input={input}"
+            );
+            super::super::test_support::validate_wgsl(
+                &nixe_gpu::lower_shader_ir_to_wgsl(&ir).unwrap(),
+            );
+        }
     }
 }

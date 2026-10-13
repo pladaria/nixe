@@ -78,7 +78,7 @@ fn control_level_prefix_executes_only_for_invocation_zero() {
         source_cpu_writes: Box::new([]),
         source_mappings: Box::new([]),
     };
-    let translated = translate_shader_binary(&binary, 5, &BTreeMap::new()).unwrap();
+    let translated = translate_shader_binary(&binary, 5, &BTreeMap::new(), false).unwrap();
     let ir = finalize_shader_ir(translated.ir, binary.stage(), &BTreeMap::new(), &[]).unwrap();
     for invocation in 0..3 {
         let inputs = nixe_gpu::ShaderEvaluationInputs::default().with_interface_bits(
@@ -132,7 +132,7 @@ fn control_sph_and_patch_store_translate_without_wgsl() {
         source_cpu_writes: Box::new([]),
         source_mappings: Box::new([]),
     };
-    let translated = translate_shader_binary(&binary, 4, &BTreeMap::new()).unwrap();
+    let translated = translate_shader_binary(&binary, 4, &BTreeMap::new(), false).unwrap();
     let ir = finalize_shader_ir(translated.ir, binary.stage(), &BTreeMap::new(), &[]).unwrap();
     assert_eq!(ir.ir().tessellation_control_points(), Some(5));
     assert!(ir.ir().outputs().iter().any(|element| element.location()
@@ -187,6 +187,7 @@ fn direct_control_stores_use_invocation_index_not_input_patch_size() {
         0xf0c8_0000_0117_0002,
         4,
         &mut inputs,
+        false,
     )
     .unwrap();
     assert!(matches!(
@@ -203,7 +204,8 @@ fn direct_control_stores_use_invocation_index_not_input_patch_size() {
             24,
             0xf0c8_0000_01d7_0001,
             4,
-            &mut inputs
+            &mut inputs,
+            false,
         ),
         Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             instruction_offset: 24,
@@ -298,7 +300,10 @@ fn fragment_interpolation_links_per_component_only_to_final_producer() {
                     words[6] = 3 << 4;
                     words[13] = 3 << 24;
                 }
-                3 => words[6] = 0b1101 << 16, // FS generic 2.x constant, 2.y linear
+                3 => {
+                    words[6] = 0b1101 << 16;
+                    words[18] = 3;
+                } // FS generic 2.x constant, 2.y linear
                 _ => unreachable!(),
             }
             let header = decode_program_header(
@@ -314,7 +319,15 @@ fn fragment_interpolation_links_per_component_only_to_final_producer() {
                 bundles: vec![MaxwellShaderInstructionBundle {
                     offset: 0,
                     control: 0,
-                    instructions: [0xe300_0000_0007_000f; 3],
+                    instructions: if stage == MaxwellShaderStage::Pixel {
+                        [
+                            0xe003_ff8a_0ff7_ff00,
+                            0xe003_ff8a_4ff7_ff01,
+                            0xe300_0000_0007_000f,
+                        ]
+                    } else {
+                        [0xe300_0000_0007_000f; 3]
+                    },
                 }]
                 .into_boxed_slice(),
                 indirect_tables: Box::new([]),
@@ -326,6 +339,7 @@ fn fragment_interpolation_links_per_component_only_to_final_producer() {
                 register_count: 4,
                 effective_group: None,
                 texture_constant_buffer_slot: None,
+                y_negate: false,
                 vertex_input_types: Box::new([]),
                 binary,
             })
@@ -363,5 +377,52 @@ fn fragment_interpolation_links_per_component_only_to_final_producer() {
     assert_eq!(
         outputs[1].interpolation(),
         Some(ShaderInterpolation::ScreenLinear)
+    );
+}
+
+#[test]
+fn pixel_y_direction_returns_origin_sign_as_float_bits_without_a_stage_input() {
+    for (negate, value) in [(false, 1.0_f32), (true, -1.0_f32)] {
+        let mut inputs = vec![];
+        let op = decode_system_register(
+            MaxwellShaderStage::Pixel,
+            0x28,
+            0xf0c8000001270005,
+            6,
+            &mut inputs,
+            negate,
+        )
+        .unwrap();
+        assert_eq!(
+            op,
+            ShaderOperation::MoveImmediate32 {
+                destination: ShaderRegister::new(5),
+                bits: value.to_bits(),
+                scalar_type: ShaderScalarType::Unsigned32,
+            }
+        );
+        assert!(inputs.is_empty());
+    }
+    assert!(
+        decode_system_register(
+            MaxwellShaderStage::Vertex,
+            0x28,
+            0xf0c8000001270005,
+            6,
+            &mut vec![],
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        decode_system_register(
+            MaxwellShaderStage::Pixel,
+            0x28,
+            0xf0c8000001270005,
+            5,
+            &mut vec![],
+            false
+        )
+        .is_err()
     );
 }

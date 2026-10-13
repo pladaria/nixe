@@ -1,0 +1,14 @@
+# Nixe-owned example lists; these are not the firmware's official vocabulary.
+# Substring entries can also match inside otherwise acceptable words.
+# Each category contributes to the common substring filter (ac_common_not_b_nx).
+# The guest SDK still applies its own input normalization and validation policy.
+# Words are lowercase ASCII. Empty categories are allowed; unknown fields are errors.
+
+[categories.profanity]
+words = ["fuck", "shit", "crap"]
+
+[categories.insults]
+words = ["idiot", "fool", "moron"]
+
+[categories.spam]
+words = ["spam", "scam", "phish"]

@@ -9,6 +9,10 @@ performance-counters = ["nixe-gpu-maxwell/performance-counters"]
 
 [dependencies]
 nixe-audio.workspace = true
+nixe-applets.workspace = true
+flate2.workspace = true
+serde.workspace = true
+toml.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 log.workspace = true
@@ -26,7 +30,7 @@ nixe-video.workspace = true
 [dev-dependencies]
 sha2.workspace = true
 tempfile.workspace = true
-toml.workspace = true
+nixe-loader-content.workspace = true
 
 [build-dependencies]
 cc = "1"

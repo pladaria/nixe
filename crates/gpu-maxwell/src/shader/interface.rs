@@ -397,6 +397,14 @@ fn input_attribute_location(
     encoding: u64,
     address: u16,
 ) -> Result<(ShaderIoLocation, u8, ShaderScalarType, u8), MaxwellShaderTranslationError> {
+    if address == 0x3fc && stage == MaxwellShaderStage::Pixel {
+        return Ok((
+            ShaderIoLocation::FrontFacing,
+            0,
+            ShaderScalarType::Unsigned32,
+            1,
+        ));
+    }
     // Mesa's pinned Maxwell ABI identifies these adjacent scalar system-value
     // attributes explicitly:
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak_private.h#L81-L82
@@ -429,7 +437,8 @@ pub(super) fn decode_attribute_store(
     offset: u32,
     encoding: u64,
     register_count: u8,
-) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+    next_temporary: &mut u16,
+) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     if encoding & (1 << 31) != 0 {
         return Err(malformed(
             stage,
@@ -440,7 +449,41 @@ pub(super) fn decode_attribute_store(
     }
     let source = (encoding & 0xff) as u8;
     let components = (((encoding >> 47) & 0x3) + 1) as u8;
-    validate_register_range(stage, offset, encoding, source, components, register_count)?;
+    // AST reads RZ as zero, just like arithmetic source operands. A vector
+    // transfer may end at RZ, but cannot name registers beyond it.
+    // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/load_store_attribute.cpp
+    if u16::from(source) + u16::from(components) > 256 {
+        return Err(malformed(
+            stage,
+            offset,
+            encoding,
+            "AST source vector extends beyond RZ",
+        ));
+    }
+    let mut operations = Vec::with_capacity(2);
+    let mut sources = Vec::with_capacity(usize::from(components));
+    for component in 0..components {
+        let raw = source + component;
+        let register = if raw == 255 {
+            let destination = allocate_shader_temporary(
+                stage,
+                offset,
+                encoding,
+                "AST zero source temporary overflow",
+                next_temporary,
+            )?;
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination,
+                bits: 0,
+                scalar_type: ShaderScalarType::Float32,
+            });
+            destination
+        } else {
+            validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
+            ShaderRegister::new(u16::from(raw))
+        };
+        sources.push(register);
+    }
     if ((encoding >> 8) & 0xff) != 0xff || ((encoding >> 39) & 0xff) != 0xff {
         return Err(malformed(
             stage,
@@ -464,15 +507,13 @@ pub(super) fn decode_attribute_store(
             "AST crosses an attribute vector boundary",
         ));
     }
-    Ok(ShaderOperation::StoreOutput {
-        sources: (0..components)
-            .map(|component| ShaderRegister::new(u16::from(source + component)))
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+    operations.push(ShaderOperation::StoreOutput {
+        sources: sources.into_boxed_slice(),
         location,
         first_component,
         scalar_type: ShaderScalarType::Float32,
-    })
+    });
+    Ok(operations)
 }
 
 pub(super) fn decode_interpolate(
@@ -522,6 +563,31 @@ pub(super) fn decode_interpolate(
     let address = ((encoding >> 28) & 0x3ff) as u16;
     let (location, component) = attribute_location(stage, offset, encoding, address)?;
     let interpolation_mode = ((encoding >> 54) & 0x3) as u8;
+    if location == ShaderIoLocation::FrontFacing {
+        // IPA FrontFace is a primitive boolean mask, not a float ±1.
+        // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+        if !matches!(interpolation_mode, 0 | 2) {
+            return Err(malformed(
+                stage,
+                offset,
+                encoding,
+                "FrontFace IPA requires PASS or CONSTANT mode",
+            ));
+        }
+        if !inputs.iter().any(|input| input.location() == location) {
+            inputs.push(
+                ShaderInterfaceElement::new(location, 0, ShaderScalarType::Unsigned32, None)
+                    .unwrap(),
+            );
+        }
+        return Ok(vec![ShaderOperation::LoadInput {
+            destinations: vec![ShaderRegister::new(u16::from(destination))].into_boxed_slice(),
+            location,
+            first_component: 0,
+            scalar_type: ShaderScalarType::Unsigned32,
+        }]);
+    }
+
     let interpolation = inputs
         .iter()
         .find(|input| input.location() == location && input.component() == component)
@@ -750,6 +816,9 @@ pub(super) fn attribute_location(
     encoding: u64,
     address: u16,
 ) -> Result<(ShaderIoLocation, u8), MaxwellShaderTranslationError> {
+    if address == 0x3fc && stage == MaxwellShaderStage::Pixel {
+        return Ok((ShaderIoLocation::FrontFacing, 0));
+    }
     // Scalar point-size slot in the public Maxwell shader ABI.
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak_private.h#L48
     if address == 0x6c {

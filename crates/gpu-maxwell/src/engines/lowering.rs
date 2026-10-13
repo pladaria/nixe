@@ -1460,7 +1460,11 @@ impl MaxwellLoweringCache {
                             Some(ResourceUsage::StorageBuffer),
                         )
                     }
-                    ShaderResourceKind::SampledImage | ShaderResourceKind::SampledImage2DArray
+                    ShaderResourceKind::SampledImage
+                    | ShaderResourceKind::SampledImage2DArray
+                    | ShaderResourceKind::SampledImageCube
+                    | ShaderResourceKind::SampledDepthImage
+                    | ShaderResourceKind::SampledDepthImage2DArray
                         if resource.readable() && !resource.writable() =>
                     {
                         let texture = program
@@ -1481,10 +1485,15 @@ impl MaxwellLoweringCache {
                                     texture.constant_buffer_byte_offset(),
                                 ),
                                 dimension: match texture.image_kind() {
-                                    ShaderResourceKind::SampledImage => {
+                                    ShaderResourceKind::SampledImage
+                                    | ShaderResourceKind::SampledDepthImage => {
                                         MaxwellThreeDTextureDimension::Two
                                     }
-                                    ShaderResourceKind::SampledImage2DArray => {
+                                    ShaderResourceKind::SampledImageCube => {
+                                        MaxwellThreeDTextureDimension::Cube
+                                    }
+                                    ShaderResourceKind::SampledImage2DArray
+                                    | ShaderResourceKind::SampledDepthImage2DArray => {
                                         MaxwellThreeDTextureDimension::TwoArray
                                     }
                                     _ => {
@@ -1496,7 +1505,9 @@ impl MaxwellLoweringCache {
                             Some(ResourceUsage::SampledImage),
                         )
                     }
-                    ShaderResourceKind::Sampler if resource.readable() && !resource.writable() => {
+                    ShaderResourceKind::Sampler | ShaderResourceKind::ComparisonSampler
+                        if resource.readable() && !resource.writable() =>
+                    {
                         let texture = program
                             .texture_bindings()
                             .iter()
@@ -3021,15 +3032,7 @@ fn draw_stencil_test_state(
             ));
         }
     };
-    let face = |compare, mask, reference, ops: [R; 3]| {
-        // KEEP has no memory side effect, independently of the write mask.
-        // https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#fragops-stencil
-        if ops
-            .iter()
-            .any(|r| value(*r) != Some(&V::StencilOp(super::threed::MaxwellThreeDStencilOp::Keep)))
-        {
-            return Err(MaxwellLoweringError::UnsupportedStencilTestSemantics { two_sided });
-        }
+    let face = |compare, mask, write_mask, reference, ops: [R; 3]| {
         let Some(V::Compare(compare)) = value(compare) else {
             return Err(MaxwellLoweringError::IncompleteDraw("stencil compare"));
         };
@@ -3039,15 +3042,36 @@ fn draw_stencil_test_state(
         let Some(V::Mask(reference)) = value(reference) else {
             return Err(MaxwellLoweringError::IncompleteDraw("stencil reference"));
         };
-        Ok((
-            neutral_depth_compare(*compare),
-            *mask as u8,
-            *reference as u8,
-        ))
+        let operation = |r| match value(r) {
+            Some(V::StencilOp(op)) => Ok(neutral_stencil_operation(*op)),
+            _ => Err(MaxwellLoweringError::IncompleteDraw("stencil operation")),
+        };
+        let [fail, depth_fail, pass] = ops.map(operation);
+        let [fail, depth_fail, pass] = [fail?, depth_fail?, pass?];
+        let write_mask = match value(write_mask) {
+            Some(V::Mask(mask)) => *mask as u8,
+            _ if [fail, depth_fail, pass]
+                .iter()
+                .all(|op| *op == nixe_gpu::StencilOperation::Keep) =>
+            {
+                0
+            }
+            _ => return Err(MaxwellLoweringError::IncompleteDraw("stencil write mask")),
+        };
+        Ok(nixe_gpu::StencilFaceState {
+            compare: neutral_depth_compare(*compare),
+            read_mask: *mask as u8,
+            write_mask,
+            reference: *reference as u8,
+            fail,
+            depth_fail,
+            pass,
+        })
     };
     let front = face(
         R::FrontStencilCompare,
         R::FrontStencilCompareMask,
+        R::FrontStencilWriteMask,
         R::FrontStencilReference,
         [
             R::FrontStencilFail,
@@ -3059,6 +3083,7 @@ fn draw_stencil_test_state(
         face(
             R::BackStencilCompare,
             R::BackStencilCompareMask,
+            R::BackStencilWriteMask,
             R::BackStencilReference,
             [
                 R::BackStencilFail,
@@ -3069,22 +3094,24 @@ fn draw_stencil_test_state(
     } else {
         front
     };
-    let constant = |compare| {
-        matches!(
-            compare,
-            DepthCompareOperation::Always | DepthCompareOperation::Never
-        )
-    };
-    if !constant(front.0) && !constant(back.0) && (front.1 != back.1 || front.2 != back.2) {
-        return Err(MaxwellLoweringError::UnsupportedStencilTestSemantics { two_sided });
+    Ok(Some(nixe_gpu::StencilTestState { front, back }))
+}
+
+const fn neutral_stencil_operation(
+    op: super::threed::MaxwellThreeDStencilOp,
+) -> nixe_gpu::StencilOperation {
+    use super::threed::MaxwellThreeDStencilOp as M;
+    use nixe_gpu::StencilOperation as N;
+    match op {
+        M::Keep => N::Keep,
+        M::Zero => N::Zero,
+        M::Replace => N::Replace,
+        M::IncrementClamp => N::IncrementClamp,
+        M::DecrementClamp => N::DecrementClamp,
+        M::Invert => N::Invert,
+        M::IncrementWrap => N::IncrementWrap,
+        M::DecrementWrap => N::DecrementWrap,
     }
-    let parameters = if constant(front.0) { back } else { front };
-    Ok(Some(nixe_gpu::StencilTestState {
-        front_compare: front.0,
-        back_compare: back.0,
-        read_mask: parameters.1,
-        reference: parameters.2,
-    }))
 }
 
 const fn neutral_depth_compare(compare: MaxwellThreeDCompareOp) -> DepthCompareOperation {
@@ -4451,28 +4478,42 @@ fn lower_draw(
             continue;
         };
         let index = resource_index(resources, resource_use.role)?;
-        let target = match &resources.resources()[index] {
-            MaxwellThreeDResolvedResource::Buffer(buffer) => AccessTarget::Buffer {
-                buffer: buffer_dependency(binding_at(resources, bindings, index)?)?,
-                range: BufferRange::new(0, buffer.description().size()).map_err(|_| {
-                    MaxwellLoweringError::InvalidResolvedView {
-                        role: buffer.role(),
-                    }
-                })?,
-            },
-            MaxwellThreeDResolvedResource::Image(image) => AccessTarget::Image {
-                image: image_dependency(binding_at(resources, bindings, index)?)?,
-                subresources: image.view().bindings()[0].subresources(),
-            },
-        };
-        shader_accesses.push(ResourceAccess::new(
-            target,
+        let scope =
             AccessScope::new(resource_use.stages, AccessMode::Read, usage).map_err(|_| {
                 MaxwellLoweringError::InvalidShaderResourceUse {
                     role: resource_use.role,
                 }
-            })?,
-        ));
+            })?;
+        match &resources.resources()[index] {
+            MaxwellThreeDResolvedResource::Buffer(buffer) => {
+                let target = AccessTarget::Buffer {
+                    buffer: buffer_dependency(binding_at(resources, bindings, index)?)?,
+                    range: BufferRange::new(0, buffer.description().size()).map_err(|_| {
+                        MaxwellLoweringError::InvalidResolvedView {
+                            role: buffer.role(),
+                        }
+                    })?,
+                };
+                shader_accesses.push(ResourceAccess::new(target, scope));
+            }
+            MaxwellThreeDResolvedResource::Image(image) => {
+                // Sampling exposes the complete mip chain and array, not only
+                // the first canonical binding. Track all potentially selected levels.
+                let image_id = image_dependency(binding_at(resources, bindings, index)?)?;
+                for mip_level in 0..image.description().mip_levels() {
+                    let target = AccessTarget::Image {
+                        image: image_id,
+                        subresources: ImageSubresourceRange {
+                            plane: 0,
+                            mip_level,
+                            base_layer: 0,
+                            layer_count: image.description().array_layers(),
+                        },
+                    };
+                    shader_accesses.push(ResourceAccess::new(target, scope));
+                }
+            }
+        }
     }
     let mut draw = PreparedDraw::new(
         pipeline,
@@ -4492,6 +4533,7 @@ fn lower_draw(
     }
     draw.front_face = raster.front_face;
     draw.cull_mode = raster.cull_mode;
+    draw.depth_bias = raster.depth_bias;
     draw.scissor = Some(draw_scissor(state, resources, attachment_selection)?);
     draw.tessellation = tessellation;
     draw.color_outputs = attachment_selection.color_outputs;
@@ -4871,6 +4913,7 @@ fn neutral_vertex_format(
         Some((width, components))
     };
     let vertex = match (widths.raw(), numerical) {
+        (0x1d, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint8,
         (0x01, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32x4,
         (0x02, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32x3,
         (0x04, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32x2,
@@ -4904,6 +4947,7 @@ fn neutral_vertex_format(
         (0x30, MaxwellThreeDVertexNumericalType::UnsignedNormalized) => {
             VertexFormat::Unorm10_10_10_2
         }
+        (0x30, MaxwellThreeDVertexNumericalType::SignedNormalized) => VertexFormat::Snorm10_10_10_2,
         (_, MaxwellThreeDVertexNumericalType::UnsignedScaled) => {
             let (width, components) =
                 scaled_layout().ok_or(MaxwellLoweringError::UnsupportedVertexAttributeFormat {
@@ -4981,7 +5025,7 @@ fn reject_draw_aliases(
             };
             if (is_depth_sampling(first, second) || is_depth_sampling(second, first))
                 && !draw_depth_state(state)?.write_enabled
-                && draw_stencil_test_state(state).is_ok()
+                && draw_stencil_test_state(state)?.is_none_or(|stencil| !stencil.writes())
             {
                 // Both views only read: retain the same resident image. The
                 // backend must expose a read-only depth/stencil attachment.
@@ -5183,9 +5227,6 @@ pub enum MaxwellLoweringError {
     },
     UnsupportedWindowClipSemantics,
     UnsupportedClipIdTestSemantics,
-    UnsupportedStencilTestSemantics {
-        two_sided: bool,
-    },
     UnsupportedClearStencilMaskSemantics,
     UnsupportedAliasedLineWidthSemantics,
     UnsupportedLineStippleSemantics {
@@ -5472,10 +5513,7 @@ impl Display for MaxwellLoweringError {
             Self::UnsupportedClipIdTestSemantics => formatter.write_str(
                 "MAXWELL_B enabled clip-ID testing has no implemented extent, surface-ID, comparison, or backend rasterization semantics",
             ),
-            Self::UnsupportedStencilTestSemantics { two_sided } => write!(
-                formatter,
-                "MAXWELL_B stencil writes or distinct per-face masks/references need additional neutral support: two-sided={two_sided}"
-            ),
+
             Self::UnsupportedClearStencilMaskSemantics => formatter.write_str(
                 "MAXWELL_B partial stencil write mask on clear has no neutral backend representation",
             ),
@@ -6163,7 +6201,7 @@ mod tests {
     }
 
     #[test]
-    fn readonly_stencil_keeps_comparison_mask_and_reference_and_rejects_writes() {
+    fn stencil_preserves_independent_faces_masks_references_and_writes() {
         use crate::engines::tests::{program_three_d, three_d_channel};
         let mut channel = three_d_channel();
         for (method, argument) in [
@@ -6182,9 +6220,9 @@ mod tests {
         let stencil = super::draw_stencil_test_state(channel.three_d())
             .unwrap()
             .unwrap();
-        assert_eq!(stencil.front_compare, DepthCompareOperation::NotEqual);
-        assert_eq!(stencil.back_compare, DepthCompareOperation::NotEqual);
-        assert_eq!((stencil.read_mask, stencil.reference), (3, 2));
+        assert_eq!(stencil.front.compare, DepthCompareOperation::NotEqual);
+        assert_eq!(stencil.back.compare, DepthCompareOperation::NotEqual);
+        assert_eq!((stencil.front.read_mask, stencil.front.reference), (3, 2));
         for (method, argument) in [
             (0x1594, 1),
             (0x1598, 1),
@@ -6199,25 +6237,30 @@ mod tests {
         let stencil = super::draw_stencil_test_state(channel.three_d())
             .unwrap()
             .unwrap();
-        assert_eq!(stencil.back_compare, DepthCompareOperation::Always);
-        assert_eq!((stencil.read_mask, stencil.reference), (3, 2));
+        assert_eq!(stencil.back.compare, DepthCompareOperation::Always);
+        assert_eq!((stencil.front.read_mask, stencil.front.reference), (3, 2));
         program_three_d(&mut channel, 0x15a4, 6);
-        assert!(matches!(
-            super::draw_stencil_test_state(channel.three_d()),
-            Err(MaxwellLoweringError::UnsupportedStencilTestSemantics { two_sided: true })
-        ));
+        let stencil = super::draw_stencil_test_state(channel.three_d())
+            .unwrap()
+            .unwrap();
+        assert_eq!((stencil.back.read_mask, stencil.back.reference), (255, 17));
+        assert_eq!(stencil.back.compare, DepthCompareOperation::NotEqual);
         program_three_d(&mut channel, 0x1390, 8);
         let stencil = super::draw_stencil_test_state(channel.three_d())
             .unwrap()
             .unwrap();
-        assert_eq!((stencil.read_mask, stencil.reference), (255, 17));
+        assert_eq!((stencil.front.read_mask, stencil.front.reference), (3, 2));
+        assert_eq!((stencil.back.read_mask, stencil.back.reference), (255, 17));
         program_three_d(&mut channel, 0x1390, 6);
         program_three_d(&mut channel, 0x1594, 0);
         program_three_d(&mut channel, 0x138c, 3); // REPLACE is a real write.
-        assert!(matches!(
-            super::draw_stencil_test_state(channel.three_d()),
-            Err(MaxwellLoweringError::UnsupportedStencilTestSemantics { two_sided: false })
-        ));
+        let stencil = super::draw_stencil_test_state(channel.three_d())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stencil.front, stencil.back);
+        assert_eq!(stencil.front.pass, nixe_gpu::StencilOperation::Replace);
+        assert_eq!(stencil.front.write_mask, 2);
+        assert!(stencil.writes());
         program_three_d(&mut channel, 0x1380, 0);
         assert_eq!(
             super::draw_stencil_test_state(channel.three_d()).unwrap(),
@@ -6285,6 +6328,32 @@ mod tests {
         assert_eq!(neutral_vertex_format(1, color), Ok(VertexFormat::Float32x3));
         assert_eq!(position.offset(), 0);
         assert_eq!(color.offset(), 12);
+    }
+
+    #[test]
+    fn scalar_byte_vertex_attribute_preserves_unsigned_integer_storage() {
+        let format = MaxwellThreeDVertexAttributeFormat::parse((0x1d << 21) | (4 << 27)).unwrap();
+        assert_eq!(neutral_vertex_format(7, format), Ok(VertexFormat::Uint8));
+        assert_eq!(VertexFormat::Uint8.size(), 1);
+        assert_eq!(
+            VertexFormat::Uint8.integer_layout(),
+            Some((
+                false,
+                VertexComponentWidth::Bits8,
+                VertexComponentCount::One
+            ))
+        );
+    }
+
+    #[test]
+    fn packed_snorm_vertex_attribute_preserves_storage_and_signedness() {
+        let format = MaxwellThreeDVertexAttributeFormat::parse((0x30 << 21) | (1 << 27)).unwrap();
+        assert_eq!(
+            neutral_vertex_format(6, format),
+            Ok(VertexFormat::Snorm10_10_10_2)
+        );
+        assert_eq!(VertexFormat::Snorm10_10_10_2.size(), 4);
+        assert!(VertexFormat::Snorm10_10_10_2.requires_vertex_pulling());
     }
 
     #[test]

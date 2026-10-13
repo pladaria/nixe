@@ -169,6 +169,7 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             &input.binary,
             input.register_count,
             &vertex_input_types,
+            input.y_negate,
         )?);
     }
 
@@ -284,9 +285,12 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
 }
 
 /// Maxwell permits a fragment program to read a generic attribute that the
-/// preceding stage does not export. Specialize the disabled attribute before
+/// preceding stage does not export, including holes within a partially written
+/// vector. Specialize each disabled component before
 /// applying the neutral backend's stricter stage-interface contract.
-/// Eden uses (0, 0, 0, 1) for a disabled/unwritten generic attribute:
+/// Ryujinx initializes each consumed output component to (0, 0, 0, 1):
+/// https://git.axenov.dev/Museum/ryujinx/src/commit/17a1cab5d29787f3b41f40a69b530dae4e3cb25f/Ryujinx.Graphics.Shader/Translation/Translator.cs
+/// Eden likewise defaults disabled/unwritten generic attributes:
 /// https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp#L306-L315
 /// https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp#L1563-L1578
 fn specialize_unwritten_fragment_inputs(
@@ -314,11 +318,9 @@ fn specialize_unwritten_fragment_inputs(
         .filter(|input| {
             matches!(input.location(), ShaderIoLocation::Generic(_))
                 && input.scalar_type() == ShaderScalarType::Float32
-                && !producer
-                    .ir
-                    .outputs()
-                    .iter()
-                    .any(|output| output.location() == input.location())
+                && !producer.ir.outputs().iter().any(|output| {
+                    output.location() == input.location() && output.component() == input.component()
+                })
         })
         .map(|input| (input.location(), input.component()))
         .collect();
@@ -569,6 +571,13 @@ pub(super) fn finalize_shader_ir(
                     binding: remapped_binding(bindings, stage, *binding)?,
                     word_index: *word_index,
                 },
+                ShaderOperation::QueryTextureLevels {
+                    destination,
+                    image_binding,
+                } => ShaderOperation::QueryTextureLevels {
+                    destination: *destination,
+                    image_binding: remapped_binding(bindings, stage, *image_binding)?,
+                },
                 ShaderOperation::LoadTexture2D {
                     outputs,
                     coordinates,
@@ -580,20 +589,55 @@ pub(super) fn finalize_shader_ir(
                     image_binding: remapped_binding(bindings, stage, *image_binding)?,
                     mip_level: *mip_level,
                 },
+                ShaderOperation::SampleDepthCompare2D {
+                    offset,
+                    outputs,
+                    coordinates,
+                    array_index,
+                    reference,
+                    image_binding,
+                    sampler_binding,
+                    level_zero,
+                } => ShaderOperation::SampleDepthCompare2D {
+                    offset: *offset,
+                    outputs: outputs.clone(),
+                    coordinates: *coordinates,
+                    array_index: *array_index,
+                    reference: *reference,
+                    image_binding: remapped_binding(bindings, stage, *image_binding)?,
+                    sampler_binding: remapped_binding(bindings, stage, *sampler_binding)?,
+                    level_zero: *level_zero,
+                },
                 ShaderOperation::SampleTexture2D {
+                    offset,
                     outputs,
                     coordinates,
                     image_binding,
                     sampler_binding,
                     lod,
                 } => ShaderOperation::SampleTexture2D {
+                    offset: *offset,
                     outputs: outputs.clone(),
                     coordinates: *coordinates,
                     image_binding: remapped_binding(bindings, stage, *image_binding)?,
                     lod: *lod,
                     sampler_binding: remapped_binding(bindings, stage, *sampler_binding)?,
                 },
+                ShaderOperation::SampleTextureCube {
+                    outputs,
+                    coordinates,
+                    image_binding,
+                    sampler_binding,
+                    lod,
+                } => ShaderOperation::SampleTextureCube {
+                    outputs: outputs.clone(),
+                    coordinates: *coordinates,
+                    image_binding: remapped_binding(bindings, stage, *image_binding)?,
+                    sampler_binding: remapped_binding(bindings, stage, *sampler_binding)?,
+                    lod: *lod,
+                },
                 ShaderOperation::SampleTexture2DArray {
+                    offset,
                     outputs,
                     coordinates,
                     array_index,
@@ -601,6 +645,7 @@ pub(super) fn finalize_shader_ir(
                     sampler_binding,
                     lod,
                 } => ShaderOperation::SampleTexture2DArray {
+                    offset: *offset,
                     outputs: outputs.clone(),
                     coordinates: *coordinates,
                     array_index: *array_index,

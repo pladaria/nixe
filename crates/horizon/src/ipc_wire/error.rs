@@ -16,6 +16,7 @@ pub(crate) enum IpcWireError {
     AudioRenderer(Box<str>),
     InputBackend(Box<str>),
     SharedFont(Box<str>),
+    SystemArchive(Box<str>),
     ErrorApplet(Box<crate::ErrorAppletDiagnostic>),
     UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
@@ -83,6 +84,9 @@ impl std::fmt::Display for HorizonIpcFault {
             IpcWireError::InputBackend(reason) => {
                 write!(formatter, "controller output failed: {reason}")
             }
+            IpcWireError::SystemArchive(reason) => {
+                write!(formatter, "system archive generation failed: {reason}")
+            }
             IpcWireError::SharedFont(reason) => {
                 write!(formatter, "shared font loading failed: {reason}")
             }
@@ -114,6 +118,10 @@ impl std::fmt::Display for HorizonIpcFault {
 /// A Horizon service operation for which Nixe lacks faithful semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnsupportedServiceOperation {
+    DataStorage {
+        storage_id: u8,
+        data_id: u64,
+    },
     Connect {
         name: Box<[u8]>,
     },
@@ -138,6 +146,13 @@ pub enum UnsupportedServiceOperation {
 impl std::fmt::Display for UnsupportedServiceOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DataStorage {
+                storage_id,
+                data_id,
+            } => write!(
+                formatter,
+                "OpenDataStorageByDataId is not implemented for storage-id={storage_id} data-id={data_id:#018x}"
+            ),
             Self::Connect { name } => write!(
                 formatter,
                 "Horizon service is not implemented: name={:?}",

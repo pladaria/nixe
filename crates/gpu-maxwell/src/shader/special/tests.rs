@@ -276,3 +276,58 @@ fn adjacent_rro_mufu_pair_lowers_as_one_high_level_special_function() {
     assert!(module.source().contains("exp2"));
     validate_wgsl(&module);
 }
+
+#[test]
+fn saturated_mufu_preserves_modifiers_range_reduction_and_gpu_clamping() {
+    use nixe_gpu::*;
+    let captured = 0x5084_0000_0027_0000;
+    assert!(is_mufu(captured));
+    for opcode in [0, 1, 2, 3, 4, 5, 8] {
+        for modifier in [0, 1 << 46, 1 << 48, (1 << 46) | (1 << 48)] {
+            let word = (captured & !(15 << 20)) | (opcode << 20) | modifier;
+            assert!(is_mufu(word));
+            let ops = decode_mufu(MaxwellShaderStage::Pixel, 0x198, word, 4, &mut 4).unwrap();
+            let control = match ops.last().unwrap() {
+                ShaderOperation::SpecialFunction32 { float_control, .. }
+                | ShaderOperation::Reciprocal32 { float_control, .. }
+                | ShaderOperation::ReciprocalSqrt32 { float_control, .. } => *float_control,
+                _ => panic!("MUFU operation"),
+            };
+            assert!(control.saturate());
+            let mut header = [0; 20];
+            header[0] = 0x0002_5462;
+            header[18] = 1;
+            let shader = translated_fixture(
+                MaxwellShaderStage::Pixel,
+                header,
+                &[
+                    0,
+                    0x0100_0000_0007_f000 | (u64::from(4.0_f32.to_bits()) << 20),
+                    word,
+                    0xe300_0000_0007_000f,
+                ],
+            );
+            let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+            assert!(module.source().contains("= nixe_saturate("));
+            validate_wgsl(&module);
+        }
+    }
+    let mut header = [0; 20];
+    header[0] = 0x0002_5462;
+    header[18] = 1;
+    let rro = 0x5c90_0080_0007_0000;
+    let shader = translated_fixture(
+        MaxwellShaderStage::Pixel,
+        header,
+        &[
+            0,
+            0x0100_0000_0007_f000 | (u64::from(4.0_f32.to_bits()) << 20),
+            rro,
+            captured,
+            0,
+            0xe300_0000_0007_000f,
+        ],
+    );
+    assert!(shader.ir().instructions().iter().any(|i| matches!(i.operation(),ShaderOperation::SpecialFunction32 {function:ShaderSpecialFunction::Exp2,float_control,..} if float_control.saturate())));
+    validate_wgsl(&lower_shader_ir_to_wgsl(&shader).unwrap());
+}

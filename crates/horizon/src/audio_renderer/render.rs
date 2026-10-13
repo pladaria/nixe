@@ -137,7 +137,7 @@ impl RenderBuffers {
 
     fn mix_and_output(
         &mut self,
-        state: &RendererUpdateState,
+        state: &mut RendererUpdateState,
         params: &RendererParameters,
         pcm: &mut [i16],
         volume: f32,
@@ -151,6 +151,17 @@ impl RenderBuffers {
         for &(id, _) in &self.order {
             let mix = state.mixes[id].as_ref().unwrap();
             let count = word(mix.as_slice(), 8) as usize;
+            for &slot in &state.effect_order[id] {
+                if slot == usize::MAX {
+                    break;
+                }
+                state.effects[slot].process(
+                    &mut self.samples
+                        [self.offsets[id] * samples..(self.offsets[id] + count) * samples],
+                    samples,
+                    count,
+                )?;
+            }
             let volume = f32::from_bits(word(mix.as_slice(), 0));
             if id == 0 {
                 if volume != 1.0 {
@@ -294,6 +305,7 @@ mod tests {
                 mix[0x24 + 25 * 4..0x28 + 25 * 4].copy_from_slice(&0.5_f32.to_le_bytes());
             }
             state.mixes.push(Some(mix));
+            state.effect_order.push(Vec::new());
         }
         let mut sink = [0; 0x140];
         sink[0] = 1;
@@ -307,7 +319,7 @@ mod tests {
         let mut pcm = [0; 6];
         assert!(
             buffers
-                .mix_and_output(&state, &params, &mut pcm, 1.0)
+                .mix_and_output(&mut state, &params, &mut pcm, 1.0)
                 .unwrap()
         );
         assert_eq!(pcm, [3, 20000, -3, -20000, 32767, 1]);
@@ -315,7 +327,7 @@ mod tests {
         buffers.samples[6..].copy_from_slice(&[40000, -40000, 3, 6, -6, 65536]);
         assert!(
             buffers
-                .mix_and_output(&state, &params, &mut pcm, 0.5)
+                .mix_and_output(&mut state, &params, &mut pcm, 0.5)
                 .unwrap()
         );
         assert_eq!(pcm, [1, 10000, -1, -10000, 16383, 0]);
@@ -323,7 +335,7 @@ mod tests {
         buffers.samples[6..].copy_from_slice(&[40000, -40000, 3, 6, -6, 65536]);
         assert!(
             buffers
-                .mix_and_output(&state, &params, &mut pcm, 1.85)
+                .mix_and_output(&mut state, &params, &mut pcm, 1.85)
                 .unwrap()
         );
         assert_eq!(pcm, [5, 32767, -5, -32768, 32767, 1]);
@@ -331,6 +343,77 @@ mod tests {
         assert!(buffers.render(&mut state, &params, &mut pcm, 1.0).unwrap());
         assert_eq!(pcm, [0; 6]);
     }
+    #[test]
+    fn effect_runs_before_submix_routing_and_volume() {
+        use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+        let mut raw_params = [0; super::super::PARAMETER_SIZE];
+        for (offset, value) in [
+            (0, 48000_u32),
+            (4, 3),
+            (8, 6),
+            (12, 1),
+            (20, 1),
+            (24, 1),
+            (48, u32::from_le_bytes(*b"REV7")),
+        ] {
+            raw_params[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let params = RendererParameters::decode(&raw_params);
+        let mut state = RendererUpdateState::default();
+        for id in 0..2 {
+            let mut mix = Box::new([0; 0x930]);
+            mix[..4].copy_from_slice(&(if id == 0 { 1_f32 } else { 0.5 }).to_le_bytes());
+            mix[4..8].copy_from_slice(&48000_u32.to_le_bytes());
+            mix[8..12].copy_from_slice(&(if id == 0 { 2_u32 } else { 4 }).to_le_bytes());
+            if id == 1 {
+                mix[0x24 + 48 * 4..0x28 + 48 * 4].copy_from_slice(&1_f32.to_le_bytes());
+                mix[0x24 + 73 * 4..0x28 + 73 * 4].copy_from_slice(&1_f32.to_le_bytes());
+            }
+            state.mixes.push(Some(mix));
+        }
+        let mut sink = [0; 0x140];
+        sink[0] = 1;
+        sink[1] = 1;
+        sink[0x120..0x124].copy_from_slice(&2_u32.to_le_bytes());
+        sink[0x125] = 1;
+        state.sinks = vec![sink];
+        let memory = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let mut raw = [0; 0xc0];
+        raw[0] = 4;
+        raw[1] = 1;
+        raw[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        raw[8..16].copy_from_slice(&0x1000_u64.to_le_bytes());
+        raw[16..24].copy_from_slice(&4096_u64.to_le_bytes());
+        raw[0x21] = 1;
+        raw[0x26] = 2;
+        raw[0x27] = 3;
+        raw[0x2c..0x2e].copy_from_slice(&2_u16.to_le_bytes());
+        raw[0x2e..0x30].copy_from_slice(&2_u16.to_le_bytes());
+        let mut effect = super::super::effect::Effect::default();
+        effect
+            .update(
+                &raw,
+                0,
+                7,
+                48000,
+                &[],
+                true,
+                &|_, _| Ok(memory.backing_range(MemoryPermissions::READ_WRITE).unwrap()),
+                true,
+            )
+            .unwrap();
+        state.effects = vec![effect];
+        state.effect_order = vec![Vec::new(), vec![0]];
+        let mut buffers = RenderBuffers::new(&params);
+        buffers.prepare_mixes(&state, &params).unwrap();
+        buffers.samples[6..12].copy_from_slice(&[1000, -1000, 3, 6, -6, 100]);
+        let mut pcm = [0; 6];
+        buffers
+            .mix_and_output(&mut state, &params, &mut pcm, 1.0)
+            .unwrap();
+        assert_eq!(pcm, [500, 3, -500, -3, 1, 50]);
+    }
+
     #[test]
     fn fixed_point_gain_matches_reference_fractional_rounding_and_signs() {
         for precision in [15, 23] {

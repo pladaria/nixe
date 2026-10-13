@@ -370,6 +370,8 @@ pub struct HorizonSvcDispatcher {
     user_account_switch_locked: Option<bool>,
     save_data: Option<crate::SaveDataSystem>,
     shared_fonts: crate::SharedFontSession,
+    system_archives: crate::SystemArchives,
+    keyboard_host: Option<nixe_applets::keyboard::KeyboardHost>,
     diagnostics: crate::HorizonDiagnostics,
     video_system: crate::VideoSystem,
     hid_system: crate::HidSystem,
@@ -523,6 +525,8 @@ impl HorizonSvcDispatcher {
             user_account_switch_locked: None,
             save_data: None,
             shared_fonts: crate::SharedFontSession::default(),
+            system_archives: crate::SystemArchives::default(),
+            keyboard_host: None,
             diagnostics: crate::HorizonDiagnostics::default(),
             video_system,
             hid_system: crate::HidSystem::new(),
@@ -540,6 +544,12 @@ impl HorizonSvcDispatcher {
         }
     }
 
+    #[must_use]
+    pub fn with_keyboard_host(mut self, host: nixe_applets::keyboard::KeyboardHost) -> Self {
+        self.keyboard_host = Some(host);
+        self
+    }
+
     /// Sets the language selected from this application's control metadata.
     /// Without it, GetDesiredLanguage reports unsupported application metadata.
     #[must_use]
@@ -552,6 +562,13 @@ impl HorizonSvcDispatcher {
     #[must_use]
     pub fn with_user_account_switch_lock(mut self, locked: bool) -> Self {
         self.user_account_switch_locked = Some(locked);
+        self
+    }
+
+    /// Supplies host-generated resources for filesystem system-data requests.
+    #[must_use]
+    pub fn with_system_archives(mut self, archives: crate::SystemArchives) -> Self {
+        self.system_archives = archives;
         self
     }
 

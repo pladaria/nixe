@@ -140,6 +140,7 @@ fn native_direct_lines_cache_width_dynamically_and_do_not_require_wireframe() {
         wide_lines: true,
         rectangular_lines: false,
         smooth_lines: true,
+        depth_bias_clamp: true,
         line_width_range_bits: [1_f32.to_bits(), 16_f32.to_bits()],
     };
     raster::validate_line(b.draw.line_rasterization.unwrap(), caps).unwrap();
@@ -172,6 +173,7 @@ fn native_wireframe_consumes_features_and_width_limits_without_clamping() {
         wide_lines: true,
         rectangular_lines: true,
         smooth_lines: true,
+        depth_bias_clamp: true,
         line_width_range_bits: [1_f32.to_bits(), 8_f32.to_bits()],
     };
     let state = |width: f32, smooth| TriangleRasterization::Wireframe {
@@ -242,6 +244,7 @@ fn native_wireframe_consumes_features_and_width_limits_without_clamping() {
             rectangular_lines: false,
             smooth_lines: false,
             line_width_range_bits: [1_f32.to_bits(); 2],
+            depth_bias_clamp: false,
         },
     )
     .unwrap();

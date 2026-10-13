@@ -251,6 +251,7 @@ mod tests {
             mix[4..8].copy_from_slice(&48000_u32.to_le_bytes());
             mix[8..12].copy_from_slice(&2_u32.to_le_bytes());
             state.mixes = vec![Some(mix)];
+            state.effect_order = vec![Vec::new()];
             let mut sink = [0; 0x140];
             sink[0] = 1;
             sink[1] = 1;

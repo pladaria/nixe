@@ -43,7 +43,7 @@ pub(crate) fn translate_compute_program(
         },
         None,
     )?;
-    let translated = translate_shader_binary(&binary, register_count, &BTreeMap::new()).inspect_err(|_| {
+    let translated = translate_shader_binary(&binary, register_count, &BTreeMap::new(), false).inspect_err(|_| {
         for bundle in binary.bundles() {
             log::debug!("untranslated compute program: gpu-va={address:#x} offset={:#x} instructions={:016x?}", bundle.offset, bundle.instructions);
         }

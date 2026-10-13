@@ -4,8 +4,8 @@ use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use crate::MaxwellShaderStage;
 use nixe_gpu::{
-    ShaderBitwiseOperation, ShaderOperation, ShaderRegister, ShaderResourceKind, ShaderScalarType,
-    ShaderTextureSampleOutput,
+    ShaderBitwiseOperation, ShaderInstruction, ShaderOperation, ShaderPredicate, ShaderRegister,
+    ShaderResourceKind, ShaderScalarType, ShaderTextureSampleOutput,
 };
 use std::collections::BTreeMap;
 
@@ -85,6 +85,41 @@ pub(super) const fn is_texture_sample(encoding: u64) -> bool {
     encoding & 0xfc38_0000_0000_0000 == 0xc038_0000_0000_0000
 }
 
+pub(super) const fn is_texture_query(encoding: u64) -> bool {
+    encoding & 0xfff8_0000_0000_0000 == 0xdf48_0000_0000_0000
+}
+
+pub(super) struct DecodedTextureQuery {
+    pub(super) destination: ShaderRegister,
+    pub(super) descriptor: u16,
+}
+
+pub(super) fn decode_texture_query(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+) -> Result<DecodedTextureQuery, MaxwellShaderTranslationError> {
+    // TXQ.DIMENSION selects width/height/depth/mip count with the RGBA mask.
+    // Mip count is independent of the input LOD.
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/frontend/maxwell/translate/impl/texture_query.cpp
+    if (encoding >> 22) & 7 != 1 || (encoding >> 31) & 15 != 8 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "TXQ mode or dimension outputs other than mip count are not implemented",
+        });
+    }
+    let destination = encoding as u8;
+    validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
+    let descriptor = ((encoding >> 36) & 0x1fff) as u16;
+    Ok(DecodedTextureQuery {
+        destination: ShaderRegister::new(u16::from(destination)),
+        descriptor,
+    })
+}
+
 pub(super) fn decode_texture_sample(
     stage: MaxwellShaderStage,
     offset: u32,
@@ -92,6 +127,7 @@ pub(super) fn decode_texture_sample(
     register_count: u8,
     bindings: &mut BTreeMap<u16, MaxwellTextureResourceBinding>,
     next_temporary: &mut u16,
+    previous: &[ShaderInstruction],
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     // Full TEX uses consecutive coordinates and packs selected RGBA channels into
     // consecutive destinations, unlike TEXS's separate coordinates/destinations.
@@ -100,6 +136,7 @@ pub(super) fn decode_texture_sample(
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/frontend/maxwell/translate/impl/texture_fetch.cpp
     let texture_type = (encoding >> 28) & 7;
     let lod_mode = (encoding >> 55) & 7;
+    let depth_compare = encoding & (1 << 50) != 0;
     if stage != MaxwellShaderStage::Pixel || !matches!(texture_type, 2 | 3) {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
@@ -109,16 +146,37 @@ pub(super) fn decode_texture_sample(
         });
     }
     if !matches!(lod_mode, 0 | 1 | 3)
-        || encoding & ((1 << 35) | (1 << 50) | (1 << 54) | (1 << 58)) != 0
+        || (depth_compare && lod_mode == 3)
+        || encoding & ((1 << 35) | (1 << 58)) != 0
         || (encoding >> 51) & 7 != 7
     {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "TEX bias, offsets, depth comparison, sparse result, NDV or LOD clamp is not implemented",
+            detail: "TEX bias, nonzero comparison LOD, sparse result, NDV or LOD clamp is not implemented",
         });
     }
+    let texel_offset = if encoding & (1 << 54) != 0 {
+        let metadata = ((encoding >> 20) & 255) as u16 + u16::from(lod_mode == 3);
+        let bits = if metadata == 255 {
+            Some(0)
+        } else {
+            literal_register(previous, ShaderRegister::new(metadata))
+        };
+        let bits = bits.ok_or(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "TEX AOFFI operand is not a proven shader constant",
+        })?;
+        Some([
+            ((bits & 15) as i32) << 28 >> 28,
+            (((bits >> 4) & 15) as i32) << 28 >> 28,
+        ])
+    } else {
+        None
+    };
     // NODEP only changes the Maxwell scoreboard dependency, not sampled values;
     // the neutral IR already orders register dependencies and texture operations.
     let coordinate = ((encoding >> 8) & 0xff) as u8;
@@ -151,7 +209,7 @@ pub(super) fn decode_texture_sample(
     let mut operations = Vec::new();
     let lod = match lod_mode {
         0 => None,
-        1 => {
+        1 if !depth_compare => {
             let zero = allocate_shader_temporary(
                 stage,
                 offset,
@@ -166,6 +224,7 @@ pub(super) fn decode_texture_sample(
             });
             Some(zero)
         }
+        1 => None,
         3 => {
             let source = ((encoding >> 20) & 0xff) as u8;
             validate_register_range(stage, offset, encoding, source, 1, register_count)?;
@@ -173,10 +232,11 @@ pub(super) fn decode_texture_sample(
         }
         _ => unreachable!(),
     };
-    let image_kind = if texture_type == 3 {
-        ShaderResourceKind::SampledImage2DArray
-    } else {
-        ShaderResourceKind::SampledImage
+    let image_kind = match (texture_type == 3, depth_compare) {
+        (true, true) => ShaderResourceKind::SampledDepthImage2DArray,
+        (false, true) => ShaderResourceKind::SampledDepthImage,
+        (true, false) => ShaderResourceKind::SampledImage2DArray,
+        (false, false) => ShaderResourceKind::SampledImage,
     };
     let binding = texture_binding(
         stage,
@@ -199,8 +259,29 @@ pub(super) fn decode_texture_sample(
         })
         .collect();
     let sampler_binding = binding.sampler_binding.expect("TEX reserves a sampler");
-    operations.push(if texture_type == 3 {
+    operations.push(if depth_compare {
+        // Explicit LZ does not consume a metadata GPR; implicit comparison uses
+        // meta_reg directly as depth reference. Nonzero comparison LOD is rejected.
+        // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/texture_fetch.cpp
+        let reference = ((encoding >> 20) & 255) as u8;
+        let reference = reference
+            .checked_add(u8::from(texel_offset.is_some()))
+            .ok_or_else(|| malformed(stage, offset, encoding, "TEX metadata extends beyond RZ"))?;
+        validate_register_range(stage, offset, encoding, reference, 1, register_count)?;
+        let base = u16::from(coordinate) + u16::from(texture_type == 3);
+        ShaderOperation::SampleDepthCompare2D {
+            offset: texel_offset,
+            outputs,
+            coordinates: [ShaderRegister::new(base), ShaderRegister::new(base + 1)],
+            array_index: (texture_type == 3).then_some(ShaderRegister::new(u16::from(coordinate))),
+            reference: ShaderRegister::new(u16::from(reference)),
+            image_binding: binding.image_binding,
+            sampler_binding,
+            level_zero: lod_mode == 1,
+        }
+    } else if texture_type == 3 {
         ShaderOperation::SampleTexture2DArray {
+            offset: texel_offset,
             outputs,
             coordinates: [
                 ShaderRegister::new(u16::from(coordinate) + 1),
@@ -213,6 +294,7 @@ pub(super) fn decode_texture_sample(
         }
     } else {
         ShaderOperation::SampleTexture2D {
+            offset: texel_offset,
             outputs,
             coordinates: [
                 ShaderRegister::new(u16::from(coordinate)),
@@ -258,12 +340,14 @@ pub(super) fn decode_texture_access_simplified(
             detail: "TLDS mode other than F32 2D level-zero without offsets",
         });
     }
-    if !fetch && (stage != MaxwellShaderStage::Pixel || !matches!(selector, 1 | 2 | 7 | 8)) {
+    if !fetch
+        && (stage != MaxwellShaderStage::Pixel || !matches!(selector, 1 | 2 | 3 | 7 | 8 | 12 | 13))
+    {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "TEXS mode other than fragment 2D/2D-array implicit or level-zero LOD",
+            detail: "TEXS dimensionality or sampling mode is not implemented",
         });
     }
     let primary_destination = (encoding & 0xff) as u8;
@@ -284,11 +368,26 @@ pub(super) fn decode_texture_access_simplified(
                 stage,
                 offset,
                 encoding,
-                "TEXS 2D-array packed layer/first-coordinate register is misaligned",
+                "TEXS packed coordinate register is misaligned",
             ));
         }
         validate_register_range(stage, offset, encoding, x_coordinate, 2, register_count)?;
-        validate_register_range(stage, offset, encoding, y_coordinate, 1, register_count)?;
+        if selector == 13 && !y_coordinate.is_multiple_of(2) {
+            return Err(malformed(
+                stage,
+                offset,
+                encoding,
+                "TEXS cube direction/LOD register pair is misaligned",
+            ));
+        }
+        validate_register_range(
+            stage,
+            offset,
+            encoding,
+            y_coordinate,
+            if selector == 13 { 2 } else { 1 },
+            register_count,
+        )?;
     }
 
     let channel_selector = ((encoding >> 50) & 0x7) as usize;
@@ -346,10 +445,12 @@ pub(super) fn decode_texture_access_simplified(
         )?;
     }
 
-    let image_kind = if fetch || matches!(selector, 1 | 2) {
-        ShaderResourceKind::SampledImage
-    } else {
+    let image_kind = if matches!(selector, 12 | 13) {
+        ShaderResourceKind::SampledImageCube
+    } else if matches!(selector, 7 | 8) {
         ShaderResourceKind::SampledImage2DArray
+    } else {
+        ShaderResourceKind::SampledImage
     };
     let binding = texture_binding(
         stage,
@@ -402,6 +503,10 @@ pub(super) fn decode_texture_access_simplified(
             scalar_type: ShaderScalarType::Float32,
         });
         Some(destination)
+    } else if !fetch && matches!(selector, 3 | 13) {
+        Some(ShaderRegister::new(
+            u16::from(y_coordinate) + u16::from(selector == 13),
+        ))
     } else {
         None
     };
@@ -415,12 +520,29 @@ pub(super) fn decode_texture_access_simplified(
             image_binding: binding.image_binding,
             mip_level: 0,
         }
-    } else if matches!(selector, 1 | 2) {
-        ShaderOperation::SampleTexture2D {
+    } else if matches!(selector, 12 | 13) {
+        ShaderOperation::SampleTextureCube {
             outputs,
             coordinates: [
                 ShaderRegister::new(u16::from(x_coordinate)),
+                ShaderRegister::new(u16::from(x_coordinate) + 1),
                 ShaderRegister::new(u16::from(y_coordinate)),
+            ],
+            image_binding: binding.image_binding,
+            lod,
+            sampler_binding: binding.sampler_binding.expect("TEXS reserves a sampler"),
+        }
+    } else if matches!(selector, 1..=3) {
+        ShaderOperation::SampleTexture2D {
+            offset: None,
+            outputs,
+            coordinates: [
+                ShaderRegister::new(u16::from(x_coordinate)),
+                ShaderRegister::new(if selector == 3 {
+                    u16::from(x_coordinate) + 1
+                } else {
+                    u16::from(y_coordinate)
+                }),
             ],
             image_binding: binding.image_binding,
             lod,
@@ -428,6 +550,7 @@ pub(super) fn decode_texture_access_simplified(
         }
     } else {
         ShaderOperation::SampleTexture2DArray {
+            offset: None,
             outputs,
             coordinates: [
                 ShaderRegister::new(u16::from(x_coordinate + 1)),
@@ -503,3 +626,52 @@ pub(super) fn decode_texture_access_simplified(
 
 #[cfg(test)]
 mod tests;
+
+/// AOFFI texel offsets are often shader literals. Stop at control-flow or a
+/// conditional redefinition; never freeze a uniform or an invocation input.
+fn literal_register(
+    mut instructions: &[ShaderInstruction],
+    mut register: ShaderRegister,
+) -> Option<u32> {
+    if instructions.iter().any(|instruction| {
+        instruction.predicate() != ShaderPredicate::Never
+            && matches!(
+                instruction.operation(),
+                ShaderOperation::Branch { .. } | ShaderOperation::BranchTable { .. }
+            )
+    }) {
+        return None;
+    }
+    loop {
+        let mut copied = None;
+        for (index, instruction) in instructions.iter().enumerate().rev() {
+            if instruction.predicate() == ShaderPredicate::Never {
+                continue;
+            }
+            if matches!(instruction.operation(), ShaderOperation::Exit) {
+                return None;
+            }
+            let mut writes = false;
+            instruction
+                .operation()
+                .visit_destination_registers(|destination| writes |= destination == register);
+            if !writes {
+                continue;
+            }
+            if instruction.predicate() != ShaderPredicate::Always {
+                return None;
+            }
+            match instruction.operation() {
+                ShaderOperation::MoveImmediate32 { bits, .. } => return Some(*bits),
+                ShaderOperation::Move32 { source, .. } => {
+                    copied = Some((index, *source));
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        let (index, source) = copied?;
+        instructions = &instructions[..index];
+        register = source;
+    }
+}

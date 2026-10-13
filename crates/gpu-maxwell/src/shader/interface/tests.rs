@@ -1,6 +1,56 @@
 use super::super::error::MaxwellShaderTranslationError;
 use super::super::test_support::{translated_fixture, validate_wgsl};
 use super::*;
+
+#[test]
+fn fragment_header_only_components_do_not_require_vertex_exports() {
+    let mut header = [0; 20];
+    header[0] = 0x00025462;
+    header[12] = 0xaa;
+    header[18] = 1;
+    let ipa = (0xe0c3_ff88_0077_ff00 & !(0x3ff << 28)) | (0x200 << 28);
+    let fragment = super::super::test_support::translated_fixture(
+        MaxwellShaderStage::Pixel,
+        header,
+        &[0, ipa, 0xe30000000007000f, 0],
+    );
+    assert_eq!(fragment.ir().inputs().len(), 1);
+    assert_eq!(
+        fragment.ir().inputs()[0].location(),
+        ShaderIoLocation::Generic(24)
+    );
+    assert_eq!(fragment.ir().inputs()[0].component(), 0);
+    let producer = nixe_gpu::ShaderIr::new(
+        ShaderStage::Vertex,
+        vec![],
+        (0..3)
+            .map(|component| {
+                ShaderInterfaceElement::new(
+                    ShaderIoLocation::Generic(24),
+                    component,
+                    ShaderScalarType::Float32,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect(),
+        vec![],
+        vec![],
+    );
+    nixe_gpu::validate_shader_stage_link(&producer, fragment.ir()).unwrap();
+    super::super::test_support::validate_wgsl(
+        &nixe_gpu::lower_shader_ir_to_wgsl(&fragment).unwrap(),
+    );
+    header[18] = 3;
+    let reads_w = super::super::test_support::translated_fixture(
+        MaxwellShaderStage::Pixel,
+        header,
+        &[0, ipa, ipa | (12 << 28) | 1, 0xe30000000007000f],
+    );
+    let error = nixe_gpu::validate_shader_stage_link(&producer, reads_w.ir()).unwrap_err();
+    assert_eq!(error.location, ShaderIoLocation::Generic(24));
+    assert_eq!(error.component, 3);
+}
 use crate::MaxwellShaderStage;
 use nixe_gpu::{
     ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderOperation, ShaderRegister,
@@ -405,10 +455,16 @@ fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodele
 
 #[test]
 fn vertex_ast_point_size_preserves_scalar_value_and_rejects_vector_stores() {
-    let operation =
-        decode_attribute_store(MaxwellShaderStage::Vertex, 8, 0xeff0_7f80_06c7_ff00, 4).unwrap();
+    let operation = decode_attribute_store(
+        MaxwellShaderStage::Vertex,
+        8,
+        0xeff0_7f80_06c7_ff00,
+        4,
+        &mut 4,
+    )
+    .unwrap();
     assert!(
-        matches!(operation, ShaderOperation::StoreOutput { ref sources,
+        matches!(operation[0], ShaderOperation::StoreOutput { ref sources,
         location: ShaderIoLocation::PointSize, first_component: 0, .. } if sources.len() == 1)
     );
     let mut header = [0; 20];
@@ -432,6 +488,117 @@ fn vertex_ast_point_size_preserves_scalar_value_and_rejects_vector_stores() {
         Some(2.5_f32.to_bits())
     );
     assert!(
-        decode_attribute_store(MaxwellShaderStage::Vertex, 8, 0xeff0_ff80_06c7_ff00, 4).is_err()
+        decode_attribute_store(
+            MaxwellShaderStage::Vertex,
+            8,
+            0xeff0_ff80_06c7_ff00,
+            4,
+            &mut 4
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn ipa_front_face_reads_full_boolean_mask_and_declares_the_builtin() {
+    use super::super::test_support::{translated_fixture_with_register_count, validate_wgsl};
+    let captured = 0xe083ffbfcff7ff19;
+    let mut inputs = vec![];
+    let operations = decode_interpolate(
+        MaxwellShaderStage::Pixel,
+        0x2f8,
+        captured,
+        32,
+        &mut inputs,
+        &mut 64,
+        false,
+    )
+    .unwrap();
+    assert!(
+        matches!(&operations[0],ShaderOperation::LoadInput {location:ShaderIoLocation::FrontFacing,scalar_type:ShaderScalarType::Unsigned32,destinations,..} if destinations[0].index()==25)
+    );
+    assert_eq!(inputs[0].interpolation(), None);
+    let mut header = [0; 20];
+    header[0] = 0x00025462;
+    header[18] = 1;
+    let ir = translated_fixture_with_register_count(
+        MaxwellShaderStage::Pixel,
+        header,
+        &[0, captured & !255, 0xe30000000007000f, 0],
+        32,
+    );
+    let module = nixe_gpu::lower_shader_ir_to_wgsl(&ir).unwrap();
+    validate_wgsl(&module);
+    assert!(
+        module.source().contains("@builtin(front_facing)")
+            && module
+                .source()
+                .contains("select(0u, 0xffffffffu, input.front_facing)")
+    );
+    for mask in [0, u32::MAX] {
+        let result = nixe_gpu::evaluate_shader_ir(
+            &ir,
+            &nixe_gpu::ShaderEvaluationInputs::default().with_interface_bits(
+                ShaderIoLocation::FrontFacing,
+                0,
+                mask,
+            ),
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Color(0), 0),
+            Some(mask)
+        );
+    }
+}
+
+#[test]
+fn ast_zero_source_preserves_real_outputs_and_validates_registers() {
+    let captured = 0xeff0_7f80_0701_ffff;
+    let operations =
+        decode_attribute_store(MaxwellShaderStage::Vertex, 0x28, captured, 4, &mut 4).unwrap();
+    assert!(
+        matches!(operations.as_slice(), [ShaderOperation::MoveImmediate32 { destination, bits: 0, .. }, ShaderOperation::StoreOutput { sources, location: ShaderIoLocation::Position, first_component: 0, .. }] if sources.as_ref() == [*destination])
+    );
+    assert!(
+        decode_attribute_store(
+            MaxwellShaderStage::Vertex,
+            8,
+            captured | (1 << 47),
+            4,
+            &mut 4
+        )
+        .is_err()
+    );
+    assert!(
+        decode_attribute_store(
+            MaxwellShaderStage::Vertex,
+            8,
+            (captured & !255) | 4,
+            4,
+            &mut 4
+        )
+        .is_err()
+    );
+    let mut header = [0; 20];
+    header[0] = 0x0006_0461;
+    header[13] = 0xf << 12;
+    let shader = translated_fixture(
+        MaxwellShaderStage::Vertex,
+        header,
+        &[0, captured | (7 << 16), 0xe300_0000_0007_000f],
+    );
+    let result =
+        nixe_gpu::evaluate_shader_ir(&shader, &nixe_gpu::ShaderEvaluationInputs::default(), 32)
+            .unwrap();
+    assert_eq!(result.output_bits(ShaderIoLocation::Position, 0), Some(0));
+    let module = nixe_gpu::lower_shader_ir_to_wgsl(&shader).unwrap();
+    super::super::test_support::validate_wgsl(&module);
+    let ending_rz = (captured & !255) | 254 | (1 << 47);
+    let operations =
+        decode_attribute_store(MaxwellShaderStage::Vertex, 8, ending_rz, 255, &mut 255).unwrap();
+    assert!(
+        matches!(&operations[1], ShaderOperation::StoreOutput { sources, .. } if sources[0].index() == 254 && sources[1].index() == 255)
     );
 }

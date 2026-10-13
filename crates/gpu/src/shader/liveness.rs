@@ -46,7 +46,9 @@ pub(super) fn live_instructions(
                     .unwrap_or(false);
             });
         let predicate_definitions = match &instruction.operation {
-            ShaderOperation::SetPredicateInteger32 { destinations, .. } => destinations
+            ShaderOperation::SetPredicatesFromBits { write_mask, .. } => *write_mask,
+            ShaderOperation::SetPredicateBoolean { destinations, .. }
+            | ShaderOperation::SetPredicateInteger32 { destinations, .. } => destinations
                 .iter()
                 .flatten()
                 .fold(0, |mask, p| mask | (1 << p)),
@@ -63,15 +65,19 @@ pub(super) fn live_instructions(
             | ShaderOperation::PatchBarrier
             | ShaderOperation::Discard
             | ShaderOperation::Exit => true,
-            ShaderOperation::Undefined32 { .. }
+            ShaderOperation::FloatQuadSwizzleAdd32 { .. }
+            | ShaderOperation::QuadShuffle32 { .. }
+            | ShaderOperation::Undefined32 { .. }
             | ShaderOperation::LoadComputeBuiltin32 { .. }
             | ShaderOperation::LoadStorageBuffer32 { .. }
             | ShaderOperation::MoveImmediate32 { .. }
             | ShaderOperation::Move32 { .. }
+            | ShaderOperation::Select32 { .. }
             | ShaderOperation::FloatAbsolute32 { .. }
             | ShaderOperation::FloatNegate32 { .. }
             | ShaderOperation::UnpackHalf32 { .. }
             | ShaderOperation::PackHalf32 { .. }
+            | ShaderOperation::QueryTextureLevels { .. }
             | ShaderOperation::ConvertIntegerToFloat32 { .. }
             | ShaderOperation::RoundFloat32ToIntegral { .. }
             | ShaderOperation::ConvertFloat32ToInteger { .. }
@@ -90,17 +96,22 @@ pub(super) fn live_instructions(
             | ShaderOperation::CompareFloat32 { .. }
             | ShaderOperation::FloatMinMax32 { .. }
             | ShaderOperation::FusedMultiplyAdd32 { .. }
+            | ShaderOperation::FusedMultiplyAddHalf32 { .. }
             | ShaderOperation::Reciprocal32 { .. }
             | ShaderOperation::ReciprocalSqrt32 { .. }
             | ShaderOperation::SpecialFunction32 { .. }
             | ShaderOperation::SetPredicateFloat32 { .. }
             | ShaderOperation::SetPredicateInteger32 { .. }
+            | ShaderOperation::SetPredicateBoolean { .. }
+            | ShaderOperation::SetPredicatesFromBits { .. }
             | ShaderOperation::InterpolateInput { .. }
             | ShaderOperation::LoadConstantBuffer32 { .. }
             | ShaderOperation::LoadConstantBufferIndexed32 { .. }
+            | ShaderOperation::SampleDepthCompare2D { .. }
             | ShaderOperation::SampleTexture2D { .. }
             | ShaderOperation::LoadTexture2D { .. }
-            | ShaderOperation::SampleTexture2DArray { .. } => false,
+            | ShaderOperation::SampleTexture2DArray { .. }
+            | ShaderOperation::SampleTextureCube { .. } => false,
             ShaderOperation::Branch { .. } | ShaderOperation::BranchTable { .. } => {
                 unreachable!("branches rejected before liveness")
             }
@@ -133,6 +144,11 @@ pub(super) fn live_instructions(
         };
         use_predicate(instruction.predicate);
         match instruction.operation {
+            ShaderOperation::SetPredicateBoolean { inputs, .. } => {
+                for input in inputs {
+                    use_predicate(input);
+                }
+            }
             ShaderOperation::SetPredicateInteger32 { accumulator, .. }
             | ShaderOperation::CompareInteger32 { accumulator, .. }
             | ShaderOperation::CompareFloat32 { accumulator, .. }

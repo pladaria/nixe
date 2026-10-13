@@ -5,53 +5,7 @@
 use super::update::{MemoryPool, UpdateError, wide, word};
 use nixe_memory::{CanonicalBackingRange, CanonicalRangeTranslationError};
 
-#[derive(Debug)]
-struct Attachment {
-    address: u64,
-    backing: CanonicalBackingRange,
-    pool: Option<usize>,
-}
-impl Attachment {
-    fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<(), Box<str>> {
-        self.backing
-            .read(offset, bytes)
-            .map_err(|e| format!("rendering: voice buffer read failed: {e}").into())
-    }
-}
-fn attach(
-    address: u64,
-    size: u64,
-    pools: &[Option<MemoryPool>],
-    force: bool,
-    translate: &impl Fn(u64, u64) -> Result<CanonicalBackingRange, CanonicalRangeTranslationError>,
-) -> Result<Option<Attachment>, UpdateError> {
-    if address == 0 || size == 0 {
-        return Ok(None);
-    }
-    let end = address.checked_add(size).ok_or(UpdateError::Invalid)?;
-    for (i, pool) in pools.iter().enumerate() {
-        let Some(pool) = pool else { continue };
-        if address >= pool.address && end <= pool.address.saturating_add(pool.backing.size()) {
-            let backing = pool
-                .backing
-                .snapshot_subrange(address - pool.address, size)
-                .map_err(|_| UpdateError::Invalid)?;
-            return Ok(Some(Attachment {
-                address,
-                backing,
-                pool: Some(i),
-            }));
-        }
-    }
-    if force {
-        return Ok(Some(Attachment {
-            address,
-            backing: translate(address, size).map_err(UpdateError::Mapping)?,
-            pool: None,
-        }));
-    }
-    Err(UpdateError::Unsupported(format!("RequestUpdate: voice buffer {address:#x} ({size} bytes) is outside attached memory pools").into()))
-}
+use super::buffer::{Attachment, attach};
 #[derive(Debug)]
 struct WaveBuffer {
     data: Attachment,

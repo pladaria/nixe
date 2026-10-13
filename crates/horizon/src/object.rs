@@ -14,6 +14,8 @@ use nixe_runtime::{
     ReadOnlyMount, ReadableEventObject, SharedMemoryObject, VirtualClock, WritableEventObject,
 };
 
+mod keyboard;
+
 use crate::graphics::ViSession;
 use crate::ipc::IpcService;
 use crate::nvdrv::NvDrvSession;
@@ -1721,8 +1723,24 @@ struct ActiveLibraryApplet {
     state_changed_event: WritableEventObject,
     result: Option<u32>,
     output: Option<Vec<u8>>,
+    output_event: WritableEventObject,
+    output_reader: ReadableEventObject,
     state_changed_event_reader: ReadableEventObject,
     input_storage_ids: VecDeque<u64>,
+    keyboard: Option<Arc<nixe_applets::keyboard::KeyboardSession>>,
+    check_text: Option<String>,
+    confirmation_text: Option<String>,
+    interactive_output: VecDeque<Vec<u8>>,
+    interactive_event: WritableEventObject,
+    interactive_reader: ReadableEventObject,
+}
+
+impl Drop for ActiveLibraryApplet {
+    fn drop(&mut self) {
+        if let Some(keyboard) = &self.keyboard {
+            keyboard.finish();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1816,6 +1834,8 @@ pub(crate) enum OpenAppletStorageAccessorError {
 pub(crate) enum AppletStorageAccessError {
     NotFound,
     OutOfRange,
+    ReadOnly,
+    BackingFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1837,6 +1857,42 @@ pub(crate) enum PrepareLibraryAppletLaunchError {
     AppletNotFound,
     StorageBackingMissing,
     AllocationFailed,
+}
+
+#[derive(Debug)]
+enum AppletStorage {
+    Owned(Vec<u8>),
+    Transfer {
+        memory: Arc<nixe_runtime::TransferMemoryObject>,
+        size: usize,
+        writable: bool,
+    },
+}
+impl AppletStorage {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.len(),
+            Self::Transfer { size, .. } => *size,
+        }
+    }
+    fn read(&self, offset: u64, size: usize) -> Result<Vec<u8>, AppletStorageAccessError> {
+        let start = usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= self.len())
+            .ok_or(AppletStorageAccessError::OutOfRange)?;
+        match self {
+            Self::Owned(bytes) => Ok(bytes[start..end].to_vec()),
+            Self::Transfer { memory, .. } => {
+                let mut bytes = vec![0; size];
+                memory
+                    .backing()
+                    .read(offset, &mut bytes)
+                    .map_err(|_| AppletStorageAccessError::BackingFailed)?;
+                Ok(bytes)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1865,7 +1921,7 @@ struct AppletDomain {
     gpu_error_detected_event: ReadableEventObject,
     active_library_applet: Option<ActiveLibraryApplet>,
     next_storage_id: u64,
-    storages: BTreeMap<u64, Vec<u8>>,
+    storages: BTreeMap<u64, AppletStorage>,
 }
 
 /// Client session connected to Horizon's `appletOE` service.
@@ -2035,9 +2091,12 @@ impl AppletSession {
                 .as_ref()
                 .is_some_and(|active| active.object_id == object_id)
         {
-            let active = domain.active_library_applet.take().unwrap();
+            let mut active = domain.active_library_applet.take().unwrap();
+            if let Some(keyboard) = &active.keyboard {
+                keyboard.finish();
+            }
             domain.library_applet_launchable_event.signal();
-            active.input_storage_ids
+            std::mem::take(&mut active.input_storage_ids)
         } else {
             VecDeque::new()
         };
@@ -2106,7 +2165,9 @@ impl AppletSession {
         let next_storage_id = storage_id
             .checked_add(1)
             .ok_or(CreateAppletStorageError::AllocationFailed)?;
-        domain.storages.insert(storage_id, bytes);
+        domain
+            .storages
+            .insert(storage_id, AppletStorage::Owned(bytes));
         domain
             .objects
             .insert(object_id, AppletObject::Storage { storage_id });
@@ -2155,7 +2216,9 @@ impl AppletSession {
             .and_then(VecDeque::pop_front)
             .expect("launch parameter availability was checked while holding the lock");
 
-        domain.storages.insert(storage_id, bytes);
+        domain
+            .storages
+            .insert(storage_id, AppletStorage::Owned(bytes));
         domain
             .objects
             .insert(object_id, AppletObject::Storage { storage_id });
@@ -2211,14 +2274,41 @@ impl AppletSession {
             .storages
             .get_mut(&storage_id)
             .ok_or(AppletStorageAccessError::NotFound)?;
+        if let AppletStorage::Transfer {
+            memory,
+            size,
+            writable,
+        } = storage
+        {
+            if !*writable {
+                return Err(AppletStorageAccessError::ReadOnly);
+            }
+            if offset
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|end| end > *size as u64)
+            {
+                return Err(AppletStorageAccessError::OutOfRange);
+            }
+            let mut batch = nixe_memory::CanonicalWriteBatch::new();
+            batch
+                .stage(memory.backing(), offset, bytes)
+                .map_err(|_| AppletStorageAccessError::BackingFailed)?;
+            batch
+                .commit()
+                .map_err(|_| AppletStorageAccessError::BackingFailed)?;
+            return Ok(());
+        }
+        let AppletStorage::Owned(storage) = storage else {
+            unreachable!()
+        };
         let start = usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
         let end = start
             .checked_add(bytes.len())
             .ok_or(AppletStorageAccessError::OutOfRange)?;
-        let destination = storage
+        storage
             .get_mut(start..end)
-            .ok_or(AppletStorageAccessError::OutOfRange)?;
-        destination.copy_from_slice(bytes);
+            .ok_or(AppletStorageAccessError::OutOfRange)?
+            .copy_from_slice(bytes);
         Ok(())
     }
 
@@ -2236,14 +2326,7 @@ impl AppletSession {
             .storages
             .get(&storage_id)
             .ok_or(AppletStorageAccessError::NotFound)?;
-        let start = usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
-        let end = start
-            .checked_add(size)
-            .ok_or(AppletStorageAccessError::OutOfRange)?;
-        Ok(storage
-            .get(start..end)
-            .ok_or(AppletStorageAccessError::OutOfRange)?
-            .to_vec())
+        storage.read(offset, size)
     }
 
     pub(crate) fn create_library_applet(
@@ -2275,13 +2358,23 @@ impl AppletSession {
             AppletObject::LibraryAppletAccessor { applet_id, mode },
         );
         domain.next_object_id = next_object_id;
+        let (interactive_event, interactive_reader) = nixe_runtime::EventObject::create_pair();
+        let (output_event, output_reader) = nixe_runtime::EventObject::create_pair();
         domain.active_library_applet = Some(ActiveLibraryApplet {
             object_id,
             state_changed_event,
             result: None,
             output: None,
+            output_event,
+            output_reader,
             state_changed_event_reader,
             input_storage_ids: VecDeque::new(),
+            keyboard: None,
+            check_text: None,
+            confirmation_text: None,
+            interactive_output: VecDeque::new(),
+            interactive_event,
+            interactive_reader,
         });
         Ok(object_id)
     }
@@ -2296,6 +2389,15 @@ impl AppletSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active = domain.active_library_applet.as_ref()?;
         (active.object_id == object_id).then(|| active.state_changed_event_reader.clone())
+    }
+
+    pub(crate) fn library_applet_output_event(&self, object: u32) -> Option<ReadableEventObject> {
+        let domain = self.domain.lock().unwrap();
+        let active = domain
+            .active_library_applet
+            .as_ref()
+            .filter(|a| a.object_id == object)?;
+        Some(active.output_reader.clone())
     }
 
     pub(crate) fn library_applet_result(&self, object_id: u32) -> Option<u32> {
@@ -2323,6 +2425,7 @@ impl AppletSession {
             return false;
         };
         active.output = Some(output);
+        active.output_event.signal();
         active.result = Some(0);
         active.state_changed_event.signal();
         true
@@ -2362,7 +2465,15 @@ impl AppletSession {
             .output
             .take()
             .unwrap();
-        domain.storages.insert(storage_id, output);
+        domain
+            .active_library_applet
+            .as_ref()
+            .unwrap()
+            .output_event
+            .clear();
+        domain
+            .storages
+            .insert(storage_id, AppletStorage::Owned(output));
         domain
             .objects
             .insert(storage_object, AppletObject::Storage { storage_id });
@@ -2426,11 +2537,9 @@ impl AppletSession {
             let Some(source) = domain.storages.get(storage_id) else {
                 return Err(PrepareLibraryAppletLaunchError::StorageBackingMissing);
             };
-            let mut storage = Vec::new();
-            storage
-                .try_reserve_exact(source.len())
-                .map_err(|_| PrepareLibraryAppletLaunchError::AllocationFailed)?;
-            storage.extend_from_slice(source);
+            let storage = source
+                .read(0, source.len())
+                .map_err(|_| PrepareLibraryAppletLaunchError::StorageBackingMissing)?;
             input_storages.push(storage);
         }
         Ok(LibraryAppletLaunchRequest {

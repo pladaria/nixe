@@ -143,7 +143,7 @@ pub(super) fn translated_fixture_with_register_count(
     let binary = read_shader_binary(&memory, stage, address).unwrap();
     validate_program_header(stage, binary.header()).unwrap();
     VerifiedShaderIr::verify(
-        translate_shader_binary(&binary, register_count, &BTreeMap::new())
+        translate_shader_binary(&binary, register_count, &BTreeMap::new(), false)
             .unwrap()
             .ir,
     )

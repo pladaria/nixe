@@ -61,13 +61,13 @@ pub use capability::{
 pub use command::{
     AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BarrierOperation,
     BlitFilter, BlitOperation, BufferRegion, CacheMaintenanceOperation, ClearOperation, ClearValue,
-    CommandDescriptionError, CopyOperation, CullMode, DepthCompareOperation, DepthState,
+    CommandDescriptionError, CopyOperation, CullMode, DepthBias, DepthCompareOperation, DepthState,
     DispatchOperation, DrawArguments, DrawOperation, FragmentDepthTransform, FrontFace, GpuCommand,
     GpuOperation, ImageOrigin, ImageRegion, IndexType, LineRasterization, OperationSubmission,
     PreparedDraw, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
-    ResolveOperation, ScissorRect, StencilTestState, TriangleRasterization, VertexAttribute,
-    VertexBufferLayout, VertexComponentCount, VertexComponentWidth, VertexFormat,
-    VertexPositionTransform, VertexStepMode, ViewportTransform,
+    ResolveOperation, ScissorRect, StencilFaceState, StencilOperation, StencilTestState,
+    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
+    VertexComponentWidth, VertexFormat, VertexPositionTransform, VertexStepMode, ViewportTransform,
 };
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,
@@ -99,12 +99,13 @@ pub use shader::{
     ShaderEvaluationError, ShaderEvaluationInputs, ShaderEvaluationResult, ShaderFloatComparison,
     ShaderFloatControl, ShaderInstruction, ShaderIntegerComparison, ShaderInterfaceElement,
     ShaderInterpolation, ShaderIoLocation, ShaderIr, ShaderIrConstructionError, ShaderMathAccuracy,
-    ShaderNanMode, ShaderOperation, ShaderPredicate, ShaderPredicateSetOperation, ShaderRegister,
-    ShaderResourceAccess, ShaderResourceKind, ShaderRoundingMode, ShaderScalarType,
-    ShaderSourceLocation, ShaderSpecialFunction, ShaderStageInterfaceError,
-    ShaderTextureSampleOutput, ShaderVerificationError, VerifiedShaderIr, WgslShaderModule,
-    evaluate_shader_ir, lower_shader_ir_to_wgsl, lower_shader_ir_to_wgsl_with_quad_flat_attributes,
-    lower_shader_ir_to_wgsl_with_vertex_pulling, validate_shader_stage_link,
+    ShaderNanMode, ShaderOperation, ShaderPredicate, ShaderPredicateSetOperation,
+    ShaderQuadOperation, ShaderRegister, ShaderResourceAccess, ShaderResourceKind,
+    ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderSpecialFunction,
+    ShaderStageInterfaceError, ShaderTextureSampleOutput, ShaderVerificationError,
+    VerifiedShaderIr, WgslShaderModule, evaluate_shader_ir, lower_shader_ir_to_wgsl,
+    lower_shader_ir_to_wgsl_with_quad_flat_attributes, lower_shader_ir_to_wgsl_with_vertex_pulling,
+    validate_shader_stage_link,
 };
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,

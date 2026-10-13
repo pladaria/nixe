@@ -1210,7 +1210,16 @@ impl CanonicalBackingPage {
     /// CPU adapters use this before operations which require canonical bytes
     /// to have been reconciled from a device owner.
     pub fn prepare_cpu_access(&self) -> Result<(), CanonicalPageError> {
-        self.ensure_cpu_visible()
+        self.prepare_cpu_access_with(&mut |coordinator, request| {
+            coordinator.make_cpu_visible(request)
+        })
+    }
+
+    pub(crate) fn prepare_cpu_access_with(
+        &self,
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<(), CanonicalPageError> {
+        self.ensure_cpu_visible_with(resolve, false)
             .map_err(CanonicalPageError::Visibility)
     }
 
@@ -1764,6 +1773,7 @@ impl CanonicalWriteBatch {
         range: &CanonicalBackingRange,
         offset: u64,
         end: u64,
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
     ) -> Result<(), CanonicalWriteBatchError> {
         let mut visited = BTreeSet::new();
         for (logical_start, segment) in range.segments_between(offset, end) {
@@ -1776,7 +1786,7 @@ impl CanonicalWriteBatch {
             {
                 segment
                     .backing()
-                    .prepare_cpu_access()
+                    .prepare_cpu_access_with(resolve)
                     .map_err(CanonicalWriteBatchError::Page)?;
             }
         }
@@ -1873,6 +1883,20 @@ impl CanonicalWriteBatch {
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), CanonicalWriteBatchError> {
+        self.read_staged_with_resolver(range, offset, output, &mut |coordinator, request| {
+            coordinator.make_cpu_visible(request)
+        })
+    }
+
+    /// Performs the same canonical operation with inline owner visibility.
+    /// The resolver runs without page locks or execution mutation guards.
+    pub fn read_staged_with_resolver(
+        &self,
+        range: &CanonicalBackingRange,
+        offset: u64,
+        output: &mut [u8],
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<(), CanonicalWriteBatchError> {
         let size =
             u64::try_from(output.len()).map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
         let end = offset
@@ -1889,7 +1913,7 @@ impl CanonicalWriteBatch {
             return Ok(());
         }
         loop {
-            self.prepare_unstaged_cpu_visible(range, offset, end)?;
+            self.prepare_unstaged_cpu_visible(range, offset, end, resolve)?;
             let mut stores = BTreeMap::new();
             for (_, segment) in range.segments_between(offset, end) {
                 // Captured pages are private, immutable snapshots. Reading them
@@ -1962,6 +1986,20 @@ impl CanonicalWriteBatch {
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), CanonicalWriteBatchError> {
+        self.read_overlay_with_resolver(range, offset, output, &mut |coordinator, request| {
+            coordinator.make_cpu_visible(request)
+        })
+    }
+
+    /// Performs the same canonical operation with inline owner visibility.
+    /// The resolver runs without page locks or execution mutation guards.
+    pub fn read_overlay_with_resolver(
+        &self,
+        range: &CanonicalBackingRange,
+        offset: u64,
+        output: &mut [u8],
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<(), CanonicalWriteBatchError> {
         let size = output.len() as u64;
         let end = offset
             .checked_add(size)
@@ -1988,10 +2026,10 @@ impl CanonicalWriteBatch {
                 })
             });
         if covered {
-            return self.read_staged(range, offset, output);
+            return self.read_staged_with_resolver(range, offset, output, resolve);
         }
         range
-            .read(offset, output)
+            .read_with_resolver(offset, output, resolve)
             .map_err(|error| CanonicalWriteBatchError::Read(Box::new(error)))?;
         for (logical, segment) in range.segments_between(offset, end) {
             let Some(pending) = self.pages.get(&segment.page()) else {
@@ -2024,6 +2062,20 @@ impl CanonicalWriteBatch {
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), CanonicalWriteBatchError> {
+        self.stage_with_resolver(range, offset, bytes, &mut |coordinator, request| {
+            coordinator.make_cpu_visible(request)
+        })
+    }
+
+    /// Performs the same canonical operation with inline owner visibility.
+    /// The resolver runs without page locks or execution mutation guards.
+    pub fn stage_with_resolver(
+        &mut self,
+        range: &CanonicalBackingRange,
+        offset: u64,
+        bytes: &[u8],
+        resolve: &mut crate::CpuVisibilityResolver<'_>,
+    ) -> Result<(), CanonicalWriteBatchError> {
         let size =
             u64::try_from(bytes.len()).map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
         let end = offset
@@ -2050,7 +2102,7 @@ impl CanonicalWriteBatch {
         }
 
         loop {
-            self.prepare_unstaged_cpu_visible(range, offset, end)?;
+            self.prepare_unstaged_cpu_visible(range, offset, end, resolve)?;
 
             // Only newly captured pages touch canonical storage or arm tracking.
             // Existing staged pages are owned bytes, even if their backing has

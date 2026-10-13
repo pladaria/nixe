@@ -62,7 +62,7 @@ impl WgpuBackendDriver {
         )?;
         let shader_handle =
             dependency_handle(dependencies, ResourceDependency::Shader(dispatch.shader))?;
-        let swizzles = self.sampled_swizzles(dependencies, &dispatch.descriptor_tables)?;
+        let swizzles = self.sampling_parameters(dependencies, &dispatch.descriptor_tables)?;
         let fingerprint = nixe_gpu::cache_fingerprint(&(shader_handle, &swizzles));
         let cache_use = self.take_cache_use()?;
         let capacity = self.cache_configuration.pipeline_variants_per_resource();
@@ -110,7 +110,7 @@ impl WgpuBackendDriver {
                 "compute workgroup size exceeds host limits: {size:?}"
             )));
         }
-        let constants = swizzles.constants(neutral);
+        let constants = swizzles.constants(neutral).map_err(unsupported)?;
         let constants = constants
             .iter()
             .map(|(name, value)| (name.as_str(), *value))

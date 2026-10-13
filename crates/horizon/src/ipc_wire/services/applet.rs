@@ -71,8 +71,13 @@ pub(in crate::ipc_wire) fn dispatch_applet(
         ));
     };
     let accepts_input_objects = matches!(object, AppletObject::LibraryAppletAccessor { .. })
-        && LibraryAppletAccessorCommand::decode(request.command_id)
-            == Some(LibraryAppletAccessorCommand::PushInData);
+        && LibraryAppletAccessorCommand::decode(request.command_id).is_some_and(|c| {
+            matches!(
+                c,
+                LibraryAppletAccessorCommand::PushInData
+                    | LibraryAppletAccessorCommand::PushInteractiveInData
+            )
+        });
     if !input_objects.is_empty() && !accepts_input_objects {
         return unsupported_service_command(applet_object_name(object), request.command_id);
     }
@@ -647,7 +652,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 // returns an ILibraryAppletAccessor domain object. libnx consumes
                 // that accessor immediately to obtain its state-change event:
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1516-L1564
-                LibraryAppletCreatorCommand::CreateLibraryApplet => {
+                LibraryAppletCreatorCommand::LibraryApplet => {
                     if request.data.len() < 8
                         || request.data[8..].iter().any(|byte| *byte != 0)
                         || has_ipc_descriptors(hipc)
@@ -711,7 +716,62 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 // CreateStorage allocates one zero-filled IStorage object. The
                 // signed libnx size reaches CMIF as the same 64-bit bit pattern:
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1761-L1767
-                LibraryAppletCreatorCommand::CreateStorage => {
+                LibraryAppletCreatorCommand::TransferMemoryStorage => {
+                    // https://switchbrew.org/wiki/Applet_Manager_services#CreateTransferMemoryStorage
+                    if request.data.len() < 16
+                        || request.data[0] > 1
+                        || request.data[16..].iter().any(|b| *b != 0)
+                        || hipc.copy_handles.len() != 1
+                        || hipc.pid.is_some()
+                        || !hipc.move_handles.is_empty()
+                        || !hipc.send_buffers.is_empty()
+                        || !hipc.receive_buffers.is_empty()
+                        || !hipc.exchange_buffers.is_empty()
+                        || !hipc.send_statics.is_empty()
+                        || !matches!(hipc.receive_statics, ReceiveStatics::None)
+                    {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let Some(memory) = process
+                        .handles()
+                        .get_as::<TransferMemoryObject>(hipc.copy_handles[0])
+                    else {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    };
+                    let size = request_u64(request.data, 8).unwrap();
+                    if size == 0 || size > memory.size() || size > usize::MAX as u64 {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let id = session
+                        .create_transfer_storage(
+                            std::sync::Arc::new(memory.clone()),
+                            size as usize,
+                            request.data[0] != 0,
+                        )
+                        .map_err(|_| {
+                            IpcWireError::HostResourceExhausted("retaining applet transfer memory")
+                        })?;
+                    Ok((
+                        encode_domain_response(
+                            request.token,
+                            HorizonIpcResult::SUCCESS,
+                            &[],
+                            &[],
+                            &[id],
+                        )?,
+                        None,
+                    ))
+                }
+                LibraryAppletCreatorCommand::Storage => {
                     if request.data.len() < 8
                         || request.data[8..].iter().any(|byte| *byte != 0)
                         || has_ipc_descriptors(hipc)
@@ -765,14 +825,24 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 return unsupported_service_command("ILibraryAppletAccessor", request.command_id);
             };
             match command {
-                LibraryAppletAccessorCommand::GetAppletStateChangedEvent => {
+                command @ (LibraryAppletAccessorCommand::GetAppletStateChangedEvent
+                | LibraryAppletAccessorCommand::GetPopInteractiveOutDataEvent
+                | LibraryAppletAccessorCommand::GetPopOutDataEvent) => {
                     if !request.data.is_empty() || has_ipc_descriptors(hipc) {
                         return applet_error(
                             request.token,
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let Some(event) = session.library_applet_state_changed_event(object_id) else {
+                    let Some(event) = (match command {
+                        LibraryAppletAccessorCommand::GetPopOutDataEvent => {
+                            session.library_applet_output_event(object_id)
+                        }
+                        LibraryAppletAccessorCommand::GetPopInteractiveOutDataEvent => {
+                            session.interactive_event(object_id)
+                        }
+                        _ => session.library_applet_state_changed_event(object_id),
+                    }) else {
                         return applet_error(
                             request.token,
                             HorizonIpcResult::CMIF_TARGET_NOT_FOUND,
@@ -796,7 +866,8 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 }
                 LibraryAppletAccessorCommand::CheckFinished
                 | LibraryAppletAccessorCommand::GetResult
-                | LibraryAppletAccessorCommand::PopOutData => {
+                | LibraryAppletAccessorCommand::PopOutData
+                | LibraryAppletAccessorCommand::PopInteractiveOutData => {
                     if !request.data.is_empty() || has_ipc_descriptors(hipc) {
                         return applet_error(
                             request.token,
@@ -819,8 +890,14 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                                 ),
                             }
                         }
-                        LibraryAppletAccessorCommand::PopOutData => {
-                            match session.pop_library_applet_output(object_id) {
+                        LibraryAppletAccessorCommand::PopOutData
+                        | LibraryAppletAccessorCommand::PopInteractiveOutData => {
+                            match if command == LibraryAppletAccessorCommand::PopInteractiveOutData
+                            {
+                                session.pop_interactive_output(object_id)
+                            } else {
+                                session.pop_library_applet_output(object_id)
+                            } {
                                 Ok(storage) => Ok((
                                     encode_domain_response(
                                         request.token,
@@ -877,6 +954,36 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                                     )
                                 }
                             })?;
+                    if launch.applet_id == LibraryAppletId::SoftwareKeyboard {
+                        if launch.mode != LibraryAppletMode::AllForeground {
+                            return Err(IpcWireError::Malformed(
+                                "inline software keyboard is not implemented",
+                            ));
+                        }
+                        let [common, args, work] = launch.input_storages.as_slice() else {
+                            return Err(IpcWireError::Malformed(
+                                "software keyboard requires common, configuration and work storages",
+                            ));
+                        };
+                        let config =
+                            nixe_applets::keyboard::KeyboardConfig::decode(common, args, work)
+                                .map_err(IpcWireError::Malformed)?;
+                        log::debug!(
+                            "software keyboard requested: kind={:?} length={}..{} text-check={} utf8={}",
+                            config.kind,
+                            config.minimum,
+                            config.maximum,
+                            config.text_check,
+                            config.utf8
+                        );
+                        let host = host_systems.keyboard.ok_or(IpcWireError::Malformed(
+                            "software keyboard requires a host window",
+                        ))?;
+                        session
+                            .start_keyboard(object_id, config, host)
+                            .map_err(IpcWireError::Malformed)?;
+                        return applet_data(request.token, &[]);
+                    }
                     if matches!(
                         launch.applet_id,
                         LibraryAppletId::Controller | LibraryAppletId::PlayerSelect
@@ -915,6 +1022,21 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 // backing independently until the applet consumes or releases it.
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L779-L793
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1754-L1758
+                LibraryAppletAccessorCommand::PushInteractiveInData => {
+                    if !request.data.is_empty()
+                        || has_ipc_descriptors(hipc)
+                        || input_objects.len() != 1
+                    {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    session
+                        .keyboard_validation(object_id, input_objects[0])
+                        .map_err(IpcWireError::Malformed)?;
+                    applet_data(request.token, &[])
+                }
                 LibraryAppletAccessorCommand::PushInData => {
                     if !request.data.is_empty()
                         || has_ipc_descriptors(hipc)
@@ -1033,6 +1155,14 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                         Err(AppletStorageAccessError::NotFound) => {
                             applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND)
                         }
+                        Err(AppletStorageAccessError::ReadOnly) => {
+                            // Eden returns ResultUnknown for a read-only transfer storage.
+                            // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/service/am/library_applet_storage.cpp
+                            applet_error(request.token, HorizonIpcResult::from_raw(u32::MAX))
+                        }
+                        Err(AppletStorageAccessError::BackingFailed) => Err(
+                            IpcWireError::Internal("applet transfer-memory backing access failed"),
+                        ),
                         Err(AppletStorageAccessError::OutOfRange) => {
                             Err(IpcWireError::UnsupportedService(
                                 UnsupportedServiceOperation::CommandVariant {
@@ -1070,6 +1200,14 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                         Err(AppletStorageAccessError::NotFound) => {
                             applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND)
                         }
+                        Err(AppletStorageAccessError::ReadOnly) => {
+                            // Eden returns ResultUnknown for a read-only transfer storage.
+                            // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/service/am/library_applet_storage.cpp
+                            applet_error(request.token, HorizonIpcResult::from_raw(u32::MAX))
+                        }
+                        Err(AppletStorageAccessError::BackingFailed) => Err(
+                            IpcWireError::Internal("applet transfer-memory backing access failed"),
+                        ),
                         Err(AppletStorageAccessError::OutOfRange) => {
                             Err(IpcWireError::UnsupportedService(
                                 UnsupportedServiceOperation::CommandVariant {
@@ -1165,6 +1303,26 @@ const fn applet_proxy_name(kind: AppletProxyKind) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn library_applet_interactive_command_ids_match_the_public_abi() {
+        assert_eq!(LibraryAppletAccessorCommand::decode(102), None);
+        assert_eq!(
+            LibraryAppletAccessorCommand::decode(103),
+            Some(LibraryAppletAccessorCommand::PushInteractiveInData)
+        );
+        assert_eq!(
+            LibraryAppletAccessorCommand::decode(104),
+            Some(LibraryAppletAccessorCommand::PopInteractiveOutData)
+        );
+        assert_eq!(
+            LibraryAppletAccessorCommand::decode(105),
+            Some(LibraryAppletAccessorCommand::GetPopOutDataEvent)
+        );
+        assert_eq!(
+            LibraryAppletAccessorCommand::decode(106),
+            Some(LibraryAppletAccessorCommand::GetPopInteractiveOutDataEvent)
+        );
+    }
     #[test]
     fn proxy_commands_follow_the_caller_role() {
         assert_eq!(

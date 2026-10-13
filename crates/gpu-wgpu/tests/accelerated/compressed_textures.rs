@@ -7,17 +7,46 @@ use nixe_gpu::{
 
 #[test]
 fn compressed_sampling_preserves_formats_swizzles_block_layout_and_cached_variants() {
-    sampling(None);
+    sampling(None, false, 0.0, None);
 }
 
 #[test]
 fn clamp_to_border_sampling_preserves_transparent_black_opaque_black_and_white() {
     for border in [[0; 4], [0, 0, 0, 1.0_f32.to_bits()], [1.0_f32.to_bits(); 4]] {
-        sampling(Some(border));
+        sampling(Some(border), false, 0.0, None);
     }
 }
 
-fn sampling(border: Option<[u32; 4]>) {
+#[test]
+fn compressed_mip_sampling_uploads_selected_levels_and_dirty_array_layers() {
+    sampling(None, true, 0.0, None);
+}
+
+#[test]
+fn sampler_lod_bias_shifts_explicit_mips_before_clamping() {
+    sampling(None, true, -1.0, None);
+}
+
+#[test]
+fn sampler_lod_bias_shifts_implicit_derivatives_before_clamping() {
+    sampling(None, true, -2.0, None);
+}
+
+#[test]
+fn sampled_texel_offsets_preserve_filtering_mips_arrays_and_border_color() {
+    // The unshifted coordinate is inside; +7 texels must select border color.
+    // An omitted offset fails even for a uniform compressed texture.
+    for mipmapped in [false, true] {
+        sampling(Some([1.0_f32.to_bits(); 4]), mipmapped, 0.0, Some([7, 0]));
+    }
+}
+
+fn sampling(
+    border: Option<[u32; 4]>,
+    mipmapped: bool,
+    lod_bias: f32,
+    texel_offset: Option<[i32; 2]>,
+) {
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
         BackendInstanceId::new(720),
@@ -170,11 +199,12 @@ fn sampling(border: Option<[u32; 4]>) {
             AddressMode::ClampToEdge
         }; 3],
         0.0,
-        0.0,
+        if mipmapped { 1.0 } else { 0.0 },
         1.0,
     )
     .unwrap();
     description.border_color = border;
+    description.lod_bias = lod_bias;
     creations.push(BackendResourceCreateInfo::Sampler {
         id: sampler,
         description,
@@ -184,6 +214,10 @@ fn sampling(border: Option<[u32; 4]>) {
         (ImageFormat::Bc1RgbaUnorm, Swizzle::IDENTITY),
         (ImageFormat::Bc1RgbSrgb, Swizzle::IDENTITY),
         (ImageFormat::Bc1RgbaSrgb, Swizzle::IDENTITY),
+        (ImageFormat::Bc3RgbaUnorm, Swizzle::IDENTITY),
+        (ImageFormat::Bc3RgbaSrgb, Swizzle::IDENTITY),
+        (ImageFormat::Bc7RgbaUnorm, Swizzle::IDENTITY),
+        (ImageFormat::Bc7RgbaSrgb, Swizzle::IDENTITY),
         (ImageFormat::Bc4RUnorm, Swizzle::IDENTITY),
         (
             ImageFormat::Bc4RUnorm,
@@ -204,6 +238,37 @@ fn sampling(border: Option<[u32; 4]>) {
             ]),
         ),
     ];
+    if border.is_none() && lod_bias == 0.0 {
+        formats.extend([
+            (
+                ImageFormat::Bc1RgbUnorm,
+                Swizzle([
+                    ComponentSwizzle::Red,
+                    ComponentSwizzle::Green,
+                    ComponentSwizzle::Blue,
+                    ComponentSwizzle::Zero,
+                ]),
+            ),
+            (
+                ImageFormat::Bc1RgbaUnorm,
+                Swizzle([
+                    ComponentSwizzle::Alpha,
+                    ComponentSwizzle::Green,
+                    ComponentSwizzle::Blue,
+                    ComponentSwizzle::One,
+                ]),
+            ),
+            (
+                ImageFormat::Bc1RgbSrgb,
+                Swizzle([
+                    ComponentSwizzle::Blue,
+                    ComponentSwizzle::Green,
+                    ComponentSwizzle::Red,
+                    ComponentSwizzle::Zero,
+                ]),
+            ),
+        ]);
+    }
     formats.push((
         ImageFormat::Rg8Unorm,
         Swizzle([
@@ -234,6 +299,21 @@ fn sampling(border: Option<[u32; 4]>) {
             ComponentSwizzle::Green,
         ]),
     ));
+    for format in [ImageFormat::Bc4RSnorm, ImageFormat::Bc5RgSnorm] {
+        formats.push((
+            format,
+            Swizzle([
+                ComponentSwizzle::Red,
+                ComponentSwizzle::Red,
+                ComponentSwizzle::Red,
+                if format == ImageFormat::Bc5RgSnorm {
+                    ComponentSwizzle::Green
+                } else {
+                    ComponentSwizzle::One
+                },
+            ]),
+        ));
+    }
     formats.extend([
         (ImageFormat::Astc8x8Unorm, Swizzle::IDENTITY),
         (ImageFormat::Astc8x8Srgb, Swizzle::IDENTITY),
@@ -242,6 +322,18 @@ fn sampling(border: Option<[u32; 4]>) {
     ]);
     if border.is_some() {
         formats = vec![(ImageFormat::Bc1RgbaUnorm, Swizzle::IDENTITY)];
+    }
+    if mipmapped {
+        formats = vec![
+            (ImageFormat::Bc3RgbaUnorm, Swizzle::IDENTITY),
+            (ImageFormat::Bc3RgbaSrgb, Swizzle::IDENTITY),
+        ];
+    }
+    if lod_bias != 0.0 {
+        formats = vec![
+            (ImageFormat::Bc3RgbaUnorm, Swizzle::IDENTITY),
+            (ImageFormat::Bc3RgbaSrgb, Swizzle::IDENTITY),
+        ];
     }
     let mut serial = 720;
     for (variant, (array, layers)) in [(false, 1_u16), (true, 1), (true, 2)]
@@ -254,8 +346,25 @@ fn sampling(border: Option<[u32; 4]>) {
             description: ShaderDescription {
                 stage: ShaderStage::Fragment,
             },
-            module: sampled_fragment(array, border.is_some()),
+            module: sampled_fragment(
+                array,
+                border.is_some() && texel_offset.is_none(),
+                mipmapped,
+                false,
+                lod_bias == -2.0,
+                texel_offset,
+            ),
         });
+        let signed_fragment = ShaderId::new(9000 + variant as u64);
+        if border.is_none() {
+            creations.push(BackendResourceCreateInfo::Shader {
+                id: signed_fragment,
+                description: ShaderDescription {
+                    stage: ShaderStage::Fragment,
+                },
+                module: sampled_fragment(array, false, mipmapped, true, false, texel_offset),
+            });
+        }
         let mut draws = Vec::new();
         for (index, (format, swizzle)) in formats.iter().copied().enumerate() {
             let id = 730 + index as u64 + variant as u64 * formats.len() as u64;
@@ -264,9 +373,14 @@ fn sampling(border: Option<[u32; 4]>) {
             let table = DescriptorTableId::new(id);
             // Two rows of two BC1 blocks. The bottom-right block is selected.
             // In a 64-byte x 8-row GOB, block (1,1) starts at byte 24.
-            let mut bytes = vec![0; usize::from(layers) * 512];
-            let selected = usize::from(layers - 1) * 512
-                + if format.astc_profile().is_some() || format == ImageFormat::Bc5RgUnorm {
+            // Mip zero intentionally stays empty. Level one contains the selected
+            // block; using a base-only upload or sampling view produces the wrong pixel.
+            let layer_stride = if mipmapped { 1536 } else { 512 };
+            let level_offset = if mipmapped { 1024 } else { 0 };
+            let mut bytes = vec![0; usize::from(layers) * layer_stride];
+            let selected = usize::from(layers - 1) * layer_stride
+                + level_offset
+                + if format.plane_bytes_per_block(0) == Some(16) {
                     48
                 } else {
                     24
@@ -299,6 +413,19 @@ fn sampling(border: Option<[u32; 4]>) {
                     let offset = usize::from(layers - 1) * 512 + offset;
                     bytes[offset..offset + 2].copy_from_slice(&0xf800_u16.to_le_bytes());
                 }
+            } else if matches!(format, ImageFormat::Bc7RgbaUnorm | ImageFormat::Bc7RgbaSrgb) {
+                bytes[selected..selected + 16].copy_from_slice(&bc7_constant([128, 64, 32, 254]));
+            } else if matches!(format, ImageFormat::Bc3RgbaUnorm | ImageFormat::Bc3RgbaSrgb) {
+                // Use an RGB endpoint: native BC interpolation precision can
+                // differ from the software decoder. Alpha still interpolates.
+                bytes[selected..selected + 16].copy_from_slice(&[
+                    200, 60, 0x92, 0x24, 0x49, 0x92, 0x24, 0x49, 0, 0, 255, 255, 0, 0, 0, 0,
+                ]);
+            } else if format == ImageFormat::Bc5RgSnorm {
+                bytes[selected..selected + 16]
+                    .copy_from_slice(&[128, 127, 0, 0, 0, 0, 0, 0, 127, 128, 0, 0, 0, 0, 0, 0]);
+            } else if format == ImageFormat::Bc4RSnorm {
+                bytes[selected..selected + 8].copy_from_slice(&[128, 127, 0, 0, 0, 0, 0, 0]);
             } else if format == ImageFormat::Bc5RgUnorm {
                 bytes[selected..selected + 16]
                     .copy_from_slice(&[73, 0, 0, 0, 0, 0, 0, 0, 191, 0, 0, 0, 0, 0, 0, 0]);
@@ -317,22 +444,44 @@ fn sampling(border: Option<[u32; 4]>) {
             let description = ImageDescription::new(
                 ImageDimension::Two,
                 ImageExtent::new(
-                    if format.astc_profile().is_some() || format == ImageFormat::Bc5RgUnorm {
-                        format.block_extent()[0] * 2 + 1
+                    if format.astc_profile().is_some()
+                        || format == ImageFormat::Bc5RgUnorm
+                        || (array && format == ImageFormat::Bc5RgSnorm)
+                        || (array
+                            && matches!(
+                                format,
+                                ImageFormat::Bc3RgbaUnorm
+                                    | ImageFormat::Bc3RgbaSrgb
+                                    | ImageFormat::Bc7RgbaUnorm
+                                    | ImageFormat::Bc7RgbaSrgb
+                            ))
+                    {
+                        (format.block_extent()[0] * 2 + 1) * if mipmapped { 2 } else { 1 }
                     } else {
-                        8
+                        if mipmapped { 16 } else { 8 }
                     },
-                    if format.astc_profile().is_some() || format == ImageFormat::Bc5RgUnorm {
-                        format.block_extent()[1] * 2 + 1
+                    if format.astc_profile().is_some()
+                        || format == ImageFormat::Bc5RgUnorm
+                        || (array && format == ImageFormat::Bc5RgSnorm)
+                        || (array
+                            && matches!(
+                                format,
+                                ImageFormat::Bc3RgbaUnorm
+                                    | ImageFormat::Bc3RgbaSrgb
+                                    | ImageFormat::Bc7RgbaUnorm
+                                    | ImageFormat::Bc7RgbaSrgb
+                            ))
+                    {
+                        (format.block_extent()[1] * 2 + 1) * if mipmapped { 2 } else { 1 }
                     } else {
-                        8
+                        if mipmapped { 16 } else { 8 }
                     },
                     1,
                 )
                 .unwrap(),
                 format,
                 ImageKind::Color,
-                1,
+                if mipmapped { 2 } else { 1 },
                 layers,
                 SampleCount::One,
             )
@@ -349,19 +498,58 @@ fn sampling(border: Option<[u32; 4]>) {
                         image,
                         description,
                         swizzle,
-                        vec![(
-                            ImageSubresourceRange {
-                                layer_count: layers,
-                                ..subresources
-                            },
-                            ImageMemoryLayout::BlockLinear(BlockLinearLayout {
-                                block_width_log2: 0,
-                                block_height_log2: 0,
-                                block_depth_log2: 0,
-                                layer_stride: 512,
-                            }),
-                            image_backing.clone(),
-                        )],
+                        if mipmapped {
+                            (0..layers)
+                                .flat_map(|layer| {
+                                    let image_backing = &image_backing;
+                                    [(0, 0, 1024), (1, 1024, 512)].into_iter().map(
+                                        move |(mip_level, offset, size)| {
+                                            let offset =
+                                                u64::from(layer) * layer_stride as u64 + offset;
+                                            let range = image_backing
+                                                .range()
+                                                .snapshot_subrange(offset, size)
+                                                .unwrap();
+                                            (
+                                                ImageSubresourceRange {
+                                                    mip_level,
+                                                    base_layer: layer,
+                                                    layer_count: 1,
+                                                    ..subresources
+                                                },
+                                                ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                                                    block_width_log2: 0,
+                                                    block_height_log2: 0,
+                                                    block_depth_log2: 0,
+                                                    layer_stride: size,
+                                                }),
+                                                BackingView::new(
+                                                    allocation,
+                                                    allocation_description,
+                                                    offset,
+                                                    range,
+                                                )
+                                                .unwrap(),
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            vec![(
+                                ImageSubresourceRange {
+                                    layer_count: layers,
+                                    ..subresources
+                                },
+                                ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                                    block_width_log2: 0,
+                                    block_height_log2: 0,
+                                    block_depth_log2: 0,
+                                    layer_stride: 512,
+                                }),
+                                image_backing.clone(),
+                            )]
+                        },
                     )
                     .unwrap(),
                 ),
@@ -429,6 +617,14 @@ fn sampling(border: Option<[u32; 4]>) {
             .enumerate()
         {
             let (prepared, image, texture_page, selected, draw_vertex_buffer) = &draws[index];
+            let fragment = if matches!(
+                formats[index].0,
+                ImageFormat::Bc4RSnorm | ImageFormat::Bc5RgSnorm
+            ) {
+                signed_fragment
+            } else {
+                fragment
+            };
             let colored = iteration >= formats.len() * 2;
             if colored {
                 // Mid-gray RGB565 endpoint, selector zero: sRGB must decode.
@@ -439,6 +635,48 @@ fn sampling(border: Option<[u32; 4]>) {
                         .write_preflighted(
                             *selected,
                             &astc_constant([0, 0, 255, 255]),
+                            generation,
+                            generation.next().unwrap(),
+                        )
+                        .unwrap();
+                } else if matches!(
+                    formats[index].0,
+                    ImageFormat::Bc7RgbaUnorm | ImageFormat::Bc7RgbaSrgb
+                ) {
+                    texture_page
+                        .write_preflighted(
+                            *selected,
+                            &bc7_constant([192, 96, 16, 128]),
+                            generation,
+                            generation.next().unwrap(),
+                        )
+                        .unwrap();
+                } else if matches!(
+                    formats[index].0,
+                    ImageFormat::Bc3RgbaUnorm | ImageFormat::Bc3RgbaSrgb
+                ) {
+                    texture_page
+                        .write_preflighted(
+                            *selected,
+                            &[90, 180, 0, 0, 0, 0, 0, 0, 0x10, 0x84, 0, 0, 0, 0, 0, 0],
+                            generation,
+                            generation.next().unwrap(),
+                        )
+                        .unwrap();
+                } else if matches!(
+                    formats[index].0,
+                    ImageFormat::Bc4RSnorm | ImageFormat::Bc5RgSnorm
+                ) {
+                    let block = [192, 127, 0, 0, 0, 0, 0, 0, 127, 128, 0, 0, 0, 0, 0, 0];
+                    let count = if formats[index].0 == ImageFormat::Bc5RgSnorm {
+                        16
+                    } else {
+                        8
+                    };
+                    texture_page
+                        .write_preflighted(
+                            *selected,
+                            &block[..count],
                             generation,
                             generation.next().unwrap(),
                         )
@@ -546,6 +784,7 @@ fn sampling(border: Option<[u32; 4]>) {
                             nixe_gpu::AccessTarget::Image {
                                 image: *image,
                                 subresources: ImageSubresourceRange {
+                                    mip_level: if mipmapped { 1 } else { 0 },
                                     layer_count: layers,
                                     ..subresources
                                 },
@@ -582,7 +821,9 @@ fn sampling(border: Option<[u32; 4]>) {
             creations.clear();
             let mut pixels = [0; 64];
             target_backing.range().read(0, &mut pixels).unwrap();
-            let expected = if let Some(border) = border {
+            let expected = if lod_bias != 0.0 {
+                [0; 4]
+            } else if let Some(border) = border {
                 border.map(|bits| (f32::from_bits(bits) * 255.0) as u8)
             } else if let Some(srgb) = formats[index].0.astc_profile() {
                 if colored {
@@ -591,6 +832,38 @@ fn sampling(border: Option<[u32; 4]>) {
                     [55, 13, 4, 255]
                 } else {
                     [128, 64, 32, 255]
+                }
+            } else if matches!(
+                formats[index].0,
+                ImageFormat::Bc7RgbaUnorm | ImageFormat::Bc7RgbaSrgb
+            ) {
+                match (colored, formats[index].0 == ImageFormat::Bc7RgbaSrgb) {
+                    (false, false) => [128, 64, 32, 254],
+                    (false, true) => [55, 13, 4, 254],
+                    (true, false) => [192, 96, 16, 128],
+                    (true, true) => [134, 30, 1, 128],
+                }
+            } else if matches!(
+                formats[index].0,
+                ImageFormat::Bc3RgbaUnorm | ImageFormat::Bc3RgbaSrgb
+            ) {
+                if colored {
+                    if formats[index].0 == ImageFormat::Bc3RgbaSrgb {
+                        [59, 57, 59, 90]
+                    } else {
+                        [132, 130, 132, 90]
+                    }
+                } else {
+                    [0, 0, 0, 180]
+                }
+            } else if matches!(
+                formats[index].0,
+                ImageFormat::Bc4RSnorm | ImageFormat::Bc5RgSnorm
+            ) {
+                if colored {
+                    [129, 129, 129, 255]
+                } else {
+                    [255; 4]
                 }
             } else if formats[index].0 == ImageFormat::R8Unorm {
                 [255, 255, 255, if colored { 149 } else { 73 }]
@@ -616,23 +889,36 @@ fn sampling(border: Option<[u32; 4]>) {
                     ComponentSwizzle::Green | ComponentSwizzle::Blue | ComponentSwizzle::Zero => 0,
                     ComponentSwizzle::Alpha | ComponentSwizzle::One => 255,
                 })
-            } else if colored {
-                if index >= 2 {
-                    [59_u8, 57, 59, 255]
-                } else {
-                    [132, 130, 132, 255]
-                }
             } else {
-                [
-                    0,
-                    0,
-                    0,
-                    if formats[index].0.has_opaque_bc1_alpha() {
-                        255
+                let texel = if colored {
+                    if matches!(
+                        formats[index].0,
+                        ImageFormat::Bc1RgbSrgb | ImageFormat::Bc1RgbaSrgb
+                    ) {
+                        [59, 57, 59, 255]
                     } else {
-                        0
-                    },
-                ]
+                        [132, 130, 132, 255]
+                    }
+                } else {
+                    [
+                        0,
+                        0,
+                        0,
+                        if formats[index].0.has_opaque_bc1_alpha() {
+                            255
+                        } else {
+                            0
+                        },
+                    ]
+                };
+                formats[index].1.0.map(|channel| match channel {
+                    ComponentSwizzle::Red => texel[0],
+                    ComponentSwizzle::Green => texel[1],
+                    ComponentSwizzle::Blue => texel[2],
+                    ComponentSwizzle::Alpha => texel[3],
+                    ComponentSwizzle::Zero => 0,
+                    ComponentSwizzle::One => 255,
+                })
             };
             for pixel in pixels.chunks_exact(4) {
                 for (actual, expected) in pixel.iter().zip(expected) {
@@ -652,7 +938,14 @@ fn interface(location: ShaderIoLocation, component: u8) -> ShaderInterfaceElemen
     ShaderInterfaceElement::new(location, component, ShaderScalarType::Float32, None).unwrap()
 }
 
-fn sampled_fragment(array: bool, outside: bool) -> nixe_gpu::ShaderBackendModule {
+fn sampled_fragment(
+    array: bool,
+    outside: bool,
+    mipmapped: bool,
+    signed: bool,
+    implicit_lod: bool,
+    texel_offset: Option<[i32; 2]>,
+) -> nixe_gpu::ShaderBackendModule {
     let outputs = (0..4)
         .map(|component| {
             ShaderTextureSampleOutput::new(ShaderRegister::new(2 + u16::from(component)), component)
@@ -662,26 +955,36 @@ fn sampled_fragment(array: bool, outside: bool) -> nixe_gpu::ShaderBackendModule
     let coordinates = [ShaderRegister::new(0), ShaderRegister::new(1)];
     let sample = if array {
         ShaderOperation::SampleTexture2DArray {
+            offset: texel_offset,
             outputs,
             coordinates,
             array_index: ShaderRegister::new(6),
             image_binding: 0,
-            lod: None,
+            lod: (mipmapped && !implicit_lod).then_some(ShaderRegister::new(7)),
             sampler_binding: 1,
         }
     } else {
         ShaderOperation::SampleTexture2D {
+            offset: texel_offset,
             outputs,
             coordinates,
             image_binding: 0,
-            lod: None,
+            lod: (mipmapped && !implicit_lod).then_some(ShaderRegister::new(7)),
             sampler_binding: 1,
         }
+    };
+    let source_inputs = if implicit_lod {
+        vec![
+            interface(ShaderIoLocation::Position, 0),
+            interface(ShaderIoLocation::Position, 1),
+        ]
+    } else {
+        vec![]
     };
     nixe_gpu::ShaderBackendModule::new(
         VerifiedShaderIr::verify(ShaderIr::new(
             ShaderStage::Fragment,
-            vec![],
+            source_inputs,
             (0..4)
                 .map(|component| interface(ShaderIoLocation::Color(0), component))
                 .collect(),
@@ -702,6 +1005,7 @@ fn sampled_fragment(array: bool, outside: bool) -> nixe_gpu::ShaderBackendModule
             vec![
                 move_f32(8, 0, if outside { 1.25 } else { 0.75 }),
                 move_f32(16, 1, 0.75),
+                move_f32(20, 7, 1.0),
                 ShaderInstruction::new(
                     ShaderSourceLocation::new(24),
                     ShaderPredicate::Always,
@@ -711,14 +1015,55 @@ fn sampled_fragment(array: bool, outside: bool) -> nixe_gpu::ShaderBackendModule
                         scalar_type: ShaderScalarType::Unsigned32,
                     },
                 ),
+            ]
+            .into_iter()
+            .chain(if implicit_lod {
+                vec![
+                    load_input(25, 0, 0, ShaderIoLocation::Position, 2),
+                    move_f32(26, 8, 0.25),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(27),
+                        ShaderPredicate::Always,
+                        ShaderOperation::Multiply32 {
+                            destination: ShaderRegister::new(0),
+                            left: ShaderRegister::new(0),
+                            right: ShaderRegister::new(8),
+                            scalar_type: ShaderScalarType::Float32,
+                            float_control: nixe_gpu::ShaderFloatControl::PRECISE,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(28),
+                        ShaderPredicate::Always,
+                        ShaderOperation::Multiply32 {
+                            destination: ShaderRegister::new(1),
+                            left: ShaderRegister::new(1),
+                            right: ShaderRegister::new(8),
+                            scalar_type: ShaderScalarType::Float32,
+                            float_control: nixe_gpu::ShaderFloatControl::PRECISE,
+                        },
+                    ),
+                ]
+            } else {
+                vec![]
+            })
+            .chain([ShaderInstruction::new(
+                ShaderSourceLocation::new(32),
+                ShaderPredicate::Always,
+                sample,
+            )])
+            .chain((2..5).filter(|_| signed).map(|reg| {
                 ShaderInstruction::new(
-                    ShaderSourceLocation::new(32),
+                    ShaderSourceLocation::new(40 + (reg - 2) * 8),
                     ShaderPredicate::Always,
-                    sample,
-                ),
-                store_output(40, 2, ShaderIoLocation::Color(0), 4),
-                exit(48),
-            ],
+                    ShaderOperation::FloatNegate32 {
+                        destination: ShaderRegister::new(reg as u16),
+                        source: ShaderRegister::new(reg as u16),
+                    },
+                )
+            }))
+            .chain([store_output(64, 2, ShaderIoLocation::Color(0), 4), exit(72)])
+            .collect(),
         ))
         .unwrap(),
     )
@@ -734,4 +1079,22 @@ fn astc_constant(rgba: [u8; 4]) -> [u8; 16] {
             .copy_from_slice(&(u16::from(value) * 257).to_le_bytes());
     }
     block
+}
+
+// One-subset mode 6: seven bits per RGBA endpoint and one shared parity bit.
+// https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format-mode-reference#mode-6
+fn bc7_constant(rgba: [u8; 4]) -> [u8; 16] {
+    let parity = rgba[0] & 1;
+    assert!(rgba.iter().all(|v| v & 1 == parity));
+    let mut bits = 1_u128 << 6;
+    let mut position = 7;
+    for channel in rgba {
+        for _ in 0..2 {
+            bits |= u128::from(channel >> 1) << position;
+            position += 7;
+        }
+    }
+    bits |= u128::from(parity) << 63;
+    bits |= u128::from(parity) << 64;
+    bits.to_le_bytes()
 }

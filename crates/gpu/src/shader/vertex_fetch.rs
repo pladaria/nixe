@@ -61,6 +61,7 @@ pub(super) fn attribute_value(
             Float32x3 => (Float, 32, 3),
             Float32x4 => (Float, 32, 4),
             Unorm10_10_10_2 => (Unorm, 32, 4),
+            Snorm10_10_10_2 => (Snorm, 32, 4),
             _ => unreachable!("integer and scaled formats handled above"),
         }
     };
@@ -106,7 +107,7 @@ pub(super) fn attribute_value(
             );
             continue;
         }
-        let packed = format == Unorm10_10_10_2;
+        let packed = matches!(format, Unorm10_10_10_2 | Snorm10_10_10_2);
         let offset = base
             .checked_add(if packed {
                 0
@@ -133,7 +134,20 @@ pub(super) fn attribute_value(
             } else {
                 (u32::from(component) * 10, 1023)
             };
-            format!("(f32(({raw} >> {shift}u) & {mask}u) / {mask}.0)")
+            if format == Snorm10_10_10_2 {
+                let bits = if component == 3 { 2 } else { 10 };
+                // Sign-extend each packed lane independently, then clamp the
+                // most negative value to -1, including the two-bit W lane.
+                // https://docs.vulkan.org/spec/latest/chapters/formats.html#formats-numericformat
+                format!(
+                    "max(f32(i32({raw} << {}u) >> {}u) / {}.0, -1.0)",
+                    32 - shift - bits,
+                    32 - bits,
+                    (1_u32 << (bits - 1)) - 1
+                )
+            } else {
+                format!("(f32(({raw} >> {shift}u) & {mask}u) / {mask}.0)")
+            }
         } else {
             match encoding {
                 Float if width == 16 => format!("unpack2x16float({raw}).x"),

@@ -160,6 +160,7 @@ pub(crate) fn create_device(
                 wide_lines: core.wide_lines != vk::FALSE,
                 rectangular_lines: line_features.rectangular_lines != vk::FALSE,
                 smooth_lines: line_features.smooth_lines != vk::FALSE,
+                depth_bias_clamp: core.depth_bias_clamp != vk::FALSE,
                 line_width_range_bits: properties.limits.line_width_range.map(f32::to_bits),
             },
             float32: SpirvFloat32Capabilities {
@@ -276,6 +277,7 @@ fn enabled_core(
     required.full_draw_index_uint32 = supported.full_draw_index_uint32;
     required.fill_mode_non_solid = supported.fill_mode_non_solid;
     required.wide_lines = supported.wide_lines;
+    required.depth_bias_clamp = supported.depth_bias_clamp;
     required
 }
 

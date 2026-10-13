@@ -103,6 +103,10 @@ impl NixeConfig {
                     .system
                     .font
                     .map(|path| resolve_path(base_directory, path)),
+                dictionary: raw
+                    .system
+                    .dictionary
+                    .map(|path| resolve_path(base_directory, path)),
                 initial_operation_mode: raw.system.initial_operation_mode,
                 time: TimeConfig {
                     mode: raw.system.time.mode,
@@ -191,6 +195,8 @@ pub struct SystemConfig {
     pub keys: PathBuf,
     /// TTF file supplied to applications through the shared-font service.
     pub font: Option<PathBuf>,
+    /// Word lists used to generate the system profanity-filter archive.
+    pub dictionary: Option<PathBuf>,
     /// Operation mode reported to titles when the emulated system starts.
     pub initial_operation_mode: InitialOperationMode,
     /// Initial virtual-time policy.
@@ -468,6 +474,8 @@ struct RawSystemConfig {
     keys: PathBuf,
     #[serde(default)]
     font: Option<PathBuf>,
+    #[serde(default)]
+    dictionary: Option<PathBuf>,
     initial_operation_mode: InitialOperationMode,
     #[serde(default)]
     time: RawTimeConfig,
@@ -776,6 +784,7 @@ mod tests {
                 preferred_languages = ["Spanish", "AmericanEnglish"]
                 keys = "./keys"
                 font = "./assets/Roboto-Regular.ttf"
+                dictionary = "./assets/dict.toml"
                 initial_operation_mode = "docked"
             "#,
         );
@@ -798,6 +807,10 @@ mod tests {
         assert_eq!(
             config.system.font,
             Some(base.join("./assets/Roboto-Regular.ttf"))
+        );
+        assert_eq!(
+            config.system.dictionary,
+            Some(base.join("./assets/dict.toml"))
         );
         assert_eq!(
             config.system.initial_operation_mode,

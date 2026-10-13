@@ -4666,8 +4666,7 @@ fn preflight_output_state(
             "SET_POLY_OFFSET",
         ),
         // These float parameters are inactive unless polygon offset is enabled
-        // for the consumed polygon mode. The raster lowering boundary rejects
-        // enabled depth bias explicitly until the host pipeline implements it.
+        // for the consumed polygon mode. Validate and lower them on consumption.
         // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2782-L2783
         // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2888-L2889
         // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3327-L3328

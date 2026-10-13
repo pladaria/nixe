@@ -3,6 +3,7 @@ members = [
     "apps/cli",
     "crates/config",
     "crates/audio",
+    "crates/applets",
     "crates/cpu",
     "crates/cpu-interpreter",
     "crates/cpu-jit",
@@ -37,6 +38,10 @@ aes = "0.8.4"
 bytemuck = "1.22"
 chrono = "0.4.41"
 chrono-tz = "0.10.4"
+flate2 = "1"
+egui = { version = "0.36.2", default-features = false }
+egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard", "x11", "wayland"] }
+egui-wgpu = { version = "0.36.2", default-features = false }
 ctrlc = "3.4"
 getrandom = "0.4"
 lz4_flex = "0.11"
@@ -58,6 +63,7 @@ tempfile = "3.27"
 twox-hash = { version = "2.1.3", default-features = false, features = ["std", "xxhash3_128"] }
 nixe-config = { path = "crates/config" }
 nixe-audio = { path = "crates/audio" }
+nixe-applets = { path = "crates/applets" }
 nixe-cpu = { path = "crates/cpu" }
 nixe-cpu-interpreter = { path = "crates/cpu-interpreter" }
 nixe-cpu-jit = { path = "crates/cpu-jit" }

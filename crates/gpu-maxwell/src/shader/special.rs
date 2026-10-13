@@ -10,7 +10,7 @@ use nixe_gpu::{
 };
 
 pub(super) const fn is_mufu(encoding: u64) -> bool {
-    ((encoding >> 48) as u16) & 0xfffe == 0x5080
+    ((encoding >> 48) as u16) & 0xfffa == 0x5080
 }
 
 pub(super) const fn is_range_reduction(encoding: u64) -> bool {
@@ -207,7 +207,7 @@ pub(super) fn decode_range_reduced_mufu(
             ShaderNanMode::Propagate,
             false,
             false,
-            false,
+            encoding & (1 << 50) != 0,
         ),
     })
 }
@@ -238,7 +238,7 @@ pub(super) fn decode_mufu(
         ShaderNanMode::Propagate,
         false,
         false,
-        false,
+        encoding & (1 << 50) != 0,
     );
     let mufu_operation = ((encoding >> 20) & 0xf) as u8;
     let operation = match mufu_operation {

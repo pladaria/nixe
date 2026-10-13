@@ -17,6 +17,8 @@ mod graphics;
 mod graphics_event;
 mod hid;
 mod ipc;
+mod system_archive;
+pub use system_archive::SystemArchives;
 mod ipc_result;
 mod ipc_wire;
 mod nvdrv;

@@ -20,8 +20,17 @@ fn enabled_vertex_and_fragment_interfaces_are_linked_before_backend_lowering() {
     fragment_header[0] = 0x0002_5462;
     fragment_header[6] = 2;
     fragment_header[18] = 1;
-    let code = [0_u64, 0x0103_f800_0007_f000, 0xe300_0000_0007_000f, 0];
     let program_bytes = |header: [u32; 20]| {
+        let generic = (0..32)
+            .find(|index| (header[6 + index / 4] >> ((index % 4) * 8)) & 255 != 0)
+            .unwrap();
+        // Consume the selected header input, so linkage tests observe real reads.
+        let code = [
+            0_u64,
+            0xe0c3_ff88_0077_ff00 | ((generic as u64 * 16) << 28),
+            0xe300_0000_0007_000f,
+            0,
+        ];
         header
             .into_iter()
             .flat_map(u32::to_le_bytes)
@@ -193,16 +202,30 @@ fn unwritten_fragment_varyings_use_maxwell_defaults_and_specialize_cache_identit
     validate_wgsl(&lower_shader_ir_to_wgsl(fragment).unwrap());
     // The fragment binary is unchanged. A different producer exporting this
     // varying must use interpolation instead of reusing the constant variant.
+    for (exported_bit, expected_red, expected_green) in
+        [(20, 0.25_f32, 1.0_f32), (23, 0.0_f32, 0.75_f32)]
+    {
+        vertex_header[13] = 1 << exported_bit;
+        write_program(0, vertex_header, &vertex_code);
+        let partial =
+            translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+        assert_eq!(partial[1].module.ir().ir().inputs().len(), 1);
+        assert_ne!(defaults[1].fingerprint(), partial[1].fingerprint());
+        let inputs = nixe_gpu::ShaderEvaluationInputs::default()
+            .with_interface_bits(ShaderIoLocation::Generic(1), 0, 0.25_f32.to_bits())
+            .with_interface_bits(ShaderIoLocation::Generic(1), 3, 0.75_f32.to_bits());
+        let result = nixe_gpu::evaluate_shader_ir(partial[1].module.ir(), &inputs, 64).unwrap();
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Color(0), 0),
+            Some(expected_red.to_bits())
+        );
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Color(0), 1),
+            Some(expected_green.to_bits())
+        );
+        validate_wgsl(&lower_shader_ir_to_wgsl(partial[1].module.ir()).unwrap());
+    }
     vertex_header[13] = 1 << 20;
-    write_program(0, vertex_header, &vertex_code);
-    assert!(matches!(
-        translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]),
-        Err(MaxwellShaderTranslationError::StageInterfaceMismatch {
-            location: ShaderIoLocation::Generic(1),
-            component: 3,
-            ..
-        })
-    ));
     vertex_header[13] |= 1 << 23;
     write_program(0, vertex_header, &vertex_code);
     let exported =
@@ -590,7 +613,6 @@ fn reset_stage_groups_receive_distinct_neutral_resource_bindings() {
         crate::MaxwellThreeDResourceRole::ConstantBuffer { group: 4, slot: 0 }
     );
 }
-use super::super::error::MaxwellShaderTranslationError;
 
 #[test]
 fn graphics_ldg_uses_distinct_stage_bindings_and_coexists_with_textures() {

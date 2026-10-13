@@ -31,6 +31,7 @@ pub(in crate::ipc_wire) fn dispatch_service(
     hipc: &HipcRequest<'_>,
     file_system_access_log_mode: FileSystemAccessLogMode,
     save_data: Option<&crate::SaveDataSystem>,
+    system_archives: &crate::SystemArchives,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let target = match &request.domain {
         Some(DomainRequest::Close { object_id }) => {
@@ -80,6 +81,13 @@ pub(in crate::ipc_wire) fn dispatch_service(
         && request.command_id == 51
     {
         return fsp::open_save_data(process, session, request, hipc, save_data);
+    }
+
+    if matches!(target, Target::Root)
+        && session.service() == IpcService::FileSystem
+        && request.command_id == 202
+    {
+        return fsp::open_system_data(process, session, request, hipc, system_archives);
     }
 
     dispatch_command(

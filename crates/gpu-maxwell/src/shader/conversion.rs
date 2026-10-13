@@ -8,7 +8,7 @@ use nixe_gpu::{ShaderOperation, ShaderRegister, ShaderRoundingMode, ShaderScalar
 
 pub(super) const fn is_integer_to_float(encoding: u64) -> bool {
     let opcode = (encoding >> 48) as u16;
-    matches!(opcode, 0x5cb8 | 0x4cb8) || opcode & 0xfeff == 0x38b8
+    matches!(opcode & 0xfffd, 0x5cb8 | 0x4cb8) || opcode & 0xfefd == 0x38b8
 }
 
 pub(super) const fn is_float_to_float(encoding: u64) -> bool {
@@ -361,21 +361,13 @@ pub(super) fn decode_integer_to_float(
             detail: "I2F integer source negation",
         });
     }
-    if encoding & (1 << 49) != 0 {
-        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-            stage,
-            instruction_offset: offset,
-            encoding,
-            detail: "I2F integer source absolute value",
-        });
-    }
 
     let source_type = if encoding & (1 << 13) != 0 {
         ShaderScalarType::Signed32
     } else {
         ShaderScalarType::Unsigned32
     };
-    let opcode = (encoding >> 48) as u16;
+    let opcode = ((encoding >> 48) as u16) & !2;
     let mut operations = Vec::with_capacity(2);
     let (source, constant_buffer_binding) = if opcode == 0x5cb8 {
         let source = ((encoding >> 20) & 0xff) as u8;
@@ -473,6 +465,106 @@ pub(super) fn decode_integer_to_float(
             reverse: false,
         });
         extended
+    } else {
+        source
+    };
+    let source = if encoding & (1 << 49) != 0 {
+        if source_type == ShaderScalarType::Unsigned32 {
+            if source_bits < 32 {
+                return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                    stage,
+                    instruction_offset: offset,
+                    encoding,
+                    detail: "I2F unsigned narrow absolute modifier",
+                });
+            }
+            source
+        } else {
+            // Signed abs preserves the minimum of the original source width,
+            // including narrow sources which have already been sign-extended.
+            // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/integer_floating_point_conversion.cpp
+            use nixe_gpu::{
+                ShaderFloatControl, ShaderIntegerComparison, ShaderPredicate,
+                ShaderPredicateSetOperation,
+            };
+            let mut temporary = || {
+                allocate_shader_temporary(
+                    stage,
+                    offset,
+                    encoding,
+                    "I2F absolute source overflow",
+                    next_temporary,
+                )
+            };
+            let zero = temporary()?;
+            let minus_one = temporary()?;
+            let negative = temporary()?;
+            let negated = temporary()?;
+            let absolute = temporary()?;
+            operations.extend([
+                ShaderOperation::MoveImmediate32 {
+                    destination: zero,
+                    bits: 0,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                },
+                ShaderOperation::MoveImmediate32 {
+                    destination: minus_one,
+                    bits: u32::MAX,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                },
+                ShaderOperation::CompareInteger32 {
+                    destination: negative,
+                    float_result: false,
+                    left: source,
+                    right: zero,
+                    signed: true,
+                    comparison: ShaderIntegerComparison::Less,
+                    accumulator: ShaderPredicate::Always,
+                    set_operation: ShaderPredicateSetOperation::And,
+                },
+                ShaderOperation::Multiply32 {
+                    destination: negated,
+                    left: source,
+                    right: minus_one,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                    float_control: ShaderFloatControl::PRECISE,
+                },
+                ShaderOperation::Select32 {
+                    destination: absolute,
+                    condition: negative,
+                    when_true: negated,
+                    when_false: source,
+                },
+            ]);
+            if source_bits < 32 {
+                let minimum = temporary()?;
+                let is_minimum = temporary()?;
+                operations.extend([
+                    ShaderOperation::MoveImmediate32 {
+                        destination: minimum,
+                        bits: (-(1_i32 << (source_bits - 1))) as u32,
+                        scalar_type: ShaderScalarType::Signed32,
+                    },
+                    ShaderOperation::CompareInteger32 {
+                        destination: is_minimum,
+                        float_result: false,
+                        left: source,
+                        right: minimum,
+                        signed: true,
+                        comparison: ShaderIntegerComparison::Equal,
+                        accumulator: ShaderPredicate::Always,
+                        set_operation: ShaderPredicateSetOperation::And,
+                    },
+                    ShaderOperation::Select32 {
+                        destination: absolute,
+                        condition: is_minimum,
+                        when_true: source,
+                        when_false: absolute,
+                    },
+                ]);
+            }
+            absolute
+        }
     } else {
         source
     };

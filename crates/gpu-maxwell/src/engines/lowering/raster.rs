@@ -11,6 +11,7 @@ pub(super) struct DrawRasterState {
     pub front_face: FrontFace,
     pub cull_mode: CullMode,
     pub triangles: TriangleRasterization,
+    pub depth_bias: Option<nixe_gpu::DepthBias>,
 }
 
 pub(super) fn draw_state(
@@ -22,6 +23,7 @@ pub(super) fn draw_state(
         ));
     }
     let (front_face, cull_mode) = face_state(state)?;
+    let mut depth_bias = None;
     let triangles = if state.generated_primitive()
         == Some(super::super::threed::state::GeneratedPrimitive::Triangles)
         && cull_mode != CullMode::FrontAndBack
@@ -56,9 +58,7 @@ pub(super) fn draw_state(
             }
         };
         if state.fixed_function().register(offset).value() == Some(&V::Boolean(true)) {
-            return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
-                "depth bias for the consumed polygon mode",
-            ));
+            depth_bias = Some(polygon_depth_bias(state)?);
         }
         match selected {
             MaxwellThreeDPolygonMode::Fill => {
@@ -83,6 +83,33 @@ pub(super) fn draw_state(
         front_face,
         cull_mode,
         triangles,
+        depth_bias,
+    })
+}
+
+fn polygon_depth_bias(
+    state: &MaxwellThreeDState,
+) -> Result<nixe_gpu::DepthBias, MaxwellLoweringError> {
+    let parameter = |register, name| {
+        let bits = match state.fixed_function().register(register).value() {
+            Some(V::FloatBits(bits)) => bits.get(),
+            None => return Err(MaxwellLoweringError::IncompleteDraw(name)),
+            _ => return Err(wrong_type()),
+        };
+        if !f32::from_bits(bits).is_finite() {
+            return Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
+                "non-finite polygon depth bias parameter",
+            ));
+        }
+        Ok(bits)
+    };
+    // Maxwell uses half of the host API's constant depth-format unit.
+    // https://git.h3cjp.net/H3cJP/ryujinx/src/commit/ed32cd6999f76d056f1bc48e438147f34fd6d3a2/src/Ryujinx.Graphics.Gpu/Engine/Threed/StateUpdater.cs
+    let units = f32::from_bits(parameter(R::DepthBias, "SET_DEPTH_BIAS")?);
+    Ok(nixe_gpu::DepthBias {
+        constant_bits: (units * 0.5).to_bits(),
+        slope_scale_bits: parameter(R::SlopeScaleDepthBias, "SET_SLOPE_SCALE_DEPTH_BIAS")?,
+        clamp_bits: parameter(R::DepthBiasClamp, "SET_DEPTH_BIAS_CLAMP")?,
     })
 }
 
@@ -291,21 +318,31 @@ mod tests {
         program_three_d(&mut channel, 0x0dc8, 1);
         assert!(draw_state(channel.three_d()).is_ok());
         program_three_d(&mut channel, 0x0dc4, 1);
-        assert!(matches!(
-            draw_state(channel.three_d()),
-            Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
-                "depth bias for the consumed polygon mode"
-            ))
-        ));
+        assert_eq!(
+            draw_state(channel.three_d()).unwrap().depth_bias,
+            Some(nixe_gpu::DepthBias {
+                constant_bits: 1_f32.to_bits(),
+                slope_scale_bits: 2_f32.to_bits(),
+                clamp_bits: 2_f32.to_bits(),
+            })
+        );
         program_three_d(&mut channel, 0x0dc4, 0);
         assert!(draw_state(channel.three_d()).is_ok());
         program_three_d(&mut channel, 0x0dac, 0x1b02);
-        assert!(matches!(
-            draw_state(channel.three_d()),
-            Err(MaxwellLoweringError::UnsupportedPolygonRasterization(
-                "depth bias for the consumed polygon mode"
-            ))
-        ));
+        program_three_d(&mut channel, 0x0db4, 0);
+        assert_eq!(
+            draw_state(channel.three_d())
+                .unwrap()
+                .depth_bias
+                .unwrap()
+                .constant_bits,
+            1_f32.to_bits()
+        );
+        // Inactive malformed bias remains irrelevant; active parameters fail.
+        program_three_d(&mut channel, 0x15bc, f32::NAN.to_bits());
+        assert!(draw_state(channel.three_d()).is_err());
+        program_three_d(&mut channel, 0x0dc8, 0);
+        assert_eq!(draw_state(channel.three_d()).unwrap().depth_bias, None);
     }
 
     #[test]
@@ -375,13 +412,7 @@ mod tests {
 
     #[test]
     fn active_unsupported_line_effects_are_not_silently_dropped() {
-        for (method, value) in [
-            (0x1570, 0),
-            (0x166c, 1),
-            (0x0f8c, 1),
-            (0x15e4, 0),
-            (0x0dc4, 1),
-        ] {
+        for (method, value) in [(0x1570, 0), (0x166c, 1), (0x0f8c, 1), (0x15e4, 0)] {
             let mut channel = wireframe_channel();
             program_three_d(&mut channel, method, value);
             assert!(

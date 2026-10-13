@@ -252,10 +252,16 @@ fn cropped_color_preserves_padding_and_readonly_stencil_shares_sampled_depth() {
                 .with_fragment_depth_transform(depth)
         });
         prepared.stencil_state = Some(StencilTestState {
-            front_compare: DepthCompareOperation::NotEqual,
-            back_compare: DepthCompareOperation::NotEqual,
-            read_mask: 2,
-            reference,
+            front: nixe_gpu::StencilFaceState::read_only(
+                DepthCompareOperation::NotEqual,
+                2,
+                reference,
+            ),
+            back: nixe_gpu::StencilFaceState::read_only(
+                DepthCompareOperation::NotEqual,
+                2,
+                reference,
+            ),
         });
         let begin = RenderPassOperation::begin(
             pass,

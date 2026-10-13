@@ -215,6 +215,16 @@ pub enum IpcResponse {
 pub struct IpcDispatcher;
 
 impl IpcDispatcher {
+    pub(crate) fn open_storage(
+        handles: &mut HandleTable,
+        storage: nixe_loader_storage::StorageRef,
+    ) -> Result<IpcResponse, IpcResultCode> {
+        insert_handle(
+            handles,
+            SemanticIpcObject::ReadOnlyStorage(ReadOnlyStorage::new(storage)),
+        )
+    }
+
     /// Connects to one built-in service after applying the effective NPDM SAC.
     pub fn connect(
         mounts: &ProcessMountNamespace,
@@ -348,10 +358,7 @@ fn dispatch_session(
                 .primary()
                 .map(|mount| mount.romfs().storage())
                 .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
-            insert_handle(
-                handles,
-                SemanticIpcObject::ReadOnlyStorage(ReadOnlyStorage::new(storage)),
-            )
+            IpcDispatcher::open_storage(handles, storage)
         }
         (IpcService::FileSystem, IpcRequest::OpenSdCardFileSystem) => {
             require_sd_card_access(mounts)?;

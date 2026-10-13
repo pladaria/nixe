@@ -224,6 +224,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         time: time_environment,
         settings: settings_environment,
         shared_fonts: nixe_horizon::SharedFontSession::new(config.system.font.clone()),
+        system_archives: nixe_horizon::SystemArchives::new(config.system.dictionary.clone()),
         application_language: plan.control_metadata().and_then(|control| {
             desired_application_language(
                 control.supported_languages(),
@@ -284,6 +285,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let input = input_owner.reader();
     let host_input = HostInputReaders {
         controller: input,
+        keyboard: frontend.as_ref().map(WindowFrontend::keyboard_host),
         touch_screen,
         vibration: input_owner
             .vibration_output()
@@ -547,6 +549,7 @@ struct HorizonEnvironment {
     time: TimeEnvironment,
     settings: SettingsEnvironment,
     shared_fonts: nixe_horizon::SharedFontSession,
+    system_archives: nixe_horizon::SystemArchives,
     application_language: Option<SystemLanguage>,
     user_account_switch_locked: Option<bool>,
     save_data: Option<SaveDataSystem>,
@@ -554,6 +557,7 @@ struct HorizonEnvironment {
 }
 
 struct HostInputReaders {
+    keyboard: Option<nixe_applets::keyboard::KeyboardHost>,
     controller: InputReader<Option<ProfiledControllerState>>,
     touch_screen: Option<TouchScreenReader>,
     vibration: nixe_input::VibrationOutput,
@@ -706,9 +710,13 @@ fn execute(
         video_system,
     )
     .with_shared_fonts(horizon_environment.shared_fonts)
+    .with_system_archives(horizon_environment.system_archives)
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend)
     .with_vibration_output(host_input.vibration.clone());
+    if let Some(host) = &host_input.keyboard {
+        dispatcher = dispatcher.with_keyboard_host(host.clone());
+    }
     if let Some(save_data) = horizon_environment.save_data {
         save_data
             .prepare_for_launch()
@@ -779,8 +787,19 @@ fn execute(
                 .vibration
                 .select_controller(profiled.map(|controller| controller.controller_id))
                 .map_err(|error| format!("cannot route controller vibration: {error}"))?;
+            let controller = profiled.map(|controller| &controller.state);
+            let captured = host_input
+                .keyboard
+                .as_ref()
+                .is_some_and(|host| host.route_controller(controller));
+            let muted = controller.map(|state| nixe_input::EmulatedControllerState {
+                buttons: Default::default(),
+                left_stick: Default::default(),
+                right_stick: Default::default(),
+                ..*state
+            });
             dispatcher
-                .advance_input(profiled.map(|controller| &controller.state), delta)
+                .advance_input(if captured { muted.as_ref() } else { controller }, delta)
                 .map_err(|error| format!("cannot publish Horizon HID state: {error}"))?;
             let touch_state = host_input
                 .touch_screen

@@ -57,7 +57,7 @@ fn four_sample_color_depth_resolve_and_single_sample_pipeline_reuse() {
             ImageFormat::Rgba8Srgb,
             ImageFormat::Bgra8Srgb,
         ] {
-            color_depth_resolve(depth_format, color_format, None);
+            color_depth_resolve(depth_format, color_format, None, None, None);
         }
     }
 }
@@ -69,7 +69,56 @@ fn indexed_u16_u32_msaa_fetch_preserves_first_index_and_signed_base_vertex() {
             ImageFormat::Depth32Float,
             ImageFormat::Rgba8Srgb,
             Some(kind),
+            None,
+            None,
         );
+    }
+}
+
+#[test]
+fn polygon_depth_bias_changes_occlusion_for_single_and_multisample_depth() {
+    for depth_format in [
+        ImageFormat::Depth32Float,
+        ImageFormat::Depth24UnormStencil8Uint,
+    ] {
+        color_depth_resolve(
+            depth_format,
+            ImageFormat::Rgba8Unorm,
+            None,
+            Some(nixe_gpu::DepthBias {
+                constant_bits: (-16777216_f32).to_bits(),
+                slope_scale_bits: 0,
+                // Positive clamp leaves negative bias intact while exercising
+                // device feature enablement and signed clamp preservation.
+                clamp_bits: 0.1_f32.to_bits(),
+            }),
+            None,
+        );
+    }
+}
+
+#[test]
+fn stencil_mutations_preserve_operations_masks_fail_paths_and_msaa_samples() {
+    use nixe_gpu::StencilOperation as O;
+    for (op, initial, result) in [
+        (O::Keep, 0xa5, 0xa5),
+        (O::Zero, 0xa5, 0),
+        (O::Replace, 0xa5, 0x3c),
+        (O::IncrementClamp, 255, 255),
+        (O::DecrementClamp, 0, 0),
+        (O::Invert, 0xa5, 0x5a),
+        (O::IncrementWrap, 255, 0),
+        (O::DecrementWrap, 0, 255),
+    ] {
+        for path in 0..3 {
+            color_depth_resolve(
+                ImageFormat::Depth24UnormStencil8Uint,
+                ImageFormat::Rgba8Unorm,
+                None,
+                None,
+                Some((op, initial, result, path)),
+            );
+        }
     }
 }
 
@@ -77,6 +126,8 @@ fn color_depth_resolve(
     depth_format: ImageFormat,
     color_format: ImageFormat,
     index_type: Option<IndexType>,
+    far_bias: Option<nixe_gpu::DepthBias>,
+    stencil: Option<(nixe_gpu::StencilOperation, u8, u8, u8)>,
 ) {
     let _guard = accelerated_test_guard();
     let Some(initialized) = initialize_backend(
@@ -259,6 +310,52 @@ fn color_depth_resolve(
             .with_depth_state(DepthState::new(true, true, DepthCompareOperation::Less)),
         )
     });
+    let prepared = prepared.map(|draw| {
+        let Some((op, _, _, path)) = stencil else {
+            return draw;
+        };
+        let mut draw = (*draw).clone();
+        let mut face = nixe_gpu::StencilFaceState::read_only(
+            if path == 0 {
+                DepthCompareOperation::Never
+            } else {
+                DepthCompareOperation::Always
+            },
+            255,
+            0x3c,
+        );
+        face.write_mask = 0x0f;
+        match path {
+            0 => face.fail = op,
+            1 => face.depth_fail = op,
+            _ => face.pass = op,
+        };
+        draw.stencil_state = Some(nixe_gpu::StencilTestState {
+            front: face,
+            back: face,
+        });
+        draw.depth_state.compare = if path == 1 {
+            DepthCompareOperation::Never
+        } else {
+            DepthCompareOperation::Always
+        };
+        Arc::new(draw)
+    });
+    let far_prepared = prepared.each_ref().map(|draw| {
+        let mut biased = (**draw).clone();
+        biased.depth_bias = far_bias;
+        if let Some((_, initial, result, _)) = stencil {
+            biased.depth_state = DepthState::DISABLED;
+            let reference = (initial & 0xf0) | (result & 0x0f);
+            let face =
+                nixe_gpu::StencilFaceState::read_only(DepthCompareOperation::Equal, 255, reference);
+            biased.stencil_state = Some(nixe_gpu::StencilTestState {
+                front: face,
+                back: face,
+            });
+        }
+        Arc::new(biased)
+    });
     let mut serial = 1;
     let mut submit = |creations: &[BackendResourceCreateInfo], operations| {
         runtime
@@ -294,7 +391,12 @@ fn color_depth_resolve(
                     depth,
                     ImageKind::DepthStencil,
                     depth_format,
-                    ClearValue::Depth(1.0),
+                    stencil.map_or(ClearValue::Depth(1.0), |(_, initial, _, _)| {
+                        ClearValue::DepthStencil {
+                            depth: 1.0,
+                            stencil: initial,
+                        }
+                    }),
                 ),
             ] {
                 operations.push(operation(GpuCommand::Clear(
@@ -329,7 +431,14 @@ fn color_depth_resolve(
                         kind: ImageKind::DepthStencil,
                         format: depth_format,
                         samples,
-                        load: load(ClearValue::Depth(1.0)),
+                        load: load(
+                            stencil.map_or(ClearValue::Depth(1.0), |(_, initial, _, _)| {
+                                ClearValue::DepthStencil {
+                                    depth: 1.0,
+                                    stencil: initial,
+                                }
+                            }),
+                        ),
                         store: AttachmentStore::Store,
                     },
                 ],
@@ -340,7 +449,11 @@ fn color_depth_resolve(
             operations.push(GpuOperation::new(
                 GpuCommand::Draw(
                     DrawOperation::new(
-                        Arc::clone(&prepared[index]),
+                        Arc::clone(if first_vertex == 3 {
+                            &far_prepared[index]
+                        } else {
+                            &prepared[index]
+                        }),
                         if index_type.is_some() {
                             DrawArguments::Indexed {
                                 first_index: first_vertex + 1,
@@ -453,7 +566,18 @@ fn color_depth_resolve(
                 };
                 (encoded * 255.0).round() as u8
             };
-            assert!(pixels[interior + red].abs_diff(encode(0.25)) <= 1);
+            let expected_red = if far_bias.is_some() || stencil.is_some() {
+                0.0
+            } else {
+                0.25
+            };
+            let expected_green = if far_bias.is_some() || stencil.is_some() {
+                1.0
+            } else {
+                0.0
+            };
+            assert!(pixels[interior + red].abs_diff(encode(expected_red)) <= 1);
+            assert!(pixels[interior + 1].abs_diff(encode(expected_green)) <= 1);
             assert_eq!(pixels[interior + 3], 255);
             assert_eq!(&pixels[..4], &[0; 4]);
             let mut partial = 0;
@@ -463,10 +587,13 @@ fn color_depth_resolve(
                 // sRGB conversion independently of edge sample coverage.
                 let coverage = (f64::from(pixel[3]) / 255.0 * 4.0).round() / 4.0;
                 assert!(
-                    pixel[red].abs_diff(encode(0.25 * coverage)) <= 2,
+                    pixel[red].abs_diff(encode(expected_red * coverage)) <= 2,
                     "format={color_format:?} samples={samples:?} pixel={pixel:?}"
                 );
-                assert_eq!(pixel[1], 0, "far green must fail per-sample depth");
+                assert!(
+                    pixel[1].abs_diff(encode(expected_green * coverage)) <= 2,
+                    "biased green must change depth occlusion"
+                );
                 assert_eq!(pixel[blue], 0);
                 if samples == SampleCount::One {
                     assert!(matches!(pixel[3], 0 | 255));

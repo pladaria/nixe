@@ -3,6 +3,7 @@
 #[cfg(feature = "performance-counters")]
 pub mod metrics;
 
+mod keyboard;
 mod screenshot;
 
 use std::collections::BTreeMap;
@@ -40,6 +41,7 @@ enum FrontendEvent {
     FrameAvailable,
     StopRequested,
     WorkerFinished,
+    Keyboard,
 }
 
 /// Thread-safe control channel into the main-thread window event loop.
@@ -116,6 +118,10 @@ impl WindowFrontend {
             pending: Arc::clone(&frame_wakeup_pending),
         }));
         let (touch_screen_writer, touch_screen) = touch_screen_channel();
+        let keyboard_proxy = proxy.clone();
+        let keyboard_host = nixe_applets::keyboard::KeyboardHost::new(move || {
+            let _ = keyboard_proxy.send_event(FrontendEvent::Keyboard);
+        });
         Ok(Self {
             event_loop,
             application: PresenterApplication {
@@ -131,6 +137,7 @@ impl WindowFrontend {
                 screenshots: None,
                 touch_screen_writer,
                 touch_tracker: TouchTracker::default(),
+                keyboard_host,
             },
             control: FrontendControl {
                 proxy,
@@ -148,6 +155,10 @@ impl WindowFrontend {
     #[must_use]
     pub fn control(&self) -> FrontendControl {
         self.control.clone()
+    }
+
+    pub fn keyboard_host(&self) -> nixe_applets::keyboard::KeyboardHost {
+        self.application.keyboard_host.clone()
     }
 
     pub fn take_touch_screen(&mut self) -> TouchScreenReader {
@@ -216,6 +227,9 @@ struct Presenter {
     displayed_title: String,
     configured: bool,
     surface_reconfigure_pending: bool,
+    keyboard: Option<keyboard::KeyboardOverlay>,
+    keyboard_host: Option<nixe_applets::keyboard::KeyboardHost>,
+    keyboard_redraw_at: Instant,
     screenshots: Option<screenshot::Screenshots>,
 }
 
@@ -357,6 +371,9 @@ impl Presenter {
             displayed_title: String::new(),
             configured: false,
             surface_reconfigure_pending: false,
+            keyboard: None,
+            keyboard_host: None,
+            keyboard_redraw_at: Instant::now(),
             screenshots: None,
         };
         presenter.resize(size.width, size.height);
@@ -553,6 +570,10 @@ impl Presenter {
             });
             if let (Some(frame_dimensions), Some(frame_bind_group)) =
                 (self.frame_dimensions, self.frame_bind_group.as_ref())
+                && !self
+                    .keyboard
+                    .as_ref()
+                    .is_some_and(keyboard::KeyboardOverlay::active)
             {
                 let viewport = letterbox_viewport(
                     frame_dimensions,
@@ -574,6 +595,22 @@ impl Presenter {
                 pass.draw(0..3, 0..1);
             }
         }
+        // egui uploads share the accelerated queue's synchronization boundary.
+        let ui_active = self
+            .keyboard
+            .as_ref()
+            .is_some_and(keyboard::KeyboardOverlay::active);
+        let _ui_queue_access = ui_active.then(|| self.queue_access.lock());
+        if ui_active {
+            self.keyboard.as_mut().unwrap().encode(
+                self.keyboard_host.as_ref().unwrap(),
+                &self.window,
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+            );
+        }
         // Encode only while the source frame lease is held. Requests made
         // between frames wait for the next fresh frame, never sample a released
         // swapchain image that the guest may already be rewriting.
@@ -590,7 +627,7 @@ impl Presenter {
         };
         let submission;
         {
-            let _queue_access = self.queue_access.lock();
+            let _queue_access = (!ui_active).then(|| self.queue_access.lock());
             submission = self.queue.submit([encoder.finish()]);
             self.queue.present(surface_texture);
         }
@@ -605,6 +642,14 @@ impl Presenter {
                 submission,
                 capture,
             );
+        }
+        drop(_ui_queue_access);
+        // AM completion can wake guest CPU work; never invoke it under the GPU queue lock.
+        if let Some(keyboard) = &mut self.keyboard {
+            keyboard.dispatch_submission();
+        }
+        if ui_active {
+            self.keyboard_redraw_at = Instant::now() + Duration::from_millis(16);
         }
         let now = Instant::now();
         self.refresh_title(now);
@@ -851,6 +896,7 @@ struct PresenterApplication {
     screenshots: Option<screenshot::Screenshots>,
     touch_screen_writer: TouchScreenWriter,
     touch_tracker: TouchTracker,
+    keyboard_host: nixe_applets::keyboard::KeyboardHost,
 }
 
 impl PresenterApplication {
@@ -885,6 +931,18 @@ impl PresenterApplication {
         let Some(presenter) = &mut self.presenter else {
             return Ok(());
         };
+        if let Some(request) = self.keyboard_host.take_request() {
+            self.touch_tracker.cancel_all(&self.touch_screen_writer);
+            let overlay = presenter.keyboard.get_or_insert_with(|| {
+                keyboard::KeyboardOverlay::new(
+                    &presenter.window,
+                    &presenter.device,
+                    presenter.surface_configuration.format,
+                )
+            });
+            overlay.open(request);
+            presenter.keyboard_host = Some(self.keyboard_host.clone());
+        }
         if let Some(frame) = self.mailbox.take_latest() {
             presenter.bind_frame(frame)?;
             presenter.frame_rate.record_frame();
@@ -944,6 +1002,11 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                     presenter.window.request_redraw();
                 }
             }
+            FrontendEvent::Keyboard => {
+                if let Some(presenter) = &self.presenter {
+                    presenter.window.request_redraw();
+                }
+            }
             FrontendEvent::StopRequested => {}
             FrontendEvent::WorkerFinished => {
                 // Drop the surface, device, queue and all presentation
@@ -968,6 +1031,25 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             .is_none_or(|presenter| presenter.window.id() != window_id)
         {
             return;
+        }
+        if let Some(presenter) = &mut self.presenter
+            && let Some(keyboard) = &mut presenter.keyboard
+            && keyboard.active()
+        {
+            keyboard.event(&presenter.window, &event);
+            if matches!(
+                event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::Ime(_)
+                    | WindowEvent::Touch(_)
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::CursorLeft { .. }
+                    | WindowEvent::MouseWheel { .. }
+            ) {
+                presenter.window.request_redraw();
+                return;
+            }
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -1083,8 +1165,19 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
         if let Some(presenter) = &mut self.presenter {
             let now = Instant::now();
             presenter.refresh_title(now);
-            event_loop
-                .set_control_flow(ControlFlow::WaitUntil(presenter.frame_rate.next_refresh()));
+            if presenter
+                .keyboard
+                .as_ref()
+                .is_some_and(keyboard::KeyboardOverlay::active)
+            {
+                if now >= presenter.keyboard_redraw_at {
+                    presenter.window.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(presenter.keyboard_redraw_at));
+            } else {
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(presenter.frame_rate.next_refresh()));
+            }
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }

@@ -350,6 +350,15 @@ pub struct LineRasterization {
     pub smooth: bool,
 }
 
+/// Polygon depth offset: constant factor in host depth-format units, slope
+/// factor and signed clamp. Float bits preserve exact pipeline identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DepthBias {
+    pub constant_bits: u32,
+    pub slope_scale_bits: u32,
+    pub clamp_bits: u32,
+}
+
 /// Front-facing winding in framebuffer coordinates (X right, Y down), after
 /// viewport transformation. Counterclockwise means negative shoelace area.
 /// Changing the viewport determinant changes facing; it does not change this
@@ -661,6 +670,7 @@ impl VertexComponentCount {
 /// Exact host-independent storage format of one vertex attribute.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VertexFormat {
+    Uint8,
     Uint8x2,
     Uint8x4,
     Sint8x2,
@@ -692,6 +702,7 @@ pub enum VertexFormat {
     Sint32x3,
     Sint32x4,
     Unorm10_10_10_2,
+    Snorm10_10_10_2,
     /// Unsigned integer storage converted to equal-magnitude floating point.
     Uscaled {
         width: VertexComponentWidth,
@@ -708,6 +719,7 @@ impl VertexFormat {
     #[must_use]
     pub const fn size(self) -> u64 {
         match self {
+            Self::Uint8 => 1,
             Self::Uint8x2 | Self::Sint8x2 | Self::Unorm8x2 | Self::Snorm8x2 => 2,
             Self::Uint8x4
             | Self::Sint8x4
@@ -721,7 +733,8 @@ impl VertexFormat {
             | Self::Float32
             | Self::Uint32
             | Self::Sint32
-            | Self::Unorm10_10_10_2 => 4,
+            | Self::Unorm10_10_10_2
+            | Self::Snorm10_10_10_2 => 4,
             Self::Uint16x4
             | Self::Sint16x4
             | Self::Unorm16x4
@@ -756,6 +769,7 @@ impl VertexFormat {
         use VertexComponentCount::{Four, One, Three, Two};
         use VertexComponentWidth::{Bits8, Bits16, Bits32};
         match self {
+            Self::Uint8 => Some((false, Bits8, One)),
             Self::Uint8x2 => Some((false, Bits8, Two)),
             Self::Uint8x4 => Some((false, Bits8, Four)),
             Self::Sint8x2 => Some((true, Bits8, Two)),
@@ -778,7 +792,9 @@ impl VertexFormat {
 
     #[must_use]
     pub const fn requires_vertex_pulling(self) -> bool {
-        self.scaled_layout().is_some() || self.integer_layout().is_some()
+        matches!(self, Self::Snorm10_10_10_2)
+            || self.scaled_layout().is_some()
+            || self.integer_layout().is_some()
     }
 }
 
@@ -871,14 +887,89 @@ impl DepthState {
     }
 }
 
-/// Read-only stencil comparison. Mutating operations need a separate draw
-/// contract rather than silently discarding their memory side effects.
+/// Fixed-function stencil operations, applied before the eight-bit write mask.
+/// https://docs.vulkan.org/spec/latest/chapters/fragops.html#fragops-stencil
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StencilOperation {
+    Keep,
+    Zero,
+    Replace,
+    IncrementClamp,
+    DecrementClamp,
+    Invert,
+    IncrementWrap,
+    DecrementWrap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct StencilFaceState {
+    pub compare: DepthCompareOperation,
+    pub fail: StencilOperation,
+    pub depth_fail: StencilOperation,
+    pub pass: StencilOperation,
+    pub read_mask: u8,
+    pub write_mask: u8,
+    pub reference: u8,
+}
+
+impl StencilFaceState {
+    #[must_use]
+    pub const fn read_only(compare: DepthCompareOperation, read_mask: u8, reference: u8) -> Self {
+        Self {
+            compare,
+            read_mask,
+            reference,
+            write_mask: 0,
+            fail: StencilOperation::Keep,
+            depth_fail: StencilOperation::Keep,
+            pass: StencilOperation::Keep,
+        }
+    }
+
+    #[must_use]
+    pub fn writes(self) -> bool {
+        self.write_mask != 0
+            && self
+                .reachable_operations()
+                .any(|op| op != StencilOperation::Keep)
+    }
+
+    #[must_use]
+    pub fn uses_reference(self) -> bool {
+        !matches!(
+            self.compare,
+            DepthCompareOperation::Always | DepthCompareOperation::Never
+        ) || (self.write_mask != 0
+            && self
+                .reachable_operations()
+                .any(|op| op == StencilOperation::Replace))
+    }
+
+    fn reachable_operations(self) -> impl Iterator<Item = StencilOperation> {
+        [
+            (self.fail, self.compare != DepthCompareOperation::Always),
+            (
+                self.depth_fail,
+                self.compare != DepthCompareOperation::Never,
+            ),
+            (self.pass, self.compare != DepthCompareOperation::Never),
+        ]
+        .into_iter()
+        .filter_map(|(op, reachable)| reachable.then_some(op))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct StencilTestState {
-    pub front_compare: DepthCompareOperation,
-    pub back_compare: DepthCompareOperation,
-    pub read_mask: u8,
-    pub reference: u8,
+    pub front: StencilFaceState,
+    pub back: StencilFaceState,
+}
+
+impl StencilTestState {
+    #[must_use]
+    pub fn writes(self) -> bool {
+        self.front.writes() || self.back.writes()
+    }
 }
 
 /// Immutable neutral state shared by draws which differ only in direct draw
@@ -904,6 +995,7 @@ pub struct PreparedDraw {
     pub vertex_position_transform: Option<VertexPositionTransform>,
     pub scissor: Option<ScissorRect>,
     pub depth_state: DepthState,
+    pub depth_bias: Option<DepthBias>,
     pub stencil_state: Option<StencilTestState>,
     accesses: Box<[ResourceAccess]>,
     dependencies: Box<[ResourceDependency]>,
@@ -988,6 +1080,7 @@ impl PreparedDraw {
             vertex_position_transform: None,
             scissor: None,
             depth_state: DepthState::DISABLED,
+            depth_bias: None,
             stencil_state: None,
             accesses: accesses.into_boxed_slice(),
             dependencies: dependencies.into_boxed_slice(),

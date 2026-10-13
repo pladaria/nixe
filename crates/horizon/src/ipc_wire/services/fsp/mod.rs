@@ -7,7 +7,9 @@ mod file;
 mod filesystem;
 mod save;
 mod storage;
+mod system_data;
 pub(super) use save::open_save_data;
+pub(super) use system_data::open_system_data;
 
 use nixe_runtime::ExceptionProcessContext;
 

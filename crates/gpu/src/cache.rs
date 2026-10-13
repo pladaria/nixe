@@ -11,7 +11,9 @@ pub const DEFAULT_SHADER_CACHE_ENTRIES: usize = 4_096;
 /// Default number of neutral frontend pipelines retained in memory.
 pub const DEFAULT_PIPELINE_CACHE_ENTRIES: usize = 8_192;
 /// Default host-specialized variants retained for one neutral pipeline.
-pub const DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE: usize = 64;
+// A neutral pipeline describes graphics/compute kind, so a 3D scene can
+// specialize it into well over a hundred host pipelines in one working set.
+pub const DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE: usize = 256;
 /// Default host bind groups retained for one neutral descriptor table.
 pub const DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE: usize = 64;
 /// Default maximum size of one persistent backend pipeline cache.

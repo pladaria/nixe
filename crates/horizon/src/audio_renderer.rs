@@ -11,6 +11,8 @@ use nixe_runtime::{
     WritableEventObject,
 };
 use std::sync::{Arc, Mutex, Weak};
+mod buffer;
+mod effect;
 mod render;
 mod resample;
 pub(crate) mod update;

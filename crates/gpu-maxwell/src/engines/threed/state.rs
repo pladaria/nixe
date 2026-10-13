@@ -2013,6 +2013,10 @@ impl MaxwellThreeDStateWrite {
         matches!(
             self,
             Self::VertexInput(MaxwellThreeDVertexInputWrite::Attribute { .. })
+                | Self::FixedFunction(MaxwellThreeDFixedFunctionWrite::Register {
+                    register: MaxwellThreeDFixedFunctionRegister::WindowOrigin,
+                    ..
+                })
                 | Self::ShaderBinding(
                     MaxwellThreeDShaderBindingWrite::ProgramRegionAddressUpper { .. }
                         | MaxwellThreeDShaderBindingWrite::ProgramRegionAddressLower { .. }

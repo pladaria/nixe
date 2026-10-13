@@ -137,6 +137,7 @@ impl HorizonSvcDispatcher {
             &self.time_environment,
             crate::ipc_wire::HostSystems {
                 video: &self.video_system,
+                keyboard: self.keyboard_host.as_ref(),
                 audio_backend: self.audio_backend.as_ref(),
                 audio_renderers: &self.audio_renderers,
                 hid: &self.hid_system,
@@ -145,6 +146,7 @@ impl HorizonSvcDispatcher {
                 user_account_switch_locked: self.user_account_switch_locked,
                 save_data: self.save_data.as_ref(),
                 shared_fonts: &self.shared_fonts,
+                system_archives: &self.system_archives,
                 diagnostics: &self.diagnostics,
                 caller_thread_id,
             },
@@ -241,6 +243,7 @@ impl HorizonSvcDispatcher {
             &self.time_environment,
             crate::ipc_wire::HostSystems {
                 video: &self.video_system,
+                keyboard: self.keyboard_host.as_ref(),
                 audio_backend: self.audio_backend.as_ref(),
                 audio_renderers: &self.audio_renderers,
                 hid: &self.hid_system,
@@ -249,6 +252,7 @@ impl HorizonSvcDispatcher {
                 user_account_switch_locked: self.user_account_switch_locked,
                 save_data: self.save_data.as_ref(),
                 shared_fonts: &self.shared_fonts,
+                system_archives: &self.system_archives,
                 diagnostics: &self.diagnostics,
                 caller_thread_id,
             },

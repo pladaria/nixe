@@ -112,6 +112,7 @@ pub(crate) struct MaxwellShaderTranslationSource {
     bindings: Arc<crate::MaxwellThreeDShaderBindingState>,
     programs: Box<[MaxwellShaderSourceProgram]>,
     texture_constant_buffer_slot: Option<u8>,
+    y_negate: bool,
     vertex_input_types: Box<[(ShaderIoLocation, ShaderScalarType)]>,
 }
 
@@ -119,6 +120,7 @@ impl PartialEq for MaxwellShaderTranslationSource {
     fn eq(&self, other: &Self) -> bool {
         self.programs == other.programs
             && self.texture_constant_buffer_slot == other.texture_constant_buffer_slot
+            && self.y_negate == other.y_negate
             && self.vertex_input_types == other.vertex_input_types
     }
 }
@@ -132,6 +134,7 @@ impl Hash for MaxwellShaderTranslationSource {
             program.hash(state);
         }
         self.texture_constant_buffer_slot.hash(state);
+        self.y_negate.hash(state);
         self.vertex_input_types.len().hash(state);
         for input in &self.vertex_input_types {
             input.hash(state);
@@ -147,6 +150,7 @@ pub(crate) struct MaxwellShaderTranslationSourceKey {
     programs: [Option<MaxwellShaderSourceProgram>; MAXWELL_PIPELINE_SHADER_COUNT],
     program_count: usize,
     texture_constant_buffer_slot: Option<u8>,
+    y_negate: bool,
     vertex_input_types:
         [Option<(ShaderIoLocation, ShaderScalarType)>; MAXWELL_VERTEX_ATTRIBUTE_COUNT],
     vertex_input_count: usize,
@@ -161,6 +165,7 @@ impl MaxwellShaderTranslationSourceKey {
     pub(crate) fn matches(&self, source: &MaxwellShaderTranslationSource) -> bool {
         self.programs().eq(source.programs.iter().copied())
             && self.texture_constant_buffer_slot == source.texture_constant_buffer_slot
+            && self.y_negate == source.y_negate
             && self
                 .vertex_input_types()
                 .eq(source.vertex_input_types.iter().copied())
@@ -171,6 +176,7 @@ impl MaxwellShaderTranslationSourceKey {
             bindings: Arc::clone(&self.bindings),
             programs: self.programs().collect(),
             texture_constant_buffer_slot: self.texture_constant_buffer_slot,
+            y_negate: self.y_negate,
             vertex_input_types: self.vertex_input_types().collect(),
         }
     }
@@ -197,6 +203,7 @@ impl Hash for MaxwellShaderTranslationSourceKey {
             program.hash(state);
         }
         self.texture_constant_buffer_slot.hash(state);
+        self.y_negate.hash(state);
         self.vertex_input_count.hash(state);
         for input in self.vertex_input_types() {
             input.hash(state);
@@ -219,6 +226,7 @@ pub(super) struct MaxwellShaderProgramTranslationInput {
     pub(super) register_count: u8,
     pub(super) effective_group: Option<u8>,
     pub(super) texture_constant_buffer_slot: Option<u8>,
+    pub(super) y_negate: bool,
     pub(super) vertex_input_types: Box<[(ShaderIoLocation, ShaderScalarType)]>,
     pub(super) binary: MaxwellShaderBinary,
 }
@@ -228,6 +236,7 @@ impl PartialEq for MaxwellShaderProgramTranslationInput {
         self.register_count == other.register_count
             && self.effective_group == other.effective_group
             && self.texture_constant_buffer_slot == other.texture_constant_buffer_slot
+            && self.y_negate == other.y_negate
             && self.vertex_input_types == other.vertex_input_types
             && self.binary == other.binary
     }
@@ -240,6 +249,7 @@ impl Hash for MaxwellShaderProgramTranslationInput {
         self.register_count.hash(state);
         self.effective_group.hash(state);
         self.texture_constant_buffer_slot.hash(state);
+        self.y_negate.hash(state);
         self.vertex_input_types.hash(state);
         self.binary.hash(state);
     }
@@ -307,6 +317,11 @@ pub(crate) fn prepare_maxwell_shader_translation_source(
         vertex_input_count += 1;
     }
     Ok(MaxwellShaderTranslationSourceKey {
+        // SR_Y_DIRECTION follows the window coordinate origin, independently
+        // of the viewport scale sign and facing-only FLIP_Y bit.
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+        y_negate: matches!(state.fixed_function().register(crate::MaxwellThreeDFixedFunctionRegister::WindowOrigin).value(),
+            Some(crate::MaxwellThreeDFixedFunctionValue::Mask(origin)) if origin & 1 != 0),
         bindings: state.shader_bindings_snapshot(),
         programs,
         program_count,
@@ -347,6 +362,7 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
             register_count: program.register_count,
             effective_group: program.effective_group,
             texture_constant_buffer_slot: source.texture_constant_buffer_slot,
+            y_negate: program.stage == MaxwellShaderStage::Pixel && source.y_negate,
             vertex_input_types: vertex_input_types.into(),
             binary,
         });

@@ -83,6 +83,9 @@ fn sampler_identity_includes_every_effective_filter_lod_and_address_field() {
         variants.push(changed);
     }
     changed = base;
+    changed.lod_bias = -2.0;
+    variants.push(changed);
+    changed = base;
     changed.lod_min = 1.0;
     variants.push(changed);
     changed = base;

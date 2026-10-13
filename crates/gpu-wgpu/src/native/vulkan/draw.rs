@@ -68,6 +68,8 @@ impl PartialEq for PipelineKey {
                     && self.draw.line_rasterization.map(|l| l.smooth)
                         == other.draw.line_rasterization.map(|l| l.smooth)
                     && self.draw.depth_state == other.draw.depth_state
+                    && self.depth.and(self.draw.depth_bias)
+                        == other.depth.and(other.draw.depth_bias)
                     && self.draw.stencil_state == other.draw.stencil_state
                     && self.draw.front_face == other.draw.front_face
                     && self.draw.cull_mode == other.draw.cull_mode
@@ -110,6 +112,7 @@ impl Hash for PipelineKey {
             .hash(h);
         self.draw.line_rasterization.map(|l| l.smooth).hash(h);
         self.draw.depth_state.hash(h);
+        self.depth.and(self.draw.depth_bias).hash(h);
         self.draw.stencil_state.hash(h);
         self.draw.front_face.hash(h);
         self.draw.cull_mode.hash(h);

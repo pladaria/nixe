@@ -422,7 +422,8 @@ fn requested_device_features(adapter_features: wgpu::Features) -> wgpu::Features
             | wgpu::Features::IMMEDIATES
             | wgpu::Features::RG11B10UFLOAT_RENDERABLE
             | wgpu::Features::TEXTURE_COMPRESSION_BC
-            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+            | wgpu::Features::SUBGROUP);
     #[cfg(feature = "performance-counters")]
     let features = features
         | (adapter_features
@@ -528,7 +529,13 @@ fn required_features_for_image_format(format: ImageFormat) -> wgpu::Features {
         | ImageFormat::Bc1RgbaUnorm
         | ImageFormat::Bc1RgbaSrgb
         | ImageFormat::Bc4RUnorm
-        | ImageFormat::Bc5RgUnorm => wgpu::Features::TEXTURE_COMPRESSION_BC,
+        | ImageFormat::Bc4RSnorm
+        | ImageFormat::Bc5RgUnorm
+        | ImageFormat::Bc5RgSnorm
+        | ImageFormat::Bc3RgbaUnorm
+        | ImageFormat::Bc3RgbaSrgb
+        | ImageFormat::Bc7RgbaUnorm
+        | ImageFormat::Bc7RgbaSrgb => wgpu::Features::TEXTURE_COMPRESSION_BC,
         // The neutral format capability currently covers every supported use of
         // a format. Keep the float32 family out of that contract unless wgpu can
         // also represent its filtered sampled-image use exactly.
@@ -591,13 +598,14 @@ fn capabilities(
     )
 }
 
-const ALL_IMAGE_FORMATS: [ImageFormat; 52] = [
+const ALL_IMAGE_FORMATS: [ImageFormat; 58] = [
     ImageFormat::Rgb565Unorm,
     ImageFormat::Bc1RgbUnorm,
     ImageFormat::Bc1RgbSrgb,
     ImageFormat::Bc1RgbaUnorm,
     ImageFormat::Bc1RgbaSrgb,
     ImageFormat::Bc4RUnorm,
+    ImageFormat::Bc4RSnorm,
     ImageFormat::R8Unorm,
     ImageFormat::Rg8Unorm,
     ImageFormat::Rgba8Unorm,
@@ -644,6 +652,11 @@ const ALL_IMAGE_FORMATS: [ImageFormat; 52] = [
     ImageFormat::Astc12x12Unorm,
     ImageFormat::Astc12x12Srgb,
     ImageFormat::Bc5RgUnorm,
+    ImageFormat::Bc5RgSnorm,
+    ImageFormat::Bc3RgbaUnorm,
+    ImageFormat::Bc3RgbaSrgb,
+    ImageFormat::Bc7RgbaUnorm,
+    ImageFormat::Bc7RgbaSrgb,
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -756,7 +769,9 @@ mod tests {
             ImageFormat::Bc1RgbaUnorm,
             ImageFormat::Bc1RgbaSrgb,
             ImageFormat::Bc4RUnorm,
+            ImageFormat::Bc4RSnorm,
             ImageFormat::Bc5RgUnorm,
+            ImageFormat::Bc5RgSnorm,
         ] {
             assert_eq!(
                 required_features_for_image_format(format),

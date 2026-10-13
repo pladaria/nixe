@@ -147,10 +147,12 @@ command_enum!(ApplicationFunctionsCommand {
 });
 
 command_enum!(LibraryAppletCreatorCommand {
-    0 => CreateLibraryApplet,
-    10 => CreateStorage,
+    0 => LibraryApplet,
+    10 => Storage,
+    11 => TransferMemoryStorage,
 });
 
+// https://switchbrew.org/wiki/Applet_Manager_services#ILibraryAppletAccessor
 command_enum!(LibraryAppletAccessorCommand {
     0 => GetAppletStateChangedEvent,
     1 => CheckFinished,
@@ -158,6 +160,10 @@ command_enum!(LibraryAppletAccessorCommand {
     30 => GetResult,
     100 => PushInData,
     101 => PopOutData,
+    103 => PushInteractiveInData,
+    104 => PopInteractiveOutData,
+    105 => GetPopOutDataEvent,
+    106 => GetPopInteractiveOutDataEvent,
 });
 
 command_enum!(StorageCommand { 0 => Open });

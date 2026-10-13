@@ -21,7 +21,8 @@ fn native_features_preserve_hal_requirements_and_do_not_invent_support() {
                 .shader_float64(supported)
                 .full_draw_index_uint32(supported)
                 .fill_mode_non_solid(supported)
-                .wide_lines(supported),
+                .wide_lines(supported)
+                .depth_bias_clamp(supported),
         );
         assert_eq!(enabled.tessellation_shader != 0, supported);
         assert_eq!(enabled.shader_float64 != 0, supported);
@@ -32,6 +33,7 @@ fn native_features_preserve_hal_requirements_and_do_not_invent_support() {
         assert_eq!(enabled.geometry_shader, 0);
         assert_eq!(enabled.fill_mode_non_solid != 0, supported);
         assert_eq!(enabled.wide_lines != 0, supported);
+        assert_eq!(enabled.depth_bias_clamp != 0, supported);
     }
     let mut extensions = vec![ash::khr::swapchain::NAME];
     add_extension(&mut extensions, fma::NAME);

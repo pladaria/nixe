@@ -28,11 +28,19 @@ impl Emitter {
                 {
                     return Err(SpirvShaderError::Interface(location));
                 }
-                let scalar = match element.scalar_type {
-                    ShaderScalarType::Float32 => self.float,
-                    ShaderScalarType::Unsigned32 => self.uint,
-                    ShaderScalarType::Signed32 => self.int,
-                    _ => return Err(SpirvShaderError::Interface(location)),
+                let scalar = if location == ShaderIoLocation::FrontFacing
+                    && input
+                    && ir.stage == ShaderStage::Fragment
+                    && element.scalar_type == ShaderScalarType::Unsigned32
+                {
+                    self.boolean
+                } else {
+                    match element.scalar_type {
+                        ShaderScalarType::Float32 => self.float,
+                        ShaderScalarType::Unsigned32 => self.uint,
+                        ShaderScalarType::Signed32 => self.int,
+                        _ => return Err(SpirvShaderError::Interface(location)),
+                    }
                 };
                 let storage = if input {
                     spv::StorageClass::Input
@@ -82,6 +90,11 @@ impl Emitter {
                         if ir.stage == ShaderStage::Fragment && scalar != self.float =>
                     {
                         (Some(spv::BuiltIn::SampleMask), 1, true)
+                    }
+                    ShaderIoLocation::FrontFacing
+                        if input && ir.stage == ShaderStage::Fragment && scalar == self.boolean =>
+                    {
+                        (Some(spv::BuiltIn::FrontFacing), 1, false)
                     }
                     ShaderIoLocation::InvocationId => (Some(spv::BuiltIn::InvocationId), 1, false),
                     ShaderIoLocation::PatchVertices => {
@@ -265,7 +278,11 @@ impl Emitter {
     ) -> Result<u32> {
         let (pointer, scalar) = self.interface_pointer(input, location, component, vertex)?;
         let value = self.b.load(scalar, None, pointer, None, [])?;
-        Ok(if scalar == self.uint {
+        Ok(if location == ShaderIoLocation::FrontFacing {
+            let yes = self.constant(u32::MAX);
+            let no = self.constant(0);
+            self.b.select(self.uint, None, value, yes, no)?
+        } else if scalar == self.uint {
             value
         } else {
             self.b.bitcast(self.uint, None, value)?

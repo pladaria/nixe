@@ -62,7 +62,7 @@ fn patch_output_load_rejects_unrepresented_modes_and_addresses() {
         let mut program = binary();
         program.bundles[1].instructions[1] = encoding;
         assert!(
-            translate_shader_binary(&program, 5, &BTreeMap::new()).is_err(),
+            translate_shader_binary(&program, 5, &BTreeMap::new(), false).is_err(),
             "{encoding:#018x}"
         );
     }

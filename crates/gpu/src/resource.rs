@@ -196,6 +196,16 @@ pub enum ImageFormat {
     /// Two independent BC4 UNORM channels in a 16-byte 4x4 block.
     /// https://registry.khronos.org/OpenGL/extensions/ARB/ARB_texture_compression_rgtc.txt
     Bc5RgUnorm,
+    /// BC3/DXT5: independent interpolated alpha and four-color RGB blocks.
+    /// https://registry.khronos.org/OpenGL/extensions/EXT/EXT_texture_compression_s3tc.txt
+    Bc3RgbaUnorm,
+    Bc3RgbaSrgb,
+    Bc4RSnorm,
+    Bc5RgSnorm,
+    /// BC7/BPTC RGBA blocks: 16 bytes for 4x4 texels.
+    /// https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format
+    Bc7RgbaUnorm,
+    Bc7RgbaSrgb,
 }
 
 impl ImageFormat {
@@ -223,7 +233,13 @@ impl ImageFormat {
             | Self::Bc1RgbaUnorm
             | Self::Bc1RgbaSrgb
             | Self::Bc4RUnorm
-            | Self::Bc5RgUnorm => [4, 4],
+            | Self::Bc4RSnorm
+            | Self::Bc5RgUnorm
+            | Self::Bc5RgSnorm
+            | Self::Bc3RgbaUnorm
+            | Self::Bc3RgbaSrgb
+            | Self::Bc7RgbaUnorm
+            | Self::Bc7RgbaSrgb => [4, 4],
             Self::Astc4x4Unorm | Self::Astc4x4Srgb => [4, 4],
             Self::Astc5x4Unorm | Self::Astc5x4Srgb => [5, 4],
             Self::Astc5x5Unorm | Self::Astc5x5Srgb => [5, 5],
@@ -253,8 +269,14 @@ impl ImageFormat {
             | Self::Bc1RgbSrgb
             | Self::Bc1RgbaUnorm
             | Self::Bc1RgbaSrgb
-            | Self::Bc4RUnorm => Some(8),
-            Self::Bc5RgUnorm => Some(16),
+            | Self::Bc4RUnorm
+            | Self::Bc4RSnorm => Some(8),
+            Self::Bc5RgUnorm
+            | Self::Bc5RgSnorm
+            | Self::Bc3RgbaUnorm
+            | Self::Bc3RgbaSrgb
+            | Self::Bc7RgbaUnorm
+            | Self::Bc7RgbaSrgb => Some(16),
             format if format.astc_profile().is_some() => Some(16),
             _ => self.plane_bytes_per_texel(plane),
         }
@@ -333,7 +355,13 @@ impl ImageFormat {
             | Self::Bc1RgbaUnorm
             | Self::Bc1RgbaSrgb
             | Self::Bc4RUnorm
+            | Self::Bc4RSnorm
             | Self::Bc5RgUnorm
+            | Self::Bc5RgSnorm
+            | Self::Bc3RgbaUnorm
+            | Self::Bc3RgbaSrgb
+            | Self::Bc7RgbaUnorm
+            | Self::Bc7RgbaSrgb
             | Self::Astc4x4Unorm
             | Self::Astc4x4Srgb
             | Self::Astc5x4Unorm
@@ -543,12 +571,14 @@ pub enum AddressMode {
 /// Immutable logical sampler description.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplerDescription {
+    pub compare: Option<crate::DepthCompareOperation>,
     pub min_filter: FilterMode,
     pub mag_filter: FilterMode,
     pub mip_filter: FilterMode,
     pub address_modes: [AddressMode; 3],
     /// Raw RGBA float bits, consumed only by ClampToBorder addressing.
     pub border_color: Option<[u32; 4]>,
+    pub lod_bias: f32,
     pub lod_min: f32,
     pub lod_max: f32,
     pub max_anisotropy: f32,
@@ -572,11 +602,13 @@ impl SamplerDescription {
             return Err(ResourceDescriptionError::InvalidAnisotropy);
         }
         Ok(Self {
+            compare: None,
             min_filter,
             mag_filter,
             mip_filter,
             address_modes,
             border_color: None,
+            lod_bias: 0.0,
             lod_min,
             lod_max,
             max_anisotropy,

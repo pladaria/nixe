@@ -19,6 +19,7 @@ sd_card = "./storage/sdmc"
 save_data = "./storage/save"
 
 [system]
+dictionary = "assets/dict.toml"
 # Languages tried for title metadata, in descending preference order. If a
 # title lacks the first language, the next available configured language is
 # used before the loader's deterministic fallback.
@@ -67,7 +68,7 @@ shader_cache_entries = 4096
 # Maximum number of neutral Maxwell pipelines retained in memory.
 pipeline_cache_entries = 8192
 # Maximum host-specialized WGPU variants retained for one neutral pipeline.
-pipeline_variants_per_resource = 64
+pipeline_variants_per_resource = 256
 # Maximum host bind groups retained for one neutral descriptor table.
 bind_groups_per_descriptor_table = 64
 # Maximum accepted and persisted WGPU driver pipeline-cache size.

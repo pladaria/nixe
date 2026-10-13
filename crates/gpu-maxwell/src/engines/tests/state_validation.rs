@@ -3165,7 +3165,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellLoweringError::UnsupportedStencilTestSemantics { two_sided: true })
+        Err(MaxwellLoweringError::IncompleteDraw("stencil compare"))
     ));
 
     program_three_d(&mut channel, 0x1594, 0);
@@ -3189,7 +3189,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
             &capabilities,
             &mut cache,
         ),
-        Err(MaxwellLoweringError::UnsupportedStencilTestSemantics { two_sided: false })
+        Err(MaxwellLoweringError::IncompleteDraw("stencil compare"))
     ));
 
     program_three_d(&mut channel, 0x1380, 0);

@@ -30,10 +30,12 @@ const CMIF_COMMAND_CLOSE: u16 = 2;
 #[derive(Clone, Copy)]
 pub(crate) struct HostSystems<'a> {
     pub video: &'a VideoSystem,
+    pub keyboard: Option<&'a nixe_applets::keyboard::KeyboardHost>,
     pub audio_backend: Option<&'a std::sync::Arc<dyn nixe_audio::AudioBackend>>,
     pub audio_renderers: &'a crate::AudioRendererManagerSession,
     pub hid: &'a HidSystem,
     pub shared_fonts: &'a crate::SharedFontSession,
+    pub system_archives: &'a crate::SystemArchives,
     pub settings: &'a SettingsEnvironment,
     pub application_language: Option<crate::SystemLanguage>,
     pub user_account_switch_locked: Option<bool>,
@@ -304,6 +306,7 @@ pub(crate) fn send_sync_request_from_buffer(
             &hipc,
             host_systems.diagnostics.file_system_access_log_mode(),
             host_systems.save_data,
+            host_systems.system_archives,
         )?,
         HorizonIpcObject::SystemSettings(_) => {
             services::dispatch_system_settings(process, request, &hipc.receive_statics)?

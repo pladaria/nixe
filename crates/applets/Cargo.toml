@@ -1,0 +1,8 @@
+[package]
+name = "nixe-applets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nixe-input.workspace = true

@@ -112,12 +112,16 @@ impl BlockDecoder {
             return Err(unsupported("BC compressed block extent mismatch"));
         }
         let channels = match format {
-            ImageFormat::Bc4RUnorm => 1,
-            ImageFormat::Bc5RgUnorm => 2,
+            ImageFormat::Bc4RUnorm | ImageFormat::Bc4RSnorm => 1,
+            ImageFormat::Bc5RgUnorm | ImageFormat::Bc5RgSnorm => 2,
             ImageFormat::Bc1RgbUnorm
             | ImageFormat::Bc1RgbSrgb
             | ImageFormat::Bc1RgbaUnorm
-            | ImageFormat::Bc1RgbaSrgb => 4,
+            | ImageFormat::Bc1RgbaSrgb
+            | ImageFormat::Bc3RgbaUnorm
+            | ImageFormat::Bc3RgbaSrgb
+            | ImageFormat::Bc7RgbaUnorm
+            | ImageFormat::Bc7RgbaSrgb => 4,
             _ => return Err(unsupported("BC software import format")),
         };
         let words_per_pixel = if channels == 4 { 2 } else { channels };
@@ -133,8 +137,24 @@ impl BlockDecoder {
             let mut normalized = [0.0; 32];
             let mut rgba = [0; 64];
             match format {
-                ImageFormat::Bc4RUnorm => bcdec_rs::bc4_float(encoded, &mut normalized, 4, false),
-                ImageFormat::Bc5RgUnorm => bcdec_rs::bc5_float(encoded, &mut normalized, 8, false),
+                ImageFormat::Bc4RUnorm | ImageFormat::Bc4RSnorm => bcdec_rs::bc4_float(
+                    encoded,
+                    &mut normalized,
+                    4,
+                    format == ImageFormat::Bc4RSnorm,
+                ),
+                ImageFormat::Bc5RgUnorm | ImageFormat::Bc5RgSnorm => bcdec_rs::bc5_float(
+                    encoded,
+                    &mut normalized,
+                    8,
+                    format == ImageFormat::Bc5RgSnorm,
+                ),
+                ImageFormat::Bc7RgbaUnorm | ImageFormat::Bc7RgbaSrgb => {
+                    bcdec_rs::bc7(encoded, &mut rgba, 16);
+                }
+                ImageFormat::Bc3RgbaUnorm | ImageFormat::Bc3RgbaSrgb => {
+                    bcdec_rs::bc3(encoded, &mut rgba, 16)
+                }
                 _ => bcdec_rs::bc1(encoded, &mut rgba, 16),
             }
             for row in 0..bh.min(height - y) {
@@ -176,10 +196,16 @@ pub(super) fn decoded_texture_format(description: ImageDescription) -> Option<Te
         return None;
     }
     Some(match format {
-        ImageFormat::Bc4RUnorm => TextureFormat::R16Float,
-        ImageFormat::Bc5RgUnorm => TextureFormat::Rg16Float,
-        ImageFormat::Bc1RgbSrgb | ImageFormat::Bc1RgbaSrgb => TextureFormat::Rgba8UnormSrgb,
-        ImageFormat::Bc1RgbUnorm | ImageFormat::Bc1RgbaUnorm => TextureFormat::Rgba8Unorm,
+        ImageFormat::Bc4RUnorm | ImageFormat::Bc4RSnorm => TextureFormat::R16Float,
+        ImageFormat::Bc5RgUnorm | ImageFormat::Bc5RgSnorm => TextureFormat::Rg16Float,
+        ImageFormat::Bc1RgbSrgb
+        | ImageFormat::Bc1RgbaSrgb
+        | ImageFormat::Bc3RgbaSrgb
+        | ImageFormat::Bc7RgbaSrgb => TextureFormat::Rgba8UnormSrgb,
+        ImageFormat::Bc1RgbUnorm
+        | ImageFormat::Bc1RgbaUnorm
+        | ImageFormat::Bc3RgbaUnorm
+        | ImageFormat::Bc7RgbaUnorm => TextureFormat::Rgba8Unorm,
         _ => return None,
     })
 }
@@ -341,6 +367,29 @@ mod tests {
     }
 
     #[test]
+    fn clipped_bc3_preserves_independent_alpha_and_four_colors_when_endpoints_are_reversed() {
+        let block = [
+            200, 60, 0x92, 0x24, 0x49, 0x92, 0x24, 0x49, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let blocks = [block, [0; 16]].concat();
+        for format in [ImageFormat::Bc3RgbaUnorm, ImageFormat::Bc3RgbaSrgb] {
+            let mut decoder = BlockDecoder::default();
+            let pixels = decoder.decode(format, 5, 3, &blocks).unwrap();
+            assert_eq!(pixels.len(), 5 * 3 * 4);
+            for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+                assert_eq!(
+                    pixel,
+                    if index % 5 < 4 {
+                        &[170, 170, 170, 180]
+                    } else {
+                        &[0, 0, 0, 0]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn clipped_bc5_import_preserves_fractional_interpolation_without_unorm8_quantization() {
         let mut decoder = BlockDecoder::default();
         // Selector 2 uses the interpolated endpoint palette, not a stored byte.
@@ -364,6 +413,55 @@ mod tests {
             };
             for (actual, expected) in channels.into_iter().zip(expected) {
                 assert!((actual - expected).abs() < 0.0003);
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_bc7_import_preserves_rgba_endpoints_and_srgb_storage() {
+        let block = [64, 32, 16, 4, 130, 64, 254, 127, 0, 0, 0, 0, 0, 0, 0, 0];
+        for format in [ImageFormat::Bc7RgbaUnorm, ImageFormat::Bc7RgbaSrgb] {
+            let mut decoder = BlockDecoder::default();
+            let pixels = decoder
+                .decode(format, 5, 3, &[block, block].concat())
+                .unwrap();
+            assert_eq!(pixels.len(), 60);
+            assert!(pixels.chunks_exact(4).all(|p| p == [128, 64, 32, 254]));
+        }
+    }
+
+    #[test]
+    fn clipped_signed_rgtc_import_preserves_negative_endpoints_and_interpolation() {
+        for format in [ImageFormat::Bc4RSnorm, ImageFormat::Bc5RgSnorm] {
+            let block = [
+                128, 127, 0x92, 0x24, 0x49, 0x92, 0x24, 0x49, 129, 127, 255, 255, 255, 255, 255,
+                255,
+            ];
+            let channels = if format == ImageFormat::Bc4RSnorm {
+                1
+            } else {
+                2
+            };
+            let bytes = channels * 8;
+            let blocks = [block[..bytes].to_vec(), vec![0; bytes]].concat();
+            let mut decoder = BlockDecoder::default();
+            let pixels = decoder.decode(format, 5, 3, &blocks).unwrap();
+            for (index, pixel) in pixels.chunks_exact(channels * 2).enumerate() {
+                for (channel, word) in pixel.chunks_exact(2).enumerate() {
+                    let actual =
+                        half::f16::from_bits(u16::from_ne_bytes([word[0], word[1]])).to_f32();
+                    let expected = if index % 5 == 4 {
+                        0.0
+                    } else if channel == 0 {
+                        -0.6
+                    } else {
+                        1.0
+                    };
+                    assert!(
+                        (actual - expected).abs() < 0.0003,
+                        "{format:?} pixel={index} channel={channel}"
+                    );
+                }
             }
         }
     }

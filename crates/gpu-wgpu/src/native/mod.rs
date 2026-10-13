@@ -31,6 +31,7 @@ pub struct VulkanRasterCapabilities {
     pub wide_lines: bool,
     pub rectangular_lines: bool,
     pub smooth_lines: bool,
+    pub depth_bias_clamp: bool,
     pub line_width_range_bits: [u32; 2],
 }
 

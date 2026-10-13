@@ -149,6 +149,8 @@ pub(crate) struct RendererUpdateState {
     pub(super) voices: Vec<super::voice::Voice>,
     pub(super) mixes: Vec<Option<Box<[u8; MIX_SIZE]>>>,
     pub(super) sinks: Vec<[u8; 0x140]>,
+    pub(super) effects: Vec<super::effect::Effect>,
+    pub(super) effect_order: Vec<Vec<usize>>,
     pub(crate) started: bool,
     pub(super) frames: u64,
     pub(crate) failure: Option<Box<str>>,
@@ -217,6 +219,7 @@ impl RendererUpdateState {
                         Err(error) => return Err(UpdateError::Mapping(error)),
                     },
                     2 if !self.voices.iter().any(|voice| voice.uses_pool(i))
+                        && !self.effects.iter().any(|effect| effect.uses_pool(i))
                         && self.pools[i].as_ref().is_some_and(|pool| {
                             pool.address == address && pool.backing.size() == size
                         }) =>
@@ -278,24 +281,19 @@ impl RendererUpdateState {
             cursor += 0x10;
         }
         put_word(&mut output, 12, params.voices * 0x10);
-        for (i, effect) in input[layout.effects.clone()].chunks_exact(0xc0).enumerate() {
-            if effect[0] != 0 {
-                const NAMES: [&str; 10] = [
-                    "Invalid",
-                    "Mix",
-                    "Aux",
-                    "Delay",
-                    "Reverb",
-                    "I3DL2 Reverb",
-                    "Biquad Filter",
-                    "Light Limiter",
-                    "Capture",
-                    "Compressor",
-                ];
-                let kind = NAMES.get(effect[0] as usize).copied().unwrap_or("unknown");
-                return Err(UpdateError::Unsupported(format!("RequestUpdate: effect slot {i} uses {kind} (type={}, enabled={}); this effect's updates are not implemented", effect[0], effect[2] != 0).into()));
-            }
-            output[cursor] = 4; // Removed: Invalid effect with no previous New/Enabled usage.
+        self.effects
+            .resize_with(params.effects as usize, super::effect::Effect::default);
+        for (i, raw) in input[layout.effects.clone()].chunks_exact(0xc0).enumerate() {
+            output[cursor] = self.effects[i].update(
+                raw,
+                i,
+                revision,
+                params.sample_rate,
+                &self.pools,
+                self.force_mapping,
+                &translate,
+                self.started,
+            )?;
             cursor += 0x10;
         }
         put_word(&mut output, 20, params.effects * 0x10);
@@ -371,6 +369,35 @@ impl RendererUpdateState {
                 }
                 next = word(target.as_slice(), 0x924);
             }
+        }
+
+        // Effect process_order is an index, not a sortable priority: command
+        // generation ends at the first empty slot in each mix's order table.
+        // https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/mix/mix_info.cpp
+        self.effect_order.resize_with(self.mixes.len(), Vec::new);
+        for order in &mut self.effect_order {
+            order.clear();
+        }
+        for (slot, effect) in self.effects.iter().enumerate() {
+            let Some((mix, index)) = effect.routing() else {
+                continue;
+            };
+            if mix == UNUSED_MIX as usize {
+                continue;
+            }
+            let Some(order) = self.effect_order.get_mut(mix) else {
+                return Err(UpdateError::Invalid);
+            };
+            if index >= self.effects.len() {
+                return Err(UpdateError::Invalid);
+            }
+            if order.len() <= index {
+                order.resize(index + 1, usize::MAX);
+            }
+            if order[index] != usize::MAX {
+                return Err(UpdateError::Invalid);
+            }
+            order[index] = slot;
         }
 
         self.sinks.resize(params.sinks as usize, [0; 0x140]);
@@ -668,9 +695,9 @@ mod tests {
         assert!(matches!(layout(&data), Err(UpdateError::Invalid)));
         let mut data = packet(true);
         let voice = 0x40 + 0x10 + 5 * 0x20 + 0x70;
-        data[voice + 0x170] = 4;
+        data[voice + 0x170] = 3;
         assert!(
-            matches!(RendererUpdateState::default().update(&params(), &layout(&data).unwrap(), &data, |_, _| panic!()), Err(UpdateError::Unsupported(detail)) if detail.contains("Reverb"))
+            matches!(RendererUpdateState::default().update(&params(), &layout(&data).unwrap(), &data, |_, _| panic!()), Err(UpdateError::Unsupported(detail)) if detail.contains("Delay"))
         );
     }
 }

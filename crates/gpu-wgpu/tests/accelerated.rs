@@ -8,6 +8,10 @@ mod compatible_attachments;
 
 #[path = "accelerated/compressed_textures.rs"]
 mod compressed_textures;
+#[path = "accelerated/depth_comparison.rs"]
+mod depth_comparison;
+#[path = "accelerated/quad_shuffle.rs"]
+mod quad_shuffle;
 
 #[path = "accelerated/image_aliases.rs"]
 mod image_aliases;
@@ -35,6 +39,12 @@ mod multiple_targets;
 
 #[path = "accelerated/compute.rs"]
 mod compute;
+
+#[path = "accelerated/half_fma.rs"]
+mod half_fma;
+
+#[path = "accelerated/cube_sampling.rs"]
+mod cube_sampling;
 
 use hardware::initialize_backend;
 use nixe_gpu::{
@@ -2105,6 +2115,7 @@ fn accelerated_flat_quads_fetch_native_and_scaled_color_formats() {
         VertexFormat::Snorm16x4,
         VertexFormat::Float16x4,
         VertexFormat::Unorm10_10_10_2,
+        VertexFormat::Snorm10_10_10_2,
         VertexFormat::Sscaled {
             width: nixe_gpu::VertexComponentWidth::Bits16,
             components: nixe_gpu::VertexComponentCount::Four,
@@ -2115,6 +2126,18 @@ fn accelerated_flat_quads_fetch_native_and_scaled_color_formats() {
             ShaderInterpolation::Perspective,
             true,
             format,
+        );
+    }
+}
+
+#[test]
+fn accelerated_packed_snorm_vertices_sign_extend_independent_lanes() {
+    for topology in [PrimitiveTopology::Triangles, PrimitiveTopology::Quads] {
+        accelerated_polygon_draw(
+            topology,
+            ShaderInterpolation::Constant,
+            false,
+            VertexFormat::Snorm10_10_10_2,
         );
     }
 }
@@ -2429,6 +2452,24 @@ fn accelerated_polygon_color_draw(
                 for component in color {
                     vertex_bytes.extend_from_slice(&((component as u16) * one).to_le_bytes());
                 }
+            }
+            VertexFormat::Snorm10_10_10_2 => {
+                // Alternate the two negative extremes in zero color channels.
+                // They must both normalize below zero, not alias positive data.
+                let lane = |value: f32| -> u32 {
+                    if value == 0.0 {
+                        if interpolation == ShaderInterpolation::Constant {
+                            if index.is_multiple_of(2) { 512 } else { 1023 }
+                        } else {
+                            0
+                        }
+                    } else {
+                        511
+                    }
+                };
+                let packed =
+                    lane(color[0]) | (lane(color[1]) << 10) | (lane(color[2]) << 20) | (1 << 30);
+                vertex_bytes.extend_from_slice(&packed.to_le_bytes());
             }
             VertexFormat::Unorm10_10_10_2 => {
                 let packed = (color[0] as u32 * 1023)
@@ -2805,6 +2846,16 @@ fn accelerated_polygon_color_draw(
         return;
     }
 
+    if interpolation == ShaderInterpolation::Constant {
+        // Triangle-list constant outputs use the first vertex on the host.
+        assert_eq!(pixel(16, 16), [255, 0, 0, 255]);
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|p| p == clear || p == [255, 0, 0, 255])
+        );
+        return;
+    }
     let top = pixel(16, 10);
     let bottom_left = pixel(10, 22);
     let bottom_right = pixel(22, 22);

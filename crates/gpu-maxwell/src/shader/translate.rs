@@ -25,8 +25,9 @@ use super::float::{
     is_float_min_max, is_float_multiply, is_float_set, is_float_set_predicate,
 };
 use super::half::{
-    decode_half_add, decode_half_multiply, decode_half_set_predicate, is_half_add,
-    is_half_multiply, is_half_set_predicate,
+    decode_half_add, decode_half_fused_multiply_add, decode_half_multiply,
+    decode_half_set_predicate, is_half_add, is_half_fused_multiply_add, is_half_multiply,
+    is_half_set_predicate,
 };
 use super::integer::{decode_shift_left, decode_shift_right, is_shift_left, is_shift_right};
 use super::interface::{
@@ -39,10 +40,10 @@ use super::special::{
     is_mufu, is_range_reduction,
 };
 use super::texture::{
-    MaxwellTextureResourceBinding, decode_texture_access_simplified, decode_texture_sample,
-    is_texture_access_simplified, is_texture_sample,
+    MaxwellTextureResourceBinding, decode_texture_access_simplified, decode_texture_query,
+    decode_texture_sample, is_texture_access_simplified, is_texture_query, is_texture_sample,
 };
-use super::{compute, global_memory, integer, patch_address, tessellation, xmad};
+use super::{compute, global_memory, integer, patch_address, quad, tessellation, xmad};
 use crate::MaxwellShaderStage;
 use nixe_gpu::{
     ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderIr, ShaderOperation,
@@ -70,6 +71,7 @@ pub(super) fn translate_shader_binary(
     binary: &MaxwellShaderBinary,
     register_count: u8,
     vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
+    y_negate: bool,
 ) -> Result<TranslatedShaderIr, MaxwellShaderTranslationError> {
     let stage = binary.stage();
     let neutral_stage = neutral_stage(stage);
@@ -105,6 +107,7 @@ pub(super) fn translate_shader_binary(
     let mut instructions = preload_vertex_inputs(neutral_stage, &inputs);
     let mut constant_buffer_bindings = BTreeSet::new();
     let mut texture_bindings = BTreeMap::new();
+    let mut texture_queries = BTreeMap::new();
     let mut next_temporary = u16::from(register_count);
     let mut explicitly_stored = BTreeSet::new();
     if stage == MaxwellShaderStage::Vertex {
@@ -132,7 +135,7 @@ pub(super) fn translate_shader_binary(
     let stack_targets = &flow.stack_targets;
     let mut pending_range_reductions = BTreeMap::<u8, super::special::PendingRangeReduction>::new();
     let mut patch_addresses = patch_address::PatchAddresses::default();
-    let mut integer_carry = None;
+    let mut integer_flags = integer::IntegerConditionCodes::default();
     let mut global_memory = global_memory::GlobalMemory::new(stage);
     let code_size = u32::try_from(binary.bundles().len() * MAXWELL_SCHEDULE_BUNDLE_SIZE)
         .expect("bounded Maxwell shader code size fits u32");
@@ -402,6 +405,12 @@ pub(super) fn translate_shader_binary(
                     ShaderOperation::Branch {
                         target: decode_shader_control_target(stage, offset, encoding, code_size)?,
                     }
+                } else if quad::is_swizzle_add(encoding) {
+                    quad::decode_swizzle_add(stage, offset, encoding, register_count)?
+                } else if quad::is_shuffle(encoding) {
+                    let operations = quad::decode_shuffle(stage, offset, encoding, register_count)?;
+                    append_expanded_operations(&mut instructions, source, predicate, operations);
+                    break 'instruction;
                 } else if tessellation::is_system_register_read(encoding) {
                     if stage == MaxwellShaderStage::Compute {
                         compute::system_register(offset, encoding, register_count)?
@@ -412,6 +421,7 @@ pub(super) fn translate_shader_binary(
                             encoding,
                             register_count,
                             &mut inputs,
+                            y_negate,
                         )?
                     }
                 } else if is_attribute_load(encoding) {
@@ -425,7 +435,9 @@ pub(super) fn translate_shader_binary(
                     for operation in &operations {
                         if let ShaderOperation::LoadInput {
                             location:
-                                location @ (ShaderIoLocation::VertexId | ShaderIoLocation::InstanceId),
+                                location @ (ShaderIoLocation::VertexId
+                                | ShaderIoLocation::InstanceId
+                                | ShaderIoLocation::FrontFacing),
                             scalar_type,
                             ..
                         } = operation
@@ -464,23 +476,31 @@ pub(super) fn translate_shader_binary(
                         }));
                         break 'instruction;
                     }
-                    let operation =
-                        decode_attribute_store(stage, offset, encoding, register_count)?;
-                    if let ShaderOperation::StoreOutput {
-                        location,
-                        first_component,
-                        sources,
-                        ..
-                    } = &operation
-                    {
-                        for component in 0..sources.len() {
-                            explicitly_stored.insert((
-                                *location,
-                                first_component.saturating_add(component as u8),
-                            ));
+                    let operations = decode_attribute_store(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    for operation in &operations {
+                        if let ShaderOperation::StoreOutput {
+                            location,
+                            first_component,
+                            sources,
+                            ..
+                        } = operation
+                        {
+                            for component in 0..sources.len() {
+                                explicitly_stored.insert((
+                                    *location,
+                                    first_component.saturating_add(component as u8),
+                                ));
+                            }
                         }
                     }
-                    operation
+                    append_expanded_operations(&mut instructions, source, predicate, operations);
+                    break 'instruction;
                 } else if is_move_immediate(encoding) {
                     decode_move_immediate(stage, offset, encoding, register_count)?
                 } else if is_move(encoding) {
@@ -586,6 +606,28 @@ pub(super) fn translate_shader_binary(
                             .map(|operation| ShaderInstruction::new(source, predicate, operation)),
                     );
                     break 'instruction;
+                } else if is_texture_query(encoding) {
+                    if stage == MaxwellShaderStage::Compute {
+                        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                            stage,
+                            instruction_offset: offset,
+                            encoding,
+                            detail: "compute texture binding ABI is not implemented",
+                        });
+                    }
+                    let query = decode_texture_query(stage, offset, encoding, register_count)?;
+                    // Resolve after texture accesses have established descriptor
+                    // dimensionality; no assumed image type escapes translation.
+                    texture_queries.insert(offset, (query.descriptor, encoding));
+                    instructions.push(ShaderInstruction::new(
+                        source,
+                        predicate,
+                        ShaderOperation::QueryTextureLevels {
+                            destination: query.destination,
+                            image_binding: u8::MAX,
+                        },
+                    ));
+                    break 'instruction;
                 } else if is_texture_access_simplified(encoding) || is_texture_sample(encoding) {
                     if stage == MaxwellShaderStage::Compute {
                         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -595,19 +637,26 @@ pub(super) fn translate_shader_binary(
                             detail: "compute texture binding ABI is not implemented",
                         });
                     }
-                    let decode = if is_texture_sample(encoding) {
-                        decode_texture_sample
+                    let operations = if is_texture_sample(encoding) {
+                        decode_texture_sample(
+                            stage,
+                            offset,
+                            encoding,
+                            register_count,
+                            &mut texture_bindings,
+                            &mut next_temporary,
+                            &instructions,
+                        )?
                     } else {
-                        decode_texture_access_simplified
+                        decode_texture_access_simplified(
+                            stage,
+                            offset,
+                            encoding,
+                            register_count,
+                            &mut texture_bindings,
+                            &mut next_temporary,
+                        )?
                     };
-                    let operations = decode(
-                        stage,
-                        offset,
-                        encoding,
-                        register_count,
-                        &mut texture_bindings,
-                        &mut next_temporary,
-                    )?;
                     // A texture instruction may write several architectural registers;
                     // preserve its predicate on both writes and the sample.
                     instructions.extend(
@@ -683,29 +732,28 @@ pub(super) fn translate_shader_binary(
                             .map(|operation| ShaderInstruction::new(source, predicate, operation)),
                     );
                     break 'instruction;
-                } else if is_half_add(encoding) {
-                    let operations = decode_half_add(
-                        stage,
-                        offset,
-                        encoding,
-                        register_count,
-                        &mut next_temporary,
-                    )?;
-                    instructions.extend(
-                        operations
-                            .into_iter()
-                            .map(|operation| ShaderInstruction::new(source, predicate, operation)),
+                } else if is_half_add(encoding)
+                    || is_half_multiply(encoding)
+                    || is_half_fused_multiply_add(encoding)
+                {
+                    let decode = if is_half_add(encoding) {
+                        decode_half_add
+                    } else if is_half_multiply(encoding) {
+                        decode_half_multiply
+                    } else {
+                        decode_half_fused_multiply_add
+                    };
+                    let decoded =
+                        decode(stage, offset, encoding, register_count, &mut next_temporary)?;
+                    if let Some(binding) = decoded.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
                     );
-                    break 'instruction;
-                } else if is_half_multiply(encoding) {
-                    let operations = decode_half_multiply(
-                        stage,
-                        offset,
-                        encoding,
-                        register_count,
-                        &mut next_temporary,
-                    )?;
-                    append_expanded_operations(&mut instructions, source, predicate, operations);
                     break 'instruction;
                 } else if is_float_multiply(encoding) {
                     let decoded = decode_float_multiply(
@@ -779,32 +827,89 @@ pub(super) fn translate_shader_binary(
                             .map(|operation| ShaderInstruction::new(source, predicate, operation)),
                     );
                     break 'instruction;
+                } else if integer::is_register_to_predicate(encoding) {
+                    let operations = integer::decode_register_to_predicate(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
+                    append_expanded_operations(&mut instructions, source, predicate, operations);
+                    break 'instruction;
+                } else if integer::is_condition_set_predicate(encoding) {
+                    let decoded = integer::decode_condition_set_predicate(
+                        stage,
+                        offset,
+                        encoding,
+                        &mut next_temporary,
+                        &integer_flags,
+                    )?;
+                    append_expanded_operations(
+                        &mut instructions,
+                        source,
+                        predicate,
+                        decoded.operations,
+                    );
+                    break 'instruction;
+                } else if integer::is_predicate_boolean(encoding) {
+                    integer::decode_predicate_boolean(stage, offset, encoding)?
                 } else if integer::is_integer_to_integer(encoding)
                     || integer::is_bitfield_extract(encoding)
                     || integer::is_bitfield_insert(encoding)
                     || integer::is_integer_min_max(encoding)
+                    || integer::is_integer_compare(encoding)
+                    || integer::is_select(encoding)
+                    || integer::is_add_three(encoding)
                     || integer::is_bitwise(encoding)
                     || integer::is_add(encoding)
                     || integer::is_shift_add(encoding)
                     || integer::is_set(encoding)
                     || integer::is_set_predicate(encoding)
                 {
-                    let decoded = if integer::is_add(encoding) || integer::is_shift_add(encoding) {
+                    let decoded = if integer::is_integer_to_integer(encoding) {
+                        integer::decode_integer_to_integer(
+                            stage,
+                            offset,
+                            encoding,
+                            register_count,
+                            &mut next_temporary,
+                            &mut integer_flags,
+                        )?
+                    } else if integer::is_add(encoding) || integer::is_shift_add(encoding) {
+                        if encoding
+                            & (1 << if encoding >> 48 & 0xfe00 == 0x1c00 {
+                                52
+                            } else {
+                                47
+                            })
+                            != 0
+                        {
+                            // This decoder currently defines only carry. Other flag
+                            // consumers remain unsupported until they have a definition.
+                            integer_flags.zero = None;
+                            integer_flags.sign = None;
+                            integer_flags.overflow = None;
+                        }
                         integer::decode_add(
                             stage,
                             offset,
                             encoding,
                             register_count,
                             &mut next_temporary,
-                            &mut integer_carry,
+                            &mut integer_flags.carry,
                         )?
                     } else {
-                        let decode = if integer::is_integer_to_integer(encoding) {
-                            integer::decode_integer_to_integer
-                        } else if integer::is_bitfield_extract(encoding) {
+                        let decode = if integer::is_bitfield_extract(encoding) {
                             integer::decode_bitfield_extract
                         } else if integer::is_bitfield_insert(encoding) {
                             integer::decode_bitfield_insert
+                        } else if integer::is_add_three(encoding) {
+                            integer::decode_add_three
+                        } else if integer::is_select(encoding) {
+                            integer::decode_select
+                        } else if integer::is_integer_compare(encoding) {
+                            integer::decode_integer_compare
                         } else if integer::is_integer_min_max(encoding) {
                             integer::decode_integer_min_max
                         } else if integer::is_bitwise(encoding) {
@@ -899,7 +1004,11 @@ pub(super) fn translate_shader_binary(
             for instruction in &instructions[translated_start..] {
                 let written = match instruction.operation() {
                     ShaderOperation::SetPredicateFloat32 { destination, .. } => vec![*destination],
-                    ShaderOperation::SetPredicateInteger32 { destinations, .. } => {
+                    ShaderOperation::SetPredicatesFromBits { write_mask, .. } => (0..7)
+                        .filter(|index| write_mask & (1 << index) != 0)
+                        .collect(),
+                    ShaderOperation::SetPredicateBoolean { destinations, .. }
+                    | ShaderOperation::SetPredicateInteger32 { destinations, .. } => {
                         destinations.iter().flatten().copied().collect()
                     }
                     _ => Vec::new(),
@@ -918,6 +1027,30 @@ pub(super) fn translate_shader_binary(
                 encoding,
                 &mut next_temporary,
             )?;
+        }
+    }
+    for instruction in &mut instructions {
+        if let ShaderOperation::QueryTextureLevels { destination, .. } = instruction.operation() {
+            let destination = *destination;
+            let offset = instruction.source().byte_offset();
+            let (descriptor, encoding) = texture_queries[&offset];
+            let image_binding = texture_bindings
+                .get(&descriptor)
+                .ok_or(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                    stage,
+                    instruction_offset: offset,
+                    encoding,
+                    detail: "TXQ-only descriptor dimensionality requires TIC specialization",
+                })?
+                .image_binding;
+            *instruction = ShaderInstruction::new(
+                instruction.source(),
+                instruction.predicate(),
+                ShaderOperation::QueryTextureLevels {
+                    destination,
+                    image_binding,
+                },
+            );
         }
     }
     let mut resources = constant_buffer_bindings
@@ -989,7 +1122,15 @@ pub(super) fn translate_shader_binary(
             resources.push(
                 ShaderResourceAccess::new(
                     sampler_binding,
-                    ShaderResourceKind::Sampler,
+                    if matches!(
+                        binding.image_kind,
+                        ShaderResourceKind::SampledDepthImage
+                            | ShaderResourceKind::SampledDepthImage2DArray
+                    ) {
+                        ShaderResourceKind::ComparisonSampler
+                    } else {
+                        ShaderResourceKind::Sampler
+                    },
                     true,
                     false,
                 )
@@ -1077,6 +1218,39 @@ pub(super) fn translate_shader_binary(
             .unwrap_or(instructions.len());
         instructions.splice(entry..entry, prologue);
     }
+    if stage == MaxwellShaderStage::Pixel {
+        // SPH configures interpolators; only actual attribute reads belong in
+        // the linked host interface. Eden also uses IR loads, not every SPH bit:
+        // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+        let mut read = BTreeSet::new();
+        for instruction in &instructions {
+            if instruction.predicate() == ShaderPredicate::Never {
+                continue;
+            }
+            match instruction.operation() {
+                ShaderOperation::InterpolateInput {
+                    location,
+                    component,
+                    ..
+                } => {
+                    read.insert((*location, *component));
+                }
+                ShaderOperation::LoadInput {
+                    destinations,
+                    location,
+                    first_component,
+                    ..
+                } => {
+                    read.extend(
+                        (0..destinations.len())
+                            .map(|index| (*location, *first_component + index as u8)),
+                    );
+                }
+                _ => {}
+            }
+        }
+        inputs.retain(|input| read.contains(&(input.location(), input.component())));
+    }
     let mut ir = ShaderIr::new(neutral_stage, inputs, outputs, resources, instructions)
         .with_tessellation_control_points(
             (stage == MaxwellShaderStage::TessellationInit)
@@ -1111,6 +1285,8 @@ const fn is_supported_family(encoding: u64) -> bool {
         || global_memory::is_load(encoding)
         || global_memory::is_store(encoding)
         || tessellation::is_system_register_read(encoding)
+        || quad::is_shuffle(encoding)
+        || quad::is_swizzle_add(encoding)
         || is_branch(encoding)
         || is_set_sync_point(encoding)
         || is_loop_push(encoding)
@@ -1130,6 +1306,7 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_constant_buffer_load(encoding)
         || is_texture_access_simplified(encoding)
         || is_texture_sample(encoding)
+        || is_texture_query(encoding)
         || is_interpolate(encoding)
         || is_range_reduction(encoding)
         || is_mufu(encoding)
@@ -1137,6 +1314,7 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_half_set_predicate(encoding)
         || is_half_add(encoding)
         || is_half_multiply(encoding)
+        || is_half_fused_multiply_add(encoding)
         || is_float_multiply(encoding)
         || is_float_fused_multiply_add(encoding)
         || is_float_add(encoding)
@@ -1144,8 +1322,15 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_float_set_predicate(encoding)
         || integer::is_set(encoding)
         || integer::is_set_predicate(encoding)
+        || integer::is_integer_to_integer(encoding)
+        || integer::is_condition_set_predicate(encoding)
+        || integer::is_predicate_boolean(encoding)
+        || integer::is_register_to_predicate(encoding)
         || xmad::is_xmad(encoding)
         || integer::is_integer_min_max(encoding)
+        || integer::is_integer_compare(encoding)
+        || integer::is_select(encoding)
+        || integer::is_add_three(encoding)
         || integer::is_bitfield_insert(encoding)
         || integer::is_bitwise(encoding)
         || integer::is_add(encoding)

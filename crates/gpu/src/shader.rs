@@ -10,6 +10,7 @@ use crate::{ShaderStage, VertexBufferLayout, VertexStepMode};
 
 mod compute;
 mod depth;
+mod half_arithmetic;
 mod integer;
 mod linkage;
 mod liveness;
@@ -120,6 +121,7 @@ pub enum ShaderIoLocation {
     TessLevelInner,
     /// Per-patch user data, distinct from arrayed per-vertex `Generic` data.
     Patch(u8),
+    FrontFacing,
 }
 
 /// Guest interpolation behavior for one fragment input.
@@ -240,8 +242,11 @@ pub enum ShaderResourceKind {
     SampledImage2DArray,
     /// Depth-only 2D sampling, replicated to RGB with alpha one.
     SampledDepthImage,
+    SampledDepthImage2DArray,
     StorageImage,
     Sampler,
+    ComparisonSampler,
+    SampledImageCube,
 }
 
 /// Explicit guest resource use retained for validation and backend binding.
@@ -385,11 +390,34 @@ impl ShaderInterfaceElement {
     }
 }
 
+/// Exchanges raw words within the rasterizer's 2x2 fragment quad, including
+/// helper invocations. This does not assume a host subgroup size or lane order.
+/// https://www.w3.org/TR/WGSL/#quad-operations
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShaderQuadOperation {
+    Broadcast(u8),
+    SwapHorizontal,
+    SwapVertical,
+    SwapDiagonal,
+}
+
 /// Minimal operation vocabulary shared by frontend translation and backends.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShaderOperation {
     /// Retains an instruction location with no per-invocation data effect.
     Nop,
+    QuadShuffle32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+        operation: ShaderQuadOperation,
+    },
+    FloatQuadSwizzleAdd32 {
+        destination: ShaderRegister,
+        left: ShaderRegister,
+        right: ShaderRegister,
+        swizzle: u8,
+        float_control: ShaderFloatControl,
+    },
     LoadComputeBuiltin32 {
         destination: ShaderRegister,
         builtin: ShaderComputeBuiltin,
@@ -437,6 +465,15 @@ pub enum ShaderOperation {
     PackHalf32 {
         destination: ShaderRegister,
         source: ShaderRegister,
+    },
+    /// Fused binary16 arithmetic. Operands are exact binary16 values represented
+    /// as F32 register bits; the low 16 result bits contain the rounded half.
+    FusedMultiplyAddHalf32 {
+        destination: ShaderRegister,
+        left: ShaderRegister,
+        right: ShaderRegister,
+        addend: ShaderRegister,
+        saturate: bool,
     },
     ConvertIntegerToFloat32 {
         destination: ShaderRegister,
@@ -592,6 +629,13 @@ pub enum ShaderOperation {
         accuracy: ShaderMathAccuracy,
         float_control: ShaderFloatControl,
     },
+    /// Select raw register bits using an integer condition (zero is false).
+    Select32 {
+        destination: ShaderRegister,
+        condition: ShaderRegister,
+        when_true: ShaderRegister,
+        when_false: ShaderRegister,
+    },
     CompareInteger32 {
         destination: ShaderRegister,
         float_result: bool,
@@ -611,6 +655,19 @@ pub enum ShaderOperation {
         accumulator: ShaderPredicate,
         set_operation: ShaderPredicateSetOperation,
         flush_denormals_to_zero: bool,
+    },
+    /// Set selected predicates from a contiguous range of integer bits.
+    SetPredicatesFromBits {
+        source: ShaderRegister,
+        first_bit: u8,
+        write_mask: u8,
+    },
+    /// Snapshot all inputs before writing either result. The second result
+    /// complements the first input, before either boolean combination.
+    SetPredicateBoolean {
+        destinations: [Option<u8>; 2],
+        inputs: [ShaderPredicate; 3],
+        operations: [ShaderPredicateSetOperation; 2],
     },
     SetPredicateFloat32 {
         destination: u8,
@@ -652,7 +709,18 @@ pub enum ShaderOperation {
         dynamic_byte_offset: ShaderRegister,
         scalar_type: ShaderScalarType,
     },
+    SampleDepthCompare2D {
+        offset: Option<[i32; 2]>,
+        outputs: Box<[ShaderTextureSampleOutput]>,
+        coordinates: [ShaderRegister; 2],
+        array_index: Option<ShaderRegister>,
+        reference: ShaderRegister,
+        image_binding: u8,
+        sampler_binding: u8,
+        level_zero: bool,
+    },
     SampleTexture2D {
+        offset: Option<[i32; 2]>,
         outputs: Box<[ShaderTextureSampleOutput]>,
         coordinates: [ShaderRegister; 2],
         image_binding: u8,
@@ -666,11 +734,23 @@ pub enum ShaderOperation {
         image_binding: u8,
         mip_level: u32,
     },
+    QueryTextureLevels {
+        destination: ShaderRegister,
+        image_binding: u8,
+    },
     SampleTexture2DArray {
+        offset: Option<[i32; 2]>,
         outputs: Box<[ShaderTextureSampleOutput]>,
         coordinates: [ShaderRegister; 2],
         /// Register whose low 16 bits hold the unsigned Maxwell array layer.
         array_index: ShaderRegister,
+        image_binding: u8,
+        lod: Option<ShaderRegister>,
+        sampler_binding: u8,
+    },
+    SampleTextureCube {
+        outputs: Box<[ShaderTextureSampleOutput]>,
+        coordinates: [ShaderRegister; 3],
         image_binding: u8,
         lod: Option<ShaderRegister>,
         sampler_binding: u8,
@@ -974,6 +1054,7 @@ pub enum ShaderEvaluationError {
     UnsupportedRoundingMode(ShaderRoundingMode),
     ApproximateOperation(ShaderSourceLocation),
     TextureSampling(ShaderSourceLocation),
+    QuadContextRequired(ShaderSourceLocation),
     StepLimitExceeded,
     InvalidIndirectBranch(u32),
     MissingExit,
@@ -1011,6 +1092,12 @@ pub fn evaluate_shader_ir(
         }
         match instruction.operation() {
             ShaderOperation::Nop => {}
+            ShaderOperation::QuadShuffle32 { .. }
+            | ShaderOperation::FloatQuadSwizzleAdd32 { .. } => {
+                return Err(ShaderEvaluationError::QuadContextRequired(
+                    instruction.source,
+                ));
+            }
             ShaderOperation::LoadComputeBuiltin32 { .. }
             | ShaderOperation::LoadStorageBuffer32 { .. }
             | ShaderOperation::StoreStorageBuffer32 { .. } => {
@@ -1102,6 +1189,29 @@ pub fn evaluate_shader_ir(
                 let value = f32::from_bits(register_bits(&registers, *source)?);
                 registers[destination.index() as usize] =
                     Some(u32::from(half::f16::from_f32(value).to_bits()));
+            }
+            ShaderOperation::FusedMultiplyAddHalf32 {
+                destination,
+                left,
+                right,
+                addend,
+                saturate,
+            } => {
+                let a = f64::from(f32::from_bits(register_bits(&registers, *left)?));
+                let b = f64::from(f32::from_bits(register_bits(&registers, *right)?));
+                let c = f64::from(f32::from_bits(register_bits(&registers, *addend)?));
+                let value = a.mul_add(b, c);
+                let value = if *saturate {
+                    if value.is_nan() || value.is_sign_negative() {
+                        0.0
+                    } else {
+                        value.min(1.0)
+                    }
+                } else {
+                    value
+                };
+                registers[destination.index() as usize] =
+                    Some(u32::from(half_arithmetic::round_half(value)));
             }
             ShaderOperation::ConvertIntegerToFloat32 {
                 destination,
@@ -1474,6 +1584,50 @@ pub fn evaluate_shader_ir(
                 })?;
                 registers[destination.index() as usize] = Some(value);
             }
+            ShaderOperation::Select32 {
+                destination,
+                condition,
+                when_true,
+                when_false,
+            } => {
+                let selected = if register_bits(&registers, *condition)? != 0 {
+                    when_true
+                } else {
+                    when_false
+                };
+                registers[usize::from(destination.index())] =
+                    Some(register_bits(&registers, *selected)?);
+            }
+            ShaderOperation::SetPredicatesFromBits {
+                source,
+                first_bit,
+                write_mask,
+            } => {
+                let bits = register_bits(&registers, *source)?;
+                for index in 0..7_u8 {
+                    if write_mask & (1 << index) != 0 {
+                        predicates[usize::from(index)] =
+                            Some(bits & (1 << (first_bit + index)) != 0);
+                    }
+                }
+            }
+            ShaderOperation::SetPredicateBoolean {
+                destinations,
+                inputs,
+                operations,
+            } => {
+                let a = evaluate_shader_predicate(inputs[0], &predicates)?;
+                let b = evaluate_shader_predicate(inputs[1], &predicates)?;
+                let c = evaluate_shader_predicate(inputs[2], &predicates)?;
+                for (index, destination) in destinations.iter().enumerate() {
+                    if let Some(destination) = destination {
+                        let first =
+                            integer::combine(if index == 0 { a } else { !a }, b, operations[0]);
+                        predicates[usize::from(*destination)] =
+                            Some(integer::combine(first, c, operations[1]));
+                    }
+                }
+            }
             ShaderOperation::SetPredicateInteger32 {
                 left,
                 right,
@@ -1640,9 +1794,12 @@ pub fn evaluate_shader_ir(
                         })?,
                 );
             }
-            ShaderOperation::SampleTexture2D { .. }
+            ShaderOperation::SampleDepthCompare2D { .. }
+            | ShaderOperation::QueryTextureLevels { .. }
+            | ShaderOperation::SampleTexture2D { .. }
             | ShaderOperation::LoadTexture2D { .. }
-            | ShaderOperation::SampleTexture2DArray { .. } => {
+            | ShaderOperation::SampleTexture2DArray { .. }
+            | ShaderOperation::SampleTextureCube { .. } => {
                 return Err(ShaderEvaluationError::TextureSampling(instruction.source));
             }
             ShaderOperation::Branch { target } => {
@@ -1878,7 +2035,8 @@ impl ShaderBackendModule {
                     }
                     ShaderOperation::SampleTexture2D { outputs, .. }
                     | ShaderOperation::LoadTexture2D { outputs, .. }
-                    | ShaderOperation::SampleTexture2DArray { outputs, .. } => {
+                    | ShaderOperation::SampleTexture2DArray { outputs, .. }
+                    | ShaderOperation::SampleTextureCube { outputs, .. } => {
                         std::mem::size_of_val(outputs.as_ref())
                     }
                     _ => 0,
@@ -1923,6 +2081,7 @@ pub enum ShaderBackendLoweringError {
     ControlFlow(ShaderSourceLocation),
     ResourceAccess(ShaderSourceLocation),
     NumericControl(ShaderSourceLocation),
+    TextureSampleOffset(ShaderSourceLocation),
     DepthSampleLod(ShaderSourceLocation),
     VertexFetch(&'static str),
 }
@@ -2017,15 +2176,37 @@ fn lower_shader_ir_to_wgsl_impl(
                 });
         }
     }
+    let uses_quad_swizzle = ir
+        .instructions
+        .iter()
+        .any(|i| matches!(i.operation, ShaderOperation::FloatQuadSwizzleAdd32 { .. }));
+    if uses_quad_swizzle {
+        input_groups
+            .entry(ShaderIoLocation::Position)
+            .or_insert(InterfaceGroup {
+                components: 2,
+                scalar_type: ShaderScalarType::Float32,
+                interpolation: None,
+            });
+    }
     let mut output_groups = interface_groups(&ir.outputs)?;
     let mut source = String::new();
     if ir.instructions.iter().any(|i| {
         matches!(
             i.operation,
-            ShaderOperation::UnpackHalf32 { .. } | ShaderOperation::PackHalf32 { .. }
+            ShaderOperation::UnpackHalf32 { .. }
+                | ShaderOperation::PackHalf32 { .. }
+                | ShaderOperation::FusedMultiplyAddHalf32 { .. }
         )
     }) {
         source.push_str(include_str!("shader/half.wgsl"));
+    }
+    if ir
+        .instructions
+        .iter()
+        .any(|i| matches!(i.operation, ShaderOperation::FusedMultiplyAddHalf32 { .. }))
+    {
+        source.push_str(include_str!("shader/half_fma.wgsl"));
     }
     emit_wgsl_resources(&mut source, ir)?;
     if ir.instructions.iter().any(|i| {
@@ -2083,6 +2264,9 @@ fn lower_shader_ir_to_wgsl_impl(
         | ShaderOperation::Add32 { float_control, .. }
         | ShaderOperation::FloatMinMax32 { float_control, .. }
         | ShaderOperation::FusedMultiplyAdd32 { float_control, .. }
+        | ShaderOperation::SpecialFunction32 { float_control, .. }
+        | ShaderOperation::Reciprocal32 { float_control, .. }
+        | ShaderOperation::ReciprocalSqrt32 { float_control, .. }
         if float_control.saturate())
     }) {
         source.push_str(
@@ -2198,6 +2382,13 @@ fn lower_shader_ir_to_wgsl_impl(
         source.push_str(&format!(
             "fn {entry_point}(input: ShaderInput) -> ShaderOutput {{\n"
         ));
+    }
+    if uses_quad_swizzle {
+        // WGSL does not expose quad IDs or guarantee subgroup ID correspondence.
+        // Derive spatial lane from the quad's top-left invocation, not warp size
+        // or framebuffer-coordinate parity (which would assume quad alignment).
+        // https://www.w3.org/TR/WGSL/#fragment-shaders-and-helper-invocations
+        source.push_str("  let nixe_quad_x0 = quadBroadcast(input.position.x, 0u);\n  let nixe_quad_y0 = quadBroadcast(input.position.y, 0u);\n  let nixe_quad_lane = select(0u, 1u, input.position.x > nixe_quad_x0) | select(0u, 2u, input.position.y > nixe_quad_y0);\n");
     }
     source.push_str(&format!(
         "  var registers: array<u32, {}>;\n",
@@ -2751,13 +2942,29 @@ fn emit_wgsl_resources(
                 "@group(0) @binding({}) var sampled_image_{}: texture_depth_2d;\n",
                 resource.binding, resource.binding
             )),
+            ShaderResourceKind::SampledDepthImage2DArray => source.push_str(&format!(
+                "@group(0) @binding({}) var sampled_image_{}: texture_depth_2d_array;\n",
+                resource.binding, resource.binding
+            )),
+            ShaderResourceKind::ComparisonSampler => source.push_str(&format!(
+                "@group(0) @binding({}) var sampler_{}: sampler_comparison;\n",
+                resource.binding, resource.binding
+            )),
+            ShaderResourceKind::SampledImageCube => source.push_str(&format!(
+                "@group(0) @binding({}) var sampled_image_{}: texture_cube<f32>;\n",
+                resource.binding, resource.binding
+            )),
             ShaderResourceKind::SampledImage2DArray => source.push_str(&format!(
                 "@group(0) @binding({}) var sampled_image_{}: texture_2d_array<f32>;\n",
                 resource.binding, resource.binding
             )),
+            // WebGPU has no sampler mipLodBias field. The backend specializes
+            // this constant per immutable sampler and includes it in the key.
+            // Bias precedes the sampler clamp, including explicit relative LOD:
+            // https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-level-of-detail-operation
             ShaderResourceKind::Sampler => source.push_str(&format!(
-                "@group(0) @binding({}) var sampler_{}: sampler;\n",
-                resource.binding, resource.binding
+                "@group(0) @binding({}) var sampler_{}: sampler;\noverride nixe_sampler_lod_bias_{}: f32 = 0.0;\n",
+                resource.binding, resource.binding, resource.binding
             )),
             ShaderResourceKind::StorageBuffer | ShaderResourceKind::StorageImage => {
                 return Err(ShaderBackendLoweringError::ResourceAccess(
@@ -2769,6 +2976,7 @@ fn emit_wgsl_resources(
             resource.kind,
             ShaderResourceKind::SampledImage
                 | ShaderResourceKind::SampledImage2DArray
+                | ShaderResourceKind::SampledImageCube
                 | ShaderResourceKind::SampledDepthImage
         ) {
             // Specialize the view mapping per binding. Host compilation folds
@@ -2862,6 +3070,9 @@ fn wgsl_interface_attribute(
             "@builtin(frag_depth)".to_owned()
         }
         ShaderIoLocation::SampleMask => "@builtin(sample_mask)".to_owned(),
+        ShaderIoLocation::FrontFacing if stage == ShaderStage::Fragment && input => {
+            "@builtin(front_facing)".to_owned()
+        }
         other => return Err(ShaderBackendLoweringError::UnsupportedInterface(other)),
     };
     let interpolation = match interpolation {
@@ -2890,10 +3101,14 @@ fn wgsl_field_name(location: ShaderIoLocation) -> String {
         ShaderIoLocation::TessLevelOuter => "tess_level_outer".to_owned(),
         ShaderIoLocation::TessLevelInner => "tess_level_inner".to_owned(),
         ShaderIoLocation::Patch(index) => format!("patch_{index}"),
+        ShaderIoLocation::FrontFacing => "front_facing".to_owned(),
     }
 }
 
 fn wgsl_type(location: ShaderIoLocation, scalar_type: ShaderScalarType, components: u8) -> String {
+    if location == ShaderIoLocation::FrontFacing {
+        return "bool".to_owned();
+    }
     let scalar = match scalar_type {
         ShaderScalarType::Unsigned32 => "u32",
         ShaderScalarType::Signed32 => "i32",
@@ -2922,6 +3137,54 @@ fn emit_wgsl_operation(
 ) -> Result<(), ShaderBackendLoweringError> {
     match instruction.operation() {
         ShaderOperation::Nop => {}
+        ShaderOperation::FloatQuadSwizzleAdd32 {
+            destination,
+            left,
+            right,
+            swizzle,
+            float_control,
+        } => {
+            if float_control.rounding() != ShaderRoundingMode::NearestEven
+                || float_control.nan_mode() != ShaderNanMode::Propagate
+                || float_control.saturate()
+            {
+                return Err(ShaderBackendLoweringError::NumericControl(
+                    instruction.source,
+                ));
+            }
+            let operand = |reg: ShaderRegister| {
+                let bits = format!("registers[{}]", reg.index());
+                if float_control.denormals_are_zero() {
+                    format!("nixe_flush_denormal({bits})")
+                } else {
+                    bits
+                }
+            };
+            let result = "bitcast<u32>(a + b)";
+            let result = if float_control.flush_denormals_to_zero() {
+                format!("nixe_flush_denormal({result})")
+            } else {
+                result.to_owned()
+            };
+            source.push_str(&format!("  {{\n    let lane_selector = ({swizzle}u >> (nixe_quad_lane * 2u)) & 3u;\n    let a = bitcast<f32>({}) * vec4<f32>(-1.0, 1.0, -1.0, 0.0)[lane_selector];\n    let b = bitcast<f32>({}) * vec4<f32>(-1.0, -1.0, 1.0, -1.0)[lane_selector];\n    registers[{}] = {result};\n  }}\n", operand(*left), operand(*right), destination.index()));
+        }
+        ShaderOperation::QuadShuffle32 {
+            destination,
+            source: operand,
+            operation,
+        } => {
+            let value = format!("registers[{}]", operand.index());
+            let expression = match operation {
+                ShaderQuadOperation::Broadcast(lane) => format!("quadBroadcast({value}, {lane}u)"),
+                ShaderQuadOperation::SwapHorizontal => format!("quadSwapX({value})"),
+                ShaderQuadOperation::SwapVertical => format!("quadSwapY({value})"),
+                ShaderQuadOperation::SwapDiagonal => format!("quadSwapDiagonal({value})"),
+            };
+            source.push_str(&format!(
+                "  registers[{}] = {expression};\n",
+                destination.index()
+            ));
+        }
         ShaderOperation::LoadComputeBuiltin32 {
             destination,
             builtin,
@@ -3020,6 +3283,20 @@ fn emit_wgsl_operation(
             "  registers[{}] = nixe_pack_half(registers[{}]);\n",
             destination.index(),
             operand.index()
+        )),
+        ShaderOperation::FusedMultiplyAddHalf32 {
+            destination,
+            left,
+            right,
+            addend,
+            saturate,
+        } => source.push_str(&format!(
+            "  registers[{}] = nixe_fma_half(registers[{}], registers[{}], registers[{}], {});\n",
+            destination.index(),
+            left.index(),
+            right.index(),
+            addend.index(),
+            saturate,
         )),
         ShaderOperation::ConvertIntegerToFloat32 {
             destination,
@@ -3179,6 +3456,13 @@ fn emit_wgsl_operation(
             first_component,
             scalar_type,
         } => {
+            if *location == ShaderIoLocation::FrontFacing {
+                source.push_str(&format!(
+                    "  registers[{}] = select(0u, 0xffffffffu, input.front_facing);\n",
+                    destinations[0].index()
+                ));
+                return Ok(());
+            }
             for (index, destination) in destinations.iter().enumerate() {
                 source.push_str(&format!(
                     "  registers[{}] = {};\n",
@@ -3447,11 +3731,17 @@ fn emit_wgsl_operation(
             float_control,
             ..
         } => {
-            require_precise_float(instruction.source, *float_control)?;
+            require_unary_float_control(instruction.source, *float_control)?;
+            let result = wgsl_saturate(
+                format!(
+                    "bitcast<u32>(1.0 / bitcast<f32>(registers[{}]))",
+                    operand.index()
+                ),
+                *float_control,
+            );
             source.push_str(&format!(
-                "  registers[{}] = bitcast<u32>(1.0 / bitcast<f32>(registers[{}]));\n",
-                destination.index(),
-                operand.index()
+                "  registers[{}] = {result};\n",
+                destination.index()
             ));
         }
         ShaderOperation::ReciprocalSqrt32 {
@@ -3460,11 +3750,17 @@ fn emit_wgsl_operation(
             float_control,
             ..
         } => {
-            require_precise_float(instruction.source, *float_control)?;
+            require_unary_float_control(instruction.source, *float_control)?;
+            let result = wgsl_saturate(
+                format!(
+                    "bitcast<u32>(inverseSqrt(bitcast<f32>(registers[{}])))",
+                    operand.index()
+                ),
+                *float_control,
+            );
             source.push_str(&format!(
-                "  registers[{}] = bitcast<u32>(inverseSqrt(bitcast<f32>(registers[{}])));\n",
-                destination.index(),
-                operand.index()
+                "  registers[{}] = {result};\n",
+                destination.index()
             ));
         }
         ShaderOperation::SpecialFunction32 {
@@ -3474,7 +3770,7 @@ fn emit_wgsl_operation(
             float_control,
             ..
         } => {
-            require_precise_float(instruction.source, *float_control)?;
+            require_unary_float_control(instruction.source, *float_control)?;
             let function = match function {
                 ShaderSpecialFunction::Cosine => "cos",
                 ShaderSpecialFunction::Sine => "sin",
@@ -3482,11 +3778,75 @@ fn emit_wgsl_operation(
                 ShaderSpecialFunction::Log2 => "log2",
                 ShaderSpecialFunction::SquareRoot => "sqrt",
             };
+            let result = wgsl_saturate(
+                format!(
+                    "bitcast<u32>({function}(bitcast<f32>(registers[{}])))",
+                    operand.index()
+                ),
+                *float_control,
+            );
             source.push_str(&format!(
-                "  registers[{}] = bitcast<u32>({function}(bitcast<f32>(registers[{}])));\n",
-                destination.index(),
-                operand.index()
+                "  registers[{}] = {result};\n",
+                destination.index()
             ));
+        }
+        ShaderOperation::Select32 {
+            destination,
+            condition,
+            when_true,
+            when_false,
+        } => {
+            source.push_str(&format!(
+                "  registers[{}] = select(registers[{}], registers[{}], registers[{}] != 0u);\n",
+                destination.index(),
+                when_false.index(),
+                when_true.index(),
+                condition.index()
+            ));
+        }
+        ShaderOperation::SetPredicatesFromBits {
+            source: input,
+            first_bit,
+            write_mask,
+        } => {
+            source.push_str(&format!(
+                "  {{\n    let predicate_bits = registers[{}];\n",
+                input.index()
+            ));
+            for index in 0..7_u8 {
+                if write_mask & (1 << index) != 0 {
+                    source.push_str(&format!(
+                        "    predicates[{index}] = (predicate_bits & {}u) != 0u;\n",
+                        1_u32 << (first_bit + index)
+                    ));
+                }
+            }
+            source.push_str("  }\n");
+        }
+        ShaderOperation::SetPredicateBoolean {
+            destinations,
+            inputs,
+            operations,
+        } => {
+            source.push_str("  {\n");
+            for (index, input) in inputs.iter().enumerate() {
+                source.push_str(&format!(
+                    "    let input_{index} = {};\n",
+                    wgsl_predicate_expression(*input)
+                ));
+            }
+            let operator = |operation| match operation {
+                ShaderPredicateSetOperation::And => "&&",
+                ShaderPredicateSetOperation::Or => "||",
+                ShaderPredicateSetOperation::Xor => "!=",
+            };
+            for (index, destination) in destinations.iter().enumerate() {
+                if let Some(destination) = destination {
+                    let invert = if index == 0 { "" } else { "!" };
+                    source.push_str(&format!("    predicates[{destination}] = (({invert}input_0) {} input_1) {} input_2;\n", operator(operations[0]), operator(operations[1])));
+                }
+            }
+            source.push_str("  }\n");
         }
         operation @ (ShaderOperation::SetPredicateInteger32 { .. }
         | ShaderOperation::CompareInteger32 { .. }) => integer::emit_wgsl(source, operation),
@@ -3623,6 +3983,14 @@ fn emit_wgsl_operation(
             dynamic_byte_offset.index(),
             *base_byte_offset as u32,
         )),
+        ShaderOperation::QueryTextureLevels {
+            destination,
+            image_binding,
+        } => source.push_str(&format!(
+            "  registers[{}] = textureNumLevels(sampled_image_{});\n",
+            destination.index(),
+            image_binding,
+        )),
         ShaderOperation::LoadTexture2D {
             outputs,
             coordinates,
@@ -3652,7 +4020,41 @@ fn emit_wgsl_operation(
             };
             emit_texture_outputs(source, outputs, &sample, *image_binding);
         }
+        ShaderOperation::SampleDepthCompare2D {
+            offset,
+            outputs,
+            coordinates,
+            array_index,
+            reference,
+            image_binding,
+            sampler_binding,
+            level_zero,
+        } => {
+            let texel_offset = wgsl_texture_offset(instruction.source, *offset)?;
+            let sample = format!("nixe_compare_{:x}", instruction.source.byte_offset());
+            let function = if *level_zero {
+                "textureSampleCompareLevel"
+            } else {
+                "textureSampleCompare"
+            };
+            let layer = array_index
+                .map(|reg| format!(", i32(registers[{}] & 0xffffu)", reg.index()))
+                .unwrap_or_default();
+            source.push_str(&format!("  let {sample} = {function}(sampled_image_{image_binding}, sampler_{sampler_binding}, vec2<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])){layer}, bitcast<f32>(registers[{}]){texel_offset});\n", coordinates[0].index(), coordinates[1].index(), reference.index()));
+            for output in outputs {
+                source.push_str(&format!(
+                    "  registers[{}] = bitcast<u32>({});\n",
+                    output.destination().index(),
+                    if output.component() == 3 {
+                        "1.0".to_owned()
+                    } else {
+                        sample.clone()
+                    }
+                ));
+            }
+        }
         ShaderOperation::SampleTexture2D {
+            offset,
             outputs,
             coordinates,
             image_binding,
@@ -3700,23 +4102,28 @@ fn emit_wgsl_operation(
                     }
                 }
             }
+            let texel_offset = wgsl_texture_offset(instruction.source, *offset)?;
             let sample = format!("nixe_sample_{:x}", instruction.source.byte_offset());
             let function = if lod.is_some() {
                 "textureSampleLevel"
             } else {
-                "textureSample"
+                if depth {
+                    "textureSample"
+                } else {
+                    "textureSampleBias"
+                }
             };
             let suffix = lod
                 .map(|level| {
                     if depth {
                         format!(", i32(bitcast<f32>(registers[{}]))", level.index())
                     } else {
-                        format!(", bitcast<f32>(registers[{}])", level.index())
+                        format!(", bitcast<f32>(registers[{}]) + nixe_sampler_lod_bias_{sampler_binding}", level.index())
                     }
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| if depth { String::new() } else { format!(", nixe_sampler_lod_bias_{sampler_binding}") });
             source.push_str(&format!(
-                "  let {sample} = {function}(sampled_image_{image_binding}, sampler_{sampler_binding}, vec2<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])){suffix});\n",
+                "  let {sample} = {function}(sampled_image_{image_binding}, sampler_{sampler_binding}, vec2<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])){suffix}{texel_offset});\n",
                 coordinates[0].index(),
                 coordinates[1].index(),
             ));
@@ -3738,7 +4145,32 @@ fn emit_wgsl_operation(
             };
             emit_texture_outputs(source, outputs, &sample, *image_binding);
         }
+        ShaderOperation::SampleTextureCube {
+            outputs,
+            coordinates,
+            image_binding,
+            sampler_binding,
+            lod,
+        } => {
+            let sample = format!("nixe_cube_{:x}", instruction.source.byte_offset());
+            let function = if lod.is_some() {
+                "textureSampleLevel"
+            } else {
+                "textureSampleBias"
+            };
+            let level = lod
+                .map(|reg| {
+                    format!(
+                        ", bitcast<f32>(registers[{}]) + nixe_sampler_lod_bias_{sampler_binding}",
+                        reg.index()
+                    )
+                })
+                .unwrap_or_else(|| format!(", nixe_sampler_lod_bias_{sampler_binding}"));
+            source.push_str(&format!("  let {sample} = {function}(sampled_image_{image_binding}, sampler_{sampler_binding}, vec3<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])){level});\n", coordinates[0].index(), coordinates[1].index(), coordinates[2].index()));
+            emit_texture_outputs(source, outputs, &sample, *image_binding);
+        }
         ShaderOperation::SampleTexture2DArray {
+            offset,
             outputs,
             coordinates,
             array_index,
@@ -3746,17 +4178,23 @@ fn emit_wgsl_operation(
             sampler_binding,
             lod,
         } => {
+            let texel_offset = wgsl_texture_offset(instruction.source, *offset)?;
             let sample = format!("nixe_sample_{:x}", instruction.source.byte_offset());
             let function = if lod.is_some() {
                 "textureSampleLevel"
             } else {
-                "textureSample"
+                "textureSampleBias"
             };
             let suffix = lod
-                .map(|level| format!(", bitcast<f32>(registers[{}])", level.index()))
-                .unwrap_or_default();
+                .map(|level| {
+                    format!(
+                        ", bitcast<f32>(registers[{}]) + nixe_sampler_lod_bias_{sampler_binding}",
+                        level.index()
+                    )
+                })
+                .unwrap_or_else(|| format!(", nixe_sampler_lod_bias_{sampler_binding}"));
             source.push_str(&format!(
-                "  let {sample} = {function}(sampled_image_{image_binding}, sampler_{sampler_binding}, vec2<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])), i32(registers[{}] & 0xffffu){suffix});\n",
+                "  let {sample} = {function}(sampled_image_{image_binding}, sampler_{sampler_binding}, vec2<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])), i32(registers[{}] & 0xffffu){suffix}{texel_offset});\n",
                 coordinates[0].index(),
                 coordinates[1].index(),
                 array_index.index(),
@@ -3770,6 +4208,21 @@ fn emit_wgsl_operation(
         ShaderOperation::Exit => source.push_str(&format!("  {return_statement}\n")),
     }
     Ok(())
+}
+
+fn wgsl_texture_offset(
+    source: ShaderSourceLocation,
+    offset: Option<[i32; 2]>,
+) -> Result<String, ShaderBackendLoweringError> {
+    let Some([x, y]) = offset else {
+        return Ok(String::new());
+    };
+    // WGSL requires a constant offset in the hardware's guaranteed [-8,7] range.
+    // https://www.w3.org/TR/WGSL/#texturesamplelevel-builtin
+    if !(-8..=7).contains(&x) || !(-8..=7).contains(&y) {
+        return Err(ShaderBackendLoweringError::TextureSampleOffset(source));
+    }
+    Ok(format!(", vec2<i32>({x}, {y})"))
 }
 
 fn emit_texture_outputs(
@@ -3967,11 +4420,15 @@ fn wgsl_saturate(result: String, control: ShaderFloatControl) -> String {
     }
 }
 
-fn require_precise_float(
+fn require_unary_float_control(
     source: ShaderSourceLocation,
     control: ShaderFloatControl,
 ) -> Result<(), ShaderBackendLoweringError> {
-    if control == ShaderFloatControl::PRECISE {
+    if control.rounding() == ShaderRoundingMode::NearestEven
+        && control.nan_mode() == ShaderNanMode::Propagate
+        && !control.denormals_are_zero()
+        && !control.flush_denormals_to_zero()
+    {
         Ok(())
     } else {
         Err(ShaderBackendLoweringError::NumericControl(source))
@@ -4030,6 +4487,9 @@ pub enum ShaderVerificationError {
         source: ShaderSourceLocation,
         reason: &'static str,
     },
+    InvalidPredicateBits {
+        source: ShaderSourceLocation,
+    },
     AliasedPredicateDestinations {
         source: ShaderSourceLocation,
     },
@@ -4080,6 +4540,9 @@ pub enum ShaderVerificationError {
     UndeclaredResourceAccess {
         source: ShaderSourceLocation,
         binding: u8,
+    },
+    InvalidQuadOperation {
+        source: ShaderSourceLocation,
     },
     InvalidTextureSample {
         source: ShaderSourceLocation,
@@ -4133,6 +4596,7 @@ impl Display for ShaderVerificationError {
                 register.index(),
                 source.byte_offset()
             ),
+            Self::InvalidPredicateBits { source } => write!(formatter, "shader predicate bit transfer has invalid bit positions or destinations at {source:?}"),
             Self::AliasedPredicateDestinations { source } => write!(formatter, "shader IR writes the same predicate twice at byte offset 0x{:x}", source.byte_offset()),
             Self::UndefinedPredicate { source, register } => write!(
                 formatter,
@@ -4160,6 +4624,7 @@ impl Display for ShaderVerificationError {
                 "shader IR accesses undeclared resource {binding} at byte offset 0x{:x}",
                 source.byte_offset()
             ),
+            Self::InvalidQuadOperation {source} => write!(formatter, "quad operation requires fragment stage and a valid quad lane at byte offset 0x{:x}", source.byte_offset()),
             Self::InvalidTextureSample { source } => write!(
                 formatter,
                 "shader IR has an invalid texture sample at byte offset 0x{:x}",
@@ -4184,6 +4649,16 @@ fn verify_interface_set(
 ) -> Result<(), ShaderVerificationError> {
     let mut seen = BTreeSet::new();
     for element in elements {
+        if element.location == ShaderIoLocation::FrontFacing
+            && (!input
+                || stage != ShaderStage::Fragment
+                || element.scalar_type != ShaderScalarType::Unsigned32)
+        {
+            return Err(ShaderVerificationError::InvalidInterpolation {
+                input,
+                location: element.location,
+            });
+        }
         tessellation::verify_interface(stage, input, element)?;
         if !seen.insert((element.location, element.component)) {
             return Err(ShaderVerificationError::DuplicateInterfaceElement {
@@ -4270,6 +4745,51 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
         }
         match &instruction.operation {
             ShaderOperation::Nop => {}
+            ShaderOperation::FloatQuadSwizzleAdd32 {
+                destination,
+                left,
+                right,
+                ..
+            } => {
+                if ir.stage != ShaderStage::Fragment {
+                    return Err(ShaderVerificationError::InvalidQuadOperation {
+                        source: instruction.source,
+                    });
+                }
+                for operand in [left, right] {
+                    require_definition(
+                        instruction.source,
+                        *operand,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
+                }
+                if !conditional {
+                    definitions.registers.insert(*destination);
+                }
+            }
+            ShaderOperation::QuadShuffle32 {
+                destination,
+                source,
+                operation,
+            } => {
+                if ir.stage != ShaderStage::Fragment
+                    || matches!(operation, ShaderQuadOperation::Broadcast(lane) if *lane > 3)
+                {
+                    return Err(ShaderVerificationError::InvalidQuadOperation {
+                        source: instruction.source,
+                    });
+                }
+                require_definition(
+                    instruction.source,
+                    *source,
+                    &definitions,
+                    instruction.predicate,
+                )?;
+                if !conditional {
+                    definitions.registers.insert(*destination);
+                }
+            }
             ShaderOperation::LoadControlPoint { destination, .. }
             | ShaderOperation::LoadPatchOutput { destination, .. } => {
                 tessellation::verify_operation(ir, instruction, index)?;
@@ -4330,10 +4850,12 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::LoadStorageBuffer32 { destination, .. }
             | ShaderOperation::MoveImmediate32 { destination, .. }
             | ShaderOperation::Move32 { destination, .. }
+            | ShaderOperation::Select32 { destination, .. }
             | ShaderOperation::FloatAbsolute32 { destination, .. }
             | ShaderOperation::FloatNegate32 { destination, .. }
             | ShaderOperation::UnpackHalf32 { destination, .. }
             | ShaderOperation::PackHalf32 { destination, .. }
+            | ShaderOperation::FusedMultiplyAddHalf32 { destination, .. }
             | ShaderOperation::ConvertIntegerToFloat32 { destination, .. }
             | ShaderOperation::RoundFloat32ToIntegral { destination, .. }
             | ShaderOperation::ConvertFloat32ToInteger { destination, .. }
@@ -4441,6 +4963,66 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     definitions.registers.insert(*destination);
                 }
             }
+            ShaderOperation::SetPredicatesFromBits {
+                source,
+                first_bit,
+                write_mask,
+            } => {
+                if write_mask & 0x80 != 0
+                    || (0..7_u8).any(|index| {
+                        write_mask & (1 << index) != 0
+                            && u16::from(*first_bit) + u16::from(index) >= 32
+                    })
+                {
+                    return Err(ShaderVerificationError::InvalidPredicateBits {
+                        source: instruction.source,
+                    });
+                }
+                require_definition(
+                    instruction.source,
+                    *source,
+                    &definitions,
+                    instruction.predicate,
+                )?;
+                for index in 0..7_u8 {
+                    if write_mask & (1 << index) != 0 {
+                        definitions.invalidate_guard(index);
+                        if !conditional {
+                            definitions.predicates.insert(index);
+                        }
+                    }
+                }
+            }
+            ShaderOperation::SetPredicateBoolean {
+                destinations,
+                inputs,
+                ..
+            } => {
+                for destination in destinations.iter().flatten() {
+                    validate_predicate_register(instruction.source, *destination)?;
+                }
+                if destinations[0].is_some() && destinations[0] == destinations[1] {
+                    return Err(ShaderVerificationError::AliasedPredicateDestinations {
+                        source: instruction.source,
+                    });
+                }
+                for input in inputs {
+                    if let ShaderPredicate::Register { register, .. } = input {
+                        validate_predicate_register(instruction.source, *register)?;
+                        require_predicate_definition(
+                            instruction.source,
+                            *register,
+                            &definitions.predicates,
+                        )?;
+                    }
+                }
+                for destination in destinations.iter().flatten() {
+                    definitions.invalidate_guard(*destination);
+                    if !conditional {
+                        definitions.predicates.insert(*destination);
+                    }
+                }
+            }
             ShaderOperation::SetPredicateInteger32 {
                 destinations,
                 accumulator,
@@ -4502,6 +5084,91 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 definitions.invalidate_guard(*destination);
                 if !conditional {
                     definitions.predicates.insert(*destination);
+                }
+            }
+            ShaderOperation::QueryTextureLevels {
+                destination,
+                image_binding,
+            } => {
+                if !ir.resources.iter().any(|r| {
+                    r.binding == *image_binding
+                        && r.readable
+                        && !r.writable
+                        && matches!(
+                            r.kind,
+                            ShaderResourceKind::SampledImage
+                                | ShaderResourceKind::SampledImage2DArray
+                                | ShaderResourceKind::SampledImageCube
+                                | ShaderResourceKind::SampledDepthImage
+                                | ShaderResourceKind::SampledDepthImage2DArray
+                        )
+                }) {
+                    return Err(ShaderVerificationError::UndeclaredResourceAccess {
+                        source: instruction.source,
+                        binding: *image_binding,
+                    });
+                }
+                if !conditional {
+                    definitions.registers.insert(*destination);
+                }
+            }
+            ShaderOperation::SampleDepthCompare2D {
+                outputs,
+                array_index,
+                image_binding,
+                sampler_binding,
+                ..
+            } => {
+                for operand in operation_sources(&instruction.operation) {
+                    require_definition(
+                        instruction.source,
+                        operand,
+                        &definitions,
+                        instruction.predicate,
+                    )?;
+                }
+                let image_kind = if array_index.is_some() {
+                    ShaderResourceKind::SampledDepthImage2DArray
+                } else {
+                    ShaderResourceKind::SampledDepthImage
+                };
+                if ir.stage != ShaderStage::Fragment
+                    || outputs.is_empty()
+                    || outputs.len() > 4
+                    || outputs
+                        .iter()
+                        .map(|o| o.component())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        != outputs.len()
+                    || outputs
+                        .iter()
+                        .map(|o| o.destination())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        != outputs.len()
+                {
+                    return Err(ShaderVerificationError::InvalidTextureSample {
+                        source: instruction.source,
+                    });
+                }
+                for (binding, kind) in [
+                    (*image_binding, image_kind),
+                    (*sampler_binding, ShaderResourceKind::ComparisonSampler),
+                ] {
+                    if !ir.resources.iter().any(|r| {
+                        r.binding == binding && r.kind == kind && r.readable && !r.writable
+                    }) {
+                        return Err(ShaderVerificationError::UndeclaredResourceAccess {
+                            source: instruction.source,
+                            binding,
+                        });
+                    }
+                }
+                if !conditional {
+                    definitions
+                        .registers
+                        .extend(outputs.iter().map(|o| o.destination()));
                 }
             }
             ShaderOperation::SampleTexture2D {
@@ -4579,12 +5246,20 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 }
             }
             ShaderOperation::SampleTexture2DArray {
+                offset: _,
                 outputs,
                 coordinates: _,
                 array_index: _,
                 image_binding,
                 sampler_binding,
                 lod,
+            }
+            | ShaderOperation::SampleTextureCube {
+                outputs,
+                image_binding,
+                sampler_binding,
+                lod,
+                ..
             } => {
                 for source in operation_sources(&instruction.operation) {
                     require_definition(
@@ -4614,7 +5289,17 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     });
                 }
                 for (binding, kind) in [
-                    (*image_binding, ShaderResourceKind::SampledImage2DArray),
+                    (
+                        *image_binding,
+                        if matches!(
+                            instruction.operation,
+                            ShaderOperation::SampleTextureCube { .. }
+                        ) {
+                            ShaderResourceKind::SampledImageCube
+                        } else {
+                            ShaderResourceKind::SampledImage2DArray
+                        },
+                    ),
                     (*sampler_binding, ShaderResourceKind::Sampler),
                 ] {
                     if !ir.resources.iter().any(|resource| {
@@ -4782,15 +5467,20 @@ fn visit_operation_destinations(
             visit(*destination);
             visit(*carry_out);
         }
-        ShaderOperation::Undefined32 { destination }
+        ShaderOperation::FloatQuadSwizzleAdd32 { destination, .. }
+        | ShaderOperation::QuadShuffle32 { destination, .. }
+        | ShaderOperation::Undefined32 { destination }
         | ShaderOperation::LoadComputeBuiltin32 { destination, .. }
         | ShaderOperation::LoadStorageBuffer32 { destination, .. }
         | ShaderOperation::MoveImmediate32 { destination, .. }
         | ShaderOperation::Move32 { destination, .. }
+        | ShaderOperation::Select32 { destination, .. }
         | ShaderOperation::FloatAbsolute32 { destination, .. }
         | ShaderOperation::FloatNegate32 { destination, .. }
         | ShaderOperation::UnpackHalf32 { destination, .. }
         | ShaderOperation::PackHalf32 { destination, .. }
+        | ShaderOperation::FusedMultiplyAddHalf32 { destination, .. }
+        | ShaderOperation::QueryTextureLevels { destination, .. }
         | ShaderOperation::ConvertIntegerToFloat32 { destination, .. }
         | ShaderOperation::RoundFloat32ToIntegral { destination, .. }
         | ShaderOperation::ConvertFloat32ToInteger { destination, .. }
@@ -4816,9 +5506,11 @@ fn visit_operation_destinations(
         ShaderOperation::LoadInput { destinations, .. } => {
             destinations.iter().copied().for_each(visit)
         }
-        ShaderOperation::SampleTexture2D { outputs, .. }
+        ShaderOperation::SampleDepthCompare2D { outputs, .. }
+        | ShaderOperation::SampleTexture2D { outputs, .. }
         | ShaderOperation::LoadTexture2D { outputs, .. }
-        | ShaderOperation::SampleTexture2DArray { outputs, .. } => outputs
+        | ShaderOperation::SampleTexture2DArray { outputs, .. }
+        | ShaderOperation::SampleTextureCube { outputs, .. } => outputs
             .iter()
             .map(|output| output.destination())
             .for_each(visit),
@@ -4880,6 +5572,12 @@ fn enqueue_shader_successor(
 
 fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
     match operation {
+        ShaderOperation::Select32 {
+            condition,
+            when_true,
+            when_false,
+            ..
+        } => vec![*condition, *when_true, *when_false],
         ShaderOperation::BranchTable { value, .. } => vec![*value],
         ShaderOperation::StoreOutput { sources, .. } => sources.to_vec(),
         ShaderOperation::LoadStorageBuffer32 { word_index, .. } => vec![*word_index],
@@ -4888,9 +5586,14 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         } => vec![*source, *word_index],
         ShaderOperation::LoadControlPoint { vertex, .. } => vec![*vertex],
         ShaderOperation::StoreControlPoint { source, vertex, .. } => vec![*source, *vertex],
-        ShaderOperation::Multiply32 { left, right, .. }
+        ShaderOperation::FloatQuadSwizzleAdd32 { left, right, .. }
+        | ShaderOperation::Multiply32 { left, right, .. }
         | ShaderOperation::FloatMultiplyZero32 { left, right, .. } => vec![*left, *right],
-        ShaderOperation::Move32 { source, .. } => vec![*source],
+        ShaderOperation::SetPredicatesFromBits { source, .. }
+        | ShaderOperation::QuadShuffle32 { source, .. }
+        | ShaderOperation::Move32 { source, .. } => {
+            vec![*source]
+        }
         ShaderOperation::Add32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::AddCarry32 {
             left,
@@ -4924,6 +5627,12 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
             right,
             addend,
             ..
+        }
+        | ShaderOperation::FusedMultiplyAddHalf32 {
+            left,
+            right,
+            addend,
+            ..
         } => vec![*left, *right, *addend],
         ShaderOperation::Reciprocal32 { source, .. } => vec![*source],
         ShaderOperation::ReciprocalSqrt32 { source, .. } => vec![*source],
@@ -4936,6 +5645,17 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
             dynamic_byte_offset,
             ..
         } => vec![*dynamic_byte_offset],
+        ShaderOperation::SampleDepthCompare2D {
+            coordinates,
+            array_index,
+            reference,
+            ..
+        } => {
+            let mut operands = coordinates.to_vec();
+            operands.extend(array_index);
+            operands.push(*reference);
+            operands
+        }
         ShaderOperation::SampleTexture2D {
             coordinates, lod, ..
         } => coordinates
@@ -4953,6 +5673,13 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
             .iter()
             .copied()
             .chain([*array_index])
+            .chain(lod.iter().copied())
+            .collect(),
+        ShaderOperation::SampleTextureCube {
+            coordinates, lod, ..
+        } => coordinates
+            .iter()
+            .copied()
             .chain(lod.iter().copied())
             .collect(),
         _ => Vec::new(),
@@ -6797,6 +7524,7 @@ mod tests {
                     source,
                     ShaderPredicate::Always,
                     ShaderOperation::SampleTexture2D {
+                        offset: None,
                         outputs: (0..4)
                             .map(|component| {
                                 ShaderTextureSampleOutput::new(
@@ -6836,7 +7564,7 @@ mod tests {
         assert!(
             module
                 .source()
-                .contains("textureSample(sampled_image_32, sampler_33")
+                .contains("textureSampleBias(sampled_image_32, sampler_33")
         );
         let naga_module = naga::front::wgsl::parse_str(module.source()).unwrap();
         let mut validator = naga::valid::Validator::new(
@@ -7275,7 +8003,7 @@ mod tests {
                     shader_location: 0,
                 },
                 crate::VertexAttribute {
-                    format: crate::VertexFormat::Uint8x2,
+                    format: crate::VertexFormat::Uint8,
                     offset: 2,
                     shader_location: 1,
                 },

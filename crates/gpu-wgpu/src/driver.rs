@@ -54,6 +54,7 @@ mod multisample;
 #[cfg(not(target_os = "macos"))]
 #[path = "native/vulkan/draw.rs"]
 mod native_draw;
+mod stencil;
 #[cfg(feature = "performance-counters")]
 mod timings;
 
@@ -191,6 +192,7 @@ enum Resource {
     },
     Sampler {
         sampler: wgpu::Sampler,
+        lod_bias_bits: u32,
     },
     Shader {
         module: Option<ShaderModule>,
@@ -489,6 +491,7 @@ impl RenderPipelineKey {
             fragment,
             topology: draw.prepared.topology,
             triangle_rasterization: draw.prepared.triangle_rasterization,
+            depth_bias: depth_format.and(draw.prepared.depth_bias),
             viewport_y_flip: draw.prepared.vertex_position_transform.is_some()
                 || viewport_y_flip(draw.prepared.viewport_transform),
             vertex_position_transform: draw.prepared.vertex_position_transform,
@@ -523,6 +526,7 @@ impl RenderPipelineKey {
             && self.fragment == location.fragment
             && self.topology == draw.prepared.topology
             && self.triangle_rasterization == draw.prepared.triangle_rasterization
+            && self.depth_bias == location.depth_format.and(draw.prepared.depth_bias)
             && self.vertex_position_transform == draw.prepared.vertex_position_transform
             && self.viewport_y_flip
                 == (draw.prepared.vertex_position_transform.is_some()
@@ -570,6 +574,7 @@ struct RenderPipelineFingerprintInput<'a> {
     fragment: BackendResourceHandle,
     topology: PrimitiveTopology,
     triangle_rasterization: TriangleRasterization,
+    depth_bias: Option<nixe_gpu::DepthBias>,
     alpha_test: Option<AlphaTest>,
     color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
     depth_format: Option<ImageFormat>,
@@ -585,6 +590,7 @@ impl Hash for RenderPipelineFingerprintInput<'_> {
         self.fragment.hash(state);
         self.topology.hash(state);
         self.triangle_rasterization.hash(state);
+        self.depth_bias.hash(state);
         self.viewport_y_flip.hash(state);
         self.vertex_position_transform.hash(state);
         self.depth_clip_negative_one_to_one.hash(state);
@@ -648,6 +654,7 @@ fn render_pipeline_fingerprint(
         fragment,
         topology: draw.prepared.topology,
         triangle_rasterization: draw.prepared.triangle_rasterization,
+        depth_bias: depth_format.and(draw.prepared.depth_bias),
         alpha_test: draw.prepared.alpha_test,
         color_outputs: draw.prepared.color_outputs,
         color_formats,
@@ -702,6 +709,7 @@ struct RenderPipelineKey {
     fragment: BackendResourceHandle,
     topology: PrimitiveTopology,
     triangle_rasterization: TriangleRasterization,
+    depth_bias: Option<nixe_gpu::DepthBias>,
     alpha_test: Option<AlphaTest>,
     color_formats: [Option<ImageFormat>; MAX_COLOR_ATTACHMENTS],
     depth_format: Option<ImageFormat>,
@@ -714,7 +722,7 @@ struct RenderPipelineKey {
 struct CachedRenderPipeline {
     vertex_fetch: VertexFetchPlan,
     identity: PreparedPipelineIdentity,
-    texture_swizzles: crate::texture_sampling::TextureSwizzles,
+    texture_parameters: crate::texture_sampling::TextureSamplingParameters,
     // Collision evidence is debug-only; do not enlarge every resource slot.
     #[cfg(debug_assertions)]
     key: Box<RenderPipelineKey>,
@@ -762,7 +770,7 @@ struct RenderPipelineLocation {
     depth_format: Option<ImageFormat>,
     samples: SampleCount,
     fingerprint: u128,
-    texture_swizzles: crate::texture_sampling::TextureSwizzles,
+    texture_parameters: crate::texture_sampling::TextureSamplingParameters,
 }
 
 #[derive(Clone)]
@@ -830,7 +838,11 @@ impl RenderPipelineCache {
         depth_format: Option<ImageFormat>,
         samples: SampleCount,
         draw: &DrawOperation,
-    ) -> Option<(u128, crate::texture_sampling::TextureSwizzles, bool)> {
+    ) -> Option<(
+        u128,
+        crate::texture_sampling::TextureSamplingParameters,
+        bool,
+    )> {
         let current = self.current.as_ref()?;
         current
             .record
@@ -838,7 +850,7 @@ impl RenderPipelineCache {
             .matches(vertex, fragment, color_formats, depth_format, samples, draw)
             .then_some((
                 current.fingerprint,
-                current.record.texture_swizzles.clone(),
+                current.record.texture_parameters.clone(),
                 current.record.vertex_fetch.quad_flat,
             ))
     }
@@ -1262,6 +1274,33 @@ const fn presentation_format(format: ImageFormat) -> Option<PresentationImageFor
         ImageFormat::Bgra8Unorm | ImageFormat::Bgra8Srgb => Some(PresentationImageFormat::Bgra8),
         _ => None,
     }
+}
+
+// wgpu exposes integer constant factors. Never truncate fractional guest bias.
+// https://docs.rs/wgpu/30.0.0/wgpu/struct.DepthBiasState.html
+fn polygon_depth_bias(
+    bias: Option<nixe_gpu::DepthBias>,
+) -> Result<wgpu::DepthBiasState, BackendDriverError> {
+    let Some(bias) = bias else {
+        return Ok(wgpu::DepthBiasState::default());
+    };
+    let constant = f32::from_bits(bias.constant_bits);
+    let slope_scale = f32::from_bits(bias.slope_scale_bits);
+    let clamp = f32::from_bits(bias.clamp_bits);
+    if !constant.is_finite() || !slope_scale.is_finite() || !clamp.is_finite() {
+        return Err(unsupported("non-finite polygon depth bias"));
+    }
+    let integer = constant as i32;
+    if constant.fract() != 0.0 || f64::from(constant) != f64::from(integer) {
+        return Err(BackendDriverError::failure(format!(
+            "wgpu cannot represent fractional/out-of-range polygon depth bias constant {constant} (slope={slope_scale}, clamp={clamp})"
+        )));
+    }
+    Ok(wgpu::DepthBiasState {
+        constant: integer,
+        slope_scale,
+        clamp,
+    })
 }
 
 fn vertex_entry_point(
@@ -3231,7 +3270,9 @@ impl WgpuBackendDriver {
                     if !operations[begin + 1..end].iter().any(|operation| matches!(operation.command(), GpuCommand::Draw(draw) if draw.prepared.depth_state.test_enabled && draw.prepared.depth_state.write_enabled)) {
                         attachment.depth_ops = None;
                     }
-                    attachment.stencil_ops = None; // Supported draws only compare stencil.
+                    if !operations[begin + 1..end].iter().any(|operation| matches!(operation.command(), GpuCommand::Draw(draw) if draw.prepared.stencil_state.is_some_and(|state| state.writes()))) {
+                        attachment.stencil_ops = None;
+                    }
                 }
                 Ok::<_, BackendDriverError>(attachment)
             }).transpose()?;
@@ -3276,7 +3317,7 @@ impl WgpuBackendDriver {
                 }
                 pass.set_pipeline(&draw_pipelines[draw_index].pipeline);
                 if let Some(stencil) = draw.prepared.stencil_state {
-                    pass.set_stencil_reference(u32::from(stencil.reference));
+                    pass.set_stencil_reference(stencil::parameters(stencil)?.1);
                 }
                 for (slot, layout) in draw.prepared.vertex_buffers.iter().enumerate() {
                     if draw_pipelines[draw_index].vertex_fetch.quad_flat
@@ -3555,7 +3596,7 @@ impl WgpuBackendDriver {
                                 .ok_or_else(|| unsupported("missing sampled-image view"))?
                                 .1,
                         ),
-                        Resource::Sampler { sampler } => BindingResource::Sampler(sampler),
+                        Resource::Sampler { sampler, .. } => BindingResource::Sampler(sampler),
                         _ => return Err(kind_mismatch(handle)),
                     };
                     Ok(BindGroupEntry {
@@ -3725,6 +3766,8 @@ impl WgpuBackendDriver {
                         resource.kind(),
                         nixe_gpu::ShaderResourceKind::SampledImage
                             | nixe_gpu::ShaderResourceKind::SampledImage2DArray
+                            | nixe_gpu::ShaderResourceKind::SampledImageCube
+                            | nixe_gpu::ShaderResourceKind::SampledDepthImage2DArray
                             | nixe_gpu::ShaderResourceKind::SampledDepthImage
                     )
             }) {
@@ -3741,12 +3784,13 @@ impl WgpuBackendDriver {
         })
     }
 
-    fn sampled_swizzles(
+    fn sampling_parameters(
         &self,
         dependencies: &ResolvedBackendResources,
         tables: &[nixe_gpu::DescriptorTableId],
-    ) -> Result<crate::texture_sampling::TextureSwizzles, BackendDriverError> {
+    ) -> Result<crate::texture_sampling::TextureSamplingParameters, BackendDriverError> {
         let mut mappings = Vec::new();
+        let mut biases = Vec::new();
         // Neutral shader resource bindings are all in group zero.
         if let Some(table) = tables.first() {
             let handle =
@@ -3755,7 +3799,15 @@ impl WgpuBackendDriver {
                 return Err(kind_mismatch(handle));
             };
             for binding in bindings {
-                if let ResourceDependency::Image(image) = binding.resource {
+                if let ResourceDependency::Sampler(id) = binding.resource {
+                    let handle = dependency_handle(dependencies, ResourceDependency::Sampler(id))?;
+                    let Resource::Sampler { lod_bias_bits, .. } = self.resource(handle)? else {
+                        return Err(kind_mismatch(handle));
+                    };
+                    if f32::from_bits(*lod_bias_bits) != 0.0 {
+                        biases.push((binding.binding, *lod_bias_bits));
+                    }
+                } else if let ResourceDependency::Image(image) = binding.resource {
                     let image_handle =
                         dependency_handle(dependencies, ResourceDependency::Image(image))?;
                     let Resource::Image {
@@ -3764,7 +3816,7 @@ impl WgpuBackendDriver {
                     else {
                         return Err(kind_mismatch(image_handle));
                     };
-                    let mapping = crate::texture_sampling::TextureSwizzles::mapping(
+                    let mapping = crate::texture_sampling::TextureSamplingParameters::mapping(
                         description.format(),
                         view.as_ref()
                             .map_or(nixe_gpu::Swizzle::IDENTITY, nixe_gpu::ImageView::swizzle),
@@ -3775,7 +3827,9 @@ impl WgpuBackendDriver {
                 }
             }
         }
-        Ok(crate::texture_sampling::TextureSwizzles::new(mappings))
+        Ok(crate::texture_sampling::TextureSamplingParameters::new(
+            mappings, biases,
+        ))
     }
 
     fn render_pipeline_location(
@@ -3801,9 +3855,6 @@ impl WgpuBackendDriver {
                 .ok_or_else(|| unsupported("too many color attachments"))? =
                 Some(attachment.format);
         }
-        if color_formats[0].is_none() {
-            return Err(unsupported("graphics draw without color attachment"));
-        }
         let samples = attachments[0].samples;
         let depth_format = attachments
             .iter()
@@ -3821,11 +3872,12 @@ impl WgpuBackendDriver {
             _ => return Err(kind_mismatch(pipeline)),
         };
         // Immutable prepared draws retain an O(1) pipeline fast path. Only a new
-        // descriptor table needs its image formats examined, not its contents.
-        let (fingerprint, texture_swizzles, quad_flat) = if let Some(cached) = cached {
+        // descriptor table needs its view/sampler parameters examined, not contents.
+        let (fingerprint, texture_parameters, quad_flat) = if let Some(cached) = cached {
             cached
         } else {
-            let swizzles = self.sampled_swizzles(dependencies, &draw.prepared.descriptor_tables)?;
+            let swizzles =
+                self.sampling_parameters(dependencies, &draw.prepared.descriptor_tables)?;
             let quad_flat = if draw.prepared.topology == PrimitiveTopology::Quads {
                 let Resource::Shader { neutral, .. } = self.resource(vertex)? else {
                     return Err(kind_mismatch(vertex));
@@ -3860,7 +3912,7 @@ impl WgpuBackendDriver {
             depth_format,
             samples,
             fingerprint,
-            texture_swizzles,
+            texture_parameters,
         })
     }
 
@@ -3895,8 +3947,8 @@ impl WgpuBackendDriver {
                     .as_mut()
                     .expect("touched pipeline is current");
                 debug_assert_eq!(
-                    current.record.texture_swizzles.clone(),
-                    location.texture_swizzles
+                    current.record.texture_parameters.clone(),
+                    location.texture_parameters
                 );
                 // Equivalent descriptor layouts can share a compiled pipeline.
                 // Remember the latest immutable draw for its next O(1) lookup.
@@ -3995,22 +4047,13 @@ impl WgpuBackendDriver {
                     } else {
                         CompareFunction::Always
                     }),
-                    stencil: draw.prepared.stencil_state.map_or_else(
-                        StencilState::default,
-                        |state| StencilState {
-                            front: wgpu::StencilFaceState {
-                                compare: compare_function(state.front_compare),
-                                ..Default::default()
-                            },
-                            back: wgpu::StencilFaceState {
-                                compare: compare_function(state.back_compare),
-                                ..Default::default()
-                            },
-                            read_mask: u32::from(state.read_mask),
-                            write_mask: 0,
-                        },
-                    ),
-                    bias: wgpu::DepthBiasState::default(),
+                    stencil: draw
+                        .prepared
+                        .stencil_state
+                        .map(stencil::parameters)
+                        .transpose()?
+                        .map_or_else(StencilState::default, |(state, _)| state),
+                    bias: polygon_depth_bias(draw.prepared.depth_bias)?,
                 })
             })
             .transpose()?;
@@ -4094,7 +4137,10 @@ impl WgpuBackendDriver {
                 })
             })
             .collect::<Vec<_>>();
-        let mut vertex_constants = location.texture_swizzles.constants(&vertex_ir);
+        let mut vertex_constants = location
+            .texture_parameters
+            .constants(&vertex_ir)
+            .map_err(unsupported)?;
         if let Some(transform) = draw.prepared.vertex_position_transform {
             vertex_constants.extend([
                 ("nixe_vertex_position_transform".to_owned(), 1.0),
@@ -4128,7 +4174,10 @@ impl WgpuBackendDriver {
         {
             vertex_constants.push(("nixe_depth_negative_one_to_one".to_owned(), 1.0));
         }
-        let mut fragment_constants = location.texture_swizzles.constants(&fragment_ir);
+        let mut fragment_constants = location
+            .texture_parameters
+            .constants(&fragment_ir)
+            .map_err(unsupported)?;
         if let Some(test) = draw.prepared.alpha_test {
             fragment_constants.push((
                 "nixe_alpha_reference".to_owned(),
@@ -4225,7 +4274,7 @@ impl WgpuBackendDriver {
             fingerprint,
             CachedRenderPipeline {
                 vertex_fetch,
-                texture_swizzles: location.texture_swizzles.clone(),
+                texture_parameters: location.texture_parameters.clone(),
                 identity: PreparedPipelineIdentity {
                     draw: Arc::clone(&draw.prepared),
                     vertex: vertex_handle,
@@ -5200,6 +5249,7 @@ impl WgpuBackendDriver {
                     return Err(unsupported("host adapter lacks clamp-to-border addressing"));
                 }
                 Resource::Sampler {
+                    lod_bias_bits: description.lod_bias.to_bits(),
                     sampler: self.device.create_sampler(&wgpu::SamplerDescriptor {
                         label: Some("Nixe neutral sampler"),
                         address_mode_u: address_mode(description.address_modes[0]),
@@ -5210,9 +5260,9 @@ impl WgpuBackendDriver {
                         mipmap_filter: mip_filter_mode(description.mip_filter),
                         lod_min_clamp: description.lod_min,
                         lod_max_clamp: description.lod_max,
+                        compare: description.compare.map(compare_function),
                         anisotropy_clamp: description.max_anisotropy as u16,
                         border_color,
-                        ..Default::default()
                     }),
                 }
             }
@@ -5947,7 +5997,13 @@ pub(crate) const fn texture_format(format: ImageFormat) -> Option<TextureFormat>
         ImageFormat::Bc1RgbUnorm | ImageFormat::Bc1RgbaUnorm => TextureFormat::Bc1RgbaUnorm,
         ImageFormat::Bc1RgbSrgb | ImageFormat::Bc1RgbaSrgb => TextureFormat::Bc1RgbaUnormSrgb,
         ImageFormat::Bc4RUnorm => TextureFormat::Bc4RUnorm,
+        ImageFormat::Bc4RSnorm => TextureFormat::Bc4RSnorm,
         ImageFormat::Bc5RgUnorm => TextureFormat::Bc5RgUnorm,
+        ImageFormat::Bc5RgSnorm => TextureFormat::Bc5RgSnorm,
+        ImageFormat::Bc3RgbaUnorm => TextureFormat::Bc3RgbaUnorm,
+        ImageFormat::Bc3RgbaSrgb => TextureFormat::Bc3RgbaUnormSrgb,
+        ImageFormat::Bc7RgbaUnorm => TextureFormat::Bc7RgbaUnorm,
+        ImageFormat::Bc7RgbaSrgb => TextureFormat::Bc7RgbaUnormSrgb,
         ImageFormat::Astc4x4Unorm
         | ImageFormat::Astc5x4Unorm
         | ImageFormat::Astc5x5Unorm
@@ -6091,7 +6147,10 @@ const fn vertex_format(format: VertexFormat) -> Option<WgpuVertexFormat> {
         VertexFormat::Sint32x3 => WgpuVertexFormat::Sint32x3,
         VertexFormat::Sint32x4 => WgpuVertexFormat::Sint32x4,
         VertexFormat::Unorm10_10_10_2 => WgpuVertexFormat::Unorm10_10_10_2,
-        VertexFormat::Uscaled { .. } | VertexFormat::Sscaled { .. } => return None,
+        VertexFormat::Uint8
+        | VertexFormat::Uscaled { .. }
+        | VertexFormat::Sscaled { .. }
+        | VertexFormat::Snorm10_10_10_2 => return None,
     })
 }
 
@@ -6148,7 +6207,13 @@ fn sampled_texture_view_descriptor(
 ) -> TextureViewDescriptor<'static> {
     let dimension = match description.dimension() {
         ImageDimension::One => TextureViewDimension::D1,
-        ImageDimension::Two if kind == nixe_gpu::ShaderResourceKind::SampledImage2DArray => {
+        ImageDimension::Two
+            if matches!(
+                kind,
+                nixe_gpu::ShaderResourceKind::SampledImage2DArray
+                    | nixe_gpu::ShaderResourceKind::SampledDepthImage2DArray
+            ) =>
+        {
             TextureViewDimension::D2Array
         }
         ImageDimension::Two => TextureViewDimension::D2,
@@ -7367,6 +7432,24 @@ mod tests {
     }
 
     #[test]
+    fn polygon_bias_keeps_sign_slope_clamp_and_rejects_lossy_constant_conversion() {
+        let bias = |constant: f32, slope: f32, clamp: f32| {
+            Some(nixe_gpu::DepthBias {
+                constant_bits: constant.to_bits(),
+                slope_scale_bits: slope.to_bits(),
+                clamp_bits: clamp.to_bits(),
+            })
+        };
+        let output = super::polygon_depth_bias(bias(-8.0, 1.5, -0.1)).unwrap();
+        assert_eq!(output.constant, -8);
+        assert_eq!(output.slope_scale, 1.5);
+        assert_eq!(output.clamp, -0.1);
+        for constant in [0.5, f32::INFINITY, f32::NAN, 2147483648.0] {
+            assert!(super::polygon_depth_bias(bias(constant, 1.0, 0.0)).is_err());
+        }
+    }
+
+    #[test]
     fn pipeline_fingerprint_tracks_all_active_color_slots_only() {
         let shader = |slot| {
             BackendResourceHandle::new(
@@ -7389,6 +7472,7 @@ mod tests {
             fragment: shader(2),
             topology: PrimitiveTopology::Triangles,
             triangle_rasterization: TriangleRasterization::Fill,
+            depth_bias: None,
             alpha_test: None,
             color_formats: [None; super::MAX_COLOR_ATTACHMENTS],
             depth_format: None,
@@ -7417,6 +7501,15 @@ mod tests {
         input.depth_clip_negative_one_to_one = false;
         input.viewport_y_flip = true;
         assert_ne!(multiple, nixe_gpu::cache_fingerprint(&input));
+        input.viewport_y_flip = false;
+        input.depth_format = Some(ImageFormat::Depth32Float);
+        let unbiased = nixe_gpu::cache_fingerprint(&input);
+        input.depth_bias = Some(nixe_gpu::DepthBias {
+            constant_bits: 2_f32.to_bits(),
+            slope_scale_bits: 1_f32.to_bits(),
+            clamp_bits: 0,
+        });
+        assert_ne!(unbiased, nixe_gpu::cache_fingerprint(&input));
     }
 
     #[test]
@@ -7471,6 +7564,7 @@ mod tests {
                 fragment: shader(2),
                 topology,
                 triangle_rasterization: TriangleRasterization::Fill,
+                depth_bias: None,
                 alpha_test: None,
                 color_outputs: [nixe_gpu::ColorOutputState::REPLACE; super::MAX_COLOR_ATTACHMENTS],
                 color_formats: std::array::from_fn(|slot| {
