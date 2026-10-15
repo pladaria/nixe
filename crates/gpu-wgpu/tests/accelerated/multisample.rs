@@ -274,6 +274,7 @@ fn color_depth_resolve(
     let prepared = [0, 1].map(|index| {
         Arc::new(
             PreparedDraw::new(
+                nixe_gpu::PreparedStateId::new(1, 1),
                 PipelineId::new(1),
                 RenderPassId::new(10 + index),
                 PrimitiveTopology::Triangles,
@@ -314,7 +315,10 @@ fn color_depth_resolve(
         let Some((op, _, _, path)) = stencil else {
             return draw;
         };
-        let mut draw = (*draw).clone();
+        let mut draw = PreparedDraw::from_state(
+            nixe_gpu::PreparedStateId::new(draw.identity().slot(), draw.identity().revision() + 1),
+            draw.state().clone(),
+        );
         let mut face = nixe_gpu::StencilFaceState::read_only(
             if path == 0 {
                 DepthCompareOperation::Never
@@ -330,11 +334,11 @@ fn color_depth_resolve(
             1 => face.depth_fail = op,
             _ => face.pass = op,
         };
-        draw.stencil_state = Some(nixe_gpu::StencilTestState {
+        draw.edit_state().stencil_state = Some(nixe_gpu::StencilTestState {
             front: face,
             back: face,
         });
-        draw.depth_state.compare = if path == 1 {
+        draw.edit_state().depth_state.compare = if path == 1 {
             DepthCompareOperation::Never
         } else {
             DepthCompareOperation::Always
@@ -342,14 +346,17 @@ fn color_depth_resolve(
         Arc::new(draw)
     });
     let far_prepared = prepared.each_ref().map(|draw| {
-        let mut biased = (**draw).clone();
-        biased.depth_bias = far_bias;
+        let mut biased = PreparedDraw::from_state(
+            nixe_gpu::PreparedStateId::new(draw.identity().slot(), draw.identity().revision() + 1),
+            draw.state().clone(),
+        );
+        biased.edit_state().depth_bias = far_bias;
         if let Some((_, initial, result, _)) = stencil {
-            biased.depth_state = DepthState::DISABLED;
+            biased.edit_state().depth_state = DepthState::DISABLED;
             let reference = (initial & 0xf0) | (result & 0x0f);
             let face =
                 nixe_gpu::StencilFaceState::read_only(DepthCompareOperation::Equal, 255, reference);
-            biased.stencil_state = Some(nixe_gpu::StencilTestState {
+            biased.edit_state().stencil_state = Some(nixe_gpu::StencilTestState {
                 front: face,
                 back: face,
             });

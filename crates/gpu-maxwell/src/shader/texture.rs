@@ -3,17 +3,17 @@
 use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use crate::MaxwellShaderStage;
-use nixe_gpu::{
-    ShaderBitwiseOperation, ShaderInstruction, ShaderOperation, ShaderPredicate, ShaderRegister,
-    ShaderResourceKind, ShaderScalarType, ShaderTextureSampleOutput,
-};
+use crate::shader::decoded::Register as ShaderRegister;
+use crate::shader::decoded::TextureOutput as ShaderTextureSampleOutput;
+use crate::shader::decoded::{Instruction as ShaderInstruction, Operation as ShaderOperation};
+use nixe_gpu::{ShaderBitwiseOperation, ShaderPredicate, ShaderResourceKind, ShaderScalarType};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellTextureResourceBinding {
     pub(super) constant_buffer_byte_offset: u32,
-    pub(super) image_binding: u8,
-    pub(super) sampler_binding: Option<u8>,
+    pub(super) image_binding: u32,
+    pub(super) sampler_binding: Option<u32>,
     pub(super) image_kind: ShaderResourceKind,
 }
 
@@ -21,11 +21,13 @@ impl MaxwellTextureResourceBinding {
     pub(crate) const fn constant_buffer_byte_offset(self) -> u32 {
         self.constant_buffer_byte_offset
     }
-    pub(crate) const fn image_binding(self) -> u8 {
-        self.image_binding
+    pub(crate) fn image_binding(self) -> u8 {
+        u8::try_from(self.image_binding).expect("oracle resource width was checked before export")
     }
-    pub(crate) const fn sampler_binding(self) -> Option<u8> {
-        self.sampler_binding
+    pub(crate) fn sampler_binding(self) -> Option<u8> {
+        self.sampler_binding.map(|binding| {
+            u8::try_from(binding).expect("oracle resource width was checked before export")
+        })
     }
     pub(crate) const fn image_kind(self) -> ShaderResourceKind {
         self.image_kind
@@ -55,14 +57,7 @@ fn texture_binding(
         }
         Ok(*binding)
     } else {
-        let next_pair = u8::try_from(32 + bindings.len() * 2).map_err(|_| {
-            malformed(
-                stage,
-                offset,
-                encoding,
-                "texture instructions neutral resource binding space is exhausted",
-            )
-        })?;
+        let next_pair = 32 + bindings.len() as u32 * 2;
         let binding = MaxwellTextureResourceBinding {
             constant_buffer_byte_offset: u32::from(constant_buffer_dword_offset) * 4,
             image_binding: next_pair,
@@ -115,7 +110,7 @@ pub(super) fn decode_texture_query(
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
     let descriptor = ((encoding >> 36) & 0x1fff) as u16;
     Ok(DecodedTextureQuery {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         descriptor,
     })
 }
@@ -126,7 +121,7 @@ pub(super) fn decode_texture_sample(
     encoding: u64,
     register_count: u8,
     bindings: &mut BTreeMap<u16, MaxwellTextureResourceBinding>,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     previous: &[ShaderInstruction],
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     // Full TEX uses consecutive coordinates and packs selected RGBA channels into
@@ -162,7 +157,7 @@ pub(super) fn decode_texture_sample(
         let bits = if metadata == 255 {
             Some(0)
         } else {
-            literal_register(previous, ShaderRegister::new(metadata))
+            literal_register(previous, ShaderRegister::new(u32::from(metadata)))
         };
         let bits = bits.ok_or(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
@@ -228,7 +223,7 @@ pub(super) fn decode_texture_sample(
         3 => {
             let source = ((encoding >> 20) & 0xff) as u8;
             validate_register_range(stage, offset, encoding, source, 1, register_count)?;
-            Some(ShaderRegister::new(u16::from(source)))
+            Some(ShaderRegister::new(u32::from(source)))
         }
         _ => unreachable!(),
     };
@@ -252,7 +247,7 @@ pub(super) fn decode_texture_sample(
         .enumerate()
         .map(|(index, component)| {
             ShaderTextureSampleOutput::new(
-                ShaderRegister::new(u16::from(destination) + index as u16),
+                ShaderRegister::new(u32::from(destination) + index as u32),
                 component,
             )
             .expect("selected channel is RGBA")
@@ -272,9 +267,12 @@ pub(super) fn decode_texture_sample(
         ShaderOperation::SampleDepthCompare2D {
             offset: texel_offset,
             outputs,
-            coordinates: [ShaderRegister::new(base), ShaderRegister::new(base + 1)],
-            array_index: (texture_type == 3).then_some(ShaderRegister::new(u16::from(coordinate))),
-            reference: ShaderRegister::new(u16::from(reference)),
+            coordinates: [
+                ShaderRegister::new(u32::from(base)),
+                ShaderRegister::new(u32::from(base + 1)),
+            ],
+            array_index: (texture_type == 3).then_some(ShaderRegister::new(u32::from(coordinate))),
+            reference: ShaderRegister::new(u32::from(reference)),
             image_binding: binding.image_binding,
             sampler_binding,
             level_zero: lod_mode == 1,
@@ -284,10 +282,10 @@ pub(super) fn decode_texture_sample(
             offset: texel_offset,
             outputs,
             coordinates: [
-                ShaderRegister::new(u16::from(coordinate) + 1),
-                ShaderRegister::new(u16::from(coordinate) + 2),
+                ShaderRegister::new(u32::from(coordinate) + 1),
+                ShaderRegister::new(u32::from(coordinate) + 2),
             ],
-            array_index: ShaderRegister::new(u16::from(coordinate)),
+            array_index: ShaderRegister::new(u32::from(coordinate)),
             image_binding: binding.image_binding,
             sampler_binding,
             lod,
@@ -297,8 +295,8 @@ pub(super) fn decode_texture_sample(
             offset: texel_offset,
             outputs,
             coordinates: [
-                ShaderRegister::new(u16::from(coordinate)),
-                ShaderRegister::new(u16::from(coordinate) + 1),
+                ShaderRegister::new(u32::from(coordinate)),
+                ShaderRegister::new(u32::from(coordinate) + 1),
             ],
             image_binding: binding.image_binding,
             sampler_binding,
@@ -321,7 +319,7 @@ pub(super) fn decode_texture_access_simplified(
     encoding: u64,
     register_count: u8,
     bindings: &mut BTreeMap<u16, MaxwellTextureResourceBinding>,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     // TEXS/TLDS operand fields, dimensionality/LOD selectors, and split destination
     // channel masks follow envytools' pinned public GM107 ISA table:
@@ -472,7 +470,7 @@ pub(super) fn decode_texture_access_simplified(
                 next_temporary,
             )?
         } else {
-            ShaderRegister::new(u16::from(if index < primary_count {
+            ShaderRegister::new(u32::from(if index < primary_count {
                 primary_destination + index as u8
             } else {
                 secondary_destination + (index - primary_count) as u8
@@ -504,9 +502,9 @@ pub(super) fn decode_texture_access_simplified(
         });
         Some(destination)
     } else if !fetch && matches!(selector, 3 | 13) {
-        Some(ShaderRegister::new(
+        Some(ShaderRegister::new(u32::from(
             u16::from(y_coordinate) + u16::from(selector == 13),
-        ))
+        )))
     } else {
         None
     };
@@ -514,8 +512,8 @@ pub(super) fn decode_texture_access_simplified(
         ShaderOperation::LoadTexture2D {
             outputs,
             coordinates: [
-                ShaderRegister::new(u16::from(x_coordinate)),
-                ShaderRegister::new(u16::from(y_coordinate)),
+                ShaderRegister::new(u32::from(x_coordinate)),
+                ShaderRegister::new(u32::from(y_coordinate)),
             ],
             image_binding: binding.image_binding,
             mip_level: 0,
@@ -524,9 +522,9 @@ pub(super) fn decode_texture_access_simplified(
         ShaderOperation::SampleTextureCube {
             outputs,
             coordinates: [
-                ShaderRegister::new(u16::from(x_coordinate)),
-                ShaderRegister::new(u16::from(x_coordinate) + 1),
-                ShaderRegister::new(u16::from(y_coordinate)),
+                ShaderRegister::new(u32::from(x_coordinate)),
+                ShaderRegister::new(u32::from(x_coordinate) + 1),
+                ShaderRegister::new(u32::from(y_coordinate)),
             ],
             image_binding: binding.image_binding,
             lod,
@@ -537,11 +535,11 @@ pub(super) fn decode_texture_access_simplified(
             offset: None,
             outputs,
             coordinates: [
-                ShaderRegister::new(u16::from(x_coordinate)),
+                ShaderRegister::new(u32::from(x_coordinate)),
                 ShaderRegister::new(if selector == 3 {
-                    u16::from(x_coordinate) + 1
+                    u32::from(u16::from(x_coordinate) + 1)
                 } else {
-                    u16::from(y_coordinate)
+                    u32::from(u16::from(y_coordinate))
                 }),
             ],
             image_binding: binding.image_binding,
@@ -553,10 +551,10 @@ pub(super) fn decode_texture_access_simplified(
             offset: None,
             outputs,
             coordinates: [
-                ShaderRegister::new(u16::from(x_coordinate + 1)),
-                ShaderRegister::new(u16::from(y_coordinate)),
+                ShaderRegister::new(u32::from(x_coordinate + 1)),
+                ShaderRegister::new(u32::from(y_coordinate)),
             ],
-            array_index: ShaderRegister::new(u16::from(x_coordinate)),
+            array_index: ShaderRegister::new(u32::from(x_coordinate)),
             image_binding: binding.image_binding,
             lod,
             sampler_binding: binding.sampler_binding.expect("TEXS reserves a sampler"),
@@ -568,7 +566,7 @@ pub(super) fn decode_texture_access_simplified(
         // outputs. Sample into temporaries first: coordinates/destinations may
         // alias, and split destinations that overlap in F32 are valid in F16.
         // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/shader_recompiler/frontend/maxwell/translate/impl/texture_fetch_swizzled.cpp#L218-L251
-        let temporary = |next: &mut u16| {
+        let temporary = |next: &mut u32| {
             allocate_shader_temporary(
                 stage,
                 offset,
@@ -578,7 +576,7 @@ pub(super) fn decode_texture_access_simplified(
             )
         };
         for (pair, registers) in sampled_registers.chunks(2).enumerate() {
-            let destination = ShaderRegister::new(u16::from(if pair == 0 {
+            let destination = ShaderRegister::new(u32::from(if pair == 0 {
                 primary_destination
             } else {
                 secondary_destination

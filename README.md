@@ -54,6 +54,12 @@ upstream adaptations are listed in [UPSTREAM.txt](vendor/dynarmic/UPSTREAM.txt).
 See [host requirements](docs/host-requirements.md) for required CPU and memory
 capabilities. `--offline` is optional once dependencies are cached.
 
+On Linux, `./scripts/build-vulkan-loader.sh` builds a pinned local Vulkan loader
+under `dev-tools/vulkan-loader/`. Cargo run/test commands, including `cargo cli`,
+use that copy when present; otherwise they use the system loader. See the
+[local loader build instructions](crates/gpu-vulkan/README.md#local-linux-loader)
+for dependencies and direct executable usage.
+
 The default configuration is in [`nixe.toml`](nixe.toml). Window size and
 position are remembered in a versioned binary `nixe.cfg` beside the selected
 `nixe.toml`; it is managed by Nixe.

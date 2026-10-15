@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
+    hash::{Hash, Hasher},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,6 +15,10 @@ use crate::{
     DeviceAccessDeclaration, GuestVirtualAddress, MappingGeneration, MemoryPermissions,
     VisibilityCoordinator, VisibilityError, VisibilityState,
 };
+
+mod mapping;
+use mapping::ByteMapping;
+pub use mapping::{CanonicalByteLayout, CanonicalByteTile};
 
 /// One contiguous segment of a translated canonical backing range.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,6 +96,22 @@ impl CanonicalBackingSegment {
         self.size
     }
 
+    /// Retains a checked subrange of this segment in constant time, preserving
+    /// the captured page, permissions and mapping generation.
+    pub fn snapshot_subrange(&self, offset: u64, size: u64) -> Result<Self, CanonicalRangeError> {
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalRangeError::RangeOverflow)?;
+        if size == 0 || end > self.size {
+            return Err(CanonicalRangeError::InvalidSubrange);
+        }
+        Ok(Self {
+            offset: self.offset + offset,
+            size,
+            ..self.clone()
+        })
+    }
+
     /// Returns whether this segment reaches the end of its canonical page.
     #[must_use]
     pub fn ends_at_page_boundary(&self) -> bool {
@@ -123,20 +144,46 @@ pub struct CanonicalBackingRange {
     size: u64,
 }
 
+/// Immutable physical byte mapping identity for representation lookup. Capture
+/// permissions, generations and CPU/GPU content epochs are deliberately absent.
+/// Different expressions of equivalent permutations may remain distinct keys.
+#[derive(Clone, Debug)]
+pub struct CanonicalByteMappingKey(CanonicalBackingRange);
+impl PartialEq for CanonicalByteMappingKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.same_byte_mapping(&other.0)
+    }
+}
+impl Eq for CanonicalByteMappingKey {}
+impl Hash for CanonicalByteMappingKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0.byte_mapping_hash());
+    }
+}
+
+type CanonicalPageSegments = BTreeMap<CanonicalPageId, Vec<(u64, u64, u64)>>;
+
 #[derive(Debug)]
 struct CanonicalRangeLayout {
-    segments: Box<[CanonicalBackingSegment]>,
-    segment_runs: Box<[CanonicalSegmentRun]>,
-    // Exclusive logical ends allow subrange access without walking the prefix.
-    segment_ends: Box<[u64]>,
-    // Indices retain first-occurrence order without duplicating page authority.
-    pages: Box<[usize]>,
+    topology: std::sync::OnceLock<CanonicalSegmentTopology>,
+    mapping: Option<ByteMapping>,
+    page_segments: std::sync::OnceLock<CanonicalPageSegments>,
+    segment_runs: std::sync::OnceLock<Box<[CanonicalSegmentRun]>>,
+    byte_mapping_hash: std::sync::OnceLock<u64>,
+    // Retained physical pages are independent of the logical byte permutation.
+    pages: Box<[CanonicalBackingPage]>,
     // Gate identity order deduplicates stores sharing one non-reentrant gate.
     gates: Box<[crate::ExecutionGate]>,
     owner: Mutex<Option<Arc<crate::backing::RangeDeviceOwner>>>,
     visibility_epoch: std::sync::OnceLock<Arc<AtomicU64>>,
     clean_read_epoch: AtomicU64,
     cpu_summary: Mutex<std::sync::Weak<CpuWriteSummary>>,
+}
+
+#[derive(Debug)]
+struct CanonicalSegmentTopology {
+    segments: Box<[CanonicalBackingSegment]>,
+    segment_ends: Box<[u64]>,
 }
 
 /// Lossless run encoding of the ordered segment sequence. Segments only share
@@ -162,17 +209,88 @@ impl PartialEq for CanonicalBackingRange {
                 crate::metrics::record(crate::metrics::Counter::RangeStructuralComparisons, 1);
                 crate::metrics::record(
                     crate::metrics::Counter::RangeEqualityInputSegments,
-                    (self.layout.segment_runs.len() + other.layout.segment_runs.len()) as u64,
+                    (self.layout.topology.get().map_or(0, |t| t.segments.len())
+                        + other.layout.topology.get().map_or(0, |t| t.segments.len()))
+                        as u64,
                 );
             }
         }
         self.size == other.size
             && (Arc::ptr_eq(&self.layout, &other.layout)
-                || self.layout.segment_runs == other.layout.segment_runs)
+                || match (&self.layout.mapping, &other.layout.mapping) {
+                    (Some(a), Some(b)) => {
+                        a == b || self.layout.segment_runs() == other.layout.segment_runs()
+                    }
+                    _ => self.layout.segment_runs() == other.layout.segment_runs(),
+                })
     }
 }
 
 impl Eq for CanonicalBackingRange {}
+
+impl CanonicalRangeLayout {
+    fn topology(&self) -> &CanonicalSegmentTopology {
+        self.topology.get_or_init(|| {
+            let mapping = self.mapping.as_ref().expect("deferred byte topology");
+            let size = match mapping {
+                ByteMapping::Rect { layout, .. } => {
+                    u64::from(layout.columns)
+                        * u64::from(layout.rows)
+                        * u64::from(layout.element_bytes)
+                }
+                ByteMapping::Concat(ranges) => ranges.iter().map(CanonicalBackingRange::size).sum(),
+                ByteMapping::Slice { size, .. } => *size,
+            };
+            let mut segments = Vec::new();
+            mapping
+                .snapshot(0, size, &mut segments)
+                .expect("validated byte mapping");
+            let mut end = 0;
+            let segment_ends = segments
+                .iter()
+                .map(|s| {
+                    end += s.size();
+                    end
+                })
+                .collect();
+            CanonicalSegmentTopology {
+                segments: segments.into(),
+                segment_ends,
+            }
+        })
+    }
+
+    /// Structural comparisons need a lossless encoding; shared topology uses
+    /// pointer identity and never allocates duplicate fragment metadata.
+    fn segment_runs(&self) -> &[CanonicalSegmentRun] {
+        self.segment_runs.get_or_init(|| {
+            let mut runs: Vec<CanonicalSegmentRun> = Vec::new();
+            for segment in &self.topology().segments {
+                let page = segment.page();
+                if let Some(run) = runs.last_mut()
+                    && run.last_page.store() == page.store()
+                    && run.last_page.page().get().checked_add(1) == Some(page.page().get())
+                    && run.offset == segment.offset
+                    && run.size == segment.size
+                    && run.permissions == segment.permissions
+                    && run.mapping_generation == segment.mapping_generation
+                {
+                    run.last_page = page;
+                } else {
+                    runs.push(CanonicalSegmentRun {
+                        first_page: page,
+                        last_page: page,
+                        offset: segment.offset,
+                        size: segment.size,
+                        permissions: segment.permissions,
+                        mapping_generation: segment.mapping_generation,
+                    });
+                }
+            }
+            runs.into_boxed_slice()
+        })
+    }
+}
 
 struct CpuWriteDependencyPage {
     page: CanonicalBackingPage,
@@ -343,13 +461,13 @@ impl CanonicalCpuWriteDependency {
         let mut execution_gates = BTreeMap::new();
         let mut pages = BTreeMap::new();
         for range in &domains {
-            for segment in range.segments() {
+            for gate in range.execution_gates() {
                 execution_gates
-                    .entry(segment.backing.store().execution_gate().identity())
-                    .or_insert_with(|| segment.backing.store().execution_gate().clone());
-                pages
-                    .entry(segment.page())
-                    .or_insert_with(|| segment.backing().clone());
+                    .entry(gate.identity())
+                    .or_insert_with(|| gate.clone());
+            }
+            for page in range.pages() {
+                pages.entry(page.identity()).or_insert_with(|| page.clone());
             }
         }
         if pages.is_empty() {
@@ -715,10 +833,6 @@ impl CanonicalCpuWriteDependency {
         if selection != CpuWriteSnapshotSelection::All && self.remains_current() {
             return Ok(Ok(Vec::new()));
         }
-        let range_pages = range
-            .pages()
-            .map(CanonicalBackingPage::identity)
-            .collect::<BTreeSet<_>>();
         let mut adaptive = self
             .inner
             .adaptive
@@ -738,7 +852,7 @@ impl CanonicalCpuWriteDependency {
                 .copied()
                 .filter(|index| {
                     let page = &self.inner.pages[*index];
-                    range_pages.contains(&page.page.identity())
+                    range.contains_page(page.page.identity())
                         && page.page.cpu_dirty_epoch()
                             == page.observed_epoch.load(Ordering::Acquire)
                         && matches!(
@@ -774,14 +888,14 @@ impl CanonicalCpuWriteDependency {
                 }
             }
         }
-        candidates.retain(|index| range_pages.contains(&self.inner.pages[*index].page.identity()));
+        candidates.retain(|index| range.contains_page(self.inner.pages[*index].page.identity()));
         let mut needed = if selection == CpuWriteSnapshotSelection::All {
             self.inner
                 .pages
                 .iter()
                 .enumerate()
                 .filter_map(|(index, page)| {
-                    range_pages.contains(&page.page.identity()).then_some(index)
+                    range.contains_page(page.page.identity()).then_some(index)
                 })
                 .collect::<BTreeSet<_>>()
         } else {
@@ -811,7 +925,7 @@ impl CanonicalCpuWriteDependency {
             .streaming
             .keys()
             .copied()
-            .filter(|index| range_pages.contains(&self.inner.pages[*index].page.identity()))
+            .filter(|index| range.contains_page(self.inner.pages[*index].page.identity()))
             .collect::<Vec<_>>();
         for index in streaming {
             let page = &self.inner.pages[index];
@@ -850,42 +964,50 @@ impl CanonicalCpuWriteDependency {
         let mut intervals = Vec::new();
         if selection == CpuWriteSnapshotSelection::All
             || (selection == CpuWriteSnapshotSelection::WholeIfDirty && !dirty.is_empty())
+            || (selection == CpuWriteSnapshotSelection::DirtyPages
+                && range.layout.pages.len() == dirty_pages.len())
         {
             intervals.push((0, range.size()));
         } else if selection == CpuWriteSnapshotSelection::DirtyPages {
-            let mut offset = 0;
-            for segment in range.segments() {
-                let end = offset + segment.size();
-                if dirty_pages.contains(&segment.page()) {
+            for page in &dirty_pages {
+                let mut overflow = false;
+                range.visit_page_mappings(*page, &mut |offset, _, size| {
                     let start = offset / alignment * alignment;
-                    let end = end
-                        .checked_add(alignment - 1)
-                        .ok_or(CanonicalRangeAccessError::RangeOverflow)?
-                        / alignment
-                        * alignment;
-                    intervals.push((start, end.min(range.size())));
+                    if let Some(end) = (offset + size).checked_add(alignment - 1) {
+                        intervals.push((start, (end / alignment * alignment).min(range.size())));
+                    } else {
+                        overflow = true;
+                    }
+                });
+                if overflow {
+                    return Err(CanonicalRangeAccessError::RangeOverflow);
                 }
-                offset += segment.size();
             }
             normalize_intervals(&mut intervals);
         }
+        // Retain only the copied windows. A sparse update in a large tiled
+        // view must not expand the entire byte topology to identify a handful
+        // of aligned physical pages or copy those same windows afterwards.
+        let windows = intervals
+            .into_iter()
+            .map(|(offset, end)| {
+                range
+                    .snapshot_subrange(offset, end - offset)
+                    .map(|window| (offset, window))
+                    .map_err(|_| CanonicalRangeAccessError::IncompleteRange)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         // Alignment or WholeIfDirty can include additional pages. Resolve
         // only pages actually copied, never unrelated GPU-owned bindings.
-        let mut offset = 0;
-        for segment in range.segments() {
-            let end = offset + segment.size();
-            if intervals
-                .iter()
-                .any(|(start, stop)| *start < end && offset < *stop)
-            {
+        for (_, window) in &windows {
+            for page in window.pages() {
                 let index = self
                     .inner
                     .pages
-                    .binary_search_by_key(&segment.page(), |page| page.page.identity())
+                    .binary_search_by_key(&page.identity(), |page| page.page.identity())
                     .expect("validated dependency page");
                 needed.insert(index);
             }
-            offset = end;
         }
         let visible = needed.iter().try_fold(true, |visible, index| {
             Ok::<_, CanonicalRangeAccessError>(
@@ -904,17 +1026,17 @@ impl CanonicalCpuWriteDependency {
                 .collect()));
         }
         let mut snapshots = Vec::new();
-        for (offset, end) in intervals {
+        for (offset, window) in windows {
             let mut bytes = vec![
                 0;
-                usize::try_from(end - offset)
+                usize::try_from(window.size())
                     .map_err(|_| CanonicalRangeAccessError::RangeOverflow)?
             ];
             crate::metrics::record(
                 crate::metrics::Counter::SnapshotCopiedBytes,
                 bytes.len() as u64,
             );
-            range.read_quiescent(offset, &mut bytes)?;
+            window.read_quiescent(0, &mut bytes)?;
             snapshots.push((offset, bytes.into_boxed_slice()));
         }
         for index in &dirty {
@@ -938,7 +1060,7 @@ impl CanonicalCpuWriteDependency {
         }
         if selection == CpuWriteSnapshotSelection::All {
             self.arm_pages((0..self.inner.pages.len()).filter(|index| {
-                range_pages.contains(&self.inner.pages[*index].page.identity())
+                range.contains_page(self.inner.pages[*index].page.identity())
                     && !adaptive.streaming.contains_key(index)
             }))?;
         } else {
@@ -1082,11 +1204,36 @@ impl CanonicalBackingRange {
         self.layout.gates.iter()
     }
 
-    fn pages(&self) -> impl Iterator<Item = &CanonicalBackingPage> {
+    /// Unique retained pages sorted by physical identity, independent of logical byte order.
+    /// Mapped views do not expand their byte permutation for ownership tracking.
+    pub fn pages(&self) -> impl Iterator<Item = &CanonicalBackingPage> {
+        self.layout.pages.iter()
+    }
+    fn contains_page(&self, page: CanonicalPageId) -> bool {
         self.layout
             .pages
-            .iter()
-            .map(|index| self.layout.segments[*index].backing())
+            .binary_search_by_key(&page, CanonicalBackingPage::identity)
+            .is_ok()
+    }
+
+    /// Conservative physical-page overlap, without expanding byte permutations.
+    /// Retained pages are sorted independently of the ordered logical segments.
+    /// Disjoint allocations reject in constant time; otherwise search the larger
+    /// page set using the smaller set. Slice metadata may conservatively overlap.
+    pub fn may_share_pages(&self, other: &Self) -> bool {
+        let a = &self.layout.pages;
+        let b = &other.layout.pages;
+        if a.last().unwrap().identity() < b[0].identity()
+            || b.last().unwrap().identity() < a[0].identity()
+        {
+            return false;
+        }
+        let (small, large) = if a.len() < b.len() { (a, b) } else { (b, a) };
+        small.iter().any(|page| {
+            large
+                .binary_search_by_key(&page.identity(), CanonicalBackingPage::identity)
+                .is_ok()
+        })
     }
 
     /// Creates a non-empty range and checks its total length.
@@ -1096,51 +1243,39 @@ impl CanonicalBackingRange {
         }
         let mut size = 0_u64;
         let mut segment_ends = Vec::with_capacity(segments.len());
-        let mut segment_runs: Vec<CanonicalSegmentRun> = Vec::new();
         for segment in &segments {
             size = size
                 .checked_add(segment.size)
                 .ok_or(CanonicalRangeError::RangeOverflow)?;
             segment_ends.push(size);
-            let page = segment.page();
-            if let Some(run) = segment_runs.last_mut()
-                && run.last_page.store() == page.store()
-                && run.last_page.page().get().checked_add(1) == Some(page.page().get())
-                && run.offset == segment.offset
-                && run.size == segment.size
-                && run.permissions == segment.permissions
-                && run.mapping_generation == segment.mapping_generation
-            {
-                run.last_page = page;
-            } else {
-                segment_runs.push(CanonicalSegmentRun {
-                    first_page: page,
-                    last_page: page,
-                    offset: segment.offset,
-                    size: segment.size,
-                    permissions: segment.permissions,
-                    mapping_generation: segment.mapping_generation,
+        }
+        let mut pages = BTreeMap::new();
+        let mut stores = BTreeMap::new();
+        let mut previous_page = None;
+        for segment in &segments {
+            if previous_page != Some(segment.page()) {
+                pages.entry(segment.page()).or_insert_with(|| {
+                    stores
+                        .entry(segment.backing().store().execution_gate().identity())
+                        .or_insert_with(|| segment.backing().store().execution_gate().clone());
+                    segment.backing().clone()
                 });
             }
+            previous_page = Some(segment.page());
         }
-        let mut seen_pages = BTreeSet::new();
-        let mut pages = Vec::new();
-        let mut stores = BTreeMap::new();
-        for (index, segment) in segments.iter().enumerate() {
-            if seen_pages.insert(segment.page()) {
-                pages.push(index);
-                stores
-                    .entry(segment.backing().store().execution_gate().identity())
-                    .or_insert_with(|| segment.backing().store().execution_gate().clone());
-            }
-        }
+        let pages: Box<[_]> = pages.into_values().collect();
         let stores = stores.into_values().collect();
         Ok(Self {
             layout: Arc::new(CanonicalRangeLayout {
-                segments: segments.into(),
-                segment_runs: segment_runs.into(),
-                segment_ends: segment_ends.into(),
-                pages: pages.into(),
+                topology: std::sync::OnceLock::from(CanonicalSegmentTopology {
+                    segments: segments.into(),
+                    segment_ends: segment_ends.into(),
+                }),
+                mapping: None,
+                page_segments: std::sync::OnceLock::new(),
+                segment_runs: std::sync::OnceLock::new(),
+                byte_mapping_hash: std::sync::OnceLock::new(),
+                pages,
                 gates: stores,
                 owner: Mutex::new(None),
                 visibility_epoch: std::sync::OnceLock::new(),
@@ -1167,7 +1302,7 @@ impl CanonicalBackingRange {
     /// Returns the ordered canonical segments.
     #[must_use]
     pub fn segments(&self) -> &[CanonicalBackingSegment] {
-        &self.layout.segments
+        &self.layout.topology().segments
     }
 
     pub(crate) fn segments_between(
@@ -1177,14 +1312,16 @@ impl CanonicalBackingRange {
     ) -> impl Iterator<Item = (u64, &CanonicalBackingSegment)> {
         let first = self
             .layout
+            .topology()
             .segment_ends
             .partition_point(|&limit| limit <= offset);
         let last = self
             .layout
+            .topology()
             .segment_ends
             .partition_point(|&limit| limit < end);
         let limit = if offset < end {
-            (last + 1).min(self.layout.segments.len())
+            (last + 1).min(self.layout.topology().segments.len())
         } else {
             first
         };
@@ -1192,9 +1329,9 @@ impl CanonicalBackingRange {
             let start = if index == 0 {
                 0
             } else {
-                self.layout.segment_ends[index - 1]
+                self.layout.topology().segment_ends[index - 1]
             };
-            (start, &self.layout.segments[index])
+            (start, &self.layout.topology().segments[index])
         })
     }
 
@@ -1235,8 +1372,34 @@ impl CanonicalBackingRange {
         }))
     }
 
+    /// Returns physical byte coverage in page/offset order, retaining holes.
+    /// This is a dependency/publication domain, not the source's logical order.
+    /// Adjacent/overlapping segments merge only with identical mapping facts.
+    pub fn physical_union(&self) -> Result<Self, CanonicalRangeError> {
+        let mut segments = self.segments().to_vec();
+        segments.sort_unstable_by_key(|s| (s.page(), s.offset));
+        let mut merged: Vec<CanonicalBackingSegment> = Vec::new();
+        for segment in segments {
+            if let Some(last) = merged.last_mut()
+                && last.page() == segment.page()
+                && segment.offset <= last.offset + last.size
+                && last.permissions == segment.permissions
+                && last.mapping_generation == segment.mapping_generation
+            {
+                last.size =
+                    (segment.offset + segment.size).max(last.offset + last.size) - last.offset;
+            } else {
+                merged.push(segment);
+            }
+        }
+        Self::new(merged)
+    }
+
     /// Retains a checked logical subrange with the same canonical page identity.
     pub fn snapshot_subrange(&self, offset: u64, size: u64) -> Result<Self, CanonicalRangeError> {
+        if offset == 0 && size == self.size {
+            return Ok(self.clone());
+        }
         let mut captured = Vec::new();
         self.snapshot_subrange_into(offset, size, &mut captured)?;
         Self::new(captured)
@@ -1258,6 +1421,14 @@ impl CanonicalBackingRange {
             .ok_or(CanonicalRangeError::RangeOverflow)?;
         if size == 0 || end > self.size {
             return Err(CanonicalRangeError::InvalidSubrange);
+        }
+        if let Some(mapping) = &self.layout.mapping {
+            let original_len = output.len();
+            let result = mapping.snapshot(offset, size, output);
+            if result.is_err() {
+                output.truncate(original_len);
+            }
+            return result;
         }
         let original_len = output.len();
         let result = (|| {
@@ -1611,12 +1782,14 @@ impl CanonicalBackingRange {
             .is_some_and(|owner| owner.advance(declaration))
     }
 
-    /// Publishes compatible writes from one accepted host submission.
+    /// Publishes compatible writes from one accepted device producer.
     ///
     /// Physical pages, execution gates and alias protections are updated once.
     /// Resource ranges retain independent ownership records: advancing one
     /// overlapping view must never advance the completion of untouched pages.
-    /// The point may be in flight; CPU consumers wait through the coordinator.
+    /// The point may be pending or in flight; CPU consumers wait through the
+    /// coordinator. An owner accepting recorded work before host submission
+    /// must submit that work on demand and invalidate ownership on failure.
     pub fn publish_device_writes<'a>(
         accesses: impl IntoIterator<Item = (&'a Self, DeviceAccessDeclaration)>,
         coordinator: Arc<dyn VisibilityCoordinator>,
@@ -1724,9 +1897,16 @@ impl CanonicalBackingRange {
     pub fn invalidate_visibility_ranges<'a>(
         ranges: impl IntoIterator<Item = &'a Self>,
     ) -> Result<(), VisibilityError> {
-        let pages = ranges
+        Self::invalidate_visibility_pages(ranges.into_iter().flat_map(Self::pages))
+    }
+
+    /// Invalidates retained pages directly; no logical byte topology is needed
+    /// when a device owner releases its authoritative contents during teardown.
+    pub fn invalidate_visibility_pages<'a>(
+        pages: impl IntoIterator<Item = &'a CanonicalBackingPage>,
+    ) -> Result<(), VisibilityError> {
+        let pages = pages
             .into_iter()
-            .flat_map(Self::pages)
             .map(|page| (page.identity(), page.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut gates = BTreeMap::new();
@@ -1864,6 +2044,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_tiled_cpu_snapshot_does_not_expand_unmodified_topology() {
+        let allocation = CanonicalAllocation::zeroed(512 * 512 * 4, 4096).unwrap();
+        let physical = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let range = CanonicalBackingRange::mapped(
+            physical,
+            CanonicalByteLayout {
+                base: 0,
+                columns: 512,
+                rows: 512,
+                element_bytes: 4,
+                source_element_bytes: 4,
+                source_byte_offset: 0,
+                source_row_pitch: 2048,
+                tile: Some(CanonicalByteTile::new(4, 1, vec![2, 1, 0, 3]).unwrap()),
+            },
+        )
+        .unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let before = range.metadata_bytes();
+        allocation
+            .write(3 * 4096 + 100, &[0x51, 0x62, 0x73, 0x84])
+            .unwrap();
+        let snapshots = dependency.snapshot_dirty_pages(&range, 4).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].0, 3 * 4096);
+        let mut expected = vec![0; 4096];
+        expected[100..104].copy_from_slice(&[0x73, 0x62, 0x51, 0x84]);
+        assert_eq!(&*snapshots[0].1, expected);
+        assert!(
+            range.metadata_bytes() < before + 128 * 1024,
+            "one dirty page must not materialize a million texel segments"
+        );
+        assert!(dependency.remains_current());
+    }
+
+    #[test]
+    fn segment_subranges_keep_captured_mapping_and_bounds() {
+        let allocation = crate::CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let whole = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let segment = whole.segments()[0].snapshot_subrange(17, 61).unwrap();
+        let nested = segment.snapshot_subrange(3, 7).unwrap();
+        let reference = whole.snapshot_subrange(20, 7).unwrap();
+        assert_eq!(&nested, &reference.segments()[0]);
+        assert_eq!(segment.snapshot_subrange(0, 61).unwrap(), segment);
+        for (offset, size) in [(0, 0), (61, 1), (60, 2), (u64::MAX, 2)] {
+            assert!(segment.snapshot_subrange(offset, size).is_err());
+        }
+    }
+
+    #[test]
     fn compressed_topology_equality_matches_the_full_ordered_segments() {
         let allocation = crate::CanonicalAllocation::zeroed(8 * 4096, 4096).unwrap();
         let full = allocation
@@ -1900,7 +2134,7 @@ mod tests {
             .cloned()
             .map(|segments| CanonicalBackingRange::new(segments).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(ranges[0].layout.segment_runs.len(), 1);
+        assert_eq!(ranges[0].layout.segment_runs().len(), 1);
         for (left, a) in ranges.iter().enumerate() {
             for (right, b) in ranges.iter().enumerate() {
                 assert_eq!(
@@ -3195,7 +3429,7 @@ mod tests {
                 .pages()
                 .map(CanonicalBackingPage::identity)
                 .collect::<Vec<_>>(),
-            [b.identity(), a.identity(), c.identity()]
+            [c.identity(), a.identity(), b.identity()]
         );
         assert_eq!(
             range
@@ -3940,5 +4174,46 @@ mod tests {
         );
         allocation.write(0, &[0x33]).unwrap();
         assert!(!dependency.remains_current());
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    #[test]
+    fn physical_union_keeps_holes_and_page_index_is_independent_of_logical_order() {
+        let allocation = crate::CanonicalAllocation::zeroed(8192, 4096).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mut segments = Vec::new();
+        for (offset, size) in [(4096, 4), (0x100, 8), (0x108, 8), (0x104, 8), (0x200, 8)] {
+            full.snapshot_subrange_into(offset, size, &mut segments)
+                .unwrap();
+        }
+        let logical = CanonicalBackingRange::new(segments).unwrap();
+        assert_eq!(logical.size(), 36);
+        assert_eq!(
+            logical
+                .pages()
+                .map(CanonicalBackingPage::identity)
+                .collect::<Vec<_>>(),
+            vec![full.segments()[0].page(), full.segments()[1].page()]
+        );
+        assert_eq!(logical.segments()[0].page(), full.segments()[1].page());
+        let physical = logical.physical_union().unwrap();
+        assert_eq!(physical.size(), 28);
+        assert_eq!(
+            physical
+                .segments()
+                .iter()
+                .map(|s| (s.page(), s.offset(), s.size()))
+                .collect::<Vec<_>>(),
+            vec![
+                (full.segments()[0].page(), 0x100, 16),
+                (full.segments()[0].page(), 0x200, 8),
+                (full.segments()[1].page(), 0, 4)
+            ]
+        );
     }
 }

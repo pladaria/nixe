@@ -28,7 +28,7 @@ fn txq_mip_count_keeps_the_established_image_type_and_binding() {
         assert_eq!(query.destination.index(), 10);
         assert_eq!(query.descriptor, 22);
         let mut ops = vec![ShaderOperation::QueryTextureLevels {
-            destination: query.destination,
+            destination: query.destination.into(),
             image_binding: 32,
         }];
         ops.push(ShaderOperation::StoreOutput {
@@ -109,7 +109,7 @@ fn texs_cube_lod_preserves_packed_directions_mips_outputs_and_query_identity() {
     )
     .unwrap();
     assert!(
-        matches!(&ops[0], ShaderOperation::SampleTextureCube { coordinates, lod: Some(lod), outputs, image_binding: 32, sampler_binding: 33 }
+        matches!(&ops[0], crate::shader::decoded::Operation::SampleTextureCube { coordinates, lod: Some(lod), outputs, image_binding: 32, sampler_binding: 33 }
         if coordinates.map(|r| r.index()) == [6,7,4] && lod.index() == 5 && outputs.iter().map(|o| o.destination().index()).collect::<Vec<_>>() == [8,9,39])
     );
     assert_eq!(
@@ -177,15 +177,16 @@ fn tlds_level_zero_preserves_coordinates_channels_and_samplerless_binding() {
     assert_eq!(operation.len(), 1);
     assert_eq!(
         operation[0],
-        ShaderOperation::LoadTexture2D {
+        crate::shader::decoded::Operation::LoadTexture2D {
             outputs: (0..4)
                 .map(|component| ShaderTextureSampleOutput::new(
                     ShaderRegister::new(u16::from(component)),
                     component
                 )
                 .unwrap())
+                .map(Into::into)
                 .collect(),
-            coordinates: [ShaderRegister::new(6), ShaderRegister::new(7)],
+            coordinates: [ShaderRegister::new(6).into(), ShaderRegister::new(7).into()],
             image_binding: 32,
             mip_level: 0,
         }
@@ -302,7 +303,7 @@ fn texs_2d_implicit_lod_decodes_captured_split_rgba_operands() {
 
     assert_eq!(
         operation[0],
-        ShaderOperation::SampleTexture2D {
+        crate::shader::decoded::Operation::SampleTexture2D {
             offset: None,
             outputs: (0..4)
                 .map(|component| {
@@ -313,8 +314,11 @@ fn texs_2d_implicit_lod_decodes_captured_split_rgba_operands() {
                     .unwrap()
                 })
                 .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            coordinates: [ShaderRegister::new(1), ShaderRegister::new(0)],
+                .into_boxed_slice()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            coordinates: [ShaderRegister::new(1).into(), ShaderRegister::new(0).into()],
             image_binding: 32,
             lod: None,
             sampler_binding: 33,
@@ -348,12 +352,15 @@ fn texs_2d_array_implicit_lod_decodes_packed_layer_and_coordinates() {
 
     assert_eq!(
         operation[0],
-        ShaderOperation::SampleTexture2DArray {
+        crate::shader::decoded::Operation::SampleTexture2DArray {
             offset: None,
             outputs: vec![ShaderTextureSampleOutput::new(ShaderRegister::new(3), 0).unwrap()]
-                .into_boxed_slice(),
-            coordinates: [ShaderRegister::new(1), ShaderRegister::new(2)],
-            array_index: ShaderRegister::new(0),
+                .into_boxed_slice()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            coordinates: [ShaderRegister::new(1).into(), ShaderRegister::new(2).into()],
+            array_index: ShaderRegister::new(0).into(),
             image_binding: 32,
             lod: None,
             sampler_binding: 33,
@@ -448,7 +455,7 @@ fn texs_half_results_pack_pairs_without_aliasing_sample_outputs() {
         &mut 2,
     )
     .unwrap();
-    let ShaderOperation::SampleTexture2D {
+    let crate::shader::decoded::Operation::SampleTexture2D {
         outputs,
         coordinates,
         ..
@@ -459,6 +466,7 @@ fn texs_half_results_pack_pairs_without_aliasing_sample_outputs() {
     assert_eq!(
         *coordinates,
         [ShaderRegister::new(1), ShaderRegister::new(0)]
+            .map(crate::shader::decoded::Register::from)
     );
     assert_eq!(
         outputs
@@ -473,12 +481,12 @@ fn texs_half_results_pack_pairs_without_aliasing_sample_outputs() {
         .iter()
         .zip([1.0_f32, -2.0, 0.75, 0.5])
         .map(|(out, value)| ShaderOperation::MoveImmediate32 {
-            destination: out.destination(),
+            destination: out.destination().into(),
             bits: value.to_bits(),
             scalar_type: ShaderScalarType::Float32,
         })
         .collect::<Vec<_>>();
-    code.extend_from_slice(&operations[1..]);
+    code.extend(operations[1..].iter().cloned().map(Into::into));
     code.push(ShaderOperation::StoreOutput {
         sources: vec![ShaderRegister::new(0), ShaderRegister::new(1)].into(),
         location: ShaderIoLocation::Color(0),
@@ -562,7 +570,7 @@ fn texs_explicit_zero_lod_preserves_sampling_semantics() {
             &mut 32,
         )
         .unwrap();
-        let ShaderOperation::MoveImmediate32 {
+        let crate::shader::decoded::Operation::MoveImmediate32 {
             destination,
             bits: 0,
             scalar_type: nixe_gpu::ShaderScalarType::Float32,
@@ -571,8 +579,8 @@ fn texs_explicit_zero_lod_preserves_sampling_semantics() {
             panic!("explicit LOD zero required")
         };
         match &operations[1] {
-            ShaderOperation::SampleTexture2D { lod, .. }
-            | ShaderOperation::SampleTexture2DArray { lod, .. } => {
+            crate::shader::decoded::Operation::SampleTexture2D { lod, .. }
+            | crate::shader::decoded::Operation::SampleTexture2DArray { lod, .. } => {
                 assert_eq!(*lod, Some(destination))
             }
             other => panic!("unexpected sample {other:?}"),
@@ -596,14 +604,17 @@ fn tex_packs_sparse_channels_and_shares_the_texs_descriptor() {
     .unwrap();
     assert_eq!(
         operations,
-        vec![ShaderOperation::SampleTexture2D {
+        vec![crate::shader::decoded::Operation::SampleTexture2D {
             offset: None,
             outputs: vec![
                 ShaderTextureSampleOutput::new(ShaderRegister::new(4), 1).unwrap(),
                 ShaderTextureSampleOutput::new(ShaderRegister::new(5), 2).unwrap(),
             ]
-            .into_boxed_slice(),
-            coordinates: [ShaderRegister::new(4), ShaderRegister::new(5)],
+            .into_boxed_slice()
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+            coordinates: [ShaderRegister::new(4).into(), ShaderRegister::new(5).into()],
             image_binding: 32,
             sampler_binding: 33,
             lod: None,
@@ -640,10 +651,10 @@ fn tex_array_explicit_lod_reads_metadata_and_preserves_the_layer() {
     )
     .unwrap();
     assert!(
-        matches!(&operations[0], ShaderOperation::SampleTexture2DArray {
+        matches!(&operations[0], crate::shader::decoded::Operation::SampleTexture2DArray {
         coordinates, array_index, lod: Some(level), ..
-    } if *coordinates == [ShaderRegister::new(5), ShaderRegister::new(6)]
-        && *array_index == ShaderRegister::new(4) && *level == ShaderRegister::new(7))
+    } if *coordinates == [ShaderRegister::new(5), ShaderRegister::new(6)].map(crate::shader::decoded::Register::from)
+        && *array_index == ShaderRegister::new(4).into() && *level == ShaderRegister::new(7).into())
     );
 }
 
@@ -681,15 +692,17 @@ fn tex_modifiers_fail_explicitly_and_lod_zero_does_not_read_rz_metadata() {
     .unwrap();
     assert!(matches!(
         operations[0],
-        ShaderOperation::MoveImmediate32 {
+        crate::shader::decoded::Operation::MoveImmediate32 {
             bits: 0,
             scalar_type: ShaderScalarType::Float32,
             ..
         }
     ));
-    assert!(matches!(operations[1], ShaderOperation::SampleTexture2D {
+    assert!(
+        matches!(operations[1], crate::shader::decoded::Operation::SampleTexture2D {
         lod: Some(level), ..
-    } if level == ShaderRegister::new(32)));
+    } if level == ShaderRegister::new(32).into())
+    );
     assert!(
         decode_texture_sample(
             MaxwellShaderStage::Pixel,
@@ -763,9 +776,11 @@ fn tex_depth_array_comparison_preserves_reference_layer_channels_and_sampler_typ
         &[],
     )
     .unwrap();
-    assert!(matches!(&ops[0],ShaderOperation::SampleDepthCompare2D {
+    assert!(
+        matches!(&ops[0],crate::shader::decoded::Operation::SampleDepthCompare2D {
             offset: None, coordinates,array_index:Some(layer),reference,image_binding:32,sampler_binding:33,level_zero:false,outputs}
-        if coordinates[0].index()==13 && coordinates[1].index()==14 && layer.index()==12 && reference.index()==23 && outputs[0].destination().index()==13));
+        if coordinates[0].index()==13 && coordinates[1].index()==14 && layer.index()==12 && reference.index()==23 && outputs[0].destination().index()==13)
+    );
     let mut header = [0; 20];
     header[0] = 0x00025462;
     header[18] = 15;
@@ -806,7 +821,8 @@ fn tex_depth_array_comparison_preserves_reference_layer_channels_and_sampler_typ
 
 #[test]
 fn tex_aoffi_signed_nibbles_preserve_native_offsets_and_metadata_routing() {
-    use nixe_gpu::{ShaderInstruction, ShaderPredicate, ShaderSourceLocation};
+    use crate::shader::decoded::Instruction as ShaderInstruction;
+    use nixe_gpu::{ShaderPredicate, ShaderSourceLocation};
     let captured = 0xc0fa_0087_a037_0400;
     for packed in 0..256_u32 {
         let previous = [ShaderInstruction::new(
@@ -816,7 +832,8 @@ fn tex_aoffi_signed_nibbles_preserve_native_offsets_and_metadata_routing() {
                 destination: ShaderRegister::new(3),
                 bits: packed,
                 scalar_type: ShaderScalarType::Unsigned32,
-            },
+            }
+            .into(),
         )];
         let ops = decode_texture_sample(
             MaxwellShaderStage::Pixel,
@@ -833,7 +850,7 @@ fn tex_aoffi_signed_nibbles_preserve_native_offsets_and_metadata_routing() {
             (((packed >> 4) & 15) as i32) << 28 >> 28,
         ];
         assert!(
-            matches!(ops.last().unwrap(),ShaderOperation::SampleTexture2D { offset:Some(offset), lod:Some(_),.. } if *offset==expected)
+            matches!(ops.last().unwrap(),crate::shader::decoded::Operation::SampleTexture2D { offset:Some(offset), lod:Some(_),.. } if *offset==expected)
         );
         let dc = decode_texture_sample(
             MaxwellShaderStage::Pixel,
@@ -846,7 +863,7 @@ fn tex_aoffi_signed_nibbles_preserve_native_offsets_and_metadata_routing() {
         )
         .unwrap();
         assert!(
-            matches!(dc.last().unwrap(),ShaderOperation::SampleDepthCompare2D { offset:Some(offset),reference,level_zero:true,.. } if *offset==expected && reference.index()==4)
+            matches!(dc.last().unwrap(),crate::shader::decoded::Operation::SampleDepthCompare2D { offset:Some(offset),reference,level_zero:true,.. } if *offset==expected && reference.index()==4)
         );
     }
     let mut header = [0; 20];
@@ -888,13 +905,14 @@ fn tex_aoffi_signed_nibbles_preserve_native_offsets_and_metadata_routing() {
 
 #[test]
 fn tex_aoffi_never_freezes_uniforms_conditional_writes_or_branch_join_values() {
-    use nixe_gpu::{ShaderInstruction, ShaderPredicate, ShaderSourceLocation};
+    use crate::shader::decoded::Instruction as ShaderInstruction;
+    use nixe_gpu::{ShaderPredicate, ShaderSourceLocation};
     let r = ShaderRegister::new;
     let literal = ShaderInstruction::new(
         ShaderSourceLocation::new(8),
         ShaderPredicate::Always,
-        ShaderOperation::MoveImmediate32 {
-            destination: r(3),
+        crate::shader::decoded::Operation::MoveImmediate32 {
+            destination: r(3).into(),
             bits: 17,
             scalar_type: ShaderScalarType::Unsigned32,
         },
@@ -905,8 +923,8 @@ fn tex_aoffi_never_freezes_uniforms_conditional_writes_or_branch_join_values() {
             register: 0,
             inverted: false,
         },
-        ShaderOperation::MoveImmediate32 {
-            destination: r(3),
+        crate::shader::decoded::Operation::MoveImmediate32 {
+            destination: r(3).into(),
             bits: 0,
             scalar_type: ShaderScalarType::Unsigned32,
         },
@@ -914,15 +932,15 @@ fn tex_aoffi_never_freezes_uniforms_conditional_writes_or_branch_join_values() {
     let branch = ShaderInstruction::new(
         ShaderSourceLocation::new(0),
         ShaderPredicate::Always,
-        ShaderOperation::Branch {
+        crate::shader::decoded::Operation::Branch {
             target: ShaderSourceLocation::new(24),
         },
     );
     let uniform = ShaderInstruction::new(
         ShaderSourceLocation::new(8),
         ShaderPredicate::Always,
-        ShaderOperation::LoadConstantBuffer32 {
-            destination: r(3),
+        crate::shader::decoded::Operation::LoadConstantBuffer32 {
+            destination: r(3).into(),
             binding: 0,
             byte_offset: 0,
             scalar_type: ShaderScalarType::Unsigned32,

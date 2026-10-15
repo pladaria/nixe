@@ -13,19 +13,19 @@
 
 use super::*;
 
-impl Emitter {
-    fn masked(&mut self, value: u32, mask: u32) -> Result<u32> {
+impl Math {
+    pub(super) fn masked(&mut self, value: u32, mask: u32) -> Result<u32> {
         let mask = self.constant(mask);
         Ok(self.b.bitwise_and(self.uint, None, value, mask)?)
     }
 
-    fn tiny(&mut self, bits: u32) -> Result<u32> {
+    pub(super) fn tiny(&mut self, bits: u32) -> Result<u32> {
         let exponent = self.masked(bits, 0x7f80_0000)?;
         let zero = self.constant(0);
         Ok(self.b.i_equal(self.boolean, None, exponent, zero)?)
     }
 
-    pub(super) fn repair_binary_underflow(
+    pub(crate) fn repair_binary_underflow(
         &mut self,
         value: u32,
         left: u32,
@@ -53,7 +53,7 @@ impl Emitter {
         Ok(self.b.bitcast(self.float, None, result)?)
     }
 
-    fn require_repair_float(&mut self) -> Result<u32> {
+    pub(super) fn require_repair_float(&mut self) -> Result<u32> {
         if let Some(ty) = self.repair_float {
             return Ok(ty);
         }
@@ -75,12 +75,12 @@ impl Emitter {
         Ok(ty)
     }
 
-    fn exact_step(&mut self, value: u32) -> u32 {
+    pub(super) fn exact_step(&mut self, value: u32) -> u32 {
         self.b.decorate(value, spv::Decoration::NoContraction, []);
         value
     }
 
-    pub(super) fn repair_product_underflow(
+    pub(crate) fn repair_product_underflow(
         &mut self,
         value: u32,
         left: u32,

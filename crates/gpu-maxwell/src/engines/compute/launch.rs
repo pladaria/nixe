@@ -143,7 +143,7 @@ impl Display for MaxwellComputeLaunchError {
 
 impl std::error::Error for MaxwellComputeLaunchError {}
 
-pub(crate) struct MaxwellResolvedComputeLaunch {
+pub struct MaxwellResolvedComputeLaunch {
     source: MaxwellMethodSource,
     program_address: u64,
     qmd: MaxwellComputeQmd,
@@ -220,11 +220,11 @@ impl MaxwellResolvedComputeLaunch {
             let (address, cb_size) = self
                 .qmd
                 .constant_buffer(buffer.constant_buffer)
-                .map_err(|reason| buffer_error(buffer.binding, reason))?;
+                .map_err(|reason| buffer_error(buffer.oracle_binding(), reason))?;
             let descriptor_bytes = if buffer.runtime_extent { 16 } else { 8 };
             if u64::from(buffer.byte_offset) + descriptor_bytes > cb_size {
                 return Err(buffer_error(
-                    buffer.binding,
+                    buffer.oracle_binding(),
                     "global pointer exceeds its constant buffer",
                 ));
             }
@@ -258,7 +258,7 @@ impl MaxwellResolvedComputeLaunch {
                 let declared = u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
                 if declared == 0 {
                     return Err(buffer_error(
-                        buffer.binding,
+                        buffer.oracle_binding(),
                         "NVN storage descriptor has zero size",
                     ));
                 }
@@ -268,12 +268,12 @@ impl MaxwellResolvedComputeLaunch {
             };
             if address & 3 != 0 {
                 return Err(buffer_error(
-                    buffer.binding,
+                    buffer.oracle_binding(),
                     "global buffer base is not word aligned",
                 ));
             }
             resources.push((
-                buffer.binding,
+                buffer.oracle_binding(),
                 resolve(
                     address,
                     size,
@@ -383,4 +383,130 @@ pub(crate) fn resolve_compute_launch(
         program_address,
         qmd,
     })
+}
+impl MaxwellResolvedComputeLaunch {
+    pub(crate) fn native_request(&self) -> crate::MaxwellSsaRequest {
+        crate::MaxwellSsaRequest {
+            stage: crate::MaxwellShaderStage::Compute,
+            address: self.program_address,
+            register_count: self.qmd.register_count(),
+            workgroup_size: Some(self.qmd.workgroup_size()),
+        }
+    }
+    pub(crate) fn native_resources(
+        &self,
+        program: &crate::MaxwellSsaProgram,
+        space: &MaxwellGpuAddressSpace,
+        writes: &CanonicalWriteBatch,
+    ) -> Result<
+        Vec<(nixe_gpu::ssa::ResourceId, crate::MaxwellResolvedRange)>,
+        MaxwellComputeLaunchError,
+    > {
+        use crate::MaxwellSsaBindingSource as S;
+        let fail = |binding, reason| MaxwellComputeLaunchError::Buffer {
+            source: Box::new(self.source),
+            binding,
+            reason,
+        };
+        let resolve = |address, size, permissions| {
+            let error = |error| MaxwellComputeLaunchError::Address {
+                source: Box::new(self.source),
+                address,
+                error,
+            };
+            let address = space
+                .address(address)
+                .map_err(MaxwellGpuAccessError::Address)
+                .map_err(error)?;
+            space
+                .resolve_range(address, size, permissions)
+                .map_err(error)
+        };
+        let extents =
+            program.global_buffer_extents(self.qmd.workgroup_size(), self.qmd.workgroups());
+        let mut result = Vec::new();
+        for binding in &program.bindings {
+            let range = match binding.source {
+                S::ConstantBuffer { slot } => {
+                    let (address, size) =
+                        self.qmd.constant_buffer(slot).map_err(|e| fail(slot, e))?;
+                    resolve(address, size, MemoryPermissions::READ)?
+                }
+                S::GlobalBuffer {
+                    constant_buffer: slot,
+                    byte_offset,
+                    runtime_extent,
+                } => {
+                    let (cb, size) = self.qmd.constant_buffer(slot).map_err(|e| fail(slot, e))?;
+                    let width = if runtime_extent { 16 } else { 8 };
+                    if u64::from(byte_offset) + width > size {
+                        return Err(fail(slot, "global descriptor exceeds its constant buffer"));
+                    }
+                    let pointer =
+                        resolve(cb + u64::from(byte_offset), width, MemoryPermissions::READ)?;
+                    let mut bytes = [0; 16];
+                    let mut copied = 0;
+                    for segment in pointer.segments() {
+                        let end = copied + segment.size() as usize;
+                        writes
+                            .read_overlay(
+                                segment.mapping().backing(),
+                                segment.backing_offset(),
+                                &mut bytes[copied..end],
+                            )
+                            .map_err(|error| MaxwellComputeLaunchError::StagedRead {
+                                source: Box::new(self.source),
+                                address: cb,
+                                error,
+                            })?;
+                        copied = end;
+                    }
+                    let address = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                    let size = if runtime_extent {
+                        u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()))
+                    } else {
+                        extents
+                            .iter()
+                            .find(|(id, _)| *id == binding.resource)
+                            .map(|(_, s)| *s)
+                            .ok_or_else(|| fail(slot, "global binding has no proved extent"))?
+                    };
+                    if size == 0 || address & 3 != 0 {
+                        return Err(fail(slot, "global buffer size/alignment is invalid"));
+                    }
+                    let mut read = false;
+                    let mut write = false;
+                    for instruction in program.function.blocks.iter().flat_map(|b| &b.instructions)
+                    {
+                        match instruction.op {
+                            nixe_gpu::ssa::Op::Load {
+                                resource: Some(id), ..
+                            } if id == binding.resource => read = true,
+                            nixe_gpu::ssa::Op::Store {
+                                resource: Some(id), ..
+                            } if id == binding.resource => write = true,
+                            _ => {}
+                        }
+                    }
+                    let permissions = match (read, write) {
+                        (true, true) => MemoryPermissions::READ_WRITE,
+                        (true, false) => MemoryPermissions::READ,
+                        (false, true) => MemoryPermissions::WRITE,
+                        (false, false) => {
+                            return Err(fail(slot, "global binding has no memory operation"));
+                        }
+                    };
+                    resolve(address, size, permissions)?
+                }
+                _ => {
+                    return Err(fail(
+                        0,
+                        "compute texture/sampler descriptor resolution is not implemented",
+                    ));
+                }
+            };
+            result.push((binding.resource, range));
+        }
+        Ok(result)
+    }
 }

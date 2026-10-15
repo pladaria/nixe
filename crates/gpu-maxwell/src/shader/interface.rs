@@ -5,10 +5,12 @@ use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use super::tessellation;
 use crate::MaxwellShaderStage;
+use crate::shader::decoded::Register as ShaderRegister;
+use crate::shader::decoded::{Instruction as ShaderInstruction, Operation as ShaderOperation};
 use nixe_gpu::{
-    ShaderFloatControl, ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation,
-    ShaderIoLocation, ShaderNanMode, ShaderOperation, ShaderPredicate, ShaderRegister,
-    ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderStage,
+    ShaderFloatControl, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation,
+    ShaderNanMode, ShaderPredicate, ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation,
+    ShaderStage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -176,7 +178,7 @@ pub(super) fn interface_element(
     .expect("decoded SPH component is bounded")
 }
 
-pub(super) fn preload_vertex_inputs(
+pub(super) fn oracle_preload_vertex_inputs(
     stage: ShaderStage,
     inputs: &[ShaderInterfaceElement],
 ) -> Vec<ShaderInstruction> {
@@ -187,8 +189,12 @@ pub(super) fn preload_vertex_inputs(
     // NVIDIA's public SPH specification makes the enabled generic input
     // components explicit in ImapGenericVector:
     // https://download.nvidia.com/open-gpu-doc/Shader-Program-Header/1/Shader-Program-Header.html#ImapVector
-    // The VTG launch contract used by the captured program exposes generic
-    // input vector zero in r0-r3; later attributes are fetched explicitly with
+    // Historical oracle-only bootstrap: the captured program exposes generic
+    // input vector zero in r0-r3. The header describes enabled components, not
+    // a hardware GPR initialization rule. Native translation emits explicit ALD
+    // fetches and preserves undefined GPR live-ins. Retire this bootstrap with
+    // the old renderer; its baseline remains frozen during the migration.
+    // Later attributes in the captured oracle programs are fetched explicitly with
     // ALD. Keep this deliberately narrow ABI bridge here, and assert its
     // decoded IR shape in the captured-program test, rather than teaching the
     // platform-independent IR about Maxwell launch registers.
@@ -200,7 +206,7 @@ pub(super) fn preload_vertex_inputs(
                 ShaderSourceLocation::new(0),
                 ShaderPredicate::Always,
                 ShaderOperation::LoadInput {
-                    destinations: vec![ShaderRegister::new(u16::from(input.component()))]
+                    destinations: vec![ShaderRegister::new(u32::from(input.component()))]
                         .into_boxed_slice(),
                     location: input.location(),
                     first_component: input.component(),
@@ -219,7 +225,7 @@ pub(super) fn append_implicit_outputs(
     explicitly_stored: &BTreeSet<(ShaderIoLocation, u8)>,
     instructions: &mut Vec<ShaderInstruction>,
 ) -> Result<(), MaxwellShaderTranslationError> {
-    let mut next_undefined_register = 255_u16;
+    let mut next_undefined_register = 255_u32;
     // TCS outputs are shared; synthetic undefined stores could erase writes
     // from other invocations, including their per-patch tessellation levels.
     if stage == ShaderStage::TessellationControl {
@@ -287,7 +293,7 @@ pub(super) fn append_implicit_outputs(
             source,
             predicate,
             ShaderOperation::StoreOutput {
-                sources: vec![ShaderRegister::new(register)].into_boxed_slice(),
+                sources: vec![ShaderRegister::new(u32::from(register))].into_boxed_slice(),
                 location: output.location(),
                 first_component: output.component(),
                 scalar_type: output.scalar_type(),
@@ -365,7 +371,7 @@ pub(super) fn decode_attribute_load(
             .get(&location)
             .copied()
             .unwrap_or(default_scalar_type);
-        let destination = ShaderRegister::new(u16::from(destination + component));
+        let destination = ShaderRegister::new(u32::from(destination + component));
         if let Some(ShaderOperation::LoadInput {
             destinations,
             location: previous_location,
@@ -437,7 +443,7 @@ pub(super) fn decode_attribute_store(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     if encoding & (1 << 31) != 0 {
         return Err(malformed(
@@ -480,7 +486,7 @@ pub(super) fn decode_attribute_store(
             destination
         } else {
             validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            ShaderRegister::new(u16::from(raw))
+            ShaderRegister::new(u32::from(raw))
         };
         sources.push(register);
     }
@@ -522,7 +528,7 @@ pub(super) fn decode_interpolate(
     encoding: u64,
     register_count: u8,
     inputs: &mut Vec<ShaderInterfaceElement>,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     normalized_multiplier: bool,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     if stage != MaxwellShaderStage::Pixel {
@@ -581,7 +587,7 @@ pub(super) fn decode_interpolate(
             );
         }
         return Ok(vec![ShaderOperation::LoadInput {
-            destinations: vec![ShaderRegister::new(u16::from(destination))].into_boxed_slice(),
+            destinations: vec![ShaderRegister::new(u32::from(destination))].into_boxed_slice(),
             location,
             first_component: 0,
             scalar_type: ShaderScalarType::Unsigned32,
@@ -607,7 +613,7 @@ pub(super) fn decode_interpolate(
             )
         }
         0 => Ok(vec![ShaderOperation::LoadInput {
-            destinations: vec![ShaderRegister::new(u16::from(destination))].into_boxed_slice(),
+            destinations: vec![ShaderRegister::new(u32::from(destination))].into_boxed_slice(),
             location,
             first_component: component,
             scalar_type: ShaderScalarType::Float32,
@@ -637,7 +643,7 @@ pub(super) fn decode_interpolate(
             // infer it just from the operand register number.
             if normalized_multiplier {
                 return Ok(vec![ShaderOperation::InterpolateInput {
-                    destination: ShaderRegister::new(u16::from(destination)),
+                    destination: ShaderRegister::new(u32::from(destination)),
                     location,
                     component,
                     interpolation,
@@ -650,7 +656,7 @@ pub(super) fn decode_interpolate(
                 destination,
                 location,
                 component,
-                Some(ShaderRegister::new(u16::from(reciprocal))),
+                Some(ShaderRegister::new(u32::from(reciprocal))),
                 inputs,
                 next_temporary,
             )
@@ -665,7 +671,7 @@ pub(super) fn decode_interpolate(
                 ));
             }
             Ok(vec![ShaderOperation::InterpolateInput {
-                destination: ShaderRegister::new(u16::from(destination)),
+                destination: ShaderRegister::new(u32::from(destination)),
                 location,
                 component,
                 interpolation: ShaderInterpolation::Constant,
@@ -681,7 +687,7 @@ pub(super) fn decode_interpolate(
                 )
             })?;
             Ok(vec![ShaderOperation::InterpolateInput {
-                destination: ShaderRegister::new(u16::from(destination)),
+                destination: ShaderRegister::new(u32::from(destination)),
                 location,
                 component,
                 interpolation,
@@ -740,7 +746,7 @@ fn interpolate_perspective_numerator(
     component: u8,
     multiplier: Option<ShaderRegister>,
     inputs: &mut Vec<ShaderInterfaceElement>,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     // IPA.PASS exposes sum(lambda_i * attribute_i / clip_w_i), whereas
     // host perspective inputs expose that numerator divided by FragCoord.w.
@@ -758,7 +764,7 @@ fn interpolate_perspective_numerator(
     };
     let attribute = temporary()?;
     let reciprocal_w = temporary()?;
-    let destination = ShaderRegister::new(u16::from(destination));
+    let destination = ShaderRegister::new(u32::from(destination));
     let numerator = if multiplier.is_some() {
         temporary()?
     } else {

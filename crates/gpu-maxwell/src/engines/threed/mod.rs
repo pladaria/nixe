@@ -4062,7 +4062,7 @@ fn preflight_output_state(
                 "reserved bits are set",
             ));
         }
-        // Disabling sRGB writes selects the linear attachment interpretation.
+        // Preserve the legacy register independently of the explicit color surface format.
         // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2883-L2886
         0x15b8 if raw <= 1 => Some((
             MaxwellThreeDRenderTargetWrite::SrgbWrite {

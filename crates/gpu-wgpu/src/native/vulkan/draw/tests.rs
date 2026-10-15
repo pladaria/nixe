@@ -3,6 +3,7 @@ use nixe_gpu::*;
 
 fn prepared() -> PreparedDraw {
     let mut draw = PreparedDraw::new(
+        nixe_gpu::PreparedStateId::new(1, 1),
         PipelineId::new(1),
         RenderPassId::new(1),
         PrimitiveTopology::Patches,
@@ -26,7 +27,7 @@ fn prepared() -> PreparedDraw {
         None,
     )
     .unwrap();
-    draw.tessellation = Some(TessellationState {
+    draw.edit_state().tessellation = Some(TessellationState {
         input_control_points: 4,
         mode: TessellationMode {
             domain: TessellationDomain::Triangles,
@@ -55,25 +56,25 @@ fn key(draw: PreparedDraw) -> PipelineKey {
 fn native_pipeline_key_excludes_dynamic_levels_bindings_and_viewport() {
     let a = key(prepared());
     let mut b = prepared();
-    b.tessellation.as_mut().unwrap().control = TessellationControl::DefaultLevels {
+    b.edit_state().tessellation.as_mut().unwrap().control = TessellationControl::DefaultLevels {
         outer: [2_f32.to_bits(); 4],
         inner: [3_f32.to_bits(); 2],
         defined: 63,
     };
-    b.vertex_buffers[0].buffer = BufferRegion {
+    b.edit_state().vertex_buffers[0].buffer = BufferRegion {
         buffer: BufferId::new(2),
         range: BufferRange::new(128, 64).unwrap(),
     };
     // Index type, buffer identity and draw indexing do not specialize a Vulkan
     // patch-list pipeline; restart is not enabled by the neutral contract.
-    b.index_buffer = Some((
+    b.edit_state().index_buffer = Some((
         BufferRegion {
             buffer: BufferId::new(9),
             range: BufferRange::new(8, 24).unwrap(),
         },
         IndexType::Uint32,
     ));
-    b.viewport_transform =
+    b.edit_state().viewport_transform =
         Some(ViewportTransform::new([8.0, -8.0, 1.0], [16.0, 16.0, 0.0], [0.0, 1.0]).unwrap());
     let b = key(b);
     assert!(a == b);
@@ -86,8 +87,11 @@ fn native_pipeline_key_excludes_dynamic_levels_bindings_and_viewport() {
     let mut keys = HashMap::default();
     keys.insert(a, 42);
     assert_eq!(keys.get(&b), Some(&42));
-    let mut depth_mode = (*b.draw).clone();
-    depth_mode.viewport_transform = depth_mode
+    let mut depth_mode = PreparedDraw::from_state(
+        PreparedStateId::new(b.draw.identity().slot(), b.draw.identity().revision() + 1),
+        b.draw.state().clone(),
+    );
+    depth_mode.edit_state().viewport_transform = depth_mode
         .viewport_transform
         .map(|v| v.with_negative_one_to_one_depth(true));
     let depth_mode = key(depth_mode);
@@ -99,7 +103,7 @@ fn native_pipeline_key_excludes_dynamic_levels_bindings_and_viewport() {
 fn native_wireframe_pipeline_key_excludes_width_but_includes_coverage_mode() {
     let draw = |width: f32, smooth| {
         let mut draw = prepared();
-        draw.triangle_rasterization = TriangleRasterization::Wireframe {
+        draw.edit_state().triangle_rasterization = TriangleRasterization::Wireframe {
             width_bits: width.to_bits(),
             smooth,
         };
@@ -119,9 +123,9 @@ fn native_wireframe_pipeline_key_excludes_width_but_includes_coverage_mode() {
 fn native_direct_lines_cache_width_dynamically_and_do_not_require_wireframe() {
     let line = |width: f32, smooth| {
         let mut draw = prepared();
-        draw.tessellation = None;
-        draw.topology = PrimitiveTopology::LineStrip;
-        draw.line_rasterization = Some(LineRasterization {
+        draw.edit_state().tessellation = None;
+        draw.edit_state().topology = PrimitiveTopology::LineStrip;
+        draw.edit_state().line_rasterization = Some(LineRasterization {
             width_bits: width.to_bits(),
             smooth,
         });
@@ -254,7 +258,7 @@ fn native_wireframe_consumes_features_and_width_limits_without_clamping() {
 fn native_pipeline_key_includes_static_state_and_full_shader_identity() {
     let a = key(prepared());
     let mut b = prepared();
-    b.front_face = nixe_gpu::FrontFace::Clockwise;
+    b.edit_state().front_face = nixe_gpu::FrontFace::Clockwise;
     assert!(a != key(b));
     for mode in [
         nixe_gpu::CullMode::Front,
@@ -262,20 +266,24 @@ fn native_pipeline_key_includes_static_state_and_full_shader_identity() {
         nixe_gpu::CullMode::FrontAndBack,
     ] {
         let mut b = prepared();
-        b.cull_mode = mode;
+        b.edit_state().cull_mode = mode;
         assert!(a != key(b));
     }
     let mut b = prepared();
-    b.tessellation.as_mut().unwrap().input_control_points = 3;
+    b.edit_state()
+        .tessellation
+        .as_mut()
+        .unwrap()
+        .input_control_points = 3;
     assert!(a != key(b));
     let mut b = prepared();
-    b.vertex_buffers[0].array_stride = 32;
+    b.edit_state().vertex_buffers[0].array_stride = 32;
     assert!(a != key(b));
     let mut b = prepared();
-    b.depth_state = DepthState::new(true, true, DepthCompareOperation::Less);
+    b.edit_state().depth_state = DepthState::new(true, true, DepthCompareOperation::Less);
     assert!(a != key(b));
     let mut b = prepared();
-    b.color_outputs[0].write_mask = ColorWriteMask::NONE;
+    b.edit_state().color_outputs[0].write_mask = ColorWriteMask::NONE;
     assert!(a != key(b));
     let mut b = prepared();
     let component = BlendComponent {
@@ -283,7 +291,7 @@ fn native_pipeline_key_includes_static_state_and_full_shader_identity() {
         source: BlendFactor::SourceAlpha,
         destination: BlendFactor::OneMinusSourceAlpha,
     };
-    b.color_outputs[0].blend = Some(ColorBlendState {
+    b.edit_state().color_outputs[0].blend = Some(ColorBlendState {
         color: component,
         alpha: component,
     });

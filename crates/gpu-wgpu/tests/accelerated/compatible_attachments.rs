@@ -184,38 +184,43 @@ fn cropped_color_preserves_padding_and_readonly_stencil_shares_sampled_depth() {
         id: pass,
         description: pass_description.clone(),
     });
-    let mut prepared = PreparedDraw::new(
-        pipeline,
-        pass,
-        PrimitiveTopology::Triangles,
-        vec![table],
-        vec![
-            VertexBufferLayout::new(
-                BufferRegion {
-                    buffer,
-                    range: BufferRange::new(0, vertices.len() as u64).unwrap(),
-                },
-                28,
-                VertexStepMode::Vertex,
-                vec![
-                    VertexAttribute {
-                        format: VertexFormat::Float32x4,
-                        offset: 0,
-                        shader_location: 0,
+    let prepare = |revision| {
+        let mut prepared = PreparedDraw::new(
+            nixe_gpu::PreparedStateId::new(1, revision),
+            pipeline,
+            pass,
+            PrimitiveTopology::Triangles,
+            vec![table],
+            vec![
+                VertexBufferLayout::new(
+                    BufferRegion {
+                        buffer,
+                        range: BufferRange::new(0, vertices.len() as u64).unwrap(),
                     },
-                    VertexAttribute {
-                        format: VertexFormat::Float32x3,
-                        offset: 16,
-                        shader_location: 1,
-                    },
-                ],
-            )
-            .unwrap(),
-        ],
-        None,
-    )
-    .unwrap();
-    prepared.depth_state = DepthState::new(true, false, DepthCompareOperation::Always);
+                    28,
+                    VertexStepMode::Vertex,
+                    vec![
+                        VertexAttribute {
+                            format: VertexFormat::Float32x4,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x3,
+                            offset: 16,
+                            shader_location: 1,
+                        },
+                    ],
+                )
+                .unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        prepared.edit_state().depth_state =
+            DepthState::new(true, false, DepthCompareOperation::Always);
+        prepared
+    };
     let depth_transform = |scale, offset| {
         Some(nixe_gpu::FragmentDepthTransform::new(scale, offset, 0.0, 1.0).unwrap())
     };
@@ -245,13 +250,14 @@ fn cropped_color_preserves_padding_and_readonly_stencil_shares_sampled_depth() {
     .into_iter()
     .enumerate()
     {
-        prepared.depth_state = DepthState::new(true, false, compare);
-        prepared.viewport_transform = transform.map(|depth| {
+        let mut prepared = prepare(index as u64 + 1);
+        prepared.edit_state().depth_state = DepthState::new(true, false, compare);
+        prepared.edit_state().viewport_transform = transform.map(|depth| {
             nixe_gpu::ViewportTransform::new([2.0, -2.0, 1.0], [2.0, 2.0, 0.0], [0.0, 1.0])
                 .unwrap()
                 .with_fragment_depth_transform(depth)
         });
-        prepared.stencil_state = Some(StencilTestState {
+        prepared.edit_state().stencil_state = Some(StencilTestState {
             front: nixe_gpu::StencilFaceState::read_only(
                 DepthCompareOperation::NotEqual,
                 2,
@@ -343,7 +349,7 @@ fn cropped_color_preserves_padding_and_readonly_stencil_shares_sampled_depth() {
             GpuOperation::new(
                 GpuCommand::Draw(
                     DrawOperation::new(
-                        Arc::new(prepared.clone()),
+                        Arc::new(prepared),
                         DrawArguments::NonIndexed {
                             first_vertex: 0,
                             vertex_count: 3,

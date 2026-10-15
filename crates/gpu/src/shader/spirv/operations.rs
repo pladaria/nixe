@@ -6,30 +6,35 @@ impl Emitter {
         match operation {
             Nop => {}
             QuadShuffle32 { .. } | FloatQuadSwizzleAdd32 { .. } => {
-                return Err(
-                    self.unsupported("fragment quad exchange requires the host quad backend")
-                );
+                return Err(self
+                    .math
+                    .unsupported("fragment quad exchange requires the host quad backend"));
             }
             QueryTextureLevels { .. } => {
-                return Err(self.unsupported("image queries require the WGSL texture backend"));
+                return Err(self
+                    .math
+                    .unsupported("image queries require the WGSL texture backend"));
             }
             FusedMultiplyAddHalf32 { .. } => {
                 return Err(self
+                    .math
                     .unsupported("direct half FMA is not implemented by native SPIR-V lowering"));
             }
             LoadComputeBuiltin32 { .. } | StoreStorageBuffer32 { .. } => {
-                return Err(self.unsupported("compute operations require the WGSL compute backend"));
+                return Err(self
+                    .math
+                    .unsupported("compute operations require the WGSL compute backend"));
             }
             Undefined32 { destination } => {
-                self.write(*destination, self.undefined_uint);
+                self.write(*destination, self.math.undefined_uint);
             }
             MoveImmediate32 {
                 destination,
                 bits,
                 scalar_type,
             } => {
-                self.require_scalar32(*scalar_type)?;
-                let value = self.constant(*bits);
+                self.math.require_scalar32(*scalar_type)?;
+                let value = self.math.constant(*bits);
                 self.write(*destination, value);
             }
             Move32 {
@@ -37,7 +42,7 @@ impl Emitter {
                 source,
                 scalar_type,
             } => {
-                self.require_scalar32(*scalar_type)?;
+                self.math.require_scalar32(*scalar_type)?;
                 self.write(*destination, self.read(*source)?);
             }
             FloatAbsolute32 {
@@ -49,15 +54,17 @@ impl Emitter {
                 source,
             } => {
                 let value = self.read(*source)?;
-                let mask = self.constant(if matches!(operation, FloatAbsolute32 { .. }) {
-                    0x7fff_ffff
-                } else {
-                    0x8000_0000
-                });
+                let mask = self
+                    .math
+                    .constant(if matches!(operation, FloatAbsolute32 { .. }) {
+                        0x7fff_ffff
+                    } else {
+                        0x8000_0000
+                    });
                 let result = if matches!(operation, FloatAbsolute32 { .. }) {
-                    self.b.bitwise_and(self.uint, None, value, mask)?
+                    self.math.b.bitwise_and(self.math.uint, None, value, mask)?
                 } else {
-                    self.b.bitwise_xor(self.uint, None, value, mask)?
+                    self.math.b.bitwise_xor(self.math.uint, None, value, mask)?
                 };
                 self.write(*destination, result);
             }
@@ -67,7 +74,7 @@ impl Emitter {
                 high,
             } => {
                 let packed = self.read(*source)?;
-                let value = self.unpack_half(packed, *high)?;
+                let value = self.math.unpack_half(packed, *high)?;
                 self.write(*destination, value);
             }
             PackHalf32 {
@@ -75,7 +82,7 @@ impl Emitter {
                 source,
             } => {
                 let value = self.read(*source)?;
-                let packed = self.pack_half(value)?;
+                let packed = self.math.pack_half(value)?;
                 self.write(*destination, packed);
             }
             ConvertIntegerToFloat32 {
@@ -86,14 +93,16 @@ impl Emitter {
             } => {
                 if *rounding != ShaderRoundingMode::NearestEven {
                     let source = self.read(*source)?;
-                    let bits = self.directed_integer_to_float(source, *source_type, *rounding)?;
+                    let bits =
+                        self.math
+                            .directed_integer_to_float(source, *source_type, *rounding)?;
                     self.write(*destination, bits);
                     return Ok(());
                 }
                 // Integer conversions cannot produce subnormals. Request RTE
                 // without requiring denormal preservation or emitting repairs.
                 // https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpConvertSToF
-                self.require_float(ShaderFloatControl::new(
+                self.math.require_float(ShaderFloatControl::new(
                     ShaderRoundingMode::NearestEven,
                     ShaderNanMode::Propagate,
                     true,
@@ -103,19 +112,19 @@ impl Emitter {
                 let source = self.read(*source)?;
                 let result = match source_type {
                     ShaderScalarType::Unsigned32 => {
-                        self.b.convert_u_to_f(self.float, None, source)?
+                        self.math.b.convert_u_to_f(self.math.float, None, source)?
                     }
                     ShaderScalarType::Signed32 => {
-                        let source = self.b.bitcast(self.int, None, source)?;
-                        self.b.convert_s_to_f(self.float, None, source)?
+                        let source = self.math.b.bitcast(self.math.int, None, source)?;
+                        self.math.b.convert_s_to_f(self.math.float, None, source)?
                     }
                     _ => {
-                        return Err(
-                            self.unsupported("native integer conversion requires a 32-bit integer")
-                        );
+                        return Err(self
+                            .math
+                            .unsupported("native integer conversion requires a 32-bit integer"));
                     }
                 };
-                let bits = self.b.bitcast(self.uint, None, result)?;
+                let bits = self.math.b.bitcast(self.math.uint, None, result)?;
                 self.write(*destination, bits);
             }
             LoadInput {
@@ -154,11 +163,12 @@ impl Emitter {
                 // Interpolation occurs at the fragment stage interface, not as
                 // a second multiplication by the reciprocal of clip W.
                 if !self
-                    .interfaces
+                    .io
+                    .elements
                     .get(&(true, *location, *component))
                     .is_some_and(|element| element.interpolation == Some(*interpolation))
                 {
-                    return Err(self.unsupported(
+                    return Err(self.math.unsupported(
                         "interpolation operation disagrees with its native interface",
                     ));
                 }
@@ -180,11 +190,11 @@ impl Emitter {
                 byte_offset,
                 scalar_type,
             } => {
-                self.require_scalar32(*scalar_type)?;
+                self.math.require_scalar32(*scalar_type)?;
                 if byte_offset & 3 != 0 {
-                    return Err(self.unsupported("unaligned constant-buffer word load"));
+                    return Err(self.math.unsupported("unaligned constant-buffer word load"));
                 }
-                let word = self.constant(byte_offset / 4);
+                let word = self.math.constant(byte_offset / 4);
                 let value = self.load_buffer_word(*binding, word)?;
                 self.write(*destination, value);
             }
@@ -195,14 +205,15 @@ impl Emitter {
                 dynamic_byte_offset,
                 scalar_type,
             } => {
-                self.require_scalar32(*scalar_type)?;
+                self.math.require_scalar32(*scalar_type)?;
                 let dynamic = self.read(*dynamic_byte_offset)?;
-                let base = self.constant(*base_byte_offset as u32);
-                let address = self.b.i_add(self.uint, None, dynamic, base)?;
-                let shift = self.constant(2);
+                let base = self.math.constant(*base_byte_offset as u32);
+                let address = self.math.b.i_add(self.math.uint, None, dynamic, base)?;
+                let shift = self.math.constant(2);
                 let word = self
+                    .math
                     .b
-                    .shift_right_logical(self.uint, None, address, shift)?;
+                    .shift_right_logical(self.math.uint, None, address, shift)?;
                 let value = self.load_buffer_word(*binding, word)?;
                 self.write(*destination, value);
             }
@@ -243,10 +254,10 @@ impl Emitter {
                 // Invocation, semantics None. OpControlBarrier itself makes
                 // output writes visible to the other invocations in the patch.
                 // https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-tessellation-output-ordering
-                let execution = self.constant(spv::Scope::Workgroup as u32);
-                let memory = self.constant(spv::Scope::Invocation as u32);
-                let semantics = self.constant(spv::MemorySemantics::empty().bits());
-                self.b.control_barrier(execution, memory, semantics)?;
+                let execution = self.math.constant(spv::Scope::Workgroup as u32);
+                let memory = self.math.constant(spv::Scope::Invocation as u32);
+                let semantics = self.math.constant(spv::MemorySemantics::empty().bits());
+                self.math.b.control_barrier(execution, memory, semantics)?;
             }
             ShiftLeft32 {
                 destination,
@@ -270,34 +281,53 @@ impl Emitter {
                     _ => (false, false, false),
                 };
                 if reverse {
-                    base = self.b.bit_reverse(self.uint, None, base)?;
+                    base = self.math.b.bit_reverse(self.math.uint, None, base)?;
                 }
-                let mask = self.constant(31);
-                let count = self.b.bitwise_and(self.uint, None, raw_count, mask)?;
-                let zero = self.constant(0);
+                let mask = self.math.constant(31);
+                let count = self
+                    .math
+                    .b
+                    .bitwise_and(self.math.uint, None, raw_count, mask)?;
+                let zero = self.math.constant(0);
                 let (mut bits, clamped) = if signed {
-                    let base = self.b.bitcast(self.int, None, base)?;
-                    let shifted = self.b.shift_right_arithmetic(self.int, None, base, count)?;
-                    let sign = self.b.shift_right_arithmetic(self.int, None, base, mask)?;
+                    let base = self.math.b.bitcast(self.math.int, None, base)?;
+                    let shifted =
+                        self.math
+                            .b
+                            .shift_right_arithmetic(self.math.int, None, base, count)?;
+                    let sign =
+                        self.math
+                            .b
+                            .shift_right_arithmetic(self.math.int, None, base, mask)?;
                     (
-                        self.b.bitcast(self.uint, None, shifted)?,
-                        self.b.bitcast(self.uint, None, sign)?,
+                        self.math.b.bitcast(self.math.uint, None, shifted)?,
+                        self.math.b.bitcast(self.math.uint, None, sign)?,
                     )
                 } else if right {
                     (
-                        self.b.shift_right_logical(self.uint, None, base, count)?,
+                        self.math
+                            .b
+                            .shift_right_logical(self.math.uint, None, base, count)?,
                         zero,
                     )
                 } else {
                     (
-                        self.b.shift_left_logical(self.uint, None, base, count)?,
+                        self.math
+                            .b
+                            .shift_left_logical(self.math.uint, None, base, count)?,
                         zero,
                     )
                 };
                 if !wrap {
-                    let limit = self.constant(32);
-                    let inside = self.b.u_less_than(self.boolean, None, raw_count, limit)?;
-                    bits = self.b.select(self.uint, None, inside, bits, clamped)?;
+                    let limit = self.math.constant(32);
+                    let inside =
+                        self.math
+                            .b
+                            .u_less_than(self.math.boolean, None, raw_count, limit)?;
+                    bits = self
+                        .math
+                        .b
+                        .select(self.math.uint, None, inside, bits, clamped)?;
                 }
                 self.write(*destination, bits);
             }
@@ -311,36 +341,61 @@ impl Emitter {
             } => {
                 let mut base = self.read(*value)?;
                 if *reverse {
-                    base = self.b.bit_reverse(self.uint, None, base)?;
+                    base = self.math.b.bit_reverse(self.math.uint, None, base)?;
                 }
                 let position = self.read(*offset)?;
                 let raw_count = self.read(*count)?;
-                let zero = self.constant(0);
-                let limit = self.constant(32);
-                let inside = self.b.u_less_than(self.boolean, None, position, limit)?;
-                let position = self.b.select(self.uint, None, inside, position, limit)?;
-                let available = self.b.i_sub(self.uint, None, limit, position)?;
-                let smaller = self
+                let zero = self.math.constant(0);
+                let limit = self.math.constant(32);
+                let inside = self
+                    .math
                     .b
-                    .u_less_than(self.boolean, None, raw_count, available)?;
-                let size = self
+                    .u_less_than(self.math.boolean, None, position, limit)?;
+                let position = self
+                    .math
                     .b
-                    .select(self.uint, None, smaller, raw_count, available)?;
-                let extracted = if *signed {
-                    let base = self.b.bitcast(self.int, None, base)?;
-                    let field = self
+                    .select(self.math.uint, None, inside, position, limit)?;
+                let available = self.math.b.i_sub(self.math.uint, None, limit, position)?;
+                let smaller =
+                    self.math
                         .b
-                        .bit_field_s_extract(self.int, None, base, position, size)?;
-                    let shift = self.constant(31);
-                    let sign = self.b.shift_right_arithmetic(self.int, None, base, shift)?;
-                    let value = self.b.select(self.int, None, inside, field, sign)?;
-                    self.b.bitcast(self.uint, None, value)?
+                        .u_less_than(self.math.boolean, None, raw_count, available)?;
+                let size =
+                    self.math
+                        .b
+                        .select(self.math.uint, None, smaller, raw_count, available)?;
+                let extracted = if *signed {
+                    let base = self.math.b.bitcast(self.math.int, None, base)?;
+                    let field = self.math.b.bit_field_s_extract(
+                        self.math.int,
+                        None,
+                        base,
+                        position,
+                        size,
+                    )?;
+                    let shift = self.math.constant(31);
+                    let sign =
+                        self.math
+                            .b
+                            .shift_right_arithmetic(self.math.int, None, base, shift)?;
+                    let value = self
+                        .math
+                        .b
+                        .select(self.math.int, None, inside, field, sign)?;
+                    self.math.b.bitcast(self.math.uint, None, value)?
                 } else {
-                    self.b
-                        .bit_field_u_extract(self.uint, None, base, position, size)?
+                    self.math
+                        .b
+                        .bit_field_u_extract(self.math.uint, None, base, position, size)?
                 };
-                let empty = self.b.i_equal(self.boolean, None, raw_count, zero)?;
-                let value = self.b.select(self.uint, None, empty, zero, extracted)?;
+                let empty = self
+                    .math
+                    .b
+                    .i_equal(self.math.boolean, None, raw_count, zero)?;
+                let value = self
+                    .math
+                    .b
+                    .select(self.math.uint, None, empty, zero, extracted)?;
                 self.write(*destination, value);
             }
             Bitwise32 {
@@ -353,13 +408,13 @@ impl Emitter {
                 let right = self.read(*right)?;
                 let value = match operation {
                     ShaderBitwiseOperation::And => {
-                        self.b.bitwise_and(self.uint, None, left, right)?
+                        self.math.b.bitwise_and(self.math.uint, None, left, right)?
                     }
                     ShaderBitwiseOperation::Or => {
-                        self.b.bitwise_or(self.uint, None, left, right)?
+                        self.math.b.bitwise_or(self.math.uint, None, left, right)?
                     }
                     ShaderBitwiseOperation::Xor => {
-                        self.b.bitwise_xor(self.uint, None, left, right)?
+                        self.math.b.bitwise_xor(self.math.uint, None, left, right)?
                     }
                 };
                 self.write(*destination, value);
@@ -373,20 +428,32 @@ impl Emitter {
             } => {
                 let left = self.read(*left)?;
                 let right = self.read(*right)?;
-                let zero = self.constant(0);
-                let one = self.constant(1);
+                let zero = self.math.constant(0);
+                let one = self.math.constant(1);
                 let carry = if let Some(register) = carry_in {
                     let value = self.read(*register)?;
-                    self.b.bitwise_and(self.uint, None, value, one)?
+                    self.math.b.bitwise_and(self.math.uint, None, value, one)?
                 } else {
                     zero
                 };
-                let sum = self.b.i_add(self.uint, None, left, right)?;
-                let total = self.b.i_add(self.uint, None, sum, carry)?;
-                let first = self.b.u_less_than(self.boolean, None, sum, left)?;
-                let second = self.b.u_less_than(self.boolean, None, total, sum)?;
-                let overflow = self.b.logical_or(self.boolean, None, first, second)?;
-                let carry = self.b.select(self.uint, None, overflow, one, zero)?;
+                let sum = self.math.b.i_add(self.math.uint, None, left, right)?;
+                let total = self.math.b.i_add(self.math.uint, None, sum, carry)?;
+                let first = self
+                    .math
+                    .b
+                    .u_less_than(self.math.boolean, None, sum, left)?;
+                let second = self
+                    .math
+                    .b
+                    .u_less_than(self.math.boolean, None, total, sum)?;
+                let overflow = self
+                    .math
+                    .b
+                    .logical_or(self.math.boolean, None, first, second)?;
+                let carry = self
+                    .math
+                    .b
+                    .select(self.math.uint, None, overflow, one, zero)?;
                 self.write(*destination, total);
                 self.write(*carry_out, carry);
             }
@@ -410,15 +477,20 @@ impl Emitter {
                 let value = match scalar_type {
                     ShaderScalarType::Unsigned32 | ShaderScalarType::Signed32 => {
                         if multiply {
-                            self.b.i_mul(self.uint, None, left, right)?
+                            self.math.b.i_mul(self.math.uint, None, left, right)?
                         } else {
-                            self.b.i_add(self.uint, None, left, right)?
+                            self.math.b.i_add(self.math.uint, None, left, right)?
                         }
                     }
                     ShaderScalarType::Float32 => {
-                        self.float_binary(left, right, *float_control, multiply)?
+                        self.math
+                            .float_binary(left, right, *float_control, multiply)?
                     }
-                    _ => return Err(self.unsupported("64-bit arithmetic is not implemented")),
+                    _ => {
+                        return Err(self
+                            .math
+                            .unsupported("64-bit arithmetic is not implemented"));
+                    }
                 };
                 self.write(*destination, value);
             }
@@ -433,21 +505,36 @@ impl Emitter {
                 // Test integer magnitudes, including subnormals when DAZ is
                 // enabled. Substitute +0 for BOTH operands before floating
                 // arithmetic so 0*Inf/NaN never reaches the host multiply.
-                let mask = self.constant(0x7fff_ffff);
-                let threshold = self.constant(if float_control.denormals_are_zero() {
+                let mask = self.math.constant(0x7fff_ffff);
+                let threshold = self.math.constant(if float_control.denormals_are_zero() {
                     0x007f_ffff
                 } else {
                     0
                 });
-                let a = self.b.bitwise_and(self.uint, None, left, mask)?;
-                let b = self.b.bitwise_and(self.uint, None, right, mask)?;
-                let a_zero = self.b.u_less_than_equal(self.boolean, None, a, threshold)?;
-                let b_zero = self.b.u_less_than_equal(self.boolean, None, b, threshold)?;
-                let absorbing = self.b.logical_or(self.boolean, None, a_zero, b_zero)?;
-                let zero = self.constant(0);
-                left = self.b.select(self.uint, None, absorbing, zero, left)?;
-                right = self.b.select(self.uint, None, absorbing, zero, right)?;
-                let value = self.float_binary(left, right, *float_control, true)?;
+                let a = self.math.b.bitwise_and(self.math.uint, None, left, mask)?;
+                let b = self.math.b.bitwise_and(self.math.uint, None, right, mask)?;
+                let a_zero =
+                    self.math
+                        .b
+                        .u_less_than_equal(self.math.boolean, None, a, threshold)?;
+                let b_zero =
+                    self.math
+                        .b
+                        .u_less_than_equal(self.math.boolean, None, b, threshold)?;
+                let absorbing = self
+                    .math
+                    .b
+                    .logical_or(self.math.boolean, None, a_zero, b_zero)?;
+                let zero = self.math.constant(0);
+                left = self
+                    .math
+                    .b
+                    .select(self.math.uint, None, absorbing, zero, left)?;
+                right = self
+                    .math
+                    .b
+                    .select(self.math.uint, None, absorbing, zero, right)?;
+                let value = self.math.float_binary(left, right, *float_control, true)?;
                 self.write(*destination, value);
             }
             FloatMinMax32 {
@@ -457,18 +544,35 @@ impl Emitter {
                 minimum,
                 float_control,
             } => {
-                self.require_float(*float_control)?;
-                let left = self.float_operand(self.read(*left)?, *float_control)?;
-                let right = self.float_operand(self.read(*right)?, *float_control)?;
-                let less = self.b.f_ord_less_than(self.boolean, None, left, right)?;
-                let greater = self.b.f_ord_greater_than(self.boolean, None, left, right)?;
+                self.math.require_float(*float_control)?;
+                let left = self.math.float_operand(self.read(*left)?, *float_control)?;
+                let right = self
+                    .math
+                    .float_operand(self.read(*right)?, *float_control)?;
+                let less = self
+                    .math
+                    .b
+                    .f_ord_less_than(self.math.boolean, None, left, right)?;
+                let greater =
+                    self.math
+                        .b
+                        .f_ord_greater_than(self.math.boolean, None, left, right)?;
                 let minimum = self.predicate(*minimum)?;
-                let select_left = self.b.select(self.boolean, None, minimum, less, greater)?;
-                let selected = self.b.select(self.float, None, select_left, left, right)?;
+                let select_left =
+                    self.math
+                        .b
+                        .select(self.math.boolean, None, minimum, less, greater)?;
+                let selected =
+                    self.math
+                        .b
+                        .select(self.math.float, None, select_left, left, right)?;
                 // min/max return the numeric operand when just one is NaN.
-                let right_nan = self.b.is_nan(self.boolean, None, right)?;
-                let selected = self.b.select(self.float, None, right_nan, left, selected)?;
-                let value = self.float_result(selected, *float_control)?;
+                let right_nan = self.math.b.is_nan(self.math.boolean, None, right)?;
+                let selected =
+                    self.math
+                        .b
+                        .select(self.math.float, None, right_nan, left, selected)?;
+                let value = self.math.float_result(selected, *float_control)?;
                 self.write(*destination, value);
             }
             FusedMultiplyAdd32 {
@@ -478,29 +582,10 @@ impl Emitter {
                 addend,
                 float_control,
             } => {
-                self.require_float(*float_control)?;
-                if !self.options.float32.fused_multiply_add {
-                    return Err(self.unsupported("correctly rounded float32 FMA requires VK_KHR_shader_fma / shaderFmaFloat32"));
-                }
-                // GLSL.std.450 Fma is explicitly allowed to be unfused in Vulkan.
-                // Use the correctly rounded operation; never silently split it.
-                // https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_shader_fma.html
-                if !self.fma_extension {
-                    self.b.extension("SPV_KHR_fma");
-                    self.b.capability(spv::Capability::FMAKHR);
-                    self.fma_extension = true;
-                }
-                let left = self.float_operand(self.read(*left)?, *float_control)?;
-                let right = self.float_operand(self.read(*right)?, *float_control)?;
-                let addend = self.float_operand(self.read(*addend)?, *float_control)?;
-                let value = self.b.fma_khr(self.float, None, left, right, addend)?;
-                self.b.decorate(value, spv::Decoration::NoContraction, []);
-                let value = if self.options.float32.denorm_preserve {
-                    value
-                } else {
-                    self.repair_product_underflow(value, left, right, Some(addend))?
-                };
-                let value = self.float_result(value, *float_control)?;
+                let left = self.read(*left)?;
+                let right = self.read(*right)?;
+                let addend = self.read(*addend)?;
+                let value = self.math.fma(left, right, addend, *float_control)?;
                 self.write(*destination, value);
             }
             Select32 {
@@ -510,11 +595,17 @@ impl Emitter {
                 when_false,
             } => {
                 let bits = self.read(*condition)?;
-                let zero = self.constant(0);
-                let condition = self.b.i_not_equal(self.boolean, None, bits, zero)?;
+                let zero = self.math.constant(0);
+                let condition = self
+                    .math
+                    .b
+                    .i_not_equal(self.math.boolean, None, bits, zero)?;
                 let yes = self.read(*when_true)?;
                 let no = self.read(*when_false)?;
-                let result = self.b.select(self.uint, None, condition, yes, no)?;
+                let result = self
+                    .math
+                    .b
+                    .select(self.math.uint, None, condition, yes, no)?;
                 self.write(*destination, result);
             }
             SetPredicatesFromBits {
@@ -523,12 +614,15 @@ impl Emitter {
                 write_mask,
             } => {
                 let bits = self.read(*source)?;
-                let zero = self.constant(0);
+                let zero = self.math.constant(0);
                 for index in 0..7_u8 {
                     if write_mask & (1 << index) != 0 {
-                        let mask = self.constant(1 << (first_bit + index));
-                        let bit = self.b.bitwise_and(self.uint, None, bits, mask)?;
-                        let value = self.b.i_not_equal(self.boolean, None, bit, zero)?;
+                        let mask = self.math.constant(1 << (first_bit + index));
+                        let bit = self.math.b.bitwise_and(self.math.uint, None, bits, mask)?;
+                        let value = self
+                            .math
+                            .b
+                            .i_not_equal(self.math.boolean, None, bit, zero)?;
                         self.predicates[usize::from(index)] = Some(value);
                     }
                 }
@@ -546,21 +640,29 @@ impl Emitter {
                         let first = if index == 0 {
                             a
                         } else {
-                            self.b.logical_not(self.boolean, None, a)?
+                            self.math.b.logical_not(self.math.boolean, None, a)?
                         };
                         let mut value = first;
                         for (operation, operand) in operations.iter().zip([b, c]) {
                             value = match operation {
-                                ShaderPredicateSetOperation::And => {
-                                    self.b.logical_and(self.boolean, None, value, operand)?
-                                }
-                                ShaderPredicateSetOperation::Or => {
-                                    self.b.logical_or(self.boolean, None, value, operand)?
-                                }
-                                ShaderPredicateSetOperation::Xor => {
-                                    self.b
-                                        .logical_not_equal(self.boolean, None, value, operand)?
-                                }
+                                ShaderPredicateSetOperation::And => self.math.b.logical_and(
+                                    self.math.boolean,
+                                    None,
+                                    value,
+                                    operand,
+                                )?,
+                                ShaderPredicateSetOperation::Or => self.math.b.logical_or(
+                                    self.math.boolean,
+                                    None,
+                                    value,
+                                    operand,
+                                )?,
+                                ShaderPredicateSetOperation::Xor => self.math.b.logical_not_equal(
+                                    self.math.boolean,
+                                    None,
+                                    value,
+                                    operand,
+                                )?,
                             };
                         }
                         self.predicates[usize::from(*destination)] = Some(value);
@@ -581,30 +683,55 @@ impl Emitter {
                 let mut left = self.read(*left)?;
                 let mut right = self.read(*right)?;
                 if *signed {
-                    left = self.b.bitcast(self.int, None, left)?;
-                    right = self.b.bitcast(self.int, None, right)?;
+                    left = self.math.b.bitcast(self.math.int, None, left)?;
+                    right = self.math.b.bitcast(self.math.int, None, right)?;
                 }
                 use ShaderIntegerComparison::*;
                 let result = match comparison {
-                    False => self.false_value,
-                    True => self.true_value,
-                    Equal => self.b.i_equal(self.boolean, None, left, right)?,
-                    NotEqual => self.b.i_not_equal(self.boolean, None, left, right)?,
-                    Less if *signed => self.b.s_less_than(self.boolean, None, left, right)?,
-                    Less => self.b.u_less_than(self.boolean, None, left, right)?,
-                    LessOrEqual if *signed => {
-                        self.b.s_less_than_equal(self.boolean, None, left, right)?
+                    False => self.math.false_value,
+                    True => self.math.true_value,
+                    Equal => self.math.b.i_equal(self.math.boolean, None, left, right)?,
+                    NotEqual => self
+                        .math
+                        .b
+                        .i_not_equal(self.math.boolean, None, left, right)?,
+                    Less if *signed => {
+                        self.math
+                            .b
+                            .s_less_than(self.math.boolean, None, left, right)?
                     }
-                    LessOrEqual => self.b.u_less_than_equal(self.boolean, None, left, right)?,
-                    Greater if *signed => self.b.s_greater_than(self.boolean, None, left, right)?,
-                    Greater => self.b.u_greater_than(self.boolean, None, left, right)?,
+                    Less => self
+                        .math
+                        .b
+                        .u_less_than(self.math.boolean, None, left, right)?,
+                    LessOrEqual if *signed => {
+                        self.math
+                            .b
+                            .s_less_than_equal(self.math.boolean, None, left, right)?
+                    }
+                    LessOrEqual => {
+                        self.math
+                            .b
+                            .u_less_than_equal(self.math.boolean, None, left, right)?
+                    }
+                    Greater if *signed => {
+                        self.math
+                            .b
+                            .s_greater_than(self.math.boolean, None, left, right)?
+                    }
+                    Greater => self
+                        .math
+                        .b
+                        .u_greater_than(self.math.boolean, None, left, right)?,
                     GreaterOrEqual if *signed => {
-                        self.b
-                            .s_greater_than_equal(self.boolean, None, left, right)?
+                        self.math
+                            .b
+                            .s_greater_than_equal(self.math.boolean, None, left, right)?
                     }
                     GreaterOrEqual => {
-                        self.b
-                            .u_greater_than_equal(self.boolean, None, left, right)?
+                        self.math
+                            .b
+                            .u_greater_than_equal(self.math.boolean, None, left, right)?
                     }
                 };
                 for (index, destination) in destinations.iter().enumerate() {
@@ -612,19 +739,23 @@ impl Emitter {
                         let compared = if index == 0 {
                             result
                         } else {
-                            self.b.logical_not(self.boolean, None, result)?
+                            self.math.b.logical_not(self.math.boolean, None, result)?
                         };
                         let value = match set_operation {
-                            ShaderPredicateSetOperation::And => {
-                                self.b
-                                    .logical_and(self.boolean, None, compared, accumulator)?
-                            }
-                            ShaderPredicateSetOperation::Or => {
-                                self.b
-                                    .logical_or(self.boolean, None, compared, accumulator)?
-                            }
-                            ShaderPredicateSetOperation::Xor => self.b.logical_not_equal(
-                                self.boolean,
+                            ShaderPredicateSetOperation::And => self.math.b.logical_and(
+                                self.math.boolean,
+                                None,
+                                compared,
+                                accumulator,
+                            )?,
+                            ShaderPredicateSetOperation::Or => self.math.b.logical_or(
+                                self.math.boolean,
+                                None,
+                                compared,
+                                accumulator,
+                            )?,
+                            ShaderPredicateSetOperation::Xor => self.math.b.logical_not_equal(
+                                self.math.boolean,
                                 None,
                                 compared,
                                 accumulator,
@@ -635,132 +766,16 @@ impl Emitter {
                 }
             }
             Branch { .. } | Exit => {
-                return Err(self.unsupported("guest control flow requires CFG structurization"));
+                return Err(self
+                    .math
+                    .unsupported("guest control flow requires CFG structurization"));
             }
-            _ => return Err(self.unsupported("operation has no native SPIR-V lowering")),
+            _ => {
+                return Err(self
+                    .math
+                    .unsupported("operation has no native SPIR-V lowering"));
+            }
         }
         Ok(())
-    }
-
-    fn require_float(&mut self, control: ShaderFloatControl) -> Result<()> {
-        if control.rounding != ShaderRoundingMode::NearestEven {
-            return Err(self.unsupported("native float arithmetic requires nearest-even rounding"));
-        }
-        let caps = self.options.float32;
-        if !caps.rounding_mode_rte || !caps.signed_zero_inf_nan_preserve {
-            return Err(self.unsupported(
-                "float32 requires RoundingModeRTE and SignedZeroInfNanPreserve host guarantees",
-            ));
-        }
-        if !caps.denorm_preserve && !(control.denormals_are_zero && control.flush_denormals_to_zero)
-        {
-            return Err(self.unsupported("float32 without DenormPreserve requires both DAZ and FTZ; preserving or mixed denormal controls are unsupported"));
-        }
-        if !self.float_modes {
-            self.b.extension("SPV_KHR_float_controls");
-            for (capability, mode) in [
-                (
-                    spv::Capability::RoundingModeRTE,
-                    spv::ExecutionMode::RoundingModeRTE,
-                ),
-                (
-                    spv::Capability::SignedZeroInfNanPreserve,
-                    spv::ExecutionMode::SignedZeroInfNanPreserve,
-                ),
-            ] {
-                self.b.capability(capability);
-                self.b.execution_mode(self.entry, mode, [32]);
-            }
-            if caps.denorm_preserve {
-                self.b.capability(spv::Capability::DenormPreserve);
-                self.b
-                    .execution_mode(self.entry, spv::ExecutionMode::DenormPreserve, [32]);
-            }
-            self.float_modes = true;
-        }
-        Ok(())
-    }
-
-    fn require_scalar32(&self, ty: ShaderScalarType) -> Result<()> {
-        if matches!(
-            ty,
-            ShaderScalarType::Unsigned32 | ShaderScalarType::Signed32 | ShaderScalarType::Float32
-        ) {
-            Ok(())
-        } else {
-            Err(self.unsupported("64-bit scalar moves are not implemented"))
-        }
-    }
-
-    fn float_binary(
-        &mut self,
-        left: u32,
-        right: u32,
-        control: ShaderFloatControl,
-        multiply: bool,
-    ) -> Result<u32> {
-        self.require_float(control)?;
-        let left = self.float_operand(left, control)?;
-        let right = self.float_operand(right, control)?;
-        let value = if multiply {
-            self.b.f_mul(self.float, None, left, right)?
-        } else {
-            self.b.f_add(self.float, None, left, right)?
-        };
-        self.b.decorate(value, spv::Decoration::NoContraction, []);
-        let value = if self.options.float32.denorm_preserve {
-            value
-        } else {
-            self.repair_binary_underflow(value, left, right, multiply)?
-        };
-        self.float_result(value, control)
-    }
-
-    fn flush_denormal(&mut self, bits: u32) -> Result<u32> {
-        // Integer classification preserves the sign of zero and leaves NaNs and
-        // infinities untouched. Per-operation DAZ/FTZ can coexist in one shader.
-        let exponent_mask = self.constant(0x7f80_0000);
-        let exponent = self.b.bitwise_and(self.uint, None, bits, exponent_mask)?;
-        let zero = self.constant(0);
-        let denormal_or_zero = self.b.i_equal(self.boolean, None, exponent, zero)?;
-        let sign_mask = self.constant(0x8000_0000);
-        let sign = self.b.bitwise_and(self.uint, None, bits, sign_mask)?;
-        Ok(self
-            .b
-            .select(self.uint, None, denormal_or_zero, sign, bits)?)
-    }
-
-    fn float_operand(&mut self, mut bits: u32, control: ShaderFloatControl) -> Result<u32> {
-        if control.denormals_are_zero {
-            bits = self.flush_denormal(bits)?;
-        }
-        Ok(self.b.bitcast(self.float, None, bits)?)
-    }
-
-    fn float_result(&mut self, value: u32, control: ShaderFloatControl) -> Result<u32> {
-        let mut bits = self.b.bitcast(self.uint, None, value)?;
-        if control.nan_mode == ShaderNanMode::Canonicalize {
-            let is_nan = self.b.is_nan(self.boolean, None, value)?;
-            let nan = self.constant(f32::NAN.to_bits());
-            bits = self.b.select(self.uint, None, is_nan, nan, bits)?;
-        }
-        if control.flush_denormals_to_zero {
-            bits = self.flush_denormal(bits)?;
-        }
-        if control.saturate {
-            let sign = self.constant(0x8000_0000);
-            let negative = self
-                .b
-                .u_greater_than_equal(self.boolean, None, bits, sign)?;
-            let infinity = self.constant(0x7f80_0000);
-            let nan = self.b.u_greater_than(self.boolean, None, bits, infinity)?;
-            let zero_result = self.b.logical_or(self.boolean, None, negative, nan)?;
-            let one = self.constant(0x3f80_0000);
-            let above_one = self.b.u_greater_than(self.boolean, None, bits, one)?;
-            bits = self.b.select(self.uint, None, above_one, one, bits)?;
-            let zero = self.constant(0);
-            bits = self.b.select(self.uint, None, zero_result, zero, bits)?;
-        }
-        Ok(bits)
     }
 }

@@ -86,6 +86,7 @@ pub enum MaxwellShaderTranslationError {
         reason: &'static str,
     },
     Verification(ShaderVerificationError),
+    Ssa(nixe_gpu::ssa::Error),
     ProgramDoesNotExit {
         stage: MaxwellShaderStage,
         limit: usize,
@@ -212,6 +213,7 @@ impl Display for MaxwellShaderTranslationError {
                 formatter,
                 "translated Maxwell shader failed neutral verification: {error}"
             ),
+            Self::Ssa(error) => write!(formatter, "Maxwell {error}"),
             Self::ProgramDoesNotExit { stage, limit } => write!(
                 formatter,
                 "Maxwell {stage:?} shader has no EXIT within the {limit}-byte decoding bound"
@@ -232,6 +234,12 @@ impl Display for MaxwellShaderTranslationError {
 }
 
 impl std::error::Error for MaxwellShaderTranslationError {}
+
+impl From<nixe_gpu::ssa::Error> for MaxwellShaderTranslationError {
+    fn from(value: nixe_gpu::ssa::Error) -> Self {
+        Self::Ssa(value)
+    }
+}
 
 impl From<ShaderVerificationError> for MaxwellShaderTranslationError {
     fn from(value: ShaderVerificationError) -> Self {

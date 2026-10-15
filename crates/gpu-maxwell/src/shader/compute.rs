@@ -9,8 +9,9 @@ use super::decode::validate_register_range;
 use super::error::{MaxwellShaderTranslationError, malformed};
 use super::global_memory;
 use super::translate::translate_shader_binary;
+use crate::shader::decoded::Register as ShaderRegister;
 use crate::{MaxwellGpuAddressSpace, MaxwellShaderStage};
-use nixe_gpu::{ShaderBackendModule, ShaderOperation, ShaderRegister, VerifiedShaderIr};
+use nixe_gpu::{ShaderBackendModule, ShaderOperation, VerifiedShaderIr};
 use nixe_memory::{CanonicalCpuWriteDependency, CanonicalWriteBatch};
 use std::collections::BTreeMap;
 
@@ -106,7 +107,7 @@ pub(super) fn system_register(
     offset: u32,
     encoding: u64,
     register_count: u8,
-) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+) -> Result<super::decoded::Operation, MaxwellShaderTranslationError> {
     let stage = MaxwellShaderStage::Compute;
     // emitSYS and emitS2R define the selector and the reserved operand fields.
     // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
@@ -135,8 +136,8 @@ pub(super) fn system_register(
         }
     };
     validate_register_range(stage, offset, encoding, encoding as u8, 1, register_count)?;
-    Ok(ShaderOperation::LoadComputeBuiltin32 {
-        destination: ShaderRegister::new(u16::from(encoding as u8)),
+    Ok(super::decoded::Operation::LoadComputeBuiltin32 {
+        destination: ShaderRegister::new(u32::from(encoding as u8)),
         builtin,
         component,
     })

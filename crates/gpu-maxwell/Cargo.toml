@@ -14,6 +14,7 @@ nixe-gpu.workspace = true
 nixe-memory.workspace = true
 
 [dev-dependencies]
+rspirv = "0.13"
 naga = { version = "30.0.0", features = ["wgsl-in"] }
 
 [target.'cfg(not(target_os = "macos"))'.dev-dependencies]

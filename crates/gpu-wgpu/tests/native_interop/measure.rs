@@ -111,6 +111,7 @@ fn ordinary(native: &[GpuOperation]) -> (Vec<BackendResourceCreateInfo>, Vec<Gpu
                 return op.clone();
             };
             let mut prepared = PreparedDraw::new(
+                nixe_gpu::PreparedStateId::new(1, 1),
                 PipelineId::new(1000),
                 draw.prepared.render_pass,
                 PrimitiveTopology::Triangles,
@@ -134,7 +135,7 @@ fn ordinary(native: &[GpuOperation]) -> (Vec<BackendResourceCreateInfo>, Vec<Gpu
                 None,
             )
             .unwrap();
-            prepared.viewport_transform = draw.prepared.viewport_transform;
+            prepared.edit_state().viewport_transform = draw.prepared.viewport_transform;
             GpuOperation::new(
                 GpuCommand::Draw(
                     DrawOperation::new(
@@ -191,14 +192,20 @@ pub fn run(runtime: &mut dyn NeutralBackendRuntime, native: &[GpuOperation]) {
             let GpuCommand::Draw(draw) = op.command() else {
                 return op.clone();
             };
-            let mut prepared = (*draw.prepared).clone();
-            prepared.triangle_rasterization = TriangleRasterization::Wireframe {
+            let mut prepared = nixe_gpu::PreparedDraw::from_state(
+                nixe_gpu::PreparedStateId::new(
+                    draw.prepared.identity().slot(),
+                    draw.prepared.identity().revision() + 1,
+                ),
+                draw.prepared.state().clone(),
+            );
+            prepared.edit_state().triangle_rasterization = TriangleRasterization::Wireframe {
                 width_bits: 4_f32.to_bits(),
                 smooth: true,
             };
-            prepared.front_face = FrontFace::CounterClockwise;
-            prepared.cull_mode = CullMode::Back;
-            prepared.color_outputs[0].blend = Some(ColorBlendState {
+            prepared.edit_state().front_face = FrontFace::CounterClockwise;
+            prepared.edit_state().cull_mode = CullMode::Back;
+            prepared.edit_state().color_outputs[0].blend = Some(ColorBlendState {
                 color: BlendComponent {
                     operation: BlendOperation::Add,
                     source: BlendFactor::SourceAlpha,

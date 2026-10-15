@@ -1176,7 +1176,14 @@ impl Default for MaxwellThreeDFixedFunctionState {
             scissor: std::array::from_fn(|_| Default::default()),
             window_clip: std::array::from_fn(|_| Default::default()),
             registers,
-            single_rop_control: Default::default(),
+            single_rop_control: {
+                let raw = super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(0x135c))
+                    .unwrap();
+                MaxwellThreeDRegister::verified_reset(
+                    raw,
+                    MaxwellThreeDSingleRopControl::parse(raw),
+                )
+            },
             blend_enable: std::array::from_fn(|index| {
                 let raw = super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(
                     0x1360 + index as u32 * 4,

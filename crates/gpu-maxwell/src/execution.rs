@@ -1,5 +1,10 @@
 //! Ordered streaming lowering and canonical execution for a frontend delivery.
 
+mod lowerer;
+mod work;
+pub use lowerer::MaxwellFrontend;
+pub use work::{MaxwellWork, MaxwellWorkBatch, MaxwellWorkSegment};
+
 use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
@@ -7,10 +12,9 @@ use std::{
 };
 
 use nixe_gpu::{
-    BackendResourceCreateInfo, CacheMaintenanceOperation, CapabilityRequirements,
-    CommandDescriptionError, FrontendSubmissionId, FrontendSubmissionSegment, GpuCommand,
-    GpuOperation, GuestTimelinePoint, OperationSubmission, ReservedTimelinePoint,
-    ResourceDependency,
+    CacheMaintenanceOperation, CapabilityRequirements, CommandDescriptionError,
+    FrontendSubmissionId, FrontendSubmissionSegment, GpuCommand, GpuOperation, GuestTimelinePoint,
+    OperationSubmission, ReservedTimelinePoint, ResourceDefinition, ResourceDependency,
 };
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
@@ -27,7 +31,7 @@ use crate::{
 };
 
 /// One ordered operation whose inputs have been resolved without side effects.
-pub enum MaxwellSubmissionExecutionStep {
+pub enum MaxwellSubmissionExecutionStep<W: MaxwellWork = MaxwellLoweredWork> {
     NotificationWrite {
         source: MaxwellMethodSource,
         target: MaxwellResolvedRange,
@@ -50,30 +54,61 @@ pub enum MaxwellSubmissionExecutionStep {
         destination: MaxwellResolvedRange,
     },
     BackendOperation(GpuOperation),
-    Gpu(MaxwellLoweredWork),
+    Gpu(W),
 }
+
+impl<W: MaxwellWork> MaxwellSubmissionExecutionStep<W> {
+    /// Conservative queued-data charge; canonical guest pages are not queue storage.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        use std::mem::{size_of, size_of_val};
+        let range_bytes = |range: &MaxwellResolvedRange| size_of_val(range.segments());
+        size_of::<Self>()
+            + match self {
+                Self::NotificationWrite { target, .. } | Self::SemaphoreRelease { target, .. } => {
+                    range_bytes(target)
+                }
+                Self::InlineWrite { target, value, .. } => range_bytes(target) + value.capacity(),
+                Self::MemoryCopy {
+                    source,
+                    destination,
+                    ..
+                } => range_bytes(source) + range_bytes(destination),
+                Self::BackendOperation(operation) => operation.retained_bytes(),
+                Self::Gpu(work) => work.retained_bytes(),
+                Self::WaitForIdle => 0,
+            }
+    }
+}
+
+// Batch many draws without delaying the first prefix until the whole pushbuffer.
+const STREAMED_BATCH_OPERATIONS: usize = 128;
+const STREAMED_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Complete neutral plan awaiting backend negotiation, execution, and completion.
 ///
 /// Only the guest-visible completion point is copied. The unforgeable
 /// reservation remains owned by the scheduled dispatch until backend work and
 /// memory visibility have completed.
-pub struct MaxwellSubmissionExecutionPlan {
+pub struct MaxwellSubmissionExecutionPlan<W: MaxwellWork = MaxwellLoweredWork> {
     frontend: FrontendSubmissionId,
     predecessors: Box<[FrontendSubmissionId]>,
-    steps: Box<[MaxwellSubmissionExecutionStep]>,
+    steps: Box<[MaxwellSubmissionExecutionStep<W>]>,
     completion: Option<GuestTimelinePoint>,
 }
 
-impl MaxwellSubmissionExecutionPlan {
-    pub(crate) fn prepend_steps(mut self, mut prefix: Vec<MaxwellSubmissionExecutionStep>) -> Self {
+impl<W: MaxwellWork> MaxwellSubmissionExecutionPlan<W> {
+    pub(crate) fn prepend_steps(
+        mut self,
+        mut prefix: Vec<MaxwellSubmissionExecutionStep<W>>,
+    ) -> Self {
         prefix.extend(self.steps);
         self.steps = prefix.into_boxed_slice();
         self
     }
 
     #[must_use]
-    pub fn into_steps(self) -> Box<[MaxwellSubmissionExecutionStep]> {
+    pub fn into_steps(self) -> Box<[MaxwellSubmissionExecutionStep<W>]> {
         self.steps
     }
     #[must_use]
@@ -82,7 +117,7 @@ impl MaxwellSubmissionExecutionPlan {
     }
 
     #[must_use]
-    pub fn steps(&self) -> &[MaxwellSubmissionExecutionStep] {
+    pub fn steps(&self) -> &[MaxwellSubmissionExecutionStep<W>] {
         &self.steps
     }
 
@@ -194,6 +229,7 @@ pub enum MaxwellSubmissionExecutionError {
     ThreeDResource(MaxwellThreeDResourceError),
     StagedMemory(Box<MaxwellCanonicalExecutionError>),
     Lowering(MaxwellLoweringError),
+    Native(Box<str>),
     ShaderTranslation(MaxwellShaderTranslationError),
     ThreeDSynchronization(MaxwellThreeDSynchronizationError),
     MissingCompletionSignal {
@@ -229,6 +265,7 @@ impl Display for MaxwellSubmissionExecutionError {
                 )
             }
             Self::Lowering(error) => Display::fmt(error, formatter),
+            Self::Native(error) => Display::fmt(error, formatter),
             Self::ShaderTranslation(error) => Display::fmt(error, formatter),
             Self::ThreeDSynchronization(error) => Display::fmt(error, formatter),
             Self::MissingCompletionSignal {
@@ -258,13 +295,16 @@ impl std::error::Error for MaxwellSubmissionExecutionError {}
 /// Packet dispatch feeds effects into this value before applying following
 /// packets. Consequently a trigger's state can be consumed before later
 /// register writes and does not need submission-lifetime retention.
-pub(crate) struct MaxwellSubmissionPlanner<'a> {
+pub(crate) struct MaxwellSubmissionPlanner<'a, L: MaxwellFrontend = MaxwellLoweringCache> {
     address_space: &'a MaxwellGpuAddressSpace,
     frontend: FrontendSubmissionId,
     predecessors: Vec<FrontendSubmissionId>,
     completion: Option<&'a ReservedTimelinePoint>,
-    cache: &'a mut MaxwellLoweringCache,
-    steps: Vec<MaxwellSubmissionExecutionStep>,
+    cache: &'a mut L,
+    steps: Vec<MaxwellSubmissionExecutionStep<L::Work>>,
+    ready_scan_start: usize,
+    ready_bytes: usize,
+    ready_operations: usize,
     prior_work_pending: bool,
     completion_signal_count: u32,
     driver_completion_increments: u32,
@@ -274,29 +314,38 @@ pub(crate) struct MaxwellSubmissionPlanner<'a> {
     inline_image_uploads: Vec<(nixe_gpu::ImageRegion, Vec<u8>)>,
 }
 
-impl<'a> MaxwellSubmissionPlanner<'a> {
+impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
     /// Seal bounded prefixes once their inline payload is complete. The
     /// canonical overlay and semantic state stay with the producer, while
     /// already lowered work can be captured by the backend concurrently.
-    pub(crate) fn take_ready_steps(&mut self) -> Option<Vec<MaxwellSubmissionExecutionStep>> {
+    pub(crate) fn take_ready_steps(
+        &mut self,
+    ) -> Option<Vec<MaxwellSubmissionExecutionStep<L::Work>>> {
         if self.inline_write_pending {
             return None;
         }
-        let mut operations = self
-            .steps
-            .iter()
-            .enumerate()
-            .filter(|(_, step)| backend_step_emits_operation(step));
-        let mut prefix_end = 0;
-        for _ in 0..7 {
-            prefix_end = operations.next()?.0 + 1;
+        for step in &self.steps[self.ready_scan_start..] {
+            self.ready_bytes = self.ready_bytes.saturating_add(step.retained_bytes());
+            self.ready_operations += usize::from(backend_step_emits_operation(step));
         }
-        // Retain at least one backend operation until completion validation.
-        // A trailing WFI may drain every emitted prefix: the backend still
-        // needs a real final segment to close its accepted frontend timeline.
-        operations.next()?;
+        self.ready_scan_start = self.steps.len();
+        if self.ready_operations <= STREAMED_BATCH_OPERATIONS
+            && self.ready_bytes < STREAMED_BATCH_BYTES
+        {
+            return None;
+        }
+        // Keep a real operation in the tail so an accepted non-final segment
+        // can always be closed, including when the suffix contains only WFI.
+        let prefix_end = self.steps.iter().rposition(backend_step_emits_operation)?;
+        if prefix_end == 0 {
+            return None;
+        }
+        self.ready_scan_start = 0;
+        self.ready_bytes = 0;
+        self.ready_operations = 0;
         Some(self.steps.drain(..prefix_end).collect())
     }
+
     pub(crate) const fn frontend(&self) -> FrontendSubmissionId {
         self.frontend
     }
@@ -305,7 +354,7 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
         frontend: FrontendSubmissionId,
         predecessors: Vec<FrontendSubmissionId>,
         completion: Option<&'a ReservedTimelinePoint>,
-        cache: &'a mut MaxwellLoweringCache,
+        cache: &'a mut L,
     ) -> Self {
         Self {
             address_space,
@@ -314,6 +363,9 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
             completion,
             cache,
             steps: Vec::new(),
+            ready_scan_start: 0,
+            ready_bytes: 0,
+            ready_operations: 0,
             prior_work_pending: false,
             completion_signal_count: 0,
             driver_completion_increments: 0,
@@ -370,57 +422,36 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
                     &self.staged_memory_writes,
                 )
                 .map_err(MaxwellSubmissionExecutionError::ComputeLaunch)?;
-                let work = self
-                    .cache
-                    .lower_compute(
-                        &resolved,
-                        self.address_space,
-                        &self.staged_memory_writes,
-                        self.frontend,
-                        self.predecessors.clone(),
-                    )
-                    .map_err(MaxwellSubmissionExecutionError::Lowering)?;
+                let work = self.cache.lower_launch(
+                    &resolved,
+                    self.address_space,
+                    &self.staged_memory_writes,
+                    self.frontend,
+                    self.predecessors.clone(),
+                )?;
                 self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
                 self.prior_work_pending = true;
             }
             PendingEngineOperation::TwoDSolid(request) => {
                 let [x0, y0, x1, y1] = request.rectangle;
                 if x0 < x1 && y0 < y1 {
-                    let limit = self.cache.resource_cache_limit();
-                    let resources = self
-                        .cache
-                        .resolved_resources_mut()
-                        .resolve_solid_image(&request, self.address_space, limit)
-                        .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
-                    let work = self
-                        .cache
-                        .lower_solid_rect(
-                            &request,
-                            &resources,
-                            self.frontend,
-                            self.predecessors.clone(),
-                        )
-                        .map_err(MaxwellSubmissionExecutionError::Lowering)?;
+                    let work = self.cache.lower_solid(
+                        &request,
+                        self.address_space,
+                        self.frontend,
+                        &self.predecessors,
+                    )?;
                     self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
                     self.prior_work_pending = true;
                 }
             }
             PendingEngineOperation::TwoDBlit(request) => {
-                let limit = self.cache.resource_cache_limit();
-                let resources = self
-                    .cache
-                    .resolved_resources_mut()
-                    .resolve_color_images(&request, self.address_space, limit)
-                    .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
-                let work = self
-                    .cache
-                    .lower_color_blit(
-                        &request,
-                        &resources,
-                        self.frontend,
-                        self.predecessors.clone(),
-                    )
-                    .map_err(MaxwellSubmissionExecutionError::Lowering)?;
+                let work = self.cache.lower_blit(
+                    &request,
+                    self.address_space,
+                    self.frontend,
+                    &self.predecessors,
+                )?;
                 self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
                 self.prior_work_pending = true;
             }
@@ -650,99 +681,14 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
                 )?;
             }
             PendingEngineOperation::ThreeD(trigger) => {
-                if trigger.is_draw() {
-                    let translated = if let Some(translated) =
-                        self.cache.reuse_translated_shaders_for_state(
-                            three_d,
-                            &self.staged_memory_writes,
-                            self.address_space,
-                        ) {
-                        translated
-                    } else {
-                        let programs = self
-                            .cache
-                            .resolve_shader_translation_for_state(
-                                three_d,
-                                &self.staged_memory_writes,
-                                self.address_space,
-                            )
-                            .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
-                        let translated = Arc::new(
-                            self.cache
-                                .stage_shader_translations(&programs)
-                                .map_err(MaxwellSubmissionExecutionError::Lowering)?,
-                        );
-                        self.cache
-                            .retain_translated_shader_state(&programs, Arc::clone(&translated));
-                        translated
-                    };
-                    let mut required_roles = self.cache.take_resource_roles();
-                    required_roles.extend(
-                        translated
-                            .resources()
-                            .iter()
-                            .map(|resource| resource.role()),
-                    );
-                    trigger.append_resource_roles(three_d, &mut required_roles);
-                    required_roles.sort_unstable();
-                    required_roles.dedup();
-                    let resource_cache_limit = self.cache.resource_cache_limit();
-                    let resources = self
-                        .cache
-                        .resolved_resources_mut()
-                        .resolve_with_buffer_sizes(
-                            three_d,
-                            self.address_space,
-                            &required_roles,
-                            translated.buffer_sizes(),
-                            Some(&self.staged_memory_writes),
-                            false,
-                            resource_cache_limit,
-                        )
-                        .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
-                    self.cache.recycle_resource_roles(required_roles);
-                    let work = lower_maxwell_three_d_operation_into_cache(
-                        three_d,
-                        resources.as_ref(),
-                        trigger,
-                        Some(translated.as_ref()),
-                        self.frontend,
-                        self.predecessors.clone(),
-                        self.cache,
-                    )
-                    .map_err(MaxwellSubmissionExecutionError::Lowering)?;
-                    self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
-                    self.prior_work_pending = true;
-                    return Ok(());
-                }
-                let mut required_roles = self.cache.take_resource_roles();
-                trigger.append_resource_roles(three_d, &mut required_roles);
-                required_roles.sort_unstable();
-                required_roles.dedup();
-                let resource_cache_limit = self.cache.resource_cache_limit();
-                let resources = self
-                    .cache
-                    .resolved_resources_mut()
-                    .resolve(
-                        three_d,
-                        self.address_space,
-                        &required_roles,
-                        Some(&self.staged_memory_writes),
-                        false,
-                        resource_cache_limit,
-                    )
-                    .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
-                self.cache.recycle_resource_roles(required_roles);
-                let work = lower_maxwell_three_d_operation_into_cache(
+                let work = self.cache.lower_three_d(
                     three_d,
-                    resources.as_ref(),
                     trigger,
-                    None,
+                    self.address_space,
+                    &self.staged_memory_writes,
                     self.frontend,
-                    self.predecessors.clone(),
-                    self.cache,
-                )
-                .map_err(MaxwellSubmissionExecutionError::Lowering)?;
+                    &self.predecessors,
+                )?;
                 self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
                 self.prior_work_pending = true;
             }
@@ -912,7 +858,7 @@ impl<'a> MaxwellSubmissionPlanner<'a> {
 
     pub(crate) fn finish(
         mut self,
-    ) -> Result<MaxwellSubmissionExecutionPlan, MaxwellSubmissionExecutionError> {
+    ) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellSubmissionExecutionError> {
         self.flush_inline_writes()?;
         self.flush_inline_images()?;
         if let Some(completion) = self.completion {
@@ -981,14 +927,14 @@ fn lower_test_pushbuffers(
 }
 
 pub struct MaxwellBackendSegment {
-    creations: Box<[BackendResourceCreateInfo]>,
+    creations: Box<[ResourceDefinition]>,
     invalidations: Box<[ResourceDependency]>,
     submission: OperationSubmission,
 }
 
 impl MaxwellBackendSegment {
     #[must_use]
-    pub fn creations(&self) -> &[BackendResourceCreateInfo] {
+    pub fn creations(&self) -> &[ResourceDefinition] {
         &self.creations
     }
 
@@ -1010,19 +956,18 @@ impl MaxwellBackendSegment {
 /// acceptance; writes to device-owned pages still wait. Reports and semaphore
 /// releases wait for preceding host work and publish at their command position,
 /// while guest timeline publication remains with the GPU owner.
-pub struct MaxwellBackendExecution {
+pub struct MaxwellBackendExecution<W: MaxwellWork = MaxwellLoweredWork> {
     frontend: FrontendSubmissionId,
     predecessors: Box<[FrontendSubmissionId]>,
-    steps: Vec<MaxwellSubmissionExecutionStep>,
+    steps: Vec<MaxwellSubmissionExecutionStep<W>>,
     next_step: usize,
     pre_writes: CanonicalWriteBatch,
     pre_write_source: Option<CanonicalWriteSource>,
-    creations: Vec<BackendResourceCreateInfo>,
-    invalidations: Vec<ResourceDependency>,
-    operations: Vec<GpuOperation>,
+    batch: W::Batch,
+    buffered_bytes: usize,
     canonical_accesses: Vec<nixe_gpu::BackingView>,
+    canonical_records: rustc_hash::FxHashSet<(usize, usize)>,
     unknown_canonical_accesses: bool,
-    batchable_render_pass_begin: Option<usize>,
     segments: BackendSegmentCursor,
     completion: Option<GuestTimelinePoint>,
     awaiting_resume: bool,
@@ -1032,7 +977,7 @@ pub struct MaxwellBackendExecution {
     sealed: bool,
 }
 
-impl MaxwellBackendExecution {
+impl<W: MaxwellWork> MaxwellBackendExecution<W> {
     /// All command-processor mutations have been committed and accepted host
     /// snapshots no longer need the ordered frontend preparation boundary.
     /// Completion writes and any unexecuted suffix keep that boundary closed.
@@ -1059,12 +1004,11 @@ impl MaxwellBackendExecution {
             next_step: 0,
             pre_writes: CanonicalWriteBatch::new(),
             pre_write_source: None,
-            creations: Vec::new(),
-            invalidations: Vec::new(),
-            operations: Vec::new(),
+            batch: W::Batch::default(),
+            buffered_bytes: 0,
             canonical_accesses: Vec::new(),
+            canonical_records: rustc_hash::FxHashSet::default(),
             unknown_canonical_accesses: false,
-            batchable_render_pass_begin: None,
             segments: BackendSegmentCursor {
                 next: FrontendSubmissionSegment::FIRST,
                 remaining_operations: 0,
@@ -1078,7 +1022,7 @@ impl MaxwellBackendExecution {
         }
     }
 
-    pub fn append_steps(&mut self, steps: Vec<MaxwellSubmissionExecutionStep>) {
+    pub fn append_steps(&mut self, steps: Vec<MaxwellSubmissionExecutionStep<W>>) {
         assert!(
             !self.sealed && !self.finished,
             "a completed delivery cannot append commands"
@@ -1091,13 +1035,22 @@ impl MaxwellBackendExecution {
         self.steps.extend(steps);
     }
 
+    /// Drops source metadata after its effects have been consumed/captured.
+    /// The owner uses the count to release byte permits for complete chunks.
+    pub fn retire_consumed_steps(&mut self) -> usize {
+        let consumed = self.next_step;
+        self.steps.drain(..consumed);
+        self.next_step = 0;
+        consumed
+    }
+
     pub fn seal(&mut self) {
         assert!(!self.sealed, "a frontend delivery is sealed once");
         self.sealed = true;
     }
 
     #[must_use]
-    pub fn new(plan: MaxwellSubmissionExecutionPlan) -> Self {
+    pub fn new(plan: MaxwellSubmissionExecutionPlan<W>) -> Self {
         let mut execution = Self::begin(plan.frontend, plan.completion);
         execution.predecessors = plan.predecessors;
         execution.append_steps(plan.steps.into_vec());
@@ -1120,13 +1073,24 @@ impl MaxwellBackendExecution {
         self.awaiting_resume = false;
     }
 
+    /// All currently delivered steps have been consumed, but the producer
+    /// has not sealed this delivery yet.
+    #[must_use]
+    pub fn waiting_for_input(&self) -> bool {
+        !self.sealed && self.next_step == self.steps.len()
+    }
+
     /// After host acceptance, earlier reads already own their encoded input
     /// snapshots. Updating CPU-visible canonical bytes cannot alter those
     /// reads: later uploads execute after them on the same host queue. Device
-    /// writes, explicit WFI, copies and guest completion still require waits.
+    /// writes consumed by the CPU, explicit WFI, copies and guest completion
+    /// still require waits. A streamed chunk boundary itself is not a wait.
     /// https://github.com/eden-emulator/mirror/blob/master/src/video_core/engines/maxwell_3d.cpp
     #[must_use]
     pub fn can_continue_after_submission(&self) -> bool {
+        if self.awaiting_resume && self.waiting_for_input() {
+            return true;
+        }
         if !self.awaiting_resume
             || !matches!(
                 self.steps.get(self.next_step),
@@ -1159,7 +1123,8 @@ impl MaxwellBackendExecution {
     pub fn next_segment(
         &mut self,
         gpu_timestamp: u64,
-    ) -> Result<Option<MaxwellBackendSegment>, MaxwellBackendExecutionError> {
+    ) -> Result<Option<<W::Batch as MaxwellWorkBatch<W>>::Segment>, MaxwellBackendExecutionError>
+    {
         self.next_segment_with_resolver(gpu_timestamp, &mut |coordinator, request| {
             coordinator.make_cpu_visible(request)
         })
@@ -1170,7 +1135,8 @@ impl MaxwellBackendExecution {
         &mut self,
         gpu_timestamp: u64,
         resolve: &mut nixe_memory::CpuVisibilityResolver<'_>,
-    ) -> Result<Option<MaxwellBackendSegment>, MaxwellBackendExecutionError> {
+    ) -> Result<Option<<W::Batch as MaxwellWorkBatch<W>>::Segment>, MaxwellBackendExecutionError>
+    {
         assert!(
             !self.awaiting_resume,
             "Maxwell execution must resume its pending segment before advancing"
@@ -1239,7 +1205,7 @@ impl MaxwellBackendExecution {
                         &mut self.pre_writes,
                         &mut self.pre_write_source,
                     )?;
-                    self.batchable_render_pass_begin = None;
+                    self.batch.break_rendering();
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::BackendOperation(operation) => {
@@ -1247,14 +1213,17 @@ impl MaxwellBackendExecution {
                         &mut self.pre_writes,
                         &mut self.pre_write_source,
                     )?;
-                    self.batchable_render_pass_begin = None;
+                    self.batch.break_rendering();
                     // Ordering-only cache commands consume no canonical input
                     // bytes. Real accesses without retained coverage stay conservative.
                     self.unknown_canonical_accesses |= !matches!(
                         operation.command(),
                         GpuCommand::Barrier(_) | GpuCommand::CacheMaintenance(_)
                     ) || !operation.accesses().is_empty();
-                    self.operations.push(operation.clone());
+                    self.buffered_bytes = self
+                        .buffered_bytes
+                        .saturating_add(operation.retained_bytes());
+                    self.batch.ordering(operation);
                     self.segments.remaining_operations -= 1;
                     self.next_step += 1;
                 }
@@ -1263,6 +1232,7 @@ impl MaxwellBackendExecution {
                     target,
                     value,
                 } => {
+                    self.buffered_bytes = self.buffered_bytes.saturating_add(value.len());
                     stage_resolved_inline_write(
                         target,
                         value,
@@ -1279,6 +1249,9 @@ impl MaxwellBackendExecution {
                     source,
                     destination,
                 } => {
+                    self.buffered_bytes = self
+                        .buffered_bytes
+                        .saturating_add(usize::try_from(destination.size()).unwrap_or(usize::MAX));
                     stage_memory_copy(
                         *operation,
                         source,
@@ -1296,17 +1269,16 @@ impl MaxwellBackendExecution {
                         &mut self.pre_writes,
                         &mut self.pre_write_source,
                     )?;
+                    self.buffered_bytes = self.buffered_bytes.saturating_add(work.retained_bytes());
                     let (accesses, unknown) = work.canonical_accesses();
-                    self.canonical_accesses.extend_from_slice(accesses);
+                    if self
+                        .canonical_records
+                        .insert((accesses.as_ptr() as usize, accesses.len()))
+                    {
+                        self.canonical_accesses.extend_from_slice(accesses);
+                    }
                     self.unknown_canonical_accesses |= unknown;
-                    self.creations.extend_from_slice(work.resource_creations());
-                    self.invalidations
-                        .extend_from_slice(work.resource_invalidations());
-                    append_batchable_operations(
-                        &mut self.operations,
-                        &mut self.batchable_render_pass_begin,
-                        work.submission().operations(),
-                    );
+                    self.batch.work(work);
                     self.segments.remaining_operations -= 1;
                     self.next_step += 1;
                 }
@@ -1314,6 +1286,18 @@ impl MaxwellBackendExecution {
         }
 
         if !self.sealed {
+            // Preserve small compatible batches, but bound the owner working
+            // set independently of the inbox. A byte-blocked producer must not
+            // need to seal the delivery before useful work can be submitted.
+            if self.batch.len() >= STREAMED_BATCH_OPERATIONS
+                || self.buffered_bytes >= STREAMED_BATCH_BYTES
+            {
+                commit_pending_backend_writes(&mut self.pre_writes, &mut self.pre_write_source)?;
+                if self.batch.len() == 0 {
+                    self.buffered_bytes = 0;
+                }
+                return self.take_segment();
+            }
             return Ok(None);
         }
         commit_pending_backend_writes(&mut self.pre_writes, &mut self.pre_write_source)?;
@@ -1329,7 +1313,7 @@ impl MaxwellBackendExecution {
         Ok(None)
     }
 
-    fn step_requires_submission(&self, step: &MaxwellSubmissionExecutionStep) -> bool {
+    fn step_requires_submission(&self, step: &MaxwellSubmissionExecutionStep<W>) -> bool {
         let MaxwellSubmissionExecutionStep::InlineWrite { target, .. } = step else {
             return backend_step_requires_prior_completion(step);
         };
@@ -1370,30 +1354,24 @@ impl MaxwellBackendExecution {
 
     fn take_segment(
         &mut self,
-    ) -> Result<Option<MaxwellBackendSegment>, MaxwellBackendExecutionError> {
-        if self.operations.is_empty() {
+    ) -> Result<Option<<W::Batch as MaxwellWorkBatch<W>>::Segment>, MaxwellBackendExecutionError>
+    {
+        if self.batch.len() == 0 {
             return Ok(None);
         }
         let final_segment = self.sealed && self.segments.remaining_operations == 0;
         let segment = self.segments.take(final_segment)?;
-        let submission = OperationSubmission::new_segment(
-            self.frontend,
-            segment,
-            final_segment,
-            self.predecessors.to_vec(),
-            std::mem::take(&mut self.operations),
-        )
-        .map_err(MaxwellBackendExecutionError::InvalidSubmission)?;
+        let submission =
+            self.batch
+                .finish(self.frontend, segment, final_segment, &self.predecessors)?;
+        self.buffered_bytes = 0;
         self.canonical_accesses.clear();
+        self.canonical_records.clear();
         self.unknown_canonical_accesses = false;
-        self.batchable_render_pass_begin = None;
+        self.batch.break_rendering();
         self.awaiting_resume = true;
         self.submitted_any = true;
-        Ok(Some(MaxwellBackendSegment {
-            creations: std::mem::take(&mut self.creations).into_boxed_slice(),
-            invalidations: std::mem::take(&mut self.invalidations).into_boxed_slice(),
-            submission,
-        }))
+        Ok(Some(submission))
     }
 }
 
@@ -1428,7 +1406,9 @@ impl BackendSegmentCursor {
     }
 }
 
-fn backend_step_requires_prior_completion(step: &MaxwellSubmissionExecutionStep) -> bool {
+fn backend_step_requires_prior_completion<W: MaxwellWork>(
+    step: &MaxwellSubmissionExecutionStep<W>,
+) -> bool {
     matches!(
         step,
         MaxwellSubmissionExecutionStep::WaitForIdle
@@ -1438,7 +1418,7 @@ fn backend_step_requires_prior_completion(step: &MaxwellSubmissionExecutionStep)
     )
 }
 
-fn backend_step_emits_operation(step: &MaxwellSubmissionExecutionStep) -> bool {
+fn backend_step_emits_operation<W: MaxwellWork>(step: &MaxwellSubmissionExecutionStep<W>) -> bool {
     matches!(
         step,
         MaxwellSubmissionExecutionStep::BackendOperation(_)
@@ -2118,6 +2098,7 @@ mod tests {
                     DrawOperation::new(
                         Arc::new(
                             PreparedDraw::new(
+                                nixe_gpu::PreparedStateId::new(1, 1),
                                 PipelineId::new(1),
                                 pass,
                                 PrimitiveTopology::Triangles,
@@ -3386,7 +3367,7 @@ mod tests {
         let frontend = FrontendSubmissionId::new(2);
         let mut planner =
             MaxwellSubmissionPlanner::new(&space, frontend, Vec::new(), None, &mut cache);
-        for _ in 0..8 {
+        for _ in 0..=STREAMED_BATCH_OPERATIONS {
             planner
                 .steps
                 .push(MaxwellSubmissionExecutionStep::BackendOperation(
@@ -3397,7 +3378,7 @@ mod tests {
             .steps
             .push(MaxwellSubmissionExecutionStep::WaitForIdle);
         let prefix = planner.take_ready_steps().unwrap();
-        assert_eq!(prefix.len(), 7);
+        assert_eq!(prefix.len(), STREAMED_BATCH_OPERATIONS);
         assert!(planner.take_ready_steps().is_none());
         let tail = planner.finish().unwrap();
         assert!(matches!(
@@ -3409,12 +3390,22 @@ mod tests {
         ));
         let mut execution = MaxwellBackendExecution::begin(frontend, None);
         execution.append_steps(prefix);
-        assert!(execution.next_segment(0).unwrap().is_none());
+        let prefix_segment = execution.next_segment(0).unwrap().unwrap();
+        assert!(!prefix_segment.submission().is_final_segment());
+        assert_eq!(
+            prefix_segment.submission().operations().len(),
+            STREAMED_BATCH_OPERATIONS
+        );
+        assert!(execution.waiting_for_input());
+        assert!(execution.can_continue_after_submission());
+        assert_eq!(execution.retire_consumed_steps(), STREAMED_BATCH_OPERATIONS);
+        execution.resume_segment();
         assert!(!execution.is_finished());
         execution.append_steps(tail.into_steps().into_vec());
         execution.seal();
+        assert!(!execution.waiting_for_input());
         let final_segment = execution.next_segment(0).unwrap().unwrap();
-        assert_eq!(final_segment.submission().operations().len(), 8);
+        assert_eq!(final_segment.submission().operations().len(), 1);
         assert!(final_segment.submission().is_final_segment());
         assert!(!execution.can_continue_after_submission());
         execution.resume_segment();

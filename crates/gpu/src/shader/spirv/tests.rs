@@ -618,8 +618,9 @@ fn denorm_repair_is_scoped_to_daz_ftz_and_wide_products() {
                 false,
             ),
         });
-        assert!(matches!(lower_shader_ir_to_spirv(&ir, opts),
-            Err(SpirvShaderError::Instruction { reason, .. }) if reason.contains("both DAZ and FTZ")));
+        let text = module(&ir, opts).disassemble();
+        assert!(text.contains("Float64"));
+        assert!(!text.contains("DenormPreserve"));
     }
 }
 

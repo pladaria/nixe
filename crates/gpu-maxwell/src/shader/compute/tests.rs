@@ -65,7 +65,7 @@ fn compute_system_registers_are_typed_and_validate_selectors_and_registers() {
         for component in 0..3 {
             let encoding = 0xf0c8_0000_0007_0000 | ((base + u64::from(component)) << 20);
             assert!(
-                matches!(system_register(8, encoding, 1).unwrap(), ShaderOperation::LoadComputeBuiltin32 {
+                matches!(system_register(8, encoding, 1).unwrap(), crate::shader::decoded::Operation::LoadComputeBuiltin32 {
                 destination, builtin: actual, component: actual_component
             } if destination == ShaderRegister::new(0) && actual == builtin && actual_component == component)
             );
@@ -165,12 +165,12 @@ fn compute_continues_after_conditional_exit_and_retains_the_final_exit() {
     );
 }
 
-pub(super) fn sinewave_kernel() -> MaxwellComputeProgram {
+pub(super) fn sinewave_words() -> Vec<u64> {
     // UAM output from the public deko3d example's compute kernel. Keeping
     // the full instruction stream checks shared decoding and relocation of
     // all eight global stores; it is not a replacement kernel.
     // https://github.com/switchbrew/switch-examples/blob/master/graphics/deko3d/deko_examples/source/sinewave.glsl
-    let words = [
+    vec![
         0x007f9800e5e00701,
         0xf0c8000002570000,
         0xf0c8000002170001,
@@ -231,7 +231,11 @@ pub(super) fn sinewave_kernel() -> MaxwellComputeProgram {
         0xeedc200000870002,
         0xeedc200000c70003,
         0xe30000000007000f,
-    ];
+    ]
+}
+
+pub(super) fn sinewave_kernel() -> MaxwellComputeProgram {
+    let words = sinewave_words();
     let (allocation, address_space, address) = super::super::test_support::mapped_memory();
     allocation.write(0, &bytes(&words)).unwrap();
     translate_compute_program(
@@ -277,4 +281,71 @@ fn sinewave_kernel_translates_all_stores_with_dispatch_bounded_storage() {
     );
     let wgsl = nixe_gpu::lower_shader_ir_to_wgsl(program.module.ir()).unwrap();
     super::super::test_support::validate_wgsl(&wgsl);
+}
+
+#[test]
+fn native_compute_cache_captures_qmd_geometry_bindings_and_exact_code_dependencies() {
+    use crate::{MaxwellShaderCompiler, MaxwellShaderSnapshot, MaxwellSsaRequest};
+    use nixe_gpu::ssa::compile::CompilePool;
+    use std::{sync::Arc, time::Duration};
+    let (allocation, space, address) = super::super::test_support::mapped_memory();
+    let words = sinewave_words();
+    allocation.write(0, &bytes(&words)).unwrap();
+    let request = || MaxwellSsaRequest {
+        stage: MaxwellShaderStage::Compute,
+        address,
+        register_count: 11,
+        workgroup_size: Some([32, 1, 1]),
+    };
+    let snapshot =
+        MaxwellShaderSnapshot::capture_compute(&space, &CanonicalWriteBatch::new(), request())
+            .unwrap();
+    let compiler =
+        MaxwellShaderCompiler::new(Arc::new(CompilePool::new(2, 8).unwrap()), 8, 1024 * 1024);
+    let code = compiler
+        .request(snapshot.clone())
+        .unwrap()
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    eprintln!(
+        "NATIVE_MAXWELL_COMPILE shader=sinewave translation_ns={} cache={:?}",
+        code.translation_ns,
+        compiler.usage()
+    );
+    assert_eq!(code.programs.len(), 1);
+    let program = &code.programs[0];
+    assert_eq!(program.function.workgroup_size, Some([32, 1, 1]));
+    assert!(program.bindings.iter().all(|b| b.binding_group.is_none()));
+    assert_eq!(
+        program
+            .global_buffer_extents([32, 1, 1], [8, 1, 1])
+            .iter()
+            .map(|(_, extent)| *extent)
+            .collect::<Vec<_>>(),
+        vec![8192]
+    );
+    let again = compiler
+        .request(snapshot.clone())
+        .unwrap()
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&code, &again));
+    let mut geometry = request();
+    geometry.workgroup_size = Some([16, 1, 1]);
+    assert_ne!(
+        snapshot.identity(),
+        MaxwellShaderSnapshot::capture_compute(&space, &CanonicalWriteBatch::new(), geometry)
+            .unwrap()
+            .identity()
+    );
+    let end = words.len() as u64 * 8;
+    let outside =
+        super::super::test_support::canonical_shader_writes(&space, &[(address + end, 12)]);
+    assert!(snapshot.staged_writes_are_irrelevant(&outside));
+    let inside = super::super::test_support::canonical_shader_writes(&space, &[(address + 8, 0)]);
+    assert!(!snapshot.staged_writes_are_irrelevant(&inside));
+    allocation.write(8, &0u64.to_le_bytes()).unwrap();
+    assert!(!snapshot.source_is_current(&space));
 }

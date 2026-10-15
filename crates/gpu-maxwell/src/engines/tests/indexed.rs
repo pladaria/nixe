@@ -1,5 +1,5 @@
 use super::*;
-use nixe_gpu::{BackendResourceCreateInfo, IndexType};
+use nixe_gpu::{IndexType, ResourceDefinition};
 
 fn configure_indices(channel: &mut MaxwellGpuChannel, address: u64, format: u32, first: u32) {
     for (method, value) in [
@@ -131,10 +131,12 @@ fn indexed_draw_preserves_bindings_arguments_and_cached_draw_kind() {
                 )
                 .unwrap();
                 assert!(work.submission().operations().iter().any(|op| matches!(op.command(), GpuCommand::Draw(draw) if draw.prepared.index_buffer.is_none())));
-                assert!(!work.resource_creations().iter().any(|resource| matches!(
-                    resource,
-                    BackendResourceCreateInfo::Pipeline { .. }
-                )));
+                assert!(
+                    !work
+                        .resource_creations()
+                        .iter()
+                        .any(|resource| matches!(resource, ResourceDefinition::Pipeline { .. }))
+                );
             }
         }
     }

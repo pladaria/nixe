@@ -3,11 +3,11 @@ use nixe_gpu::ShaderSourceLocation;
 
 const STORE: u64 = 0xeedc_2000_0007_00ff;
 
-fn r(index: u16) -> ShaderRegister {
+fn r(index: u32) -> ShaderRegister {
     ShaderRegister::new(index)
 }
 
-fn immediate(destination: u16, bits: u32) -> ShaderOperation {
+fn immediate(destination: u32, bits: u32) -> ShaderOperation {
     ShaderOperation::MoveImmediate32 {
         destination: r(destination),
         bits,
@@ -18,7 +18,7 @@ fn immediate(destination: u16, bits: u32) -> ShaderOperation {
 fn observe(
     memory: &mut GlobalMemory,
     ops: Vec<ShaderOperation>,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Vec<ShaderInstruction> {
     let mut instructions = ops
         .into_iter()
@@ -28,7 +28,7 @@ fn observe(
     instructions
 }
 
-fn pointer(relative: u32, high_offset: u32) -> (GlobalMemory, u16, Vec<ShaderInstruction>) {
+fn pointer(relative: u32, high_offset: u32) -> (GlobalMemory, u32, Vec<ShaderInstruction>) {
     let mut memory = GlobalMemory::default();
     let mut next = 20;
     let instructions = observe(
@@ -235,7 +235,7 @@ fn direct_constant_buffer_pointer_can_load_into_its_own_low_register() {
             .map(|i| ShaderOperation::LoadConstantBuffer32 {
                 destination: r(i),
                 binding: 2,
-                byte_offset: 0x140 + u32::from(i) * 4,
+                byte_offset: 0x140 + i * 4,
                 scalar_type: ShaderScalarType::Unsigned32,
             })
             .collect(),

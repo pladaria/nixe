@@ -16,6 +16,56 @@ pub(super) struct Screenshots {
 }
 
 impl Screenshots {
+    pub(super) fn native(
+        &mut self,
+        client: &nixe_gpu_vulkan::presentation::PresentationClient,
+    ) -> Option<std::sync::mpsc::Sender<Result<nixe_gpu_vulkan::presentation::Screenshot, String>>>
+    {
+        let path = self.requested.take()?;
+        self.join_worker();
+        let (sender, receiver) =
+            std::sync::mpsc::channel::<Result<nixe_gpu_vulkan::presentation::Screenshot, String>>();
+        let client = client.clone();
+        match std::thread::Builder::new()
+            .name("nixe-screenshot".into())
+            .spawn(move || {
+                let capture = loop {
+                    match receiver.recv_timeout(Duration::from_millis(50)) {
+                        Ok(result) => break result,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !client.stopped() => {
+                            continue;
+                        }
+                        _ => {
+                            log::info!("screenshot canceled during presentation shutdown");
+                            return;
+                        }
+                    }
+                };
+                let result = capture.map_err(io::Error::other).and_then(|capture| {
+                    save_png(
+                        &path,
+                        (capture.width, capture.height),
+                        capture.width * 4,
+                        &capture.rgba,
+                        FrameTransform::default(),
+                        false,
+                    )
+                });
+                match result {
+                    Ok(()) => log::info!("saved screenshot {}", path.display()),
+                    Err(error) => log::error!("cannot save screenshot {}: {error}", path.display()),
+                }
+            }) {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                Some(sender)
+            }
+            Err(error) => {
+                log::error!("cannot start native screenshot writer: {error}");
+                None
+            }
+        }
+    }
     pub(super) fn new(title: String, directory: PathBuf) -> Self {
         Self {
             title: filename_title(&title),

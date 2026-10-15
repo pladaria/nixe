@@ -15,6 +15,7 @@ egui-wgpu.workspace = true
 nixe-config.workspace = true
 nixe-gpu.workspace = true
 nixe-gpu-wgpu.workspace = true
+nixe-gpu-vulkan.workspace = true
 nixe-input.workspace = true
 nixe-video.workspace = true
 png.workspace = true

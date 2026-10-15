@@ -10,8 +10,6 @@ test-support = []
 performance-counters = ["nixe-gpu/performance-counters"]
 
 [dependencies]
-bcdec_rs = "0.2.0"
-ctt-astcenc = "0.4.0"
 half = "2.7"
 log.workspace = true
 nixe-gpu.workspace = true

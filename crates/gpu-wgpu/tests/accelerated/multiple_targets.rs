@@ -355,6 +355,7 @@ fn multiple_color_targets_preserve_slot_formats_blending_masks_and_sampling() {
             store: AttachmentStore::Store,
         });
         let mut prepared = PreparedDraw::new(
+            nixe_gpu::PreparedStateId::new(1, 1),
             PipelineId::new(1),
             pass,
             PrimitiveTopology::Triangles,
@@ -374,7 +375,7 @@ fn multiple_color_targets_preserve_slot_formats_blending_masks_and_sampling() {
                 source: BlendFactor::SourceAlpha,
                 destination: BlendFactor::OneMinusSourceAlpha,
             };
-            prepared.color_outputs[1] = ColorOutputState {
+            prepared.edit_state().color_outputs[1] = ColorOutputState {
                 blend: Some(ColorBlendState {
                     color: blend,
                     alpha: blend,
@@ -407,6 +408,7 @@ fn multiple_color_targets_preserve_slot_formats_blending_masks_and_sampling() {
             .unwrap();
             let prepared = Arc::new(
                 PreparedDraw::new(
+                    nixe_gpu::PreparedStateId::new(1, 1),
                     PipelineId::new(1),
                     pass,
                     PrimitiveTopology::Triangles,

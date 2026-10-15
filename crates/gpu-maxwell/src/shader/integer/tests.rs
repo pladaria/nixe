@@ -4,7 +4,7 @@ use super::*;
 use crate::MaxwellShaderStage;
 use nixe_gpu::{
     ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderIr, ShaderOperation,
-    ShaderPredicate, ShaderResourceAccess, ShaderResourceKind, ShaderScalarType,
+    ShaderPredicate, ShaderRegister, ShaderResourceAccess, ShaderResourceKind, ShaderScalarType,
     ShaderSourceLocation, ShaderStage, VerifiedShaderIr, lower_shader_ir_to_wgsl,
 };
 
@@ -175,7 +175,7 @@ fn shift_left_decodes_register_immediate_and_constant_buffer_forms() {
     assert_eq!(register.constant_buffer_binding, None);
     assert!(matches!(
         register.operations.as_slice(),
-        [ShaderOperation::ShiftLeft32 {
+        [crate::shader::decoded::Operation::ShiftLeft32 {
             destination,
             value,
             amount,
@@ -194,11 +194,11 @@ fn shift_left_decodes_register_immediate_and_constant_buffer_forms() {
     assert!(matches!(
         immediate.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 {
+            crate::shader::decoded::Operation::MoveImmediate32 {
                 bits: 0xfff8_0003,
                 ..
             },
-            ShaderOperation::ShiftLeft32 { wrap: false, .. }
+            crate::shader::decoded::Operation::ShiftLeft32 { wrap: false, .. }
         ]
     ));
 
@@ -214,13 +214,13 @@ fn shift_left_decodes_register_immediate_and_constant_buffer_forms() {
     assert!(matches!(
         constant.operations.as_slice(),
         [
-            ShaderOperation::LoadConstantBuffer32 {
+            crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 binding: 2,
                 byte_offset: 12,
                 scalar_type: ShaderScalarType::Unsigned32,
                 ..
             },
-            ShaderOperation::ShiftLeft32 { wrap: false, .. }
+            crate::shader::decoded::Operation::ShiftLeft32 { wrap: false, .. }
         ]
     ));
 }
@@ -293,11 +293,12 @@ fn iadd_constant_buffer_pointer_pair_carries_across_the_four_gib_boundary() {
             operations: high_operations,
             constant_buffer_binding: Some(2),
         };
-        high.operations.push(ShaderOperation::Move32 {
-            destination: ShaderRegister::new(0),
-            source: ShaderRegister::new(1),
-            scalar_type: ShaderScalarType::Unsigned32,
-        });
+        high.operations
+            .push(crate::shader::decoded::Operation::Move32 {
+                destination: ShaderRegister::new(0).into(),
+                source: ShaderRegister::new(1).into(),
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
         assert_eq!(
             evaluate_integer(high, offset, 0xffff_fffc),
             (expected >> 32) as u32
@@ -385,11 +386,13 @@ fn iscadd_negation_and_plus_one_preserve_wrapping_aliases_and_carry() {
     let mut carry = None;
     let mut decoded =
         decode_add(STAGE, 8, 0x5c1b_8000_0017_0000, 4, &mut next, &mut carry).unwrap();
-    decoded.operations.push(ShaderOperation::Move32 {
-        destination: ShaderRegister::new(0),
-        source: carry.unwrap(),
-        scalar_type: ShaderScalarType::Unsigned32,
-    });
+    decoded
+        .operations
+        .push(crate::shader::decoded::Operation::Move32 {
+            destination: ShaderRegister::new(0).into(),
+            source: carry.unwrap(),
+            scalar_type: ShaderScalarType::Unsigned32,
+        });
     assert_eq!(evaluate_integer(decoded, 0, u32::MAX), 1);
 }
 
@@ -439,7 +442,7 @@ fn evaluate_integer_with_third(
         bits: third,
         scalar_type: ShaderScalarType::Unsigned32,
     });
-    operations.extend(decoded.operations);
+    operations.extend(decoded.operations.into_iter().map(Into::into));
     operations.extend([
         ShaderOperation::StoreOutput {
             sources: vec![ShaderRegister::new(0)].into(),
@@ -601,8 +604,8 @@ fn isetp_register_immediate_and_constant_forms() {
     assert!(matches!(
         decoded.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 { bits: 0, .. },
-            ShaderOperation::SetPredicateInteger32 {
+            crate::shader::decoded::Operation::MoveImmediate32 { bits: 0, .. },
+            crate::shader::decoded::Operation::SetPredicateInteger32 {
                 destinations: [Some(0), None],
                 signed: false,
                 comparison: ShaderIntegerComparison::Equal,
@@ -620,7 +623,7 @@ fn isetp_register_immediate_and_constant_forms() {
         assert!(is_set_predicate(encoding));
         let decoded = decode_set_predicate(STAGE, 8, encoding, 5, &mut 5).unwrap();
         assert!(
-            matches!(decoded.operations[0], ShaderOperation::MoveImmediate32 { bits: actual, .. } if actual == bits)
+            matches!(decoded.operations[0], crate::shader::decoded::Operation::MoveImmediate32 { bits: actual, .. } if actual == bits)
         );
     }
     let encoding = 0x4b65_0380_0037_0007 | (2 << 34);
@@ -628,7 +631,7 @@ fn isetp_register_immediate_and_constant_forms() {
     assert_eq!(decoded.constant_buffer_binding, Some(2));
     assert!(matches!(
         decoded.operations[0],
-        ShaderOperation::LoadConstantBuffer32 {
+        crate::shader::decoded::Operation::LoadConstantBuffer32 {
             binding: 2,
             byte_offset: 12,
             ..
@@ -636,7 +639,7 @@ fn isetp_register_immediate_and_constant_forms() {
     ));
     assert!(matches!(
         decoded.operations[1],
-        ShaderOperation::SetPredicateInteger32 { signed: true, .. }
+        crate::shader::decoded::Operation::SetPredicateInteger32 { signed: true, .. }
     ));
     for bits in [1 << 6, 1 << 7, 1 << 28, 1 << 38, 1 << 44, 1 << 47, 3 << 45] {
         assert!(
@@ -747,13 +750,19 @@ fn iadd_negation_plus_one_and_extended_complement() {
                     0x5c12_0800_0017_0000,
                     0x1d20_0000_0007_0000 | (u64::from(right) << 20),
                 ] {
-                    let mut decoded =
-                        decode_add(STAGE, 8, word, 4, &mut 4, &mut Some(ShaderRegister::new(2)))
-                            .unwrap();
+                    let mut decoded = decode_add(
+                        STAGE,
+                        8,
+                        word,
+                        4,
+                        &mut 4,
+                        &mut Some(ShaderRegister::new(2).into()),
+                    )
+                    .unwrap();
                     decoded.operations.insert(
                         0,
-                        ShaderOperation::MoveImmediate32 {
-                            destination: ShaderRegister::new(2),
+                        crate::shader::decoded::Operation::MoveImmediate32 {
+                            destination: ShaderRegister::new(2).into(),
                             bits: carry,
                             scalar_type: ShaderScalarType::Unsigned32,
                         },
@@ -850,7 +859,7 @@ fn psetp_truth_tables_negations_aliases_and_instruction_predicate() {
                                         },
                                     ));
                                 }
-                                ops.push((guard, decoded));
+                                ops.push((guard, (decoded).into()));
                                 for index in 0..3_u8 {
                                     ops.push((
                                         ShaderPredicate::Always,
@@ -963,7 +972,7 @@ fn psetp_captured_encoding_and_reserved_fields() {
     assert!(is_predicate_boolean(word));
     assert!(matches!(
         decode_predicate_boolean(STAGE, 0x18, word).unwrap(),
-        ShaderOperation::SetPredicateBoolean {
+        crate::shader::decoded::Operation::SetPredicateBoolean {
             destinations: [Some(0), None],
             inputs: [
                 ShaderPredicate::Register {
@@ -1073,7 +1082,7 @@ fn r2p_selected_bytes_masks_preservation_and_predication() {
                                 },
                             ));
                         }
-                        ops.extend(decoded.into_iter().map(|op| (guard, op)));
+                        ops.extend(decoded.into_iter().map(|op| (guard, op.into())));
                         for index in 0..7_u8 {
                             ops.push((
                                 ShaderPredicate::Always,
@@ -1164,15 +1173,15 @@ fn r2p_captured_zero_source_and_reserved_fields() {
     let word = 0x38f0_0000_0037_0700;
     assert!(is_register_to_predicate(word));
     assert!(
-        matches!(decode_register_to_predicate(STAGE, 0x238, word, 8, &mut 8).unwrap().as_slice(), [ShaderOperation::SetPredicatesFromBits { source, first_bit: 0, write_mask: 3 }] if source.index() == 7)
+        matches!(decode_register_to_predicate(STAGE, 0x238, word, 8, &mut 8).unwrap().as_slice(), [crate::shader::decoded::Operation::SetPredicatesFromBits { source, first_bit: 0, write_mask: 3 }] if source.index() == 7)
     );
     assert!(matches!(
         decode_register_to_predicate(STAGE, 8, word | 0xff00, 8, &mut 8)
             .unwrap()
             .as_slice(),
         [
-            ShaderOperation::MoveImmediate32 { bits: 0, .. },
-            ShaderOperation::SetPredicatesFromBits { .. }
+            crate::shader::decoded::Operation::MoveImmediate32 { bits: 0, .. },
+            crate::shader::decoded::Operation::SetPredicatesFromBits { .. }
         ]
     ));
     for bits in [1, 1 << 43, 1 << 47] {
@@ -1183,7 +1192,7 @@ fn r2p_captured_zero_source_and_reserved_fields() {
     assert!(matches!(
         decode_register_to_predicate(STAGE, 8, word | (0x7ffff << 20) | (1 << 56), 8, &mut 8)
             .unwrap()[0],
-        ShaderOperation::SetPredicatesFromBits {
+        crate::shader::decoded::Operation::SetPredicatesFromBits {
             write_mask: 127,
             ..
         }
@@ -1244,11 +1253,13 @@ fn icmp_signed_unsigned_truth_tables_aliases_and_all_operand_forms() {
                         let mut decoded =
                             decode_integer_compare(STAGE, 8, word, 4, &mut 4).unwrap();
                         if destination != 0 && destination != 255 {
-                            decoded.operations.push(ShaderOperation::Move32 {
-                                destination: ShaderRegister::new(0),
-                                source: ShaderRegister::new(u16::from(destination)),
-                                scalar_type: ShaderScalarType::Unsigned32,
-                            });
+                            decoded
+                                .operations
+                                .push(crate::shader::decoded::Operation::Move32 {
+                                    destination: ShaderRegister::new(0).into(),
+                                    source: ShaderRegister::new(u16::from(destination)).into(),
+                                    scalar_type: ShaderScalarType::Unsigned32,
+                                });
                         }
                         let no = match opcode {
                             0x3640 => u32::MAX,
@@ -1278,14 +1289,14 @@ fn icmp_captured_zero_source_reaches_gpu_selection() {
     let decoded = decode_integer_compare(STAGE, 0x508, word, 32, &mut 32).unwrap();
     assert!(matches!(
         &decoded.operations[decoded.operations.len() - 2],
-        ShaderOperation::CompareInteger32 {
+        crate::shader::decoded::Operation::CompareInteger32 {
             signed: true,
             comparison: ShaderIntegerComparison::GreaterOrEqual,
             ..
         }
     ));
     assert!(
-        matches!(decoded.operations.last().unwrap(), ShaderOperation::Select32 { destination, .. } if destination.index() == 25)
+        matches!(decoded.operations.last().unwrap(), crate::shader::decoded::Operation::Select32 { destination, .. } if destination.index() == 25)
     );
     assert!(decode_integer_compare(STAGE, 8, word | (1 << 47), 32, &mut 32).is_err());
     assert!(
@@ -1339,11 +1350,14 @@ fn iadd3_halves_negations_shifts_and_aliases_preserve_wrapping_sums() {
                                 let mut decoded =
                                     decode_add_three(STAGE, 8, word, 4, &mut 4).unwrap();
                                 if destination != 0 && destination != 255 {
-                                    decoded.operations.push(ShaderOperation::Move32 {
-                                        destination: ShaderRegister::new(0),
-                                        source: ShaderRegister::new(u16::from(destination)),
-                                        scalar_type: ShaderScalarType::Unsigned32,
-                                    });
+                                    decoded.operations.push(
+                                        crate::shader::decoded::Operation::Move32 {
+                                            destination: ShaderRegister::new(0).into(),
+                                            source: ShaderRegister::new(u16::from(destination))
+                                                .into(),
+                                            scalar_type: ShaderScalarType::Unsigned32,
+                                        },
+                                    );
                                 }
                                 let parts = [ha, hb, hc]
                                     .into_iter()
@@ -1403,7 +1417,7 @@ fn iadd3_immediate_constant_zero_sources_and_captured_negated_sum() {
     let decoded = decode_add_three(STAGE, 0x570, word, 40, &mut 40).unwrap();
     assert!(matches!(
         decoded.operations[0],
-        ShaderOperation::MoveImmediate32 { bits: 0, .. }
+        crate::shader::decoded::Operation::MoveImmediate32 { bits: 0, .. }
     ));
     for bits in [1 << 47, 1 << 48, 1 << 28, 3 << 35, 3 << 37] {
         assert!(decode_add_three(STAGE, 8, word | bits, 40, &mut 40).is_err());

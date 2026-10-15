@@ -2,7 +2,8 @@
 
 use super::error::{MaxwellShaderTranslationError, malformed};
 use crate::MaxwellShaderStage;
-use nixe_gpu::{ShaderPredicate, ShaderRegister};
+use crate::shader::decoded::Register as ShaderRegister;
+use nixe_gpu::ShaderPredicate;
 
 pub(super) const fn decode_predicate(encoding: u64) -> ShaderPredicate {
     decode_predicate_fields(encoding, 16, 19)
@@ -31,9 +32,9 @@ pub(super) fn allocate_shader_temporary(
     offset: u32,
     encoding: u64,
     detail: &'static str,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<ShaderRegister, MaxwellShaderTranslationError> {
-    if *next_temporary == u16::MAX {
+    if *next_temporary == u32::MAX {
         return Err(malformed(stage, offset, encoding, detail));
     }
     let register = ShaderRegister::new(*next_temporary);

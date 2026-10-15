@@ -10,10 +10,9 @@ use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use super::interface::{attribute_location, interface_element};
 use crate::MaxwellShaderStage;
-use nixe_gpu::{
-    ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderOperation, ShaderPredicate,
-    ShaderRegister, ShaderScalarType,
-};
+use crate::shader::decoded::Register as ShaderRegister;
+use crate::shader::decoded::{Instruction as ShaderInstruction, Operation as ShaderOperation};
+use nixe_gpu::{ShaderInterfaceElement, ShaderIoLocation, ShaderPredicate, ShaderScalarType};
 
 #[cfg(test)]
 mod patch_order_tests;
@@ -175,7 +174,7 @@ pub(super) fn decode_system_register(
         // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/move_special_register.cpp
         validate_register_range(stage, offset, encoding, encoding as u8, 1, register_count)?;
         return Ok(ShaderOperation::MoveImmediate32 {
-            destination: ShaderRegister::new(u16::from(encoding as u8)),
+            destination: ShaderRegister::new(u32::from(encoding as u8)),
             bits: (if y_negate { -1.0_f32 } else { 1.0_f32 }).to_bits(),
             // S2R returns the register's raw bits; subsequent instructions
             // choose their interpretation, rather than converting the float.
@@ -202,7 +201,7 @@ pub(super) fn decode_system_register(
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
     declare_input(inputs, location);
     Ok(ShaderOperation::LoadInput {
-        destinations: vec![ShaderRegister::new(u16::from(destination))].into_boxed_slice(),
+        destinations: vec![ShaderRegister::new(u32::from(destination))].into_boxed_slice(),
         location,
         first_component: 0,
         scalar_type: ShaderScalarType::Unsigned32,
@@ -214,7 +213,7 @@ pub(super) fn decode_control_store(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     inputs: &mut Vec<ShaderInterfaceElement>,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     let source = encoding as u8;
@@ -264,7 +263,7 @@ pub(super) fn decode_control_store(
         } else {
             attribute_location(stage, offset, encoding, address)?
         };
-        let register = ShaderRegister::new(u16::from(source + lane));
+        let register = ShaderRegister::new(u32::from(source + lane));
         operations.push(if let Some(vertex) = vertex {
             ShaderOperation::StoreControlPoint {
                 source: register,

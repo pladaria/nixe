@@ -44,41 +44,44 @@ impl Emitter {
                 });
             }
             let block = *block_type.get_or_insert_with(|| {
-                self.buffer_word_pointer = Some(self.b.type_pointer(
+                self.buffer_word_pointer = Some(self.math.b.type_pointer(
                     None,
                     spv::StorageClass::StorageBuffer,
-                    self.uint,
+                    self.math.uint,
                 ));
-                let array = self.b.type_runtime_array(self.uint);
-                self.b.decorate(
+                let array = self.math.b.type_runtime_array(self.math.uint);
+                self.math.b.decorate(
                     array,
                     spv::Decoration::ArrayStride,
                     [Operand::LiteralBit32(4)],
                 );
-                let block = self.b.type_struct([array]);
-                self.b.decorate(block, spv::Decoration::Block, []);
-                self.b.member_decorate(
+                let block = self.math.b.type_struct([array]);
+                self.math.b.decorate(block, spv::Decoration::Block, []);
+                self.math.b.member_decorate(
                     block,
                     0,
                     spv::Decoration::Offset,
                     [Operand::LiteralBit32(0)],
                 );
-                self.b
+                self.math
+                    .b
                     .member_decorate(block, 0, spv::Decoration::NonWritable, []);
                 block
             });
             let pointer = self
+                .math
                 .b
                 .type_pointer(None, spv::StorageClass::StorageBuffer, block);
-            let variable = self
-                .b
-                .variable(pointer, None, spv::StorageClass::StorageBuffer, None);
-            self.b.decorate(
+            let variable =
+                self.math
+                    .b
+                    .variable(pointer, None, spv::StorageClass::StorageBuffer, None);
+            self.math.b.decorate(
                 variable,
                 spv::Decoration::DescriptorSet,
                 [Operand::LiteralBit32(0)],
             );
-            self.b.decorate(
+            self.math.b.decorate(
                 variable,
                 spv::Decoration::Binding,
                 [Operand::LiteralBit32(u32::from(binding))],
@@ -91,13 +94,18 @@ impl Emitter {
     }
 
     pub(super) fn load_buffer_word(&mut self, binding: u8, word: u32) -> Result<u32> {
-        let buffer = self.readonly_buffers[usize::from(binding)]
-            .ok_or_else(|| self.unsupported("missing native read-only buffer descriptor"))?;
+        let buffer = self.readonly_buffers[usize::from(binding)].ok_or_else(|| {
+            self.math
+                .unsupported("missing native read-only buffer descriptor")
+        })?;
         let pointer = self
             .buffer_word_pointer
             .expect("declared buffer has a scalar pointer type");
-        let zero = self.constant(0);
-        let address = self.b.access_chain(pointer, None, buffer, [zero, word])?;
-        Ok(self.b.load(self.uint, None, address, None, [])?)
+        let zero = self.math.constant(0);
+        let address = self
+            .math
+            .b
+            .access_chain(pointer, None, buffer, [zero, word])?;
+        Ok(self.math.b.load(self.math.uint, None, address, None, [])?)
     }
 }

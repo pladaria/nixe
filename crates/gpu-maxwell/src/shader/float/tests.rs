@@ -76,7 +76,7 @@ fn fmul_register_and_compact_immediate_forms_decode_consistently() {
     assert_eq!(register.constant_buffer_binding, None);
     assert!(matches!(
         register.operations.as_slice(),
-        [ShaderOperation::Multiply32 {
+        [crate::shader::decoded::Operation::Multiply32 {
             destination,
             left,
             right,
@@ -98,8 +98,8 @@ fn fmul_register_and_compact_immediate_forms_decode_consistently() {
     assert!(matches!(
         immediate.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 { bits, .. },
-            ShaderOperation::Multiply32 { right, .. },
+            crate::shader::decoded::Operation::MoveImmediate32 { bits, .. },
+            crate::shader::decoded::Operation::Multiply32 { right, .. },
         ] if *bits == immediate_bits && right.index() == 4
     ));
 }
@@ -176,7 +176,7 @@ fn ffma_register_immediate_and_constant_addend_forms_decode() {
     .unwrap();
     assert!(matches!(
         register.operations.as_slice(),
-        [ShaderOperation::FusedMultiplyAdd32 {
+        [crate::shader::decoded::Operation::FusedMultiplyAdd32 {
             destination,
             left,
             right,
@@ -202,8 +202,8 @@ fn ffma_register_immediate_and_constant_addend_forms_decode() {
     assert!(matches!(
         immediate.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 { bits, .. },
-            ShaderOperation::FusedMultiplyAdd32 { right, addend, .. },
+            crate::shader::decoded::Operation::MoveImmediate32 { bits, .. },
+            crate::shader::decoded::Operation::FusedMultiplyAdd32 { right, addend, .. },
         ] if *bits == immediate_bits && right.index() == 4 && addend.index() == 3
     ));
 
@@ -220,11 +220,11 @@ fn ffma_register_immediate_and_constant_addend_forms_decode() {
     assert!(matches!(
         constant_addend.operations.as_slice(),
         [
-            ShaderOperation::LoadConstantBuffer32 {
+            crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 byte_offset: 8,
                 ..
             },
-            ShaderOperation::FusedMultiplyAdd32 { right, addend, .. },
+            crate::shader::decoded::Operation::FusedMultiplyAdd32 { right, addend, .. },
         ] if right.index() == 2 && addend.index() == 5
     ));
 }
@@ -243,11 +243,11 @@ fn captured_pixel_ffma_decodes_product_and_addend_sign_modifiers() {
     assert!(matches!(
         captured.operations.as_slice(),
         [
-            ShaderOperation::FloatNegate32 {
+            crate::shader::decoded::Operation::FloatNegate32 {
                 destination: negated_addend,
                 source,
             },
-            ShaderOperation::FusedMultiplyAdd32 {
+            crate::shader::decoded::Operation::FusedMultiplyAdd32 {
                 destination,
                 left,
                 right,
@@ -274,11 +274,11 @@ fn captured_pixel_ffma_decodes_product_and_addend_sign_modifiers() {
     assert!(matches!(
         product_negated.operations.as_slice(),
         [
-            ShaderOperation::FloatNegate32 {
+            crate::shader::decoded::Operation::FloatNegate32 {
                 destination: negated_left,
                 source,
             },
-            ShaderOperation::FusedMultiplyAdd32 {
+            crate::shader::decoded::Operation::FusedMultiplyAdd32 {
                 left,
                 right,
                 addend,
@@ -442,7 +442,7 @@ fn fadd_register_and_compact_immediate_forms_decode() {
     .unwrap();
     assert!(matches!(
         register.operations.as_slice(),
-        [ShaderOperation::Add32 {
+        [crate::shader::decoded::Operation::Add32 {
             destination,
             left,
             right,
@@ -465,8 +465,8 @@ fn fadd_register_and_compact_immediate_forms_decode() {
     assert!(matches!(
         immediate.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 { bits, .. },
-            ShaderOperation::Add32 { right, .. },
+            crate::shader::decoded::Operation::MoveImmediate32 { bits, .. },
+            crate::shader::decoded::Operation::Add32 { right, .. },
         ] if *bits == immediate_bits && right.index() == 4
     ));
 }
@@ -557,12 +557,12 @@ fn captured_fsetp_lt_ftz_writes_p0_from_rz_and_r0() {
     assert!(matches!(
         decoded.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 {
+            crate::shader::decoded::Operation::MoveImmediate32 {
                 destination: zero,
                 bits: 0,
                 ..
             },
-            ShaderOperation::SetPredicateFloat32 {
+            crate::shader::decoded::Operation::SetPredicateFloat32 {
                 destination: 0,
                 left,
                 right,
@@ -590,7 +590,7 @@ fn fsetp_register_immediate_and_constant_buffer_forms_decode() {
     .unwrap();
     assert!(matches!(
         register.operations.as_slice(),
-        [ShaderOperation::SetPredicateFloat32 {
+        [crate::shader::decoded::Operation::SetPredicateFloat32 {
             destination: 2,
             left,
             right,
@@ -619,8 +619,8 @@ fn fsetp_register_immediate_and_constant_buffer_forms_decode() {
     assert!(matches!(
         immediate.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 { bits, .. },
-            ShaderOperation::SetPredicateFloat32 {
+            crate::shader::decoded::Operation::MoveImmediate32 { bits, .. },
+            crate::shader::decoded::Operation::SetPredicateFloat32 {
                 comparison: ShaderFloatComparison::OrderedNotEqual,
                 ..
             }
@@ -640,12 +640,12 @@ fn fsetp_register_immediate_and_constant_buffer_forms_decode() {
     assert!(matches!(
         constant.operations.as_slice(),
         [
-            ShaderOperation::LoadConstantBuffer32 {
+            crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 binding: 2,
                 byte_offset: 16,
                 ..
             },
-            ShaderOperation::SetPredicateFloat32 {
+            crate::shader::decoded::Operation::SetPredicateFloat32 {
                 comparison: ShaderFloatComparison::OrderedGreaterOrEqual,
                 ..
             }
@@ -669,8 +669,8 @@ fn fmnmx_register_immediate_and_constant_forms_decode_with_minimum_selector() {
     assert!(matches!(
         register.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 { bits: 0, .. },
-            ShaderOperation::FloatMinMax32 {
+            crate::shader::decoded::Operation::MoveImmediate32 { bits: 0, .. },
+            crate::shader::decoded::Operation::FloatMinMax32 {
                 destination,
                 left,
                 minimum: ShaderPredicate::Never,
@@ -691,8 +691,8 @@ fn fmnmx_register_immediate_and_constant_forms_decode_with_minimum_selector() {
     assert!(matches!(
         immediate.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 { bits, .. },
-            ShaderOperation::FloatMinMax32 {
+            crate::shader::decoded::Operation::MoveImmediate32 { bits, .. },
+            crate::shader::decoded::Operation::FloatMinMax32 {
                 minimum: ShaderPredicate::Always,
                 ..
             }
@@ -706,12 +706,12 @@ fn fmnmx_register_immediate_and_constant_forms_decode_with_minimum_selector() {
     assert!(matches!(
         constant.operations.as_slice(),
         [
-            ShaderOperation::LoadConstantBuffer32 {
+            crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 binding: 3,
                 byte_offset: 16,
                 ..
             },
-            ShaderOperation::FloatMinMax32 {
+            crate::shader::decoded::Operation::FloatMinMax32 {
                 minimum: ShaderPredicate::Always,
                 ..
             }

@@ -146,7 +146,7 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         .unwrap()[target_index];
         assert!(creations.iter().any(|creation| matches!(
             creation,
-            BackendResourceCreateInfo::Image { view: Some(view), .. }
+            ResourceDefinition::Image { view: Some(view), .. }
                 if view.has_canonical_texels() && !view.can_initialize_from_canonical_texels()
         )));
         creations.clear();
@@ -245,7 +245,7 @@ fn compressed_color_sampling_reuses_only_current_matching_resident_images() {
         assert_eq!(creations.len(), 1);
         assert!(matches!(
             &creations[0],
-            BackendResourceCreateInfo::Image { view: None, .. }
+            ResourceDefinition::Image { view: None, .. }
         ));
         assert_eq!(cache.image_alias_copies.len(), 1);
         let GpuCommand::Copy(nixe_gpu::CopyOperation::ImageToImage {
@@ -910,7 +910,7 @@ fn vic_producer_and_maxwell_texture_share_the_same_canonical_image() {
     assert_ne!(sampled, destination);
     assert!(matches!(
         &creations[..],
-        [BackendResourceCreateInfo::Image { view: None, .. }]
+        [ResourceDefinition::Image { view: None, .. }]
     ));
     assert_eq!(cache.image_alias_copies.len(), 1);
     finish_lowered_work(
@@ -1034,7 +1034,7 @@ fn uncompressed_color_sampling_refreshes_resident_copies_after_gpu_and_cpu_write
     assert_ne!(alias, producer);
     assert!(matches!(
         creations.as_slice(),
-        [BackendResourceCreateInfo::Image { view: None, .. }]
+        [ResourceDefinition::Image { view: None, .. }]
     ));
     assert_eq!(cache.image_alias_copies.len(), 1);
     creations.clear();
@@ -1110,7 +1110,7 @@ fn uncompressed_color_sampling_refreshes_resident_copies_after_gpu_and_cpu_write
     .unwrap();
     assert!(cache.image_alias_copies.is_empty());
     assert!(
-        matches!(creations.as_slice(), [BackendResourceCreateInfo::Image { view: Some(view), .. }]
+        matches!(creations.as_slice(), [ResourceDefinition::Image { view: Some(view), .. }]
         if view.swizzle() == nixe_gpu::Swizzle([nixe_gpu::ComponentSwizzle::Red, nixe_gpu::ComponentSwizzle::Red, nixe_gpu::ComponentSwizzle::Red, nixe_gpu::ComponentSwizzle::One]))
     );
 }

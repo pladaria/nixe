@@ -47,7 +47,7 @@ impl MaxwellLoweringCache {
             if let Some(old) = self.compute_shaders.get(fingerprint) {
                 invalidations.push(ResourceDependency::Shader(old.id));
             }
-            creations.push(BackendResourceCreateInfo::Shader {
+            creations.push(ResourceDefinition::Shader {
                 id,
                 description: ShaderDescription {
                     stage: ShaderStage::Compute,
@@ -146,7 +146,7 @@ impl MaxwellLoweringCache {
             pipeline
         } else {
             let id = PipelineId::new(take_identity(self)?);
-            creations.push(BackendResourceCreateInfo::Pipeline {
+            creations.push(ResourceDefinition::Pipeline {
                 id,
                 description: PipelineDescription {
                     kind: PipelineKind::Compute,

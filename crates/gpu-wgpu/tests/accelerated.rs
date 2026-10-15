@@ -2560,6 +2560,7 @@ fn accelerated_polygon_color_draw(
     let begin =
         RenderPassOperation::begin(render_pass, render_pass_description, vec![attachment]).unwrap();
     let prepared = PreparedDraw::new(
+        nixe_gpu::PreparedStateId::new(1, 1),
         pipeline,
         render_pass,
         topology,
@@ -2599,7 +2600,7 @@ fn accelerated_polygon_color_draw(
         .unwrap(),
     );
     let mut prepared = prepared;
-    prepared.scissor = match scissor {
+    prepared.edit_state().scissor = match scissor {
         Some(ScissorScenario::Partial) => Some(nixe_gpu::ScissorRect {
             x: 8,
             y: 8,
@@ -2615,7 +2616,7 @@ fn accelerated_polygon_color_draw(
         _ => None,
     };
     if let Some((front, cull, _)) = facing {
-        prepared.front_face = if positive_y {
+        prepared.edit_state().front_face = if positive_y {
             match front {
                 nixe_gpu::FrontFace::Clockwise => nixe_gpu::FrontFace::CounterClockwise,
                 nixe_gpu::FrontFace::CounterClockwise => nixe_gpu::FrontFace::Clockwise,
@@ -2623,10 +2624,10 @@ fn accelerated_polygon_color_draw(
         } else {
             front
         };
-        prepared.cull_mode = cull;
+        prepared.edit_state().cull_mode = cull;
     }
     if let Some((output, _)) = color_output {
-        prepared.color_outputs[0] = output;
+        prepared.edit_state().color_outputs[0] = output;
     }
     let mut draw = DrawOperation::new(
         Arc::new(prepared),
@@ -2665,9 +2666,15 @@ fn accelerated_polygon_color_draw(
     if color_output.is_some() || facing.is_some() || scissor.is_some() {
         // Same neutral pipeline/shaders, one changed pipeline field. The first
         // draw is invisible; a cache hit must restore the second draw's state.
-        let mut prepared = (*draw.prepared).clone();
+        let mut prepared = nixe_gpu::PreparedDraw::from_state(
+            nixe_gpu::PreparedStateId::new(
+                draw.prepared.identity().slot(),
+                draw.prepared.identity().revision() + 1,
+            ),
+            draw.prepared.state().clone(),
+        );
         if scissor.is_some() {
-            prepared.scissor = Some(nixe_gpu::ScissorRect {
+            prepared.edit_state().scissor = Some(nixe_gpu::ScissorRect {
                 x: 0,
                 y: 0,
                 width: 0,
@@ -2675,13 +2682,13 @@ fn accelerated_polygon_color_draw(
             });
         }
         if color_output.is_some() {
-            prepared.color_outputs[0].write_mask = nixe_gpu::ColorWriteMask::NONE;
+            prepared.edit_state().color_outputs[0].write_mask = nixe_gpu::ColorWriteMask::NONE;
         }
         if let Some((front, _, true)) = facing {
             if front == nixe_gpu::FrontFace::CounterClockwise {
-                prepared.front_face = nixe_gpu::FrontFace::Clockwise;
+                prepared.edit_state().front_face = nixe_gpu::FrontFace::Clockwise;
             } else {
-                prepared.cull_mode = nixe_gpu::CullMode::Back;
+                prepared.edit_state().cull_mode = nixe_gpu::CullMode::Back;
             }
         }
         draw.prepared = Arc::new(prepared);

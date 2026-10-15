@@ -32,7 +32,7 @@ struct Key {
 pub(super) struct KeyboardOverlay {
     ctx: egui::Context,
     input: egui_winit::State,
-    renderer: egui_wgpu::Renderer,
+    renderer: Option<egui_wgpu::Renderer>,
     editor: Option<Editor>,
 }
 struct Editor {
@@ -354,6 +354,12 @@ fn enabled(editor: &Editor, key: &Key) -> bool {
 }
 impl KeyboardOverlay {
     pub fn new(window: &Window, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let mut overlay =
+            Self::new_native(window, device.limits().max_texture_dimension_2d as usize);
+        overlay.renderer = Some(egui_wgpu::Renderer::new(device, format, Default::default()));
+        overlay
+    }
+    pub fn new_native(window: &Window, max_texture: usize) -> Self {
         let ctx = egui::Context::default();
         let mut fonts = egui::FontDefinitions::empty();
         fonts.font_data.insert(
@@ -376,12 +382,12 @@ impl KeyboardOverlay {
             window,
             Some(window.scale_factor() as f32),
             None,
-            Some(device.limits().max_texture_dimension_2d as usize),
+            Some(max_texture),
         );
         Self {
             ctx,
             input,
-            renderer: egui_wgpu::Renderer::new(device, format, Default::default()),
+            renderer: None,
             editor: None,
         }
     }
@@ -401,23 +407,17 @@ impl KeyboardOverlay {
             editor.session.submit(value);
         }
     }
-    pub fn encode(
+    pub fn prepare(
         &mut self,
         host: &KeyboardHost,
         window: &Window,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        view: &wgpu::TextureView,
-    ) {
-        let Some(editor) = self.editor.as_mut() else {
-            return;
-        };
+    ) -> Option<nixe_gpu_vulkan::presentation::UiFrame> {
+        let editor = self.editor.as_mut()?;
         if editor.session.finished() {
             host.close(&editor.session);
             self.editor = None;
             window.request_redraw();
-            return;
+            return None;
         }
         if let Some(feedback) = editor.session.take_feedback() {
             editor.waiting = false;
@@ -464,7 +464,7 @@ impl KeyboardOverlay {
             true
         });
         let ctx = self.ctx.clone();
-        let mut output = ctx.run_ui(input, |root| {
+        let output = ctx.run_ui(input, |root| {
             let ctx = root.ctx();
             let screen = ctx.viewport_rect();
             let scale = (screen.width() / 1280.0).min(screen.height() / 720.0);
@@ -700,18 +700,36 @@ impl KeyboardOverlay {
             .handle_platform_output(window, output.platform_output);
         let pixels = output.pixels_per_point;
         let jobs = ctx.tessellate(output.shapes, pixels);
+        Some(nixe_gpu_vulkan::presentation::UiFrame {
+            primitives: jobs,
+            textures: output.textures_delta,
+            pixels_per_point: pixels,
+        })
+    }
+    pub fn encode(
+        &mut self,
+        host: &KeyboardHost,
+        window: &Window,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+    ) {
+        let Some(mut frame) = self.prepare(host, window) else {
+            return;
+        };
+        let renderer = self.renderer.as_mut().expect("legacy keyboard renderer");
+        let jobs = frame.primitives;
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [window.inner_size().width, window.inner_size().height],
-            pixels_per_point: pixels,
+            pixels_per_point: frame.pixels_per_point,
         };
-        for (id, deltas) in &output.textures_delta.set {
+        for (id, deltas) in &frame.textures.set {
             for delta in deltas {
-                self.renderer.update_texture(device, queue, *id, delta);
+                renderer.update_texture(device, queue, *id, delta);
             }
         }
-        let commands = self
-            .renderer
-            .update_buffers(device, queue, encoder, &jobs, &screen);
+        let commands = renderer.update_buffers(device, queue, encoder, &jobs, &screen);
         debug_assert!(
             commands.is_empty(),
             "keyboard has no custom render callbacks"
@@ -731,12 +749,12 @@ impl KeyboardOverlay {
                 ..Default::default()
             })
             .forget_lifetime();
-        self.renderer.render(&mut pass, &jobs, &screen);
+        renderer.render(&mut pass, &jobs, &screen);
         drop(pass);
-        for id in &output.textures_delta.free {
-            self.renderer.free_texture(id);
+        for id in &frame.textures.free {
+            renderer.free_texture(id);
         }
-        output.textures_delta.clear();
+        frame.textures.clear();
     }
 }
 

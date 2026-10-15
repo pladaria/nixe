@@ -298,7 +298,7 @@ impl MaxwellLoweringCache {
     }
 }
 
-fn solid_clear_value(
+pub(super) fn solid_clear_value(
     packed: u32,
     color_format: u8,
     guest_format: super::super::threed::MaxwellThreeDGuestImageFormat,

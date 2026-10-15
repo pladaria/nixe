@@ -134,13 +134,13 @@ fn vertex_system_value_ald_spans_adjacent_instance_and_vertex_id_slots() {
     assert!(matches!(
         operations.as_slice(),
         [
-            ShaderOperation::LoadInput {
+            crate::shader::decoded::Operation::LoadInput {
                 destinations: instance,
                 location: ShaderIoLocation::InstanceId,
                 first_component: 0,
                 scalar_type: ShaderScalarType::Unsigned32,
             },
-            ShaderOperation::LoadInput {
+            crate::shader::decoded::Operation::LoadInput {
                 destinations: vertex,
                 location: ShaderIoLocation::VertexId,
                 first_component: 0,
@@ -176,13 +176,13 @@ fn attribute_load_spans_generic_vectors_without_losing_register_order() {
     assert!(matches!(
         operations.as_slice(),
         [
-            ShaderOperation::LoadInput {
+            crate::shader::decoded::Operation::LoadInput {
                 destinations: first,
                 location: ShaderIoLocation::Generic(0),
                 first_component: 3,
                 ..
             },
-            ShaderOperation::LoadInput {
+            crate::shader::decoded::Operation::LoadInput {
                 destinations: second,
                 location: ShaderIoLocation::Generic(1),
                 first_component: 0,
@@ -335,41 +335,45 @@ fn perspective_normalization_proof_tracks_register_overwrites_and_predication() 
         )
     };
     let mut instructions = vec![
-        make(ShaderOperation::LoadInput {
-            destinations: vec![ShaderRegister::new(0)].into_boxed_slice(),
+        make(crate::shader::decoded::Operation::LoadInput {
+            destinations: vec![ShaderRegister::new(0)]
+                .into_boxed_slice()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             location: ShaderIoLocation::Position,
             first_component: 3,
             scalar_type: ShaderScalarType::Float32,
         }),
-        make(ShaderOperation::Reciprocal32 {
-            destination: ShaderRegister::new(2),
-            source: ShaderRegister::new(0),
+        make(crate::shader::decoded::Operation::Reciprocal32 {
+            destination: ShaderRegister::new(2).into(),
+            source: ShaderRegister::new(0).into(),
             accuracy: nixe_gpu::ShaderMathAccuracy::Approximate,
             float_control: ShaderFloatControl::PRECISE,
         }),
     ];
     assert!(is_reciprocal_fragment_w(
         &instructions,
-        ShaderRegister::new(2)
+        ShaderRegister::new(2).into()
     ));
     // The reciprocal retains its value after its source register is reused.
-    instructions.push(make(ShaderOperation::MoveImmediate32 {
-        destination: ShaderRegister::new(0),
+    instructions.push(make(crate::shader::decoded::Operation::MoveImmediate32 {
+        destination: ShaderRegister::new(0).into(),
         bits: 3_f32.to_bits(),
         scalar_type: ShaderScalarType::Float32,
     }));
     assert!(is_reciprocal_fragment_w(
         &instructions,
-        ShaderRegister::new(2)
+        ShaderRegister::new(2).into()
     ));
-    instructions.push(make(ShaderOperation::MoveImmediate32 {
-        destination: ShaderRegister::new(2),
+    instructions.push(make(crate::shader::decoded::Operation::MoveImmediate32 {
+        destination: ShaderRegister::new(2).into(),
         bits: 3_f32.to_bits(),
         scalar_type: ShaderScalarType::Float32,
     }));
     assert!(!is_reciprocal_fragment_w(
         &instructions,
-        ShaderRegister::new(2)
+        ShaderRegister::new(2).into()
     ));
     instructions.truncate(1);
     instructions.push(ShaderInstruction::new(
@@ -378,16 +382,16 @@ fn perspective_normalization_proof_tracks_register_overwrites_and_predication() 
             register: 0,
             inverted: false,
         },
-        ShaderOperation::Reciprocal32 {
-            destination: ShaderRegister::new(2),
-            source: ShaderRegister::new(0),
+        crate::shader::decoded::Operation::Reciprocal32 {
+            destination: ShaderRegister::new(2).into(),
+            source: ShaderRegister::new(0).into(),
             accuracy: nixe_gpu::ShaderMathAccuracy::Approximate,
             float_control: ShaderFloatControl::PRECISE,
         },
     ));
     assert!(!is_reciprocal_fragment_w(
         &instructions,
-        ShaderRegister::new(2)
+        ShaderRegister::new(2).into()
     ));
 }
 
@@ -412,8 +416,8 @@ fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodele
             false,
         )
         .unwrap(),
-        vec![ShaderOperation::InterpolateInput {
-            destination: ShaderRegister::new(0),
+        vec![crate::shader::decoded::Operation::InterpolateInput {
+            destination: ShaderRegister::new(0).into(),
             location: ShaderIoLocation::Generic(1),
             component: 0,
             interpolation: ShaderInterpolation::Constant,
@@ -430,7 +434,7 @@ fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodele
     let sc = (captured & !(3_u64 << 54)) | (3_u64 << 54);
     assert!(matches!(
         decode_interpolate(MaxwellShaderStage::Pixel, 0x38, sc, 1, &mut vec![screen_input], &mut 8, false),
-        Ok(operations) if matches!(operations.as_slice(), [ShaderOperation::InterpolateInput { interpolation: ShaderInterpolation::ScreenLinear, .. }])
+        Ok(operations) if matches!(operations.as_slice(), [crate::shader::decoded::Operation::InterpolateInput { interpolation: ShaderInterpolation::ScreenLinear, .. }])
     ));
 
     for unsupported in [
@@ -464,7 +468,7 @@ fn vertex_ast_point_size_preserves_scalar_value_and_rejects_vector_stores() {
     )
     .unwrap();
     assert!(
-        matches!(operation[0], ShaderOperation::StoreOutput { ref sources,
+        matches!(operation[0], crate::shader::decoded::Operation::StoreOutput { ref sources,
         location: ShaderIoLocation::PointSize, first_component: 0, .. } if sources.len() == 1)
     );
     let mut header = [0; 20];
@@ -515,7 +519,7 @@ fn ipa_front_face_reads_full_boolean_mask_and_declares_the_builtin() {
     )
     .unwrap();
     assert!(
-        matches!(&operations[0],ShaderOperation::LoadInput {location:ShaderIoLocation::FrontFacing,scalar_type:ShaderScalarType::Unsigned32,destinations,..} if destinations[0].index()==25)
+        matches!(&operations[0],crate::shader::decoded::Operation::LoadInput {location:ShaderIoLocation::FrontFacing,scalar_type:ShaderScalarType::Unsigned32,destinations,..} if destinations[0].index()==25)
     );
     assert_eq!(inputs[0].interpolation(), None);
     let mut header = [0; 20];
@@ -559,7 +563,7 @@ fn ast_zero_source_preserves_real_outputs_and_validates_registers() {
     let operations =
         decode_attribute_store(MaxwellShaderStage::Vertex, 0x28, captured, 4, &mut 4).unwrap();
     assert!(
-        matches!(operations.as_slice(), [ShaderOperation::MoveImmediate32 { destination, bits: 0, .. }, ShaderOperation::StoreOutput { sources, location: ShaderIoLocation::Position, first_component: 0, .. }] if sources.as_ref() == [*destination])
+        matches!(operations.as_slice(), [crate::shader::decoded::Operation::MoveImmediate32 { destination, bits: 0, .. }, crate::shader::decoded::Operation::StoreOutput { sources, location: ShaderIoLocation::Position, first_component: 0, .. }] if sources.as_ref() == [*destination])
     );
     assert!(
         decode_attribute_store(
@@ -599,6 +603,6 @@ fn ast_zero_source_preserves_real_outputs_and_validates_registers() {
     let operations =
         decode_attribute_store(MaxwellShaderStage::Vertex, 8, ending_rz, 255, &mut 255).unwrap();
     assert!(
-        matches!(&operations[1], ShaderOperation::StoreOutput { sources, .. } if sources[0].index() == 254 && sources[1].index() == 255)
+        matches!(&operations[1], crate::shader::decoded::Operation::StoreOutput { sources, .. } if sources[0].index() == 254 && sources[1].index() == 255)
     );
 }

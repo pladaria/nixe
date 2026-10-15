@@ -18,6 +18,7 @@ use super::data::{
     is_move, is_move_immediate,
 };
 use super::decode::decode_predicate;
+use super::decoded::ResourceAccess as ShaderResourceAccess;
 use super::error::{MaxwellShaderTranslationError, malformed, unsupported_instruction};
 use super::float::{
     decode_float_add, decode_float_fused_multiply_add, decode_float_min_max, decode_float_multiply,
@@ -33,7 +34,7 @@ use super::integer::{decode_shift_left, decode_shift_right, is_shift_left, is_sh
 use super::interface::{
     append_implicit_outputs, decode_attribute_load, decode_attribute_store, decode_header_inputs,
     decode_header_outputs, decode_interpolate, is_attribute_load, is_attribute_store,
-    is_interpolate, neutral_stage, preload_vertex_inputs,
+    is_interpolate, neutral_stage, oracle_preload_vertex_inputs,
 };
 use super::special::{
     decode_mufu, decode_range_reduced_mufu, decode_range_reduction, freeze_range_reduction_input,
@@ -45,10 +46,10 @@ use super::texture::{
 };
 use super::{compute, global_memory, integer, patch_address, quad, tessellation, xmad};
 use crate::MaxwellShaderStage;
+use crate::shader::decoded::{Instruction as ShaderInstruction, Operation as ShaderOperation};
 use nixe_gpu::{
-    ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderIr, ShaderOperation,
-    ShaderPredicate, ShaderResourceAccess, ShaderResourceKind, ShaderScalarType,
-    ShaderSourceLocation,
+    ShaderInterfaceElement, ShaderIoLocation, ShaderIr, ShaderPredicate, ShaderResourceKind,
+    ShaderScalarType, ShaderSourceLocation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,12 +68,12 @@ pub(super) struct TranslatedShaderIr {
 /// FFMA, FADD, and FSETP encodings are derived from Mesa NAK's pinned SM50 encoder and
 /// opcode tables, rather than from the captured shader binaries:
 /// https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs
-pub(super) fn translate_shader_binary(
+pub(super) fn decode_shader_binary(
     binary: &MaxwellShaderBinary,
     register_count: u8,
     vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
     y_negate: bool,
-) -> Result<TranslatedShaderIr, MaxwellShaderTranslationError> {
+) -> Result<DecodedProgram, MaxwellShaderTranslationError> {
     let stage = binary.stage();
     let neutral_stage = neutral_stage(stage);
     // The reciprocal/IPA fusion below uses straight-line register definitions.
@@ -104,11 +105,11 @@ pub(super) fn translate_shader_binary(
         ),
         MaxwellShaderMetadata::Compute { .. } => (Vec::new(), Vec::new()),
     };
-    let mut instructions = preload_vertex_inputs(neutral_stage, &inputs);
+    let mut instructions = Vec::new();
     let mut constant_buffer_bindings = BTreeSet::new();
     let mut texture_bindings = BTreeMap::new();
     let mut texture_queries = BTreeMap::new();
-    let mut next_temporary = u16::from(register_count);
+    let mut next_temporary = u32::from(register_count);
     let mut explicitly_stored = BTreeSet::new();
     if stage == MaxwellShaderStage::Vertex {
         // Maxwell's position export starts at (0, 0, 0, 1). A shader may
@@ -266,7 +267,7 @@ pub(super) fn translate_shader_binary(
                     source,
                     predicate,
                     ShaderOperation::BranchTable {
-                        value: nixe_gpu::ShaderRegister::new(u16::from(table.register)),
+                        value: crate::shader::decoded::Register::new(u32::from(table.register)),
                         targets: table.targets.clone(),
                     },
                 ));
@@ -317,6 +318,11 @@ pub(super) fn translate_shader_binary(
                 if !is_supported_family(encoding) {
                     return Err(unsupported_instruction(binary, offset, encoding));
                 }
+                instructions.push(ShaderInstruction::new(
+                    source,
+                    ShaderPredicate::Always,
+                    ShaderOperation::Nop,
+                ));
                 continue;
             }
 
@@ -344,7 +350,7 @@ pub(super) fn translate_shader_binary(
                         .source_registers()
                         .iter()
                         .any(|register| {
-                            register.index() < u16::from(register_count)
+                            register.index() < u32::from(register_count)
                                 && pending_range_reductions.contains_key(&(register.index() as u8))
                         })
                     {
@@ -357,7 +363,8 @@ pub(super) fn translate_shader_binary(
                     }
                 }
                 patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
-                let destination = nixe_gpu::ShaderRegister::new(u16::from(range.destination));
+                let destination =
+                    crate::shader::decoded::Register::new(u32::from(range.destination));
                 patch_addresses.remove(destination);
                 global_memory.observe(
                     &mut instructions,
@@ -624,7 +631,7 @@ pub(super) fn translate_shader_binary(
                         predicate,
                         ShaderOperation::QueryTextureLevels {
                             destination: query.destination,
-                            image_binding: u8::MAX,
+                            image_binding: u32::MAX,
                         },
                     ));
                     break 'instruction;
@@ -677,7 +684,9 @@ pub(super) fn translate_shader_binary(
                             && ((encoding >> 54) & 3) == 1
                             && super::interface::is_reciprocal_fragment_w(
                                 &instructions,
-                                nixe_gpu::ShaderRegister::new(((encoding >> 20) & 0xff) as u16),
+                                crate::shader::decoded::Register::new(u32::from(
+                                    ((encoding >> 20) & 0xff) as u16,
+                                )),
                             ),
                     )?;
                     append_expanded_operations(&mut instructions, source, predicate, operations);
@@ -977,7 +986,7 @@ pub(super) fn translate_shader_binary(
             for instruction in &instructions[translated_start..] {
                 for register in instruction.operation().source_registers() {
                     if let Some(range) = pending_range_reductions.get(&(register.index() as u8))
-                        && register.index() < u16::from(register_count)
+                        && register.index() < u32::from(register_count)
                     {
                         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
                             stage,
@@ -990,7 +999,7 @@ pub(super) fn translate_shader_binary(
                 instruction
                     .operation()
                     .visit_destination_registers(|register| {
-                        if register.index() < u16::from(register_count) {
+                        if register.index() < u32::from(register_count) {
                             if predicate == ShaderPredicate::Always {
                                 pending_range_reductions.remove(&(register.index() as u8));
                             } else if let Some(range) =
@@ -1056,16 +1065,20 @@ pub(super) fn translate_shader_binary(
     let mut resources = constant_buffer_bindings
         .into_iter()
         .map(|binding| {
-            ShaderResourceAccess::new(binding, ShaderResourceKind::ConstantBuffer, true, false)
-                .expect("read-only constant-buffer access is valid")
+            ShaderResourceAccess::new(
+                binding.into(),
+                ShaderResourceKind::ConstantBuffer,
+                true,
+                false,
+            )
+            .expect("read-only constant-buffer access is valid")
         })
         .collect::<Vec<_>>();
     let mut global_buffers = global_memory.bindings;
     // Texture pairs occupy local bindings starting at 32. Place storage
     // bindings after the complete texture set before verification/linking.
     if !global_buffers.buffers.is_empty() && !texture_bindings.is_empty() {
-        let shift = u8::try_from(texture_bindings.len() * 2)
-            .map_err(|_| MaxwellShaderTranslationError::ResourceBindingExhausted)?;
+        let shift = texture_bindings.len() as u32 * 2;
         for buffer in &mut global_buffers.buffers {
             buffer.binding = buffer
                 .binding
@@ -1156,7 +1169,7 @@ pub(super) fn translate_shader_binary(
         }
         previous_source = Some(instruction.source());
         for register in instruction.operation().source_registers() {
-            if register.index() < u16::from(register_count) && !defined.contains(&register) {
+            if register.index() < u32::from(register_count) && !defined.contains(&register) {
                 live_in.insert(register);
             }
         }
@@ -1187,7 +1200,7 @@ pub(super) fn translate_shader_binary(
     if stage == MaxwellShaderStage::Vertex {
         // One compiler scratch register suffices for the output prologue. It is
         // allocated after translation and has no overlap with guest temporaries.
-        let register = nixe_gpu::ShaderRegister::new(next_temporary);
+        let register = crate::shader::decoded::Register::new(next_temporary);
         let source = ShaderSourceLocation::new(0);
         let prologue = (0..4).flat_map(|component| {
             [
@@ -1251,18 +1264,84 @@ pub(super) fn translate_shader_binary(
         }
         inputs.retain(|input| read.contains(&(input.location(), input.component())));
     }
-    let mut ir = ShaderIr::new(neutral_stage, inputs, outputs, resources, instructions)
-        .with_tessellation_control_points(
-            (stage == MaxwellShaderStage::TessellationInit)
-                .then(|| binary.header().bits(88, 8) as u32),
-        );
-    if let MaxwellShaderMetadata::Compute { workgroup_size, .. } = binary.metadata {
-        ir = ir.with_workgroup_size(workgroup_size);
+    Ok(DecodedProgram {
+        stage: neutral_stage,
+        inputs,
+        outputs,
+        resources,
+        instructions,
+        workgroup_size: match binary.metadata {
+            MaxwellShaderMetadata::Compute { workgroup_size, .. } => Some(workgroup_size),
+            _ => None,
+        },
+        tessellation_control_points: (stage == MaxwellShaderStage::TessellationInit)
+            .then(|| binary.header().bits(88, 8) as u32),
+        temporary_count: next_temporary,
+        texture_bindings: texture_bindings.values().copied().collect(),
+        global_buffers,
+    })
+}
+
+pub(super) struct DecodedProgram {
+    pub(super) stage: nixe_gpu::ShaderStage,
+    pub(super) inputs: Vec<ShaderInterfaceElement>,
+    pub(super) outputs: Vec<ShaderInterfaceElement>,
+    pub(super) resources: Vec<ShaderResourceAccess>,
+    pub(super) instructions: Vec<ShaderInstruction>,
+    pub(super) workgroup_size: Option<[u32; 3]>,
+    pub(super) tessellation_control_points: Option<u32>,
+    pub(super) temporary_count: u32,
+    pub(super) texture_bindings: Box<[MaxwellTextureResourceBinding]>,
+    pub(super) global_buffers: global_memory::GlobalBufferBindings,
+}
+
+/// Retiring oracle export. The native compiler calls decode_shader_binary and
+/// consumes frontend instructions directly; it never calls this adapter.
+pub(super) fn translate_shader_binary(
+    binary: &MaxwellShaderBinary,
+    register_count: u8,
+    vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
+    y_negate: bool,
+) -> Result<TranslatedShaderIr, MaxwellShaderTranslationError> {
+    let mut decoded = decode_shader_binary(binary, register_count, vertex_input_types, y_negate)?;
+    // Freeze the reference renderer's historical launch bridge only here. It
+    // is not an ISA rule and never enters native SSA compilation.
+    if decoded.temporary_count > u32::from(u16::MAX) {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage: binary.stage(),
+            instruction_offset: 0,
+            encoding: 0,
+            detail: "reference renderer temporary namespace is limited to u16",
+        });
+    }
+    let preload = oracle_preload_vertex_inputs(decoded.stage, &decoded.inputs);
+    let mut launch_registers = BTreeSet::new();
+    for i in &preload {
+        i.operation().visit_destination_registers(|r| {
+            launch_registers.insert(r);
+        });
+    }
+    decoded.instructions.retain(|i|i.source().byte_offset()!=0||!matches!(i.operation(),ShaderOperation::Undefined32 {destination} if launch_registers.contains(destination)));
+    decoded.instructions.splice(0..0, preload);
+    let mut ir = ShaderIr::new(
+        decoded.stage,
+        decoded.inputs,
+        decoded.outputs,
+        decoded
+            .resources
+            .into_iter()
+            .map(ShaderResourceAccess::oracle)
+            .collect::<Result<_, _>>()?,
+        decoded.instructions.into_iter().map(Into::into).collect(),
+    )
+    .with_tessellation_control_points(decoded.tessellation_control_points);
+    if let Some(size) = decoded.workgroup_size {
+        ir = ir.with_workgroup_size(size);
     }
     Ok(TranslatedShaderIr {
         ir,
-        texture_bindings: texture_bindings.values().copied().collect(),
-        global_buffers,
+        texture_bindings: decoded.texture_bindings,
+        global_buffers: decoded.global_buffers,
     })
 }
 

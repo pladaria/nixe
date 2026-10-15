@@ -2,8 +2,8 @@
 //! https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt
 use super::*;
 
-impl Emitter {
-    pub(super) fn directed_integer_to_float(
+impl Math {
+    pub(crate) fn directed_integer_to_float(
         &mut self,
         bits: u32,
         source_type: ShaderScalarType,
@@ -58,12 +58,27 @@ impl Emitter {
             let lost_mask = self.b.i_sub(self.uint, None, lost_mask, one)?;
             let lost = self.b.bitwise_and(self.uint, None, magnitude, lost_mask)?;
             let inexact = self.b.i_not_equal(self.boolean, None, lost, zero)?;
-            let away = if rounding == ShaderRoundingMode::TowardNegative {
-                negative
+            let increment = if rounding == ShaderRoundingMode::NearestEven {
+                let half = self
+                    .b
+                    .shift_right_logical(self.uint, None, lost_mask, one)?;
+                // lost_mask = 2^n - 1, so compare to floor(half) and
+                // distinguish the exact tie using the discarded-bit count.
+                let half = self.b.i_add(self.uint, None, half, one)?;
+                let above = self.b.u_greater_than(self.boolean, None, lost, half)?;
+                let equal = self.b.i_equal(self.boolean, None, lost, half)?;
+                let odd = self.b.bitwise_and(self.uint, None, truncated, one)?;
+                let odd = self.b.i_not_equal(self.boolean, None, odd, zero)?;
+                let tie = self.b.logical_and(self.boolean, None, equal, odd)?;
+                self.b.logical_or(self.boolean, None, above, tie)?
             } else {
-                self.b.logical_not(self.boolean, None, negative)?
+                let away = if rounding == ShaderRoundingMode::TowardNegative {
+                    negative
+                } else {
+                    self.b.logical_not(self.boolean, None, negative)?
+                };
+                self.b.logical_and(self.boolean, None, inexact, away)?
             };
-            let increment = self.b.logical_and(self.boolean, None, inexact, away)?;
             let increment = self.b.select(self.uint, None, increment, one, zero)?;
             result = self.b.i_add(self.uint, None, result, increment)?;
         }

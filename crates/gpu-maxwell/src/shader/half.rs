@@ -1,14 +1,14 @@
 //! Packed half arithmetic with explicit operand swizzles and result conversion.
+use crate::shader::decoded::Register as ShaderRegister;
 mod fma;
+use crate::shader::decoded::Operation as ShaderOperation;
 pub(super) use fma::{decode_half_fused_multiply_add, is_half_fused_multiply_add};
 
 use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::MaxwellShaderTranslationError;
 use super::float::{apply_float_source_modifiers, prepare_float_register_source};
 use crate::MaxwellShaderStage;
-use nixe_gpu::{
-    ShaderBitwiseOperation, ShaderFloatControl, ShaderOperation, ShaderRegister, ShaderScalarType,
-};
+use nixe_gpu::{ShaderBitwiseOperation, ShaderFloatControl, ShaderScalarType};
 
 pub(super) const fn is_half_multiply(encoding: u64) -> bool {
     encoding & 0xfff8_0000_0000_0000 == 0x5d08_0000_0000_0000
@@ -34,7 +34,7 @@ pub(super) fn decode_half_add(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedHalfBinary, MaxwellShaderTranslationError> {
     decode_half_binary(
         stage,
@@ -51,7 +51,7 @@ pub(super) fn decode_half_multiply(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedHalfBinary, MaxwellShaderTranslationError> {
     decode_half_binary(
         stage,
@@ -68,7 +68,7 @@ fn decode_half_binary(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     add: bool,
 ) -> Result<DecodedHalfBinary, MaxwellShaderTranslationError> {
     // HMUL2 register encoding and float/half swizzle/result modes:
@@ -111,7 +111,7 @@ fn decode_half_binary(
     }
     let raw_destination = encoding as u8;
     validate_register_range(stage, offset, encoding, raw_destination, 1, register_count)?;
-    let destination = ShaderRegister::new(u16::from(raw_destination));
+    let destination = ShaderRegister::new(u32::from(raw_destination));
     let mut operations = Vec::new();
     let left = prepare_float_register_source(
         stage,
@@ -135,7 +135,7 @@ fn decode_half_binary(
         )?;
         operations.push(ShaderOperation::LoadConstantBuffer32 {
             destination,
-            binding,
+            binding: binding.into(),
             byte_offset: (((encoding >> 20) & 0x3fff) as u32) * 4,
             scalar_type: ShaderScalarType::Float32,
         });
@@ -178,7 +178,7 @@ fn decode_half_binary(
             &mut operations,
         )?
     };
-    let temporary = |next: &mut u16| {
+    let temporary = |next: &mut u32| {
         allocate_shader_temporary(
             stage,
             offset,
@@ -307,7 +307,7 @@ fn prepare_half_lane(
     lane: u8,
     absolute: bool,
     negate: bool,
-    next: &mut u16,
+    next: &mut u32,
     operations: &mut Vec<ShaderOperation>,
 ) -> Result<ShaderRegister, MaxwellShaderTranslationError> {
     let value = if swizzle == 1 {
@@ -345,10 +345,10 @@ fn merge_half_results(
     destination: ShaderRegister,
     merge: u64,
     results: &[ShaderRegister],
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     operations: &mut Vec<ShaderOperation>,
 ) -> Result<(), MaxwellShaderTranslationError> {
-    let temporary = |next: &mut u16| {
+    let temporary = |next: &mut u32| {
         allocate_shader_temporary(
             stage,
             offset,
@@ -420,7 +420,7 @@ pub(super) fn decode_half_set_predicate(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     use nixe_gpu::{ShaderFloatComparison as C, ShaderPredicate, ShaderPredicateSetOperation};
     // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_set_predicate.cpp
@@ -599,9 +599,10 @@ pub(super) fn decode_half_set_predicate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_gpu::ShaderInstruction;
     use nixe_gpu::{
-        ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderIr, ShaderPredicate,
-        ShaderSourceLocation, ShaderStage, VerifiedShaderIr,
+        ShaderInterfaceElement, ShaderIoLocation, ShaderIr, ShaderPredicate, ShaderSourceLocation,
+        ShaderStage, VerifiedShaderIr,
     };
 
     #[test]
@@ -669,7 +670,7 @@ mod tests {
                         ShaderInstruction::new(
                             ShaderSourceLocation::new(i as u32 * 8),
                             ShaderPredicate::Always,
-                            op,
+                            op.into(),
                         )
                     })
                     .collect(),
@@ -762,7 +763,7 @@ mod tests {
                     ShaderInstruction::new(
                         ShaderSourceLocation::new(i as u32 * 8),
                         ShaderPredicate::Always,
-                        op,
+                        op.into(),
                     )
                 })
                 .collect(),
@@ -837,7 +838,7 @@ mod tests {
                         ShaderInstruction::new(
                             ShaderSourceLocation::new(i as u32 * 8),
                             ShaderPredicate::Always,
-                            op,
+                            op.into(),
                         )
                     })
                     .collect(),

@@ -1,0 +1,10 @@
+{
+  "sdk": "1.4.341.1",
+  "archive_sha256": "3bf0f762afb6c79bc6a9d9fb5998745ccff928800a29619b501ed9de7fd9789b",
+  "tools": {
+    "glslc": "391e6570653ca9b8b9e78032ab4e766e52758f3ee09890bc6e12df369d207871",
+    "spirv-val": "cf341751800f75429d546af0ffef33643e4d3e7af22c87018782f8a202a394e3"
+  },
+  "target": "vulkan1.2",
+  "spirv": "spv1.5"
+}

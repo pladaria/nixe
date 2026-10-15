@@ -47,6 +47,7 @@ pub struct Arguments {
     pub log_level_override: Option<LogLevel>,
     pub identifier: String,
     pub headless: bool,
+    pub native_vulkan: Option<nixe_gpu_vulkan::DeviceOptions>,
     pub cpu_backend_override: Option<CpuBackendSelection>,
     pub guest_logs_level_override: Option<GuestLogsLevel>,
     pub file_system_access_log_override: Option<bool>,
@@ -58,12 +59,13 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         log_level_override,
         identifier,
         headless,
+        native_vulkan,
         cpu_backend_override,
         guest_logs_level_override,
         file_system_access_log_override,
     } = arguments;
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
-    let (frontend, frontend_control, presenter, touch_screen) = if headless {
+    let (mut frontend, frontend_control, presenter, touch_screen) = if headless {
         log::info!("headless presentation enabled; no host window will be created");
         (None, None, None, None)
     } else {
@@ -91,14 +93,16 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     if let Some(backend) = cpu_backend_override {
         log::info!("CPU backend selection overridden by CLI: {backend:?}");
     }
-    log::info!(
-        "GPU cache policy: shaders={} pipelines={} variants-per-pipeline={} bind-groups-per-table={} persistent-pipeline-cache={} MiB",
-        config.gpu.shader_entries(),
-        config.gpu.pipeline_entries(),
-        config.gpu.pipeline_variants_per_resource(),
-        config.gpu.bind_groups_per_descriptor_table(),
-        config.gpu.persistent_pipeline_cache_bytes() / (1024 * 1024)
-    );
+    if native_vulkan.is_none() {
+        log::info!(
+            "GPU cache policy: shaders={} pipelines={} variants-per-pipeline={} bind-groups-per-table={} persistent-pipeline-cache={} MiB",
+            config.gpu.shader_entries(),
+            config.gpu.pipeline_entries(),
+            config.gpu.pipeline_variants_per_resource(),
+            config.gpu.bind_groups_per_descriptor_table(),
+            config.gpu.persistent_pipeline_cache_bytes() / (1024 * 1024)
+        );
+    }
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
         format!(
@@ -253,24 +257,82 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         "virtual time: mode={clock_mode:?}, timezone={}",
         config.system.time.timezone
     );
-    let gpu_backend = initialize_backend(
-        BackendInstanceId::new(1),
-        NonCpuDeviceId::new(1),
-        WgpuBackendConfiguration {
-            cache: config.gpu,
-            ..WgpuBackendConfiguration::default()
-        },
-    )
-    .map_err(|error| format!("cannot initialize accelerated GPU backend: {error}"))?;
-    log::info!(
-        "GPU backend initialized: api={:?} adapter={} driver={}",
-        gpu_backend.adapter.backend,
-        gpu_backend.adapter.name,
-        gpu_backend.adapter.driver
-    );
-    let presentation_context = gpu_backend.presentation_context();
-    let video_system =
-        VideoSystem::with_gpu_backend(presenter, gpu_backend.into_runtime(), config.gpu);
+    let window_state_path = config.window_state_path();
+    let saved_window_state = match WindowState::load(&window_state_path) {
+        Ok(Some(state)) => {
+            log::info!("read window configuration {}", window_state_path.display());
+            Some(state)
+        }
+        Ok(None) => {
+            log::info!(
+                "window configuration {} does not exist; using defaults",
+                window_state_path.display()
+            );
+            None
+        }
+        Err(error) => {
+            log::warn!(
+                "cannot use window configuration {}: {error}; discarding its contents and using defaults",
+                window_state_path.display()
+            );
+            None
+        }
+    };
+    frontend = frontend.map(|frontend| frontend.with_window_state(saved_window_state));
+    let (video_system, presentation_context) = if let Some(options) = native_vulkan {
+        let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {
+            let (device, client) = frontend
+                .create_vulkan_device(options)
+                .map_err(|e| e.to_string())?;
+            (device, Some(client))
+        } else {
+            (
+                nixe_gpu_vulkan::VulkanDevice::new(options, None).map_err(|e| e.to_string())?,
+                None,
+            )
+        };
+        log::info!(
+            "GPU backend initialized: api=Vulkan native adapter={}",
+            device.profile().name
+        );
+        let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
+            device,
+            nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
+            nixe_gpu_vulkan::cache::CacheConfiguration::default(),
+            1024 * 1024 * 1024,
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(client) = native_presentation {
+            renderer
+                .attach_presentation(client)
+                .map_err(|e| e.to_string())?;
+        }
+        let maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(renderer.compilation_pool());
+        (
+            VideoSystem::with_gpu_frontend(presenter, renderer, maxwell),
+            None,
+        )
+    } else {
+        let gpu_backend = initialize_backend(
+            BackendInstanceId::new(1),
+            NonCpuDeviceId::new(1),
+            WgpuBackendConfiguration {
+                cache: config.gpu,
+                ..WgpuBackendConfiguration::default()
+            },
+        )
+        .map_err(|error| format!("cannot initialize accelerated GPU backend: {error}"))?;
+        log::info!(
+            "GPU backend initialized: api={:?} adapter={} driver={}",
+            gpu_backend.adapter.backend,
+            gpu_backend.adapter.name,
+            gpu_backend.adapter.driver
+        );
+        let presentation_context = Some(gpu_backend.presentation_context());
+        let video_system =
+            VideoSystem::with_gpu_backend(presenter, gpu_backend.into_runtime(), config.gpu);
+        (video_system, presentation_context)
+    };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
     // The owners outlive guest execution in both windowed and headless modes.
@@ -304,31 +366,13 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             trace_interpreter,
         ));
     };
-    let window_state_path = config.window_state_path();
-    let saved_window_state = match WindowState::load(&window_state_path) {
-        Ok(Some(state)) => {
-            log::info!("read window configuration {}", window_state_path.display());
-            Some(state)
-        }
-        Ok(None) => {
-            log::info!(
-                "window configuration {} does not exist; using defaults",
-                window_state_path.display()
-            );
-            None
-        }
-        Err(error) => {
-            log::warn!(
-                "cannot use window configuration {}: {error}; discarding its contents and using defaults",
-                window_state_path.display()
-            );
-            None
-        }
+    let frontend = if let Some(context) = presentation_context {
+        frontend.with_gpu_context(context)
+    } else {
+        frontend
     };
-    let frontend = frontend
-        .with_gpu_context(presentation_context)
-        .with_window_state(saved_window_state)
-        .with_screenshots(title.name.clone(), PathBuf::from("dump/screenshots/nixe"));
+    let frontend =
+        frontend.with_screenshots(title.name.clone(), PathBuf::from("dump/screenshots/nixe"));
 
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");

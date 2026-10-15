@@ -149,6 +149,36 @@ impl NvDrvSession {
         Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend), cache_configuration))
     }
 
+    /// Selects the concrete host renderer once, before starting GPU workers.
+    #[must_use]
+    pub fn with_gpu_execution<
+        E: nixe_gpu::GpuExecution<
+                Commands = nixe_gpu::OperationSubmission,
+                ImageRequest = nixe_gpu::PresentationImageRequest,
+            >,
+    >(
+        execution: E,
+        cache_configuration: GpuCacheConfiguration,
+    ) -> Self {
+        Self::new_with_executor(NvDrvGpuExecutor::with_execution(
+            Some(execution),
+            cache_configuration,
+        ))
+    }
+
+    /// Startup composition; neither worker erases the selected command representation.
+    #[must_use]
+    pub fn with_gpu_frontend<E, L>(execution: E, frontend: L) -> Self
+    where
+        L: nixe_gpu_maxwell::MaxwellFrontend,
+        E: nixe_gpu::GpuExecution<
+                Commands = nixe_gpu_maxwell::MaxwellWorkCommands<L::Work>,
+                ImageRequest = <L::Work as nixe_gpu_maxwell::MaxwellWork>::ImageRequest,
+            >,
+    {
+        Self::new_with_executor(NvDrvGpuExecutor::with_frontend(Some(execution), frontend))
+    }
+
     fn new_with_executor(gpu_executor: NvDrvGpuExecutor) -> Self {
         Self {
             connection_id: NvDrvSessionId::ROOT,

@@ -48,8 +48,8 @@ fn fmul32i_preserves_all_immediate_bits_and_uses_its_own_modifier_fields() {
             decode_float_multiply(MaxwellShaderStage::Compute, 8, encoding, 4, &mut 4).unwrap();
         assert_eq!(decoded.constant_buffer_binding, None);
         assert!(matches!(decoded.operations.as_slice(), [
-            ShaderOperation::MoveImmediate32 { bits: actual, .. },
-            ShaderOperation::Multiply32 { float_control, .. },
+            crate::shader::decoded::Operation::MoveImmediate32 { bits: actual, .. },
+            crate::shader::decoded::Operation::Multiply32 { float_control, .. },
         ] if *actual == bits && !float_control.denormals_are_zero()
             && !float_control.flush_denormals_to_zero()));
         assert_eq!(
@@ -104,7 +104,7 @@ fn decoded(
     kind: u8,
     ftz: bool,
     dnz: bool,
-) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
+) -> Result<Vec<crate::shader::decoded::Operation>, MaxwellShaderTranslationError> {
     let stage = MaxwellShaderStage::Vertex;
     let mut temporary = 4;
     match kind {
@@ -139,7 +139,7 @@ fn evaluate(kind: u8, ftz: bool, values: [u32; 3]) -> u32 {
     evaluate_operations(decoded(kind, ftz, false).unwrap(), values)
 }
 
-fn evaluate_operations(operations: Vec<ShaderOperation>, values: [u32; 3]) -> u32 {
+fn evaluate_operations(operations: Vec<impl Into<ShaderOperation>>, values: [u32; 3]) -> u32 {
     let mut code: Vec<_> = values
         .into_iter()
         .enumerate()
@@ -149,7 +149,7 @@ fn evaluate_operations(operations: Vec<ShaderOperation>, values: [u32; 3]) -> u3
             scalar_type: ShaderScalarType::Float32,
         })
         .collect();
-    code.extend(operations);
+    code.extend(operations.into_iter().map(Into::into));
     code.push(ShaderOperation::StoreOutput {
         sources: vec![ShaderRegister::new(3)].into(),
         location: ShaderIoLocation::Generic(0),
@@ -194,9 +194,11 @@ fn ftz_is_not_an_independent_output_only_modifier() {
         for ftz in [false, true] {
             let operations = decoded(kind, ftz, false).unwrap();
             let control = match operations.last().unwrap() {
-                ShaderOperation::Add32 { float_control, .. }
-                | ShaderOperation::Multiply32 { float_control, .. }
-                | ShaderOperation::FusedMultiplyAdd32 { float_control, .. } => float_control,
+                crate::shader::decoded::Operation::Add32 { float_control, .. }
+                | crate::shader::decoded::Operation::Multiply32 { float_control, .. }
+                | crate::shader::decoded::Operation::FusedMultiplyAdd32 { float_control, .. } => {
+                    float_control
+                }
                 _ => panic!("unexpected arithmetic lowering"),
             };
             assert_eq!(control.flush_denormals_to_zero(), ftz);
@@ -249,7 +251,7 @@ fn unsupported_dnz_combinations_remain_explicit() {
 fn fmul_dnz_absorbs_signed_zero_and_subnormals_before_multiplication() {
     let operations = decoded(1, false, true).unwrap();
     assert!(
-        matches!(operations.as_slice(), [ShaderOperation::FloatMultiplyZero32 { float_control, .. }]
+        matches!(operations.as_slice(), [crate::shader::decoded::Operation::FloatMultiplyZero32 { float_control, .. }]
         if float_control.denormals_are_zero() && float_control.flush_denormals_to_zero())
     );
     for zero in [0, 0x8000_0000, 1, 0x807f_ffff] {
@@ -302,8 +304,8 @@ fn fmul_dnz_constant_buffer_encoding_and_immediate_form() {
     .unwrap();
     assert_eq!(decoded.constant_buffer_binding, Some(2));
     assert!(matches!(decoded.operations.as_slice(), [
-        ShaderOperation::LoadConstantBuffer32 { binding: 2, byte_offset: 60, destination: load, .. },
-        ShaderOperation::FloatMultiplyZero32 { destination, left, right, .. },
+        crate::shader::decoded::Operation::LoadConstantBuffer32 { binding: 2, byte_offset: 60, destination: load, .. },
+        crate::shader::decoded::Operation::FloatMultiplyZero32 { destination, left, right, .. },
     ] if destination.index() == 0 && left.index() == 0 && *right == *load));
     let decoded = decode_float_multiply(
         MaxwellShaderStage::Pixel,
@@ -337,7 +339,7 @@ fn multiply_saturation_handles_every_operand_form_and_special_results() {
             decode_float_multiply(MaxwellShaderStage::Compute, 8, encoding, 4, &mut 4).unwrap();
         assert_eq!(decoded.operations.len(), if immediate { 2 } else { 1 });
         assert!(
-            matches!(decoded.operations.last().unwrap(), ShaderOperation::Multiply32 { float_control, .. } if float_control.saturate())
+            matches!(decoded.operations.last().unwrap(), crate::shader::decoded::Operation::Multiply32 { float_control, .. } if float_control.saturate())
         );
         if decoded.constant_buffer_binding.is_some() {
             continue;
@@ -368,6 +370,6 @@ fn multiply_saturation_handles_every_operand_form_and_special_results() {
     )
     .unwrap();
     assert!(
-        matches!(decoded.operations.last().unwrap(), ShaderOperation::Multiply32 { float_control, .. } if float_control.saturate() && float_control.flush_denormals_to_zero())
+        matches!(decoded.operations.last().unwrap(), crate::shader::decoded::Operation::Multiply32 { float_control, .. } if float_control.saturate() && float_control.flush_denormals_to_zero())
     );
 }

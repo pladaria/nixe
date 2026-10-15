@@ -555,6 +555,7 @@ fn compute_generated_vertices(line_width: Option<f32>, split: bool) -> Option<u6
         description: pass_description.clone(),
     });
     let mut prepared = PreparedDraw::new(
+        nixe_gpu::PreparedStateId::new(1, 1),
         PipelineId::new(2),
         pass,
         if line_width.is_some() {
@@ -589,10 +590,11 @@ fn compute_generated_vertices(line_width: Option<f32>, split: bool) -> Option<u6
         None,
     )
     .unwrap();
-    prepared.line_rasterization = line_width.map(|width| nixe_gpu::LineRasterization {
-        width_bits: width.to_bits(),
-        smooth: true,
-    });
+    prepared.edit_state().line_rasterization =
+        line_width.map(|width| nixe_gpu::LineRasterization {
+            width_bits: width.to_bits(),
+            smooth: true,
+        });
     let op = |command| GpuOperation::new(command, [], [], CapabilityRequirements::none());
     let mut operations = vec![
         GpuOperation::new(

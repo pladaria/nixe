@@ -73,7 +73,7 @@ impl MaxwellTranslatedShaderProgram {
         self.global_buffers
             .buffers
             .iter()
-            .find(|buffer| buffer.binding == binding)
+            .find(|buffer| buffer.binding == binding.into())
     }
 
     pub(crate) fn buffer_size(&self, binding: u8) -> crate::engines::MaxwellShaderBufferSize {
@@ -83,7 +83,7 @@ impl MaxwellTranslatedShaderProgram {
             .buffers
             .iter()
             .enumerate()
-            .find(|(_, b)| b.binding == binding)
+            .find(|(_, b)| b.binding == binding.into())
         {
             return if buffer.runtime_extent {
                 MaxwellShaderBufferSize::Declared
@@ -199,14 +199,15 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
         let stage = input.binary.stage();
         let local_bindings = program_resource_bindings(input, &translated, &global_bindings)?;
         for buffer in &mut translated.global_buffers.buffers {
-            buffer.binding = remapped_binding(&local_bindings, stage, buffer.binding)?;
+            buffer.binding =
+                remapped_oracle_metadata_binding(&local_bindings, stage, buffer.binding)?;
         }
         for texture in &mut translated.texture_bindings {
             texture.image_binding =
-                remapped_binding(&local_bindings, stage, texture.image_binding)?;
+                remapped_oracle_metadata_binding(&local_bindings, stage, texture.image_binding)?;
             texture.sampler_binding = texture
                 .sampler_binding
-                .map(|binding| remapped_binding(&local_bindings, stage, binding))
+                .map(|binding| remapped_oracle_metadata_binding(&local_bindings, stage, binding))
                 .transpose()?;
         }
         let output_interpolation = if Some(neutral_stage(stage)) == final_producer {
@@ -457,7 +458,7 @@ fn graphics_resource_identity(
             .global_buffers
             .buffers
             .iter()
-            .find(|buffer| buffer.binding == resource.binding())
+            .find(|buffer| buffer.binding == resource.binding().into())
             .ok_or(MaxwellShaderTranslationError::MissingResourceBindingRemap {
                 stage: match program.ir.stage() {
                     ShaderStage::Vertex => MaxwellShaderStage::Vertex,
@@ -742,3 +743,13 @@ pub(super) fn validate_graphics_stage_interfaces(
 
 #[cfg(test)]
 mod tests;
+
+fn remapped_oracle_metadata_binding(
+    remap: &BTreeMap<u8, u8>,
+    stage: MaxwellShaderStage,
+    binding: u32,
+) -> Result<u32, MaxwellShaderTranslationError> {
+    let binding = u8::try_from(binding)
+        .map_err(|_| MaxwellShaderTranslationError::ResourceBindingExhausted)?;
+    remapped_binding(remap, stage, binding).map(u32::from)
+}

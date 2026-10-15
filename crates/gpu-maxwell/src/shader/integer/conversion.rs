@@ -1,5 +1,6 @@
 //! Integer conversions use scalar bit operations shared by every host backend.
 use super::*;
+use crate::shader::decoded::Operation as ShaderOperation;
 use nixe_gpu::ShaderPredicate;
 
 pub(in crate::shader) const fn is_integer_to_integer(encoding: u64) -> bool {
@@ -12,7 +13,7 @@ pub(in crate::shader) fn decode_integer_to_integer(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
     flags: &mut IntegerConditionCodes,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     // Operand fields: Mesa SM50 OpI2I and UAM GM107 emitI2I.
@@ -50,14 +51,14 @@ pub(in crate::shader) fn decode_integer_to_integer(
                 zero
             } else {
                 validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-                ShaderRegister::new(u16::from(raw))
+                ShaderRegister::new(u32::from(raw))
             }
         }
         0x4ce0 => {
             let source = temp()?;
             ops.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: source,
-                binding: binding.unwrap(),
+                binding: u32::from(binding.unwrap()),
                 byte_offset: ((encoding >> 20) & 0x3fff) as u32 * 4,
                 scalar_type: ShaderScalarType::Unsigned32,
             });
@@ -175,7 +176,7 @@ pub(in crate::shader) fn decode_integer_to_integer(
         temp()?
     } else {
         validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-        ShaderRegister::new(u16::from(raw))
+        ShaderRegister::new(u32::from(raw))
     };
     // Saturation retains the signed 32-bit clamp result; wrapping conversions
     // truncate to the destination width and zero-extend the stored register.

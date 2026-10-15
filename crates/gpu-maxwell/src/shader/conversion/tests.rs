@@ -182,7 +182,7 @@ fn float_to_integer_covers_width_sign_rounding_and_cbuf_forms() {
             .unwrap();
             assert!(matches!(
                 decoded.operations.as_slice(),
-                [ShaderOperation::ConvertFloat32ToInteger {
+                [crate::shader::decoded::Operation::ConvertFloat32ToInteger {
                     destination_type: ShaderScalarType::Signed32,
                     destination_bits,
                     rounding,
@@ -205,12 +205,12 @@ fn float_to_integer_covers_width_sign_rounding_and_cbuf_forms() {
     assert!(matches!(
         constant.operations.as_slice(),
         [
-            ShaderOperation::LoadConstantBuffer32 {
+            crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 binding: 2,
                 byte_offset: 12,
                 ..
             },
-            ShaderOperation::ConvertFloat32ToInteger {
+            crate::shader::decoded::Operation::ConvertFloat32ToInteger {
                 destination_bits: 16,
                 rounding: ShaderRoundingMode::TowardNegative,
                 ..
@@ -238,7 +238,7 @@ fn float_to_float_integral_rounding_covers_directed_modes_and_cbuf() {
         assert_eq!(decoded.constant_buffer_binding, None);
         assert!(matches!(
             decoded.operations.last(),
-            Some(ShaderOperation::RoundFloat32ToIntegral {
+            Some(crate::shader::decoded::Operation::RoundFloat32ToIntegral {
                 destination,
                 source,
                 rounding,
@@ -260,12 +260,12 @@ fn float_to_float_integral_rounding_covers_directed_modes_and_cbuf() {
     assert!(matches!(
         constant.operations.as_slice(),
         [
-            ShaderOperation::LoadConstantBuffer32 {
+            crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 binding: 2,
                 byte_offset: 12,
                 ..
             },
-            ShaderOperation::RoundFloat32ToIntegral {
+            crate::shader::decoded::Operation::RoundFloat32ToIntegral {
                 rounding: ShaderRoundingMode::TowardNegative,
                 ..
             }
@@ -287,7 +287,7 @@ fn integer_to_float_decodes_register_immediate_and_constant_buffer_forms() {
     assert_eq!(register.constant_buffer_binding, None);
     assert!(matches!(
         register.operations.as_slice(),
-        [ShaderOperation::ConvertIntegerToFloat32 {
+        [crate::shader::decoded::Operation::ConvertIntegerToFloat32 {
             destination,
             source,
             source_type: ShaderScalarType::Unsigned32,
@@ -307,12 +307,12 @@ fn integer_to_float_decodes_register_immediate_and_constant_buffer_forms() {
     assert!(matches!(
         immediate.operations.as_slice(),
         [
-            ShaderOperation::MoveImmediate32 {
+            crate::shader::decoded::Operation::MoveImmediate32 {
                 bits: 0xfff8_0003,
                 scalar_type: ShaderScalarType::Signed32,
                 ..
             },
-            ShaderOperation::ConvertIntegerToFloat32 {
+            crate::shader::decoded::Operation::ConvertIntegerToFloat32 {
                 source_type: ShaderScalarType::Signed32,
                 ..
             }
@@ -331,13 +331,13 @@ fn integer_to_float_decodes_register_immediate_and_constant_buffer_forms() {
     assert!(matches!(
         constant.operations.as_slice(),
         [
-            ShaderOperation::LoadConstantBuffer32 {
+            crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 binding: 2,
                 byte_offset: 12,
                 scalar_type: ShaderScalarType::Unsigned32,
                 ..
             },
-            ShaderOperation::ConvertIntegerToFloat32 {
+            crate::shader::decoded::Operation::ConvertIntegerToFloat32 {
                 source_type: ShaderScalarType::Unsigned32,
                 ..
             }
@@ -415,14 +415,14 @@ fn integer_to_float_directed_rounding_preserves_inexact_large_values() {
             let decoded =
                 decode_integer_to_float(MaxwellShaderStage::Pixel, 8, word, 1, &mut 1).unwrap();
             assert!(
-                matches!(decoded.operations.last(), Some(ShaderOperation::ConvertIntegerToFloat32 { rounding: r, .. }) if *r == rounding)
+                matches!(decoded.operations.last(), Some(crate::shader::decoded::Operation::ConvertIntegerToFloat32 { rounding: r, .. }) if *r == rounding)
             );
             let mut operations = vec![ShaderOperation::MoveImmediate32 {
                 destination: ShaderRegister::new(0),
                 bits,
                 scalar_type: ShaderScalarType::Unsigned32,
             }];
-            operations.extend(decoded.operations);
+            operations.extend(decoded.operations.into_iter().map(Into::into));
             operations.push(ShaderOperation::StoreOutput {
                 sources: vec![ShaderRegister::new(0)].into(),
                 location: ShaderIoLocation::Color(0),
@@ -557,7 +557,7 @@ fn integer_to_float_sources_preserve_selectors_sign_extension_and_absolute_value
                                 bits: input,
                                 scalar_type: ShaderScalarType::Unsigned32,
                             }];
-                            operations.extend(decoded.operations);
+                            operations.extend(decoded.operations.into_iter().map(Into::into));
                             operations.push(ShaderOperation::StoreOutput {
                                 sources: vec![ShaderRegister::new(0)].into(),
                                 location: ShaderIoLocation::Color(0),

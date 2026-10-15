@@ -376,7 +376,7 @@ impl MaxwellTwoDBlitState {
         if extent.width == 0 || extent.height == 0 {
             return Err(error(source, "2D point dimensions must be nonzero"));
         }
-        let origins = [
+        let mut origins = [
             nixe_gpu::ImageOrigin {
                 x: get(&self.parameters[9])?,
                 y: get(&self.parameters[11])?,
@@ -437,14 +437,28 @@ impl MaxwellTwoDBlitState {
                 layout,
             })
         };
-        Ok((
-            [
-                surface(&self.src, origins[0], false)?,
-                surface(&self.dst, origins[1], true)?,
-            ],
-            origins,
-            extent,
-        ))
+        let mut images = [
+            surface(&self.src, origins[0], false)?,
+            surface(&self.dst, origins[1], true)?,
+        ];
+        if let BlitSurfaceLayout::Pitch(pitch) = images[0].layout {
+            // A pitch is a row address increment, independent of SRC_WIDTH.
+            // Drivers can bias the base before the first requested texel and
+            // extend SRC_WIDTH past a row's pitch. Describe only the accessed
+            // point rectangle as an image; importing the unused prefix both
+            // invents overlapping image rows and copies bytes never sampled.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/twod/cl902d.h
+            let bytes = pixel_bytes(images[0].format).expect("validated point format");
+            images[0].address = images[0]
+                .address
+                .checked_add(u64::from(origins[0].y) * u64::from(pitch))
+                .and_then(|address| address.checked_add(u64::from(origins[0].x) * u64::from(bytes)))
+                .ok_or_else(|| error(source, "2D pitch source address overflows"))?;
+            images[0].width = extent.width;
+            images[0].height = extent.height;
+            origins[0] = nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 };
+        }
+        Ok((images, origins, extent))
     }
 }
 

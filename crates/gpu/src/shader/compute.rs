@@ -3,7 +3,7 @@ use super::*;
 
 /// Unsigned compute invocation coordinates.
 /// https://www.w3.org/TR/WGSL/#builtin-values
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShaderComputeBuiltin {
     GlobalInvocationId,
     LocalInvocationId,

@@ -192,11 +192,11 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
         }])
         .unwrap();
         let mut creations = vec![
-            BackendResourceCreateInfo::Allocation {
+            ResourceDefinition::Allocation {
                 id: GpuAllocationId::new(1),
                 description: GpuAllocationDescription::new(u64::from(SIZE * SIZE * 4), 4).unwrap(),
             },
-            BackendResourceCreateInfo::Image {
+            ResourceDefinition::Image {
                 id: image,
                 description,
                 view: Some(
@@ -209,11 +209,11 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
                     .unwrap(),
                 ),
             },
-            BackendResourceCreateInfo::Allocation {
+            ResourceDefinition::Allocation {
                 id: GpuAllocationId::new(2),
                 description: GpuAllocationDescription::new(size, 4).unwrap(),
             },
-            BackendResourceCreateInfo::Buffer {
+            ResourceDefinition::Buffer {
                 id: vertices,
                 description: BufferDescription::new(size).unwrap(),
                 view: Some(
@@ -226,13 +226,13 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
                     .unwrap(),
                 ),
             },
-            BackendResourceCreateInfo::Pipeline {
+            ResourceDefinition::Pipeline {
                 id: pipeline,
                 description: PipelineDescription {
                     kind: PipelineKind::Graphics,
                 },
             },
-            BackendResourceCreateInfo::RenderPass {
+            ResourceDefinition::RenderPass {
                 id: pass,
                 description: pass_description.clone(),
             },
@@ -246,7 +246,7 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
         for (i, ir) in chain.into_iter().enumerate() {
             let id = ShaderId::new(i as u64 + 1);
             dependencies.push(ResourceDependency::Shader(id));
-            creations.push(BackendResourceCreateInfo::Shader {
+            creations.push(ResourceDefinition::Shader {
                 id,
                 description: ShaderDescription {
                     stage: ir.ir().stage(),
@@ -255,6 +255,7 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
             });
         }
         let mut prepared = PreparedDraw::new(
+            nixe_gpu::PreparedStateId::new(1, 1),
             pipeline,
             pass,
             PrimitiveTopology::Patches,
@@ -287,11 +288,11 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
         .unwrap();
         // Match the demo's CCW front face/back culling. Without culling, an
         // inverted tessellation-domain orientation produces identical pixels.
-        prepared.front_face = FrontFace::CounterClockwise;
-        prepared.cull_mode = CullMode::Back;
+        prepared.edit_state().front_face = FrontFace::CounterClockwise;
+        prepared.edit_state().cull_mode = CullMode::Back;
         if wireframe {
             // The demo's blend equation consumes coverage generated after FS.
-            prepared.color_outputs[0].blend = Some(ColorBlendState {
+            prepared.edit_state().color_outputs[0].blend = Some(ColorBlendState {
                 color: BlendComponent {
                     operation: BlendOperation::Add,
                     source: BlendFactor::SourceAlpha,
@@ -304,7 +305,7 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
                 },
             });
         }
-        prepared.tessellation = Some(TessellationState {
+        prepared.edit_state().tessellation = Some(TessellationState {
             input_control_points: 3,
             mode: TessellationMode {
                 domain: TessellationDomain::Triangles,
@@ -327,16 +328,23 @@ fn run_chain(patch_barriers: bool, wireframe: bool) {
         for frame in 0..6 {
             let mut frame_draw = draw.clone();
             if wireframe || frame >= 3 {
-                let mut prepared = (*frame_draw.prepared).clone();
+                let mut prepared = nixe_gpu::PreparedDraw::from_state(
+                    nixe_gpu::PreparedStateId::new(
+                        frame_draw.prepared.identity().slot(),
+                        frame as u64 + 2,
+                    ),
+                    frame_draw.prepared.state().clone(),
+                );
                 if wireframe {
-                    prepared.triangle_rasterization = TriangleRasterization::Wireframe {
-                        width_bits: if frame % 2 == 0 { 1_f32 } else { 4_f32 }.to_bits(),
-                        smooth: true,
-                    };
+                    prepared.edit_state().triangle_rasterization =
+                        TriangleRasterization::Wireframe {
+                            width_bits: if frame % 2 == 0 { 1_f32 } else { 4_f32 }.to_bits(),
+                            smooth: true,
+                        };
                 }
                 if frame >= 3 {
-                    prepared.front_face = FrontFace::Clockwise;
-                    prepared.viewport_transform = Some(
+                    prepared.edit_state().front_face = FrontFace::Clockwise;
+                    prepared.edit_state().viewport_transform = Some(
                         ViewportTransform::new([32., 32., 1.], [32., 32., 0.], [0., 1.]).unwrap(),
                     );
                 }

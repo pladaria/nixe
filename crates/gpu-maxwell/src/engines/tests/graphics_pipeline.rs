@@ -677,7 +677,7 @@ fn check_compressed_color_materialization(format: u32, kind: u8, zbc_mask: Optio
         .resource_creations()
         .iter()
         .find_map(|creation| match creation {
-            nixe_gpu::BackendResourceCreateInfo::Image {
+            nixe_gpu::ResourceDefinition::Image {
                 description, view, ..
             } => Some((description, view)),
             _ => None,
@@ -4153,4 +4153,134 @@ fn viewport_firmware_defaults_are_shared_by_live_state_and_shadow_replay() {
             MaxwellThreeDViewportScaleOffsetEnable::Disabled
         ))
     );
+}
+
+#[test]
+fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::{native::NativeCommand, ssa::compile::CompilePool};
+    let vertices = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let color = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let shaders = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let mut space = resource_address_space();
+    let mut map = |allocation: &CanonicalAllocation, id, kind| {
+        map_resource(
+            &mut space,
+            allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+            id,
+            kind,
+        )
+        .offset()
+        .get()
+    };
+    let vertex = map(&vertices, 1, 0);
+    let target = map(&color, 2, 0xfe);
+    let code = map(&shaders, 3, 0);
+    let exit = 0xe300_0000_0007_000f_u64;
+    let mut header = [0_u32; 20];
+    header[0] = 0x0002_0461;
+    shaders
+        .write(
+            0,
+            &header
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .chain([0, exit, 0, 0].into_iter().flat_map(u64::to_le_bytes))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    header = [0; 20];
+    header[0] = 0x0002_5462;
+    header[4] = 0x000f_f000;
+    header[6] = 2;
+    header[13] = 0x0007_f000;
+    header[18] = 1;
+    shaders
+        .write(
+            0x100,
+            &header
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .chain(
+                    [0, 0xe0c3_ff88_0077_ff00, exit, 0]
+                        .into_iter()
+                        .flat_map(u64::to_le_bytes),
+                )
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let mut channel = three_d_channel();
+    program_basic_draw_state(&mut channel, vertex);
+    program_color_target(&mut channel, 0, target, 0xd5);
+    program_three_d(&mut channel, 0x121c, 1);
+    for (method, value) in [
+        (0x1608, (code >> 32) as u32),
+        (0x160c, code as u32),
+        (0x2004, 0),
+        (0x200c, 4),
+        (0x2044, 0x100),
+        (0x204c, 4),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let mut frontend = crate::MaxwellNativeFrontend::new(Arc::new(CompilePool::new(1, 8).unwrap()));
+    let mut previous = None;
+    for first in 0..32 {
+        program_three_d(&mut channel, 0x0d74, first);
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                draw.state(),
+                draw.trigger(),
+                &space,
+                &nixe_memory::CanonicalWriteBatch::new(),
+                FrontendSubmissionId::new(u64::from(first) + 1),
+                &[],
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, arguments } = work.command else {
+            panic!("expected native draw")
+        };
+        assert!(
+            matches!(arguments,nixe_gpu::DrawArguments::NonIndexed {first_vertex,..} if first_vertex==first)
+        );
+        if let Some(old) = &previous {
+            assert!(Arc::ptr_eq(old, &state));
+        }
+        previous = Some(state);
+    }
+    assert_eq!(frontend.statistics.prepared_draws, 1);
+    assert_eq!(frontend.statistics.shader_captures, 1);
+    assert_eq!(frontend.statistics.warm_draws, 31);
+    let original = previous.unwrap();
+    for phase in 0..2 {
+        // Stream offsets affect vertex binding, but not shader input types.
+        program_three_d(&mut channel, 0x1160, 0x3820_0000 | (((phase + 1) * 8) << 7));
+        if phase == 1 {
+            // Even identical code bytes written through a CPU alias invalidate
+            // the captured dependency and require another protected snapshot.
+            shaders.write(0x50, &0_u64.to_le_bytes()).unwrap();
+        }
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                draw.state(),
+                draw.trigger(),
+                &space,
+                &nixe_memory::CanonicalWriteBatch::new(),
+                FrontendSubmissionId::new(100 + u64::from(phase)),
+                &[],
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected draw")
+        };
+        assert!(!Arc::ptr_eq(&original, &state));
+        assert!(Arc::ptr_eq(&original.program.shader, &state.program.shader));
+        assert_eq!(frontend.statistics.shader_captures, u64::from(phase) + 1);
+    }
 }

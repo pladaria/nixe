@@ -76,7 +76,7 @@ fn captured_predicated_mufu_sqrt_and_scalar_special_functions_decode() {
     );
     assert!(matches!(
         decoded.as_slice(),
-        [ShaderOperation::SpecialFunction32 {
+        [crate::shader::decoded::Operation::SpecialFunction32 {
             destination,
             source,
             function: ShaderSpecialFunction::SquareRoot,
@@ -97,7 +97,7 @@ fn captured_predicated_mufu_sqrt_and_scalar_special_functions_decode() {
             decode_mufu(MaxwellShaderStage::Vertex, 8, encoding, 8, &mut temporary).unwrap();
         assert!(matches!(
             decoded.as_slice(),
-            [ShaderOperation::SpecialFunction32 { function, .. }] if *function == expected
+            [crate::shader::decoded::Operation::SpecialFunction32 { function, .. }] if *function == expected
         ));
     }
 }
@@ -135,7 +135,7 @@ fn captured_rro_ex2_fuses_with_the_matching_mufu() {
             &range_reduction,
         )
         .unwrap(),
-        ShaderOperation::SpecialFunction32 {
+        crate::shader::decoded::Operation::SpecialFunction32 {
             destination,
             source,
             function: ShaderSpecialFunction::Exp2,
@@ -162,8 +162,8 @@ fn rro_register_constant_and_immediate_sources_decode() {
     assert!(matches!(
         register.preparation.as_slice(),
         [
-            ShaderOperation::FloatAbsolute32 { source, .. },
-            ShaderOperation::FloatNegate32 { .. }
+            crate::shader::decoded::Operation::FloatAbsolute32 { source, .. },
+            crate::shader::decoded::Operation::FloatNegate32 { .. }
         ] if source.index() == 2
     ));
 
@@ -181,7 +181,7 @@ fn rro_register_constant_and_immediate_sources_decode() {
     assert_eq!(constant.constant_buffer_binding, Some(3));
     assert!(matches!(
         constant.preparation.as_slice(),
-        [ShaderOperation::LoadConstantBuffer32 {
+        [crate::shader::decoded::Operation::LoadConstantBuffer32 {
             binding: 3,
             byte_offset: 20,
             ..
@@ -204,7 +204,7 @@ fn rro_register_constant_and_immediate_sources_decode() {
     .unwrap();
     assert!(matches!(
         immediate.preparation.as_slice(),
-        [ShaderOperation::MoveImmediate32 { bits, .. }] if *bits == immediate_bits
+        [crate::shader::decoded::Operation::MoveImmediate32 { bits, .. }] if *bits == immediate_bits
     ));
 }
 
@@ -288,9 +288,11 @@ fn saturated_mufu_preserves_modifiers_range_reduction_and_gpu_clamping() {
             assert!(is_mufu(word));
             let ops = decode_mufu(MaxwellShaderStage::Pixel, 0x198, word, 4, &mut 4).unwrap();
             let control = match ops.last().unwrap() {
-                ShaderOperation::SpecialFunction32 { float_control, .. }
-                | ShaderOperation::Reciprocal32 { float_control, .. }
-                | ShaderOperation::ReciprocalSqrt32 { float_control, .. } => *float_control,
+                crate::shader::decoded::Operation::SpecialFunction32 { float_control, .. }
+                | crate::shader::decoded::Operation::Reciprocal32 { float_control, .. }
+                | crate::shader::decoded::Operation::ReciprocalSqrt32 { float_control, .. } => {
+                    *float_control
+                }
                 _ => panic!("MUFU operation"),
             };
             assert!(control.saturate());

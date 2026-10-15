@@ -7,6 +7,7 @@ use crate::logging::{self, LogLevel};
 pub mod input;
 pub mod list;
 pub mod run;
+pub mod vulkan_check;
 
 fn load_config(
     path: Option<PathBuf>,

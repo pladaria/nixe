@@ -141,7 +141,7 @@ impl MaxwellLoweringCache {
                 Some(_) => {}
                 None => {
                     self.allocations.push((allocation, image.allocation));
-                    creations.push(BackendResourceCreateInfo::Allocation {
+                    creations.push(ResourceDefinition::Allocation {
                         id: allocation,
                         description: image.allocation,
                     });
@@ -195,7 +195,7 @@ impl MaxwellLoweringCache {
                     )],
                 )
                 .map_err(|_| MaxwellLoweringError::ResourceExhausted)?;
-                creations.push(BackendResourceCreateInfo::Image {
+                creations.push(ResourceDefinition::Image {
                     id,
                     description: image.description,
                     view: Some(view),
@@ -236,7 +236,7 @@ impl MaxwellLoweringCache {
 }
 
 struct PreparedImages {
-    creations: Vec<BackendResourceCreateInfo>,
+    creations: Vec<ResourceDefinition>,
     invalidations: Vec<ResourceDependency>,
     regions: Vec<ImageRegion>,
 }

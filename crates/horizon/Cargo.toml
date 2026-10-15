@@ -28,6 +28,8 @@ nixe-scheduler.workspace = true
 nixe-video.workspace = true
 
 [dev-dependencies]
+ash.workspace = true
+nixe-gpu-vulkan.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 nixe-loader-content.workspace = true

@@ -1,4 +1,4 @@
-//! Object-safe, host-independent execution of one neutral GPU transaction.
+//! Legacy validated backend runtime, retained until migration task 15.
 //!
 //! The composition root selects a concrete backend driver. Console frontends
 //! only receive this interface and therefore cannot observe host API objects.
@@ -27,6 +27,20 @@ pub struct BackendExecutionCompletion {
 }
 
 impl BackendExecutionCompletion {
+    /// Construct only after host execution and canonical ownership have completed.
+    #[must_use]
+    pub const fn new(
+        frontend: FrontendSubmissionId,
+        submission: BackendSubmissionToken,
+        visibility: DeviceVisibilityPoint,
+    ) -> Self {
+        Self {
+            frontend,
+            submission,
+            visibility,
+        }
+    }
+
     #[must_use]
     pub const fn frontend(self) -> FrontendSubmissionId {
         self.frontend
@@ -43,7 +57,7 @@ impl BackendExecutionCompletion {
     }
 }
 
-/// Object-safe backend selected and owned by the application composition root.
+/// Legacy object-safe runtime. New renderers implement `GpuExecution` directly.
 pub trait NeutralBackendRuntime: Send {
     fn external_image_device(&self) -> Option<[u8; 16]> {
         None

@@ -278,11 +278,56 @@ impl VideoSystem {
         Self::new_with_gpu_backend(presenter, Some(backend), cache_configuration)
     }
 
+    /// Composes the Switch Maxwell frontend with a concrete host renderer.
+    #[must_use]
+    pub fn with_gpu_execution<
+        E: nixe_gpu::GpuExecution<
+                Commands = nixe_gpu::OperationSubmission,
+                ImageRequest = nixe_gpu::PresentationImageRequest,
+            >,
+    >(
+        presenter: Option<FrameMailbox>,
+        execution: E,
+        cache_configuration: GpuCacheConfiguration,
+    ) -> Self {
+        Self::with_nvdrv(
+            presenter,
+            NvDrvSession::with_gpu_execution(execution, cache_configuration),
+        )
+    }
+
+    /// Composes concrete native Maxwell work with its renderer before workers start.
+    #[must_use]
+    pub fn with_gpu_frontend<E, L>(
+        presenter: Option<FrameMailbox>,
+        execution: E,
+        frontend: L,
+    ) -> Self
+    where
+        L: nixe_gpu_maxwell::MaxwellFrontend,
+        E: nixe_gpu::GpuExecution<
+                Commands = nixe_gpu_maxwell::MaxwellWorkCommands<L::Work>,
+                ImageRequest = <L::Work as nixe_gpu_maxwell::MaxwellWork>::ImageRequest,
+            >,
+    {
+        Self::with_nvdrv(
+            presenter,
+            NvDrvSession::with_gpu_frontend(execution, frontend),
+        )
+    }
+
     fn new_with_gpu_backend(
         presenter: Option<FrameMailbox>,
         backend: Option<Box<dyn NeutralBackendRuntime>>,
         cache_configuration: GpuCacheConfiguration,
     ) -> Self {
+        let nvdrv = backend.map_or_else(NvDrvSession::new, |backend| {
+            NvDrvSession::with_gpu_backend(backend, cache_configuration)
+        });
+        Self::with_nvdrv(presenter, nvdrv)
+    }
+
+    fn with_nvdrv(presenter: Option<FrameMailbox>, nvdrv: NvDrvSession) -> Self {
         Self {
             state: Arc::new(Mutex::new(VideoState {
                 next_layer_id: 1,
@@ -292,9 +337,7 @@ impl VideoSystem {
                 display_clock: DisplayClock::new(60)
                     .expect("the fixed Switch display refresh is non-zero"),
                 presenter,
-                nvdrv: backend.map_or_else(NvDrvSession::new, |backend| {
-                    NvDrvSession::with_gpu_backend(backend, cache_configuration)
-                }),
+                nvdrv,
                 next_frame_sequence: 1,
                 pending_frames: VecDeque::new(),
             })),

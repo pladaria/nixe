@@ -4,7 +4,7 @@ use crate::MaxwellShaderStage;
 use nixe_gpu::*;
 
 fn evaluate(
-    operations: Vec<ShaderOperation>,
+    operations: Vec<impl Into<ShaderOperation>>,
     inputs: &[u32],
     extra: Vec<ShaderInstruction>,
 ) -> u32 {
@@ -28,7 +28,7 @@ fn evaluate(
         ShaderInstruction::new(
             ShaderSourceLocation::new(80),
             ShaderPredicate::Always,
-            operation,
+            operation.into(),
         )
     }));
     instructions.extend(extra);
@@ -484,7 +484,9 @@ fn hsetp2_compares_each_lane_and_preserves_an_aliased_accumulator() {
                 4,
                 &mut 4,
             )
-            .unwrap(),
+            .unwrap()
+            .into_iter()
+            .map(Into::into),
         );
         ops.push(ShaderOperation::MoveImmediate32 {
             destination: r(0),
@@ -531,7 +533,7 @@ fn hsetp2_preserves_both_results_when_it_overwrites_its_instruction_guard() {
         half::decode_half_set_predicate(MaxwellShaderStage::Pixel, 8, encoding, 4, &mut 4)
             .unwrap()
             .into_iter()
-            .map(|op| ShaderInstruction::new(ShaderSourceLocation::new(80), guard, op))
+            .map(|op| ShaderInstruction::new(ShaderSourceLocation::new(80), guard, (op).into()))
             .collect::<Vec<_>>();
     extra.push(ShaderInstruction::new(
         ShaderSourceLocation::new(84),
@@ -703,7 +705,7 @@ fn bitfield_extract_preserves_sign_reversal_boundaries_and_operand_aliases() {
                             .unwrap();
                             if form == 0x4c00 {
                                 assert_eq!(decoded.constant_buffer_binding, Some(0));
-                                let ShaderOperation::LoadConstantBuffer32 {
+                                let crate::shader::decoded::Operation::LoadConstantBuffer32 {
                                     destination,
                                     byte_offset,
                                     ..
@@ -712,11 +714,12 @@ fn bitfield_extract_preserves_sign_reversal_boundaries_and_operand_aliases() {
                                     panic!("constant operand expected")
                                 };
                                 assert_eq!(byte_offset, 4);
-                                decoded.operations[0] = ShaderOperation::MoveImmediate32 {
-                                    destination,
-                                    bits: control,
-                                    scalar_type: ShaderScalarType::Unsigned32,
-                                };
+                                decoded.operations[0] =
+                                    crate::shader::decoded::Operation::MoveImmediate32 {
+                                        destination,
+                                        bits: control,
+                                        scalar_type: ShaderScalarType::Unsigned32,
+                                    };
                             }
                             assert_eq!(
                                 evaluate(decoded.operations, &[value, control], vec![]),
@@ -861,10 +864,10 @@ fn i2i_converts_selected_lanes_modifiers_and_saturates_without_aliasing() {
         // CC is based on the converted result, including narrow truncation
         // and saturation. Preexisting C/O are cleared rather than preserved.
         let mut flags = integer::IntegerConditionCodes {
-            zero: Some(ShaderRegister::new(2)),
-            sign: Some(ShaderRegister::new(3)),
-            carry: Some(ShaderRegister::new(4)),
-            overflow: Some(ShaderRegister::new(5)),
+            zero: Some(ShaderRegister::new(2).into()),
+            sign: Some(ShaderRegister::new(3).into()),
+            carry: Some(ShaderRegister::new(4).into()),
+            overflow: Some(ShaderRegister::new(5).into()),
         };
         let cc = integer::decode_integer_to_integer(
             MaxwellShaderStage::Pixel,
@@ -886,7 +889,7 @@ fn i2i_converts_selected_lanes_modifiers_and_saturates_without_aliasing() {
                 ShaderPredicate::Always,
                 ShaderOperation::Move32 {
                     destination: ShaderRegister::new(0),
-                    source: flag,
+                    source: flag.into(),
                     scalar_type: ShaderScalarType::Unsigned32,
                 },
             );
@@ -906,12 +909,19 @@ fn i2i_converts_selected_lanes_modifiers_and_saturates_without_aliasing() {
                     ShaderInstruction::new(
                         ShaderSourceLocation::new(80),
                         ShaderPredicate::Never,
-                        operation,
+                        (operation).into(),
                     )
                 })
                 .collect::<Vec<_>>();
             disabled.push(read_flag);
-            assert_eq!(evaluate(vec![], &[0, input, 1, 1, 1, 1], disabled), 1);
+            assert_eq!(
+                evaluate(
+                    Vec::<ShaderOperation>::new(),
+                    &[0, input, 1, 1, 1, 1],
+                    disabled
+                ),
+                1
+            );
         }
         // In-place source/destination conversion must consume the old value.
         let alias = 0x5ce0_0000_0007_0000 | fields;
@@ -961,7 +971,7 @@ fn i2i_immediate_constant_buffer_and_zero_operands_decode_by_family() {
     assert_eq!(decoded.constant_buffer_binding, Some(2));
     assert!(decoded.operations.iter().any(|op| matches!(
         op,
-        ShaderOperation::LoadConstantBuffer32 {
+        crate::shader::decoded::Operation::LoadConstantBuffer32 {
             binding: 2,
             byte_offset: 16,
             ..
@@ -1046,7 +1056,7 @@ fn i2i_cc_discarded_destination_resets_the_shared_extended_add_carry() {
                         ShaderPredicate::Always,
                         ShaderOperation::Move32 {
                             destination: ShaderRegister::new(0),
-                            source: flag,
+                            source: flag.into(),
                             scalar_type: ShaderScalarType::Unsigned32
                         },
                     )]
@@ -1061,10 +1071,10 @@ fn i2i_cc_discarded_destination_resets_the_shared_extended_add_carry() {
 fn csetp_condition_truth_tables_boolean_combination_and_aliased_accumulator() {
     let r = ShaderRegister::new;
     let flags = integer::IntegerConditionCodes {
-        zero: Some(r(0)),
-        sign: Some(r(1)),
-        carry: Some(r(2)),
-        overflow: Some(r(3)),
+        zero: Some(r(0).into()),
+        sign: Some(r(1).into()),
+        carry: Some(r(2).into()),
+        overflow: Some(r(3).into()),
     };
     for bits in 0..16 {
         let z = bits & 1 != 0;
@@ -1131,7 +1141,7 @@ fn csetp_condition_truth_tables_boolean_combination_and_aliased_accumulator() {
                             accumulator: ShaderPredicate::Always,
                             set_operation: ShaderPredicateSetOperation::And,
                         }];
-                        ops.extend(decoded.operations);
+                        ops.extend(decoded.operations.into_iter().map(Into::into));
                         let accumulator = accumulator ^ inverted;
                         for (predicate, condition) in [(2, condition), (1, !condition)] {
                             let expected = match combine {
@@ -1261,11 +1271,11 @@ fn sel_preserves_operand_bits_forms_predicates_zero_and_register_aliases() {
                                             .find(|op| {
                                                 matches!(
                                                     op,
-                                                    ShaderOperation::LoadConstantBuffer32 { .. }
+                                                    crate::shader::decoded::Operation::LoadConstantBuffer32 { .. }
                                                 )
                                             })
                                             .unwrap();
-                                        let ShaderOperation::LoadConstantBuffer32 {
+                                        let crate::shader::decoded::Operation::LoadConstantBuffer32 {
                                             destination,
                                             byte_offset,
                                             ..
@@ -1274,11 +1284,12 @@ fn sel_preserves_operand_bits_forms_predicates_zero_and_register_aliases() {
                                             unreachable!()
                                         };
                                         assert_eq!(byte_offset, 12);
-                                        *load = ShaderOperation::MoveImmediate32 {
-                                            destination,
-                                            bits: right,
-                                            scalar_type: ShaderScalarType::Unsigned32,
-                                        };
+                                        *load =
+                                            crate::shader::decoded::Operation::MoveImmediate32 {
+                                                destination,
+                                                bits: right,
+                                                scalar_type: ShaderScalarType::Unsigned32,
+                                            };
                                     }
                                     let mut ops = vec![ShaderOperation::SetPredicateInteger32 {
                                         destinations: [Some(0), None],
@@ -1289,15 +1300,17 @@ fn sel_preserves_operand_bits_forms_predicates_zero_and_register_aliases() {
                                         accumulator: ShaderPredicate::Always,
                                         set_operation: ShaderPredicateSetOperation::And,
                                     }];
-                                    let ShaderOperation::Select32 { destination, .. } =
-                                        *decoded.operations.last().unwrap()
+                                    let crate::shader::decoded::Operation::Select32 {
+                                        destination,
+                                        ..
+                                    } = *decoded.operations.last().unwrap()
                                     else {
                                         panic!("SEL must use neutral select")
                                     };
-                                    ops.extend(decoded.operations);
+                                    ops.extend(decoded.operations.into_iter().map(Into::into));
                                     ops.push(ShaderOperation::Move32 {
                                         destination: r(0),
-                                        source: destination,
+                                        source: destination.into(),
                                         scalar_type: ShaderScalarType::Unsigned32,
                                     });
                                     let selected_a = (selector == 7 || predicate) ^ inverted;
@@ -1334,12 +1347,10 @@ fn sel_preserves_operand_bits_forms_predicates_zero_and_register_aliases() {
     )
     .unwrap();
     assert_eq!(captured.constant_buffer_binding, None);
-    assert!(
-        captured
-            .operations
-            .iter()
-            .any(|op| matches!(op, ShaderOperation::MoveImmediate32 { bits: u32::MAX, .. }))
-    );
+    assert!(captured.operations.iter().any(|op| matches!(
+        op,
+        crate::shader::decoded::Operation::MoveImmediate32 { bits: u32::MAX, .. }
+    )));
     assert!(
         integer::decode_select(
             MaxwellShaderStage::Vertex,

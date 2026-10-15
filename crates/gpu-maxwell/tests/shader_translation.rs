@@ -1,6 +1,5 @@
 use nixe_gpu::{
-    BackendResourceCreateInfo, FrontendSubmissionId, GpuVirtualAddress, MappingGeneration,
-    ShaderStage,
+    FrontendSubmissionId, GpuVirtualAddress, MappingGeneration, ResourceDefinition, ShaderStage,
 };
 use nixe_gpu_maxwell::*;
 use nixe_memory::{CanonicalAllocation, MemoryPermissions};
@@ -219,7 +218,7 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
         .resource_creations()
         .iter()
         .filter_map(|creation| match creation {
-            BackendResourceCreateInfo::Shader {
+            ResourceDefinition::Shader {
                 description,
                 module,
                 ..
@@ -278,13 +277,13 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
         !replacement_work
             .resource_creations()
             .iter()
-            .any(|creation| matches!(creation, BackendResourceCreateInfo::Shader { .. }))
+            .any(|creation| matches!(creation, ResourceDefinition::Shader { .. }))
     );
     assert!(
         !replacement_work
             .resource_creations()
             .iter()
-            .any(|creation| matches!(creation, BackendResourceCreateInfo::Pipeline { .. }))
+            .any(|creation| matches!(creation, ResourceDefinition::Pipeline { .. }))
     );
 
     let prepared = |work: &MaxwellLoweredWork| {
@@ -329,12 +328,14 @@ fn captured_color_shader_pipeline(unused_alpha: bool) {
         assert_eq!(current.pipeline, filled.pipeline);
         assert!(!work.resource_creations().iter().any(|c| matches!(
             c,
-            BackendResourceCreateInfo::Shader { .. } | BackendResourceCreateInfo::Pipeline { .. }
+            ResourceDefinition::Shader { .. } | ResourceDefinition::Pipeline { .. }
         )));
         if previous.triangle_rasterization == current.triangle_rasterization {
             assert!(std::sync::Arc::ptr_eq(&previous, &current));
+            assert_eq!(previous.identity(), current.identity());
         } else {
             assert!(!std::sync::Arc::ptr_eq(&previous, &current));
+            assert_ne!(previous.identity(), current.identity());
         }
         previous = current;
     }

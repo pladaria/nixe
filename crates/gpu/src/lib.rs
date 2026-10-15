@@ -21,9 +21,15 @@ pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Conversion};
 mod device_image;
 pub use device_image::{DeviceImageFrame, DeviceImageSource, ExternalImageBuffer};
 mod diagnostics;
+mod execution;
 mod presentation;
 mod resource;
+mod resource_definition;
 mod runtime;
+pub use execution::{ExecutionBatch, GpuExecution, LegacyGpuExecution, PreparedStateId};
+pub use resource_definition::ResourceDefinition;
+/// Temporary name for old driver consumers; removed with the legacy backend in task 15.
+pub use resource_definition::ResourceDefinition as BackendResourceCreateInfo;
 mod shader;
 mod tessellation;
 pub use tessellation::{
@@ -45,8 +51,8 @@ pub use allocation::{
 };
 pub use backend::{
     AcceptedBackendSubmission, Backend, BackendDriver, BackendDriverError, BackendError,
-    BackendResourceCreateInfo, BackendResourceHandle, BackendResourceKind,
-    BackendResourceValidationError, BackendState, ResolvedBackendResources,
+    BackendResourceHandle, BackendResourceKind, BackendResourceValidationError, BackendState,
+    ResolvedBackendResources,
 };
 pub use cache::{
     DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE, DEFAULT_PERSISTENT_PIPELINE_CACHE_BYTES,
@@ -64,17 +70,21 @@ pub use command::{
     CommandDescriptionError, CopyOperation, CullMode, DepthBias, DepthCompareOperation, DepthState,
     DispatchOperation, DrawArguments, DrawOperation, FragmentDepthTransform, FrontFace, GpuCommand,
     GpuOperation, ImageOrigin, ImageRegion, IndexType, LineRasterization, OperationSubmission,
-    PreparedDraw, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
-    ResolveOperation, ScissorRect, StencilFaceState, StencilOperation, StencilTestState,
-    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
-    VertexComponentWidth, VertexFormat, VertexPositionTransform, VertexStepMode, ViewportTransform,
+    PreparedDraw, PreparedDrawState, PrimitiveTopology, QueryOperation, RenderAttachment,
+    RenderPassOperation, ResolveOperation, ScissorRect, StencilFaceState, StencilOperation,
+    StencilTestState, TriangleRasterization, VertexAttribute, VertexBufferLayout,
+    VertexComponentCount, VertexComponentWidth, VertexFormat, VertexPositionTransform,
+    VertexStepMode, ViewportTransform,
 };
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,
     GraphicsAllocationId, GraphicsGapKind,
 };
 pub use nixe_memory::{CanonicalBackingSegment, MappingGeneration};
-pub use presentation::{PresentationImageFormat, PresentationImageRequest, ResidentImage};
+pub use presentation::{
+    PresentationImageFormat, PresentationImageId, PresentationImageRequest, PresentationLease,
+    PresentationRelease, ResidentImage,
+};
 pub use resource::{
     AddressMode, BufferDescription, BufferId, DescriptorKind, DescriptorTableBinding,
     DescriptorTableDescription, DescriptorTableId, FilterMode, ImageDescription, ImageDimension,
@@ -94,6 +104,7 @@ pub use shader::spirv::{
     lower_default_tessellation_control_to_spirv, lower_raster_shaders_to_spirv,
     lower_shader_ir_to_spirv, lower_tessellation_shaders_to_spirv,
 };
+pub use shader::ssa;
 pub use shader::{
     ShaderBackendLoweringError, ShaderBackendModule, ShaderBitwiseOperation, ShaderComputeBuiltin,
     ShaderEvaluationError, ShaderEvaluationInputs, ShaderEvaluationResult, ShaderFloatComparison,
@@ -123,3 +134,7 @@ pub use view::{
 
 /// Diagnostic counters compiled only when explicitly enabled.
 pub mod metrics;
+
+pub mod texture_decode;
+
+pub mod native;

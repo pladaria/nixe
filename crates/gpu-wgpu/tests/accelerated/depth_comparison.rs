@@ -205,6 +205,7 @@ fn depth_comparison_filters_tests_and_selects_array_layers() {
             },
         ]);
         let mut shadow = PreparedDraw::new(
+            nixe_gpu::PreparedStateId::new(1, 1),
             PipelineId::new(770),
             shadow_pass,
             PrimitiveTopology::Triangles,
@@ -235,7 +236,7 @@ fn depth_comparison_filters_tests_and_selects_array_layers() {
             None,
         )
         .unwrap();
-        shadow.depth_state = nixe_gpu::DepthState {
+        shadow.edit_state().depth_state = nixe_gpu::DepthState {
             test_enabled: true,
             write_enabled: true,
             compare: Compare::Always,
@@ -355,6 +356,7 @@ fn depth_comparison_filters_tests_and_selects_array_layers() {
                 .into_boxed_slice(),
             });
             let prepared = PreparedDraw::new(
+                nixe_gpu::PreparedStateId::new(1, 1),
                 PipelineId::new(770),
                 pass,
                 PrimitiveTopology::Triangles,

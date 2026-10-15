@@ -117,6 +117,9 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
         // The common selector is initialized alongside the per-target ones.
         // Firmware table provenance and hash are documented in output.rs.
         0x133c => Some(BLEND_SEPARATE_ALPHA_RESET),
+        // The same pinned GM20B table writes (0x04d7b197, 0) at byte 0x2780:
+        // SET_SINGLE_ROP_CONTROL starts with independent target enables.
+        0x135c => Some(0),
         // GM20B sw_method_init.bin, SHA-256 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24:
         // byte offsets 0x2490/0x2498 contain (0x064bb197, 1) and (0x064fb197, 0x2c1c).
         // These defaults must also be visible to MME shadow-register reads.
@@ -1108,6 +1111,7 @@ impl Default for MaxwellThreeDFrontendState {
             0x191c,
             0x1920,
             0x133c,
+            0x135c,
             MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD,

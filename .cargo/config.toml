@@ -30,3 +30,7 @@ test-diff-a64 = [
     "--nocapture",
 ]
 fuzz-all = ["run", "--quiet", "--package", "nixe-xtask", "--", "fuzz"]
+
+# https://doc.rust-lang.org/cargo/reference/config.html#targettriplerunner
+[target.'cfg(target_os = "linux")']
+runner = "scripts/with-vulkan-loader.sh"

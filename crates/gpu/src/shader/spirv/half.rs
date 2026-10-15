@@ -2,8 +2,8 @@
 //! GLSL pack/unpack denormal rules. Mirror the bit conversion in half.wgsl.
 use super::*;
 
-impl Emitter {
-    pub(super) fn unpack_half(&mut self, packed: u32, high: bool) -> Result<u32> {
+impl Math {
+    pub(crate) fn unpack_half(&mut self, packed: u32, high: bool) -> Result<u32> {
         let sixteen = self.constant(16);
         let bits = if high {
             self.b
@@ -55,7 +55,7 @@ impl Emitter {
         Ok(self.b.bitwise_or(self.uint, None, value, sign)?)
     }
 
-    pub(super) fn pack_half(&mut self, bits: u32) -> Result<u32> {
+    pub(crate) fn pack_half(&mut self, bits: u32) -> Result<u32> {
         let zero = self.constant(0);
         let one = self.constant(1);
         let thirteen = self.constant(13);

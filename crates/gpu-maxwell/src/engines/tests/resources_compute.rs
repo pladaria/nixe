@@ -1002,7 +1002,7 @@ fn cube_full_stencil_mask_materializes_depth_and_stencil_from_the_clear_snapshot
     let plan = lower(full.operations()[0], &mut cache).unwrap();
     assert!(plan.resource_creations().iter().any(|creation| matches!(
         creation,
-        nixe_gpu::BackendResourceCreateInfo::Image { description, view: Some(view), .. }
+        nixe_gpu::ResourceDefinition::Image { description, view: Some(view), .. }
             if !view.has_canonical_texels() && description.dimension() == nixe_gpu::ImageDimension::Two
                 && description.extent().depth == 1
                 && description.array_layers() == 1
@@ -1242,7 +1242,7 @@ fn check_depth_2cz_materialization(
     .unwrap();
     assert!(plan.resource_creations().iter().any(|creation| matches!(
         creation,
-        nixe_gpu::BackendResourceCreateInfo::Image { view: Some(view), .. } if !view.has_canonical_texels()
+        nixe_gpu::ResourceDefinition::Image { view: Some(view), .. } if !view.has_canonical_texels()
     )));
     assert!(matches!(
         plan.submission().operations()[0].command(),
@@ -1314,9 +1314,10 @@ fn check_depth_2cz_materialization(
     )
     .unwrap();
     assert!(
-        !remapped_plan.resource_creations().iter().any(|creation| {
-            matches!(creation, nixe_gpu::BackendResourceCreateInfo::Image { .. })
-        })
+        !remapped_plan
+            .resource_creations()
+            .iter()
+            .any(|creation| { matches!(creation, nixe_gpu::ResourceDefinition::Image { .. }) })
     );
     assert!(remapped_plan.resource_invalidations().is_empty());
 
@@ -2612,10 +2613,11 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
     assert_eq!(viewport.offset(), [32.0, 16.0, 0.5]);
     assert_eq!(viewport.depth_range(), [0.0, 1.0]);
     assert_eq!(plan.dirty_images().len(), 1);
-    assert!(plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
+    assert!(
+        plan.resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
 
     let reused_plan = lower_maxwell_three_d_operation(
         limited.state(),
@@ -2676,10 +2678,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
         !vertex_plan
             .resource_creations()
             .iter()
-            .any(|creation| matches!(
-                creation,
-                nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-            ))
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
     );
 
     target_allocation.write(0, &[5, 6, 7, 8]).unwrap();
@@ -2872,18 +2871,16 @@ fn draw_routing_is_exact_and_reuses_one_graphics_pipeline_family() {
         &mut cache,
     )
     .unwrap();
-    assert!(plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
+    assert!(
+        plan.resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
     assert_eq!(plan.dirty_images(), &[target_one_index]);
     assert_eq!(
         plan.resource_creations()
             .iter()
-            .filter(|creation| matches!(
-                creation,
-                nixe_gpu::BackendResourceCreateInfo::Image { .. }
-            ))
+            .filter(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Image { .. }))
             .count(),
         1
     );
@@ -2920,9 +2917,9 @@ fn draw_routing_is_exact_and_reuses_one_graphics_pipeline_family() {
         !unselected_plan.resource_creations().iter().any(|creation| {
             matches!(
                 creation,
-                nixe_gpu::BackendResourceCreateInfo::Image { .. }
-                    | nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-                    | nixe_gpu::BackendResourceCreateInfo::RenderPass { .. }
+                nixe_gpu::ResourceDefinition::Image { .. }
+                    | nixe_gpu::ResourceDefinition::Pipeline { .. }
+                    | nixe_gpu::ResourceDefinition::RenderPass { .. }
             )
         })
     );
@@ -2988,16 +2985,18 @@ fn draw_routing_is_exact_and_reuses_one_graphics_pipeline_family() {
     assert_eq!(plan.dirty_images(), &[target_zero_index, target_one_index]);
     assert!(plan.resource_creations().iter().any(|creation| matches!(
         creation,
-        nixe_gpu::BackendResourceCreateInfo::RenderPass { description, .. }
+        nixe_gpu::ResourceDefinition::RenderPass { description, .. }
             if description.attachments().iter().map(|attachment| attachment.format).eq([
                 ImageFormat::Rgba8Unorm,
                 ImageFormat::Bgra8Unorm,
             ])
     )));
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
 }
 
 #[test]
@@ -5087,7 +5086,7 @@ fn standalone_inline_pitch_rows_use_pitch_and_ignore_block_geometry() {
 }
 
 #[test]
-fn srgb_write_selects_linear_or_srgb_color_attachment_views() {
+fn explicit_srgb_surface_format_survives_legacy_srgb_write_state() {
     let allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
     let backing = allocation
         .backing_range(MemoryPermissions::READ_WRITE)
@@ -5113,22 +5112,10 @@ fn srgb_write_selects_linear_or_srgb_color_attachment_views() {
     ] {
         program_three_d(&mut channel, method, value);
     }
-    for (guest_format, linear, srgb) in [
-        (
-            0xd6,
-            nixe_gpu::ImageFormat::Rgba8Unorm,
-            nixe_gpu::ImageFormat::Rgba8Srgb,
-        ),
-        (
-            0xd0,
-            nixe_gpu::ImageFormat::Bgra8Unorm,
-            nixe_gpu::ImageFormat::Bgra8Srgb,
-        ),
-        (
-            0xd5,
-            nixe_gpu::ImageFormat::Rgba8Unorm,
-            nixe_gpu::ImageFormat::Rgba8Unorm,
-        ),
+    for (guest_format, expected) in [
+        (0xd6, nixe_gpu::ImageFormat::Rgba8Srgb),
+        (0xd0, nixe_gpu::ImageFormat::Bgra8Srgb),
+        (0xd5, nixe_gpu::ImageFormat::Rgba8Unorm),
     ] {
         program_three_d(&mut channel, 0x810, guest_format);
         for enabled in [false, true] {
@@ -5146,10 +5133,7 @@ fn srgb_write_selects_linear_or_srgb_color_attachment_views() {
             let MaxwellThreeDResolvedResource::Image(image) = &resources.resources()[0] else {
                 panic!("expected attachment")
             };
-            assert_eq!(
-                image.description().format(),
-                if enabled { srgb } else { linear }
-            );
+            assert_eq!(image.description().format(), expected);
         }
     }
     assert!(dispatch_method(&mut channel, 0x15b8 / 4, 2).is_err());

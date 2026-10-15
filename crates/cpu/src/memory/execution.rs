@@ -918,10 +918,10 @@ impl Default for ExecutionMemory {
 
 impl ExecutionMemory {
     /// Completes non-zeroing data-cache maintenance under the caller's native
-    /// execution lease when canonical RAM is already CPU-visible. CPU stores
-    /// update that backing directly; no emulated dirty cache line remains to
-    /// clean. False defers mapping faults, devices and GPU visibility to the
-    /// checked maintenance path after the lease has been released.
+    /// execution lease. CPU stores update canonical backing directly; there is
+    /// no dirty emulated CPU cache line to clean or invalidate. Device-owned
+    /// bytes stay protected until an actual CPU access demands visibility.
+    /// False defers mapping faults and devices to the checked maintenance path.
     /// https://developer.arm.com/documentation/ddi0601/latest/AArch64-Instructions/DC-CVAC--Data-or-unified-Cache-line-Clean-by-VA-to-PoC
     pub fn try_native_data_cache_maintenance(
         &self,
@@ -932,12 +932,9 @@ impl ExecutionMemory {
         let Some(mapping) = inner.mapping_at(space, address) else {
             return false;
         };
-        let Some(ExecutionPhysicalPage::Ram(page)) = inner.page(mapping.physical_slot) else {
-            return false;
-        };
         matches!(
-            page.visibility_state(),
-            nixe_memory::VisibilityState::Clean | nixe_memory::VisibilityState::CpuNewer
+            inner.page(mapping.physical_slot),
+            Some(ExecutionPhysicalPage::Ram(_))
         )
     }
 
@@ -3089,99 +3086,54 @@ impl CpuMemory for ExecutionMemory {
                 DataAccessFaultReason::AddressOverflow,
             )
         })?;
-        'resolve: loop {
-            let inner = self.lock_inner();
-            let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
-                DataAccessFault::new(
-                    address_space,
-                    address,
-                    DataAccessKind::Read,
-                    DataAccessFaultReason::Unmapped,
-                )
-            })?;
-            let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
-            else {
-                return Err(DataAccessFault::new(
-                    address_space,
-                    address,
-                    DataAccessKind::Read,
-                    DataAccessFaultReason::Device(
-                        "cache maintenance requires canonical RAM".into(),
-                    ),
-                ));
-            };
-            match kind {
-                super::CacheMaintenanceKind::InstructionInvalidate => {
-                    self.invalidations
-                        .reserve_with_origin(
-                            MemoryInvalidationKind::ExecutableContent {
-                                first: mapping.physical_page,
-                                second: None,
-                            },
-                            MemoryInvalidationOrigin::CacheMaintenance,
-                        )
-                        .map_err(|reason| {
-                            DataAccessFault::new(
-                                address_space,
-                                address,
-                                DataAccessKind::Read,
-                                DataAccessFaultReason::HostBacking(reason.to_string().into()),
-                            )
-                        })?
-                        .commit();
-                }
-                super::CacheMaintenanceKind::DataInvalidate
-                | super::CacheMaintenanceKind::DataClean
-                | super::CacheMaintenanceKind::DataCleanAndInvalidate => {
-                    if matches!(
-                        backing.visibility_state(),
-                        nixe_memory::VisibilityState::Clean
-                            | nixe_memory::VisibilityState::CpuNewer
-                    ) {
-                        return Ok(());
-                    }
-                    let backing = backing.clone();
-                    let mapping_generation = mapping.mapping_generation;
-                    drop(inner);
-                    // Device publication already withdrew executable aliases and
-                    // published its invalidation. Downloading those same bytes is
-                    // not a second code mutation. No mapping/log lock may survive
-                    // the device callback, which may itself remap this address.
-                    let result = backing.prepare_cpu_access();
-                    let current = self.lock_inner();
-                    if !current
-                        .mapping_at(address_space, address)
-                        .is_some_and(|mapping| {
-                            mapping.mapping_generation == mapping_generation
-                                && matches!(current.page(mapping.physical_slot),
-                            Some(ExecutionPhysicalPage::Ram(page))
-                                if page.identity() == backing.identity())
-                        })
-                    {
-                        continue 'resolve;
-                    }
-                    result.map_err(|reason| {
+        let inner = self.lock_inner();
+        let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::Unmapped,
+            )
+        })?;
+        let Some(ExecutionPhysicalPage::Ram(_)) = inner.page(mapping.physical_slot) else {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::Device("cache maintenance requires canonical RAM".into()),
+            ));
+        };
+        match kind {
+            super::CacheMaintenanceKind::InstructionInvalidate => {
+                self.invalidations
+                    .reserve_with_origin(
+                        MemoryInvalidationKind::ExecutableContent {
+                            first: mapping.physical_page,
+                            second: None,
+                        },
+                        MemoryInvalidationOrigin::CacheMaintenance,
+                    )
+                    .map_err(|reason| {
                         DataAccessFault::new(
                             address_space,
                             address,
                             DataAccessKind::Read,
                             DataAccessFaultReason::HostBacking(reason.to_string().into()),
                         )
-                    })?;
-                    // A newer device publication can overtake the completed
-                    // download. Consume visibility again rather than return stale.
-                    if !matches!(
-                        backing.visibility_state(),
-                        nixe_memory::VisibilityState::Clean
-                            | nixe_memory::VisibilityState::CpuNewer
-                    ) {
-                        continue 'resolve;
-                    }
-                }
-                super::CacheMaintenanceKind::InstructionPrefetch => {}
+                    })?
+                    .commit();
             }
-            return Ok(());
+            // CPU writes are already canonical and device publication has
+            // withdrawn CPU aliases. Cleaning/invalidating a cache line does
+            // not load it: preserve GPU ownership and resolve on actual access.
+            // https://developer.arm.com/documentation/ddi0601/latest/AArch64-Instructions/DC-CVAC--Data-or-unified-Cache-line-Clean-by-VA-to-PoC
+            // https://developer.arm.com/documentation/ddi0601/latest/AArch64-Instructions/DC-IVAC--Data-or-unified-Cache-line-Invalidate-by-VA-to-PoC
+            super::CacheMaintenanceKind::DataInvalidate
+            | super::CacheMaintenanceKind::DataClean
+            | super::CacheMaintenanceKind::DataCleanAndInvalidate
+            | super::CacheMaintenanceKind::InstructionPrefetch => {}
         }
+        Ok(())
     }
 
     fn query_page(
@@ -4691,6 +4643,23 @@ mod tests {
             VisibilityState::GpuNewer { .. }
         ));
 
+        // Cache maintenance does not load a CPU cache line. Device-owned
+        // bytes remain protected and are downloaded only by the later access.
+        for kind in [
+            CacheMaintenanceKind::DataClean,
+            CacheMaintenanceKind::DataInvalidate,
+            CacheMaintenanceKind::DataCleanAndInvalidate,
+        ] {
+            memory
+                .maintain_cache(space, kind, Some(GuestVirtualAddress::new(0x8009)))
+                .unwrap();
+            assert!(matches!(
+                retained.segments()[0].visibility_state(),
+                VisibilityState::GpuNewer { .. }
+            ));
+        }
+        assert!(memory.try_native_data_cache_maintenance(space, GuestVirtualAddress::new(0x8009)));
+
         let result = memory
             .read(
                 space,
@@ -5535,6 +5504,23 @@ mod tests {
             memory.direct_protection_at(space, second),
             Some(DirectProtection::None)
         );
+
+        assert!(memory.try_native_data_cache_maintenance(space, first));
+        for kind in [
+            CacheMaintenanceKind::DataClean,
+            CacheMaintenanceKind::DataInvalidate,
+            CacheMaintenanceKind::DataCleanAndInvalidate,
+        ] {
+            memory.maintain_cache(space, kind, Some(second)).unwrap();
+            assert_eq!(
+                memory.direct_protection_at(space, first),
+                Some(DirectProtection::None)
+            );
+            assert_eq!(
+                memory.direct_protection_at(space, second),
+                Some(DirectProtection::None)
+            );
+        }
 
         let lease = memory.acquire_execution_lease();
         assert_eq!(

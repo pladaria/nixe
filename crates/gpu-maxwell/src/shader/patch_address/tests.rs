@@ -218,7 +218,7 @@ fn complete_guest_evaluation_uses_ftz_for_both_operands_and_results() {
         .find(|i| i.source().byte_offset() == 0x70)
         .unwrap();
     assert!(
-        matches!(operation.operation(), ShaderOperation::Multiply32 { float_control, .. }
+        matches!(operation.operation(), nixe_gpu::ShaderOperation::Multiply32 { float_control, .. }
         if float_control.flush_denormals_to_zero() && float_control.denormals_are_zero()),
         "{:?}",
         operation.operation()
@@ -572,5 +572,56 @@ fn address_proof_is_independent_of_guest_register_numbers() {
             result.control_point_bits(vertex, ShaderIoLocation::Position, 0),
             Some(((vertex * 8) as f32).to_bits())
         );
+    }
+}
+#[test]
+#[ignore = "requires NIXE_SPIRV_VAL pointing to the pinned SPIRV-Tools validator"]
+fn complete_guest_patch_programs_compile_directly_through_ssa() {
+    let validator = std::env::var_os("NIXE_SPIRV_VAL").expect("NIXE_SPIRV_VAL required");
+    for (control, code, registers) in [(true, CONTROL, 5), (false, EVALUATION, 16)] {
+        let binary = binary(control, code);
+        let decoded = crate::shader::translate::decode_shader_binary(
+            &binary,
+            registers,
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        let program = crate::shader::ssa::MaxwellSsaProgram::new(&binary, decoded).unwrap();
+        let module = nixe_gpu::ssa::spirv::emit(
+            &program.function,
+            nixe_gpu::ssa::spirv::Options {
+                shader: native_options(control),
+                integer64: false,
+                subgroup_quad: false,
+                shared_memory_bytes: 0,
+                local_memory_bytes: 0,
+            },
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "nixe-maxwell-ssa-patch-{}-{control}.spv",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            module
+                .words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let result = std::process::Command::new(&validator)
+            .args(["--target-env", "vulkan1.2"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

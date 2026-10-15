@@ -1,5 +1,6 @@
 //! Maxwell condition tests lowered to boolean-valued neutral registers.
 use super::*;
+use crate::shader::decoded::Operation as ShaderOperation;
 
 /// Absent flags have no translated reaching definition. Consumers must not
 /// invent reset values; these registers are shared by all ISA flag producers.
@@ -82,7 +83,7 @@ pub(in crate::shader) fn decode_condition_set_predicate(
     stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
-    next: &mut u16,
+    next: &mut u32,
     flags: &IntegerConditionCodes,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/condition_code_set.cpp

@@ -1,0 +1,28 @@
+[package]
+name = "nixe-gpu-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustc-hash.workspace = true
+ash.workspace = true
+ash-window.workspace = true
+gpu-allocator.workspace = true
+log.workspace = true
+egui.workspace = true
+nixe-video.workspace = true
+raw-window-handle.workspace = true
+nixe-gpu.workspace = true
+nixe-memory.workspace = true
+
+[features]
+performance-counters = ["nixe-gpu/performance-counters"]
+binding-probe = []
+
+[[example]]
+name = "binding-probe"
+required-features = ["binding-probe"]
+
+[dev-dependencies]
+tempfile.workspace = true

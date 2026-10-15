@@ -1,5 +1,6 @@
 //! Half FMA operands are promoted together when an operand selects F32.
 use super::*;
+use crate::shader::decoded::Operation as ShaderOperation;
 
 pub(in crate::shader) const fn is_half_fused_multiply_add(word: u64) -> bool {
     word & 0xfff8_0000_0000_0000 == 0x5d00_0000_0000_0000
@@ -15,7 +16,7 @@ pub(in crate::shader) fn decode_half_fused_multiply_add(
     offset: u32,
     word: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<DecodedHalfBinary, MaxwellShaderTranslationError> {
     // Encoding, operand promotion, negation and merge modes:
     // https://github.com/envytools/envytools/blob/master/envydis/gm107.c
@@ -66,9 +67,9 @@ pub(in crate::shader) fn decode_half_fused_multiply_add(
     let promoted = swizzles.contains(&1);
     let raw_dst = word as u8;
     validate_register_range(stage, offset, word, raw_dst, 1, register_count)?;
-    let destination = ShaderRegister::new(u16::from(raw_dst));
+    let destination = ShaderRegister::new(u32::from(raw_dst));
     let mut operations = Vec::new();
-    let temporary = |next: &mut u16| {
+    let temporary = |next: &mut u32| {
         allocate_shader_temporary(stage, offset, word, "HFMA2 temporary overflow", next)
     };
     let mut sources = [destination; 3];
@@ -92,7 +93,7 @@ pub(in crate::shader) fn decode_half_fused_multiply_add(
             let destination = temporary(next)?;
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination,
-                binding: constant_buffer_binding.unwrap(),
+                binding: u32::from(constant_buffer_binding.unwrap()),
                 byte_offset: (((word >> 20) & 0x3fff) as u32) * 4,
                 scalar_type: ShaderScalarType::Float32,
             });

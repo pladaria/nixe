@@ -21,9 +21,11 @@ fn zero_address_ldc_preserves_static_multiword_offsets_and_bounds() {
         assert_eq!(next, 4, "a static address needs no temporary");
         assert_eq!(decoded.operations.len(), words);
         for (word, op) in decoded.operations.iter().enumerate() {
-            assert!(matches!(op, ShaderOperation::LoadConstantBuffer32 {
+            assert!(
+                matches!(op, crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 destination, binding: 1, byte_offset, ..
-            } if destination.index() == word as u16 && *byte_offset == 0x110 + word as u32 * 4));
+            } if destination.index() == u32::from(word as u16) && *byte_offset == 0x110 + word as u32 * 4)
+            );
         }
     }
 }
@@ -255,7 +257,7 @@ fn captured_predicated_mov_and_constant_buffer_form_decode() {
     );
     assert!(matches!(
         decoded.operations.as_slice(),
-        [ShaderOperation::Move32 {
+        [crate::shader::decoded::Operation::Move32 {
             destination,
             source,
             scalar_type: ShaderScalarType::Unsigned32,
@@ -274,12 +276,12 @@ fn captured_predicated_mov_and_constant_buffer_form_decode() {
     assert!(matches!(
         constant.operations.as_slice(),
         [
-            ShaderOperation::LoadConstantBuffer32 {
+            crate::shader::decoded::Operation::LoadConstantBuffer32 {
                 binding: 2,
                 byte_offset: 16,
                 ..
             },
-            ShaderOperation::Move32 {
+            crate::shader::decoded::Operation::Move32 {
                 destination,
                 source,
                 ..
@@ -297,7 +299,7 @@ fn captured_predicated_mov_and_constant_buffer_form_decode() {
     .unwrap();
     assert!(matches!(
         zero.operations.as_slice(),
-        [ShaderOperation::MoveImmediate32 {
+        [crate::shader::decoded::Operation::MoveImmediate32 {
             destination,
             bits: 0,
             ..

@@ -503,6 +503,12 @@ fn retain_shader_read_evidence(
     }
 }
 
+impl MaxwellShaderProgramHeader {
+    pub(super) fn words(&self) -> &[u32; 20] {
+        &self.words
+    }
+}
+
 pub(super) fn decode_program_header(
     bytes: &[u8],
 ) -> Result<MaxwellShaderProgramHeader, MaxwellShaderTranslationError> {

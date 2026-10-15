@@ -16,6 +16,10 @@ impl Capture {
         let Some(path) = std::env::var_os("NIXE_PERFORMANCE_COUNTERS") else {
             return Ok(None);
         };
+        let started = Instant::now();
+        if let Some(path) = std::env::var_os("NIXE_PERFORMANCE_FRAME_TIMINGS") {
+            nixe_video_winit::metrics::start_frame_capture(std::path::Path::new(&path), started)?;
+        }
         let page_report = std::path::PathBuf::from(&path).with_extension("memory.csv");
         let mut output = BufWriter::new(File::create(path)?);
         nixe_memory::metrics::start_page_tracking();
@@ -37,7 +41,6 @@ impl Capture {
         }
         writeln!(output)?;
         let worker = thread::spawn(move || {
-            let started = Instant::now();
             loop {
                 let stop = !matches!(
                     receiver.recv_timeout(Duration::from_secs(1)),
@@ -60,9 +63,13 @@ impl Capture {
         Ok(Some(Self { stop, worker }))
     }
     pub(super) fn finish(self) -> io::Result<()> {
+        let frames = nixe_video_winit::metrics::finish_frame_capture();
         let _ = self.stop.send(());
-        self.worker
+        let counters = self
+            .worker
             .join()
-            .map_err(|_| io::Error::other("performance capture worker panicked"))?
+            .map_err(|_| io::Error::other("performance capture worker panicked"))?;
+        frames?;
+        counters
     }
 }

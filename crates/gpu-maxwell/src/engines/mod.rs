@@ -29,7 +29,7 @@ pub use compute::{
     MaxwellComputeOperationTrigger, MaxwellComputeProgramState, MaxwellComputeRegister,
     MaxwellComputeRegisterOrigin, MaxwellComputeShaderCacheInvalidation, MaxwellComputeSmCount,
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeSynchronizationPlan,
-    MaxwellComputeTriggeredOperation, MaxwellShaderCacheInvalidation,
+    MaxwellComputeTriggeredOperation, MaxwellResolvedComputeLaunch, MaxwellShaderCacheInvalidation,
     lower_maxwell_compute_synchronization,
 };
 
@@ -172,7 +172,8 @@ pub use twod::{
     MaxwellTwoDNotifyState, MaxwellTwoDOperation, MaxwellTwoDPixelsFromMemoryCorralSize,
     MaxwellTwoDPixelsFromMemorySafeOverlap, MaxwellTwoDPixelsFromMemoryState,
     MaxwellTwoDProcessingClusters, MaxwellTwoDRegister, MaxwellTwoDRegisterOrigin,
-    MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDState,
+    MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDSolidOperation,
+    MaxwellTwoDState,
 };
 
 use std::fmt::{Display, Formatter};
@@ -1057,3 +1058,5 @@ fn dispatch_class_method(
         }),
     }
 }
+
+pub use lowering::native::{MaxwellNativeFrontend, NativeFrontendStatistics};

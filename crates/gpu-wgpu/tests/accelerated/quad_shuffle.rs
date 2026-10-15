@@ -140,6 +140,7 @@ fn quad_exchange(swizzle: Option<u8>, front_face: Option<nixe_gpu::FrontFace>) {
             },
         });
         let mut prepared = PreparedDraw::new(
+            nixe_gpu::PreparedStateId::new(1, 1),
             PipelineId::new(760),
             pass,
             PrimitiveTopology::Triangles,
@@ -171,7 +172,7 @@ fn quad_exchange(swizzle: Option<u8>, front_face: Option<nixe_gpu::FrontFace>) {
         )
         .unwrap();
         if let Some(face) = front_face {
-            prepared.front_face = face;
+            prepared.edit_state().front_face = face;
         }
         let begin = RenderPassOperation::begin(
             pass,

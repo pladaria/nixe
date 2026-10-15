@@ -7,9 +7,9 @@ use super::{
     integer::DecodedIntegerOperation,
 };
 use crate::MaxwellShaderStage;
-use nixe_gpu::{
-    ShaderBitwiseOperation, ShaderFloatControl, ShaderOperation, ShaderRegister, ShaderScalarType,
-};
+use crate::shader::decoded::Operation as ShaderOperation;
+use crate::shader::decoded::Register as ShaderRegister;
+use nixe_gpu::{ShaderBitwiseOperation, ShaderFloatControl, ShaderScalarType};
 
 pub(super) const fn is_xmad(encoding: u64) -> bool {
     let opcode = encoding >> 48;
@@ -24,7 +24,7 @@ struct Expansion<'a> {
     offset: u32,
     encoding: u64,
     registers: u8,
-    next: &'a mut u16,
+    next: &'a mut u32,
     ops: Vec<ShaderOperation>,
 }
 impl Expansion<'_> {
@@ -58,7 +58,7 @@ impl Expansion<'_> {
             1,
             self.registers,
         )?;
-        Ok(ShaderRegister::new(u16::from(raw)))
+        Ok(ShaderRegister::new(u32::from(raw)))
     }
     fn bits(
         &mut self,
@@ -140,7 +140,7 @@ pub(super) fn decode_xmad(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     let opcode = encoding >> 48;
     let cb_b = opcode & 0xfe00 == 0x4e00;
@@ -173,7 +173,7 @@ pub(super) fn decode_xmad(
         e.temp()?
     } else {
         validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-        ShaderRegister::new(u16::from(destination))
+        ShaderRegister::new(u32::from(destination))
     };
     let a = e.reg((encoding >> 8) as u8)?;
     let mut constant_buffer_binding = None;
@@ -183,7 +183,7 @@ pub(super) fn decode_xmad(
         let destination = e.temp()?;
         e.ops.push(ShaderOperation::LoadConstantBuffer32 {
             destination,
-            binding,
+            binding: binding.into(),
             byte_offset: ((encoding >> 20) as u32 & 0x3fff) * 4,
             scalar_type: ShaderScalarType::Unsigned32,
         });

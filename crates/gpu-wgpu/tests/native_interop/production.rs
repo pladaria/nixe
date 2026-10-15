@@ -739,6 +739,7 @@ fn check_chain(
             dependencies[0] = ResourceDependency::Buffer(id);
         }
         let mut prepared = PreparedDraw::new(
+            nixe_gpu::PreparedStateId::new(1, 1),
             pipeline,
             pass,
             PrimitiveTopology::Patches,
@@ -795,7 +796,7 @@ fn check_chain(
             }),
         )
         .unwrap();
-        prepared.tessellation = Some(TessellationState {
+        prepared.edit_state().tessellation = Some(TessellationState {
             input_control_points: points,
             mode: TessellationMode {
                 domain: TessellationDomain::Triangles,
@@ -817,7 +818,7 @@ fn check_chain(
                 }
             },
         });
-        prepared.depth_state = DepthState {
+        prepared.edit_state().depth_state = DepthState {
             test_enabled: true,
             write_enabled: true,
             compare: if resources && serial >= 3 {
@@ -829,25 +830,30 @@ fn check_chain(
             },
         };
         if scenario == Resources::ColorOutput {
-            prepared.color_outputs[0] = color_output(serial);
+            prepared.edit_state().color_outputs[0] = color_output(serial);
         }
         if let Resources::Culling(positive_y, clockwise) = scenario {
             if clockwise {
-                prepared.tessellation.as_mut().unwrap().mode.output =
-                    TessellationOutput::Triangles(TessellationWinding::Clockwise);
+                prepared
+                    .edit_state()
+                    .tessellation
+                    .as_mut()
+                    .unwrap()
+                    .mode
+                    .output = TessellationOutput::Triangles(TessellationWinding::Clockwise);
             }
-            prepared.front_face = if serial <= 2 {
+            prepared.edit_state().front_face = if serial <= 2 {
                 FrontFace::CounterClockwise
             } else {
                 FrontFace::Clockwise
             };
-            prepared.cull_mode = match serial {
+            prepared.edit_state().cull_mode = match serial {
                 1 | 3 => CullMode::Back,
                 2 | 4 => CullMode::Front,
                 5 | 7 => CullMode::FrontAndBack,
                 _ => CullMode::None,
             };
-            prepared.viewport_transform = Some(
+            prepared.edit_state().viewport_transform = Some(
                 ViewportTransform::new(
                     [16.0, if positive_y { 16.0 } else { -16.0 }, 1.0],
                     [16.0, 16.0, 0.0],
@@ -859,9 +865,9 @@ fn check_chain(
         if let Resources::Wireframe(smooth) = scenario {
             // Lower-left-domain CCW triangles remain framebuffer CCW with
             // the negative-Y viewport. Exercise culling and wireframe together.
-            prepared.front_face = FrontFace::CounterClockwise;
-            prepared.cull_mode = CullMode::Back;
-            prepared.triangle_rasterization = TriangleRasterization::Wireframe {
+            prepared.edit_state().front_face = FrontFace::CounterClockwise;
+            prepared.edit_state().cull_mode = CullMode::Back;
+            prepared.edit_state().triangle_rasterization = TriangleRasterization::Wireframe {
                 width_bits: if serial % 2 == 1 { 1_f32 } else { 4_f32 }.to_bits(),
                 smooth,
             };
@@ -972,33 +978,39 @@ fn check_chain(
                 | Resources::Culling(..)
         ) || !guest_control
         {
-            let mut prepared = (*draw.prepared).clone();
+            let mut prepared = nixe_gpu::PreparedDraw::from_state(
+                nixe_gpu::PreparedStateId::new(
+                    draw.prepared.identity().slot(),
+                    draw.prepared.identity().revision() + 1,
+                ),
+                draw.prepared.state().clone(),
+            );
             if matches!(scenario, Resources::Culling(..)) {
-                prepared.cull_mode = CullMode::FrontAndBack;
+                prepared.edit_state().cull_mode = CullMode::FrontAndBack;
             } else if matches!(scenario, Resources::Wireframe(_)) {
-                prepared.color_outputs[0].write_mask = ColorWriteMask::NONE;
+                prepared.edit_state().color_outputs[0].write_mask = ColorWriteMask::NONE;
                 // Two widths within one pass; neither pipeline selection nor
                 // redundant-state suppression may drop the second width.
                 if let TriangleRasterization::Wireframe { width_bits, .. } =
-                    &mut prepared.triangle_rasterization
+                    &mut prepared.edit_state().triangle_rasterization
                 {
                     *width_bits = 8_f32.to_bits();
                 }
             } else if scenario == Resources::ColorOutput {
                 // Same logical pipeline and shaders, distinct component mask.
                 // The next draw must restore writes on a pipeline-cache hit.
-                prepared.color_outputs[0].write_mask = ColorWriteMask::NONE;
+                prepared.edit_state().color_outputs[0].write_mask = ColorWriteMask::NONE;
             } else if scenario == Resources::SharedVertex {
-                prepared.depth_state.compare = DepthCompareOperation::Never;
-                prepared.vertex_buffers[0].buffer.range =
+                prepared.edit_state().depth_state.compare = DepthCompareOperation::Never;
+                prepared.edit_state().vertex_buffers[0].buffer.range =
                     BufferRange::new(16, vertex_size - 16).unwrap();
             } else if scenario == Resources::Builtins {
-                prepared.depth_state.compare = DepthCompareOperation::Never;
-                prepared.viewport_transform = Some(
+                prepared.edit_state().depth_state.compare = DepthCompareOperation::Never;
+                prepared.edit_state().viewport_transform = Some(
                     ViewportTransform::new([8.0, -8.0, 1.0], [8.0, 8.0, 0.0], [0.0, 1.0]).unwrap(),
                 );
             } else if let TessellationControl::DefaultLevels { outer, .. } =
-                &mut prepared.tessellation.as_mut().unwrap().control
+                &mut prepared.edit_state().tessellation.as_mut().unwrap().control
             {
                 outer[0] = 0;
             }
@@ -1006,8 +1018,14 @@ fn check_chain(
         }
         let hidden_fill = matches!(scenario, Resources::Wireframe(_)).then(|| {
             let mut fill = first_draw.clone();
-            let mut prepared = (*fill.prepared).clone();
-            prepared.triangle_rasterization = TriangleRasterization::Fill;
+            let mut prepared = nixe_gpu::PreparedDraw::from_state(
+                nixe_gpu::PreparedStateId::new(
+                    fill.prepared.identity().slot(),
+                    fill.prepared.identity().revision() + 1,
+                ),
+                fill.prepared.state().clone(),
+            );
+            prepared.edit_state().triangle_rasterization = TriangleRasterization::Fill;
             fill.prepared = Arc::new(prepared);
             fill
         });

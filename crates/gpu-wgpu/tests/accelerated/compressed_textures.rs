@@ -580,6 +580,7 @@ fn sampling(
                 vertex_buffer
             };
             let mut prepared = PreparedDraw::new(
+                nixe_gpu::PreparedStateId::new(1, 1),
                 pipeline,
                 render_pass,
                 PrimitiveTopology::Triangles,
@@ -604,7 +605,7 @@ fn sampling(
             )
             .unwrap();
             if window_coordinates {
-                prepared.vertex_position_transform =
+                prepared.edit_state().vertex_position_transform =
                     Some(nixe_gpu::VertexPositionTransform::framebuffer(4, 4).unwrap());
             }
             let prepared = Arc::new(prepared);

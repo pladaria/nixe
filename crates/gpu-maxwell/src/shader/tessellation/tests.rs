@@ -140,7 +140,7 @@ fn control_sph_and_patch_store_translate_without_wgsl() {
         && element.component() == 3));
     assert!(ir.ir().instructions().iter().any(|instruction| matches!(
         instruction.operation(),
-        ShaderOperation::StoreOutput {
+        nixe_gpu::ShaderOperation::StoreOutput {
             location: ShaderIoLocation::TessLevelInner,
             first_component: 0,
             ..
@@ -178,7 +178,7 @@ fn direct_control_stores_use_invocation_index_not_input_patch_size() {
     ));
     for (lane, operation) in operations[1..].iter().enumerate() {
         assert!(
-            matches!(operation, ShaderOperation::StoreControlPoint { source, vertex, location: ShaderIoLocation::Position, component } if source.index() == lane as u16 && vertex.index() == 4 && *component == lane as u8)
+            matches!(operation, ShaderOperation::StoreControlPoint { source, vertex, location: ShaderIoLocation::Position, component } if source.index() == u32::from(lane as u16) && vertex.index() == 4 && *component == lane as u8)
         );
     }
     let operation = decode_system_register(
@@ -347,7 +347,7 @@ fn fragment_interpolation_links_per_component_only_to_final_producer() {
         .collect();
     let inputs = MaxwellShaderTranslationInputs {
         fingerprint: nixe_gpu::cache_fingerprint(&programs),
-        programs,
+        snapshot: super::super::source::MaxwellShaderSnapshot { programs },
     };
     let translated = translate_prepared_maxwell_shader_programs(&inputs).unwrap();
     for program in &translated[..2] {

@@ -4,9 +4,11 @@ use super::decode::{allocate_shader_temporary, decode_predicate, validate_regist
 use super::error::{MaxwellShaderTranslationError, malformed};
 use super::float::{apply_float_source_modifiers, prepare_float_register_source};
 use crate::MaxwellShaderStage;
+use crate::shader::decoded::Operation as ShaderOperation;
+use crate::shader::decoded::Register as ShaderRegister;
 use nixe_gpu::{
-    ShaderFloatControl, ShaderMathAccuracy, ShaderNanMode, ShaderOperation, ShaderPredicate,
-    ShaderRegister, ShaderRoundingMode, ShaderScalarType, ShaderSpecialFunction,
+    ShaderFloatControl, ShaderMathAccuracy, ShaderNanMode, ShaderPredicate, ShaderRoundingMode,
+    ShaderScalarType, ShaderSpecialFunction,
 };
 
 pub(super) const fn is_mufu(encoding: u64) -> bool {
@@ -42,7 +44,7 @@ pub(super) fn decode_range_reduction(
     encoding: u64,
     predicate: ShaderPredicate,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<PendingRangeReduction, MaxwellShaderTranslationError> {
     // RRO source forms, modifiers, and the SINCOS/EX2 selector follow Mesa
     // NAK's pinned SM50 encoder and envytools' pinned public GM107 table:
@@ -79,7 +81,7 @@ pub(super) fn decode_range_reduction(
             constant_buffer_binding = Some(binding);
             preparation.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: source,
-                binding,
+                binding: binding.into(),
                 byte_offset,
                 scalar_type: ShaderScalarType::Float32,
             });
@@ -137,7 +139,7 @@ pub(super) fn decode_range_reduction(
 pub(super) fn freeze_range_reduction_input(
     range: &mut PendingRangeReduction,
     stage: MaxwellShaderStage,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<(), MaxwellShaderTranslationError> {
     let destination = allocate_shader_temporary(
         stage,
@@ -198,7 +200,7 @@ pub(super) fn decode_range_reduced_mufu(
         _ => unreachable!("compatibility check bounds the MUFU operation"),
     };
     Ok(ShaderOperation::SpecialFunction32 {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         source: range_reduction.input,
         function,
         accuracy: ShaderMathAccuracy::Approximate,
@@ -217,7 +219,7 @@ pub(super) fn decode_mufu(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     let destination = (encoding & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
@@ -243,7 +245,7 @@ pub(super) fn decode_mufu(
     let mufu_operation = ((encoding >> 20) & 0xf) as u8;
     let operation = match mufu_operation {
         0..=3 | 8 => ShaderOperation::SpecialFunction32 {
-            destination: ShaderRegister::new(u16::from(destination)),
+            destination: ShaderRegister::new(u32::from(destination)),
             source,
             function: match mufu_operation {
                 0 => ShaderSpecialFunction::Cosine,
@@ -257,13 +259,13 @@ pub(super) fn decode_mufu(
             float_control,
         },
         4 => ShaderOperation::Reciprocal32 {
-            destination: ShaderRegister::new(u16::from(destination)),
+            destination: ShaderRegister::new(u32::from(destination)),
             source,
             accuracy: ShaderMathAccuracy::Approximate,
             float_control,
         },
         5 => ShaderOperation::ReciprocalSqrt32 {
-            destination: ShaderRegister::new(u16::from(destination)),
+            destination: ShaderRegister::new(u32::from(destination)),
             source,
             accuracy: ShaderMathAccuracy::Approximate,
             float_control,

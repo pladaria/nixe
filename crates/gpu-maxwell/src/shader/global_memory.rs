@@ -8,10 +8,9 @@
 use super::decode::{allocate_shader_temporary, decode_predicate, validate_register_range};
 use super::error::MaxwellShaderTranslationError;
 use crate::MaxwellShaderStage;
-use nixe_gpu::{
-    ShaderFloatControl, ShaderInstruction, ShaderOperation, ShaderPredicate, ShaderRegister,
-    ShaderScalarType,
-};
+use crate::shader::decoded::Register as ShaderRegister;
+use crate::shader::decoded::{Instruction as ShaderInstruction, Operation as ShaderOperation};
+use nixe_gpu::{ShaderFloatControl, ShaderPredicate, ShaderScalarType};
 use std::collections::BTreeMap;
 
 #[cfg(test)]
@@ -63,7 +62,7 @@ enum Value {
 pub(crate) struct GlobalBufferBinding {
     pub constant_buffer: u8,
     pub byte_offset: u32,
-    pub binding: u8,
+    pub binding: u32,
     pub read: bool,
     pub write: bool,
     pub runtime_extent: bool,
@@ -76,6 +75,12 @@ pub(crate) struct GlobalBufferBindings {
     bounds: Vec<Bound>,
 }
 
+impl GlobalBufferBinding {
+    /// Only the retiring renderer calls this after checked oracle export.
+    pub(crate) fn oracle_binding(&self) -> u8 {
+        u8::try_from(self.binding).expect("oracle resource width was checked before export")
+    }
+}
 impl GlobalBufferBindings {
     /// Linear-time evaluation of the shared bound DAG, once per dispatch.
     /// A wrapping operation conservatively expands to the entire u32 domain;
@@ -163,7 +168,7 @@ impl GlobalMemory {
         instructions: &mut Vec<ShaderInstruction>,
         start: usize,
         encoding: u64,
-        next_temporary: &mut u16,
+        next_temporary: &mut u32,
     ) -> Result<(), MaxwellShaderTranslationError> {
         let mut index = start;
         while index < instructions.len() {
@@ -192,7 +197,10 @@ impl GlobalMemory {
                         binding,
                         byte_offset,
                         ..
-                    } => Some(Value::BaseWord(*binding, *byte_offset)),
+                    } => Some(Value::BaseWord(
+                        u8::try_from(*binding).expect("decoded constant-buffer ISA slot"),
+                        *byte_offset,
+                    )),
                     ShaderOperation::LoadComputeBuiltin32 {
                         builtin, component, ..
                     } => match builtin {
@@ -361,7 +369,7 @@ impl GlobalMemory {
         offset: u32,
         encoding: u64,
         register_count: u8,
-        next: &mut u16,
+        next: &mut u32,
     ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
         self.access(offset, encoding, register_count, next, true)
     }
@@ -371,7 +379,7 @@ impl GlobalMemory {
         offset: u32,
         encoding: u64,
         register_count: u8,
-        next: &mut u16,
+        next: &mut u32,
     ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
         self.access(offset, encoding, register_count, next, false)
     }
@@ -381,7 +389,7 @@ impl GlobalMemory {
         offset: u32,
         encoding: u64,
         register_count: u8,
-        next: &mut u16,
+        next: &mut u32,
         load: bool,
     ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
         let stage = self.stage;
@@ -430,10 +438,10 @@ impl GlobalMemory {
         }
         let halves = (
             self.values
-                .get(&ShaderRegister::new(u16::from(address)))
+                .get(&ShaderRegister::new(u32::from(address)))
                 .copied(),
             self.values
-                .get(&ShaderRegister::new(u16::from(address) + 1))
+                .get(&ShaderRegister::new(u32::from(address) + 1))
                 .copied(),
         );
         let mut prefix = Vec::new();
@@ -487,8 +495,7 @@ impl GlobalMemory {
             index
         } else {
             let index = self.bindings.buffers.len();
-            let binding = u8::try_from(index + 32)
-                .map_err(|_| MaxwellShaderTranslationError::ResourceBindingExhausted)?;
+            let binding = index as u32 + 32;
             self.bindings.buffers.push(GlobalBufferBinding {
                 constant_buffer: pointer.constant_buffer,
                 byte_offset: pointer.byte_offset,
@@ -601,7 +608,7 @@ impl GlobalMemory {
                 }
                 register
             } else {
-                ShaderRegister::new(u16::from(raw) + u16::from(word))
+                ShaderRegister::new(u32::from(raw) + u32::from(u16::from(word)))
             };
             ops.push(if load {
                 ShaderOperation::LoadStorageBuffer32 {

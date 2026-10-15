@@ -14,10 +14,9 @@ use super::error::{MaxwellShaderTranslationError, malformed};
 use super::interface::{attribute_location, interface_element, is_attribute_load};
 use super::tessellation;
 use crate::MaxwellShaderStage;
-use nixe_gpu::{
-    ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation, ShaderOperation, ShaderPredicate,
-    ShaderRegister, ShaderScalarType,
-};
+use crate::shader::decoded::Register as ShaderRegister;
+use crate::shader::decoded::{Instruction as ShaderInstruction, Operation as ShaderOperation};
+use nixe_gpu::{ShaderInterfaceElement, ShaderIoLocation, ShaderPredicate, ShaderScalarType};
 
 #[cfg(test)]
 mod tests;
@@ -61,7 +60,7 @@ impl PatchAddresses {
     fn value(&self, register: ShaderRegister) -> Option<Value> {
         self.values
             .as_ref()
-            .and_then(|values| values.get(usize::from(register.index())))
+            .and_then(|values| values.get(register.index() as usize))
             .copied()
             .flatten()
     }
@@ -75,7 +74,7 @@ impl PatchAddresses {
 
     pub(super) fn remove(&mut self, register: ShaderRegister) {
         if let Some(values) = &mut self.values
-            && let Some(value) = values.get_mut(usize::from(register.index()))
+            && let Some(value) = values.get_mut(register.index() as usize)
             && value.take().is_some()
         {
             self.live -= 1;
@@ -86,7 +85,7 @@ impl PatchAddresses {
         if register == 0xff {
             return Value::Constant(0);
         }
-        let register = ShaderRegister::new(u16::from(register));
+        let register = ShaderRegister::new(u32::from(register));
         self.value(register).unwrap_or(Value::Register(register))
     }
 
@@ -101,7 +100,7 @@ impl PatchAddresses {
         offset: u32,
         encoding: u64,
         register_count: u8,
-        next_temporary: &mut u16,
+        next_temporary: &mut u32,
         inputs: &mut Vec<ShaderInterfaceElement>,
     ) -> Result<Option<Vec<ShaderOperation>>, MaxwellShaderTranslationError> {
         if !matches!(
@@ -176,7 +175,7 @@ impl PatchAddresses {
         };
         let mut freeze = |index: Index| -> Result<ShaderRegister, MaxwellShaderTranslationError> {
             if let Index::Register(register) = index
-                && register.index() >= u16::from(register_count)
+                && register.index() >= u32::from(register_count)
             {
                 return Ok(register);
             }
@@ -324,7 +323,7 @@ impl PatchAddresses {
             let handle = self.get(c);
             let mut loaded = Vec::with_capacity(usize::from(count));
             for lane in 0..count {
-                let destination = ShaderRegister::new(u16::from(dst + lane));
+                let destination = ShaderRegister::new(u32::from(dst + lane));
                 let address = address + u16::from(lane) * 4;
                 let operation = if patch {
                     let (location, component) =
@@ -387,7 +386,7 @@ impl PatchAddresses {
                 loaded.push(operation);
             }
             for lane in 0..count {
-                self.remove(ShaderRegister::new(u16::from(dst + lane)));
+                self.remove(ShaderRegister::new(u32::from(dst + lane)));
             }
             operations.extend(loaded);
             None

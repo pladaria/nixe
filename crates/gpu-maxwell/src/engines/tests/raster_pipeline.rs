@@ -2476,7 +2476,7 @@ fn single_rop_control_is_typed_source_preserving_and_family_isolated() {
             .fixed_function()
             .single_rop_control()
             .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
+        MaxwellThreeDRegisterOrigin::VerifiedReset
     );
 
     for (argument, expected) in [
@@ -5719,10 +5719,11 @@ fn graphics_pipeline_family_is_reused_across_coverage_line_and_restart_state() {
         &mut cache,
     )
     .unwrap();
-    assert!(plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
+    assert!(
+        plan.resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
 
     program_three_d(&mut channel, 0x15b4, 0);
     let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
@@ -5739,14 +5740,18 @@ fn graphics_pipeline_family_is_reused_across_coverage_line_and_restart_state() {
         &mut cache,
     )
     .unwrap();
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::RenderPass { .. }
-    )));
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::RenderPass { .. }))
+    );
 
     program_three_d(&mut channel, 0x020c, 0);
     let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
@@ -5763,14 +5768,18 @@ fn graphics_pipeline_family_is_reused_across_coverage_line_and_restart_state() {
         &mut cache,
     )
     .unwrap();
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::RenderPass { .. }
-    )));
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::RenderPass { .. }))
+    );
 
     program_three_d(&mut channel, 0x0de8, 0);
     let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
@@ -5787,14 +5796,18 @@ fn graphics_pipeline_family_is_reused_across_coverage_line_and_restart_state() {
         &mut cache,
     )
     .unwrap();
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::RenderPass { .. }
-    )));
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::RenderPass { .. }))
+    );
 }
 
 #[test]
@@ -5843,10 +5856,11 @@ fn graphics_pipeline_family_is_reused_across_effective_blend_state() {
         &mut cache,
     )
     .unwrap();
-    assert!(plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
+    assert!(
+        plan.resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
 
     // Equations and unselected target enables are inactive while the active
     // target's SET_BLEND(0) is disabled, independently of selector state.
@@ -5874,10 +5888,12 @@ fn graphics_pipeline_family_is_reused_across_effective_blend_state() {
         &mut cache,
     )
     .unwrap();
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
 
     // Selecting per-target state and explicitly disabling the active
     // target changes the effective pipeline state.
@@ -5897,10 +5913,12 @@ fn graphics_pipeline_family_is_reused_across_effective_blend_state() {
         &mut cache,
     )
     .unwrap();
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
 
     // Broadcasting SET_BLEND(0) preserves the active target's disabled blend.
     program_three_d(&mut channel, 0x135c, 1);
@@ -5919,10 +5937,12 @@ fn graphics_pipeline_family_is_reused_across_effective_blend_state() {
         &mut cache,
     )
     .unwrap();
-    assert!(!plan.resource_creations().iter().any(|creation| matches!(
-        creation,
-        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-    )));
+    assert!(
+        !plan
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::ResourceDefinition::Pipeline { .. }))
+    );
 }
 
 #[test]

@@ -23,7 +23,19 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub(crate) struct MaxwellShaderTranslationInputs {
     pub(super) fingerprint: u128,
+    pub(super) snapshot: MaxwellShaderSnapshot,
+}
+
+/// Canonical immutable shader facts/dependencies, independent of cache policy.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct MaxwellShaderSnapshot {
     pub(super) programs: Box<[Arc<MaxwellShaderProgramTranslationInput>]>,
+}
+impl std::ops::Deref for MaxwellShaderTranslationInputs {
+    type Target = MaxwellShaderSnapshot;
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
 }
 
 impl MaxwellShaderTranslationInputs {
@@ -46,7 +58,7 @@ impl Hash for MaxwellShaderTranslationInputs {
     }
 }
 
-impl MaxwellShaderTranslationInputs {
+impl MaxwellShaderSnapshot {
     pub(crate) fn source_is_current(&self, address_space: &MaxwellGpuAddressSpace) -> bool {
         self.programs.iter().all(|program| {
             program
@@ -90,8 +102,12 @@ impl MaxwellShaderTranslationInputs {
             {
                 return false;
             }
-            let size = MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64
-                + binary.bundles.len() as u64 * MAXWELL_SCHEDULE_BUNDLE_SIZE as u64;
+            let header = if binary.stage() == MaxwellShaderStage::Compute {
+                0
+            } else {
+                MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64
+            };
+            let size = header + binary.bundles.len() as u64 * MAXWELL_SCHEDULE_BUNDLE_SIZE as u64;
             let end = binary.address.saturating_add(size);
             binary.source_mappings.iter().all(|mapping| {
                 let start = binary.address.max(mapping.offset().get());
@@ -155,6 +171,19 @@ pub(crate) struct MaxwellShaderTranslationSourceKey {
         [Option<(ShaderIoLocation, ShaderScalarType)>; MAXWELL_VERTEX_ATTRIBUTE_COUNT],
     vertex_input_count: usize,
 }
+impl PartialEq for MaxwellShaderTranslationSourceKey {
+    fn eq(&self, other: &Self) -> bool {
+        // CB addresses/contents are runtime inputs, except for the separately
+        // retained indirect-code table dependencies in a captured snapshot.
+        self.program_count == other.program_count
+            && self.programs == other.programs
+            && self.texture_constant_buffer_slot == other.texture_constant_buffer_slot
+            && self.y_negate == other.y_negate
+            && self.vertex_input_count == other.vertex_input_count
+            && self.vertex_input_types == other.vertex_input_types
+    }
+}
+impl Eq for MaxwellShaderTranslationSourceKey {}
 
 impl MaxwellShaderTranslationSourceKey {
     pub(crate) fn fingerprint(&self) -> u128 {
@@ -339,6 +368,18 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
     address_space: &MaxwellGpuAddressSpace,
     staged_writes: &CanonicalWriteBatch,
 ) -> Result<MaxwellShaderTranslationInputs, MaxwellShaderTranslationError> {
+    let snapshot = capture_maxwell_shader_snapshot(source, address_space, staged_writes)?;
+    Ok(MaxwellShaderTranslationInputs {
+        fingerprint: nixe_gpu::cache_fingerprint(&snapshot.programs),
+        snapshot,
+    })
+}
+
+pub(super) fn capture_maxwell_shader_snapshot(
+    source: &MaxwellShaderTranslationSource,
+    address_space: &MaxwellGpuAddressSpace,
+    staged_writes: &CanonicalWriteBatch,
+) -> Result<MaxwellShaderSnapshot, MaxwellShaderTranslationError> {
     let mapping_generation = address_space.mapping_generation();
     let memory = MaxwellShaderMemoryView::new(address_space, staged_writes);
     let mut programs = Vec::with_capacity(source.programs.len());
@@ -378,10 +419,7 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
         });
     }
     let programs: Box<[_]> = programs.into_iter().map(Arc::new).collect();
-    Ok(MaxwellShaderTranslationInputs {
-        fingerprint: nixe_gpu::cache_fingerprint(&programs),
-        programs,
-    })
+    Ok(MaxwellShaderSnapshot { programs })
 }
 
 fn maxwell_vertex_input_types_iter(

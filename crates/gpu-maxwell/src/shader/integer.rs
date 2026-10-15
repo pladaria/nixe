@@ -1,8 +1,10 @@
 //! Maxwell integer instruction decoding. ISA fields follow the public GM107
 //! emitter, not instruction samples:
 //! https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L2084-L2130
+use crate::shader::decoded::Register as ShaderRegister;
 mod condition;
 mod conversion;
+use crate::shader::decoded::Operation as ShaderOperation;
 pub(super) use condition::{
     IntegerConditionCodes, decode_condition_set_predicate, is_condition_set_predicate,
 };
@@ -15,8 +17,7 @@ use super::error::{MaxwellShaderTranslationError, malformed};
 use crate::MaxwellShaderStage;
 use nixe_gpu::{
     ShaderBitwiseOperation, ShaderFloatControl, ShaderIntegerComparison, ShaderNanMode,
-    ShaderOperation, ShaderPredicateSetOperation, ShaderRegister, ShaderRoundingMode,
-    ShaderScalarType,
+    ShaderPredicateSetOperation, ShaderRoundingMode, ShaderScalarType,
 };
 
 pub(super) const fn is_shift_left(encoding: u64) -> bool {
@@ -34,7 +35,7 @@ pub(super) fn decode_shift_right(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedShift, MaxwellShaderTranslationError> {
     decode_shift(
         stage,
@@ -56,7 +57,7 @@ pub(super) fn decode_shift_left(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedShift, MaxwellShaderTranslationError> {
     decode_shift(
         stage,
@@ -73,7 +74,7 @@ fn decode_shift(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     right: bool,
 ) -> Result<DecodedShift, MaxwellShaderTranslationError> {
     // Operand forms and the wrap-count bit follow Mesa NAK's pinned SM50 SHL
@@ -92,7 +93,7 @@ fn decode_shift(
         )?
     } else {
         validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-        ShaderRegister::new(u16::from(destination))
+        ShaderRegister::new(u32::from(destination))
     };
     let value = if value == 255 {
         let zero = allocate_shader_temporary(
@@ -110,7 +111,7 @@ fn decode_shift(
         zero
     } else {
         validate_register_range(stage, offset, encoding, value, 1, register_count)?;
-        ShaderRegister::new(u16::from(value))
+        ShaderRegister::new(u32::from(value))
     };
     if encoding & (1 << 47) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -156,7 +157,7 @@ fn decode_shift(
             zero
         } else {
             validate_register_range(stage, offset, encoding, amount, 1, register_count)?;
-            ShaderRegister::new(u16::from(amount))
+            ShaderRegister::new(u32::from(amount))
         };
         (amount, None)
     } else {
@@ -172,7 +173,7 @@ fn decode_shift(
             let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: temporary,
-                binding,
+                binding: binding.into(),
                 byte_offset,
                 scalar_type: ShaderScalarType::Unsigned32,
             });
@@ -243,7 +244,7 @@ pub(super) fn decode_bitfield_extract(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     // Encoding: UAM GM107 emitBFE; boundary/sign extension behavior is
     // documented in PTX and agrees with Eden's Maxwell BFE implementation.
@@ -268,7 +269,7 @@ pub(super) fn decode_bitfield_extract(
     }
     let reg = |index: u8| -> Result<ShaderRegister, MaxwellShaderTranslationError> {
         validate_register_range(stage, offset, encoding, index, 1, register_count)?;
-        Ok(ShaderRegister::new(u16::from(index)))
+        Ok(ShaderRegister::new(u32::from(index)))
     };
     let mut temp =
         || allocate_shader_temporary(stage, offset, encoding, "BFE temporary overflow", next);
@@ -292,7 +293,7 @@ pub(super) fn decode_bitfield_extract(
         let binding = ((encoding >> 34) & 31) as u8;
         operations.push(ShaderOperation::LoadConstantBuffer32 {
             destination: control,
-            binding,
+            binding: binding.into(),
             byte_offset: ((encoding >> 20) & 0x3fff) as u32 * 4,
             scalar_type: ShaderScalarType::Unsigned32,
         });
@@ -367,7 +368,7 @@ pub(super) fn decode_bitfield_insert(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     // Packed control: low eight bits are the position, next eight the width.
     // Insertion truncates at bit 32; an out-of-range position changes no bits.
@@ -413,7 +414,7 @@ pub(super) fn decode_bitfield_insert(
             Ok(zero)
         } else {
             validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            Ok(ShaderRegister::new(u16::from(raw)))
+            Ok(ShaderRegister::new(u32::from(raw)))
         }
     };
     let a = reg((encoding >> 8) as u8)?;
@@ -436,7 +437,7 @@ pub(super) fn decode_bitfield_insert(
         binding = Some(slot);
         ops.push(ShaderOperation::LoadConstantBuffer32 {
             destination: control,
-            binding: slot,
+            binding: u32::from(slot),
             byte_offset: ((encoding >> 20) & 0x3fff) as u32 * 4,
             scalar_type: ShaderScalarType::Unsigned32,
         });
@@ -538,7 +539,7 @@ pub(super) fn decode_integer_min_max(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     // https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/envydis/gm107.c (IMNMX)
     if encoding & ((1 << 47) | (3 << 43)) != 0 {
@@ -566,7 +567,7 @@ pub(super) fn decode_integer_min_max(
             Ok(zero)
         } else {
             validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            Ok(ShaderRegister::new(u16::from(raw)))
+            Ok(ShaderRegister::new(u32::from(raw)))
         }
     };
     let a = reg((encoding >> 8) as u8)?;
@@ -583,7 +584,7 @@ pub(super) fn decode_integer_min_max(
         binding = Some(slot);
         ops.push(ShaderOperation::LoadConstantBuffer32 {
             destination: b,
-            binding: slot,
+            binding: u32::from(slot),
             byte_offset: ((encoding >> 20) & 0x3fff) as u32 * 4,
             scalar_type: ShaderScalarType::Unsigned32,
         });
@@ -643,7 +644,7 @@ pub(super) fn decode_bitwise(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     // LOP register/cbuf/signed-20-bit immediate forms and operand complements.
     // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L1568-L1645
@@ -699,7 +700,7 @@ pub(super) fn decode_bitwise(
         temporary()?
     } else {
         validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-        ShaderRegister::new(u16::from(destination))
+        ShaderRegister::new(u32::from(destination))
     };
     let mut operand = |raw: u8,
                        operations: &mut Vec<ShaderOperation>|
@@ -714,7 +715,7 @@ pub(super) fn decode_bitwise(
             Ok(destination)
         } else {
             validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            Ok(ShaderRegister::new(u16::from(raw)))
+            Ok(ShaderRegister::new(u32::from(raw)))
         }
     };
     let selector = (encoding >> if full_immediate { 53 } else { 41 }) & 3;
@@ -734,7 +735,7 @@ pub(super) fn decode_bitwise(
             constant_buffer_binding = Some(binding);
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination,
-                binding,
+                binding: binding.into(),
                 byte_offset: (((encoding >> 20) & 0x3fff) as u32) * 4,
                 scalar_type: ShaderScalarType::Unsigned32,
             });
@@ -868,59 +869,15 @@ pub(super) fn decode_add(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     carry_register: &mut Option<ShaderRegister>,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
-    // IADD and ISCADD share modulo-2^32 operands; ISCADD shifts the first
-    // operand by an immediate 0..31 before adding, without a carry input.
-    // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L1648-L1685
-    let shifted = is_shift_add(encoding);
-    let long = (encoding >> 48) & 0xfe00 == 0x1c00;
-    if encoding & (1 << if long { 54 } else { 50 }) != 0 {
-        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-            stage,
-            instruction_offset: offset,
-            encoding,
-            detail: "IADD signed saturation",
-        });
-    }
-    let opcode = (encoding >> 48) as u16;
-    let register = if shifted {
-        opcode & 0xfffc == 0x5c18
-    } else {
-        opcode & 0xfff8 == 0x5c10
-    };
-    let constant = if shifted {
-        opcode & 0xfffc == 0x4c18
-    } else {
-        opcode & 0xfff8 == 0x4c10
-    };
-    let operand_mask = if long {
-        u64::from(u32::MAX) << 20
-    } else if register {
-        0xff_u64 << 20
-    } else {
-        0x7ffff_u64 << 20
-    };
-    let shift_mask = if long {
-        (1 << 56) | (1 << 53) | (1 << 52)
-    } else if shifted {
-        (0x1f << 39) | (1 << 47)
-    } else {
-        (1 << 47) | (1 << 43)
-    };
-    if encoding & !(0xffff_0000_000f_ffff | operand_mask | shift_mask) != 0 {
-        return Err(malformed(
-            stage,
-            offset,
-            encoding,
-            if shifted {
-                "ISCADD reserved field is nonzero"
-            } else {
-                "IADD reserved field is nonzero"
-            },
-        ));
-    }
+    let AddFields {
+        shifted,
+        long,
+        register,
+        constant,
+    } = decode_add_fields(stage, offset, encoding)?;
     let mut operations = Vec::with_capacity(3);
     let mut temporary = || {
         allocate_shader_temporary(
@@ -936,7 +893,7 @@ pub(super) fn decode_add(
         temporary()?
     } else {
         validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-        ShaderRegister::new(u16::from(destination))
+        ShaderRegister::new(u32::from(destination))
     };
     let mut operand = |raw: u8,
                        operations: &mut Vec<ShaderOperation>|
@@ -951,7 +908,7 @@ pub(super) fn decode_add(
             Ok(destination)
         } else {
             validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            Ok(ShaderRegister::new(u16::from(raw)))
+            Ok(ShaderRegister::new(u32::from(raw)))
         }
     };
     let mut left = operand((encoding >> 8) as u8, &mut operations)?;
@@ -965,7 +922,7 @@ pub(super) fn decode_add(
             constant_buffer_binding = Some(binding);
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination,
-                binding,
+                binding: binding.into(),
                 byte_offset: (((encoding >> 20) & 0x3fff) as u32) * 4,
                 scalar_type: ShaderScalarType::Unsigned32,
             });
@@ -1153,13 +1110,175 @@ pub(super) fn decode_add(
     })
 }
 
+pub(super) struct AddFields {
+    pub(super) shifted: bool,
+    pub(super) long: bool,
+    pub(super) register: bool,
+    pub(super) constant: bool,
+}
+pub(super) fn decode_add_fields(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+) -> Result<AddFields, MaxwellShaderTranslationError> {
+    // IADD and ISCADD share modulo-2^32 operands; ISCADD shifts the first
+    // operand by an immediate 0..31 before adding, without a carry input.
+    // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp#L1648-L1685
+    let shifted = is_shift_add(encoding);
+    let long = (encoding >> 48) & 0xfe00 == 0x1c00;
+    if encoding & (1 << if long { 54 } else { 50 }) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "IADD signed saturation",
+        });
+    }
+    let opcode = (encoding >> 48) as u16;
+    let register = if shifted {
+        opcode & 0xfffc == 0x5c18
+    } else {
+        opcode & 0xfff8 == 0x5c10
+    };
+    let constant = if shifted {
+        opcode & 0xfffc == 0x4c18
+    } else {
+        opcode & 0xfff8 == 0x4c10
+    };
+    let operand_mask = if long {
+        u64::from(u32::MAX) << 20
+    } else if register {
+        0xff_u64 << 20
+    } else {
+        0x7ffff_u64 << 20
+    };
+    let shift_mask = if long {
+        (1 << 56) | (1 << 53) | (1 << 52)
+    } else if shifted {
+        (0x1f << 39) | (1 << 47)
+    } else {
+        (1 << 47) | (1 << 43)
+    };
+    if encoding & !(0xffff_0000_000f_ffff | operand_mask | shift_mask) != 0 {
+        return Err(malformed(
+            stage,
+            offset,
+            encoding,
+            if shifted {
+                "ISCADD reserved field is nonzero"
+            } else {
+                "IADD reserved field is nonzero"
+            },
+        ));
+    }
+    Ok(AddFields {
+        shifted,
+        long,
+        register,
+        constant,
+    })
+}
+
 pub(super) fn decode_set_predicate(
     stage: MaxwellShaderStage,
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
+    let SetPredicateFields {
+        register,
+        constant,
+        destinations,
+        set_operation,
+        comparison,
+    } = decode_set_predicate_fields(stage, offset, encoding)?;
+    let mut operations = Vec::with_capacity(3);
+    let mut source_register = |raw: u8,
+                               operations: &mut Vec<ShaderOperation>|
+     -> Result<ShaderRegister, MaxwellShaderTranslationError> {
+        if raw == 0xff {
+            let destination = allocate_shader_temporary(
+                stage,
+                offset,
+                encoding,
+                "ISETP zero operand temporary overflow",
+                next_temporary,
+            )?;
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination,
+                bits: 0,
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
+            Ok(destination)
+        } else {
+            validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
+            Ok(ShaderRegister::new(u32::from(raw)))
+        }
+    };
+    let left = source_register((encoding >> 8) as u8, &mut operations)?;
+    let mut constant_buffer_binding = None;
+    let right = if register {
+        source_register((encoding >> 20) as u8, &mut operations)?
+    } else {
+        let destination = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "ISETP right operand temporary overflow",
+            next_temporary,
+        )?;
+        if constant {
+            let binding = ((encoding >> 34) & 0x1f) as u8;
+            constant_buffer_binding = Some(binding);
+            operations.push(ShaderOperation::LoadConstantBuffer32 {
+                destination,
+                binding: binding.into(),
+                byte_offset: (((encoding >> 20) & 0x3fff) as u32) * 4,
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
+        } else {
+            let bits = ((encoding >> 20) & 0x7ffff) as u32
+                | if encoding & (1 << 56) != 0 {
+                    0xfff8_0000
+                } else {
+                    0
+                };
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination,
+                bits,
+                scalar_type: ShaderScalarType::Unsigned32,
+            });
+        }
+        destination
+    };
+    operations.push(ShaderOperation::SetPredicateInteger32 {
+        destinations,
+        left,
+        right,
+        signed: encoding & (1 << 48) != 0,
+        comparison,
+        accumulator: decode_predicate_fields(encoding, 39, 42),
+        set_operation,
+    });
+    Ok(DecodedIntegerOperation {
+        operations,
+        constant_buffer_binding,
+    })
+}
+
+pub(super) struct SetPredicateFields {
+    pub(super) register: bool,
+    pub(super) constant: bool,
+    pub(super) destinations: [Option<u8>; 2],
+    pub(super) set_operation: ShaderPredicateSetOperation,
+    pub(super) comparison: ShaderIntegerComparison,
+}
+pub(super) fn decode_set_predicate_fields(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+) -> Result<SetPredicateFields, MaxwellShaderTranslationError> {
     if encoding & (1 << 43) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
@@ -1219,77 +1338,12 @@ pub(super) fn decode_set_predicate(
         7 => ShaderIntegerComparison::True,
         _ => unreachable!(),
     };
-    let mut operations = Vec::with_capacity(3);
-    let mut source_register = |raw: u8,
-                               operations: &mut Vec<ShaderOperation>|
-     -> Result<ShaderRegister, MaxwellShaderTranslationError> {
-        if raw == 0xff {
-            let destination = allocate_shader_temporary(
-                stage,
-                offset,
-                encoding,
-                "ISETP zero operand temporary overflow",
-                next_temporary,
-            )?;
-            operations.push(ShaderOperation::MoveImmediate32 {
-                destination,
-                bits: 0,
-                scalar_type: ShaderScalarType::Unsigned32,
-            });
-            Ok(destination)
-        } else {
-            validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            Ok(ShaderRegister::new(u16::from(raw)))
-        }
-    };
-    let left = source_register((encoding >> 8) as u8, &mut operations)?;
-    let mut constant_buffer_binding = None;
-    let right = if register {
-        source_register((encoding >> 20) as u8, &mut operations)?
-    } else {
-        let destination = allocate_shader_temporary(
-            stage,
-            offset,
-            encoding,
-            "ISETP right operand temporary overflow",
-            next_temporary,
-        )?;
-        if constant {
-            let binding = ((encoding >> 34) & 0x1f) as u8;
-            constant_buffer_binding = Some(binding);
-            operations.push(ShaderOperation::LoadConstantBuffer32 {
-                destination,
-                binding,
-                byte_offset: (((encoding >> 20) & 0x3fff) as u32) * 4,
-                scalar_type: ShaderScalarType::Unsigned32,
-            });
-        } else {
-            let bits = ((encoding >> 20) & 0x7ffff) as u32
-                | if encoding & (1 << 56) != 0 {
-                    0xfff8_0000
-                } else {
-                    0
-                };
-            operations.push(ShaderOperation::MoveImmediate32 {
-                destination,
-                bits,
-                scalar_type: ShaderScalarType::Unsigned32,
-            });
-        }
-        destination
-    };
-    operations.push(ShaderOperation::SetPredicateInteger32 {
+    Ok(SetPredicateFields {
+        register,
+        constant,
         destinations,
-        left,
-        right,
-        signed: encoding & (1 << 48) != 0,
-        comparison,
-        accumulator: decode_predicate_fields(encoding, 39, 42),
         set_operation,
-    });
-    Ok(DecodedIntegerOperation {
-        operations,
-        constant_buffer_binding,
+        comparison,
     })
 }
 
@@ -1306,7 +1360,7 @@ pub(super) fn decode_set(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     if encoding & (1 << 43) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -1352,7 +1406,7 @@ pub(super) fn decode_set(
         )?
     } else {
         validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-        ShaderRegister::new(u16::from(raw))
+        ShaderRegister::new(u32::from(raw))
     };
     let set_operation = match (encoding >> 45) & 3 {
         0 => ShaderPredicateSetOperation::And,
@@ -1398,7 +1452,7 @@ pub(super) fn decode_set(
             Ok(destination)
         } else {
             validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            Ok(ShaderRegister::new(u16::from(raw)))
+            Ok(ShaderRegister::new(u32::from(raw)))
         }
     };
     let left = source_register((encoding >> 8) as u8, &mut operations)?;
@@ -1418,7 +1472,7 @@ pub(super) fn decode_set(
             constant_buffer_binding = Some(binding);
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination,
-                binding,
+                binding: binding.into(),
                 byte_offset: (((encoding >> 20) & 0x3fff) as u32) * 4,
                 scalar_type: ShaderScalarType::Unsigned32,
             });
@@ -1464,6 +1518,25 @@ pub(super) fn decode_predicate_boolean(
     offset: u32,
     encoding: u64,
 ) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+    let fields = decode_predicate_boolean_fields(stage, offset, encoding)?;
+    Ok(ShaderOperation::SetPredicateBoolean {
+        destinations: fields.destinations,
+        inputs: fields.inputs,
+        operations: fields.operations,
+    })
+}
+
+pub(super) struct PredicateBooleanFields {
+    pub(super) destinations: [Option<u8>; 2],
+    pub(super) inputs: [nixe_gpu::ShaderPredicate; 3],
+    pub(super) operations: [ShaderPredicateSetOperation; 2],
+}
+
+pub(super) fn decode_predicate_boolean_fields(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+) -> Result<PredicateBooleanFields, MaxwellShaderTranslationError> {
     let allowed = 0xfff8_0000_0000_0000
         | 0x3f
         | (0xf << 12)
@@ -1501,7 +1574,7 @@ pub(super) fn decode_predicate_boolean(
             "PSETP reserved boolean operation",
         )),
     };
-    Ok(ShaderOperation::SetPredicateBoolean {
+    Ok(PredicateBooleanFields {
         destinations,
         inputs: [
             decode_predicate_fields(encoding, 12, 15),
@@ -1522,7 +1595,7 @@ pub(super) fn decode_register_to_predicate(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     if encoding & (1 << 40) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -1564,7 +1637,7 @@ pub(super) fn decode_register_to_predicate(
         destination
     } else {
         validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-        ShaderRegister::new(u16::from(raw))
+        ShaderRegister::new(u32::from(raw))
     };
     operations.push(ShaderOperation::SetPredicatesFromBits {
         source,
@@ -1585,7 +1658,7 @@ pub(super) fn decode_integer_compare(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     let opcode = (encoding >> 48) as u16;
     let register = opcode & 0xfff0 == 0x5b40;
@@ -1626,7 +1699,7 @@ pub(super) fn decode_integer_compare(
             Ok(zero)
         } else {
             validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            Ok(ShaderRegister::new(u16::from(raw)))
+            Ok(ShaderRegister::new(u32::from(raw)))
         }
     };
     let when_true = reg((encoding >> 8) as u8)?;
@@ -1640,7 +1713,7 @@ pub(super) fn decode_integer_compare(
             constant_buffer_binding = Some(binding);
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: operand,
-                binding,
+                binding: binding.into(),
                 byte_offset: ((encoding >> 20) & 0x3fff) as u32 * 4,
                 scalar_type: ShaderScalarType::Unsigned32,
             });
@@ -1712,7 +1785,7 @@ pub(super) fn decode_select(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     // SEL preserves raw operand bits, with predicate inversion swapping A/B.
     // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/select_source_with_predicate.cpp
@@ -1747,7 +1820,7 @@ pub(super) fn decode_select(
             return Ok(zero);
         }
         validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-        Ok(ShaderRegister::new(u16::from(raw)))
+        Ok(ShaderRegister::new(u32::from(raw)))
     };
     let when_true = reg((encoding >> 8) as u8)?;
     let binding = constant.then_some(((encoding >> 34) & 31) as u8);
@@ -1758,7 +1831,7 @@ pub(super) fn decode_select(
         operations.push(if let Some(binding) = binding {
             ShaderOperation::LoadConstantBuffer32 {
                 destination,
-                binding,
+                binding: binding.into(),
                 byte_offset: ((encoding >> 20) & 0x3fff) as u32 * 4,
                 scalar_type: ShaderScalarType::Unsigned32,
             }

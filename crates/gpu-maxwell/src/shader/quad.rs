@@ -3,9 +3,10 @@
 use super::decode::validate_register_range;
 use super::error::{MaxwellShaderTranslationError, malformed};
 use crate::MaxwellShaderStage;
+use crate::shader::decoded::Operation as ShaderOperation;
+use crate::shader::decoded::Register as ShaderRegister;
 use nixe_gpu::{
-    ShaderIntegerComparison, ShaderOperation, ShaderPredicate, ShaderPredicateSetOperation,
-    ShaderQuadOperation, ShaderRegister,
+    ShaderIntegerComparison, ShaderPredicate, ShaderPredicateSetOperation, ShaderQuadOperation,
 };
 
 pub(super) const fn is_shuffle(encoding: u64) -> bool {
@@ -58,10 +59,10 @@ pub(super) fn decode_shuffle(
     let source = ((encoding >> 8) & 255) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
     validate_register_range(stage, offset, encoding, source, 1, register_count)?;
-    let source = ShaderRegister::new(u16::from(source));
+    let source = ShaderRegister::new(u32::from(source));
     let mut operations = Vec::with_capacity(2);
     operations.push(ShaderOperation::QuadShuffle32 {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         source,
         operation,
     });
@@ -122,9 +123,9 @@ pub(super) fn decode_swizzle_add(
     }
     let ftz = encoding & (1 << 44) != 0;
     Ok(ShaderOperation::FloatQuadSwizzleAdd32 {
-        destination: ShaderRegister::new(u16::from(destination)),
-        left: ShaderRegister::new(u16::from(left)),
-        right: ShaderRegister::new(u16::from(right)),
+        destination: ShaderRegister::new(u32::from(destination)),
+        left: ShaderRegister::new(u32::from(left)),
+        right: ShaderRegister::new(u32::from(right)),
         swizzle: (encoding >> 28) as u8,
         float_control: nixe_gpu::ShaderFloatControl::new(
             nixe_gpu::ShaderRoundingMode::NearestEven,
@@ -200,12 +201,10 @@ mod tests {
             header,
             &[0, word | (1 << 19), 0xe30000000007000f, 0],
         );
-        assert!(
-            !ir.ir()
-                .instructions()
-                .iter()
-                .any(|i| matches!(i.operation(), ShaderOperation::QuadShuffle32 { .. }))
-        );
+        assert!(!ir.ir().instructions().iter().any(|i| matches!(
+            i.operation(),
+            nixe_gpu::ShaderOperation::QuadShuffle32 { .. }
+        )));
     }
     #[test]
     fn swizzled_add_decodes_sources_selectors_and_exact_float_control() {

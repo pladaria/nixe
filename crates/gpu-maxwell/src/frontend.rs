@@ -3,11 +3,11 @@
 use std::fmt::{Display, Formatter};
 
 use crate::engines::{MaxwellEngineStreamError, stream_maxwell_engine_packet};
-use crate::execution::MaxwellSubmissionPlanner;
+use crate::execution::{MaxwellFrontend, MaxwellSubmissionPlanner};
 use crate::pushbuffer::packet::SubmissionWords;
 use crate::{
     MaxwellDecodedPushbuffer, MaxwellEngineDispatchError, MaxwellFrontendDispatch,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellLoweringCache, MaxwellPushbufferDecodeError,
+    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellPushbufferDecodeError,
     MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan,
     MaxwellSubmissionExecutionStep, decode_maxwell_pushbuffer,
 };
@@ -71,13 +71,13 @@ impl std::error::Error for MaxwellFrontendDispatchError {}
 /// Delivers bounded lowered prefixes while subsequent packets are prepared.
 /// The returned tail has passed completion-signal validation; only then may
 /// its backend consumer seal the frontend delivery and publish its fence.
-pub fn stream_maxwell_frontend(
+pub fn stream_maxwell_frontend<L: MaxwellFrontend>(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
     address_space: &MaxwellGpuAddressSpace,
-    cache: &mut MaxwellLoweringCache,
-    consume: &mut impl FnMut(Vec<MaxwellSubmissionExecutionStep>) -> Result<(), Box<str>>,
-) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
+    cache: &mut L,
+    consume: &mut impl FnMut(Vec<MaxwellSubmissionExecutionStep<L::Work>>) -> Result<(), Box<str>>,
+) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
     let submission = dispatch.scheduled().submission();
     let decoded = decode_maxwell_pushbuffer(SubmissionWords::new(submission, address_space))
         .map_err(MaxwellFrontendDispatchError::PacketDecode)?;
@@ -99,15 +99,15 @@ pub fn stream_maxwell_frontend(
 
 /// Applies and lowers an already decoded pushbuffer through the current
 /// streaming frontend path.
-pub fn lower_maxwell_pushbuffer(
+pub fn lower_maxwell_pushbuffer<L: MaxwellFrontend>(
     decoded: &MaxwellDecodedPushbuffer,
     channel: &mut MaxwellGpuChannel,
     address_space: &MaxwellGpuAddressSpace,
     frontend: FrontendSubmissionId,
     predecessors: Vec<FrontendSubmissionId>,
     completion: Option<&ReservedTimelinePoint>,
-    cache: &mut MaxwellLoweringCache,
-) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
+    cache: &mut L,
+) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
     if decoded.packets().is_empty() {
         return Err(MaxwellFrontendDispatchError::EmptySubmission);
     }
@@ -116,11 +116,11 @@ pub fn lower_maxwell_pushbuffer(
     lower_packets(decoded, channel, planner)
 }
 
-fn lower_packets(
+fn lower_packets<L: MaxwellFrontend>(
     decoded: &MaxwellDecodedPushbuffer,
     channel: &mut MaxwellGpuChannel,
-    planner: MaxwellSubmissionPlanner<'_>,
-) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
+    planner: MaxwellSubmissionPlanner<'_, L>,
+) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
     let mut prefix = Vec::new();
     let tail = lower_packets_streamed(decoded, channel, planner, &mut |steps| {
         prefix.extend(steps);
@@ -129,12 +129,12 @@ fn lower_packets(
     Ok(tail.prepend_steps(prefix))
 }
 
-fn lower_packets_streamed(
+fn lower_packets_streamed<L: MaxwellFrontend>(
     decoded: &MaxwellDecodedPushbuffer,
     channel: &mut MaxwellGpuChannel,
-    mut planner: MaxwellSubmissionPlanner<'_>,
-    consume: &mut impl FnMut(Vec<MaxwellSubmissionExecutionStep>) -> Result<(), Box<str>>,
-) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
+    mut planner: MaxwellSubmissionPlanner<'_, L>,
+    consume: &mut impl FnMut(Vec<MaxwellSubmissionExecutionStep<L::Work>>) -> Result<(), Box<str>>,
+) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
     #[cfg(feature = "performance-counters")]
     let started = std::time::Instant::now();
     let frontend = planner.frontend();

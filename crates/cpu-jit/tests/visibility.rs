@@ -318,16 +318,27 @@ fn gpu_owned_code_is_resolved_at_execution_without_a_translation_lease() {
 }
 
 #[test]
-fn data_cache_clean_resolves_gpu_visibility_outside_native_execution() {
+fn data_cache_clean_defers_gpu_visibility_until_the_load() {
     bounded(|| {
-        // DC CVAC,X1; LDR X2,[X1]; SVC. The coordinator takes an exclusive
-        // mapping lease, so attempting readback in the native callback deadlocks.
-        let memory = fixture(&[0xd50b_7a21, 0xf940_0022, 0xd400_0001], None);
+        // DC CVAC,X1; SVC; LDR X2,[X1]; SVC. Maintenance must leave the
+        // GPU-owned page protected. Only the later load requests visibility,
+        // outside native execution: the coordinator takes an exclusive lease.
+        let memory = fixture(&[0xd50b_7a21, 0xd400_0001, 0xf940_0022, 0xd400_0001], None);
         let coordinator = publish(&memory, DATA, vec![0x22; 0x1000].into_boxed_slice(), false);
         let mut saved = A64State::default();
         saved.set_pc(CODE.get());
         saved.write_x(x(1), DATA.get());
         let mut state: ThreadState = saved.into();
+        assert!(matches!(
+            execute(&memory, &mut state).stop,
+            CpuExit::SupervisorCall { .. }
+        ));
+        assert_eq!(coordinator.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            memory.direct_protection_at(SPACE, DATA),
+            Some(nixe_memory::DirectProtection::None)
+        );
+        state.saved_mut().set_pc(CODE.get() + 8);
         assert!(matches!(
             execute(&memory, &mut state).stop,
             CpuExit::SupervisorCall { .. }

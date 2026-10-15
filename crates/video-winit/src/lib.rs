@@ -1,10 +1,14 @@
-//! `winit` window and shared-device `wgpu` presenter for Nixe frames.
+//! Main-thread window/input/UI with owner-controlled native Vulkan presentation.
 
 #[cfg(feature = "performance-counters")]
 pub mod metrics;
 
 mod keyboard;
+mod native;
 mod screenshot;
+mod vulkan;
+use native::Presenter;
+pub use vulkan::with_vulkan_device;
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -96,7 +100,7 @@ impl FrameNotifier for EventLoopFrameNotifier {
     }
 }
 
-/// Main-thread owner of the native window and WGPU presentation state.
+/// Main-thread owner of the window, input and UI state.
 pub struct WindowFrontend {
     event_loop: EventLoop<FrontendEvent>,
     application: PresenterApplication,
@@ -184,11 +188,16 @@ impl WindowFrontend {
     /// Enables on-demand native-resolution PNG captures with the S hotkey.
     #[must_use]
     pub fn with_screenshots(mut self, title: String, directory: std::path::PathBuf) -> Self {
-        self.application.screenshots = Some(screenshot::Screenshots::new(title, directory));
+        let screenshots = screenshot::Screenshots::new(title, directory);
+        if let Some(presenter) = &mut self.application.presenter {
+            presenter.screenshots = Some(screenshots);
+        } else {
+            self.application.screenshots = Some(screenshots);
+        }
         self
     }
 
-    /// Runs native event dispatch and WGPU presentation on the calling thread.
+    /// Runs window event dispatch and frontend UI on the calling thread.
     pub fn run(self) -> Result<Option<WindowState>, WindowError> {
         let Self {
             event_loop,
@@ -206,8 +215,19 @@ impl WindowFrontend {
     }
 }
 
-struct Presenter {
+struct PresenterState {
     window: Arc<Window>,
+    frame_dimensions: Option<(u32, u32)>,
+    backend_name: &'static str,
+    frame_rate: FrameRateTracker,
+    displayed_title: String,
+    keyboard: Option<keyboard::KeyboardOverlay>,
+    keyboard_host: Option<nixe_applets::keyboard::KeyboardHost>,
+    keyboard_redraw_at: Instant,
+    screenshots: Option<screenshot::Screenshots>,
+}
+struct LegacyPresenter {
+    common: PresenterState,
     instance: Instance,
     surface: Surface<'static>,
     device: Device,
@@ -219,21 +239,13 @@ struct Presenter {
     pipeline: RenderPipeline,
     sampling_buffer: Buffer,
     frame_bind_group: Option<BindGroup>,
-    frame_dimensions: Option<(u32, u32)>,
     pending_frame: Option<Arc<PresentationFrame>>,
     backend: nixe_gpu::BackendInstanceId,
-    backend_name: &'static str,
-    frame_rate: FrameRateTracker,
-    displayed_title: String,
     configured: bool,
     surface_reconfigure_pending: bool,
-    keyboard: Option<keyboard::KeyboardOverlay>,
-    keyboard_host: Option<nixe_applets::keyboard::KeyboardHost>,
-    keyboard_redraw_at: Instant,
-    screenshots: Option<screenshot::Screenshots>,
 }
 
-impl Presenter {
+impl LegacyPresenter {
     fn new(window: Arc<Window>, context: WgpuPresentationContext) -> Result<Self, WindowError> {
         let instance = context.instance().clone();
         let surface = instance
@@ -351,7 +363,7 @@ impl Presenter {
             mapped_at_creation: false,
         });
         let mut presenter = Self {
-            window,
+            common: PresenterState::new(window, backend_name),
             instance,
             surface,
             device,
@@ -363,18 +375,10 @@ impl Presenter {
             pipeline,
             sampling_buffer,
             frame_bind_group: None,
-            frame_dimensions: None,
             pending_frame: None,
             backend: context.backend(),
-            backend_name,
-            frame_rate: FrameRateTracker::new(Instant::now()),
-            displayed_title: String::new(),
             configured: false,
             surface_reconfigure_pending: false,
-            keyboard: None,
-            keyboard_host: None,
-            keyboard_redraw_at: Instant::now(),
-            screenshots: None,
         };
         presenter.resize(size.width, size.height);
         presenter.update_title();
@@ -399,20 +403,24 @@ impl Presenter {
     }
 
     fn resize_to_frame(&mut self) {
-        let Some((width, height)) = self.frame_dimensions else {
+        let Some((width, height)) = self.common.frame_dimensions else {
             return;
         };
-        let minimum = LogicalSize::new(320.0, 180.0).to_physical::<u32>(self.window.scale_factor());
-        self.window.set_min_inner_size(Some(PhysicalSize::new(
-            minimum.width.min(width),
-            minimum.height.min(height),
-        )));
+        let minimum =
+            LogicalSize::new(320.0, 180.0).to_physical::<u32>(self.common.window.scale_factor());
+        self.common
+            .window
+            .set_min_inner_size(Some(PhysicalSize::new(
+                minimum.width.min(width),
+                minimum.height.min(height),
+            )));
         if let Some(size) = self
+            .common
             .window
             .request_inner_size(PhysicalSize::new(width, height))
         {
             self.resize(size.width, size.height);
-            self.window.request_redraw();
+            self.common.window.request_redraw();
         }
     }
 
@@ -430,7 +438,7 @@ impl Presenter {
     fn recreate_surface(&mut self) -> Result<(), WindowError> {
         self.surface = self
             .instance
-            .create_surface(Arc::clone(&self.window))
+            .create_surface(Arc::clone(&self.common.window))
             .map_err(WindowError::surface)?;
         self.configured = false;
         self.surface_reconfigure_pending = true;
@@ -454,7 +462,7 @@ impl Presenter {
             ..Default::default()
         });
         self.frame_bind_group = Some(self.create_frame_bind_group(&view));
-        self.frame_dimensions = Some((frame.width(), frame.height()));
+        self.common.frame_dimensions = Some((frame.width(), frame.height()));
         let extent = image.description().extent();
         let crop = frame.crop();
         self.write_sampling(
@@ -474,7 +482,8 @@ impl Presenter {
 
     fn touch_position(&self, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
         let viewport = letterbox_viewport(
-            self.frame_dimensions
+            self.common
+                .frame_dimensions
                 .unwrap_or((TOUCH_SCREEN_WIDTH, TOUCH_SCREEN_HEIGHT)),
             (
                 self.surface_configuration.width,
@@ -533,12 +542,12 @@ impl Presenter {
             CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return Ok(()),
             CurrentSurfaceTexture::Outdated => {
                 self.surface_reconfigure_pending = true;
-                self.window.request_redraw();
+                self.common.window.request_redraw();
                 return Ok(());
             }
             CurrentSurfaceTexture::Lost => {
                 self.recreate_surface()?;
-                self.window.request_redraw();
+                self.common.window.request_redraw();
                 return Ok(());
             }
             CurrentSurfaceTexture::Validation => {
@@ -569,8 +578,9 @@ impl Presenter {
                 ..Default::default()
             });
             if let (Some(frame_dimensions), Some(frame_bind_group)) =
-                (self.frame_dimensions, self.frame_bind_group.as_ref())
+                (self.common.frame_dimensions, self.frame_bind_group.as_ref())
                 && !self
+                    .common
                     .keyboard
                     .as_ref()
                     .is_some_and(keyboard::KeyboardOverlay::active)
@@ -597,14 +607,15 @@ impl Presenter {
         }
         // egui uploads share the accelerated queue's synchronization boundary.
         let ui_active = self
+            .common
             .keyboard
             .as_ref()
             .is_some_and(keyboard::KeyboardOverlay::active);
         let _ui_queue_access = ui_active.then(|| self.queue_access.lock());
         if ui_active {
-            self.keyboard.as_mut().unwrap().encode(
-                self.keyboard_host.as_ref().unwrap(),
-                &self.window,
+            self.common.keyboard.as_mut().unwrap().encode(
+                self.common.keyboard_host.as_ref().unwrap(),
+                &self.common.window,
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -615,7 +626,7 @@ impl Presenter {
         // between frames wait for the next fresh frame, never sample a released
         // swapchain image that the guest may already be rewriting.
         let capture = if self.pending_frame.is_some() {
-            self.screenshots.as_mut().and_then(|screenshots| {
+            self.common.screenshots.as_mut().and_then(|screenshots| {
                 screenshots.encode(
                     &self.device,
                     &mut encoder,
@@ -637,44 +648,44 @@ impl Presenter {
         }
         self.pending_frame = None;
         if let Some(capture) = capture {
-            self.screenshots.as_mut().expect("capture requested").save(
-                self.device.clone(),
-                submission,
-                capture,
-            );
+            self.common
+                .screenshots
+                .as_mut()
+                .expect("capture requested")
+                .save(self.device.clone(), submission, capture);
         }
         drop(_ui_queue_access);
         // AM completion can wake guest CPU work; never invoke it under the GPU queue lock.
-        if let Some(keyboard) = &mut self.keyboard {
+        if let Some(keyboard) = &mut self.common.keyboard {
             keyboard.dispatch_submission();
         }
         if ui_active {
-            self.keyboard_redraw_at = Instant::now() + Duration::from_millis(16);
+            self.common.keyboard_redraw_at = Instant::now() + Duration::from_millis(16);
         }
         let now = Instant::now();
         self.refresh_title(now);
         if reconfigure_after_present {
             self.surface_reconfigure_pending = true;
-            self.window.request_redraw();
+            self.common.window.request_redraw();
         }
         Ok(())
     }
 
     fn refresh_title(&mut self, now: Instant) {
-        if self.frame_rate.refresh(now) {
+        if self.common.frame_rate.refresh(now) {
             self.update_title();
         }
     }
 
     fn update_title(&mut self) {
         let title = window_title(
-            self.backend_name,
-            self.frame_dimensions,
-            self.frame_rate.frames_per_second(),
+            self.common.backend_name,
+            self.common.frame_dimensions,
+            self.common.frame_rate.frames_per_second(),
         );
-        if title != self.displayed_title {
-            self.window.set_title(&title);
-            self.displayed_title = title;
+        if title != self.common.displayed_title {
+            self.common.window.set_title(&title);
+            self.common.displayed_title = title;
         }
     }
 }
@@ -933,19 +944,10 @@ impl PresenterApplication {
         };
         if let Some(request) = self.keyboard_host.take_request() {
             self.touch_tracker.cancel_all(&self.touch_screen_writer);
-            let overlay = presenter.keyboard.get_or_insert_with(|| {
-                keyboard::KeyboardOverlay::new(
-                    &presenter.window,
-                    &presenter.device,
-                    presenter.surface_configuration.format,
-                )
-            });
-            overlay.open(request);
-            presenter.keyboard_host = Some(self.keyboard_host.clone());
+            presenter.open_keyboard(request, self.keyboard_host.clone());
         }
         if let Some(frame) = self.mailbox.take_latest() {
             presenter.bind_frame(frame)?;
-            presenter.frame_rate.record_frame();
         }
         presenter.redraw()
     }
@@ -1032,11 +1034,12 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
         {
             return;
         }
+        let event_window = self.presenter.as_ref().map(|p| Arc::clone(&p.window));
         if let Some(presenter) = &mut self.presenter
             && let Some(keyboard) = &mut presenter.keyboard
             && keyboard.active()
         {
-            keyboard.event(&presenter.window, &event);
+            keyboard.event(event_window.as_ref().unwrap(), &event);
             if matches!(
                 event,
                 WindowEvent::KeyboardInput { .. }
@@ -1063,6 +1066,14 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 // loop waited for WorkerFinished while the worker waited for
                 // the HostStop sent after the event loop returned.
                 event_loop.exit();
+            }
+            WindowEvent::Occluded(occluded) => {
+                if let Some(Presenter::Native(presenter)) = &mut self.presenter {
+                    presenter.set_occluded(occluded);
+                    if let Some(presenter) = &self.presenter {
+                        presenter.window.request_redraw();
+                    }
+                }
             }
             WindowEvent::Resized(size) => {
                 if let Some(presenter) = &mut self.presenter {
@@ -1156,7 +1167,9 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.worker_completion.is_finished() {
+        // Like window close, frontend failure must return so the CLI can send
+        // HostStop and join the guest; waiting here for that join would deadlock.
+        if self.failure.is_some() || self.worker_completion.is_finished() {
             self.capture_window_state();
             self.presenter = None;
             event_loop.exit();
@@ -1169,6 +1182,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 .keyboard
                 .as_ref()
                 .is_some_and(keyboard::KeyboardOverlay::active)
+                || presenter.needs_retry()
             {
                 if now >= presenter.keyboard_redraw_at {
                     presenter.window.request_redraw();

@@ -36,7 +36,7 @@ fn compiled_patch_reads_restore_raw_war_ordering() {
     let barriers: Vec<_> = tc
         .instructions()
         .iter()
-        .filter(|i| matches!(i.operation(), ShaderOperation::PatchBarrier))
+        .filter(|i| matches!(i.operation(), nixe_gpu::ShaderOperation::PatchBarrier))
         .map(|i| (i.source().byte_offset(), i.predicate()))
         .collect();
     assert_eq!(
@@ -76,6 +76,6 @@ fn ordinary_demo_control_shader_needs_no_patch_output_barriers() {
             .ir()
             .instructions()
             .iter()
-            .all(|i| { !matches!(i.operation(), ShaderOperation::PatchBarrier) })
+            .all(|i| { !matches!(i.operation(), nixe_gpu::ShaderOperation::PatchBarrier) })
     );
 }

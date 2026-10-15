@@ -14,6 +14,11 @@ mod pushbuffer;
 mod scheduler;
 mod shader;
 mod shader_stage;
+pub use shader::{
+    MAXWELL_SHADER_NAMESPACE, MaxwellShaderCode, MaxwellShaderCompiler, MaxwellShaderSnapshot,
+    MaxwellSsaBinding, MaxwellSsaBindingSource, MaxwellSsaPipeline, MaxwellSsaProgram,
+    MaxwellSsaRequest, MaxwellSsaSource, compile_maxwell_pipeline_ssa, compile_maxwell_shader_ssa,
+};
 
 pub use address_space::{
     MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,
@@ -221,4 +226,14 @@ pub use scheduler::{
 };
 pub use shader::{
     MAXWELL_SHADER_PROGRAM_HEADER_SIZE, MAXWELL_SHADER_READ_LIMIT, MaxwellShaderTranslationError,
+};
+
+pub use execution::{MaxwellFrontend, MaxwellWork, MaxwellWorkBatch, MaxwellWorkSegment};
+
+pub type MaxwellWorkCommands<W> =
+    <<<W as MaxwellWork>::Batch as MaxwellWorkBatch<W>>::Segment as MaxwellWorkSegment>::Commands;
+
+pub use engines::{
+    MaxwellNativeFrontend, MaxwellResolvedComputeLaunch, MaxwellTwoDSolidOperation,
+    NativeFrontendStatistics,
 };

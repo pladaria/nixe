@@ -67,7 +67,7 @@ pub(super) fn prepare_buffer(
     mappings: Arc<[MaxwellThreeDMappingReference]>,
     writable: bool,
     cache: &mut MaxwellLoweringCache,
-    creations: &mut Vec<BackendResourceCreateInfo>,
+    creations: &mut Vec<ResourceDefinition>,
     invalidations: &mut Vec<ResourceDependency>,
     retained: impl Iterator<Item = ResourceDependency> + Clone,
 ) -> Result<ResourceDependency, MaxwellLoweringError> {
@@ -113,7 +113,7 @@ pub(super) fn prepare_buffer(
         Some(_) => {}
         None => {
             cache.allocations.push((allocation, allocation_description));
-            creations.push(BackendResourceCreateInfo::Allocation {
+            creations.push(ResourceDefinition::Allocation {
                 id: allocation,
                 description: allocation_description,
             });
@@ -123,7 +123,7 @@ pub(super) fn prepare_buffer(
     let id = BufferId::new(take_identity(cache)?);
     let view = BufferView::new(id, description, 0, backing)
         .map_err(|e| MaxwellLoweringError::BufferBacking(e.to_string()))?;
-    creations.push(BackendResourceCreateInfo::Buffer {
+    creations.push(ResourceDefinition::Buffer {
         id,
         description,
         view: Some(view),

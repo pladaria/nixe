@@ -4,7 +4,9 @@ use super::decode::{allocate_shader_temporary, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use super::float::{apply_float_source_modifiers, prepare_float_register_source};
 use crate::MaxwellShaderStage;
-use nixe_gpu::{ShaderOperation, ShaderRegister, ShaderRoundingMode, ShaderScalarType};
+use crate::shader::decoded::Operation as ShaderOperation;
+use crate::shader::decoded::Register as ShaderRegister;
+use nixe_gpu::{ShaderRoundingMode, ShaderScalarType};
 
 pub(super) const fn is_integer_to_float(encoding: u64) -> bool {
     let opcode = (encoding >> 48) as u16;
@@ -42,7 +44,7 @@ pub(super) fn decode_float_to_integer(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedFloatToInteger, MaxwellShaderTranslationError> {
     // Operand forms, destination type, rounding, and FTZ follow Mesa NAK's
     // pinned SM50 F2I encoder. Range clamping and NaN/FTZ behavior follow
@@ -132,7 +134,7 @@ pub(super) fn decode_float_to_integer(
         let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
         operations.push(ShaderOperation::LoadConstantBuffer32 {
             destination: temporary,
-            binding,
+            binding: binding.into(),
             byte_offset,
             scalar_type: ShaderScalarType::Float32,
         });
@@ -156,7 +158,7 @@ pub(super) fn decode_float_to_integer(
         });
     };
     operations.push(ShaderOperation::ConvertFloat32ToInteger {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         source,
         destination_type,
         destination_bits,
@@ -174,7 +176,7 @@ pub(super) fn decode_float_to_float(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedFloatToFloat, MaxwellShaderTranslationError> {
     // Operand forms and conversion controls follow Mesa NAK's pinned SM50
     // F2F encoder:
@@ -266,7 +268,7 @@ pub(super) fn decode_float_to_float(
         let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
         operations.push(ShaderOperation::LoadConstantBuffer32 {
             destination: temporary,
-            binding,
+            binding: binding.into(),
             byte_offset,
             scalar_type: ShaderScalarType::Float32,
         });
@@ -290,7 +292,7 @@ pub(super) fn decode_float_to_float(
         });
     };
     operations.push(ShaderOperation::RoundFloat32ToIntegral {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         source,
         rounding,
         flush_denormals_to_zero: encoding & (1 << 44) != 0,
@@ -306,7 +308,7 @@ pub(super) fn decode_integer_to_float(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedIntegerToFloat, MaxwellShaderTranslationError> {
     if encoding & (1 << 47) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -387,7 +389,7 @@ pub(super) fn decode_integer_to_float(
             temporary
         } else {
             validate_register_range(stage, offset, encoding, source, 1, register_count)?;
-            ShaderRegister::new(u16::from(source))
+            ShaderRegister::new(u32::from(source))
         };
         (source, None)
     } else {
@@ -403,7 +405,7 @@ pub(super) fn decode_integer_to_float(
             let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: temporary,
-                binding,
+                binding: binding.into(),
                 byte_offset,
                 scalar_type: source_type,
             });
@@ -569,7 +571,7 @@ pub(super) fn decode_integer_to_float(
         source
     };
     operations.push(ShaderOperation::ConvertIntegerToFloat32 {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         source,
         source_type,
         rounding,

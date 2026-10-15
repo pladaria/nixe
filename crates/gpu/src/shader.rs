@@ -16,6 +16,7 @@ mod linkage;
 mod liveness;
 pub use linkage::{ShaderStageInterfaceError, validate_shader_stage_link};
 pub mod spirv;
+pub mod ssa;
 mod tessellation;
 mod vertex_fetch;
 
@@ -393,7 +394,7 @@ impl ShaderInterfaceElement {
 /// Exchanges raw words within the rasterizer's 2x2 fragment quad, including
 /// helper invocations. This does not assume a host subgroup size or lane order.
 /// https://www.w3.org/TR/WGSL/#quad-operations
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShaderQuadOperation {
     Broadcast(u8),
     SwapHorizontal,

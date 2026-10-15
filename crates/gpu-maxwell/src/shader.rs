@@ -9,6 +9,7 @@ mod control_flow;
 mod conversion;
 mod data;
 mod decode;
+mod decoded;
 mod error;
 mod float;
 mod global_memory;
@@ -20,6 +21,12 @@ mod link;
 mod patch_address;
 mod quad;
 mod source;
+mod ssa;
+pub use ssa::{
+    MAXWELL_SHADER_NAMESPACE, MaxwellShaderCode, MaxwellShaderCompiler, MaxwellShaderSnapshot,
+    MaxwellSsaBinding, MaxwellSsaBindingSource, MaxwellSsaPipeline, MaxwellSsaProgram,
+    MaxwellSsaRequest, MaxwellSsaSource, compile_maxwell_pipeline_ssa, compile_maxwell_shader_ssa,
+};
 mod special;
 mod tessellation;
 mod texture;

@@ -230,7 +230,7 @@ struct CanonicalWriteSnapshot {
 /// One arena call coalesces equal-permission runs across physical pages.
 #[derive(Default)]
 struct DirectProtectionBatch {
-    arenas: BTreeMap<usize, (DirectArena, BTreeMap<u64, DirectProtectRequest>)>,
+    arenas: BTreeMap<usize, (DirectArena, Vec<DirectProtectRequest>)>,
 }
 
 impl DirectProtectionBatch {
@@ -245,26 +245,43 @@ impl DirectProtectionBatch {
             };
             self.arenas
                 .entry(arena_id)
-                .or_insert_with(|| (arena, BTreeMap::new()))
+                .or_insert_with(|| (arena, Vec::new()))
                 .1
-                .insert(
-                    alias.guest_address,
-                    DirectProtectRequest {
-                        guest_address: alias.guest_address,
-                        size: DIRECT_PAGE_SIZE,
-                        protection: protection(alias),
-                    },
-                );
+                .push(DirectProtectRequest {
+                    guest_address: alias.guest_address,
+                    size: DIRECT_PAGE_SIZE,
+                    protection: protection(alias),
+                });
             true
         });
     }
 
-    fn apply(&self) -> Result<(), DirectMemoryError> {
-        for (arena, requests) in self.arenas.values() {
-            arena.protect_ranges(&requests.values().copied().collect::<Vec<_>>())?;
+    fn apply(&mut self) -> Result<(), DirectMemoryError> {
+        for (arena, requests) in self.arenas.values_mut() {
+            order_protection_requests(requests);
+            arena.protect_ranges(requests)?;
         }
         Ok(())
     }
+}
+fn order_protection_requests(requests: &mut Vec<DirectProtectRequest>) {
+    // Collection is O(1) per alias, with no tree node per physical page.
+    // Canonical traversal usually already follows guest virtual address order.
+    // Stable sorting preserves the last transition for repeated aliases, as
+    // required when a batch collects more than one state change for a page.
+    if requests
+        .windows(2)
+        .any(|p| p[0].guest_address > p[1].guest_address)
+    {
+        requests.sort_by_key(|r| r.guest_address);
+    }
+    requests.dedup_by(|next, previous| {
+        if next.guest_address != previous.guest_address {
+            return false;
+        }
+        *previous = *next;
+        true
+    });
 }
 
 /// The caller owns ordered execution exclusion for distinct physical pages.
@@ -2794,6 +2811,35 @@ mod tests {
         CanonicalCpuWriteDependency, DeviceVisibilityPoint, DirectArena, DirectMapRequest,
         DirectProtection, GenerationKind, VisibilityCoordinatorError, VisibilityState,
     };
+
+    #[test]
+    fn protection_batch_preserves_last_transition_for_each_alias() {
+        use DirectProtection::{None, Read};
+        for (order, expected) in [
+            ([2, 0, 1, 0, 2], [None, Read, None]),
+            ([0, 0, 1, 2, 2], [Read, Read, None]),
+        ] {
+            let mut requests: Vec<_> = order
+                .into_iter()
+                .enumerate()
+                .map(|(i, page)| DirectProtectRequest {
+                    guest_address: page * DIRECT_PAGE_SIZE as u64,
+                    size: DIRECT_PAGE_SIZE,
+                    protection: if i < 3 {
+                        DirectProtection::Read
+                    } else {
+                        DirectProtection::None
+                    },
+                })
+                .collect();
+            order_protection_requests(&mut requests);
+            assert_eq!(requests.len(), 3);
+            for (page, request) in requests.iter().enumerate() {
+                assert_eq!(request.guest_address, (page * DIRECT_PAGE_SIZE) as u64);
+                assert_eq!(request.protection, expected[page]);
+            }
+        }
+    }
 
     #[test]
     fn ordered_device_overlay_preserves_later_cpu_bytes_outside_its_patch() {

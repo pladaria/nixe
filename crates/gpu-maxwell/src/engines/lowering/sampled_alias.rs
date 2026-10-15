@@ -102,7 +102,7 @@ fn can_copy(record: &ViewRecord, image: &MaxwellThreeDResolvedImage) -> bool {
 pub(super) fn prepare(
     image: &MaxwellThreeDResolvedImage,
     cache: &mut MaxwellLoweringCache,
-    creations: &mut Vec<BackendResourceCreateInfo>,
+    creations: &mut Vec<ResourceDefinition>,
 ) -> Result<Option<ResourceDependency>, MaxwellLoweringError> {
     let Some(producer) = cache
         .image_views()
@@ -150,7 +150,7 @@ pub(super) fn prepare(
         image_dependency(record.dependency)?
     } else {
         let id = ImageId::new(take_identity(cache)?);
-        creations.push(BackendResourceCreateInfo::Image {
+        creations.push(ResourceDefinition::Image {
             id,
             description: image.description(),
             view: None,

@@ -1,6 +1,7 @@
 //! Three-input integer addition, with unsigned half extraction before negation.
 //! https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/integer_add_three_input.cpp
 use super::*;
+use crate::shader::decoded::Operation as ShaderOperation;
 
 pub(in crate::shader) const fn is_add_three(encoding: u64) -> bool {
     let opcode = (encoding >> 48) as u16;
@@ -12,7 +13,7 @@ pub(in crate::shader) fn decode_add_three(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next: &mut u16,
+    next: &mut u32,
 ) -> Result<DecodedIntegerOperation, MaxwellShaderTranslationError> {
     if encoding & ((1 << 47) | (1 << 48)) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -69,7 +70,7 @@ pub(in crate::shader) fn decode_add_three(
             Ok(zero)
         } else {
             validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-            Ok(ShaderRegister::new(u16::from(raw)))
+            Ok(ShaderRegister::new(u32::from(raw)))
         }
     };
     let a = reg((encoding >> 8) as u8)?;
@@ -84,7 +85,7 @@ pub(in crate::shader) fn decode_add_three(
             constant_buffer_binding = Some(binding);
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination,
-                binding,
+                binding: binding.into(),
                 byte_offset: ((encoding >> 20) & 0x3fff) as u32 * 4,
                 scalar_type: ShaderScalarType::Unsigned32,
             });

@@ -3,9 +3,11 @@
 use super::decode::{allocate_shader_temporary, decode_predicate_fields, validate_register_range};
 use super::error::{MaxwellShaderTranslationError, malformed};
 use crate::MaxwellShaderStage;
+use crate::shader::decoded::Operation as ShaderOperation;
+use crate::shader::decoded::Register as ShaderRegister;
 use nixe_gpu::{
-    ShaderFloatComparison, ShaderFloatControl, ShaderNanMode, ShaderOperation,
-    ShaderPredicateSetOperation, ShaderRegister, ShaderRoundingMode, ShaderScalarType,
+    ShaderFloatComparison, ShaderFloatControl, ShaderNanMode, ShaderPredicateSetOperation,
+    ShaderRoundingMode, ShaderScalarType,
 };
 
 pub(super) const fn is_float_multiply(encoding: u64) -> bool {
@@ -69,7 +71,7 @@ pub(super) fn decode_float_multiply(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedFloatMultiply, MaxwellShaderTranslationError> {
     // SM50 FTZ and DNZ are distinct modes, not independent output/input flags.
     // DNZ implies FTZ and additionally makes +/-0 absorb even Inf/NaN to +0.
@@ -170,10 +172,10 @@ pub(super) fn decode_float_multiply(
             )
         } else {
             validate_register_range(stage, offset, encoding, right, 1, register_count)?;
-            (ShaderRegister::new(u16::from(right)), None, None)
+            (ShaderRegister::new(u32::from(right)), None, None)
         }
     } else {
-        if *next_temporary == u16::MAX {
+        if *next_temporary == u32::MAX {
             return Err(malformed(
                 stage,
                 offset,
@@ -190,7 +192,7 @@ pub(super) fn decode_float_multiply(
                 temporary,
                 Some(ShaderOperation::LoadConstantBuffer32 {
                     destination: temporary,
-                    binding,
+                    binding: binding.into(),
                     byte_offset,
                     scalar_type: ShaderScalarType::Float32,
                 }),
@@ -240,7 +242,7 @@ pub(super) fn decode_float_multiply(
         });
         destination
     } else {
-        ShaderRegister::new(u16::from(left))
+        ShaderRegister::new(u32::from(left))
     };
     if scale != 0 {
         let factor = allocate_shader_temporary(
@@ -297,14 +299,14 @@ pub(super) fn decode_float_multiply(
     }
     operations.push(if dnz {
         ShaderOperation::FloatMultiplyZero32 {
-            destination: ShaderRegister::new(u16::from(destination)),
+            destination: ShaderRegister::new(u32::from(destination)),
             left,
             right,
             float_control,
         }
     } else {
         ShaderOperation::Multiply32 {
-            destination: ShaderRegister::new(u16::from(destination)),
+            destination: ShaderRegister::new(u32::from(destination)),
             left,
             right,
             scalar_type: ShaderScalarType::Float32,
@@ -322,7 +324,7 @@ pub(super) fn decode_float_min_max(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedFloatMinMax, MaxwellShaderTranslationError> {
     // Operand forms and modifier fields follow Mesa NAK's pinned SM50 FMNMX
     // encoder and envytools' pinned GM107 disassembler table:
@@ -379,7 +381,7 @@ pub(super) fn decode_float_min_max(
             let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: temporary,
-                binding,
+                binding: binding.into(),
                 byte_offset,
                 scalar_type: ShaderScalarType::Float32,
             });
@@ -411,7 +413,7 @@ pub(super) fn decode_float_min_max(
     };
     let ftz = encoding & (1 << 44) != 0;
     operations.push(ShaderOperation::FloatMinMax32 {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         left,
         right,
         minimum: decode_predicate_fields(encoding, 39, 42),
@@ -434,7 +436,7 @@ pub(super) fn decode_float_add(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedFloatAdd, MaxwellShaderTranslationError> {
     // FADD32I carries all immediate bits at 20..51; modifiers move above it.
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L481-L535
@@ -530,7 +532,7 @@ pub(super) fn decode_float_add(
             let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: temporary,
-                binding,
+                binding: binding.into(),
                 byte_offset,
                 scalar_type: ShaderScalarType::Float32,
             });
@@ -561,7 +563,7 @@ pub(super) fn decode_float_add(
         }
     };
     operations.push(ShaderOperation::Add32 {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         left,
         right,
         scalar_type: ShaderScalarType::Float32,
@@ -578,7 +580,7 @@ pub(super) fn decode_float_set_predicate(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedFloatSetPredicate, MaxwellShaderTranslationError> {
     // Field locations and opcode forms follow Mesa NAK's pinned SM50 FSETP
     // encoder: https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L866-L898
@@ -678,7 +680,7 @@ pub(super) fn decode_float_set_predicate(
             let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: temporary,
-                binding,
+                binding: binding.into(),
                 byte_offset,
                 scalar_type: ShaderScalarType::Float32,
             });
@@ -732,7 +734,7 @@ pub(super) fn prepare_float_register_source(
     absolute: bool,
     negate: bool,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     operations: &mut Vec<ShaderOperation>,
 ) -> Result<ShaderRegister, MaxwellShaderTranslationError> {
     let source = if raw == 0xff {
@@ -751,7 +753,7 @@ pub(super) fn prepare_float_register_source(
         temporary
     } else {
         validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-        ShaderRegister::new(u16::from(raw))
+        ShaderRegister::new(u32::from(raw))
     };
     apply_float_source_modifiers(
         stage,
@@ -773,7 +775,7 @@ pub(super) fn apply_float_source_modifiers(
     mut source: ShaderRegister,
     absolute: bool,
     negate: bool,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
     operations: &mut Vec<ShaderOperation>,
 ) -> Result<ShaderRegister, MaxwellShaderTranslationError> {
     if absolute {
@@ -812,7 +814,7 @@ pub(super) fn decode_float_fused_multiply_add(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedFloatFusedMultiplyAdd, MaxwellShaderTranslationError> {
     // A floating CC write must not leave a preceding integer carry live.
     // https://github.com/devkitPro/uam/blob/master/mesa-imported/codegen/nv50_ir_emit_gm107.cpp (emitFFMA)
@@ -913,7 +915,7 @@ pub(super) fn decode_float_fused_multiply_add(
         constant_buffer_binding = Some(binding);
         operations.push(ShaderOperation::LoadConstantBuffer32 {
             destination: addend,
-            binding,
+            binding: binding.into(),
             byte_offset,
             scalar_type: ShaderScalarType::Float32,
         });
@@ -945,7 +947,7 @@ pub(super) fn decode_float_fused_multiply_add(
             constant_buffer_binding = Some(binding);
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: right,
-                binding,
+                binding: binding.into(),
                 byte_offset,
                 scalar_type: ShaderScalarType::Float32,
             });
@@ -989,7 +991,7 @@ pub(super) fn decode_float_fused_multiply_add(
         &mut operations,
     )?;
     operations.push(ShaderOperation::FusedMultiplyAdd32 {
-        destination: ShaderRegister::new(u16::from(destination)),
+        destination: ShaderRegister::new(u32::from(destination)),
         left,
         right,
         addend,
@@ -1017,7 +1019,7 @@ pub(super) fn decode_float_set(
     offset: u32,
     encoding: u64,
     register_count: u8,
-    next_temporary: &mut u16,
+    next_temporary: &mut u32,
 ) -> Result<DecodedFloatSetPredicate, MaxwellShaderTranslationError> {
     // FSET uses distinct modifier fields from FSET:
     // https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/envydis/gm107.c
@@ -1040,7 +1042,7 @@ pub(super) fn decode_float_set(
         )?
     } else {
         validate_register_range(stage, offset, encoding, raw, 1, register_count)?;
-        ShaderRegister::new(u16::from(raw))
+        ShaderRegister::new(u32::from(raw))
     };
     let comparison = match (encoding >> 48) & 0xf {
         1 => ShaderFloatComparison::OrderedLess,
@@ -1121,7 +1123,7 @@ pub(super) fn decode_float_set(
             let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
             operations.push(ShaderOperation::LoadConstantBuffer32 {
                 destination: temporary,
-                binding,
+                binding: binding.into(),
                 byte_offset,
                 scalar_type: ShaderScalarType::Float32,
             });

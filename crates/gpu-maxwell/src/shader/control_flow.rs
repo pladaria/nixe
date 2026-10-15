@@ -165,11 +165,15 @@ pub(super) fn discover_shader_control_flow(
             })?;
             pending.push_back((destination, taken_stack));
         }
-        if (!is_exit(encoding) && target.is_none()) || predicate != ShaderPredicate::Always {
+        // KIL terminates the invocation just like EXIT. Keeping a lexical
+        // fallthrough would turn dead instructions into bogus reachable CFG
+        // edges (and make the native compiler consume their operands).
+        let terminates = is_exit(encoding) || encoding >> 48 == 0xe330;
+        if (!terminates && target.is_none()) || predicate != ShaderPredicate::Always {
             // Metadata pushes are unconditional; their low bits are not an
             // instruction predicate. A taken branch uses its popped stack,
             // while its fallthrough retains the original one.
-            if !is_exit(encoding) || predicate != ShaderPredicate::Always {
+            if !terminates || predicate != ShaderPredicate::Always {
                 pending.push_back((index + 1, stack));
             }
         }

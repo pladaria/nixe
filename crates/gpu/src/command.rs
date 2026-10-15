@@ -975,8 +975,16 @@ impl StencilTestState {
 /// Immutable neutral state shared by draws which differ only in direct draw
 /// arguments. Frontends retain this record across unchanged draws so vertex
 /// layouts and pipeline state are not rebuilt for every submission.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct PreparedDraw {
+    identity: crate::PreparedStateId,
+    state: PreparedDrawState,
+}
+
+/// Semantic prepared state before assigning an immutable revision identity.
+/// Cloning these values does not clone a queued revision or its identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedDrawState {
     pub pipeline: PipelineId,
     pub render_pass: RenderPassId,
     pub topology: PrimitiveTopology,
@@ -1001,6 +1009,13 @@ pub struct PreparedDraw {
     dependencies: Box<[ResourceDependency]>,
 }
 
+impl std::ops::Deref for PreparedDraw {
+    type Target = PreparedDrawState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DrawOperation {
     pub prepared: Arc<PreparedDraw>,
@@ -1008,8 +1023,37 @@ pub struct DrawOperation {
 }
 
 impl PreparedDraw {
+    /// Edit only uniquely owned preparation state, advancing its cache revision.
+    /// Queued records cannot be edited while an Arc reference retains them.
+    pub fn edit_state(&mut self) -> &mut PreparedDrawState {
+        self.identity = crate::PreparedStateId::new(
+            self.identity.slot(),
+            self.identity
+                .revision()
+                .checked_add(1)
+                .expect("prepared-state revisions exhausted"),
+        );
+        &mut self.state
+    }
+
+    #[must_use]
+    pub fn from_state(identity: crate::PreparedStateId, state: PreparedDrawState) -> Self {
+        Self { identity, state }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &PreparedDrawState {
+        &self.state
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> crate::PreparedStateId {
+        self.identity
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        identity: crate::PreparedStateId,
         pipeline: PipelineId,
         render_pass: RenderPassId,
         topology: PrimitiveTopology,
@@ -1063,54 +1107,57 @@ impl PreparedDraw {
             push_target_dependency(&mut dependencies, access.target());
         }
         Ok(Self {
-            pipeline,
-            render_pass,
-            topology,
-            tessellation: None,
-            triangle_rasterization: TriangleRasterization::Fill,
-            line_rasterization: None,
-            front_face: FrontFace::CounterClockwise,
-            cull_mode: CullMode::None,
-            alpha_test: None,
-            color_outputs: [crate::ColorOutputState::REPLACE; 8],
-            descriptor_tables: descriptor_tables.into_boxed_slice(),
-            vertex_buffers: vertex_buffers.into_boxed_slice(),
-            index_buffer,
-            viewport_transform: None,
-            vertex_position_transform: None,
-            scissor: None,
-            depth_state: DepthState::DISABLED,
-            depth_bias: None,
-            stencil_state: None,
-            accesses: accesses.into_boxed_slice(),
-            dependencies: dependencies.into_boxed_slice(),
+            identity,
+            state: PreparedDrawState {
+                pipeline,
+                render_pass,
+                topology,
+                tessellation: None,
+                triangle_rasterization: TriangleRasterization::Fill,
+                line_rasterization: None,
+                front_face: FrontFace::CounterClockwise,
+                cull_mode: CullMode::None,
+                alpha_test: None,
+                color_outputs: [crate::ColorOutputState::REPLACE; 8],
+                descriptor_tables: descriptor_tables.into_boxed_slice(),
+                vertex_buffers: vertex_buffers.into_boxed_slice(),
+                index_buffer,
+                viewport_transform: None,
+                vertex_position_transform: None,
+                scissor: None,
+                depth_state: DepthState::DISABLED,
+                depth_bias: None,
+                stencil_state: None,
+                accesses: accesses.into_boxed_slice(),
+                dependencies: dependencies.into_boxed_slice(),
+            },
         })
     }
 
     #[must_use]
     pub fn with_viewport_transform(mut self, viewport_transform: ViewportTransform) -> Self {
-        self.viewport_transform = Some(viewport_transform);
+        self.edit_state().viewport_transform = Some(viewport_transform);
         self
     }
 
     #[must_use]
-    pub const fn with_depth_state(mut self, depth_state: DepthState) -> Self {
-        self.depth_state = depth_state;
+    pub fn with_depth_state(mut self, depth_state: DepthState) -> Self {
+        self.edit_state().depth_state = depth_state;
         self
     }
 
     #[must_use]
-    pub const fn with_triangle_rasterization(
+    pub fn with_triangle_rasterization(
         mut self,
         triangle_rasterization: TriangleRasterization,
     ) -> Self {
-        self.triangle_rasterization = triangle_rasterization;
+        self.edit_state().triangle_rasterization = triangle_rasterization;
         self
     }
 
     #[must_use]
-    pub const fn with_alpha_test(mut self, alpha_test: AlphaTest) -> Self {
-        self.alpha_test = Some(alpha_test);
+    pub fn with_alpha_test(mut self, alpha_test: AlphaTest) -> Self {
+        self.edit_state().alpha_test = Some(alpha_test);
         self
     }
 }
@@ -1389,6 +1436,7 @@ pub struct GpuOperation {
     accesses: Arc<[ResourceAccess]>,
     dependencies: Arc<[ResourceDependency]>,
     requirements: CapabilityRequirements,
+    retained_bytes: usize,
 }
 
 impl GpuOperation {
@@ -1409,7 +1457,13 @@ impl GpuOperation {
         let requirements = command
             .capability_requirements()
             .merged(&additional_requirements);
+        let retained_bytes = std::mem::size_of::<Self>()
+            + std::mem::size_of_val(accesses.as_slice())
+            + std::mem::size_of_val(dependencies.as_slice())
+            + std::mem::size_of_val(requirements.requirements())
+            + command_retained_bytes(&command);
         Self {
+            retained_bytes,
             command,
             accesses: accesses.into(),
             dependencies: dependencies.into(),
@@ -1431,7 +1485,14 @@ impl GpuOperation {
             accesses: Arc::clone(&self.accesses),
             dependencies: Arc::clone(&self.dependencies),
             requirements: self.requirements.clone(),
+            retained_bytes: self.retained_bytes,
         })
+    }
+
+    /// Conservative charge for queued immutable metadata and payloads.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     #[must_use]
@@ -1691,6 +1752,33 @@ impl GpuCommand {
             _ => {}
         }
         CapabilityRequirements::new(requirements)
+    }
+}
+
+fn command_retained_bytes(command: &GpuCommand) -> usize {
+    match command {
+        GpuCommand::UploadImage { bytes, .. } => bytes.len(),
+        GpuCommand::Draw(draw) => {
+            let state = &draw.prepared;
+            std::mem::size_of::<PreparedDraw>()
+                + std::mem::size_of_val(state.descriptor_tables.as_ref())
+                + std::mem::size_of_val(state.vertex_buffers.as_ref())
+                + state
+                    .vertex_buffers
+                    .iter()
+                    .map(|layout| std::mem::size_of_val(layout.attributes.as_ref()))
+                    .sum::<usize>()
+                + std::mem::size_of_val(state.accesses.as_ref())
+                + std::mem::size_of_val(state.dependencies.as_ref())
+        }
+        GpuCommand::Dispatch(dispatch) => {
+            std::mem::size_of_val(dispatch.descriptor_tables.as_ref())
+        }
+        GpuCommand::Barrier(barrier) => std::mem::size_of_val(barrier.transitions()),
+        GpuCommand::RenderPass(RenderPassOperation::Begin { attachments, .. }) => {
+            std::mem::size_of_val(attachments.as_ref())
+        }
+        _ => 0,
     }
 }
 
@@ -2182,6 +2270,7 @@ mod tests {
             DrawOperation::new(
                 Arc::new(
                     PreparedDraw::new(
+                        crate::PreparedStateId::new(1, 1),
                         PipelineId::new(1),
                         RenderPassId::new(1),
                         PrimitiveTopology::Triangles,
@@ -2235,15 +2324,18 @@ mod tests {
 
     #[test]
     fn patch_draw_requires_tessellation_state_without_changing_draw_arguments() {
-        let mut prepared = PreparedDraw::new(
-            PipelineId::new(1),
-            RenderPassId::new(1),
-            PrimitiveTopology::Patches,
-            vec![],
-            vec![],
-            None,
-        )
-        .unwrap();
+        let mut prepared = Arc::new(
+            PreparedDraw::new(
+                crate::PreparedStateId::new(1, 1),
+                PipelineId::new(1),
+                RenderPassId::new(1),
+                PrimitiveTopology::Patches,
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap(),
+        );
         let arguments = DrawArguments::NonIndexed {
             first_vertex: 4,
             vertex_count: 12,
@@ -2251,10 +2343,13 @@ mod tests {
             instance_count: 3,
         };
         assert_eq!(
-            DrawOperation::new(Arc::new(prepared.clone()), arguments),
+            DrawOperation::new(Arc::clone(&prepared), arguments),
             Err(CommandDescriptionError::TessellationTopologyMismatch)
         );
-        prepared.tessellation = Some(crate::TessellationState {
+        Arc::get_mut(&mut prepared)
+            .unwrap()
+            .edit_state()
+            .tessellation = Some(crate::TessellationState {
             mode: crate::TessellationMode {
                 domain: crate::TessellationDomain::Triangles,
                 spacing: crate::TessellationSpacing::Equal,
@@ -2266,20 +2361,26 @@ mod tests {
             control: crate::TessellationControl::Shader,
         });
         assert_eq!(
-            DrawOperation::new(Arc::new(prepared.clone()), arguments)
+            DrawOperation::new(Arc::clone(&prepared), arguments)
                 .unwrap()
                 .arguments,
             arguments
         );
-        prepared.topology = PrimitiveTopology::Triangles;
+        Arc::get_mut(&mut prepared).unwrap().edit_state().topology = PrimitiveTopology::Triangles;
         assert_eq!(
-            DrawOperation::new(Arc::new(prepared.clone()), arguments),
+            DrawOperation::new(Arc::clone(&prepared), arguments),
             Err(CommandDescriptionError::TessellationTopologyMismatch)
         );
-        prepared.topology = PrimitiveTopology::Patches;
-        prepared.tessellation.as_mut().unwrap().input_control_points = 0;
+        Arc::get_mut(&mut prepared).unwrap().edit_state().topology = PrimitiveTopology::Patches;
+        Arc::get_mut(&mut prepared)
+            .unwrap()
+            .edit_state()
+            .tessellation
+            .as_mut()
+            .unwrap()
+            .input_control_points = 0;
         assert_eq!(
-            DrawOperation::new(Arc::new(prepared), arguments),
+            DrawOperation::new(prepared, arguments),
             Err(CommandDescriptionError::TessellationTopologyMismatch)
         );
     }
@@ -2587,6 +2688,7 @@ mod tests {
 
         assert_eq!(
             PreparedDraw::new(
+                crate::PreparedStateId::new(1, 1),
                 PipelineId::new(1),
                 RenderPassId::new(1),
                 PrimitiveTopology::Points,

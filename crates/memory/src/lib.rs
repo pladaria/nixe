@@ -42,10 +42,11 @@ pub use invalidation::{
     MemoryInvalidationOrigin, MemoryInvalidationReservation, MemoryInvalidationSource,
 };
 pub use range::{
-    CanonicalBackingRange, CanonicalBackingSegment, CanonicalByteSnapshots,
-    CanonicalCpuWriteDependency, CanonicalRangeAccessError, CanonicalRangeError,
-    CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
-    CpuWriteSnapshotRequest, CpuWriteSnapshotSelection,
+    CanonicalBackingRange, CanonicalBackingSegment, CanonicalByteLayout, CanonicalByteMappingKey,
+    CanonicalByteSnapshots, CanonicalByteTile, CanonicalCpuWriteDependency,
+    CanonicalRangeAccessError, CanonicalRangeError, CanonicalRangeTranslationError,
+    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, CpuWriteSnapshotRequest,
+    CpuWriteSnapshotSelection,
 };
 pub use visibility::{
     CpuVisibilityRequest, CpuVisibilityResolver, DeviceVisibilityRequest, VisibilityCoordinator,

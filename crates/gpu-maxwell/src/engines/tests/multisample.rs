@@ -1,5 +1,5 @@
 use super::*;
-use nixe_gpu::{BackendResourceCreateInfo, ClearOperation, ImageExtent, ResourceDependency};
+use nixe_gpu::{ClearOperation, ImageExtent, ResourceDefinition, ResourceDependency};
 
 fn source_target(channel: &mut MaxwellGpuChannel, address: u64, compression: Option<u32>) {
     for (method, argument) in [
@@ -192,7 +192,7 @@ fn check_msaa_clear_draw_resolve(compression: Option<u32>, raw: u32, format: Ima
         .resource_creations()
         .iter()
         .find_map(|create| match create {
-            BackendResourceCreateInfo::Image {
+            ResourceDefinition::Image {
                 id,
                 view: Some(view),
                 ..
@@ -334,12 +334,82 @@ fn four_sample_depth_clear_materializes_both_guest_packings() {
             work.resource_creations()
                 .iter()
                 .any(|creation| matches!(creation,
-            BackendResourceCreateInfo::Image { description, view: Some(view), .. }
+            ResourceDefinition::Image { description, view: Some(view), .. }
             if !view.has_canonical_texels() && description.samples() == SampleCount::Four
             && description.extent() == ImageExtent::new(32, 16, 1).unwrap()
             && description.format() == ImageFormat::Depth24UnormStencil8Uint))
         );
     }
+}
+
+#[test]
+fn two_d_point_source_uses_only_the_accessed_pitch_rectangle() {
+    use crate::engines::twod::blit::{BlitKind, BlitSurfaceLayout};
+    let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let destination = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let mut space = resource_address_space();
+    let src = map_resource(
+        &mut space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        75,
+        0,
+    );
+    let dst = map_resource(
+        &mut space,
+        destination
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        76,
+        0xfe,
+    );
+    let mut channel = two_d_channel();
+    program_resolve(&mut channel, src.offset().get(), dst.offset().get());
+    for (method, argument) in [
+        (0x0234, 1), // Pitch source, width extends beyond the row increment.
+        (0x0244, 48),
+        (0x0248, 20),
+        (0x024c, 7),
+        (0x0218, 16),
+        (0x021c, 8),
+        (0x088c, 0),
+        (0x08b8, 12),
+        (0x08bc, 3),
+        (0x08c4, 1),
+        (0x08cc, 1),
+        (0x08d0, 0),
+        (0x08d4, 8),
+        (0x08d8, 0),
+    ] {
+        two_d_write(&mut channel, method, argument).unwrap();
+    }
+    let dispatch = two_d_write(&mut channel, 0x08dc, 2).unwrap();
+    let [MaxwellEngineOperation::TwoDBlit(request)] = dispatch.ordered_operations() else {
+        panic!("one point blit expected")
+    };
+    assert_eq!(
+        request.images[0].address,
+        src.offset().get() + 2 * 48 + 8 * 4
+    );
+    assert_eq!((request.images[0].width, request.images[0].height), (12, 3));
+    assert_eq!(request.images[0].layout, BlitSurfaceLayout::Pitch(48));
+    assert!(matches!(request.kind, BlitKind::Copy { origins, extent }
+        if origins[0] == nixe_gpu::ImageOrigin { x: 0, y: 0, z: 0 }
+        && extent == ImageExtent::new(12, 3, 1).unwrap()));
+    let mut cache = MaxwellLoweringCache::default();
+    let resources = cache
+        .resolved_resources_mut()
+        .resolve_color_images(request, &space, 16)
+        .unwrap();
+    let MaxwellThreeDResolvedResource::Image(image) = &resources.resources()[0] else {
+        panic!("source image expected")
+    };
+    assert_eq!(
+        image.description().extent(),
+        ImageExtent::new(12, 3, 1).unwrap()
+    );
+    assert_eq!(image.source().size(), 48 * 3);
 }
 
 #[test]

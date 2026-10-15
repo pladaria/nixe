@@ -900,11 +900,7 @@ fn resolve_maxwell_three_d_resources_inner(
         match target.readiness(true) {
             MaxwellThreeDAttachmentReadiness::Unprogrammed
             | MaxwellThreeDAttachmentReadiness::Disabled => {}
-            MaxwellThreeDAttachmentReadiness::Ready => builder.color_target(
-                index as u8,
-                target,
-                state.render_targets().srgb_write().value() == Some(&true),
-            )?,
+            MaxwellThreeDAttachmentReadiness::Ready => builder.color_target(index as u8, target)?,
             _ => {
                 return Err(MaxwellThreeDResourceError::IncompleteState { role });
             }
@@ -2582,7 +2578,6 @@ impl<'a> ResourceBuilder<'a> {
         &mut self,
         index: u8,
         target: &MaxwellThreeDColorTargetState,
-        srgb_write: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let role = MaxwellThreeDResourceRole::ColorTarget(index);
         let address = unresolved(
@@ -2612,18 +2607,11 @@ impl<'a> ResourceBuilder<'a> {
             .copied()
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
         let format = color_image_format(guest_format.raw(), role)?;
-        // Framebuffer sRGB controls attachment conversion and blending, while
-        // sampled texture descriptors independently retain their sRGB format.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2883-L2886
-        let format = if srgb_write {
-            format
-        } else {
-            match format {
-                ImageFormat::Rgba8Srgb => ImageFormat::Rgba8Unorm,
-                ImageFormat::Bgra8Srgb => ImageFormat::Bgra8Unorm,
-                other => other,
-            }
-        };
+        // GM20B color surface formats explicitly distinguish UNORM and sRGB.
+        // deko3d programs RGBA8Srgb/BGRA8Srgb directly without SET_SRGB_WRITE;
+        // the latter's zero reset must not strip the attachment's transfer function.
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc#L46-L47
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L50-L55
         let (dimension, depth, layers, selected_layer) = match kind {
             MaxwellThreeDImageKind::Array => {
                 let layers = u16::try_from(third)

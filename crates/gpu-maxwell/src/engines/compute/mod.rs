@@ -6,9 +6,8 @@ mod operations;
 mod qmd;
 mod state;
 
-pub(crate) use launch::MaxwellResolvedComputeLaunch;
 pub(crate) use launch::resolve_compute_launch;
-pub use launch::{MaxwellComputeLaunch, MaxwellComputeLaunchError};
+pub use launch::{MaxwellComputeLaunch, MaxwellComputeLaunchError, MaxwellResolvedComputeLaunch};
 
 pub use operations::{
     MaxwellComputeOperationTrigger, MaxwellComputeShaderCacheInvalidation,

@@ -53,7 +53,7 @@ impl SpirvDefaultControlShader {
     }
 }
 
-pub(super) fn parameters(required_levels: u8, control: TessellationControl) -> Result<[u32; 6]> {
+pub(crate) fn parameters(required_levels: u8, control: TessellationControl) -> Result<[u32; 6]> {
     let TessellationControl::DefaultLevels {
         outer,
         inner,
@@ -176,10 +176,10 @@ pub fn lower_default_tessellation_control_to_spirv(
         float64: Default::default(),
     });
     e.emit_interfaces(&ir)?;
-    let block = e.b.type_struct([e.uint; 6]);
-    e.b.decorate(block, spv::Decoration::Block, []);
+    let block = e.math.b.type_struct([e.math.uint; 6]);
+    e.math.b.decorate(block, spv::Decoration::Block, []);
     for lane in 0..6 {
-        e.b.member_decorate(
+        e.math.b.member_decorate(
             block,
             lane,
             spv::Decoration::Offset,
@@ -188,49 +188,61 @@ pub fn lower_default_tessellation_control_to_spirv(
             )],
         );
     }
-    let ptr =
-        e.b.type_pointer(None, spv::StorageClass::PushConstant, block);
-    let parameters =
-        e.b.variable(ptr, None, spv::StorageClass::PushConstant, None);
-    let word_ptr =
-        e.b.type_pointer(None, spv::StorageClass::PushConstant, e.uint);
-    let void = e.b.type_void();
-    let function = e.b.type_function(void, []);
-    e.entry =
-        e.b.begin_function(void, None, spv::FunctionControl::NONE, function)?;
+    let ptr = e
+        .math
+        .b
+        .type_pointer(None, spv::StorageClass::PushConstant, block);
+    let parameters = e
+        .math
+        .b
+        .variable(ptr, None, spv::StorageClass::PushConstant, None);
+    let word_ptr = e
+        .math
+        .b
+        .type_pointer(None, spv::StorageClass::PushConstant, e.math.uint);
+    let void = e.math.b.type_void();
+    let function = e.math.b.type_function(void, []);
+    e.math.entry = e
+        .math
+        .b
+        .begin_function(void, None, spv::FunctionControl::NONE, function)?;
     e.configure_stage(&ir)?;
-    e.block = e.b.begin_block(None)?;
+    e.math.block = e.math.b.begin_block(None)?;
     let invocation = e.load_interface(true, ShaderIoLocation::InvocationId, 0, None)?;
     for &(location, component) in forwarded.keys() {
         let bits = e.load_interface(true, location, component, Some(invocation))?;
         e.store_interface(location, component, Some(invocation), bits)?;
     }
-    let zero = e.constant(0);
-    let first = e.b.i_equal(e.boolean, None, invocation, zero)?;
-    let write_levels = e.b.id();
-    let merge = e.b.id();
-    e.b.selection_merge(merge, spv::SelectionControl::NONE)?;
-    e.b.branch_conditional(first, write_levels, merge, [])?;
-    e.b.begin_block(Some(write_levels))?;
+    let zero = e.math.constant(0);
+    let first = e.math.b.i_equal(e.math.boolean, None, invocation, zero)?;
+    let write_levels = e.math.b.id();
+    let merge = e.math.b.id();
+    e.math
+        .b
+        .selection_merge(merge, spv::SelectionControl::NONE)?;
+    e.math
+        .b
+        .branch_conditional(first, write_levels, merge, [])?;
+    e.math.b.begin_block(Some(write_levels))?;
     for lane in 0..6 {
         if required_levels & (1 << lane) == 0 {
             continue;
         }
-        let index = e.constant(u32::from(lane));
-        let pointer = e.b.access_chain(word_ptr, None, parameters, [index])?;
-        let bits = e.b.load(e.uint, None, pointer, None, [])?;
+        let index = e.math.constant(u32::from(lane));
+        let pointer = e.math.b.access_chain(word_ptr, None, parameters, [index])?;
+        let bits = e.math.b.load(e.math.uint, None, pointer, None, [])?;
         let (location, component) = level_lane(lane);
         e.store_interface(location, component, None, bits)?;
     }
     // There are no cross-invocation output reads. Stage completion suffices;
     // an extra patch-wide rendezvous would add work without providing semantics.
-    e.b.branch(merge)?;
-    e.b.begin_block(Some(merge))?;
-    e.b.ret()?;
-    e.b.end_function()?;
+    e.math.b.branch(merge)?;
+    e.math.b.begin_block(Some(merge))?;
+    e.math.b.ret()?;
+    e.math.b.end_function()?;
     Ok(SpirvDefaultControlShader {
         module: SpirvShaderModule {
-            words: e.b.module().assemble().into_boxed_slice(),
+            words: e.math.b.module().assemble().into_boxed_slice(),
             bindings: Box::new([]),
         },
         required_levels,

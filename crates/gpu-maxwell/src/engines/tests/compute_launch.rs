@@ -223,8 +223,8 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
             // per slot, but never another shader or pipeline.
             assert!(work.resource_creations().iter().all(|c| matches!(
                 c,
-                nixe_gpu::BackendResourceCreateInfo::Buffer { .. }
-                    | nixe_gpu::BackendResourceCreateInfo::DescriptorTable { .. }
+                nixe_gpu::ResourceDefinition::Buffer { .. }
+                    | nixe_gpu::ResourceDefinition::DescriptorTable { .. }
             )));
             ring_tables.push(tables);
         } else {
@@ -255,7 +255,7 @@ fn storage_launch_case(mut runtime: Option<Box<dyn nixe_gpu::NeutralBackendRunti
         changed
             .resource_creations()
             .iter()
-            .any(|c| matches!(c, nixe_gpu::BackendResourceCreateInfo::Shader { .. }))
+            .any(|c| matches!(c, nixe_gpu::ResourceDefinition::Shader { .. }))
     );
     assert!(
         changed
