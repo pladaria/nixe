@@ -168,7 +168,7 @@ impl VulkanResidency {
             ),
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         )?;
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let native = Arc::clone(&self.image(image)?.native);
         let work = self.device.work_ticket()?;
         self.device.retire_image(Arc::clone(&native), work)?;

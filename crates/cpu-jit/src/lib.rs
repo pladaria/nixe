@@ -16,7 +16,7 @@ use nixe_cpu::execution::{
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::{CpuMemory, ExecutionMemory, InstructionMemory};
 use nixe_cpu::profile::ProcessCpuContext;
-use nixe_memory::{GuestVirtualAddress, MemoryInvalidationSource};
+use nixe_memory::{DirectAddressSpaceView, GuestVirtualAddress, MemoryInvalidationSource};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -61,6 +61,7 @@ impl Drop for Native {
 pub struct JitProcess {
     cpu: ProcessCpuContext,
     memory: Arc<ExecutionMemory>,
+    arena: DirectAddressSpaceView,
     monitor: Arc<Monitor>,
     cores: Mutex<Vec<Weak<Native>>>,
     stopped: AtomicBool,
@@ -73,12 +74,11 @@ impl JitProcess {
         memory: Arc<ExecutionMemory>,
         timer_frequency: u64,
     ) -> Result<Self, JitError> {
-        if memory
+        // The backend is bound once before process publication. Retained memory
+        // owns the arena for the JIT process's entire lifetime.
+        let arena = memory
             .direct_address_space_view(cpu.address_space_id())
-            .is_none()
-        {
-            return Err(JitError("Dynarmic requires a direct memory arena".into()));
-        }
+            .ok_or_else(|| JitError("Dynarmic requires a direct memory arena".into()))?;
         let frequency = u32::try_from(timer_frequency)
             .ok()
             .filter(|f| *f != 0)
@@ -92,6 +92,7 @@ impl JitProcess {
         Ok(Self {
             cpu,
             memory,
+            arena,
             monitor: Arc::new(Monitor(monitor)),
             cores: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
@@ -131,10 +132,7 @@ pub struct JitThread {
 }
 impl JitThread {
     pub fn new(process: Arc<JitProcess>) -> Result<Self, JitError> {
-        let arena = process
-            .memory
-            .direct_address_space_view(process.cpu.address_space_id())
-            .unwrap();
+        let arena = process.arena;
         if !arena.address_space_size.is_power_of_two() {
             return Err(JitError(
                 "Dynarmic arena size must be a power of two".into(),
@@ -376,6 +374,7 @@ impl JitThread {
             let active = self.control.enter_execution();
             let mut context = callbacks::Context {
                 memory: &process.memory,
+                arena: process.arena,
                 cpu: process.cpu,
                 timer,
                 blocked_fetches: &mut self.blocked_fetches,
@@ -390,10 +389,7 @@ impl JitThread {
             let native_measurement = Timer::new(Counter::NativeRunNanoseconds);
             let ok = invocation::run(
                 worker,
-                process
-                    .memory
-                    .direct_address_space_view(process.cpu.address_space_id())
-                    .unwrap(),
+                process.arena,
                 self.native.pointer,
                 &mut context,
                 instruction_budget - progress,

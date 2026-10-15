@@ -252,8 +252,14 @@ impl Barriers {
     pub fn queue_image(&mut self, barrier: vk::ImageMemoryBarrier2<'static>) {
         self.images.push(barrier);
     }
-    pub fn emit(&mut self, device: &VulkanDevice) {
-        if self.memory.is_empty() && self.buffers.is_empty() && self.images.is_empty() {
+    pub(super) fn is_empty(&self) -> bool {
+        self.memory.is_empty() && self.buffers.is_empty() && self.images.is_empty()
+    }
+    pub fn emit(&mut self, device: &mut VulkanDevice) {
+        // Transfers, compute, and barriers are recorded outside dynamic rendering.
+        // Graphics alone may retain the scope when no dependency is pending.
+        device.end_rendering();
+        if self.is_empty() {
             return;
         }
         let index = device

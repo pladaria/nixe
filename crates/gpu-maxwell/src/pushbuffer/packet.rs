@@ -593,6 +593,7 @@ pub(crate) struct SubmissionWords<'a> {
     current_entry: u32,
     current_bytes: Vec<u8>,
     current_offset: usize,
+    current_segment: usize,
     failed: bool,
 }
 
@@ -608,29 +609,33 @@ impl<'a> SubmissionWords<'a> {
             current_entry: 0,
             current_bytes: Vec::new(),
             current_offset: 0,
+            current_segment: 0,
             failed: false,
         }
     }
 
     fn load_next_entry(&mut self) -> Result<bool, MaxwellGpfifoSourceError> {
+        if self.next_entry == 0 {
+            self.submission.validate_sources(self.address_space)?;
+        }
         let Some(pushbuffer) = self.submission.pushbuffers().get(self.next_entry) else {
             return Ok(false);
         };
         let byte_count = usize::try_from(pushbuffer.entry().byte_count())
             .map_err(|_| MaxwellGpfifoSourceError::ArithmeticOverflow)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(byte_count)
+        self.current_bytes.clear();
+        self.current_bytes
+            .try_reserve(byte_count)
             .map_err(|_| MaxwellGpfifoSourceError::ResourceExhausted)?;
-        bytes.resize(byte_count, 0);
-        self.submission.read_pushbuffer(
+        self.current_bytes.resize(byte_count, 0);
+        self.submission.read_entry(
             self.address_space,
             pushbuffer.entry_index(),
-            &mut bytes,
+            &mut self.current_bytes,
         )?;
         self.current_entry = pushbuffer.entry_index();
-        self.current_bytes = bytes;
         self.current_offset = 0;
+        self.current_segment = 0;
         self.next_entry += 1;
         Ok(true)
     }
@@ -661,23 +666,29 @@ impl Iterator for SubmissionWords<'_> {
                 .expect("GPFIFO word counts always produce complete dwords"),
         );
         self.current_offset += 4;
-        let word_offset = match u64::try_from(word_offset) {
-            Ok(offset) => offset,
-            Err(_) => {
-                self.failed = true;
-                return Some(Err(MaxwellGpfifoSourceError::ArithmeticOverflow));
-            }
-        };
-        match self
-            .submission
-            .word_location(self.current_entry, word_offset)
+        let pushbuffer = &self.submission.pushbuffers()[self.next_entry - 1];
+        // The retained range proves the entry's complete ordered mapping.
+        // Walk it once while decoding instead of searching from its first
+        // segment and rechecking the entry bounds for every command word.
+        let address = pushbuffer.entry().address().get() + word_offset as u64 * 4;
+        let segments = pushbuffer.source().segments();
+        while address
+            >= segments[self.current_segment].gpu_offset().get()
+                + segments[self.current_segment].size()
         {
-            Ok(location) => Some(Ok(MaxwellPushbufferWord::new(value, location))),
-            Err(error) => {
-                self.failed = true;
-                Some(Err(error))
-            }
+            self.current_segment += 1;
         }
+        let mapping = segments[self.current_segment].mapping();
+        let location = MaxwellGpfifoSourceLocation {
+            channel: self.submission.channel(),
+            frontend: self.submission.frontend(),
+            entry_index: self.current_entry,
+            pushbuffer: pushbuffer.entry().address(),
+            word_offset: word_offset as u64,
+            mapping: mapping.id(),
+            generation: mapping.generation(),
+        };
+        Some(Ok(MaxwellPushbufferWord::new(value, location)))
     }
 }
 

@@ -318,6 +318,18 @@ impl MaxwellValidatedGpfifoSubmission {
         output: &mut [u8],
     ) -> Result<(), MaxwellGpfifoSourceError> {
         self.validate_sources(address_space)?;
+        self.read_entry(address_space, entry_index, output)
+    }
+
+    /// The streaming decoder checks the complete retained submission once
+    /// before its first read. Each entry still revalidates its own live mappings
+    /// in read_resolved; repeating the all-entry scan here would be quadratic.
+    pub(crate) fn read_entry(
+        &self,
+        address_space: &MaxwellGpuAddressSpace,
+        entry_index: u32,
+        output: &mut [u8],
+    ) -> Result<(), MaxwellGpfifoSourceError> {
         let pushbuffer = self
             .pushbuffers
             .get(entry_index as usize)
@@ -1286,6 +1298,19 @@ mod tests {
             .read_pushbuffer(&address_space, 0, &mut bytes)
             .unwrap();
         assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let words = crate::pushbuffer::packet::SubmissionWords::new(&validated, &address_space)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (index, word) in words.iter().enumerate() {
+            assert_eq!(
+                word.value(),
+                u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+            );
+            assert_eq!(
+                word.location(),
+                validated.word_location(0, index as u64).unwrap()
+            );
+        }
 
         drop(first_allocation);
         address_space.unmap(first.offset()).unwrap();

@@ -225,6 +225,7 @@ impl Frames {
             }
         };
         let snapshot = &mut self.snapshots[slot];
+        cache.device_mut().end_rendering();
         let index = cache.device_mut().submission.begin()?;
         let device = cache.device();
         let command = device.submission.slots[index].command;

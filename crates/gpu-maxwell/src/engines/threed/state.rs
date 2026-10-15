@@ -244,7 +244,6 @@ pub enum MaxwellThreeDRegisterOrigin {
 /// One typed register with explicit validity and optional write provenance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDRegister<T> {
-    origin: MaxwellThreeDRegisterOrigin,
     raw: Option<u32>,
     value: Option<T>,
     source: Option<MaxwellMethodSource>,
@@ -255,7 +254,13 @@ impl<T> MaxwellThreeDRegister<T> {
     /// explicitly programmed. Callers must not treat `Unset` as zero.
     #[must_use]
     pub const fn origin(&self) -> MaxwellThreeDRegisterOrigin {
-        self.origin
+        if self.source.is_some() {
+            MaxwellThreeDRegisterOrigin::Programmed
+        } else if self.raw.is_some() {
+            MaxwellThreeDRegisterOrigin::VerifiedReset
+        } else {
+            MaxwellThreeDRegisterOrigin::Unset
+        }
     }
 
     /// Exact method/reset bits retained before later semantic interpretation.
@@ -280,7 +285,6 @@ impl<T> MaxwellThreeDRegister<T> {
 impl<T> Default for MaxwellThreeDRegister<T> {
     fn default() -> Self {
         Self {
-            origin: MaxwellThreeDRegisterOrigin::Unset,
             raw: None,
             value: None,
             source: None,
@@ -291,7 +295,6 @@ impl<T> Default for MaxwellThreeDRegister<T> {
 impl<T> MaxwellThreeDRegister<T> {
     pub(super) const fn verified_reset(raw: u32, value: Option<T>) -> Self {
         Self {
-            origin: MaxwellThreeDRegisterOrigin::VerifiedReset,
             raw: Some(raw),
             value,
             source: None,
@@ -300,11 +303,57 @@ impl<T> MaxwellThreeDRegister<T> {
 
     pub(super) const fn programmed(raw: u32, value: T, source: MaxwellMethodSource) -> Self {
         Self {
-            origin: MaxwellThreeDRegisterOrigin::Programmed,
             raw: Some(raw),
             value: Some(value),
             source: Some(source),
         }
+    }
+}
+
+/// The fixed class register file keeps consumed raw words dense. Source records
+/// are cold: MME reads, shadow replay and change detection never load them.
+/// Diagnostic inspection reconstructs the typed register only when requested.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct MaxwellThreeDRawRegisterFile {
+    values: Box<[Option<u32>]>,
+    sources: Box<[Option<MaxwellMethodSource>]>,
+}
+
+impl Default for MaxwellThreeDRawRegisterFile {
+    fn default() -> Self {
+        Self {
+            values: vec![None; 0x1000].into_boxed_slice(),
+            sources: vec![None; 0x1000].into_boxed_slice(),
+        }
+    }
+}
+
+impl MaxwellThreeDRawRegisterFile {
+    pub(super) fn raw(&self, method: GpuMethodId) -> Option<u32> {
+        if !method.0.is_multiple_of(4) {
+            return None;
+        }
+        self.values.get((method.0 / 4) as usize).copied().flatten()
+    }
+
+    pub(super) fn inspect(&self, method: GpuMethodId) -> Option<MaxwellThreeDRegister<u32>> {
+        let value = self.raw(method)?;
+        Some(match self.sources[(method.0 / 4) as usize] {
+            Some(source) => MaxwellThreeDRegister::programmed(value, value, source),
+            None => MaxwellThreeDRegister::verified_reset(value, Some(value)),
+        })
+    }
+
+    fn set_reset(&mut self, method: GpuMethodId, value: u32) {
+        let index = (method.0 / 4) as usize;
+        self.values[index] = Some(value);
+        self.sources[index] = None;
+    }
+
+    pub(super) fn write(&mut self, method: GpuMethodId, value: u32, source: MaxwellMethodSource) {
+        let index = (method.0 / 4) as usize;
+        self.values[index] = Some(value);
+        self.sources[index] = Some(source);
     }
 }
 
@@ -666,86 +715,72 @@ impl MaxwellThreeDRasterState {
     pub const fn new() -> Self {
         Self {
             point_size: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             attribute_point_size: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             point_sprite_enable: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             anti_aliased_point_enable: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             point_sprite_select: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             point_center_mode: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             edge_flag: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             alpha_fraction: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             bounding_box: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             fill_via_triangle: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             conservative_raster: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             polygon_smooth_enable: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             polygon_stipple_enable: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             polygon_stipple_pattern: [const {
                 MaxwellThreeDRegister {
-                    origin: MaxwellThreeDRegisterOrigin::Unset,
                     raw: None,
                     value: None,
                     source: None,
@@ -910,13 +945,11 @@ impl MaxwellThreeDViewportState {
     pub const fn new() -> Self {
         Self {
             z_clip_range: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
             },
             pixel_center: MaxwellThreeDRegister {
-                origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
                 source: None,
@@ -946,6 +979,7 @@ pub struct MaxwellThreeDState {
     // independent revision counters happen to have the same numeric value.
     cache_scope: Arc<()>,
     draw_state_revision: u64,
+    draw_parameters_revision: u64,
     render_target_revision: u64,
     vertex_resource_revision: u64,
     constant_buffer_revision: u64,
@@ -998,9 +1032,14 @@ pub(crate) struct MaxwellThreeDShaderStateIdentity {
 pub(crate) struct MaxwellThreeDDrawStateIdentity {
     scope: Arc<()>,
     revision: u64,
+    parameters_revision: u64,
 }
 
 impl MaxwellThreeDDrawStateIdentity {
+    pub(crate) fn matches_parameters(&self, state: &MaxwellThreeDState) -> bool {
+        Arc::ptr_eq(&self.scope, &state.cache_scope)
+            && self.parameters_revision == state.draw_parameters_revision
+    }
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
         Arc::ptr_eq(&self.scope, &state.cache_scope) && self.revision == state.draw_state_revision
     }
@@ -1068,6 +1107,7 @@ impl std::hash::Hash for MaxwellThreeDResourceStateIdentity {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MaxwellThreeDResourceSemanticWrites {
     draw_state: bool,
+    draw_parameters: bool,
     render_targets: bool,
     vertex_resources: bool,
     constant_buffers: bool,
@@ -1078,6 +1118,7 @@ struct MaxwellThreeDResourceSemanticWrites {
 impl MaxwellThreeDResourceSemanticWrites {
     const fn any(self) -> bool {
         self.draw_state
+            || self.draw_parameters
             || self.render_targets
             || self.vertex_resources
             || self.constant_buffers
@@ -1089,7 +1130,7 @@ impl MaxwellThreeDResourceSemanticWrites {
 /// Complete currently modeled live state of one channel's `MAXWELL_B` engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellThreeDFrontendState {
-    raw_registers: Box<[Option<MaxwellThreeDRegister<u32>>]>,
+    raw_registers: MaxwellThreeDRawRegisterFile,
     pub(in crate::engines) pending_notification: Option<(u64, MaxwellMethodSource)>,
     operation: MaxwellThreeDState,
     mme: MaxwellThreeDMmeState,
@@ -1101,7 +1142,7 @@ impl Default for MaxwellThreeDFrontendState {
     fn default() -> Self {
         // Maxwell methods are 12-bit word addresses in PFIFO. Keep validated
         // raw values and provenance in that fixed register file, not a tree.
-        let mut raw_registers = vec![None; 0x1000].into_boxed_slice();
+        let mut raw_registers = MaxwellThreeDRawRegisterFile::default();
         for method in [
             0x1208,
             0x15b8,
@@ -1119,8 +1160,7 @@ impl Default for MaxwellThreeDFrontendState {
         ] {
             let reset = verified_raw_register_reset(GpuMethodId(method))
                 .expect("listed Maxwell register reset must be verified");
-            raw_registers[(method / 4) as usize] =
-                Some(MaxwellThreeDRegister::verified_reset(reset, Some(reset)));
+            raw_registers.set_reset(GpuMethodId(method), reset);
         }
         for pipeline in 0..MAXWELL_PIPELINE_SHADER_COUNT {
             let method = MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD
@@ -1128,32 +1168,24 @@ impl Default for MaxwellThreeDFrontendState {
             for register in [method, method + 0x10] {
                 let reset = verified_raw_register_reset(GpuMethodId(register))
                     .expect("listed Maxwell pipeline reset must be verified");
-                raw_registers[(register / 4) as usize] =
-                    Some(MaxwellThreeDRegister::verified_reset(reset, Some(reset)));
+                raw_registers.set_reset(GpuMethodId(register), reset);
             }
         }
         for target in 0..MAXWELL_COLOR_TARGET_COUNT {
             let blend_method = BLEND_SEPARATE_ALPHA_BASE + target as u32 * BLEND_TARGET_STRIDE;
-            raw_registers[(blend_method / 4) as usize] =
-                Some(MaxwellThreeDRegister::verified_reset(
-                    BLEND_SEPARATE_ALPHA_RESET,
-                    Some(BLEND_SEPARATE_ALPHA_RESET),
-                ));
+            raw_registers.set_reset(GpuMethodId(blend_method), BLEND_SEPARATE_ALPHA_RESET);
             let method = MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD
                 + target as u32 * MAXWELL_THREE_D_COLOR_TARGET_STRIDE
                 + MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET;
             let reset = verified_raw_register_reset(GpuMethodId(method))
                 .expect("listed Maxwell color-target layer reset must be verified");
-            raw_registers[(method / 4) as usize] =
-                Some(MaxwellThreeDRegister::verified_reset(reset, Some(reset)));
+            raw_registers.set_reset(GpuMethodId(method), reset);
 
             let compression_method = MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD
                 + target as u32 * MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE;
             let compression_reset = verified_raw_register_reset(GpuMethodId(compression_method))
                 .expect("listed Maxwell color-compression reset must be verified");
-            raw_registers[(compression_method / 4) as usize] = Some(
-                MaxwellThreeDRegister::verified_reset(compression_reset, Some(compression_reset)),
-            );
+            raw_registers.set_reset(GpuMethodId(compression_method), compression_reset);
         }
         Self {
             raw_registers,
@@ -1192,17 +1224,18 @@ impl MaxwellThreeDFrontendState {
 
     /// Returns the last validated raw value for one byte-addressed class method.
     #[must_use]
-    pub fn raw_register(&self, method: GpuMethodId) -> Option<&MaxwellThreeDRegister<u32>> {
-        if !method.0.is_multiple_of(4) {
-            return None;
-        }
-        self.raw_registers.get((method.0 / 4) as usize)?.as_ref()
+    pub(super) fn raw_register_value(&self, method: GpuMethodId) -> Option<u32> {
+        self.raw_registers.raw(method)
+    }
+
+    #[cfg(test)]
+    pub fn raw_register(&self, method: GpuMethodId) -> Option<MaxwellThreeDRegister<u32>> {
+        self.raw_registers.inspect(method)
     }
 
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
-        self.raw_registers[(source.method().0 / 4) as usize] = Some(
-            MaxwellThreeDRegister::programmed(source.argument(), source.argument(), source),
-        );
+        self.raw_registers
+            .write(source.method(), source.argument(), source);
     }
 }
 
@@ -1211,6 +1244,7 @@ impl MaxwellThreeDState {
         MaxwellThreeDDrawStateIdentity {
             scope: Arc::clone(&self.cache_scope),
             revision: self.draw_state_revision,
+            parameters_revision: self.draw_parameters_revision,
         }
     }
 
@@ -1428,6 +1462,9 @@ impl MaxwellThreeDFrontendState {
         if resource_semantic_writes.draw_state {
             advance_revision(&mut state.draw_state_revision);
         }
+        if resource_semantic_writes.draw_parameters {
+            advance_revision(&mut state.draw_parameters_revision);
+        }
         if resource_semantic_writes.render_targets {
             advance_revision(&mut state.render_target_revision);
         }
@@ -1470,6 +1507,7 @@ impl MaxwellThreeDFrontendState {
             });
         }
         self.resource_semantic_writes.draw_state = write.affects_prepared_draw();
+        self.resource_semantic_writes.draw_parameters = write.affects_draw_parameters();
         self.shader_semantic_write = write.affects_shader_translation();
         match write {
             MaxwellThreeDStateWrite::PointSize { value, source } => {
@@ -1597,8 +1635,8 @@ impl MaxwellThreeDFrontendState {
                     source: write.source(),
                 };
                 self.mme.apply(completion);
-                self.raw_registers[(0x3400 / 4) as usize] =
-                    Some(MaxwellThreeDRegister::programmed(1, 1, write.source()));
+                self.raw_registers
+                    .write(GpuMethodId(0x3400), 1, write.source());
             }
             MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
         }
@@ -1877,6 +1915,27 @@ pub enum MaxwellThreeDStateWrite {
 }
 
 impl MaxwellThreeDStateWrite {
+    const fn affects_draw_parameters(self) -> bool {
+        // Physical stream windows and draw arguments do not change vertex
+        // formats, rasterization, or shader specialization. They are resolved
+        // and bounds-checked independently at each consuming draw.
+        self.affects_prepared_draw()
+            && !matches!(
+                self,
+                Self::VertexInput(
+                    MaxwellThreeDVertexInputWrite::StreamAddressUpper { .. }
+                        | MaxwellThreeDVertexInputWrite::StreamAddressLower { .. }
+                        | MaxwellThreeDVertexInputWrite::StreamLimitUpper { .. }
+                        | MaxwellThreeDVertexInputWrite::StreamLimitLower { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexAddressUpper { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexAddressLower { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexLimitUpper { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexLimitLower { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexFirst { .. }
+                        | MaxwellThreeDVertexInputWrite::IndexCount { .. }
+                )
+            )
+    }
     const fn affects_prepared_draw(self) -> bool {
         match self {
             Self::PointSize { .. }

@@ -154,6 +154,8 @@ pub struct BufferUpload {
     pub consumed: usize,
 }
 struct BufferEntry {
+    streaming_cpu: Option<CanonicalCpuWriteDependency>,
+    streamed: Option<buffer::StreamedBuffer>,
     image_import: Option<buffer::ImageBufferImport>,
     contents: Contents,
     native: Arc<AllocatedBuffer>,
@@ -240,7 +242,10 @@ pub struct ImageViewDescription {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResidencyStatistics {
+    pub attachment_publication_hits: u64,
     pub cpu_uploaded_bytes: u64,
+    pub cpu_streamed_bytes: u64,
+    pub cpu_stream_hits: u64,
     pub gpu_copied_bytes: u64,
     /// Exact bytes transferred to host memory, excluding GPU-only realignment.
     pub native_readback_bytes: u64,
@@ -772,7 +777,7 @@ impl VulkanResidency {
         waits: &[vk::SemaphoreSubmitInfo<'_>],
         signals: &[vk::SemaphoreSubmitInfo<'_>],
     ) -> Result<Option<WorkTicket>, VulkanError> {
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let work = match unsafe {
             self.device
                 .submission

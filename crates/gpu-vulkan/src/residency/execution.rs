@@ -11,6 +11,7 @@ pub use graphics::{
     AttachmentSource, Draw, IndexBuffer, PreparedDraw, PreparedTargets, RenderAttachment,
     RenderingTargets, VertexBuffer,
 };
+pub(crate) use state::PreparedGraphicsState;
 pub use state::{GraphicsParameters, PreparedGraphics};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -90,6 +91,8 @@ pub struct PreparedProgram {
     pub(super) pipeline: Arc<NativePipeline>,
     record: Option<Arc<BindingRecord>>,
     pub(super) uses: Box<[Use]>,
+    // Descriptor-order correspondence to the merged canonical access windows.
+    binding_uses: Box<[Option<usize>]>,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Dispatch {
@@ -110,6 +113,7 @@ impl VulkanResidency {
                 pipeline,
                 record: Some(record),
                 uses: Box::new([]),
+                binding_uses: Box::new([]),
             },
             parameters,
         )
@@ -119,6 +123,7 @@ impl VulkanResidency {
         graphics: &PreparedGraphics,
         push: &[u8],
     ) -> Result<(), VulkanError> {
+        self.device.end_rendering();
         self.graphics_state(graphics)?;
         self.program_bind(&graphics.program, push).map(|_| ())
     }
@@ -314,6 +319,12 @@ impl VulkanResidency {
             }
             merged.push(next);
         }
+        let binding_uses = bindings.iter().map(|binding| match binding {
+            Binding::Buffer { buffer, offset, size } => merged.iter().position(|usage| matches!(usage,
+                Use::Buffer { id, offset: start, size: length, .. } if id == buffer && *start <= *offset && *offset + *size <= *start + *length
+            )),
+            _ => None,
+        }).collect();
         let record = if resources.is_empty() {
             None
         } else {
@@ -323,10 +334,78 @@ impl VulkanResidency {
             pipeline,
             record,
             uses: merged.into_boxed_slice(),
+            binding_uses,
         })
     }
+    fn stream_program(
+        &mut self,
+        program: &PreparedProgram,
+        descriptors: &mut DescriptorCache,
+    ) -> Result<(Option<Arc<BindingRecord>>, Vec<bool>), VulkanError> {
+        let Some(record) = &program.record else {
+            return Ok((None, Vec::new()));
+        };
+        let mut streams = Vec::with_capacity(program.uses.len());
+        for usage in &program.uses {
+            streams.push(match *usage {
+                Use::Buffer {
+                    id,
+                    offset,
+                    size,
+                    scope,
+                } if !scope.writes() => self.stream_buffer(
+                    id,
+                    offset,
+                    size,
+                    self.device
+                        .profile()
+                        .limits
+                        .min_storage_buffer_offset_alignment,
+                )?,
+                _ => None,
+            });
+        }
+        let mask = streams.iter().map(Option::is_some).collect();
+        if streams.iter().all(Option::is_none) {
+            return Ok((None, mask));
+        }
+        let mut resources = record.resources.clone();
+        for ((resource, usage), original) in resources
+            .iter_mut()
+            .zip(&program.binding_uses)
+            .zip(&record.resources)
+        {
+            if let Some(index) = usage
+                && let Some((buffer, base)) = &streams[*index]
+                && let DescriptorResource::Buffer { offset, range, .. } = original
+            {
+                let Use::Buffer { offset: start, .. } = program.uses[*index] else {
+                    unreachable!()
+                };
+                *resource = DescriptorResource::Buffer {
+                    buffer: Arc::clone(buffer),
+                    offset: base + offset - start,
+                    range: *range,
+                };
+            }
+        }
+        Ok((
+            Some(descriptors.get(Arc::clone(&program.pipeline.layout), resources)?),
+            mask,
+        ))
+    }
     pub(super) fn program_access(&mut self, program: &PreparedProgram) -> Result<(), VulkanError> {
-        for &resource in &program.uses {
+        self.program_access_except(program, &[])
+    }
+    fn program_access_except(
+        &mut self,
+        program: &PreparedProgram,
+        streamed: &[bool],
+    ) -> Result<(), VulkanError> {
+        for (index, &resource) in program.uses.iter().enumerate() {
+            if streamed.get(index).copied().unwrap_or(false) {
+                continue;
+            }
             match resource {
                 Use::Buffer {
                     id,
@@ -380,6 +459,14 @@ impl VulkanResidency {
         program: &PreparedProgram,
         push: &[u8],
     ) -> Result<vk::CommandBuffer, VulkanError> {
+        self.program_bind_record(program, push, program.record.as_ref())
+    }
+    fn program_bind_record(
+        &mut self,
+        program: &PreparedProgram,
+        push: &[u8],
+        record: Option<&Arc<BindingRecord>>,
+    ) -> Result<vk::CommandBuffer, VulkanError> {
         if push.len() < program.pipeline.layout.key.push_bytes as usize
             || !push.len().is_multiple_of(4)
             || push.len() > self.device.profile().limits.max_push_constants_size as usize
@@ -389,7 +476,7 @@ impl VulkanResidency {
             ));
         }
         self.device.bind_native_pipeline(&program.pipeline)?;
-        if let Some(record) = &program.record {
+        if let Some(record) = record {
             self.device
                 .bind_native_descriptors(&program.pipeline, record)?;
         }
@@ -448,7 +535,7 @@ impl VulkanResidency {
             }
             _ => None,
         };
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let command = self.program_bind(program, push)?;
         unsafe {
             match dispatch {

@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 nixe-memory.workspace = true
+rustc-hash.workspace = true

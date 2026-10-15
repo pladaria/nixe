@@ -6,16 +6,16 @@ use rustc_hash::FxHashMap;
 struct PagePlan {
     page: CanonicalPageId,
     spans: Arc<Spans>,
+    binding_revision: u64,
 }
 pub(super) struct ImageWritePlan {
     ownership: CanonicalBackingRange,
     pages: Box<[PagePlan]>,
     logical: Box<[(u64, u64)]>,
     repeated: bool,
-    aliases: Option<AliasCoverage>,
+    aliases: Option<Box<[AliasWindows]>>,
     queued: Option<WorkTicket>,
 }
-type AliasCoverage = (Box<[u64]>, Box<[AliasWindows]>);
 struct AliasWindows {
     resource: Resource,
     windows: Box<[(u64, u64)]>,
@@ -123,6 +123,7 @@ impl VulkanResidency {
                     Some(PagePlan {
                         page: page.page,
                         spans,
+                        binding_revision: 0,
                     })
                 })
                 .collect()
@@ -131,6 +132,7 @@ impl VulkanResidency {
                 .pages()
                 .map(|page| PagePlan {
                     page: page.identity(),
+                    binding_revision: 0,
                     spans: Arc::new(Spans::image(
                         backing.clone(),
                         page.identity(),
@@ -224,12 +226,21 @@ impl VulkanResidency {
         let source = Resource::Image(id);
         // Layout changes invalidate alias coverage; producer epochs do not.
         // This metadata is owned by the recorder and never rebuilt per unchanged draw.
-        if plan.aliases.as_ref().is_none_or(|(revisions, _)| {
-            revisions
-                .iter()
-                .zip(&plan.pages)
-                .any(|(revision, p)| *revision != self.index.pages[&p.page].revision)
-        }) {
+        // Alias discovery reads immutable bindings, not producer authority.
+        // Update authority and inspect binding revisions in the same lookup;
+        // unchanged plans no longer walk/hash every physical page twice.
+        let mut rebuild_aliases = plan.aliases.is_none();
+        for p in plan.pages.iter_mut() {
+            let page = self
+                .index
+                .pages
+                .get_mut(&p.page)
+                .expect("indexed write plan");
+            rebuild_aliases |= p.binding_revision != page.revision;
+            p.binding_revision = page.revision;
+            page.record_image_write(source, &p.spans, point);
+        }
+        if rebuild_aliases {
             let mut aliases = FxHashMap::<Resource, Vec<(u64, u64)>>::default();
             for p in plan.pages.iter() {
                 let page = self.index.pages.get(&p.page).expect("indexed write plan");
@@ -291,11 +302,7 @@ impl VulkanResidency {
                     }
                 }
             }
-            plan.aliases = Some((
-                plan.pages
-                    .iter()
-                    .map(|p| self.index.pages[&p.page].revision)
-                    .collect(),
+            plan.aliases = Some(
                 aliases
                     .into_iter()
                     .map(|(resource, mut windows)| {
@@ -312,23 +319,15 @@ impl VulkanResidency {
                         }
                     })
                     .collect(),
-            ));
+            );
         }
-        for alias in plan.aliases.as_ref().unwrap().1.iter() {
+        for alias in plan.aliases.as_ref().unwrap().iter() {
             let contents = self.contents_mut(alias.resource);
             if contents.invalid.as_slice() == alias.windows.as_ref() {
                 continue;
             }
             contents.invalidate_intervals(&alias.windows);
         }
-        for p in plan.pages.iter() {
-            self.index
-                .pages
-                .get_mut(&p.page)
-                .unwrap()
-                .record_image_write(source, &p.spans, point);
-        }
-
         // One accepted recording tick needs this immutable coverage once.
         // Exact producer authority above still changes on every write. A CPU
         // demand necessarily flushes the recorder before materializing bytes,

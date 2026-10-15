@@ -1,5 +1,11 @@
 //! Physical buffer lookup, CPU epochs and GPU alias reconstruction.
 use super::*;
+pub(super) struct StreamedBuffer {
+    work: WorkTicket,
+    window: (u64, u64),
+    buffer: Arc<AllocatedBuffer>,
+    offset: u64,
+}
 #[derive(Clone)]
 pub(super) struct ImageBufferImport {
     source: ImageId,
@@ -83,6 +89,8 @@ impl VulkanResidency {
         self.buffers[slot] = Slot {
             generation,
             entry: Some(BufferEntry {
+                streaming_cpu: None,
+                streamed: None,
                 image_import: None,
                 contents: Contents {
                     invalid: vec![(0, backing.size())],
@@ -105,6 +113,103 @@ impl VulkanResidency {
         }
         self.touch(Resource::Buffer(id));
         Ok(id)
+    }
+    /// Small CPU-authored read snapshots can be consumed directly from the
+    /// mapped submission arena. Every version has a distinct, atom-isolated
+    /// region retained until timeline completion; GPU-authored data and large
+    /// working sets continue through the native device buffer and exact hazards.
+    pub(super) fn stream_buffer(
+        &mut self,
+        id: BufferId,
+        offset: u64,
+        size: u64,
+        alignment: u64,
+    ) -> Result<Option<(Arc<AllocatedBuffer>, u64)>, VulkanError> {
+        const MAX_STREAM_BYTES: u64 = 64 * 1024;
+        self.check_buffer_range(id, offset, size)?;
+        if size > MAX_STREAM_BYTES || size > self.device.submission.configuration.arena_bytes {
+            return Ok(None);
+        }
+        let backing = self
+            .buffer(id)?
+            .contents
+            .backing
+            .snapshot_subrange(offset, size)
+            .map_err(memory_error)?;
+        if backing
+            .pages()
+            .any(|page| self.gpu_owned(page.identity(), page.visibility_state()))
+        {
+            return Ok(None);
+        }
+        let work = self.device.work_ticket()?;
+        if let Some(entry) = &self.buffers[id.slot].entry
+            && let Some(stream) = &entry.streamed
+            && stream.work == work
+            && stream.window == (offset, size)
+            && entry
+                .streaming_cpu
+                .as_ref()
+                .is_some_and(CanonicalCpuWriteDependency::remains_current)
+        {
+            let binding = (Arc::clone(&stream.buffer), stream.offset);
+            self.statistics.cpu_stream_hits += 1;
+            self.touch(Resource::Buffer(id));
+            return Ok(Some(binding));
+        }
+        // Descriptor records can outlive a submission. Restrict direct streams
+        // to the fixed arenas; retaining overflow allocations in that cache
+        // would escape the queue's transient overflow accounting.
+        let slot = self.device.submission.begin()?;
+        if let Some(arena) = &self.device.submission.slots[slot].upload
+            && crate::queue::align_up(
+                arena.cursor,
+                alignment.max(4).max(arena.buffer.host_alignment()),
+            )
+            .and_then(|start| start.checked_add(size))
+            .is_none_or(|end| end > arena.buffer.size())
+        {
+            return Ok(None);
+        }
+        let dependency = if let Some(dependency) = &self.buffer(id)?.streaming_cpu {
+            dependency.clone()
+        } else {
+            let dependency =
+                CanonicalCpuWriteDependency::capture(&self.buffer(id)?.contents.backing)
+                    .map_err(memory_error)?;
+            self.buffers[id.slot].entry.as_mut().unwrap().streaming_cpu = Some(dependency.clone());
+            dependency
+        };
+        // This observer is independent of the persistent native buffer's dirty
+        // proof: streaming must not acknowledge data that buffer never imported.
+        let mut snapshots = dependency
+            .snapshot_with_resolver(&backing, CpuWriteSnapshotSelection::All, 1, &mut |_, _| {
+                Err(nixe_memory::VisibilityCoordinatorError::new(
+                    "streamed CPU snapshot crossed concurrent GPU ownership",
+                ))
+            })
+            .map_err(memory_error)?;
+        let (_, bytes) = snapshots.pop().expect("complete CPU stream snapshot");
+        let (slot, slice) = self
+            .device
+            .submission
+            .reserve_upload_aligned(&bytes, alignment.max(4))?;
+        let buffer = self.device.submission.slots[slot].upload_lease(slice);
+        let work = self.device.work_ticket()?;
+        let contents = self.contents_mut(Resource::Buffer(id));
+        contents.last_use = Some(work);
+        contents.touched = work.tick();
+        self.buffers[id.slot].entry.as_mut().unwrap().streamed = Some(StreamedBuffer {
+            work,
+            window: (offset, size),
+            buffer: Arc::clone(&buffer),
+            offset: slice.offset,
+        });
+        self.statistics.cpu_streamed_bytes += size;
+        // Queue submission makes these already-flushed host writes visible;
+        // no transfer command or in-rendering pipeline barrier is required.
+        // https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-submission-host-writes
+        Ok(Some((buffer, slice.offset)))
     }
     /// Warm buffers do one CPU summary check and no page walk or transfer.
     pub fn ensure_buffer(&mut self, id: BufferId) -> Result<(), VulkanError> {
@@ -186,6 +291,21 @@ impl VulkanResidency {
             .map(|page| page.identity())
             .collect();
         let all_cpu = gpu_pages.is_empty();
+        if all_cpu && (invalid.is_empty() || invalid == [(0, backing.size())]) {
+            // A dirty-only request already returns ordered disjoint windows;
+            // a complete invalidation needs one full snapshot, not overlapping
+            // dirty and forced copies of the same bytes.
+            let selection = if invalid.is_empty() {
+                CpuWriteSnapshotSelection::DirtyPages
+            } else {
+                CpuWriteSnapshotSelection::All
+            };
+            return dependency.snapshot_with_resolver(backing, selection, 1, &mut |_, _| {
+                Err(nixe_memory::VisibilityCoordinatorError::new(
+                    "CPU snapshot crossed concurrent GPU ownership; owner must resolve visibility inline",
+                ))
+            }).map_err(memory_error);
+        }
         if all_cpu {
             mapping.push((0, 0, backing.size()));
         } else {
@@ -206,15 +326,23 @@ impl VulkanResidency {
             }
         }
         let mut ranges = Vec::new();
-        for &(_, logical, length) in &mapping {
-            for &(start, size) in invalid {
+        for &(start, size) in invalid {
+            let end = start + size;
+            // Mapping runs are ordered even when the invalid intervals are not.
+            // Start at the first overlap instead of checking every run for each
+            // interval in a mixed CPU/GPU view.
+            let first = mapping.partition_point(|&(_, logical, length)| logical + length <= start);
+            for &(_, logical, length) in &mapping[first..] {
+                if logical >= end {
+                    break;
+                }
                 let begin = start.max(logical);
-                let end = (start + size).min(logical + length);
-                if begin < end {
+                let finish = end.min(logical + length);
+                if begin < finish {
                     ranges.push((
                         begin,
                         backing
-                            .snapshot_subrange(begin, end - begin)
+                            .snapshot_subrange(begin, finish - begin)
                             .map_err(memory_error)?,
                     ));
                 }
@@ -227,7 +355,9 @@ impl VulkanResidency {
         } else {
             Some(CanonicalBackingRange::new(cpu_segments).map_err(memory_error)?)
         };
-        let mut requests = Vec::new();
+        let mut requests = Vec::with_capacity(
+            ranges.len() + usize::from(cpu_range.is_some()) + usize::from(!all_cpu),
+        );
         if let Some(range) = &cpu_range {
             requests.push(CpuWriteSnapshotRequest {
                 dependency,
@@ -258,9 +388,20 @@ impl VulkanResidency {
         if all_cpu {
             results.extend(responses.next().expect("CPU dirty request"));
         } else if cpu_range.is_some() {
+            // DirtyPages produces ordered, disjoint logical windows. Both
+            // those compressed windows and this mapping advance monotonically.
+            let mut first_mapping = 0;
             for (offset, bytes) in responses.next().expect("CPU dirty request") {
                 let end = offset + bytes.len() as u64;
-                for &(compressed, logical, size) in &mapping {
+                while first_mapping < mapping.len()
+                    && mapping[first_mapping].0 + mapping[first_mapping].2 <= offset
+                {
+                    first_mapping += 1;
+                }
+                for &(compressed, logical, size) in &mapping[first_mapping..] {
+                    if compressed >= end {
+                        break;
+                    }
                     let start = offset.max(compressed);
                     let finish = end.min(compressed + size);
                     if start < finish {
@@ -278,7 +419,7 @@ impl VulkanResidency {
             }
         }
         results.sort_unstable_by_key(|(offset, _)| *offset);
-        let mut merged: Vec<(u64, Box<[u8]>)> = Vec::new();
+        let mut merged: Vec<(u64, Vec<u8>)> = Vec::with_capacity(results.len());
         for (offset, bytes) in results {
             if let Some((start, previous)) = merged.last_mut()
                 && offset <= *start + previous.len() as u64
@@ -286,15 +427,19 @@ impl VulkanResidency {
                 let overlap =
                     (*start + previous.len() as u64 - offset).min(bytes.len() as u64) as usize;
                 if overlap < bytes.len() {
-                    let mut combined = previous.to_vec();
-                    combined.extend_from_slice(&bytes[overlap..]);
-                    *previous = combined.into_boxed_slice();
+                    // Retain capacity while accumulating adjacent windows.
+                    // Rebuilding a boxed prefix at each join copied O(n^2)
+                    // bytes for a long sequence of small fragments.
+                    previous.extend_from_slice(&bytes[overlap..]);
                 }
             } else {
-                merged.push((offset, bytes));
+                merged.push((offset, bytes.into_vec()));
             }
         }
-        Ok(merged)
+        Ok(merged
+            .into_iter()
+            .map(|(offset, bytes)| (offset, bytes.into_boxed_slice()))
+            .collect())
     }
     fn restore_gpu_bytes(
         &mut self,

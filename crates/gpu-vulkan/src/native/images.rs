@@ -19,6 +19,13 @@ pub(super) struct ImageKey {
     sample_grid: [u32; 2],
     planes: TransferLayout,
 }
+pub(super) struct Targets {
+    colors: Box<[GuestImage]>,
+    depth_stencil: Option<GuestImage>,
+    extent: [u32; 2],
+    stencil: bool,
+    native: Arc<PreparedTargets>,
+}
 pub(super) struct GuestNativeImage {
     pub image: ImageId,
     pub planes: Box<[ImagePlane]>,
@@ -240,18 +247,17 @@ impl NativeGpuExecution {
         program: &GuestProgram,
         pipeline: &NativePipeline,
     ) -> Result<Vec<Binding>, VulkanError> {
-        let mut reflected = std::collections::BTreeMap::new();
-        // Dense layout order corresponds to globally namespaced SSA resource order.
-        for (index, (id, binding)) in program.bindings.iter().enumerate() {
-            reflected.insert(*id, (index, binding));
-        }
-        if reflected.len() != pipeline.layout.key.bindings.len() {
+        // The frontend already supplies strictly sorted SSA identities. Avoid
+        // allocating and rebuilding an ordered map for each changed binding set.
+        if program.bindings.len() != pipeline.layout.key.bindings.len()
+            || program.bindings.windows(2).any(|b| b[0].0 >= b[1].0)
+        {
             return Err(VulkanError::InvalidResource(
                 "native guest resources differ from linked reflection",
             ));
         }
-        let mut result = Vec::new();
-        for (_, (_, binding)) in reflected {
+        let mut result = Vec::with_capacity(program.bindings.len());
+        for (_, binding) in &program.bindings {
             result.push(match binding {
                 GuestBinding::Buffer(backing) => Binding::Buffer {
                     buffer: self.residency.buffer_for_deferred_import(
@@ -320,6 +326,24 @@ impl NativeGpuExecution {
         &mut self,
         state: &GuestDrawState,
     ) -> Result<Arc<PreparedTargets>, VulkanError> {
+        if let Some(source) = &self.targets
+            && source.extent == state.parameters.extent
+            && source.stencil == state.parameters.stencil.is_some()
+            && source.colors.len() == state.colors.len()
+            && source
+                .colors
+                .iter()
+                .zip(&state.colors)
+                .all(|(a, b)| a.same_view(b))
+            && match (&source.depth_stencil, &state.depth_stencil) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same_view(b),
+                _ => false,
+            }
+            && self.residency.targets_current(&source.native)
+        {
+            return Ok(Arc::clone(&source.native));
+        }
         let mut colors = Vec::new();
         for image in &state.colors {
             let native = self.image(image)?;
@@ -349,22 +373,30 @@ impl NativeGpuExecution {
                 };
                 if p.aspect == vk::ImageAspectFlags::DEPTH {
                     depth = Some(a)
-                } else if state.stencil.is_some() {
+                } else if state.parameters.stencil.is_some() {
                     stencil = Some(a)
                 }
             }
         }
-        self.residency.prepare_targets(RenderingTargets {
+        let targets = self.residency.prepare_targets(RenderingTargets {
             area: rect(nixe_gpu::ScissorRect {
                 x: 0,
                 y: 0,
-                width: state.extent[0],
-                height: state.extent[1],
+                width: state.parameters.extent[0],
+                height: state.parameters.extent[1],
             }),
             colors: colors.into_boxed_slice(),
             depth,
             stencil,
-        })
+        })?;
+        self.targets = Some(Targets {
+            colors: state.colors.clone(),
+            depth_stencil: state.depth_stencil.clone(),
+            extent: state.parameters.extent,
+            stencil: state.parameters.stencil.is_some(),
+            native: Arc::clone(&targets),
+        });
+        Ok(targets)
     }
     pub(super) fn clear(
         &mut self,

@@ -48,7 +48,7 @@ An engine handler should:
 - declare verified methods and field masks;
 - validate method sequences and cross-register requirements;
 - preserve the exact method source for diagnostics;
-- update a candidate state atomically; and
+- apply validated methods to live channel state in submission order; and
 - emit typed, host-independent operations for execution when required.
 
 Engine handlers must not access Horizon objects, guest mappings, scheduler
@@ -56,3 +56,37 @@ ownership, or host graphics APIs directly. Address resolution and execution
 belong to the submission execution layer; backend-specific work belongs behind
 the neutral GPU contracts. Unsupported semantics must remain explicit typed
 errors rather than fabricated success.
+
+The retained pushbuffer iterator validates submission identity once before its
+first read. Each entry read still validates its own retained mappings. A monotonic
+segment cursor preserves exact source locations across fragmented entries without
+searching their preceding segments again for every word.
+
+MME instruction uploads retain dense predecoded execution pages separately from
+raw words and their diagnostic provenance. Replacing a word updates both; active
+program snapshots keep their original instructions through copy-on-write. Calls
+still execute parameters, register reads, shadow behavior and emitted methods in
+order. Cached code does not cache a macro's state-dependent effects.
+
+The live raw and MME shadow register files keep valid words in dense arrays and
+write provenance in separate cold storage. Reads, replay and change detection
+consume only the words; diagnostic inspection reconstructs a source-preserving
+register on demand. Method replay updates the argument in place, and preparation
+returns only effects/metadata instead of copying the complete dispatch back to
+its caller. Rewriting the same value still updates its exact write provenance.
+
+Native preparation shares immutable binding-role and consumed-role arrays across
+draws. Program binding comparison allocates a replacement only at the first
+physical binding change, retaining the previous program when all bindings match.
+Canonical access collection appends directly into one vector, without allocating
+an intermediate vector for each resource. After successful backend acceptance,
+the owner recycles the native command vector; acceptance has already retained
+native uses through GPU completion. Pending preparation keeps its segment intact,
+and ordered canonical writes and completion boundaries are unchanged.
+
+Native shader preparation derives consumed constant-buffer extents from live
+optimized SSA. Static loads bound the byte window, while dynamic addresses retain
+the complete declared range. Stage requirements and texture-handle dependencies
+are unioned before resolving resources. Resource resolution builds a mask of
+required constant slots and visits only those slots in hardware order, rather
+than searching every slot against every required role.

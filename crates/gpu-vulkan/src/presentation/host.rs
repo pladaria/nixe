@@ -94,6 +94,7 @@ impl Host {
                 let extent = source.dimensions();
                 let image = cache.allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)?;
                 let view = render::view(cache.device(), image, vk::Format::R8G8B8A8_UNORM)?;
+                cache.device_mut().end_rendering();
                 let slot = cache.device_mut().submission.begin()?;
                 let command = cache.device().submission.slots[slot].command;
                 render::transition(
@@ -172,6 +173,7 @@ impl Host {
         } else {
             None
         };
+        cache.device_mut().end_rendering();
         let slot = cache.device_mut().submission.begin()?;
         self.pending_surface = Some(acquired);
         let command = cache.device().submission.slots[slot].command;
@@ -279,6 +281,7 @@ impl Host {
                 .max(1)
                 .min((capture.extent[1] - capture.next_row) as usize) as u32;
             let size = u64::from(rows) * u64::from(capture.extent[0]) * 4;
+            cache.device_mut().end_rendering();
             let (slot, slice, ticket) = match cache.device_mut().submission.reserve_readback(size) {
                 Ok(value) => value,
                 Err(VulkanError::QueuePressure { .. }) => {

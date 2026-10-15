@@ -92,7 +92,7 @@ pub struct QueueUsage {
 }
 
 pub(crate) struct Arena {
-    pub buffer: AllocatedBuffer,
+    pub buffer: Arc<AllocatedBuffer>,
     pub cursor: u64,
 }
 impl Arena {
@@ -129,8 +129,8 @@ pub(crate) struct Slot {
     pub tick: u64,
     pub upload: Option<Arena>,
     pub readback: Option<Arena>,
-    pub upload_overflow: Vec<AllocatedBuffer>,
-    pub readback_overflow: Vec<AllocatedBuffer>,
+    pub upload_overflow: Vec<Arc<AllocatedBuffer>>,
+    pub readback_overflow: Vec<Arc<AllocatedBuffer>>,
     pub readbacks: Vec<Option<Slice>>,
     unread_count: usize,
     pub retired_buffers: Vec<Arc<AllocatedBuffer>>,
@@ -155,6 +155,7 @@ pub(crate) struct Slot {
     pub push_stages: vk::ShaderStageFlags,
     pub push_bytes: Vec<u8>,
     pub native_targets: Vec<Arc<crate::PreparedTargets>>,
+    pub active_targets: Option<Arc<crate::PreparedTargets>>,
     pub target_handles: std::collections::HashSet<usize>,
     pub graphics_parameters: Option<Arc<crate::GraphicsParameters>>,
     pub bound_set: vk::DescriptorSet,
@@ -208,6 +209,7 @@ impl Slot {
             push_stages: vk::ShaderStageFlags::empty(),
             push_bytes: Vec::new(),
             native_targets: Vec::new(),
+            active_targets: None,
             target_handles: Default::default(),
             graphics_parameters: None,
             bound_set: vk::DescriptorSet::null(),
@@ -234,6 +236,12 @@ impl Slot {
         match slice.overflow {
             Some(i) => &self.upload_overflow[i],
             None => &self.upload.as_ref().expect("upload arena").buffer,
+        }
+    }
+    pub(crate) fn upload_lease(&self, slice: Slice) -> Arc<AllocatedBuffer> {
+        match slice.overflow {
+            Some(index) => Arc::clone(&self.upload_overflow[index]),
+            None => Arc::clone(&self.upload.as_ref().expect("upload arena").buffer),
         }
     }
     pub fn readback_buffer(&self, slice: Slice) -> &AllocatedBuffer {
@@ -282,6 +290,13 @@ pub(crate) struct QueueState {
     lost: bool,
 }
 impl QueueState {
+    pub(crate) fn end_rendering(&mut self, dispatch: &crate::dispatch::Dispatch) {
+        if let Some(index) = self.recording
+            && self.slots[index].active_targets.take().is_some()
+        {
+            unsafe { dispatch.end_rendering(self.slots[index].command) };
+        }
+    }
     pub fn new(
         owner: Arc<DeviceOwner>,
         family: u32,
@@ -373,14 +388,14 @@ impl QueueState {
                 self.overflow_capacity -= slot
                     .upload_overflow
                     .iter()
-                    .map(AllocatedBuffer::size)
+                    .map(|buffer| buffer.size())
                     .sum::<u64>();
                 slot.upload_overflow.clear();
                 if slot.unread() == 0 {
                     self.overflow_capacity -= slot
                         .readback_overflow
                         .iter()
-                        .map(AllocatedBuffer::size)
+                        .map(|buffer| buffer.size())
                         .sum::<u64>();
                     slot.readback_overflow.clear();
                 }
@@ -506,7 +521,8 @@ impl QueueState {
                 MemoryLocation::CpuToGpu,
                 vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::INDEX_BUFFER,
+                    | vk::BufferUsageFlags::INDEX_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_BUFFER,
                 "nixe upload arena",
             ),
             (
@@ -518,14 +534,14 @@ impl QueueState {
         ] {
             if arena.is_none() {
                 *arena = Some(Arena {
-                    buffer: allocate_buffer(
+                    buffer: Arc::new(allocate_buffer(
                         &self.owner,
                         self.configuration.arena_bytes,
                         usage,
                         location,
                         AllocationMode::Dedicated,
                         label,
-                    )?,
+                    )?),
                     cursor: 0,
                 });
             }
@@ -570,7 +586,8 @@ impl QueueState {
                 capacity,
                 vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::INDEX_BUFFER,
+                    | vk::BufferUsageFlags::INDEX_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_BUFFER,
                 MemoryLocation::CpuToGpu,
                 AllocationMode::Dedicated,
                 "nixe upload overflow",
@@ -586,8 +603,8 @@ impl QueueState {
             let slot = &mut self.slots[index];
             let a = slot.upload_overflow.len();
             let b = slot.readback_overflow.len();
-            slot.upload_overflow.push(source);
-            slot.readback_overflow.push(destination);
+            slot.upload_overflow.push(Arc::new(source));
+            slot.readback_overflow.push(Arc::new(destination));
             self.overflow_capacity += extra;
             (
                 Slice {
@@ -632,7 +649,14 @@ impl QueueState {
     }
     /// Independent directions avoid allocating or filling the other arena.
     pub fn reserve_upload(&mut self, bytes: &[u8]) -> Result<(usize, Slice), VulkanError> {
-        let (index, slice) = self.reserve_slice(bytes.len() as u64, true, 4)?;
+        self.reserve_upload_aligned(bytes, 4)
+    }
+    pub(crate) fn reserve_upload_aligned(
+        &mut self,
+        bytes: &[u8],
+        alignment: u64,
+    ) -> Result<(usize, Slice), VulkanError> {
+        let (index, slice) = self.reserve_slice(bytes.len() as u64, true, alignment)?;
         let slot = &mut self.slots[index];
         let buffer = match slice.overflow {
             Some(i) => &mut slot.upload_overflow[i],
@@ -697,7 +721,8 @@ impl QueueState {
                 MemoryLocation::CpuToGpu,
                 vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::INDEX_BUFFER,
+                    | vk::BufferUsageFlags::INDEX_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_BUFFER,
                 "nixe upload arena",
             )
         } else {
@@ -715,14 +740,14 @@ impl QueueState {
         };
         if arena.is_none() {
             *arena = Some(Arena {
-                buffer: allocate_buffer(
+                buffer: Arc::new(allocate_buffer(
                     &self.owner,
                     self.configuration.arena_bytes,
                     usage,
                     location,
                     AllocationMode::Dedicated,
                     label,
-                )?,
+                )?),
                 cursor: 0,
             });
         }
@@ -764,7 +789,7 @@ impl QueueState {
             &mut slot.readback_overflow
         };
         let entry = overflow.len();
-        overflow.push(buffer);
+        overflow.push(Arc::new(buffer));
         self.overflow_capacity += capacity;
         Ok((
             index,
@@ -786,6 +811,7 @@ impl QueueState {
         let Some(index) = self.recording else {
             return Ok(None);
         };
+        self.end_rendering(dispatch);
         let slot = &self.slots[index];
         let tick = slot.tick;
         unsafe { self.owner.device.end_command_buffer(slot.command) }
@@ -909,6 +935,9 @@ impl Drop for QueueState {
 }
 
 impl VulkanDevice {
+    pub(crate) fn end_rendering(&mut self) {
+        self.submission.end_rendering(&self.dispatch);
+    }
     /// Reserve an ordered completion point, including a real signal for work
     /// with no commands. A flush accepts it; host polling alone is not guest success.
     pub fn work_ticket(&mut self) -> Result<WorkTicket, VulkanError> {

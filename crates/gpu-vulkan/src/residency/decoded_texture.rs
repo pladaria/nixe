@@ -260,7 +260,7 @@ impl VulkanResidency {
                 height: rect.extent.height,
                 depth: 1,
             });
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         unsafe {
             self.device.owner.device.cmd_copy_buffer_to_image(
                 self.device.submission.slots[slot].command,

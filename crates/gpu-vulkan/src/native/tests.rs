@@ -82,7 +82,8 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         )
         .unwrap();
     let state = Arc::new(GuestDrawState {
-        program: GuestProgram {
+        identity: PreparedStateId::new(1, 1),
+        program: Arc::new(GuestProgram {
             identity: PreparedStateId::new(1, 1),
             shader: Arc::new(GuestShaderCode {
                 identity: ssa::artifact::ContentId::of(b"native-draw-test", &[]),
@@ -91,53 +92,62 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             bindings: Box::new([]),
             shared_memory_bytes: 0,
             local_memory_bytes: 0,
-        },
+        }),
         vertices: Box::new([GuestVertexBuffer {
             binding: 0,
             backing: vertex_backing,
-            stride: 24,
-            step: VertexStepMode::Vertex,
-            attributes: Box::new([
-                nixe_gpu::VertexAttribute {
-                    shader_location: 0,
-                    format: VertexFormat::Float32x3,
-                    offset: 0,
-                },
-                nixe_gpu::VertexAttribute {
-                    shader_location: 1,
-                    format: VertexFormat::Float32x3,
-                    offset: 12,
-                },
-            ]),
         }]),
         index: None,
         colors: Box::new([image]),
         depth_stencil: None,
-        extent: [8, 8],
-        topology: PrimitiveTopology::Triangles,
-        restart: false,
-        provoking_first: false,
-        raster: TriangleRasterization::Fill,
-        line: None,
-        front_face: FrontFace::CounterClockwise,
-        cull: CullMode::None,
-        depth_bias: None,
-        viewport: None,
-        position_transform: None,
-        scissor: ScissorRect {
-            x: 0,
-            y: 0,
-            width: 8,
-            height: 8,
-        },
-        depth: DepthState::DISABLED,
-        stencil: None,
-        color_outputs: Box::new([ColorOutputState::REPLACE]),
-        blend_constants: [0.; 4],
-        alpha_test: None,
-        tessellation: None,
-        sample_mask: u64::MAX,
-        alpha_to_coverage: false,
+        parameters: Arc::new(GuestDrawParameters {
+            identity: PreparedStateId::new(2, 1),
+            vertices: Box::new([GuestVertexLayout {
+                binding: 0,
+                stride: 24,
+                step: VertexStepMode::Vertex,
+                attributes: Box::new([
+                    nixe_gpu::VertexAttribute {
+                        shader_location: 0,
+                        format: VertexFormat::Float32x3,
+                        offset: 0,
+                    },
+                    nixe_gpu::VertexAttribute {
+                        shader_location: 1,
+                        format: VertexFormat::Float32x3,
+                        offset: 12,
+                    },
+                ]),
+            }]),
+            color_formats: Box::new([ImageFormat::Rgba8Unorm]),
+            depth_stencil_format: None,
+            samples: SampleCount::One,
+            extent: [8, 8],
+            topology: PrimitiveTopology::Triangles,
+            restart: false,
+            provoking_first: false,
+            raster: TriangleRasterization::Fill,
+            line: None,
+            front_face: FrontFace::CounterClockwise,
+            cull: CullMode::None,
+            depth_bias: None,
+            viewport: None,
+            position_transform: None,
+            scissor: ScissorRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            depth: DepthState::DISABLED,
+            stencil: None,
+            color_outputs: Box::new([ColorOutputState::REPLACE]),
+            blend_constants: [0.; 4],
+            alpha_test: None,
+            tessellation: None,
+            sample_mask: u64::MAX,
+            alpha_to_coverage: false,
+        }),
     });
     let draw = NativeCommand::Draw {
         state: Arc::clone(&state),
@@ -189,7 +199,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     assert_eq!(execution.statistics.warm_draws, 31);
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert!(bytes.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
-    assert_eq!(execution.residency.statistics().cpu_uploaded_bytes, 328);
+    assert!(execution.residency.statistics().cpu_streamed_bytes > 0);
     // Acceptance of a read snapshot need not submit a command buffer. A
     // following CPU write is uploaded after that read, with a native WAR edge.
     let prefix = NativeSubmission {
@@ -227,9 +237,10 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         )
         .unwrap();
     let mut changed = (*state).clone();
-    changed.program.identity = PreparedStateId::new(2, 1);
-    changed.scissor.x = 4;
-    changed.scissor.width = 4;
+    changed.identity = PreparedStateId::new(2, 1);
+    Arc::make_mut(&mut changed.parameters).identity = PreparedStateId::new(3, 1);
+    Arc::make_mut(&mut changed.parameters).scissor.x = 4;
+    Arc::make_mut(&mut changed.parameters).scissor.width = 4;
     let final_segment = NativeSubmission {
         frontend: prefix.frontend,
         segment: prefix.segment,
@@ -342,8 +353,287 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             .submission(),
         repeated
     );
+    // Different bindings and scissors across frontend deliveries share native
+    // rendering, but preserve draw order and their own prepared semantics.
+    let (other_vertices, other_backing) = backing_allocation(256, 256, 0);
+    other_vertices
+        .write(
+            0,
+            &red.into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let other_backing = other_backing.snapshot_subrange(0, 72).unwrap();
+    let mut other = (*state).clone();
+    other.identity = PreparedStateId::new(10, 1);
+    other.vertices[0].backing = other_backing;
+    let other = Arc::new(other);
+    let mut clipped = (*other).clone();
+    clipped.identity = PreparedStateId::new(11, 1);
+    let parameters = Arc::make_mut(&mut clipped.parameters);
+    parameters.identity = PreparedStateId::new(12, 1);
+    parameters.scissor.width = 4;
+    let clipped = Arc::new(clipped);
+    let scopes = execution.recording_statistics().rendering_scopes;
+    let mut sent = Vec::new();
+    for (index, current) in [&other, &state, &clipped].into_iter().enumerate() {
+        let submission = NativeSubmission {
+            frontend: FrontendSubmissionId::new(10 + index as u64),
+            segment: FrontendSubmissionSegment::FIRST,
+            final_segment: false,
+            commands: vec![NativeCommand::Draw {
+                state: Arc::clone(current),
+                arguments: DrawArguments::NonIndexed {
+                    first_vertex: 0,
+                    vertex_count: 3,
+                    first_instance: 0,
+                    instance_count: 1,
+                },
+            }],
+        };
+        ready(&mut execution, &submission);
+        sent.push(
+            execution
+                .submit(ExecutionBatch {
+                    commands: &submission,
+                    definitions: &[],
+                    retirements: &[],
+                })
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        execution.recording_statistics().rendering_scopes - scopes,
+        1
+    );
+    assert!(execution.statistics.reused_graphics > 0);
+    assert!(execution.statistics.reused_programs > 0);
+    assert!(execution.residency.statistics().cpu_stream_hits > 0);
+    assert!(execution.residency.statistics().attachment_publication_hits >= 2);
+    let bytes = cpu_read(&mut execution.residency, &backing);
+    for (index, pixel) in bytes.chunks_exact(4).enumerate() {
+        assert_eq!(
+            pixel,
+            if index % 8 < 4 {
+                &[255, 0, 0, 255]
+            } else {
+                &[0, 255, 0, 255]
+            }
+        );
+    }
+    for token in sent {
+        assert_eq!(
+            execution
+                .wait_for_completion_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .submission(),
+            token
+        );
+    }
+    // CPU updates between accepted draws must preserve distinct read snapshots,
+    // including shader descriptors, without ending rendering or submitting early.
+    let (uniform, uniform_backing) = backing_allocation(256, 256, 0);
+    let uniform_backing = uniform_backing.snapshot_subrange(0, 16).unwrap();
+    let encode = |rgba: [f32; 4]| {
+        rgba.into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let mut uniform_draw = (*state).clone();
+    uniform_draw.identity = PreparedStateId::new(20, 1);
+    uniform_draw.program = Arc::new(GuestProgram {
+        identity: PreparedStateId::new(21, 1),
+        shader: Arc::new(GuestShaderCode {
+            identity: ssa::artifact::ContentId::of(b"streamed-uniform-test", &[]),
+            functions: uniform_color_shader(),
+        }),
+        bindings: Box::new([(
+            ssa::ResourceId::new(42),
+            GuestBinding::Buffer(uniform_backing.clone()),
+        )]),
+        shared_memory_bytes: 0,
+        local_memory_bytes: 0,
+    });
+    Arc::make_mut(&mut uniform_draw.parameters).identity = PreparedStateId::new(22, 1);
+    let uniform_draw = Arc::new(uniform_draw);
+    let mut inputs = Vec::new();
+    for (index, rgba) in [[0., 1., 0., 1.], [1., 0., 0., 1.], [0., 0., 1., 1.]]
+        .into_iter()
+        .enumerate()
+    {
+        let mut draw = (*uniform_draw).clone();
+        draw.identity = PreparedStateId::new(23 + index as u64, 1);
+        let parameters = Arc::make_mut(&mut draw.parameters);
+        parameters.identity = PreparedStateId::new(26 + index as u64, 1);
+        if index > 0 {
+            parameters.scissor.x = if index == 1 { 4 } else { 0 };
+            parameters.scissor.width = 4;
+        }
+        let submission = NativeSubmission {
+            frontend: FrontendSubmissionId::new(20 + index as u64),
+            segment: FrontendSubmissionSegment::FIRST,
+            final_segment: false,
+            commands: vec![NativeCommand::Draw {
+                state: Arc::new(draw),
+                arguments: DrawArguments::NonIndexed {
+                    first_vertex: 0,
+                    vertex_count: 3,
+                    first_instance: 0,
+                    instance_count: 1,
+                },
+            }],
+        };
+        ready(&mut execution, &submission);
+        inputs.push((submission, encode(rgba)));
+    }
+    let scopes = execution.recording_statistics().rendering_scopes;
+    let mut sent = Vec::new();
+    for (submission, bytes) in &inputs {
+        uniform.write(0, bytes).unwrap();
+        sent.push(
+            execution
+                .submit(ExecutionBatch {
+                    commands: submission,
+                    definitions: &[],
+                    retirements: &[],
+                })
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        execution.recording_statistics().rendering_scopes - scopes,
+        1
+    );
+    let bytes = cpu_read(&mut execution.residency, &backing);
+    for (index, pixel) in bytes.chunks_exact(4).enumerate() {
+        assert_eq!(
+            pixel,
+            if index % 8 < 4 {
+                &[0, 0, 255, 255]
+            } else {
+                &[255, 0, 0, 255]
+            }
+        );
+    }
+    for token in sent {
+        assert_eq!(
+            execution
+                .wait_for_completion_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .submission(),
+            token
+        );
+    }
+    // Streaming has not acknowledged the persistent buffer's dirty observer.
+    let native_uniform = execution
+        .residency
+        .buffer_for(uniform_backing, vk::BufferUsageFlags::STORAGE_BUFFER)
+        .unwrap();
+    assert_eq!(
+        execution
+            .residency
+            .read_buffer(native_uniform, 0, 16)
+            .unwrap(),
+        encode([0., 0., 1., 1.])
+    );
+    // A following GPU writer replaces CPU authority and must bypass CPU streams.
+    let upload = execution
+        .residency
+        .write_buffer(native_uniform, 0, &encode([1., 1., 0., 1.]))
+        .unwrap();
+    assert_eq!(upload.consumed, 16);
+    let submission = NativeSubmission {
+        frontend: FrontendSubmissionId::new(30),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands: vec![NativeCommand::Draw {
+            state: uniform_draw,
+            arguments: DrawArguments::NonIndexed {
+                first_vertex: 0,
+                vertex_count: 3,
+                first_instance: 0,
+                instance_count: 1,
+            },
+        }],
+    };
+    ready(&mut execution, &submission);
+    execution
+        .submit(ExecutionBatch {
+            commands: &submission,
+            definitions: &[],
+            retirements: &[],
+        })
+        .unwrap();
+    let bytes = cpu_read(&mut execution.residency, &backing);
+    assert!(
+        bytes
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 255, 0, 255])
+    );
+    execution
+        .wait_for_completion_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
     drop(pixels);
     execution.teardown().unwrap();
     drop(execution);
     monitor.check().unwrap();
+}
+
+fn uniform_color_shader() -> Box<[ssa::Function]> {
+    use ssa::*;
+    let vertex = crate::residency::execution::tests::vertex_fragment()[0].clone();
+    let mut builder = FunctionBuilder::new(ShaderStage::Fragment);
+    let entry = builder.entry();
+    let pc = ShaderSourceLocation::new(8);
+    for component in 0..4 {
+        let address = builder.emit(
+            entry,
+            pc,
+            Op::Constant(Constant {
+                ty: Type::U32,
+                bits: u64::from(component * 4),
+            }),
+            vec![],
+        )[0];
+        let value = builder.emit(
+            entry,
+            pc,
+            Op::Load {
+                space: MemorySpace::Storage,
+                resource: Some(ResourceId::new(42)),
+                address_type: Type::U32,
+                ty: Type::F32,
+            },
+            vec![address.into()],
+        )[0];
+        builder.emit(
+            entry,
+            pc,
+            Op::Output {
+                location: ShaderIoLocation::Color(0),
+                component,
+                ty: Type::F32,
+            },
+            vec![value.into()],
+        );
+    }
+    builder.terminate(entry, pc, Terminator::Return);
+    let mut fragment = builder.finish().unwrap();
+    fragment.outputs = (0..4)
+        .map(|component| {
+            ShaderInterfaceElement::new(
+                ShaderIoLocation::Color(0),
+                component,
+                ShaderScalarType::Float32,
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    fragment.optimize().unwrap();
+    Box::new([vertex, fragment])
 }

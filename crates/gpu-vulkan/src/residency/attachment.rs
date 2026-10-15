@@ -263,7 +263,7 @@ impl VulkanResidency {
                 height: rect.extent.height,
                 depth: 1,
             });
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let slot = self.device.submission.begin()?;
         unsafe {
             self.device.owner.device.cmd_resolve_image(

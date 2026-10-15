@@ -85,7 +85,7 @@ impl VulkanResidency {
             cell.layout = layout;
             cell.ownership = Ownership::Released(destination_family);
         }
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let work = self.device.work_ticket()?;
         self.contents_mut(Resource::Image(id)).last_use = Some(work);
         Ok(work)
@@ -135,7 +135,7 @@ impl VulkanResidency {
             cell.state = sync::AccessState::default();
             let _ = cell.state.access(scope);
         }
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let work = self.device.work_ticket()?;
         self.contents_mut(Resource::Image(id)).last_use = Some(work);
         Ok(work)

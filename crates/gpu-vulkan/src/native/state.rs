@@ -55,10 +55,10 @@ fn stencil(value: nixe_gpu::StencilFaceState) -> StencilState {
         compare: compare(value.compare),
     }
 }
-pub(super) fn graphics(draw: &GuestDrawState) -> Result<GraphicsState, VulkanError> {
+pub(super) fn graphics(draw: &GuestDrawParameters) -> Result<GraphicsState, VulkanError> {
     let mut state = GraphicsState::color(vk::Format::UNDEFINED);
     state.colors = draw
-        .colors
+        .color_formats
         .iter()
         .zip(&draw.color_outputs)
         .map(|(i, c)| {
@@ -73,14 +73,14 @@ pub(super) fn graphics(draw: &GuestDrawState) -> Result<GraphicsState, VulkanErr
                 b.dst_alpha = blend_factor(blend.alpha.destination);
                 b.alpha_op = blend_op(blend.alpha.operation);
             }
-            (images::format(i.description.format()), b)
+            (images::format(*i), b)
         })
         .collect();
-    if let Some(image) = &draw.depth_stencil {
-        state.depth_format = images::format(image.description.format());
+    if let Some(format) = draw.depth_stencil_format {
+        state.depth_format = images::format(format);
         if draw.stencil.is_some()
             && matches!(
-                image.description.format(),
+                format,
                 nixe_gpu::ImageFormat::Depth24UnormStencil8Uint
                     | nixe_gpu::ImageFormat::Depth32FloatStencil8Uint
             )
@@ -88,13 +88,7 @@ pub(super) fn graphics(draw: &GuestDrawState) -> Result<GraphicsState, VulkanErr
             state.stencil_format = state.depth_format;
         }
     }
-    let samples = draw
-        .colors
-        .first()
-        .or(draw.depth_stencil.as_ref())
-        .map(|i| i.description.samples())
-        .ok_or(VulkanError::InvalidResource("draw has no targets"))?;
-    state.samples = match samples {
+    state.samples = match draw.samples {
         nixe_gpu::SampleCount::One => vk::SampleCountFlags::TYPE_1,
         nixe_gpu::SampleCount::Two => vk::SampleCountFlags::TYPE_2,
         nixe_gpu::SampleCount::Four => vk::SampleCountFlags::TYPE_4,
@@ -188,7 +182,7 @@ pub(super) fn graphics(draw: &GuestDrawState) -> Result<GraphicsState, VulkanErr
     state.vertex_attributes = attributes.into_boxed_slice();
     Ok(state)
 }
-pub(super) fn parameters(draw: &GuestDrawState) -> Result<GraphicsParameters, VulkanError> {
+pub(super) fn parameters(draw: &GuestDrawParameters) -> Result<GraphicsParameters, VulkanError> {
     let state = graphics(draw)?;
     let extent = vk::Extent2D {
         width: draw.extent[0],
@@ -272,7 +266,7 @@ pub(super) fn shader_code(
     let mut code = Arc::clone(&program.shader);
     let mut scaled = Vec::new();
     if let Some(draw) = draw {
-        for vertex in &draw.vertices {
+        for vertex in &draw.parameters.vertices {
             for attr in &vertex.attributes {
                 if let Some(signed) = vertex::VertexFetchFormat::new(attr.format).scaled32 {
                     scaled.push((attr.shader_location, signed));
@@ -288,12 +282,12 @@ pub(super) fn shader_code(
             ssa::scale_vertex_inputs(v, &scaled)
                 .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
         }
-        if draw.alpha_test.is_some() {
+        if draw.parameters.alpha_test.is_some() {
             return Err(VulkanError::InvalidResource(
                 "native fragment alpha-test legalization is required",
             ));
         }
-        if let Some(t) = draw.tessellation
+        if let Some(t) = draw.parameters.tessellation
             && matches!(
                 t.control,
                 nixe_gpu::TessellationControl::DefaultLevels { .. }
@@ -328,18 +322,19 @@ pub(super) fn shader_code(
         .map(|f| {
             let mut o = options;
             if let Some(draw) = draw {
-                let final_stage = if draw.tessellation.is_some() {
+                let final_stage = if draw.parameters.tessellation.is_some() {
                     nixe_gpu::ShaderStage::TessellationEvaluation
                 } else {
                     nixe_gpu::ShaderStage::Vertex
                 };
                 if f.stage == final_stage {
                     o.shader.depth_clip_negative_one_to_one = draw
+                        .parameters
                         .viewport
                         .is_some_and(|v| v.depth_clip_negative_one_to_one());
-                    o.shader.vertex_position_transform = draw.position_transform;
+                    o.shader.vertex_position_transform = draw.parameters.position_transform;
                 }
-                if let Some(t) = draw.tessellation {
+                if let Some(t) = draw.parameters.tessellation {
                     if f.stage == nixe_gpu::ShaderStage::TessellationControl {
                         o.shader.input_control_points = u32::from(t.input_control_points);
                     } else if f.stage == nixe_gpu::ShaderStage::TessellationEvaluation {
@@ -363,7 +358,7 @@ pub(super) fn shader_code(
     Ok((code, options, identity))
 }
 pub(super) fn push(draw: &GuestDrawState) -> Result<Box<[u8]>, VulkanError> {
-    if let Some(t) = draw.tessellation
+    if let Some(t) = draw.parameters.tessellation
         && let nixe_gpu::TessellationControl::DefaultLevels {
             outer,
             inner,

@@ -257,7 +257,7 @@ fn exercise(api: ApiPreference, recording: RecordingPolicy) {
                 ),
             )
             .unwrap();
-        cache.barriers.emit(&cache.device);
+        cache.barriers.emit(&mut cache.device);
     }
     assert_eq!(cache.barrier_statistics().calls, before);
     assert_eq!(cache.device.queue_usage().retained_readbacks, 0);

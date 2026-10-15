@@ -1527,6 +1527,7 @@ fn advance_backend_work<
                         detail: error.to_string().into(),
                     }
                 })?;
+                work.execution.recycle_segment(segment);
                 work.release_consumed_chunks();
                 let execution = &mut work.execution;
                 let pending = &mut work.pending;

@@ -43,6 +43,16 @@ fn fixture(
     instructions: &[u64],
     register_count: u8,
 ) -> (Function, MaxwellShaderBinary) {
+    let (program, binary) = program_fixture(stage, header, instructions, register_count);
+    (program.function, binary)
+}
+
+fn program_fixture(
+    stage: MaxwellShaderStage,
+    header: Option<[u32; 20]>,
+    instructions: &[u64],
+    register_count: u8,
+) -> (MaxwellSsaProgram, MaxwellShaderBinary) {
     let (allocation, address_space, address) = mapped_memory();
     let mut bytes: Vec<u8> = header
         .map(|h| h.into_iter().flat_map(u32::to_le_bytes).collect())
@@ -60,9 +70,7 @@ fn fixture(
         register_count,
         workgroup_size: (stage == MaxwellShaderStage::Compute).then_some([32, 1, 1]),
     };
-    let function = compile_maxwell_shader_ssa(&address_space, &writes, request)
-        .unwrap()
-        .function;
+    let program = compile_maxwell_shader_ssa(&address_space, &writes, request).unwrap();
     let memory = MaxwellShaderMemoryView::new(&address_space, &writes);
     let binary = if stage == MaxwellShaderStage::Compute {
         read_shader_code(
@@ -79,8 +87,58 @@ fn fixture(
     } else {
         read_shader_binary(&memory, stage, address).unwrap()
     };
-    function.verify().unwrap();
-    (function, binary)
+    program.function.verify().unwrap();
+    (program, binary)
+}
+
+#[test]
+fn constant_buffer_bounds_cover_all_static_words_and_keep_dynamic_bindings_declared() {
+    let mut header = pixel_header();
+    header[18] = 15;
+    // LDC.128 c[1][0x110] consumes all four words through byte 0x11f.
+    let (program, _) = program_fixture(
+        MaxwellShaderStage::Pixel,
+        Some(header),
+        &[0xef96_0010_1107_ff00, EXIT],
+        4,
+    );
+    let binding = program
+        .bindings
+        .iter()
+        .find(|b| b.source == MaxwellSsaBindingSource::ConstantBuffer { slot: 1 })
+        .unwrap();
+    assert_eq!(
+        program.constant_buffer_extents()[&binding.resource],
+        Some(0x120)
+    );
+
+    header[18] = 7;
+    // R0 comes from c[2][16], then indexes c[1]. The later static c[1][16]
+    // access cannot narrow that dynamic binding. c[2] still needs only 20 bytes.
+    let (program, _) = program_fixture(
+        MaxwellShaderStage::Pixel,
+        Some(header),
+        &[
+            0x4c98_0788_0047_0000,
+            0xef95_0010_0007_0000,
+            0x4c98_0784_0047_0002,
+            EXIT,
+        ],
+        3,
+    );
+    let extents = program.constant_buffer_extents();
+    for binding in &program.bindings {
+        match binding.source {
+            MaxwellSsaBindingSource::ConstantBuffer { slot: 1 } => {
+                assert_eq!(extents[&binding.resource], None);
+            }
+            MaxwellSsaBindingSource::ConstantBuffer { slot: 2 } => {
+                assert_eq!(extents[&binding.resource], Some(20));
+            }
+            other => panic!("unexpected fixture binding: {other:?}"),
+        }
+    }
+    assert_eq!(program.bindings.len(), 2);
 }
 
 // Independent bounded fixture execution of typed SSA; not compiled into the

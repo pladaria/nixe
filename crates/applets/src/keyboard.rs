@@ -46,9 +46,12 @@ impl KeyboardConfig {
             0x6000b | 0x8000d => 0x4c8,
             _ => return Err("unsupported software keyboard API version"),
         };
-        if args.len() != size {
-            return Err("invalid software keyboard configuration size");
-        }
+        // Consume the versioned wire prefix, not the whole IStorage allocation.
+        // libnx sends sizeof its C argument struct, including alignment padding.
+        // https://github.com/switchbrew/libnx/blob/master/nx/source/applets/swkbd.c
+        let args = args
+            .get(..size)
+            .ok_or("invalid software keyboard configuration size")?;
         let kind = match u32_at(args, 0)? {
             0 | 2 | 3 | 4 | 8 | 9 => KeyboardType::Ascii,
             1 => KeyboardType::Numeric,
@@ -386,14 +389,80 @@ pub fn neutral(state: EmulatedControllerState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn config() -> KeyboardConfig {
-        let mut common = vec![0; 32];
+    fn common_args(version: u32) -> [u8; 32] {
+        let mut common = [0; 32];
         common[..4].copy_from_slice(&1u32.to_le_bytes());
         common[4..8].copy_from_slice(&32u32.to_le_bytes());
-        common[8..12].copy_from_slice(&0x8000du32.to_le_bytes());
+        common[8..12].copy_from_slice(&version.to_le_bytes());
+        common
+    }
+    fn config() -> KeyboardConfig {
         let mut args = vec![0; 0x4c8];
         args[0x3ac..0x3b0].copy_from_slice(&9u32.to_le_bytes());
-        KeyboardConfig::decode(&common, &args, &[]).unwrap()
+        KeyboardConfig::decode(&common_args(0x8000d), &args, &[]).unwrap()
+    }
+    #[test]
+    fn libnx_v5_keyboard_configuration_accepts_struct_padding_and_text_validation() {
+        // Reproduces software-keyboard's actual version/size and default preset.
+        let mut args = vec![0; 0x3e8];
+        args[..4].copy_from_slice(&2u32.to_le_bytes());
+        args[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
+        args[0x3b8..0x3bc].copy_from_slice(&1u32.to_le_bytes());
+        args[0x3bc] = 1;
+        args[0x3d0] = 1;
+        // The guest's callback pointer/padding is not executed by the applet.
+        args[0x3e0..].fill(0xa5);
+        let config = KeyboardConfig::decode(&common_args(5), &args, &[0; 0x1000]).unwrap();
+        assert_eq!(config.kind, KeyboardType::Ascii);
+        assert!(config.cursor_at_end);
+        assert!(config.multiline);
+        assert!(config.text_check);
+        assert!(!config.utf8);
+        assert!(config.initial.is_empty());
+        assert_eq!((config.minimum, config.maximum), (0, 500));
+        assert!(config.valid("Hello\nworld"));
+        assert_eq!(&config.encode_check("Nixe")[8..18], b"N\0i\0x\0e\0\0\0");
+    }
+    #[test]
+    fn configuration_uses_the_versioned_prefix_with_larger_storage() {
+        for (version, size) in [
+            (5, 0x3e0),
+            (0x10006, 0x3e0),
+            (0x30007, 0x400),
+            (0x40008, 0x400),
+            (0x50009, 0x400),
+            (0x6000b, 0x4c8),
+            (0x8000d, 0x4c8),
+        ] {
+            let mut args = vec![0; size];
+            args[0x3ac..0x3b0].copy_from_slice(&12u32.to_le_bytes());
+            args[0x3b0..0x3b4].copy_from_slice(&2u32.to_le_bytes());
+            args[0x3c0..0x3c4].copy_from_slice(&4u32.to_le_bytes());
+            args[0x3c4..0x3c8].copy_from_slice(&4u32.to_le_bytes());
+            if version == 0x8000d {
+                args[0x4b5] = 1;
+            }
+            let work = b"\0\0\0\0N\0i\0x\0e\0";
+            for trailing in [0, 8, 32] {
+                let mut storage = args.clone();
+                storage.extend(std::iter::repeat_n(0xff, trailing));
+                let config = KeyboardConfig::decode(&common_args(version), &storage, work).unwrap();
+                assert_eq!(config.initial, "Nixe");
+                assert_eq!((config.minimum, config.maximum), (2, 12));
+                assert_eq!(config.cancel_disabled, version == 0x8000d);
+                assert!(config.valid("Nixe"));
+                assert!(!config.valid("x"));
+                assert!(!config.valid("too many characters"));
+            }
+            assert!(matches!(
+                KeyboardConfig::decode(&common_args(version), &args[..size - 1], work),
+                Err("invalid software keyboard configuration size")
+            ));
+        }
+        assert!(matches!(
+            KeyboardConfig::decode(&common_args(0x9000f), &[0; 0x1000], &[]),
+            Err("unsupported software keyboard API version")
+        ));
     }
     #[test]
     fn restrictions_apply_to_all_input_sources() {

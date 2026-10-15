@@ -80,7 +80,7 @@ impl VulkanResidency {
             scope,
             vk::ImageLayout::GENERAL,
         )?;
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let slot = self.device.submission.begin()?;
         let command = self.device.submission.slots[slot].command;
         let attachment = vk::RenderingAttachmentInfo::default()
@@ -235,7 +235,7 @@ impl VulkanResidency {
             .dst_subresource(dst.layers())
             .src_offsets(corners(source_rect))
             .dst_offsets(corners(destination_rect));
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let slot = self.device.submission.begin()?;
         unsafe {
             self.device.owner.device.cmd_blit_image(

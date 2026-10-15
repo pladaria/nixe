@@ -22,6 +22,7 @@ use nixe_memory::{
     MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationKind,
     MemoryInvalidationLog, MemoryInvalidationOrigin, MemoryInvalidationSource,
 };
+use rustc_hash::FxHashMap;
 
 use crate::{
     error::{InstructionFetchFault, InstructionFetchFaultReason},
@@ -63,13 +64,13 @@ type PageTableLeaf = [Option<ExecutionMapping>; LEAF_ENTRY_COUNT];
 
 /// Sparse two-level virtual page table.
 ///
-/// One allocated leaf covers 2 MiB of virtual address space. Consequently the
-/// allocation cost is proportional to populated regions, never to the 64-bit
-/// guest address space. A lookup performs one ordered lookup for the leaf and
-/// one array index for the page.
+/// One allocated leaf covers 2 MiB of virtual address space. Translation uses
+/// one expected O(1) hash lookup and an array index. Ordered leaf keys serve
+/// sparse QueryMemory boundaries without putting a tree walk on every access.
 #[derive(Default)]
 struct ExecutionPageTable {
-    leaves: BTreeMap<(AddressSpaceId, u64), Box<PageTableLeaf>>,
+    leaves: FxHashMap<(AddressSpaceId, u64), Box<PageTableLeaf>>,
+    ordered_leaves: BTreeSet<(AddressSpaceId, u64)>,
     // QueryMemory repeatedly asks about the same large heap. Retain its last
     // maximal extent, with the exact query limit, until ANY mapping mutation.
     // Keeping this beside the leaves makes invalidation unavoidable at every
@@ -115,10 +116,10 @@ impl ExecutionPageTable {
     ) -> Option<ExecutionMapping> {
         self.query = None;
         let (leaf, index) = Self::coordinates(virtual_page);
-        let entries = self
-            .leaves
-            .entry((address_space, leaf))
-            .or_insert_with(|| Box::new([None; LEAF_ENTRY_COUNT]));
+        let entries = self.leaves.entry((address_space, leaf)).or_insert_with(|| {
+            self.ordered_leaves.insert((address_space, leaf));
+            Box::new([None; LEAF_ENTRY_COUNT])
+        });
         entries[index].replace(mapping)
     }
 
@@ -134,14 +135,16 @@ impl ExecutionPageTable {
         let removed = entries[index].take();
         if entries.iter().all(Option::is_none) {
             self.leaves.remove(&key);
+            self.ordered_leaves.remove(&key);
         }
         removed
     }
 
     fn mappings(&self) -> impl Iterator<Item = (AddressSpaceId, u64, ExecutionMapping)> + '_ {
-        self.leaves
+        self.ordered_leaves
             .iter()
-            .flat_map(|(&(address_space, leaf), entries)| {
+            .flat_map(|&(address_space, leaf)| {
+                let entries = &self.leaves[&(address_space, leaf)];
                 entries
                     .iter()
                     .enumerate()
@@ -678,11 +681,12 @@ impl ExecutionMemoryInner {
         let (leaf, index) = ExecutionPageTable::coordinates(page);
         let previous = self
             .mappings
-            .leaves
+            .ordered_leaves
             .range(..=(address_space, leaf))
             .rev()
-            .take_while(|((space, _), _)| *space == address_space)
-            .find_map(|((_, candidate), entries)| {
+            .take_while(|(space, _)| *space == address_space)
+            .find_map(|key @ (_, candidate)| {
+                let entries = &self.mappings.leaves[key];
                 let end = if *candidate == leaf {
                     index
                 } else {
@@ -696,10 +700,11 @@ impl ExecutionMemoryInner {
             .unwrap_or(0);
         let next = self
             .mappings
-            .leaves
+            .ordered_leaves
             .range((address_space, leaf)..)
-            .take_while(|((space, _), _)| *space == address_space)
-            .find_map(|((_, candidate), entries)| {
+            .take_while(|(space, _)| *space == address_space)
+            .find_map(|key @ (_, candidate)| {
+                let entries = &self.mappings.leaves[key];
                 let start = if *candidate == leaf { index + 1 } else { 0 };
                 entries[start..]
                     .iter()
@@ -974,8 +979,7 @@ impl ExecutionMemory {
                 return Ok(NativeMemoryAccess::Visibility(page.clone()));
             }
         }
-        drop(inner);
-        match self.repair_resolved_direct_access(space, address, kind, resolved) {
+        match self.repair_resolved_direct_access(inner, space, address, kind, resolved) {
             DirectFaultResolution::Retry => Ok(NativeMemoryAccess::Ram),
             DirectFaultResolution::Cold => Ok(NativeMemoryAccess::CheckedRam),
             DirectFaultResolution::Fault(fault) => Err(fault),
@@ -1036,6 +1040,7 @@ impl ExecutionMemory {
 
     fn repair_resolved_direct_access(
         &self,
+        inner: MutexGuard<'_, ExecutionMemoryInner>,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
         kind: DataAccessKind,
@@ -1044,6 +1049,10 @@ impl ExecutionMemory {
         // Check the complete subaccess before changing protection: report a
         // second-page guest fault at its first failing byte. At most two pages
         // are touched by a supported native access.
+        let arena = match inner.backends.get(&address_space) {
+            Some(ExecutionBackendBinding::LinuxDirect { arena, .. }) => arena.clone(),
+            _ => return DirectFaultResolution::Cold,
+        };
         let pages = [
             Some((address, resolved.first)),
             resolved.second.map(|mapping| {
@@ -1053,8 +1062,21 @@ impl ExecutionMemory {
                 )
             }),
         ];
-        for (address, mapping) in pages.into_iter().flatten() {
-            match repair_direct_page(self, address_space, address, kind, mapping) {
+        // All callers retain an execution lease: mappings cannot change until
+        // native execution leaves its slice. Retain backing under the original
+        // lookup lock, then release it before page transitions or visibility.
+        let pages = pages.map(|page| {
+            page.map(|(address, mapping)| {
+                let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
+                else {
+                    unreachable!("resolved RAM retains its backing")
+                };
+                (address, mapping, backing.clone())
+            })
+        });
+        drop(inner);
+        for (address, mapping, backing) in pages.into_iter().flatten() {
+            match repair_direct_page(&arena, &backing, address_space, address, kind, mapping) {
                 DirectFaultResolution::Retry => {}
                 other => return other,
             }
@@ -2581,7 +2603,8 @@ fn checked_ram_access(
 }
 
 fn repair_direct_page(
-    memory: &ExecutionMemory,
+    arena: &DirectArena,
+    backing: &CanonicalBackingPage,
     address_space: AddressSpaceId,
     address: GuestVirtualAddress,
     kind: DataAccessKind,
@@ -2590,29 +2613,9 @@ fn repair_direct_page(
     let fault = |address, reason| {
         DirectFaultResolution::Fault(DataAccessFault::new(address_space, address, kind, reason))
     };
-    let required = match kind {
-        DataAccessKind::Read => MemoryPermissions::READ,
-        DataAccessKind::Write => MemoryPermissions::WRITE,
-    };
     if !direct_data_permissions_representable(mapping.permissions) {
         return DirectFaultResolution::Cold;
     }
-    let inner = memory.lock_inner();
-    let backing = match inner.page(mapping.physical_slot) {
-        Some(ExecutionPhysicalPage::Ram(backing)) => backing,
-        Some(ExecutionPhysicalPage::Mmio(_)) => return DirectFaultResolution::Cold,
-        None => {
-            return fault(
-                address,
-                DataAccessFaultReason::HostBacking("guest mapping has no physical backing".into()),
-            );
-        }
-    };
-    let backing = backing.clone();
-    // Fault resolution runs while the vCPU retains its shared execution
-    // lease. Never hold the mapping mutex while entering a backing-page
-    // transition; mapping/protection revalidation reacquires it afterwards.
-    drop(inner);
     let transition = match kind {
         DataAccessKind::Read => backing.prepare_cpu_access(),
         DataAccessKind::Write => backing.resolve_direct_write_fault().map(|_| ()),
@@ -2631,35 +2634,16 @@ fn repair_direct_page(
     }
     let expected = match kind {
         DataAccessKind::Read => matches!(
-            effective_direct_protection(maximum_direct_protection(mapping), &backing),
+            effective_direct_protection(maximum_direct_protection(mapping), backing),
             DirectProtection::Read | DirectProtection::ReadWrite
         ),
         DataAccessKind::Write => matches!(
-            effective_direct_protection(maximum_direct_protection(mapping), &backing),
+            effective_direct_protection(maximum_direct_protection(mapping), backing),
             DirectProtection::ReadWrite
         ),
     };
     if expected {
-        let inner = memory.lock_inner();
-        let still_mapped = inner
-            .mapping_at(address_space, address)
-            .is_some_and(|current| {
-                current.physical_page == mapping.physical_page
-                    && current.physical_slot == mapping.physical_slot
-                    && current.permissions.contains(required)
-            });
-        if !still_mapped {
-            return fault(address, DataAccessFaultReason::Unmapped);
-        }
-        let protection = inner
-            .backends
-            .get(&address_space)
-            .and_then(|binding| match binding {
-                ExecutionBackendBinding::LinuxDirect { arena, .. } => {
-                    arena.protection_at(page_address(virtual_page(address)).get())
-                }
-                ExecutionBackendBinding::Checked => None,
-            });
+        let protection = arena.protection_at(page_address(virtual_page(address)).get());
         let published = match kind {
             DataAccessKind::Read => matches!(
                 protection,
@@ -2778,13 +2762,12 @@ impl CpuMemory for ExecutionMemory {
         if resolved.region != MemoryRegionKind::Ram || resolved.second.is_some() {
             return DirectFaultResolution::Cold;
         }
-        drop(inner);
-        repair_direct_page(
-            self,
+        self.repair_resolved_direct_access(
+            inner,
             address_space,
             address,
             DataAccessKind::Write,
-            resolved.first,
+            resolved,
         )
     }
 
@@ -2815,8 +2798,7 @@ impl CpuMemory for ExecutionMemory {
         if resolved.region == MemoryRegionKind::Device {
             return DirectFaultResolution::Cold;
         }
-        drop(inner);
-        self.repair_resolved_direct_access(address_space, address, kind, resolved)
+        self.repair_resolved_direct_access(inner, address_space, address, kind, resolved)
     }
 
     fn read(
@@ -5134,6 +5116,89 @@ mod tests {
         assert_eq!(
             memory.read(space, address, ordinary).unwrap().value,
             replacement
+        );
+    }
+
+    #[test]
+    fn sparse_query_boundaries_follow_leaf_removal_recreation_and_other_spaces() {
+        let memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(1);
+        let other = AddressSpaceId::new(2);
+        let limit = GuestVirtualAddress::new(0x80_0000);
+        for (space, address) in [
+            (other, 0x20_0000),
+            (space, 0x40_0000),
+            (space, 0x1000),
+            (space, 0x20_0000),
+        ] {
+            memory
+                .resize_zeroed_mapping(
+                    space,
+                    GuestVirtualAddress::new(address),
+                    0,
+                    PAGE_SIZE,
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Heap,
+                )
+                .unwrap();
+        }
+        let query = |space, address| {
+            memory
+                .query_memory(space, GuestVirtualAddress::new(address), limit)
+                .unwrap()
+        };
+        let hole = query(space, 0x30_0000);
+        assert_eq!(
+            (hole.base.get(), hole.size, hole.region),
+            (0x20_1000, 0x1f_f000, None)
+        );
+        memory
+            .resize_zeroed_mapping(
+                space,
+                GuestVirtualAddress::new(0x20_0000),
+                PAGE_SIZE,
+                0,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        let hole = query(space, 0x30_0000);
+        assert_eq!(
+            (hole.base.get(), hole.size, hole.region),
+            (0x2000, 0x3f_e000, None)
+        );
+        assert_eq!(query(other, 0x20_0000).region, Some(MemoryRegionKind::Ram));
+        let access = MemoryAccess::normal(MemoryAccessSize::Word);
+        let address = GuestVirtualAddress::new(0x20_0000);
+        assert_eq!(
+            memory.read(space, address, access).unwrap_err().reason,
+            DataAccessFaultReason::Unmapped
+        );
+        memory
+            .resize_zeroed_mapping(
+                space,
+                address,
+                0,
+                PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        memory
+            .write(space, address, access, MemoryValue::U32(0x1234_5678))
+            .unwrap();
+        assert_eq!(
+            memory.read(space, address, access).unwrap().value,
+            MemoryValue::U32(0x1234_5678)
+        );
+        assert_eq!(
+            memory.read(other, address, access).unwrap().value,
+            MemoryValue::U32(0)
+        );
+        let hole = query(space, 0x30_0000);
+        assert_eq!(
+            (hole.base.get(), hole.size, hole.region),
+            (0x20_1000, 0x1f_f000, None)
         );
     }
 

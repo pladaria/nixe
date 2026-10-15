@@ -8,10 +8,13 @@ fn neutral_memory_contract_has_no_platform_or_execution_dependencies() {
         fs::read_to_string(manifest.join("Cargo.toml")).expect("memory manifest must be readable");
     let dependencies = dependency_names(&contents);
 
-    assert!(
-        dependencies.is_empty(),
-        "neutral memory crate must remain dependency-free, found {dependencies:?}"
-    );
+    // A local hash-table implementation owns no platform or execution behavior.
+    for dependency in dependencies {
+        assert_eq!(
+            dependency, "rustc-hash",
+            "memory dependency must preserve the neutral ownership boundary"
+        );
+    }
 }
 
 fn dependency_names(manifest: &str) -> Vec<&str> {

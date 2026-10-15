@@ -1073,6 +1073,13 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         self.awaiting_resume = false;
     }
 
+    /// Reclaims only the host command container after successful acceptance.
+    /// The backend retains native resources until their real GPU completion.
+    pub fn recycle_segment(&mut self, segment: <W::Batch as MaxwellWorkBatch<W>>::Segment) {
+        debug_assert!(self.awaiting_resume);
+        self.batch.recycle_segment(segment);
+    }
+
     /// All currently delivered steps have been consumed, but the producer
     /// has not sealed this delivery yet.
     #[must_use]

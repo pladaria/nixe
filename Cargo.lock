@@ -1465,6 +1465,7 @@ name = "nixe-cpu"
 version = "0.1.0"
 dependencies = [
  "nixe-memory",
+ "rustc-hash 1.1.0",
 ]
 
 [[package]]
@@ -1659,6 +1660,7 @@ name = "nixe-memory"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustc-hash 1.1.0",
 ]
 
 [[package]]

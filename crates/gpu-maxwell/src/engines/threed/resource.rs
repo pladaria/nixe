@@ -6,7 +6,7 @@
 
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
     sync::Arc,
 };
@@ -24,6 +24,7 @@ use nixe_memory::{
 };
 
 use crate::engines::MaxwellShaderBufferSize;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
     MaxwellAllocationId, MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellMappingId,
@@ -775,17 +776,15 @@ fn resolve_maxwell_three_d_resources_inner(
     }
 
     let bindings = state.shader_bindings();
-    for group in 0..MAXWELL_BIND_GROUP_COUNT {
-        for slot in 0..MAXWELL_CONSTANT_BUFFER_SLOT_COUNT {
+    let constant_slots = constant_buffer_masks(required_roles, inspect_complete_state);
+    for (group, mut slots) in constant_slots.into_iter().enumerate() {
+        while slots != 0 {
+            let slot = slots.trailing_zeros() as usize;
+            slots &= slots - 1;
             let role = MaxwellThreeDResourceRole::ConstantBuffer {
                 group: group as u8,
                 slot: slot as u8,
             };
-            if !inspect_complete_state
-                && !constant_buffer_is_required(required_roles, group as u8, slot as u8)
-            {
-                continue;
-            }
             let Some(binding) = bindings.groups()[group].constant_buffers()[slot] else {
                 continue;
             };
@@ -3161,22 +3160,34 @@ fn color_image_format(
     }
 }
 
-fn constant_buffer_is_required(
+fn constant_buffer_masks(
     required_roles: &[MaxwellThreeDResourceRole],
-    group: u8,
-    slot: u8,
-) -> bool {
-    required_roles.iter().any(|role| match role {
-        MaxwellThreeDResourceRole::ConstantBuffer {
-            group: required_group,
-            slot: required_slot,
-        } => *required_group == group && *required_slot == slot,
-        MaxwellThreeDResourceRole::SampledImage { texture, .. }
-        | MaxwellThreeDResourceRole::Sampler(texture) => {
-            texture.group == group && texture.constant_buffer_slot == slot
+    inspect_complete_state: bool,
+) -> [u32; MAXWELL_BIND_GROUP_COUNT] {
+    let mut constant_slots = [0u32; MAXWELL_BIND_GROUP_COUNT];
+    if inspect_complete_state {
+        constant_slots.fill(u32::MAX >> (u32::BITS as usize - MAXWELL_CONSTANT_BUFFER_SLOT_COUNT));
+    } else {
+        // Resolve the consumed bindings once. Scanning every slot and searching
+        // the whole role list at each slot made sparse draws scale with the
+        // complete hardware register file instead of their actual resources.
+        for role in required_roles {
+            let (group, slot) = match *role {
+                MaxwellThreeDResourceRole::ConstantBuffer { group, slot } => (group, slot),
+                MaxwellThreeDResourceRole::SampledImage { texture, .. }
+                | MaxwellThreeDResourceRole::Sampler(texture) => {
+                    (texture.group, texture.constant_buffer_slot)
+                }
+                _ => continue,
+            };
+            if let Some(mask) = constant_slots.get_mut(group as usize)
+                && (slot as usize) < MAXWELL_CONSTANT_BUFFER_SLOT_COUNT
+            {
+                *mask |= 1 << slot;
+            }
         }
-        _ => false,
-    })
+    }
+    constant_slots
 }
 
 /// Decodes verified Maxwell TIC format/component/swizzle tuples into their
@@ -3919,7 +3930,7 @@ mod tests {
         MAXWELL_C32_2CRA_KIND, MAXWELL_C64_2CRA_KIND, MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
         MaxwellThreeDPreservedImageLayout, MaxwellThreeDResolvedResourceCache,
         MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDRetainedBackingCache,
-        MaxwellThreeDTextureDimension, constant_buffer_is_required, decode_sampled_texture_format,
+        MaxwellThreeDTextureDimension, constant_buffer_masks, decode_sampled_texture_format,
         decode_sampler, image_kind_matches, read_backing_bytes, read_descriptor_bytes,
         texture_descriptor_pair, uses_maxwell_texture_headers,
     };
@@ -4401,10 +4412,15 @@ mod tests {
             MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 2 },
         ];
 
-        assert!(constant_buffer_is_required(&roles, 4, 0));
-        assert!(constant_buffer_is_required(&roles, 0, 2));
-        assert!(!constant_buffer_is_required(&roles, 4, 1));
-        assert!(!constant_buffer_is_required(&roles, 3, 0));
+        let masks = constant_buffer_masks(&roles, false);
+        assert_eq!(masks[4], 1);
+        assert_eq!(masks[0], 1 << 2);
+        assert_eq!(masks[3], 0);
+        assert!(
+            constant_buffer_masks(&[], true)
+                .iter()
+                .all(|mask| *mask == u32::MAX)
+        );
     }
 
     #[test]

@@ -404,7 +404,7 @@ impl VulkanResidency {
                 .src_subresource(subresource)
                 .dst_subresource(subresource)
                 .extent(p.extent);
-            self.barriers.emit(&self.device);
+            self.barriers.emit(&mut self.device);
             let slot = self.device.submission.begin()?;
             unsafe {
                 self.device.owner.device.cmd_copy_image(
@@ -570,7 +570,7 @@ impl VulkanResidency {
                         .size(piece.length)
                 })
                 .collect();
-            self.barriers.emit(&self.device);
+            self.barriers.emit(&mut self.device);
             unsafe {
                 self.device
                     .owner
@@ -589,7 +589,7 @@ impl VulkanResidency {
                 .map(|piece| piece.region(source_offset + piece.logical))
                 .collect()
         };
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         unsafe {
             self.device.owner.device.cmd_copy_buffer_to_image(
                 command,
@@ -1056,7 +1056,7 @@ impl VulkanResidency {
             .zip(&slices)
             .map(|(piece, &offset)| piece.region(offset))
             .collect();
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         unsafe {
             self.device.owner.device.cmd_copy_image_to_buffer(
                 command,

@@ -272,7 +272,7 @@ impl VulkanResidency {
             ),
         )?;
         let address = self.buffer(id)?.address;
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let slot = &mut self.device.submission.slots[index];
         let command = slot.command;
         unsafe {

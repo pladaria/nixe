@@ -301,6 +301,7 @@ impl ScreenRenderer {
                         "UI texture update exceeds allocation",
                     ));
                 }
+                cache.device_mut().end_rendering();
                 let (slot, slice) = cache.device_mut().submission.reserve_upload(&bytes)?;
                 let device = cache.device();
                 let command = device.submission.slots[slot].command;
@@ -579,6 +580,7 @@ impl ScreenRenderer {
         let mut push = [0u8; 8];
         push[..4].copy_from_slice(&(extent.width as f32 / ui.pixels_per_point).to_le_bytes());
         push[4..8].copy_from_slice(&(extent.height as f32 / ui.pixels_per_point).to_le_bytes());
+        cache.device_mut().end_rendering();
         let index = cache.device_mut().submission.begin()?;
         let command = cache.device().submission.slots[index].command;
         let dependency = [vk::MemoryBarrier2::default()

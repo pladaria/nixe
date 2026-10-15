@@ -3,7 +3,9 @@ use std::path::Path;
 
 // Keep this allowlist explicit. Adding an entry is an architectural review of
 // the CPU crate's ownership boundary, not merely a manifest edit.
-const APPROVED_DEPENDENCIES: &[&str] = &["nixe-memory"];
+// rustc-hash provides local page-table containers; it owns no execution engine
+// or platform behavior and introduces no dependency on a concrete CPU backend.
+const APPROVED_DEPENDENCIES: &[&str] = &["nixe-memory", "rustc-hash"];
 
 #[test]
 fn manifest_contains_only_architecturally_approved_dependencies() {

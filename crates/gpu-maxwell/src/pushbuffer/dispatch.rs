@@ -41,8 +41,8 @@ const MEM_OP_B_L2_FLUSH_DIRTY: u8 = 0x10;
 /// Complete pointer-free source of one expanded Maxwell method write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellMethodSource {
-    channel: MaxwellChannelId,
-    submission: FrontendSubmissionId,
+    // Dispatch validates both identities against the location. Retain them once
+    // rather than copying duplicate IDs through every raw/typed/shadow register.
     location: MaxwellGpfifoSourceLocation,
     subchannel: MaxwellPushbufferSubchannel,
     method: GpuMethodId,
@@ -58,18 +58,14 @@ impl MaxwellMethodSource {
         }
     }
 
-    pub(crate) const fn with_effective_argument(self, argument: u32) -> Self {
-        Self { argument, ..self }
-    }
-
     #[must_use]
     pub const fn channel(self) -> MaxwellChannelId {
-        self.channel
+        self.location.channel
     }
 
     #[must_use]
     pub const fn submission(self) -> FrontendSubmissionId {
-        self.submission
+        self.location.frontend
     }
 
     #[must_use]
@@ -165,11 +161,8 @@ impl MaxwellMethodDispatch {
         }
     }
 
-    pub(crate) const fn with_effective_argument(self, argument: u32) -> Self {
-        Self {
-            source: self.source.with_effective_argument(argument),
-            ..self
-        }
+    pub(crate) const fn set_effective_argument(&mut self, argument: u32) {
+        self.source.argument = argument;
     }
 
     #[must_use]
@@ -447,15 +440,13 @@ fn dispatch_method(
     method: MaxwellDecodedMethod,
     frontend: &mut MaxwellChannelFrontendState,
 ) -> Result<MaxwellMethodDispatch, MaxwellMethodDispatchError> {
+    validate_source_identity(channel, submission, method.argument_source())?;
     let source = MaxwellMethodSource {
-        channel,
-        submission,
         location: method.argument_source(),
         subchannel,
         method: method.method(),
         argument: method.argument(),
     };
-    validate_source_identity(channel, submission, source.location)?;
     if method.method() == MAXWELL_SET_OBJECT_METHOD {
         return preflight_set_object(profile, source, frontend);
     }

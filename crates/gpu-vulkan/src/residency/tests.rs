@@ -300,6 +300,119 @@ fn buffer_coherence_khr12() {
 }
 
 #[test]
+fn cpu_snapshots_exclude_gpu_holes_and_preserve_repeated_dirty_pages() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (a, range_a) = backing_allocation(4096, 4096, 0x11);
+    let (_, range_b) = backing_allocation(4096, 4096, 0x22);
+    let (_, range_c) = backing_allocation(4096, 4096, 0x33);
+    let gpu = buffer(&mut cache, range_b.snapshot_subrange(0, 32).unwrap());
+    write(&mut cache, gpu, 0, &[0x99; 32]);
+    cache.flush().unwrap();
+    let parts = [&range_a, &range_b, &range_c, &range_a]
+        .map(|range| range.snapshot_subrange(0, 32).unwrap());
+    let mixed = CanonicalBackingRange::new(
+        parts
+            .iter()
+            .flat_map(|range| range.segments().iter().cloned())
+            .collect(),
+    )
+    .unwrap();
+    let dependency = CanonicalCpuWriteDependency::capture(&mixed).unwrap();
+    assert_eq!(
+        cache
+            .cpu_snapshots(&mixed, &dependency, &[(0, 128)])
+            .unwrap(),
+        vec![
+            (0, vec![0x11; 32].into_boxed_slice()),
+            (
+                64,
+                [vec![0x33; 32], vec![0x11; 32]].concat().into_boxed_slice()
+            ),
+        ]
+    );
+    a.write(7, &[0x77; 4]).unwrap();
+    let mut updated = vec![0x11; 32];
+    updated[7..11].fill(0x77);
+    // Forced windows need not arrive sorted and can cross GPU-owned holes.
+    assert_eq!(
+        cache
+            .cpu_snapshots(&mixed, &dependency, &[(110, 10), (4, 70)])
+            .unwrap(),
+        vec![
+            (0, updated.clone().into_boxed_slice()),
+            (64, vec![0x33; 10].into_boxed_slice()),
+            (96, updated.into_boxed_slice()),
+        ]
+    );
+    assert!(
+        cache
+            .cpu_snapshots(&mixed, &dependency, &[])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(cache.statistics().canonical_readback_bytes, 0);
+    assert_eq!(cache.statistics().native_readback_bytes, 0);
+    assert!(matches!(
+        range_b.pages().next().unwrap().visibility_state(),
+        VisibilityState::GpuNewer { .. }
+    ));
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+fn cpu_snapshots_merge_adjacent_forced_windows_and_rearm_full_snapshots() {
+    let Some(cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (allocation, whole) = backing_allocation(4096, 4096, 0);
+    let mut expected = (0..1024).map(|index| index as u8).collect::<Vec<_>>();
+    allocation.write(0, &expected).unwrap();
+    let range = whole.snapshot_subrange(0, 1024).unwrap();
+    let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+    assert_eq!(
+        cache
+            .cpu_snapshots(&range, &dependency, &[(0, 1024)])
+            .unwrap(),
+        vec![(0, expected.clone().into_boxed_slice())]
+    );
+    assert!(
+        cache
+            .cpu_snapshots(&range, &dependency, &[])
+            .unwrap()
+            .is_empty()
+    );
+    let fragments = (0..128)
+        .rev()
+        .map(|index| (index * 8, 8))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cache
+            .cpu_snapshots(&range, &dependency, &fragments)
+            .unwrap(),
+        vec![(0, expected.clone().into_boxed_slice())]
+    );
+    allocation.write(99, &[0xef; 5]).unwrap();
+    expected[99..104].fill(0xef);
+    assert_eq!(
+        cache.cpu_snapshots(&range, &dependency, &[]).unwrap(),
+        vec![(0, expected.into_boxed_slice())]
+    );
+    assert!(
+        cache
+            .cpu_snapshots(&range, &dependency, &[])
+            .unwrap()
+            .is_empty()
+    );
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn fragmented_repeated_canonical_offsets_and_same_buffer_copies() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
@@ -379,6 +492,65 @@ fn rgba_image() -> (NativeImageDescription, Vec<ImagePlane>) {
         }],
     )
 }
+#[test]
+fn image_publication_refreshes_late_aliases_after_foreign_writes_and_cpu_visibility() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (_, backing) = backing_allocation(4096, 4096, 0x41);
+    let (description, planes) = rgba_image();
+    let image = cache
+        .image_for(backing.clone(), description, planes.clone())
+        .unwrap();
+    cache
+        .clear_color_image(
+            image,
+            0,
+            vk::ClearColorValue {
+                float32: [1., 0., 0., 1.],
+            },
+        )
+        .unwrap();
+    // Populate coverage before these bindings exist: the next publication must
+    // rebuild alias invalidation even though the physical footprint is unchanged.
+    let alias = buffer(&mut cache, backing.snapshot_subrange(0, 128).unwrap());
+    let mut other_description = description;
+    other_description.format = vk::Format::B8G8R8A8_UNORM;
+    let other = cache
+        .image_for(backing.clone(), other_description, planes)
+        .unwrap();
+    for color in [[0., 1., 0., 1.], [0., 0., 1., 1.], [1., 1., 1., 1.]] {
+        let version = cache.image(image).unwrap().version;
+        cache
+            .clear_color_image(image, 0, vk::ClearColorValue { float32: color })
+            .unwrap();
+        assert_eq!(cache.image(image).unwrap().version, version + 1);
+        assert!(!cache.buffer(alias).unwrap().contents.invalid.is_empty());
+        assert!(!cache.image(other).unwrap().contents.invalid.is_empty());
+        let pixel = color.map(|channel| (channel * 255.) as u8);
+        let mut expected = vec![0x41; 128];
+        for row in 0..3 {
+            for x in 0..4 {
+                let start = 32 + row * 24 + x * 4;
+                expected[start..start + 4].copy_from_slice(&pixel);
+            }
+        }
+        assert_eq!(cache.read_buffer(alias, 0, 128).unwrap(), expected);
+        // Expand authority with a foreign buffer writer, then acknowledge a
+        // real CPU read. A later image write must republish its latest bytes.
+        write(&mut cache, alias, 36, &[0xaa; 4]);
+        expected[36..40].fill(0xaa);
+        assert_eq!(
+            cpu_read(&mut cache, &backing.snapshot_subrange(0, 128).unwrap()),
+            expected
+        );
+        cache.drain_notifications();
+    }
+    drop(cache);
+    validation.check().unwrap();
+}
+
 #[test]
 fn image_buffer_aliases_compatible_views_and_partial_readback() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {

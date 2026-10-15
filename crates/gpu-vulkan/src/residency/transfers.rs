@@ -78,7 +78,7 @@ impl VulkanResidency {
             ),
         )?;
         let index = self.device.submission.begin()?;
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         unsafe {
             self.device.owner.device.cmd_fill_buffer(
                 self.device.submission.slots[index].command,
@@ -199,8 +199,13 @@ impl VulkanResidency {
         rect: vk::Rect2D,
     ) -> Result<(), VulkanError> {
         self.publish_image_write(id, p, rect)?;
-        let work = self.device.work_ticket()?;
         self.define_image_rect(id, p, rect);
+        self.advance_image_producer(id)
+    }
+    /// The native content version changes for every accepted write, including
+    /// writes whose physical coverage is already current in a rendering scope.
+    pub(super) fn advance_image_producer(&mut self, id: ImageId) -> Result<(), VulkanError> {
+        let work = self.device.work_ticket()?;
         let entry = self.images[id.slot].entry.as_mut().expect("image");
         entry.producer = Some(work);
         entry.version = entry
@@ -300,7 +305,7 @@ impl VulkanResidency {
             ),
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let index = self.device.submission.begin()?;
         unsafe {
             self.device.owner.device.cmd_clear_color_image(
@@ -352,7 +357,7 @@ impl VulkanResidency {
             ),
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let index = self.device.submission.begin()?;
         unsafe {
             self.device.owner.device.cmd_clear_depth_stencil_image(
@@ -446,7 +451,7 @@ impl VulkanResidency {
                 height: rect.extent.height,
                 depth: 1,
             });
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let slot = self.device.submission.begin()?;
         unsafe {
             self.device.owner.device.cmd_resolve_image(
@@ -506,7 +511,7 @@ impl VulkanResidency {
                 ),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             )?;
-            self.barriers.emit(&self.device);
+            self.barriers.emit(&mut self.device);
             let index = self.device.submission.begin()?;
             let command = self.device.submission.slots[index].command;
             let extent = vk::Extent3D {
@@ -541,7 +546,7 @@ impl VulkanResidency {
                 ),
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             )?;
-            self.barriers.emit(&self.device);
+            self.barriers.emit(&mut self.device);
             let region = vk::BufferImageCopy::default()
                 .image_subresource(dst.layers())
                 .image_offset(vk::Offset3D {
@@ -601,7 +606,7 @@ impl VulkanResidency {
                 height: rect.extent.height,
                 depth: 1,
             });
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         let index = self.device.submission.begin()?;
         unsafe {
             self.device.owner.device.cmd_copy_image(

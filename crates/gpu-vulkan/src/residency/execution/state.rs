@@ -57,8 +57,31 @@ impl GraphicsParameters {
     }
 }
 pub struct PreparedGraphics {
-    pub(super) program: PreparedProgram,
+    pub(super) program: Arc<PreparedProgram>,
     pub(super) parameters: Arc<GraphicsParameters>,
+}
+pub(crate) struct PreparedGraphicsState {
+    pipeline: Arc<NativePipeline>,
+    parameters: Arc<GraphicsParameters>,
+}
+impl PreparedGraphicsState {
+    pub(crate) fn bind(
+        &self,
+        program: Arc<PreparedProgram>,
+    ) -> Result<PreparedGraphics, VulkanError> {
+        if !Arc::ptr_eq(&self.pipeline, &program.pipeline) {
+            return Err(VulkanError::InvalidResource(
+                "graphics state belongs to another pipeline",
+            ));
+        }
+        Ok(PreparedGraphics {
+            program,
+            parameters: Arc::clone(&self.parameters),
+        })
+    }
+    pub(crate) fn pipeline(&self) -> &Arc<NativePipeline> {
+        &self.pipeline
+    }
 }
 impl VulkanResidency {
     pub fn prepare_graphics(
@@ -66,7 +89,14 @@ impl VulkanResidency {
         program: PreparedProgram,
         parameters: GraphicsParameters,
     ) -> Result<PreparedGraphics, VulkanError> {
-        let pipeline = &program.pipeline;
+        self.prepare_graphics_state(Arc::clone(&program.pipeline), parameters)?
+            .bind(Arc::new(program))
+    }
+    pub(crate) fn prepare_graphics_state(
+        &self,
+        pipeline: Arc<NativePipeline>,
+        parameters: GraphicsParameters,
+    ) -> Result<PreparedGraphicsState, VulkanError> {
         if pipeline.bind_point != vk::PipelineBindPoint::GRAPHICS
             || pipeline.graphics.as_ref()
                 != Some(
@@ -153,8 +183,8 @@ impl VulkanResidency {
                 "depth bounds exceed enabled normalized depthBounds contract",
             ));
         }
-        Ok(PreparedGraphics {
-            program,
+        Ok(PreparedGraphicsState {
+            pipeline,
             parameters: Arc::new(parameters),
         })
     }

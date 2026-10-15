@@ -403,6 +403,43 @@ its code/descriptor/mapping proofs; Vulkan owns native formats, caches, recordin
 hazards and completion. The old execution remains the reference until task 15;
 the generic composition seam and its old default types retire in task 16.
 
+Draw arguments, shader bindings and graphics parameters have independent retained
+identities. Physical vertex-window changes preserve vertex formats and raster
+preparation. If intermediate register writes restore the same consumed state,
+bit-exact semantic comparison retains the previous parameters instead of issuing
+a fresh native identity. Shader bindings likewise compare physical buffer
+mappings and immutable image views, independently of content epochs. A changed
+binding set reuses the compiled pipeline and validated dynamic-state parameters;
+unchanged sets retain their descriptor preparation. Current render targets also
+retain native view preparation separately from vertex/shader bindings.
+
+Compatible LOAD/STORE attachments keep one dynamic-rendering instance across
+frontend deliveries, pipeline/dynamic-state changes and descriptor changes.
+Ordinary framebuffer operations retain Vulkan's rasterization ordering; shader
+writes, feedback, transfers, real hazards, clears, presentation and submission
+terminate the instance. Canonical write ownership still publishes at accepted
+command boundaries, and command-buffer retirement retains every native use.
+Within an unchanged compatible scope, the first draw publishes the attachment's
+physical coverage. Later draws retain that coverage and advance the image's
+content version and producer ticket without walking its pages again. Imports,
+CPU visibility and other ownership changes end the scope before it can be reused.
+
+Small CPU-authored read-only shader/vertex windows can bind immutable snapshots
+directly from mapped upload arenas. Fresh versions use distinct aligned regions;
+unchanged versions reuse their region only within the same reserved submission
+and with a current CPU dependency. An independent observer preserves the native
+buffer's dirty proof. GPU-authored/mixed pages use ordinary native reconstruction
+and barriers. The 64 KiB policy bounds per-read snapshots; fixed-arena exhaustion
+uses ordinary transfers rather than retaining cached overflow allocations outside
+their budget. Non-coherent flush/atom isolation and timeline retirement apply on
+both discrete and unified-memory hosts.
+
+Maxwell derives constant-buffer windows from live optimized SSA once during
+compilation. Proven static loads retain their maximum consumed byte end across
+stages; unproved addresses retain the declared binding. Texture-handle reads also
+extend the resolved window. This bounds snapshots to consumed bytes without
+per-draw shader inspection or assumptions about guest buffer contents.
+
 Task 11 verifies real offscreen homebrew execution and prepared-state reuse.
 Task 12 adds native windowed presentation, egui mesh/texture recording and PNG
 readback. Video producers/conversion remain task 13. Complete guest coverage, host verification and final workload/performance

@@ -2,12 +2,13 @@ use crate::ffi;
 use nixe_cpu::execution::ArchitecturalTimer;
 use nixe_cpu::memory::*;
 use nixe_cpu::profile::ProcessCpuContext;
-use nixe_memory::{CanonicalBackingPage, GuestVirtualAddress};
+use nixe_memory::{CanonicalBackingPage, DirectAddressSpaceView, GuestVirtualAddress};
 use std::collections::HashSet;
 use std::ffi::c_void;
 
 pub struct Context<'a> {
     pub memory: &'a ExecutionMemory,
+    pub arena: DirectAddressSpaceView,
     pub cpu: ProcessCpuContext,
     pub timer: &'a dyn ArchitecturalTimer,
     pub blocked_fetches: &'a mut HashSet<u64>,
@@ -157,8 +158,7 @@ unsafe extern "C" fn memory(
             DirectFaultResolution::Retry => {
                 // The execution lease keeps mappings stable; the resolver checks
                 // the complete access and reconciles tracking/device ownership.
-                let arena = context.memory.direct_address_space_view(space).unwrap();
-                let pointer = (arena.base + address.get() as usize) as *mut u8;
+                let pointer = (context.arena.base + address.get() as usize) as *mut u8;
                 let mut data = input.to_le_bytes();
                 unsafe {
                     if op == 0 {

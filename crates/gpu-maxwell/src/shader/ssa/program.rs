@@ -300,6 +300,59 @@ impl MaxwellSsaProgram {
             })
             .collect()
     }
+
+    /// Live constant loads with proven byte addresses need only their maximum
+    /// consumed end. An unproved address keeps the whole declared guest binding;
+    /// shader code is inspected once at compilation, never on the draw path.
+    pub(crate) fn constant_buffer_extents(&self) -> BTreeMap<ResourceId, Option<u64>> {
+        let mut extents: BTreeMap<_, _> = self
+            .bindings
+            .iter()
+            .filter_map(|binding| {
+                matches!(
+                    binding.source,
+                    MaxwellSsaBindingSource::ConstantBuffer { .. }
+                )
+                .then_some((binding.resource, Some(0)))
+            })
+            .collect();
+        for instruction in self.function.blocks.iter().flat_map(|b| &b.instructions) {
+            let Op::Load {
+                space: MemorySpace::Constant,
+                resource: Some(resource),
+                address_type,
+                ty,
+            } = instruction.op
+            else {
+                continue;
+            };
+            let Some(extent) = extents.get_mut(&resource) else {
+                continue;
+            };
+            let nixe_gpu::ssa::Definition::Instruction { block, index, .. } =
+                self.function.values[instruction.arguments[0].index()].definition
+            else {
+                *extent = None;
+                continue;
+            };
+            let end = match self.function.blocks[block.index()].instructions[index as usize].op {
+                Op::Constant(c) if c.ty == Type::U32 && address_type == Type::U32 => {
+                    let bytes = match ty {
+                        Type::U32 | Type::I32 | Type::F32 => Some(4),
+                        Type::U64 | Type::I64 | Type::F64 => Some(8),
+                        _ => None,
+                    };
+                    bytes.and_then(|bytes| c.bits.checked_add(bytes))
+                }
+                _ => None,
+            };
+            *extent = match (*extent, end) {
+                (Some(old), Some(end)) => Some(old.max(end)),
+                _ => None,
+            };
+        }
+        extents
+    }
 }
 /// Linked native stages, ready for SSA-derived SPIR-V and pipeline cache keys.
 #[derive(Clone, Debug, Eq, PartialEq)]

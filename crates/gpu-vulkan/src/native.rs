@@ -21,12 +21,21 @@ use images::GuestNativeImage;
 pub struct NativeExecutionStatistics {
     pub draws: u64,
     pub prepared_draws: u64,
+    pub prepared_graphics: u64,
+    pub reused_graphics: u64,
+    pub reused_programs: u64,
     pub warm_draws: u64,
     pub batches: u64,
     pub submits: u64,
     pub dispatches: u64,
 }
-enum Drawing {
+struct Drawing {
+    source: Arc<GuestDrawState>,
+    draw: PreparedDraw,
+    push: Arc<[u8]>,
+    recorded: bool,
+}
+enum Graphics {
     Shader {
         pending: Pending<ShaderArtifact>,
         state: Arc<GuestDrawState>,
@@ -37,10 +46,11 @@ enum Drawing {
         state: Arc<GuestDrawState>,
     },
     Ready {
-        source: Arc<GuestDrawState>,
-        draw: PreparedDraw,
-        push: Box<[u8]>,
-        recorded: bool,
+        source: Arc<GuestDrawParameters>,
+        shader: Arc<GuestShaderCode>,
+        state: crate::residency::execution::PreparedGraphicsState,
+        program: Option<(Arc<GuestProgram>, Arc<PreparedProgram>)>,
+        push: Arc<[u8]>,
     },
 }
 enum Computing {
@@ -72,6 +82,8 @@ pub struct NativeGpuExecution {
     descriptors: DescriptorCache,
     samplers: SamplerCache,
     drawings: HashMap<PreparedStateId, Drawing>,
+    graphics: HashMap<PreparedStateId, Graphics>,
+    targets: Option<images::Targets>,
     computing: HashMap<PreparedStateId, Computing>,
     images: HashMap<images::ImageKey, Arc<GuestNativeImage>>,
     draw_arguments: Vec<Draw>,
@@ -124,6 +136,8 @@ impl NativeGpuExecution {
             descriptors,
             samplers,
             drawings: HashMap::default(),
+            graphics: HashMap::default(),
+            targets: None,
             computing: HashMap::default(),
             images: HashMap::default(),
             draw_arguments: Vec::with_capacity(128),
@@ -160,18 +174,18 @@ impl NativeGpuExecution {
             |code: &Arc<GuestShaderCode>| code.functions.iter().collect(),
         )
     }
-    fn drawing(&mut self, state: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
-        let id = state.program.identity;
-        if !self.drawings.contains_key(&id) {
-            let graphics = state::graphics(state)?;
+    fn graphics(&mut self, state: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
+        let id = state.parameters.identity;
+        if !self.graphics.contains_key(&id) {
+            let graphics = state::graphics(&state.parameters)?;
             let pending = match self.request_shader(&state.program, Some(state)) {
                 Ok(p) => p,
                 Err(CompileError::Backpressure | CompileError::Budget) => return Ok(false),
                 Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
             };
-            self.drawings.insert(
+            self.graphics.insert(
                 id,
-                Drawing::Shader {
+                Graphics::Shader {
                     pending,
                     state: Arc::clone(state),
                     graphics,
@@ -179,26 +193,35 @@ impl NativeGpuExecution {
             );
         }
         loop {
-            let ready = match &self.drawings[&id] {
-                Drawing::Ready { .. } => return Ok(true),
-                Drawing::Shader { pending, .. } => pending.poll().map(|r| r.map(Either::Shader)),
-                Drawing::Pipeline { pending, .. } => {
+            let ready = match &self.graphics[&id] {
+                Graphics::Ready { source, shader, .. } => {
+                    if !Arc::ptr_eq(source, &state.parameters)
+                        || !Arc::ptr_eq(shader, &state.program.shader)
+                    {
+                        return Err(VulkanError::InvalidResource(
+                            "graphics identity was reused for different parameters or code",
+                        ));
+                    }
+                    return Ok(true);
+                }
+                Graphics::Shader { pending, .. } => pending.poll().map(|r| r.map(Either::Shader)),
+                Graphics::Pipeline { pending, .. } => {
                     pending.poll().map(|r| r.map(Either::Pipeline))
                 }
             };
             let Some(ready) = ready else { return Ok(false) };
             let ready = ready.map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-            let old = self.drawings.remove(&id).unwrap();
+            let old = self.graphics.remove(&id).unwrap();
             match (old, ready) {
                 (
-                    Drawing::Shader {
+                    Graphics::Shader {
                         state,
                         graphics,
                         pending,
                     },
                     Either::Shader(mut shader),
                 ) => {
-                    if state.topology == nixe_gpu::PrimitiveTopology::Quads {
+                    if state.parameters.topology == nixe_gpu::PrimitiveTopology::Quads {
                         let vertex = state
                             .program
                             .shader
@@ -206,9 +229,11 @@ impl NativeGpuExecution {
                             .iter()
                             .find(|f| f.stage == nixe_gpu::ShaderStage::Vertex)
                             .unwrap();
-                        let geometry =
-                            ssa::spirv::emit_quad_geometry(vertex, state.provoking_first)
-                                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+                        let geometry = ssa::spirv::emit_quad_geometry(
+                            vertex,
+                            state.parameters.provoking_first,
+                        )
+                        .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
                         let mut stages = shader.stages.to_vec();
                         stages.push(CompiledStage::new(
                             nixe_gpu::ShaderStage::Geometry,
@@ -225,9 +250,9 @@ impl NativeGpuExecution {
                     }) {
                         Ok(p) => p,
                         Err(CompileError::Backpressure | CompileError::Budget) => {
-                            self.drawings.insert(
+                            self.graphics.insert(
                                 id,
-                                Drawing::Shader {
+                                Graphics::Shader {
                                     pending,
                                     state,
                                     graphics,
@@ -237,73 +262,131 @@ impl NativeGpuExecution {
                         }
                         Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
                     };
-                    self.drawings
-                        .insert(id, Drawing::Pipeline { pending, state });
+                    self.graphics
+                        .insert(id, Graphics::Pipeline { pending, state });
                 }
-                (Drawing::Pipeline { state, .. }, Either::Pipeline(pipeline)) => {
-                    let bindings = self.bindings(&state.program, &pipeline)?;
-                    let program = self.residency.prepare_program(
-                        pipeline,
-                        &bindings,
-                        &mut self.descriptors,
-                    )?;
-                    let parameters = state::parameters(&state)?;
-                    let graphics = self.residency.prepare_graphics(program, parameters)?;
-                    let targets = self.targets(&state)?;
-                    let mut vertices = Vec::new();
-                    for v in &state.vertices {
-                        let buffer = self.residency.buffer_for_deferred_import(
-                            v.backing.clone(),
-                            vk::BufferUsageFlags::VERTEX_BUFFER,
-                        )?;
-                        vertices.push(VertexBuffer {
-                            binding: v.binding,
-                            buffer,
-                            offset: 0,
-                            size: v.backing.size(),
-                        });
-                    }
-                    let index = state
-                        .index
-                        .as_ref()
-                        .map(|(backing, kind)| {
-                            let buffer = self.residency.buffer_for_deferred_import(
-                                backing.clone(),
-                                vk::BufferUsageFlags::INDEX_BUFFER,
-                            )?;
-                            Ok::<_, VulkanError>(IndexBuffer {
-                                buffer,
-                                offset: 0,
-                                size: backing.size(),
-                                kind: match kind {
-                                    nixe_gpu::IndexType::Uint8 => vk::IndexType::UINT8_EXT,
-                                    nixe_gpu::IndexType::Uint16 => vk::IndexType::UINT16,
-                                    nixe_gpu::IndexType::Uint32 => vk::IndexType::UINT32,
-                                },
-                            })
-                        })
-                        .transpose()?;
-                    let draw = self.residency.prepare_draw(
-                        graphics,
-                        targets,
-                        vertices.into_boxed_slice(),
-                        index,
-                    )?;
-                    let push = state::push(&state)?;
-                    self.statistics.prepared_draws += 1;
-                    self.drawings.insert(
+                (Graphics::Pipeline { state, .. }, Either::Pipeline(pipeline)) => {
+                    let parameters = state::parameters(&state.parameters)?;
+                    let prepared = self
+                        .residency
+                        .prepare_graphics_state(pipeline, parameters)?;
+                    let push = state::push(&state)?.into();
+                    self.statistics.prepared_graphics += 1;
+                    self.graphics.insert(
                         id,
-                        Drawing::Ready {
-                            source: state,
-                            draw,
+                        Graphics::Ready {
+                            source: Arc::clone(&state.parameters),
+                            shader: Arc::clone(&state.program.shader),
+                            state: prepared,
+                            program: None,
                             push,
-                            recorded: false,
                         },
                     );
                 }
                 _ => unreachable!("compilation phase/result match"),
             }
         }
+    }
+    fn drawing(&mut self, source: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
+        let id = source.identity;
+        if let Some(draw) = self.drawings.get(&id) {
+            if !Arc::ptr_eq(&draw.source, source) {
+                return Err(VulkanError::InvalidResource(
+                    "prepared draw identity was reused",
+                ));
+            }
+            return Ok(true);
+        }
+        let already_prepared = matches!(
+            self.graphics.get(&source.parameters.identity),
+            Some(Graphics::Ready { .. })
+        );
+        if !self.graphics(source)? {
+            return Ok(false);
+        }
+        let Graphics::Ready { state, push, .. } = &self.graphics[&source.parameters.identity]
+        else {
+            unreachable!()
+        };
+        let pipeline = Arc::clone(state.pipeline());
+        let push = Arc::clone(push);
+        let program = match &self.graphics[&source.parameters.identity] {
+            Graphics::Ready {
+                program: Some((old, program)),
+                ..
+            } if Arc::ptr_eq(old, &source.program) => {
+                self.statistics.reused_programs += 1;
+                Arc::clone(program)
+            }
+            _ => {
+                let bindings = self.bindings(&source.program, &pipeline)?;
+                let program = Arc::new(self.residency.prepare_program(
+                    pipeline,
+                    &bindings,
+                    &mut self.descriptors,
+                )?);
+                let Graphics::Ready { program: saved, .. } =
+                    self.graphics.get_mut(&source.parameters.identity).unwrap()
+                else {
+                    unreachable!()
+                };
+                *saved = Some((Arc::clone(&source.program), Arc::clone(&program)));
+                program
+            }
+        };
+        let Graphics::Ready { state, .. } = &self.graphics[&source.parameters.identity] else {
+            unreachable!()
+        };
+        let graphics = state.bind(program)?;
+        let targets = self.targets(source)?;
+        let mut vertices = Vec::new();
+        for v in &source.vertices {
+            let buffer = self.residency.buffer_for_deferred_import(
+                v.backing.clone(),
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+            )?;
+            vertices.push(VertexBuffer {
+                binding: v.binding,
+                buffer,
+                offset: 0,
+                size: v.backing.size(),
+            });
+        }
+        let index = source
+            .index
+            .as_ref()
+            .map(|(backing, kind)| {
+                let buffer = self.residency.buffer_for_deferred_import(
+                    backing.clone(),
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                )?;
+                Ok::<_, VulkanError>(IndexBuffer {
+                    buffer,
+                    offset: 0,
+                    size: backing.size(),
+                    kind: match kind {
+                        nixe_gpu::IndexType::Uint8 => vk::IndexType::UINT8_EXT,
+                        nixe_gpu::IndexType::Uint16 => vk::IndexType::UINT16,
+                        nixe_gpu::IndexType::Uint32 => vk::IndexType::UINT32,
+                    },
+                })
+            })
+            .transpose()?;
+        let draw =
+            self.residency
+                .prepare_draw(graphics, targets, vertices.into_boxed_slice(), index)?;
+        self.statistics.prepared_draws += 1;
+        self.statistics.reused_graphics += u64::from(already_prepared);
+        self.drawings.insert(
+            id,
+            Drawing {
+                source: Arc::clone(source),
+                draw,
+                push,
+                recorded: false,
+            },
+        );
+        Ok(true)
     }
     fn computing(&mut self, source: &Arc<GuestProgram>) -> Result<bool, VulkanError> {
         let id = source.identity;
@@ -406,25 +489,26 @@ impl NativeGpuExecution {
                 }
             }
             NativeCommand::Draw { state, arguments } => {
-                let Drawing::Ready {
+                let Drawing {
                     source,
                     draw,
                     push,
                     recorded,
                 } = self
                     .drawings
-                    .get_mut(&state.program.identity)
-                    .ok_or(VulkanError::InvalidResource("draw was not prepared"))?
-                else {
-                    return Err(VulkanError::InvalidResource("draw compilation is pending"));
-                };
+                    .get_mut(&state.identity)
+                    .ok_or(VulkanError::InvalidResource("draw was not prepared"))?;
                 if !Arc::ptr_eq(source, state) {
                     return Err(VulkanError::InvalidResource(
                         "prepared draw identity was reused",
                     ));
                 }
-                self.residency
-                    .draw(draw, state::arguments(*arguments), push)?;
+                self.residency.draws_streamed(
+                    draw,
+                    &[state::arguments(*arguments)],
+                    push,
+                    &mut self.descriptors,
+                )?;
                 self.statistics.draws += 1;
                 self.statistics.warm_draws += u64::from(*recorded);
                 *recorded = true;
@@ -486,12 +570,12 @@ impl NativeGpuExecution {
         let mut at = 0;
         while at < commands.len() {
             if let NativeCommand::Draw { state, arguments } = &commands[at]
-                && let Some(Drawing::Ready {
+                && let Some(Drawing {
                     draw,
                     push,
                     recorded,
                     ..
-                }) = self.drawings.get_mut(&state.program.identity)
+                }) = self.drawings.get_mut(&state.identity)
                 && draw.can_group()
             {
                 self.draw_arguments.clear();
@@ -508,7 +592,12 @@ impl NativeGpuExecution {
                     self.draw_arguments.push(state::arguments(*arguments));
                     end += 1;
                 }
-                self.residency.draws(draw, &self.draw_arguments, push)?;
+                self.residency.draws_streamed(
+                    draw,
+                    &self.draw_arguments,
+                    push,
+                    &mut self.descriptors,
+                )?;
                 self.statistics.draws += (end - at) as u64;
                 self.statistics.warm_draws += (end - at) as u64 - u64::from(!*recorded);
                 *recorded = true;
@@ -586,8 +675,10 @@ impl GpuExecution for NativeGpuExecution {
     ) -> Result<bool, BackendRuntimeError> {
         #[cfg(feature = "performance-counters")]
         let started = std::time::Instant::now();
-        self.drawings.retain(|_, drawing| match drawing {
-            Drawing::Ready { source, .. } => Arc::strong_count(source) > 1,
+        self.drawings
+            .retain(|_, drawing| Arc::strong_count(&drawing.source) > 1);
+        self.graphics.retain(|_, graphics| match graphics {
+            Graphics::Ready { source, .. } => Arc::strong_count(source) > 1,
             _ => true,
         });
         self.computing.retain(|_, computing| match computing {
@@ -683,6 +774,7 @@ impl GpuExecution for NativeGpuExecution {
         }
         log::info!("native Vulkan residency: {:?}", self.residency.statistics());
         log::info!("native Vulkan recording: {:?}", self.recording_statistics());
+        log::info!("native Vulkan preparation: {:?}", self.statistics);
         log::info!(
             "native Vulkan execution: draws={} dispatches={} prepared-draws={} batches={} submits={} descriptors={:?}",
             self.statistics.draws,

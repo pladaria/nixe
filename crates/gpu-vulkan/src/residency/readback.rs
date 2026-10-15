@@ -151,7 +151,7 @@ impl VulkanResidency {
                     .zip(&offsets)
                     .map(|(piece, offset)| piece.region(slice.offset + offset))
                     .collect();
-                self.barriers.emit(&self.device);
+                self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device
                         .owner
@@ -170,7 +170,7 @@ impl VulkanResidency {
                         ),
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     )?;
-                    self.barriers.emit(&self.device);
+                    self.barriers.emit(&mut self.device);
                     let region = vk::BufferImageCopy::default()
                         .buffer_offset(slice.offset + offset)
                         .image_subresource(

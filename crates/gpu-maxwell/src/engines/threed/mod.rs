@@ -239,7 +239,6 @@ enum PendingOperation {
 }
 
 struct PreparedMethod {
-    method: MaxwellMethodDispatch,
     metadata: MaxwellEngineMethodMetadata,
     operation: Option<PendingOperation>,
     writes_state: bool,
@@ -247,13 +246,11 @@ struct PreparedMethod {
 
 impl PreparedMethod {
     const fn new(
-        method: MaxwellMethodDispatch,
         metadata: MaxwellEngineMethodMetadata,
         operation: Option<PendingOperation>,
         writes_state: bool,
     ) -> Self {
         Self {
-            method,
             metadata,
             operation,
             writes_state,
@@ -1302,8 +1299,7 @@ where
     fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
         self.candidate
-            .raw_register(method)
-            .and_then(MaxwellThreeDRegister::raw)
+            .raw_register_value(method)
             .or_else(|| state::verified_raw_register_reset(method))
             .ok_or_else(|| {
                 MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::MmeExecution {
@@ -1324,11 +1320,11 @@ where
             ));
         }
         let source = self.source.emitted_by_mme(method, argument);
-        let dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
+        let mut dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
         // MME sends use the same method path, including shadow tracking/replay,
         // as pushbuffer writes. The interpreter and JIT both call CallMethod:
         // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/video_core/macro.cpp#L664-L666
-        let prepared = preflight_with_shadow(self.profile, dispatch, self.candidate)
+        let prepared = preflight_with_shadow(self.profile, &mut dispatch, self.candidate)
             .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
         if let Some(operation) = lower_pending_operation(prepared.operation, self.candidate) {
             (self.consume)(operation, self.candidate.operation_state())
@@ -1340,16 +1336,12 @@ where
 
 pub(super) fn preflight(
     profile: &MaxwellGpuProfile,
-    method: MaxwellMethodDispatch,
+    mut method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
-    let prepared = preflight_with_shadow(profile, method, candidate)?;
+    let prepared = preflight_with_shadow(profile, &mut method, candidate)?;
     let operation = lower_pending_operation(prepared.operation, candidate);
-    Ok(AppliedMethod::new(
-        prepared.method,
-        prepared.metadata,
-        operation,
-    ))
+    Ok(AppliedMethod::new(method, prepared.metadata, operation))
 }
 
 fn lower_pending_operation(
@@ -1373,7 +1365,7 @@ fn lower_pending_operation(
 
 fn preflight_with_shadow(
     profile: &MaxwellGpuProfile,
-    mut method: MaxwellMethodDispatch,
+    method: &mut MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
@@ -1389,27 +1381,26 @@ fn preflight_with_shadow(
         .resolve_shadow_argument(source.method(), source.argument())
         .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
 
-    method = method.with_effective_argument(effective_argument);
-    let register_changed = candidate
-        .raw_register(method.source().method())
-        .is_none_or(|register| register.raw() != Some(method.source().argument()));
-    let prepared = preflight_register(profile, method, candidate)?;
+    method.set_effective_argument(effective_argument);
+    let register_changed =
+        candidate.raw_register_value(source.method()) != Some(effective_argument);
+    let effective_source = method.source();
+    let prepared = preflight_register(profile, effective_source, candidate)?;
     if prepared.writes_state {
         candidate.refresh_semantic_identities(register_changed);
-        candidate.record_raw_register(prepared.method.source());
+        candidate.record_raw_register(effective_source);
     }
     candidate
         .mme_mut()
-        .track_shadow_register(shadow_control, prepared.method.source());
+        .track_shadow_register(shadow_control, effective_source);
     Ok(prepared)
 }
 
 fn preflight_register(
     profile: &MaxwellGpuProfile,
-    method: MaxwellMethodDispatch,
+    source: crate::MaxwellMethodSource,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
-    let source = method.source();
     if let Some((write, method_name, upload)) =
         inline_to_memory::preflight(source, candidate.operation_state().inline_to_memory())?
     {
@@ -1417,36 +1408,26 @@ fn preflight_register(
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         let (operation, writes_state) = upload.map_or(state_write(), state_inline_to_memory);
-        return Ok(PreparedMethod::new(
-            method,
-            metadata,
-            operation,
-            writes_state,
-        ));
+        return Ok(PreparedMethod::new(metadata, operation, writes_state));
     }
     if let Some((write, method_name)) = preflight_mme_state(source, candidate)? {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        return Ok(PreparedMethod::new(method, metadata, None, true));
+        return Ok(PreparedMethod::new(metadata, None, true));
     }
     if let Some((write, method_name, upload)) = preflight_constant_buffer_load(source, candidate)? {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         let (operation, writes_state) = upload.map_or(state_write(), state_inline_constant_buffer);
-        return Ok(PreparedMethod::new(
-            method,
-            metadata,
-            operation,
-            writes_state,
-        ));
+        return Ok(PreparedMethod::new(metadata, operation, writes_state));
     }
     if let Some((write, method_name)) = preflight_vertex_and_binding_state(source, candidate)? {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        return Ok(PreparedMethod::new(method, metadata, None, true));
+        return Ok(PreparedMethod::new(metadata, None, true));
     }
     if let Some((write, method_name)) = preflight_output_state(source)? {
         candidate.apply(write);
@@ -1467,12 +1448,7 @@ fn preflight_register(
         } else {
             state_write()
         };
-        return Ok(PreparedMethod::new(
-            method,
-            metadata,
-            operation,
-            writes_state,
-        ));
+        return Ok(PreparedMethod::new(metadata, operation, writes_state));
     }
     let Some(declaration) = (source.method().0 & 3 == 0)
         .then(|| METHODS_BY_DWORD.get((source.method().0 / 4) as usize))
@@ -1515,12 +1491,8 @@ fn preflight_register(
                         metadata: declaration.metadata,
                     });
                 }
-                let high = candidate
-                    .raw_register(GpuMethodId(0x0104))
-                    .and_then(state::MaxwellThreeDRegister::raw);
-                let low = candidate
-                    .raw_register(GpuMethodId(0x0108))
-                    .and_then(state::MaxwellThreeDRegister::raw);
+                let high = candidate.raw_register_value(GpuMethodId(0x0104));
+                let low = candidate.raw_register_value(GpuMethodId(0x0108));
                 let (Some(high), Some(low)) = (high, low) else {
                     return Err(invalid_encoding(
                         source,
@@ -2862,7 +2834,6 @@ fn preflight_register(
             }
         };
     Ok(PreparedMethod::new(
-        method,
         *declaration.metadata,
         operation,
         writes_state,

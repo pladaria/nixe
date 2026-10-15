@@ -4,6 +4,7 @@
 //! [`crate::CanonicalBackingPage`]; mappings here are rebuildable aliases of
 //! the canonical `memfd` and never become a second memory authority.
 
+use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
@@ -176,7 +177,8 @@ struct DirectMappedPage {
 }
 
 struct DirectArenaState {
-    pages: BTreeMap<u64, DirectMappedPage>,
+    // Page numbers avoid the constant low address bits of aligned mappings.
+    pages: FxHashMap<u64, DirectMappedPage>,
 }
 
 struct DirectArenaInner {
@@ -262,7 +264,7 @@ impl DirectArena {
                 base,
                 address_space_size,
                 state: Mutex::new(DirectArenaState {
-                    pages: BTreeMap::new(),
+                    pages: FxHashMap::default(),
                 }),
                 poisoned: AtomicBool::new(false),
             }),
@@ -299,9 +301,12 @@ impl DirectArena {
 
     #[must_use]
     pub fn protection_at(&self, guest_address: u64) -> Option<DirectProtection> {
+        if !guest_address.is_multiple_of(DIRECT_PAGE_SIZE as u64) {
+            return None;
+        }
         self.lock_state()
             .pages
-            .get(&guest_address)
+            .get(&page_number(guest_address))
             .map(|page| page.protection)
     }
 
@@ -373,7 +378,7 @@ impl DirectArena {
             self.map_run(first, size)?;
             for request in &requests[start..end] {
                 state.pages.insert(
-                    request.guest_address,
+                    page_number(request.guest_address),
                     DirectMappedPage {
                         backing: request.backing.clone(),
                         protection: request.protection,
@@ -410,16 +415,19 @@ impl DirectArena {
                 .iter()
                 .map(|request| (request.guest_address, request))
                 .collect::<BTreeMap<_, _>>();
-            let removed = state
+            let mut removed = state
                 .pages
                 .keys()
+                .map(|page| page * DIRECT_PAGE_SIZE as u64)
                 .filter(|guest| !desired.contains_key(guest))
-                .copied()
                 .collect::<Vec<_>>();
+            // Publication still coalesces in guest order; point lookups need
+            // no ordered index on the callback and protection paths.
+            removed.sort_unstable();
             let mut remapped = Vec::new();
             let mut protected = Vec::new();
             for request in requests {
-                match state.pages.get(&request.guest_address) {
+                match state.pages.get(&page_number(request.guest_address)) {
                     Some(current)
                         if current.backing.fd() == request.backing.fd()
                             && current.backing.offset() == request.backing.offset() =>
@@ -478,7 +486,7 @@ impl DirectArena {
             let mut remapped = Vec::new();
             let mut protected = Vec::new();
             for request in requests {
-                match state.pages.get(&request.guest_address) {
+                match state.pages.get(&page_number(request.guest_address)) {
                     Some(current)
                         if current.backing.fd() == request.backing.fd()
                             && current.backing.offset() == request.backing.offset() =>
@@ -512,7 +520,7 @@ impl DirectArena {
         let current = self
             .lock_state()
             .pages
-            .get(&guest_address)
+            .get(&page_number(guest_address))
             .map(|page| (page.backing.fd(), page.backing.offset(), page.protection));
         match (current, desired) {
             (None, None) => Ok(()),
@@ -571,7 +579,7 @@ impl DirectArena {
                 pages(request.guest_address, request.size).any(|page| {
                     state
                         .pages
-                        .get(&page)
+                        .get(&page_number(page))
                         .is_some_and(|mapped| mapped.protection != request.protection)
                 })
             })
@@ -581,7 +589,7 @@ impl DirectArena {
         }
         for request in &requests {
             for page in pages(request.guest_address, request.size) {
-                if !state.pages.contains_key(&page) {
+                if !state.pages.contains_key(&page_number(page)) {
                     return Err(DirectMemoryError::invalid(
                         "direct protection request contains an unmapped page",
                     ));
@@ -606,7 +614,7 @@ impl DirectArena {
             for page in pages(first.guest_address, size) {
                 let mapped = state
                     .pages
-                    .get_mut(&page)
+                    .get_mut(&page_number(page))
                     .expect("direct protection pages were preflighted");
                 mapped.protection = first.protection;
             }
@@ -628,7 +636,7 @@ impl DirectArena {
         for request in requests {
             self.replace_run_with_none(request.guest_address, request.size)?;
             for page in pages(request.guest_address, request.size) {
-                state.pages.remove(&page);
+                state.pages.remove(&page_number(page));
             }
         }
         Ok(())
@@ -907,6 +915,10 @@ fn reserve(size: usize, operation: &str) -> Result<NonNull<u8>, DirectMemoryErro
     Ok(NonNull::new(mapped.cast()).expect("mmap never returns null on success"))
 }
 
+fn page_number(address: u64) -> u64 {
+    address / DIRECT_PAGE_SIZE as u64
+}
+
 fn pages(start: u64, size: usize) -> impl Iterator<Item = u64> {
     let count = size / DIRECT_PAGE_SIZE;
     (0..count).map(move |page| start + (page * DIRECT_PAGE_SIZE) as u64)
@@ -1003,6 +1015,55 @@ mod tests {
         let view = arena.view();
         assert_eq!(unsafe { *((view.base + 0x4000) as *const u8) }, 0x11);
         assert_eq!(unsafe { *((view.base + 0x5000) as *const u8) }, 0x22);
+    }
+
+    #[test]
+    fn complete_reconciliation_removes_sparse_pages_and_preserves_requested_aliases() {
+        let store = CanonicalBackingStore::allocate().unwrap();
+        let backing = page(&store, 1, 0x6b).direct_backing().unwrap();
+        let arena = DirectArena::new(0x40_000).unwrap();
+        let requests = (1..=32)
+            .map(|index| DirectMapRequest {
+                guest_address: index * DIRECT_PAGE_SIZE as u64,
+                backing: &backing,
+                protection: DirectProtection::ReadWrite,
+            })
+            .collect::<Vec<_>>();
+        arena.map_pages(&requests).unwrap();
+        let retained = requests
+            .iter()
+            .step_by(5)
+            .map(|request| DirectMapRequest {
+                protection: DirectProtection::Read,
+                ..*request
+            })
+            .collect::<Vec<_>>();
+        arena.reconcile_pages(&retained).unwrap();
+        assert_eq!(arena.mapped_pages(), retained.len());
+        for (index, request) in requests.iter().enumerate() {
+            if index % 5 == 0 {
+                assert_eq!(
+                    arena.protection_at(request.guest_address),
+                    Some(DirectProtection::Read)
+                );
+                assert_eq!(
+                    unsafe {
+                        *(arena.view().host_address(request.guest_address).unwrap() as *const u8)
+                    },
+                    0x6b
+                );
+            } else {
+                assert_eq!(arena.protection_at(request.guest_address), None);
+            }
+        }
+        arena.reconcile_pages(&[]).unwrap();
+        assert_eq!(arena.mapped_pages(), 0);
+        arena.map_pages(&requests).unwrap();
+        assert_eq!(arena.mapped_pages(), requests.len());
+        assert_eq!(
+            arena.protection_at(requests[31].guest_address),
+            Some(DirectProtection::ReadWrite)
+        );
     }
 
     #[test]

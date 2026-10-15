@@ -50,7 +50,7 @@ impl VulkanResidency {
                 .src_offset(slice.offset)
                 .dst_offset(offset + (part * limit) as u64)
                 .size(bytes.len() as u64)];
-            self.barriers.emit(&self.device);
+            self.barriers.emit(&mut self.device);
             unsafe {
                 self.device.owner.device.cmd_copy_buffer(
                     self.device.submission.slots[index].command,
@@ -108,7 +108,7 @@ impl VulkanResidency {
                     size,
                     &[Resource::Buffer(source), Resource::Buffer(destination)],
                 )?;
-                self.barriers.emit(&self.device);
+                self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.owner.device.cmd_copy_buffer(
                         command,
@@ -129,7 +129,7 @@ impl VulkanResidency {
                 let work = self.device.work_ticket()?;
                 self.device.retire_buffer(scratch, work)?;
             } else {
-                self.barriers.emit(&self.device);
+                self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.owner.device.cmd_copy_buffer(
                         command,
@@ -165,7 +165,7 @@ impl VulkanResidency {
                     .map(|piece| piece.region(destination_offset + piece.logical - offset))
                     .collect();
                 let index = self.device.submission.begin()?;
-                self.barriers.emit(&self.device);
+                self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.owner.device.cmd_copy_image_to_buffer(
                         self.device.submission.slots[index].command,
@@ -189,7 +189,7 @@ impl VulkanResidency {
                     })
                     .collect();
                 let index = self.device.submission.begin()?;
-                self.barriers.emit(&self.device);
+                self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.owner.device.cmd_copy_buffer(
                         self.device.submission.slots[index].command,
@@ -315,7 +315,7 @@ impl VulkanResidency {
             let buffer = self.device.submission.slots[index]
                 .readback_buffer(slice)
                 .handle;
-            self.barriers.emit(&self.device);
+            self.barriers.emit(&mut self.device);
             for (source, mut region) in regions {
                 region.dst_offset += slice.offset;
                 unsafe {
@@ -395,7 +395,7 @@ impl VulkanResidency {
                 .zip(&offsets)
                 .map(|(piece, offset)| piece.region(slice.offset + offset))
                 .collect();
-            self.barriers.emit(&self.device);
+            self.barriers.emit(&mut self.device);
             unsafe {
                 self.device
                     .owner
@@ -444,7 +444,7 @@ impl VulkanResidency {
         let target = self.device.submission.slots[index]
             .readback_buffer(slice)
             .handle;
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         unsafe {
             self.device.owner.device.cmd_copy_buffer(
                 command,
@@ -466,7 +466,7 @@ impl VulkanResidency {
             .buffer(target)
             .offset(slice.offset)
             .size(size)];
-        self.barriers.emit(&self.device);
+        self.barriers.emit(&mut self.device);
         unsafe {
             self.device.dispatch.barrier(
                 command,

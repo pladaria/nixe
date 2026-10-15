@@ -103,7 +103,7 @@ pub struct BindingRecord {
     pub(crate) set: vk::DescriptorSet,
     pub layout: Arc<PipelineLayout>,
     _page: Arc<Page>,
-    _resources: Box<[DescriptorResource]>,
+    pub(crate) resources: Box<[DescriptorResource]>,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DescriptorStatistics {
@@ -320,7 +320,7 @@ impl DescriptorCache {
             set,
             layout,
             _page: Arc::clone(&self.pages[page].page),
-            _resources: resources,
+            resources,
         });
         self.records.insert(
             key,

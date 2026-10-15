@@ -8,6 +8,87 @@ use nixe_memory::{
 use super::*;
 
 #[test]
+fn raw_and_shadow_words_preserve_validity_and_latest_write_provenance() {
+    let mut channel = three_d_channel();
+    let reset = channel
+        .three_d_mut()
+        .raw_register(GpuMethodId(0x0dac))
+        .unwrap();
+    assert_eq!(reset.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+    assert_eq!(reset.raw(), Some(0x1b02));
+    assert_eq!(reset.source(), None);
+    assert!(
+        channel
+            .three_d_mut()
+            .mme()
+            .shadow_register(GpuMethodId(0x0dac))
+            .is_none()
+    );
+    for method in [0x3401, 0x37fc, 0x4000, u32::MAX] {
+        assert!(
+            channel
+                .three_d_mut()
+                .raw_register(GpuMethodId(method))
+                .is_none()
+        );
+        assert!(
+            channel
+                .three_d_mut()
+                .mme()
+                .shadow_register(GpuMethodId(method))
+                .is_none()
+        );
+    }
+
+    // Both ends of scratch RAM accept all 32-bit words, including zero. Source
+    // offsets differ even when the final value repeats an earlier write.
+    for method in [0x3400, 0x37fc] {
+        let decoded =
+            non_incrementing_packet_on_subchannel(0, method / 4, &[u32::MAX, 0, u32::MAX]);
+        let applied = dispatch_first(&mut channel, &decoded).unwrap();
+        let source = applied.methods().last().unwrap().method().source();
+        let raw = channel
+            .three_d_mut()
+            .raw_register(GpuMethodId(method))
+            .unwrap();
+        assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+        assert_eq!(raw.raw(), Some(u32::MAX));
+        assert_eq!(raw.value(), Some(&u32::MAX));
+        assert_eq!(raw.source(), Some(source));
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .mme()
+                .shadow_register(GpuMethodId(method)),
+            Some(raw)
+        );
+
+        let retained = channel.three_d_mut().clone();
+        let rewrite = dispatch_method(&mut channel, method / 4, u32::MAX).unwrap();
+        let new_source = rewrite.methods()[0].method().source();
+        assert_ne!(source, new_source);
+        assert_eq!(retained.raw_register(GpuMethodId(method)), Some(raw));
+        assert_eq!(
+            retained.mme().shadow_register(GpuMethodId(method)),
+            Some(raw)
+        );
+        let rewritten = channel
+            .three_d_mut()
+            .raw_register(GpuMethodId(method))
+            .unwrap();
+        assert_eq!(rewritten.raw(), raw.raw());
+        assert_eq!(rewritten.source(), Some(new_source));
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .mme()
+                .shadow_register(GpuMethodId(method)),
+            Some(rewritten)
+        );
+    }
+}
+
+#[test]
 fn notification_address_state_arms_a_single_following_no_operation() {
     let mut channel = three_d_channel();
     for (method, value) in [(0x0104, 0x12), (0x0108, 0x3456_7890)] {
@@ -17,7 +98,7 @@ fn notification_address_state_arms_a_single_following_no_operation() {
             channel
                 .three_d_mut()
                 .raw_register(GpuMethodId(method))
-                .and_then(MaxwellThreeDRegister::raw),
+                .and_then(|register| register.raw()),
             Some(value)
         );
     }
@@ -2113,7 +2194,7 @@ fn mme_macro_executes_captured_code_and_emits_validated_methods() {
         channel
             .three_d_mut()
             .raw_register(GpuMethodId(0x1518))
-            .and_then(MaxwellThreeDRegister::raw),
+            .and_then(|register| register.raw()),
         Some(argument)
     );
 }
@@ -2145,7 +2226,7 @@ fn mme_emitted_methods_track_replay_and_bypass_the_same_shadow_registers_as_push
             .three_d_mut()
             .mme()
             .shadow_register(GpuMethodId(0x192c))
-            .and_then(MaxwellThreeDRegister::raw);
+            .and_then(|register| register.raw());
         assert_eq!(shadow, Some(u32::from(mode >= 2)), "mode {mode}");
         program_three_d(&mut channel, 0x0124, 3);
         program_three_d(&mut channel, 0x192c, 0);
@@ -2292,6 +2373,25 @@ fn mme_execution_crosses_instruction_windows_and_preserves_sparse_addresses() {
             Some(set_method)
         );
         assert_eq!(channel.three_d_mut().mme().instruction_count(), 3);
+        // Replacing an uploaded instruction must replace its executable form
+        // too, while an older retained program still owns its original words.
+        let send_zero_and_exit = (4 << 4) | (1 << 7);
+        dispatch_increment_once(
+            &mut channel,
+            0x0114 / 4,
+            &[start, set_method, send_zero_and_exit],
+        )
+        .unwrap();
+        let next = 4.25_f32.to_bits();
+        dispatch_method(&mut channel, (0x3800 + macro_index * 8) / 4, next).unwrap();
+        assert_eq!(channel.three_d().raster().point_size().raw(), Some(0));
+        assert_eq!(
+            before
+                .instruction(MaxwellThreeDMmeRamAddress::new(start + 1))
+                .unwrap()
+                .raw(),
+            Some(send_parameter_and_exit)
+        );
     }
 }
 
@@ -2744,7 +2844,7 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
         channel
             .three_d_mut()
             .raw_register(GpuMethodId(0x0820))
-            .and_then(MaxwellThreeDRegister::raw),
+            .and_then(|register| register.raw()),
         Some(0)
     );
 
@@ -2770,7 +2870,7 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
             channel
                 .three_d_mut()
                 .raw_register(GpuMethodId(method))
-                .and_then(MaxwellThreeDRegister::raw),
+                .and_then(|register| register.raw()),
             Some(argument)
         );
     }
@@ -4256,6 +4356,58 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     assert_eq!(frontend.statistics.shader_captures, 1);
     assert_eq!(frontend.statistics.warm_draws, 31);
     let original = previous.unwrap();
+    // Every streamed vertex window is a distinct physical binding, while its
+    // vertex layout and rasterization semantics retain one prepared identity.
+    program_three_d(&mut channel, 0x1f04, (vertex + 0xfff) as u32);
+    for offset in (16..=256).step_by(16) {
+        program_three_d(&mut channel, 0x1c08, vertex as u32 + offset);
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                draw.state(),
+                draw.trigger(),
+                &space,
+                &nixe_memory::CanonicalWriteBatch::new(),
+                FrontendSubmissionId::new(200 + u64::from(offset)),
+                &[],
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected draw")
+        };
+        assert!(!Arc::ptr_eq(&original, &state));
+        assert!(Arc::ptr_eq(&original.parameters, &state.parameters));
+        assert!(Arc::ptr_eq(&original.program, &state.program));
+        assert_ne!(
+            original.vertices[0].backing.byte_mapping_key(),
+            state.vertices[0].backing.byte_mapping_key()
+        );
+    }
+    assert_eq!(frontend.statistics.prepared_parameters, 1);
+    assert_eq!(frontend.statistics.reused_parameters, 16);
+    assert_eq!(frontend.statistics.reused_programs, 16);
+    // Intermediate state changes restored before consumption do not create a
+    // new semantic preparation, even though their monotonic revisions advanced.
+    program_three_d(&mut channel, 0x1160, 0x3820_0000 | (8 << 7));
+    program_three_d(&mut channel, 0x1160, 0x3820_0000);
+    let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+    let draw = &dispatch.operations()[0];
+    let work = frontend
+        .lower_three_d(
+            draw.state(),
+            draw.trigger(),
+            &space,
+            &nixe_memory::CanonicalWriteBatch::new(),
+            FrontendSubmissionId::new(500),
+            &[],
+        )
+        .unwrap();
+    let NativeCommand::Draw { state, .. } = work.command else {
+        panic!("expected draw")
+    };
+    assert!(Arc::ptr_eq(&original.parameters, &state.parameters));
+    assert_eq!(frontend.statistics.prepared_parameters, 1);
     for phase in 0..2 {
         // Stream offsets affect vertex binding, but not shader input types.
         program_three_d(&mut channel, 0x1160, 0x3820_0000 | (((phase + 1) * 8) << 7));
@@ -4280,7 +4432,90 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
             panic!("expected draw")
         };
         assert!(!Arc::ptr_eq(&original, &state));
+        assert!(!Arc::ptr_eq(&original.parameters, &state.parameters));
         assert!(Arc::ptr_eq(&original.program.shader, &state.program.shader));
         assert_eq!(frontend.statistics.shader_captures, u64::from(phase) + 1);
     }
+
+    // Two live uniform bindings exercise both complete reuse and a changed
+    // suffix after an equal prefix. Data epochs cannot change binding identity.
+    let uniforms = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let uniform_address = map_resource(
+        &mut space,
+        uniforms
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        4,
+        0,
+    )
+    .offset()
+    .get();
+    header[18] = 3;
+    shaders
+        .write(
+            0x100,
+            &header
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .chain(
+                    [0, 0x4c98_0784_0047_0000, 0x4c98_0788_0047_0001, exit]
+                        .into_iter()
+                        .flat_map(u64::to_le_bytes),
+                )
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    for (method, value) in [
+        (0x2380, 0x100),
+        (0x2384, (uniform_address >> 32) as u32),
+        (0x2388, uniform_address as u32),
+        (0x2430, 0x11),
+        (0x2430, 0x21),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let draw = |channel: &mut MaxwellGpuChannel, frontend: &mut crate::MaxwellNativeFrontend| {
+        let dispatch = dispatch_method(channel, 0x0d78 / 4, 3).unwrap();
+        let trigger = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                trigger.state(),
+                trigger.trigger(),
+                &space,
+                &nixe_memory::CanonicalWriteBatch::new(),
+                FrontendSubmissionId::new(600),
+                &[],
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected draw")
+        };
+        state
+    };
+    let before = draw(&mut channel, &mut frontend);
+    assert_eq!(before.program.bindings.len(), 2);
+    uniforms.write(16, &1.0_f32.to_le_bytes()).unwrap();
+    let rewritten = draw(&mut channel, &mut frontend);
+    assert!(Arc::ptr_eq(&before.program, &rewritten.program));
+    program_three_d(&mut channel, 0x2388, (uniform_address + 0x100) as u32);
+    program_three_d(&mut channel, 0x2430, 0x21);
+    let changed = draw(&mut channel, &mut frontend);
+    assert!(!Arc::ptr_eq(&before.program, &changed.program));
+    let mapping = |binding: &nixe_gpu::native::GuestBinding| {
+        let nixe_gpu::native::GuestBinding::Buffer(range) = binding else {
+            panic!("expected buffer")
+        };
+        range.byte_mapping_key()
+    };
+    assert_eq!(
+        mapping(&before.program.bindings[0].1),
+        mapping(&changed.program.bindings[0].1)
+    );
+    assert_ne!(
+        mapping(&before.program.bindings[1].1),
+        mapping(&changed.program.bindings[1].1)
+    );
+    program_three_d(&mut channel, 0x1c08, vertex as u32 + 32);
+    let rebound_vertex = draw(&mut channel, &mut frontend);
+    assert!(Arc::ptr_eq(&changed.program, &rebound_vertex.program));
 }

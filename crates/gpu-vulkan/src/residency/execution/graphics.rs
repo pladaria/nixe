@@ -36,7 +36,7 @@ pub enum Draw {
         indexed: bool,
     },
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentSource {
     Canonical { image: ImageId, plane: usize },
     ResidentOnly(super::super::attachment::AttachmentId),
@@ -96,6 +96,28 @@ pub struct PreparedTargets {
     native_stencil: Option<vk::RenderingAttachmentInfo<'static>>,
 }
 impl PreparedTargets {
+    fn compatible(&self, other: &Self) -> bool {
+        let same = |a: &Option<Attachment>, b: &Option<Attachment>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.description.source == b.description.source
+                    && a.view.handle == b.view.handle
+                    && a.plane == b.plane
+                    && a.samples == b.samples
+                    && a.format == b.format
+            }
+            _ => false,
+        };
+        self.area == other.area
+            && self.colors.len() == other.colors.len()
+            && self
+                .colors
+                .iter()
+                .zip(&other.colors)
+                .all(|(a, b)| same(a, b))
+            && same(&self.depth, &other.depth)
+            && same(&self.stencil, &other.stencil)
+    }
     fn attachments(&self) -> impl Iterator<Item = &Attachment> {
         self.colors
             .iter()
@@ -109,7 +131,7 @@ pub struct PreparedDraw {
     graphics: PreparedGraphics,
     targets: Arc<PreparedTargets>,
     vertices: Box<[VertexBuffer]>,
-    vertex_leases: Box<[Arc<AllocatedBuffer>]>,
+    _vertex_leases: Box<[Arc<AllocatedBuffer>]>,
     index: Option<(IndexBuffer, Arc<AllocatedBuffer>)>,
 }
 impl PreparedDraw {
@@ -124,6 +146,22 @@ impl PreparedDraw {
     }
 }
 impl VulkanResidency {
+    pub(crate) fn targets_current(&self, targets: &PreparedTargets) -> bool {
+        targets
+            .attachments()
+            .all(|attachment| match attachment.description.source {
+                AttachmentSource::Canonical { image, .. } => self.image(image).is_ok(),
+                AttachmentSource::ResidentOnly(id) => self.attachment(id).is_ok(),
+            })
+    }
+    fn rendering_matches(&self, targets: &Arc<PreparedTargets>) -> bool {
+        self.device
+            .submission
+            .recording
+            .and_then(|index| self.device.submission.slots[index].active_targets.as_ref())
+            .is_some_and(|active| Arc::ptr_eq(active, targets) || active.compatible(targets))
+    }
+
     pub fn prepare_targets(
         &mut self,
         targets: RenderingTargets,
@@ -448,7 +486,7 @@ impl VulkanResidency {
             graphics,
             targets,
             vertices,
-            vertex_leases,
+            _vertex_leases: vertex_leases,
             index,
         })
     }
@@ -468,6 +506,24 @@ impl VulkanResidency {
         draws: &[Draw],
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
+        self.record_draws(prepared, draws, push, None)
+    }
+    pub(crate) fn draws_streamed(
+        &mut self,
+        prepared: &PreparedDraw,
+        draws: &[Draw],
+        push: &[u8],
+        descriptors: &mut DescriptorCache,
+    ) -> Result<WorkTicket, VulkanError> {
+        self.record_draws(prepared, draws, push, Some(descriptors))
+    }
+    fn record_draws(
+        &mut self,
+        prepared: &PreparedDraw,
+        draws: &[Draw],
+        push: &[u8],
+        descriptors: Option<&mut DescriptorCache>,
+    ) -> Result<WorkTicket, VulkanError> {
         if draws.is_empty() {
             return Err(VulkanError::InvalidResource("empty draw group"));
         }
@@ -477,6 +533,9 @@ impl VulkanResidency {
             return Err(VulkanError::InvalidResource(
                 "draw group requires direct arguments and read-only shader resources",
             ));
+        }
+        if !prepared.can_group() || !self.rendering_matches(&prepared.targets) {
+            self.device.end_rendering();
         }
         let is_empty = |d: &Draw| match *d {
             Draw::Direct {
@@ -526,11 +585,25 @@ impl VulkanResidency {
                 _ => {}
             }
         }
+        let streaming = descriptors.is_some() && prepared.can_group() && !empty;
+        let (record, mask) = if streaming {
+            self.stream_program(&graphics.program, descriptors.unwrap())?
+        } else {
+            (None, Vec::new())
+        };
+        let mut vertex_bindings = Vec::with_capacity(prepared.vertices.len());
         let indirect = if !empty {
-            self.program_access(&graphics.program)?;
+            self.program_access_except(&graphics.program, &mask)?;
             for vertex in &prepared.vertices {
+                if streaming
+                    && let Some((buffer, offset)) =
+                        self.stream_buffer(vertex.buffer, vertex.offset, vertex.size, 4)?
+                {
+                    vertex_bindings.push((buffer.handle, offset));
+                    continue;
+                }
                 self.ensure_buffer(vertex.buffer)?;
-                self.buffer_access_range(
+                let handle = self.buffer_access_range(
                     vertex.buffer,
                     vertex.offset,
                     vertex.size,
@@ -539,7 +612,9 @@ impl VulkanResidency {
                         vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
                     ),
                 )?;
+                vertex_bindings.push((handle, vertex.offset));
             }
+            // Input order matches the immutable vertex lease array.
             if let Some((index, _)) = &prepared.index {
                 self.ensure_buffer(index.buffer)?;
                 self.buffer_access_range(
@@ -593,21 +668,6 @@ impl VulkanResidency {
             None
         };
         for a in prepared.targets.attachments() {
-            let (stages, access) = if a.plane.aspect == vk::ImageAspectFlags::COLOR {
-                (
-                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                    vk::AccessFlags2::COLOR_ATTACHMENT_READ
-                        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                )
-            } else {
-                (
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                )
-            };
-            let scope = AccessScope::new(stages, access);
             match a.description.source {
                 AttachmentSource::Canonical { image, .. } => {
                     if a.description.load == vk::AttachmentLoadOp::LOAD {
@@ -616,12 +676,6 @@ impl VulkanResidency {
                         self.ensure_image(image)?;
                     }
                     self.prepare_image_rect(image, a.plane, prepared.targets.area)?;
-                    self.image_access_subresources(
-                        image,
-                        commands::plane_range(a.plane),
-                        scope,
-                        vk::ImageLayout::GENERAL,
-                    )?;
                 }
                 AttachmentSource::ResidentOnly(id) => {
                     if a.description.load == vk::AttachmentLoadOp::LOAD
@@ -635,16 +689,59 @@ impl VulkanResidency {
                             "attachment LOAD consumes undefined or discarded samples",
                         ));
                     }
-                    self.attachment_access(id, scope, vk::ImageLayout::GENERAL)?;
                 }
             }
         }
-        self.barriers.emit(&self.device);
+        // Framebuffer operations in one rendering instance already execute in
+        // rasterization order. Only unchanged native attachments can continue;
+        // shader writes/feedback, imports and real hazards terminate the scope.
+        // https://docs.vulkan.org/spec/latest/chapters/primsrast.html#primsrast-order
+        if !self.barriers.is_empty() {
+            self.device.end_rendering();
+        }
+        let continuing = self.rendering_matches(&prepared.targets);
+        if !continuing {
+            for a in prepared.targets.attachments() {
+                let (stages, access) = if a.plane.aspect == vk::ImageAspectFlags::COLOR {
+                    (
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                        vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    )
+                } else {
+                    (
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    )
+                };
+                let scope = AccessScope::new(stages, access);
+                match a.description.source {
+                    AttachmentSource::Canonical { image, .. } => {
+                        self.image_access_subresources(
+                            image,
+                            commands::plane_range(a.plane),
+                            scope,
+                            vk::ImageLayout::GENERAL,
+                        )?;
+                    }
+                    AttachmentSource::ResidentOnly(id) => {
+                        self.attachment_access(id, scope, vk::ImageLayout::GENERAL)?;
+                    }
+                }
+            }
+            self.barriers.emit(&mut self.device);
+        }
         let command = if empty {
             let slot = self.device.submission.begin()?;
             self.device.submission.slots[slot].command
         } else {
-            let command = self.program_bind(&graphics.program, push)?;
+            let command = self.program_bind_record(
+                &graphics.program,
+                push,
+                record.as_ref().or(graphics.program.record.as_ref()),
+            )?;
             self.graphics_state(graphics)?;
             command
         };
@@ -661,16 +758,10 @@ impl VulkanResidency {
         let raw = &self.device.owner.device;
         unsafe {
             if !empty {
-                for (v, buffer) in prepared.vertices.iter().zip(&prepared.vertex_leases) {
-                    let value = (buffer.handle, v.offset);
+                for (v, &value) in prepared.vertices.iter().zip(&vertex_bindings) {
                     if slot.vertex_bindings.get(&v.binding) != Some(&value) {
                         self.device.submission.statistics.vertex_binds += 1;
-                        raw.cmd_bind_vertex_buffers(
-                            command,
-                            v.binding,
-                            &[buffer.handle],
-                            &[v.offset],
-                        );
+                        raw.cmd_bind_vertex_buffers(command, v.binding, &[value.0], &[value.1]);
                         slot.vertex_bindings.insert(v.binding, value);
                     }
                 }
@@ -683,21 +774,24 @@ impl VulkanResidency {
                     }
                 }
             }
-            let targets = &prepared.targets;
-            let mut info = vk::RenderingInfo::default()
-                .render_area(targets.area)
-                .layer_count(1)
-                .color_attachments(&targets.native_colors);
-            if let Some(depth) = &targets.native_depth {
-                info = info.depth_attachment(depth);
+            if !continuing {
+                let targets = &prepared.targets;
+                let mut info = vk::RenderingInfo::default()
+                    .render_area(targets.area)
+                    .layer_count(1)
+                    .color_attachments(&targets.native_colors);
+                if let Some(depth) = &targets.native_depth {
+                    info = info.depth_attachment(depth);
+                }
+                if let Some(stencil) = &targets.native_stencil {
+                    info = info.stencil_attachment(stencil);
+                }
+                // No render-pass object, framebuffer cache, HAL encoder or backend segment.
+                // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBeginRendering.html
+                self.device.submission.statistics.rendering_scopes += 1;
+                self.device.dispatch.begin_rendering(command, &info);
+                slot.active_targets = Some(Arc::clone(&prepared.targets));
             }
-            if let Some(stencil) = &targets.native_stencil {
-                info = info.stencil_attachment(stencil);
-            }
-            // No render-pass object, framebuffer cache, HAL encoder or backend segment.
-            // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBeginRendering.html
-            self.device.submission.statistics.rendering_scopes += 1;
-            self.device.dispatch.begin_rendering(command, &info);
             if !empty {
                 for &draw in draws {
                     match draw {
@@ -751,7 +845,9 @@ impl VulkanResidency {
                     }
                 }
             }
-            self.device.dispatch.end_rendering(command);
+        }
+        if !prepared.can_group() {
+            self.device.end_rendering();
         }
         if !empty {
             self.program_written(&graphics.program)?;
@@ -759,7 +855,17 @@ impl VulkanResidency {
         for a in prepared.targets.attachments() {
             match a.description.source {
                 AttachmentSource::Canonical { image, .. } => {
-                    if !(empty && a.description.load == vk::AttachmentLoadOp::DONT_CARE) {
+                    if continuing {
+                        // The first draw already published this exact coverage
+                        // at the current ticket. A continued LOAD/STORE scope
+                        // permits no shader writes, attachment feedback, native
+                        // imports or intervening commands that can consume or
+                        // replace that authority. CPU visibility also ends and
+                        // submits rendering before exposing bytes. Keep version
+                        // changes per draw, without walking every target page.
+                        self.advance_image_producer(image)?;
+                        self.statistics.attachment_publication_hits += 1;
+                    } else if !(empty && a.description.load == vk::AttachmentLoadOp::DONT_CARE) {
                         self.finish_image_rect(image, a.plane, prepared.targets.area)?;
                     }
                     if a.description.store == vk::AttachmentStoreOp::DONT_CARE

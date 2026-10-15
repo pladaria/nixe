@@ -24,12 +24,21 @@ Linked executable pipelines also retain their library components, independently
 of compiler/cache lifetime. Vertex/index and attachment preparation pins resident
 objects; eviction cannot invalidate a live prepared reference.
 
-Task 11 groups adjacent direct draws sharing prepared state when their shaders
-are read-only, attachment operations preserve prior contents, and vertex/index/
-shader reads cannot alias attachment writes. Guest effects, input snapshots,
-changed targets and explicit ordering split groups. Push, vertex/index, pipeline,
-descriptor and graphics-state caches reset on every new command buffer. Compatible
-parameters also avoid setters when only bindings changed.
+Read-only draws with compatible LOAD/STORE targets retain a dynamic-rendering
+instance across frontend deliveries, including changed pipeline parameters,
+descriptors and physical vertex bindings. Vertex/index/shader reads cannot alias
+attachment writes. Small CPU-authored shader/vertex inputs can consume immutable
+mapped arena snapshots without a transfer; GPU-authored inputs retain native
+imports. Transfers, real hazards, shader writes, changed targets and explicit
+ordering terminate rendering. Push, vertex/index, pipeline, descriptor and
+graphics-state caches reset on every new command buffer. Compatible parameters
+also avoid setters when only bindings changed.
+
+The first draw in a compatible scope publishes its attachment coverage. Continued
+draws advance each image's content version and producer ticket while retaining
+that already published coverage. This avoids repeated page walks without delaying
+ownership until the end of rendering. CPU demands and native imports terminate
+the scope before consuming or changing that ownership.
 
 Accepted non-final segments can share a command buffer. Final segments, actual
 ordering/visibility consumption, waits and staging pressure submit it. Distinct
@@ -93,8 +102,9 @@ Packed depth/stencil address legalization retains compact byte permutations.
 Exact physical intervals are expanded only for demanded pages or conflicting
 partial producers, rather than stored as one segment per texel.
 Repeated immutable write coverage is queued once per recording ticket. CPU demand
-flushes that ticket before materialization, so later writes publish a new point;
-each draw still updates its exact producer intervals and Vulkan hazards.
+flushes that ticket before materialization, so later writes publish a new point.
+Every draw advances its native content version and producer ticket; compatible
+continued rendering reuses the existing exact coverage and rasterization ordering.
 
 ## Raster and dispatch
 

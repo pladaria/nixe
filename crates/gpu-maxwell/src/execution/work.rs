@@ -30,6 +30,11 @@ pub trait MaxwellWorkBatch<W: MaxwellWork + ?Sized>: Default + Send {
         final_segment: bool,
         predecessors: &[FrontendSubmissionId],
     ) -> Result<Self::Segment, MaxwellBackendExecutionError>;
+    /// Called after the backend accepts the commands and retains their uses.
+    /// The recording container can then be reused before GPU completion.
+    fn recycle_segment(&mut self, segment: Self::Segment) {
+        drop(segment);
+    }
 }
 
 #[derive(Default)]
@@ -169,5 +174,82 @@ impl MaxwellWorkBatch<nixe_gpu::native::NativeWork> for NativeWorkBatch {
             final_segment,
             commands: std::mem::take(&mut self.commands),
         })
+    }
+
+    fn recycle_segment(&mut self, mut segment: Self::Segment) {
+        debug_assert!(self.commands.is_empty());
+        // submit() has already captured the native uses. Drop command leases,
+        // retain the vector capacity, and never replay the accepted commands.
+        segment.commands.clear();
+        self.commands = segment.commands;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_gpu::native::{GuestProgram, GuestShaderCode, NativeCommand, NativeWork};
+
+    #[test]
+    fn accepted_native_segments_release_command_leases_and_reuse_empty_storage() {
+        let frontend = FrontendSubmissionId::new(7);
+        let program = Arc::new(GuestProgram {
+            identity: nixe_gpu::PreparedStateId::new(1, 1),
+            shader: Arc::new(GuestShaderCode {
+                identity: nixe_gpu::ssa::artifact::ContentId::of(b"batch-retirement-test", &[]),
+                functions: Box::new([]),
+            }),
+            bindings: Box::new([]),
+            shared_memory_bytes: 0,
+            local_memory_bytes: 0,
+        });
+        let mut batch = NativeWorkBatch::default();
+        {
+            let work = NativeWork {
+                frontend,
+                command: NativeCommand::Dispatch {
+                    program: Arc::clone(&program),
+                    groups: [3, 2, 1],
+                },
+                canonical_accesses: Arc::from([]),
+            };
+            batch.work(&work);
+        }
+        let first = batch
+            .finish(frontend, FrontendSubmissionSegment::FIRST, false, &[])
+            .unwrap();
+        let storage = first.commands.as_ptr();
+        assert_eq!(first.commands.len(), 1);
+        assert_eq!(Arc::strong_count(&program), 2);
+        batch.recycle_segment(first);
+        assert_eq!(Arc::strong_count(&program), 1);
+        assert!(batch.is_empty());
+
+        let operation = GpuOperation::new(
+            GpuCommand::CacheMaintenance(
+                nixe_gpu::CacheMaintenanceOperation::InvalidateDeviceReadCaches,
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        );
+        batch.ordering(&operation);
+        let second = batch
+            .finish(
+                frontend,
+                FrontendSubmissionSegment::FIRST.checked_next().unwrap(),
+                true,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(second.commands.as_ptr(), storage);
+        assert!(second.final_segment);
+        assert!(matches!(
+            second.commands.as_slice(),
+            [NativeCommand::Ordering(
+                nixe_gpu::CacheMaintenanceOperation::InvalidateDeviceReadCaches
+            )]
+        ));
+        assert_eq!(Arc::strong_count(&program), 1);
     }
 }
