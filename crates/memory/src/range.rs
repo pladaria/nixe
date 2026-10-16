@@ -1575,6 +1575,13 @@ impl CanonicalBackingRange {
                 range_size: self.size,
             });
         }
+        if offset == 0
+            && output_size == self.size
+            && let Some(mapping) = &self.layout.mapping
+            && mapping.read_tiled_quiescent(output)?
+        {
+            return Ok(());
+        }
         let mut copied = 0_usize;
         for (logical_start, segment) in self.segments_between(offset, end) {
             let logical_end = logical_start

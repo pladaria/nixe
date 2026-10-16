@@ -127,6 +127,8 @@ pub(crate) struct Slot {
     pub pool: vk::CommandPool,
     pub command: vk::CommandBuffer,
     pub tick: u64,
+    stream_read_until: u64,
+    pending_stream_read: bool,
     pub upload: Option<Arena>,
     pub readback: Option<Arena>,
     pub upload_overflow: Vec<Arc<AllocatedBuffer>>,
@@ -181,6 +183,8 @@ impl Slot {
             pool,
             command: vk::CommandBuffer::null(),
             tick: 0,
+            stream_read_until: 0,
+            pending_stream_read: false,
             upload: None,
             readback: None,
             upload_overflow: Vec::new(),
@@ -253,6 +257,11 @@ impl Slot {
     fn unread(&self) -> usize {
         self.unread_count
     }
+    fn reusable(&self, completed: u64) -> bool {
+        !self.pending_stream_read
+            && self.tick.max(self.stream_read_until) <= completed
+            && self.unread() == 0
+    }
 }
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -286,6 +295,7 @@ pub(crate) struct QueueState {
     pub submitted: u64,
     pub completed: u64,
     overflow_capacity: u64,
+    pending_stream_reads: Vec<usize>,
     stopped: bool,
     lost: bool,
 }
@@ -324,6 +334,7 @@ impl QueueState {
             submitted: 0,
             completed: 0,
             overflow_capacity: 0,
+            pending_stream_reads: Vec::new(),
             stopped: false,
             lost: false,
         };
@@ -372,7 +383,8 @@ impl QueueState {
     fn reclaim(&mut self, completed: u64) {
         self.completed = self.completed.max(completed);
         for slot in &mut self.slots {
-            if slot.tick <= self.completed {
+            if !slot.pending_stream_read && slot.tick.max(slot.stream_read_until) <= self.completed
+            {
                 slot.retired_buffers.clear();
                 slot.retired_images.clear();
                 slot.retained_views.clear();
@@ -402,13 +414,35 @@ impl QueueState {
             }
         }
     }
+    /// A transfer may submit while a draw is still preparing its inputs. Keep
+    /// its mapped streams alive until the command that actually reads them,
+    /// rather than recycling them at the earlier upload submission's signal.
+    pub(crate) fn retain_stream_upload(&mut self, slot: usize) {
+        if !self.slots[slot].pending_stream_read {
+            self.slots[slot].pending_stream_read = true;
+            self.pending_stream_reads.push(slot);
+        }
+    }
+    pub(crate) fn release_stream_uploads(&mut self) {
+        let consumer = self.submitted + u64::from(self.recording.is_some());
+        let mut reclaim = false;
+        for index in self.pending_stream_reads.drain(..) {
+            let slot = &mut self.slots[index];
+            slot.stream_read_until = slot.stream_read_until.max(consumer);
+            slot.pending_stream_read = false;
+            reclaim |= slot.tick.max(slot.stream_read_until) <= self.completed;
+        }
+        if reclaim {
+            self.reclaim(self.completed);
+        }
+    }
     fn pressure(&self) -> VulkanError {
         VulkanError::QueuePressure {
             pending: self
                 .slots
                 .iter()
-                .filter(|slot| slot.tick > self.completed && slot.tick <= self.submitted)
-                .map(|slot| slot.tick)
+                .map(|slot| slot.tick.max(slot.stream_read_until))
+                .filter(|&tick| tick > self.completed && tick <= self.submitted)
                 .min()
                 .map(|tick| self.ticket(tick)),
             retained_readbacks: self.slots.iter().map(Slot::unread).sum(),
@@ -420,17 +454,13 @@ impl QueueState {
             return Ok(index);
         }
         // Poll only at batch acquisition/pressure, never per draw or arena slice.
-        if !self
-            .slots
-            .iter()
-            .any(|slot| slot.tick <= self.completed && slot.unread() == 0)
-        {
+        if !self.slots.iter().any(|slot| slot.reusable(self.completed)) {
             self.poll()?;
         }
         let index = match self
             .slots
             .iter()
-            .position(|slot| slot.tick <= self.completed && slot.unread() == 0)
+            .position(|slot| slot.reusable(self.completed))
         {
             Some(index) => index,
             None if self.slots.len() < self.configuration.command_slots => {

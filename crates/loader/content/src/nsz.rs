@@ -5,6 +5,9 @@ use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 use crate::compressed_package::logical_nca_name;
 use crate::{CompressedPackageEntry, NczLoader, Pfs0Archive};
 
+mod reblock;
+pub use reblock::prepare_nsz_for_random_access;
+
 /// Loads an NSZ by reusing the PFS0 parser and wrapping its NCZ entries.
 #[derive(Debug)]
 pub struct NszLoader;
@@ -196,5 +199,135 @@ mod tests {
 
         let archive = NszLoader::load(Arc::new(Bytes(package))).unwrap();
         assert_eq!(archive.entries()[0].logical_name(), "content.nca");
+    }
+
+    #[test]
+    fn converts_solid_entries_preserves_other_entries_and_keeps_the_original() {
+        use nixe_loader_storage::FileStorage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.NSZ");
+        let backup = directory.path().join("game.NSZ.solid");
+        let tail = vec![0x5a; 2 * 1024 * 1024 + 19];
+        let solid = ncz(&tail);
+        let original = pfs0(&[
+            ("content.NCZ", &solid),
+            ("ticket.tik", b"ticket"),
+            ("empty", b""),
+        ]);
+        std::fs::write(&path, &original).unwrap();
+        assert!(prepare_nsz_for_random_access(&path, true).unwrap());
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let archive = NszLoader::load(Arc::new(FileStorage::open(&path).unwrap())).unwrap();
+        let info = archive.entries()[0].ncz().unwrap().block_info().unwrap();
+        assert_eq!(info.block_size(), 1024 * 1024);
+        assert_eq!(info.block_count(), 3);
+        let mut output = vec![0; tail.len()];
+        archive
+            .open("content.nca")
+            .unwrap()
+            .unwrap()
+            .read_at(0x4000, &mut output)
+            .unwrap();
+        assert_eq!(output, tail);
+        let mut ticket = [0; 6];
+        archive
+            .open("ticket.tik")
+            .unwrap()
+            .unwrap()
+            .read_at(0, &mut ticket)
+            .unwrap();
+        assert_eq!(&ticket, b"ticket");
+        assert!(archive.open("empty").unwrap().unwrap().is_empty().unwrap());
+        let converted = std::fs::read(&path).unwrap();
+        assert!(!prepare_nsz_for_random_access(&path, true).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), converted);
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+        // A package can mix already blocked and solid entries. Re-conversion
+        // must copy the blocked entry byte-for-byte.
+        let blocked = archive.pfs0.open("content.NCZ").unwrap().unwrap();
+        let mut blocked_bytes = vec![0; blocked.len().unwrap() as usize];
+        blocked.read_at(0, &mut blocked_bytes).unwrap();
+        let mixed_path = directory.path().join("mixed.nsz");
+        let mixed = pfs0(&[("blocked.ncz", &blocked_bytes), ("solid.ncz", &solid)]);
+        std::fs::write(&mixed_path, mixed).unwrap();
+        assert!(prepare_nsz_for_random_access(&mixed_path, false).unwrap());
+        assert!(!directory.path().join("mixed.nsz.solid").exists());
+        let mixed = NszLoader::load(Arc::new(FileStorage::open(&mixed_path).unwrap())).unwrap();
+        let mut copied = vec![0; blocked_bytes.len()];
+        mixed
+            .pfs0
+            .open("blocked.ncz")
+            .unwrap()
+            .unwrap()
+            .read_at(0, &mut copied)
+            .unwrap();
+        assert_eq!(copied, blocked_bytes);
+        assert!(mixed.entries().iter().all(
+            |entry| entry.ncz().unwrap().compression_kind() == crate::NczCompressionKind::Block
+        ));
+    }
+
+    #[test]
+    fn conversion_failure_leaves_the_original_and_existing_backups_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.nsz");
+        let backup = directory.path().join("game.nsz.solid");
+        let original = pfs0(&[("content.ncz", &ncz(b"tail"))]);
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(&backup, b"existing backup").unwrap();
+        assert!(
+            prepare_nsz_for_random_access(&path, true)
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&backup).unwrap(), b"existing backup");
+        std::fs::remove_file(&backup).unwrap();
+        let solid = ncz(&vec![7; 20_000]);
+        for malformed in [
+            &solid[..solid.len() - 5],
+            &[solid.as_slice(), b"trailing"].concat(),
+        ] {
+            let original = pfs0(&[("content.ncz", malformed)]);
+            std::fs::write(&path, &original).unwrap();
+            assert!(prepare_nsz_for_random_access(&path, true).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(!backup.exists());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn concurrent_converters_publish_one_verified_package_and_one_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.nsz");
+        let original = pfs0(&[("content.ncz", &ncz(&vec![3; 1024 * 1024 + 7]))]);
+        std::fs::write(&path, &original).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let threads = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    prepare_nsz_for_random_access(path, true).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            threads
+                .into_iter()
+                .filter_map(|thread| thread.join().unwrap().then_some(()))
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("game.nsz.solid")).unwrap(),
+            original
+        );
+        assert!(!prepare_nsz_for_random_access(path, true).unwrap());
     }
 }

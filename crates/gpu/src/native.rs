@@ -86,6 +86,9 @@ pub struct GuestDrawParameters {
     pub depth_stencil_format: Option<ImageFormat>,
     pub samples: SampleCount,
     pub extent: [u32; 2],
+    /// Attachment load/store bounds, independent of the viewport and dynamic
+    /// scissor. The allocated image can include texels outside this region.
+    pub render_area: ScissorRect,
     pub topology: PrimitiveTopology,
     pub restart: bool,
     pub provoking_first: bool,
@@ -115,6 +118,7 @@ impl GuestDrawParameters {
             && self.depth_stencil_format == other.depth_stencil_format
             && self.samples == other.samples
             && self.extent == other.extent
+            && self.render_area == other.render_area
             && self.topology == other.topology
             && self.restart == other.restart
             && self.provoking_first == other.provoking_first

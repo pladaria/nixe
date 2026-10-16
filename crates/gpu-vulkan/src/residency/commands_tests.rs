@@ -42,6 +42,89 @@ fn color_image() -> (NativeImageDescription, Vec<ImagePlane>) {
     )
 }
 #[test]
+fn cropped_native_alias_skips_buffer_reconstruction_and_preserves_undefined_padding() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (_, storage) = backing_allocation(4096, 256, 0x73);
+    let tile = nixe_memory::CanonicalByteTile::new(
+        64,
+        4,
+        (0..256).map(|i| (i % 64) * 4 + i / 64).collect(),
+    )
+    .unwrap();
+    let make = |cache: &mut VulkanResidency, width, height| {
+        let backing = CanonicalBackingRange::mapped(
+            storage.clone(),
+            nixe_memory::CanonicalByteLayout {
+                base: 0,
+                columns: width,
+                rows: height,
+                element_bytes: 4,
+                source_element_bytes: 4,
+                source_byte_offset: 0,
+                source_row_pitch: u64::from(width) * 4,
+                tile: Some(tile.clone()),
+            },
+        )
+        .unwrap();
+        let (mut description, mut planes) = color_image();
+        description.extent.width = width;
+        description.extent.height = height;
+        planes[0].offset = 0;
+        planes[0].row_pitch = u64::from(width) * 4;
+        planes[0].extent = description.extent;
+        let id = cache
+            .image_for_device_write(backing.clone(), description, planes)
+            .unwrap();
+        (id, backing)
+    };
+    let (source, _) = make(&mut cache, 19, 9);
+    let (target, bytes) = make(&mut cache, 17, 7);
+    let plane = cache.image(target).unwrap().planes[0];
+    let area = transfers::full_rect(plane);
+    for color in [[1., 0., 0., 1.], [0., 1., 0., 1.]] {
+        cache
+            .clear_image_rect(
+                source,
+                0,
+                area,
+                vk::ClearValue {
+                    color: vk::ClearColorValue { float32: color },
+                },
+            )
+            .unwrap();
+        cache.ensure_image_initialized(target, plane, area).unwrap();
+        assert_eq!(cache.statistics().cpu_uploaded_bytes, 0);
+        assert!(
+            cache.buffers.iter().all(|slot| slot.entry.is_none()),
+            "a compatible rectangle must transfer directly between native images"
+        );
+        assert!(cache.image(target).unwrap().discarded.is_empty());
+        assert!(!cache.image(source).unwrap().discarded.is_empty());
+    }
+    cache.flush().unwrap();
+    let readback = cache
+        .buffer_for(bytes.clone(), vk::BufferUsageFlags::TRANSFER_SRC)
+        .unwrap();
+    let actual = cache.read_buffer(readback, 0, bytes.size()).unwrap();
+    for (index, pixel) in actual.chunks_exact(4).enumerate() {
+        assert_eq!(pixel, [0, 255, 0, 255], "pixel {index}");
+    }
+    let (unwritten, _) = make(&mut cache, 18, 7);
+    let plane = cache.image(unwritten).unwrap().planes[0];
+    assert!(
+        cache
+            .ensure_image_initialized(unwritten, plane, transfers::full_rect(plane))
+            .is_err(),
+        "native alias projection must not substitute undefined source texels"
+    );
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn dense_image_buffer_alias_preserves_compact_authority_and_rejects_stale_images() {
     let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
         return;

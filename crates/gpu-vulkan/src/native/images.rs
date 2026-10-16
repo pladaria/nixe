@@ -22,7 +22,7 @@ pub(super) struct ImageKey {
 pub(super) struct Targets {
     colors: Box<[GuestImage]>,
     depth_stencil: Option<GuestImage>,
-    extent: [u32; 2],
+    area: nixe_gpu::ScissorRect,
     stencil: bool,
     native: Arc<PreparedTargets>,
 }
@@ -326,8 +326,23 @@ impl NativeGpuExecution {
         &mut self,
         state: &GuestDrawState,
     ) -> Result<Arc<PreparedTargets>, VulkanError> {
+        // Attachment load/store coverage follows the guest surface clip, not
+        // allocation alignment or a per-draw scissor. Keep viewport coordinates
+        // independent and retain scopes across dynamic scissor changes.
+        // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-renderarea
+        let mut area = state.parameters.render_area;
+        // An empty guest clip is enforced by its empty scissor. Vulkan still
+        // requires a nonempty render area for vertex/shader side effects.
+        if area.width == 0 || area.height == 0 {
+            area = nixe_gpu::ScissorRect {
+                x: 0,
+                y: 0,
+                width: state.parameters.extent[0],
+                height: state.parameters.extent[1],
+            };
+        }
         if let Some(source) = &self.targets
-            && source.extent == state.parameters.extent
+            && source.area == area
             && source.stencil == state.parameters.stencil.is_some()
             && source.colors.len() == state.colors.len()
             && source
@@ -379,12 +394,7 @@ impl NativeGpuExecution {
             }
         }
         let targets = self.residency.prepare_targets(RenderingTargets {
-            area: rect(nixe_gpu::ScissorRect {
-                x: 0,
-                y: 0,
-                width: state.parameters.extent[0],
-                height: state.parameters.extent[1],
-            }),
+            area: rect(area),
             colors: colors.into_boxed_slice(),
             depth,
             stencil,
@@ -392,7 +402,7 @@ impl NativeGpuExecution {
         self.targets = Some(Targets {
             colors: state.colors.clone(),
             depth_stencil: state.depth_stencil.clone(),
-            extent: state.parameters.extent,
+            area,
             stencil: state.parameters.stencil.is_some(),
             native: Arc::clone(&targets),
         });

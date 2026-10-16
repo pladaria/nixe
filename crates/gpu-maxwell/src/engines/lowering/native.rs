@@ -542,6 +542,8 @@ impl MaxwellNativeFrontend {
                     .description
                     .samples(),
                 extent,
+                render_area: lowering(draw_surface_region(state, extent[0], extent[1]))?
+                    .scissor(extent[0], extent[1]),
                 topology: lowering(primitive_topology(
                     *state.vertex_input().primitive().active_begin().unwrap(),
                 ))?,

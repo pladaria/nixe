@@ -23,6 +23,31 @@ impl VulkanResidency {
         }
         Ok(())
     }
+    pub(super) fn reserve_upload(
+        &mut self,
+        bytes: &[u8],
+        alignment: u64,
+    ) -> Result<(usize, crate::queue::Slice), VulkanError> {
+        loop {
+            match self
+                .device
+                .submission
+                .reserve_upload_aligned(bytes, alignment)
+            {
+                Ok(reservation) => return Ok(reservation),
+                Err(error @ VulkanError::QueuePressure { pending, .. }) => {
+                    // Submit an oversized resource's recorded prefix, then wait
+                    // only for work that can release bounded staging capacity.
+                    let flushed = self.flush()?;
+                    let Some(work) = pending.or(flushed) else {
+                        return Err(error);
+                    };
+                    self.device.wait_for_work(work, std::time::Duration::MAX)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
     pub(super) fn upload_buffer(
         &mut self,
         id: BufferId,
@@ -33,7 +58,7 @@ impl VulkanResidency {
         // Chunking is a staging policy, never a guest buffer-size restriction.
         let limit = self.device.submission.configuration.arena_bytes as usize;
         for (part, bytes) in bytes.chunks(limit).enumerate() {
-            let (index, slice) = self.device.submission.reserve_upload(bytes)?;
+            let (index, slice) = self.reserve_upload(bytes, 4)?;
             let target = self.buffer_access_range(
                 id,
                 offset + (part * limit) as u64,

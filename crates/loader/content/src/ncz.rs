@@ -7,6 +7,9 @@ use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, Storag
 use crate::binary::{read_u32, read_u64};
 use crate::crypto::apply_ctr_at;
 
+mod reblock;
+pub(crate) use reblock::{reblock_solid, verify_reblocked};
+
 const PREFIX_SIZE: u64 = 0x4000;
 const SECTION_HEADER_SIZE: u64 = 0x10;
 const SECTION_SIZE: u64 = 0x40;
@@ -1365,5 +1368,61 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn reblocking_preserves_ctr_sections_gaps_raw_blocks_and_partial_final_blocks() {
+        let mut tail = vec![0; 1024 * 1024];
+        let mut random = 0x1234_5678_u32;
+        tail.extend((0..1024 * 1024).map(|_| {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random as u8
+        }));
+        tail.extend_from_slice(&[0xab; 13]);
+        let section = section_record(
+            PREFIX_SIZE + 0x200,
+            tail.len() as u64 - 0x200,
+            3,
+            [0x23; 16],
+            [0x45; 16],
+        );
+        let source: StorageRef = Arc::new(Bytes::new(solid_ncz(&tail, &[section])));
+        let solid = NczLoader::load(source.clone()).unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        let digest = reblock_solid(source, &solid, &mut output, &mut |_| {}).unwrap();
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut converted = Vec::new();
+        output.read_to_end(&mut converted).unwrap();
+        let header_end =
+            PREFIX_SIZE as usize + SECTION_HEADER_SIZE as usize + SECTION_SIZE as usize;
+        let sizes_start = header_end + BLOCK_HEADER_SIZE as usize;
+        assert!(read_u32(&converted, sizes_start) < 1024 * 1024);
+        assert_eq!(read_u32(&converted, sizes_start + 4), 1024 * 1024);
+        assert_eq!(read_u32(&converted, sizes_start + 8), 13);
+        let storage: StorageRef = Arc::new(Bytes::new(converted.clone()));
+        let blocked = NczLoader::load(storage.clone()).unwrap();
+        verify_reblocked(storage, &blocked, digest, &mut |_| {}).unwrap();
+        let mut original = vec![0; solid.logical_size() as usize];
+        let mut reconstructed = vec![0; original.len()];
+        solid.nca_storage().read_at(0, &mut original).unwrap();
+        blocked
+            .nca_storage()
+            .read_at(0, &mut reconstructed)
+            .unwrap();
+        assert_eq!(reconstructed, original);
+
+        // Corrupt a raw block, whose byte count still passes format validation.
+        let second_block = sizes_start + 12 + read_u32(&converted, sizes_start) as usize;
+        converted[second_block + 100] ^= 1;
+        let corrupted: StorageRef = Arc::new(Bytes::new(converted));
+        let archive = NczLoader::load(corrupted.clone()).unwrap();
+        assert!(
+            verify_reblocked(corrupted, &archive, digest, &mut |_| {})
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
     }
 }

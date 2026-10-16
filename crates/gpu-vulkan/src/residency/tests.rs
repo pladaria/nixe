@@ -765,7 +765,7 @@ fn stale_cpu_acknowledgement_cannot_release_newer_producer() {
 }
 
 #[test]
-fn staging_pressure_resumes_partial_cpu_uploads_and_gpu_prefixes() {
+fn large_cpu_uploads_progress_with_bounded_staging_and_preserve_gpu_prefixes() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
     };
@@ -781,34 +781,15 @@ fn staging_pressure_resumes_partial_cpu_uploads_and_gpu_prefixes() {
     )
     .unwrap();
     let (allocation, range) = backing_allocation(4096, 4096, 0x34);
-    let mut pressures = 0;
-    let id = loop {
-        match cache.buffer_for(range.clone(), vk::BufferUsageFlags::STORAGE_BUFFER) {
-            Ok(id) => break id,
-            Err(VulkanError::QueuePressure { .. }) => {
-                pressures += 1;
-                let work = cache.flush().unwrap().unwrap();
-                cache
-                    .device
-                    .wait_for_work(work, Duration::from_secs(5))
-                    .unwrap();
-            }
-            Err(error) => panic!("unexpected upload error: {error}"),
-        }
-        assert!(pressures <= 8, "a resumed upload must make progress");
-    };
-    assert_eq!(pressures, 7);
+    let id = cache
+        .buffer_for(range.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
+        .unwrap();
+    assert!(cache.device.queue_usage().submitted_tick >= 7);
+    assert_eq!(cache.device.queue_usage().overflow_capacity, 0);
     assert_eq!(cache.statistics().cpu_uploaded_bytes, 4096);
     assert_eq!(cache.read_buffer(id, 0, 4096).unwrap(), vec![0x34; 4096]);
     allocation.write(100, &[0x56; 3]).unwrap();
-    while let Err(error) = cache.ensure_buffer(id) {
-        assert!(matches!(error, VulkanError::QueuePressure { .. }));
-        let work = cache.flush().unwrap().unwrap();
-        cache
-            .device
-            .wait_for_work(work, Duration::from_secs(5))
-            .unwrap();
-    }
+    cache.ensure_buffer(id).unwrap();
     assert_eq!(cache.read_buffer(id, 100, 3).unwrap(), vec![0x56; 3]);
     let bytes = vec![0x99; 2048];
     let mut consumed = 0;
@@ -829,6 +810,228 @@ fn staging_pressure_resumes_partial_cpu_uploads_and_gpu_prefixes() {
     assert_eq!(cache.statistics().canonical_readback_bytes - before, 2048);
     assert_eq!(&cpu_read(&mut cache, &range)[..2048], &bytes);
     assert!(cache.evict_one().unwrap());
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    cache.device.submission = QueueState::new(
+        Arc::clone(&cache.device.owner),
+        cache.device.queues().graphics_compute_family,
+        QueueConfiguration {
+            command_slots: 2,
+            arena_bytes: 512,
+            overflow_bytes: 0,
+        },
+    )
+    .unwrap();
+    let (allocation, physical) = backing_allocation(16384, 256, 0x73);
+    let backing = CanonicalBackingRange::mapped(
+        physical.clone(),
+        nixe_memory::CanonicalByteLayout {
+            base: 0,
+            columns: 57,
+            rows: 33,
+            element_bytes: 4,
+            source_element_bytes: 4,
+            source_byte_offset: 0,
+            source_row_pitch: 228,
+            tile: Some(
+                nixe_memory::CanonicalByteTile::new(
+                    64,
+                    4,
+                    (0..256).map(|i| (i % 64) * 4 + i / 64).collect(),
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .unwrap();
+    let extent = vk::Extent3D {
+        width: 57,
+        height: 33,
+        depth: 1,
+    };
+    let plane = ImagePlane {
+        offset: 0,
+        row_pitch: 228,
+        mip_level: 0,
+        array_layer: 0,
+        aspect: vk::ImageAspectFlags::COLOR,
+        extent,
+        block_extent: vk::Extent2D {
+            width: 1,
+            height: 1,
+        },
+        bytes_per_block: 4,
+    };
+    let image = cache
+        .image_for(
+            backing.clone(),
+            NativeImageDescription {
+                image_type: vk::ImageType::TYPE_2D,
+                format: vk::Format::R8G8B8A8_UNORM,
+                extent,
+                mip_levels: 1,
+                array_layers: 1,
+                samples: vk::SampleCountFlags::TYPE_1,
+                usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                flags: vk::ImageCreateFlags::empty(),
+            },
+            vec![plane],
+        )
+        .unwrap();
+    assert_eq!(cache.statistics().cpu_uploaded_bytes, backing.size());
+    assert!(cache.buffers.iter().all(|slot| slot.entry.is_none()));
+    assert!(backing.metadata_bytes() < backing.size() as usize);
+    let (_, output) = backing_allocation(backing.size() as usize, 256, 0x23);
+    let destination = cache
+        .buffer_for_deferred_import(output, vk::BufferUsageFlags::TRANSFER_DST)
+        .unwrap();
+    cache
+        .prepare_write(Resource::Buffer(destination), 0, backing.size())
+        .unwrap();
+    cache
+        .copy_source(Resource::Image(image), 0, destination, 0, backing.size())
+        .unwrap();
+    cache
+        .record_authority(Resource::Buffer(destination), 0, backing.size())
+        .unwrap();
+    assert_eq!(
+        cache.read_buffer(destination, 0, backing.size()).unwrap(),
+        vec![0x73; backing.size() as usize]
+    );
+    cache
+        .clear_color_image(
+            image,
+            0,
+            vk::ClearColorValue {
+                float32: [0., 1., 0., 1.],
+            },
+        )
+        .unwrap();
+    cache.flush().unwrap();
+    cpu_read(&mut cache, &physical);
+    allocation.write(0, &[0x31; 16384]).unwrap();
+    cache.ensure_image(image).unwrap();
+    cache
+        .clear_image_rect(
+            image,
+            0,
+            vk::Rect2D {
+                offset: Default::default(),
+                extent: vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+            },
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0., 0., 1., 1.],
+                },
+            },
+        )
+        .unwrap();
+    cache.flush().unwrap();
+    let actual = cpu_read(&mut cache, &backing);
+    assert_eq!(&actual[..4], &[0, 0, 255, 255]);
+    assert!(
+        actual[4..].iter().all(|&byte| byte == 0x31),
+        "CPU replacements must retire previous GPU authority before a partial GPU writer"
+    );
+    assert!(cache.device.queue_usage().command_pools <= 2);
+    assert_eq!(cache.device.queue_usage().overflow_capacity, 0);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+fn large_uploads_retain_streams_until_their_actual_consumer() {
+    mod gate {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/gate.rs"
+        ));
+    }
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    cache.device.submission = QueueState::new(
+        Arc::clone(&cache.device.owner),
+        cache.device.queues().graphics_compute_family,
+        QueueConfiguration {
+            command_slots: 2,
+            arena_bytes: 512,
+            overflow_bytes: 0,
+        },
+    )
+    .unwrap();
+    let (stream_slot, stream) = cache.device.submission.reserve_upload(&[0x42; 64]).unwrap();
+    cache.device.submission.retain_stream_upload(stream_slot);
+    let source = cache.device.submission.slots[stream_slot].upload_lease(stream);
+    // Texture imports can flush repeatedly between preparing a uniform/vertex
+    // stream and recording the draw that consumes it. Two slots and no overflow
+    // force reuse; the stream's slot must remain unavailable throughout.
+    let (_, range) = backing_allocation(4096, 4096, 0x34);
+    let image_bytes = cache
+        .buffer_for(range, vk::BufferUsageFlags::TRANSFER_SRC)
+        .unwrap();
+    assert_eq!(cache.statistics().cpu_uploaded_bytes, 4096);
+    assert!(cache.device.queue_usage().submitted_tick >= 8);
+    let (slot, destination, readback) = cache.device.submission.reserve_readback(64).unwrap();
+    let command = cache.device.submission.slots[slot].command;
+    let target = cache.device.submission.slots[slot]
+        .readback_buffer(destination)
+        .handle;
+    unsafe {
+        cache.device.owner.device.cmd_copy_buffer(
+            command,
+            source.handle,
+            target,
+            &[vk::BufferCopy::default()
+                .src_offset(stream.offset)
+                .dst_offset(destination.offset)
+                .size(64)],
+        );
+    }
+    recording::host_read_barrier(&cache.device, command, target, destination.offset, 64);
+    cache.device.submission.release_stream_uploads();
+    let mut gate = gate::Gate::new(&cache.device);
+    let waits = [vk::SemaphoreSubmitInfo::default()
+        .semaphore(gate.handle)
+        .value(1)
+        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+    let consumer = cache.flush_with_sync(&waits, &[]).unwrap().unwrap();
+    gate.last_use = consumer.tick();
+    assert!(
+        !cache
+            .device
+            .wait_for_work(consumer, Duration::ZERO)
+            .unwrap()
+    );
+    assert!(
+        matches!(
+            cache.device.submission.begin(),
+            Err(VulkanError::QueuePressure { pending: Some(work), .. }) if work == consumer
+        ),
+        "the stream's upload submission has completed, but its actual consumer still owns the arena"
+    );
+    gate.signal();
+    assert_eq!(cache.device.readback(readback).unwrap(), [0x42; 64]);
+    assert_eq!(
+        cache.read_buffer(image_bytes, 0, 4096).unwrap(),
+        [0x34; 4096]
+    );
+    assert_eq!(cache.device.queue_usage().command_pools, 2);
+    assert_eq!(cache.device.queue_usage().overflow_capacity, 0);
+    drop(gate);
+    drop(source);
     drop(cache);
     validation.check().unwrap();
 }

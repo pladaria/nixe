@@ -335,6 +335,7 @@ impl VulkanResidency {
                         format: target.description.format,
                         usage: target.description.usage,
                         flags: target.description.flags,
+                        extent: target.description.extent,
                         ..entry.description
                     };
                     let formats_compatible = entry.description.format == target.description.format
@@ -348,16 +349,51 @@ impl VulkanResidency {
                                 && format::copy_block(entry.description.format, p.aspect)
                                     == format::copy_block(target.description.format, p.aspect)
                         });
+                    let same_mapping = entry.planes == target.planes
+                        && same_bytes(&entry.contents.backing, &target.contents.backing);
+                    let rectangular_mapping =
+                        match (entry.planes.as_slice(), target.planes.as_slice()) {
+                            ([a], [b])
+                                if entry.description.samples == vk::SampleCountFlags::TYPE_1
+                                    && a.offset == 0
+                                    && b.offset == 0
+                                    && a.extent.depth == 1
+                                    && b.extent.depth == 1
+                                    && a.extent.width >= b.extent.width
+                                    && a.extent.height >= b.extent.height
+                                    && (b.extent.width.is_multiple_of(b.block_extent.width)
+                                        || b.extent.width == a.extent.width)
+                                    && (b.extent.height.is_multiple_of(b.block_extent.height)
+                                        || b.extent.height == a.extent.height)
+                                    && a.mip_level == b.mip_level
+                                    && a.array_layer == b.array_layer
+                                    && a.aspect == b.aspect
+                                    && a.block_extent == b.block_extent
+                                    && a.bytes_per_block == b.bytes_per_block =>
+                            {
+                                entry.contents.backing.same_rectangular_bytes(
+                                    a.row_pitch,
+                                    &target.contents.backing,
+                                    b.row_pitch,
+                                    b.row_bytes(),
+                                    b.rows(),
+                                )
+                            }
+                            _ => false,
+                        };
                     (compatible == target.description
                         && formats_compatible
                         && entry.sample_grid == target.sample_grid
-                        && entry.planes == target.planes
+                        && (same_mapping || rectangular_mapping)
                         && entry.decoded.is_none()
                         && entry.producer.is_some()
-                        && entry.discarded.is_empty()
+                        && !entry.discarded.iter().any(|&(plane, undefined)| {
+                            target.planes.get(plane).is_none_or(|p| {
+                                transfers::intersects(undefined, transfers::full_rect(*p))
+                            })
+                        })
                         && entry.contents.invalid.is_empty()
-                        && entry.contents.cpu.remains_current()
-                        && same_bytes(&entry.contents.backing, &target.contents.backing))
+                        && entry.contents.cpu.remains_current())
                     .then_some(source)
                 })
             });
@@ -467,10 +503,45 @@ impl VulkanResidency {
         let backing = entry.contents.backing.clone();
         let dependency = entry.contents.cpu.clone();
         let mut dirty = entry.contents.invalid.clone();
+        let direct_plane = match entry.planes.as_slice() {
+            [p] if p.offset == 0
+                && p.extent.depth == 1
+                && p.row_pitch == p.row_bytes()
+                && p.end() == Some(backing.size())
+                && p.row_pitch <= self.device.submission.configuration.arena_bytes
+                && (dirty.is_empty() || dirty == [(0, backing.size())])
+                && backing
+                    .pages()
+                    .all(|p| !self.gpu_owned(p.identity(), p.visibility_state())) =>
+            {
+                Some(*p)
+            }
+            _ => None,
+        };
         // This snapshot establishes the image observer BEFORE native imports.
         // CPU writes after it stay dirty even if the buffer import sees them.
-        for (offset, bytes) in self.cpu_snapshots(&backing, &dependency, &[])? {
-            dirty.push((offset, bytes.len() as u64));
+        let snapshots = if let Some(p) = direct_plane {
+            dependency
+                .snapshot_with_resolver(
+                    &backing,
+                    if dirty.is_empty() {
+                        CpuWriteSnapshotSelection::DirtyPages
+                    } else {
+                        CpuWriteSnapshotSelection::All
+                    },
+                    p.row_pitch,
+                    &mut |_, _| {
+                        Err(nixe_memory::VisibilityCoordinatorError::new(
+                            "CPU image snapshot crossed concurrent GPU ownership",
+                        ))
+                    },
+                )
+                .map_err(memory_error)?
+        } else {
+            self.cpu_snapshots(&backing, &dependency, &[])?
+        };
+        for (offset, bytes) in &snapshots {
+            dirty.push((*offset, bytes.len() as u64));
         }
         normalize(&mut dirty);
         self.images[id.slot]
@@ -482,11 +553,28 @@ impl VulkanResidency {
         if dirty.is_empty() {
             return Ok(());
         }
-        let source = self.buffer_for(backing, vk::BufferUsageFlags::TRANSFER_SRC)?;
-        self.constructing.push(Resource::Buffer(source));
-        let result = self.copy_rows_to_image(source, 0, id, &dirty);
-        self.unpin(Resource::Buffer(source));
-        result?;
+        if let Some(plane) = direct_plane {
+            // CPU-authored texels already exist in this immutable snapshot.
+            // Stage them once; a persistent canonical buffer would duplicate
+            // both the snapshot and the GPU transfer, and index tiled fragments.
+            let mut visible = self.visibility.pages.lock().unwrap();
+            for page in backing.pages() {
+                if let Some(indexed) = self.index.pages.get_mut(&page.identity()) {
+                    indexed.clear_writes();
+                }
+                visible.remove(&page.identity());
+            }
+            drop(visible);
+            for (offset, bytes) in snapshots {
+                self.upload_cpu_image_rows(id, plane, offset, &bytes)?;
+            }
+        } else {
+            let source = self.buffer_for(backing, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            self.constructing.push(Resource::Buffer(source));
+            let result = self.copy_rows_to_image(source, 0, id, &dirty);
+            self.unpin(Resource::Buffer(source));
+            result?;
+        }
         let producer = self.device.work_ticket()?;
         let entry = self.images[id.slot].entry.as_mut().expect("image");
         entry.producer = Some(producer);
@@ -497,6 +585,79 @@ impl VulkanResidency {
             .ok_or(VulkanError::InvalidResource(
                 "image content version exhausted",
             ))?;
+        Ok(())
+    }
+    fn upload_cpu_image_rows(
+        &mut self,
+        id: ImageId,
+        plane: ImagePlane,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), VulkanError> {
+        debug_assert!(offset.is_multiple_of(plane.row_pitch));
+        debug_assert!((bytes.len() as u64).is_multiple_of(plane.row_pitch));
+        let rows = self.device.submission.configuration.arena_bytes / plane.row_pitch;
+        let chunk_bytes = (rows * plane.row_pitch) as usize;
+        for (chunk, bytes) in bytes.chunks(chunk_bytes).enumerate() {
+            let row = (offset + (chunk * chunk_bytes) as u64) / plane.row_pitch;
+            let y = row as u32 * plane.block_extent.height;
+            let height = (bytes.len() as u64 / plane.row_pitch) as u32 * plane.block_extent.height;
+            let height = height.min(plane.extent.height - y);
+            let (slot, slice) =
+                self.reserve_upload(bytes, u64::from(plane.bytes_per_block).max(4))?;
+            let (image, layout) = self.image_access_subresources(
+                id,
+                commands::plane_range(plane),
+                AccessScope::new(
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                ),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            )?;
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(slice.offset)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(plane.aspect)
+                        .mip_level(plane.mip_level)
+                        .base_array_layer(plane.array_layer)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D {
+                    x: 0,
+                    y: y as i32,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: plane.extent.width,
+                    height,
+                    depth: 1,
+                });
+            self.barriers.emit(&mut self.device);
+            unsafe {
+                self.device.owner.device.cmd_copy_buffer_to_image(
+                    self.device.submission.slots[slot].command,
+                    self.device.submission.slots[slot]
+                        .upload_buffer(slice)
+                        .handle,
+                    image,
+                    layout,
+                    &[region],
+                );
+            }
+            self.define_image_rect(
+                id,
+                plane,
+                vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: y as i32 },
+                    extent: vk::Extent2D {
+                        width: plane.extent.width,
+                        height,
+                    },
+                },
+            );
+            self.statistics.cpu_uploaded_bytes += bytes.len() as u64;
+        }
         Ok(())
     }
     fn copy_rows_to_image(

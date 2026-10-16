@@ -2857,30 +2857,7 @@ fn draw_scissor_region(
     width: u32,
     height: u32,
 ) -> Result<nixe_gpu::ScissorRect, MaxwellLoweringError> {
-    // Surface clip uses origin + extent; scissor uses half-open min/max.
-    // Both restrict window-space fragments, preserving vertex execution and
-    // shader-visible coordinates even when their intersection is empty.
-    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1386-L1392
-    // https://docs.rs/wgpu/30.0.1/wgpu/struct.RenderPass.html#method.set_scissor_rect
-    let mut region = MaxwellThreeDRasterRegion::attachment(width, height);
-    let horizontal = state.fixed_function().surface_clip_horizontal().value();
-    let vertical = state.fixed_function().surface_clip_vertical().value();
-    match (horizontal, vertical) {
-        (Some(horizontal), Some(vertical)) => {
-            region.min_x = u32::from(horizontal.origin()).min(width);
-            region.max_x =
-                (u32::from(horizontal.origin()) + u32::from(horizontal.extent())).min(width);
-            region.min_y = u32::from(vertical.origin()).min(height);
-            region.max_y =
-                (u32::from(vertical.origin()) + u32::from(vertical.extent())).min(height);
-        }
-        (None, None) => {}
-        _ => {
-            return Err(MaxwellLoweringError::IncompleteDraw(
-                "SET_SURFACE_CLIP_HORIZONTAL/VERTICAL",
-            ));
-        }
-    }
+    let mut region = draw_surface_region(state, width, height)?;
     let scissor = &state.fixed_function().scissor()[0];
     if scissor.enable().value() == Some(&true) {
         let mut scissor_y =
@@ -2909,12 +2886,38 @@ fn draw_scissor_region(
             scissor_y,
         );
     }
-    Ok(nixe_gpu::ScissorRect {
-        x: region.min_x.min(width),
-        y: region.min_y.min(height),
-        width: region.max_x.saturating_sub(region.min_x),
-        height: region.max_y.saturating_sub(region.min_y),
-    })
+    Ok(region.scissor(width, height))
+}
+
+fn draw_surface_region(
+    state: &MaxwellThreeDState,
+    width: u32,
+    height: u32,
+) -> Result<MaxwellThreeDRasterRegion, MaxwellLoweringError> {
+    // Surface clip uses origin + extent; scissor uses half-open min/max.
+    // Both restrict window-space fragments, preserving vertex execution and
+    // shader-visible coordinates even when their intersection is empty.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1386-L1392
+    let mut region = MaxwellThreeDRasterRegion::attachment(width, height);
+    let horizontal = state.fixed_function().surface_clip_horizontal().value();
+    let vertical = state.fixed_function().surface_clip_vertical().value();
+    match (horizontal, vertical) {
+        (Some(horizontal), Some(vertical)) => {
+            region.min_x = u32::from(horizontal.origin()).min(width);
+            region.max_x =
+                (u32::from(horizontal.origin()) + u32::from(horizontal.extent())).min(width);
+            region.min_y = u32::from(vertical.origin()).min(height);
+            region.max_y =
+                (u32::from(vertical.origin()) + u32::from(vertical.extent())).min(height);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(MaxwellLoweringError::IncompleteDraw(
+                "SET_SURFACE_CLIP_HORIZONTAL/VERTICAL",
+            ));
+        }
+    }
+    Ok(region)
 }
 
 fn lower_left_window_origin(state: &MaxwellThreeDState) -> bool {
@@ -3609,6 +3612,15 @@ struct MaxwellThreeDRasterRegion {
 }
 
 impl MaxwellThreeDRasterRegion {
+    fn scissor(self, width: u32, height: u32) -> nixe_gpu::ScissorRect {
+        nixe_gpu::ScissorRect {
+            x: self.min_x.min(width),
+            y: self.min_y.min(height),
+            width: self.max_x.saturating_sub(self.min_x),
+            height: self.max_y.saturating_sub(self.min_y),
+        }
+    }
+
     const fn attachment(width: u32, height: u32) -> Self {
         Self {
             min_x: 0,
@@ -5858,6 +5870,18 @@ mod tests {
         ));
         program_three_d(&mut channel, 0x0e04, (50 << 16) | 12);
         program_three_d(&mut channel, 0x0e08, (23 << 16) | 2);
+        assert_eq!(
+            super::draw_surface_region(channel.three_d(), 64, 32)
+                .unwrap()
+                .scissor(64, 32),
+            ScissorRect {
+                x: 5,
+                y: 7,
+                width: 40,
+                height: 20
+            },
+            "dynamic scissor must not change attachment load/store bounds"
+        );
         assert_eq!(
             super::draw_scissor_region(channel.three_d(), 64, 32).unwrap(),
             ScissorRect {

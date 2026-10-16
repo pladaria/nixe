@@ -967,7 +967,16 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                         };
                         let config =
                             nixe_applets::keyboard::KeyboardConfig::decode(common, args, work)
-                                .map_err(IpcWireError::Malformed)?;
+                                .map_err(|reason| {
+                                    let version = common.get(8..12).map(|bytes| {
+                                        u32::from_le_bytes(bytes.try_into().unwrap())
+                                    });
+                                    log::error!(
+                                        "software keyboard configuration rejected: {reason}; API version={version:x?}, storage sizes: common={:#x}, configuration={:#x}, work={:#x}",
+                                        common.len(), args.len(), work.len()
+                                    );
+                                    IpcWireError::Malformed(reason)
+                                })?;
                         log::debug!(
                             "software keyboard requested: kind={:?} length={}..{} text-check={} utf8={}",
                             config.kind,

@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::path::{Path, PathBuf};
 
 use nixe_loader_content::{
     ApplicationVersion, CnmtContentInfo, CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType,
@@ -111,6 +112,7 @@ pub struct PackageMetadata {
     /// Canonical binary metadata used to compare and resolve package revisions.
     canonical_content_meta: CnmtContentMeta,
     source_format: Option<PackageFormat>,
+    source_path: Option<PathBuf>,
 }
 
 impl PackageMetadata {
@@ -166,6 +168,7 @@ impl PackageMetadata {
             control_metadata: None,
             canonical_content_meta: content_meta.clone(),
             source_format: None,
+            source_path: None,
         })
     }
 
@@ -202,8 +205,14 @@ impl PackageMetadata {
         self.control_metadata = metadata;
     }
 
-    pub(crate) fn set_source_format(&mut self, format: PackageFormat) {
+    /// Returns the host package path, when loaded from a local file.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    pub(crate) fn set_source(&mut self, format: PackageFormat, path: &Path) {
         self.source_format = Some(format);
+        self.source_path = Some(path.to_owned());
     }
 
     /// Returns the patch title declared by an application package.

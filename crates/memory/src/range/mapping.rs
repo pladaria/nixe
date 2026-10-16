@@ -214,6 +214,61 @@ pub(super) enum ByteMapping {
     },
 }
 impl ByteMapping {
+    /// Read dense tiled snapshots in physical tile order. Expanding an image
+    /// into retained 16-byte segments adds allocation/reference-count work for
+    /// every fragment; each tile needs only one source read and bounded scratch.
+    pub(super) fn read_tiled_quiescent(
+        &self,
+        output: &mut [u8],
+    ) -> Result<bool, CanonicalRangeAccessError> {
+        let Self::Rect { source, layout } = self else {
+            return Ok(false);
+        };
+        let Some(tile) = &layout.tile else {
+            return Ok(false);
+        };
+        if layout.element_bytes != layout.source_element_bytes || layout.source_byte_offset != 0 {
+            return Ok(false);
+        }
+        let width = u64::from(layout.columns) * u64::from(layout.element_bytes);
+        let tile_width = u64::from(tile.width);
+        let tile_height = u64::from(tile.height);
+        let columns = width.div_ceil(tile_width);
+        let rows = u64::from(layout.rows).div_ceil(tile_height);
+        let tile_size = tile.offsets.len();
+        // Sparse planes/aspects retain exact reads; never gather arbitrarily
+        // large padding merely to snapshot a small logical view.
+        if width * u64::from(layout.rows) != output.len() as u64
+            || columns * rows * tile_size as u64 > (output.len() as u64).saturating_mul(2)
+        {
+            return Ok(false);
+        }
+        let mut bytes = vec![0; tile_size];
+        for tile_y in 0..rows {
+            let y = tile_y * tile_height;
+            let height = tile_height.min(u64::from(layout.rows) - y);
+            for tile_x in 0..columns {
+                let x = tile_x * tile_width;
+                let length = tile_width.min(width - x);
+                source.read_quiescent(
+                    layout.base + (tile_y * columns + tile_x) * tile_size as u64,
+                    &mut bytes,
+                )?;
+                for row in 0..height {
+                    let mut column = 0;
+                    while column < length {
+                        let cell = (row * tile_width + column) as usize;
+                        let count = u64::from(tile.contiguous[cell]).min(length - column) as usize;
+                        let from = tile.offsets[cell] as usize;
+                        let to = ((y + row) * width + x + column) as usize;
+                        output[to..to + count].copy_from_slice(&bytes[from..from + count]);
+                        column += count as u64;
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
     pub(super) fn snapshot(
         &self,
         offset: u64,
@@ -607,6 +662,71 @@ impl CanonicalBackingRange {
             _ => false,
         }
     }
+    /// Prove that two dense logical rectangles address the same physical bytes,
+    /// despite different logical row pitches or padded extents. This compares
+    /// retained address equations, never expanded pixels or current contents.
+    pub fn same_rectangular_bytes(
+        &self,
+        row_pitch: u64,
+        other: &Self,
+        other_row_pitch: u64,
+        row_bytes: u64,
+        rows: u32,
+    ) -> bool {
+        if rows == 0 || row_bytes == 0 || row_bytes > row_pitch || row_bytes > other_row_pitch {
+            return false;
+        }
+        let fits = |pitch: u64, size: u64| {
+            u64::from(rows - 1)
+                .checked_mul(pitch)
+                .and_then(|start| start.checked_add(row_bytes))
+                .is_some_and(|end| end <= size)
+        };
+        if !fits(row_pitch, self.size()) || !fits(other_row_pitch, other.size()) {
+            return false;
+        }
+        let (
+            Some(ByteMapping::Rect {
+                source: a,
+                layout: x,
+            }),
+            Some(ByteMapping::Rect {
+                source: b,
+                layout: y,
+            }),
+        ) = (&self.layout.mapping, &other.layout.mapping)
+        else {
+            return row_pitch == other_row_pitch && self.same_byte_mapping(other);
+        };
+        if row_pitch != u64::from(x.columns) * u64::from(x.element_bytes)
+            || other_row_pitch != u64::from(y.columns) * u64::from(y.element_bytes)
+            || rows > x.rows.min(y.rows)
+            || x.element_bytes != y.element_bytes
+            || x.source_element_bytes != y.source_element_bytes
+            || x.source_byte_offset != y.source_byte_offset
+            || x.base != y.base
+            || x.tile != y.tile
+        {
+            return false;
+        }
+        let same_stride = if let Some(tile) = &x.tile {
+            let tiles = |layout: &CanonicalByteLayout| {
+                (u64::from(layout.columns) * u64::from(layout.source_element_bytes))
+                    .div_ceil(u64::from(tile.width))
+            };
+            tiles(x) == tiles(y)
+        } else {
+            x.source_row_pitch == y.source_row_pitch
+        };
+        if !same_stride {
+            return false;
+        }
+        let size = a.size().min(b.size());
+        match (a.logical_view(0, size), b.logical_view(0, size)) {
+            (Ok(a), Ok(b)) => a.same_byte_mapping(&b),
+            _ => false,
+        }
+    }
     /// Retained topology size, without forcing expansion of mapped byte views.
     pub fn metadata_bytes(&self) -> usize {
         std::mem::size_of::<CanonicalRangeLayout>()
@@ -621,6 +741,113 @@ impl CanonicalBackingRange {
 mod tests {
     use super::*;
     use crate::{CanonicalAllocation, MemoryPermissions};
+    #[test]
+    fn dense_tiled_snapshots_read_tiles_without_expanding_byte_topology() {
+        let allocation = CanonicalAllocation::zeroed(16384, 256).unwrap();
+        let physical = (0..16384).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        allocation.write(0, &physical).unwrap();
+        let source = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        for offsets in [
+            (0..256).collect::<Vec<_>>(),
+            (0..256).map(|i| (i % 64) * 4 + i / 64).collect(),
+            (0..256).map(|i| i * 73 % 256).collect(),
+        ] {
+            let layout = CanonicalByteLayout {
+                base: 17,
+                columns: 57,
+                rows: 33,
+                element_bytes: 4,
+                source_element_bytes: 4,
+                source_byte_offset: 0,
+                source_row_pitch: 228,
+                tile: Some(CanonicalByteTile::new(64, 4, offsets).unwrap()),
+            };
+            let mut expected = (0..57 * 33 * 4)
+                .map(|i| physical[layout.address(i) as usize])
+                .collect::<Vec<_>>();
+            let mapped = CanonicalBackingRange::mapped(source.clone(), layout.clone()).unwrap();
+            let dependency = CanonicalCpuWriteDependency::capture(&mapped).unwrap();
+            let snapshot = dependency.snapshot_all(&mapped).unwrap();
+            assert_eq!(&*snapshot, expected);
+            assert!(mapped.layout.topology.get().is_none());
+            allocation
+                .write(layout.address(17) as usize, &[0xfe])
+                .unwrap();
+            expected[17] = 0xfe;
+            let snapshot = dependency.snapshot_all(&mapped).unwrap();
+            assert_eq!(&*snapshot, expected);
+            assert!(mapped.layout.topology.get().is_none());
+            allocation
+                .write(
+                    layout.address(17) as usize,
+                    &[physical[layout.address(17) as usize]],
+                )
+                .unwrap();
+        }
+    }
+    #[test]
+    fn rectangular_equivalence_preserves_pitch_tiles_and_physical_identity() {
+        let allocation = CanonicalAllocation::zeroed(4096, 256).unwrap();
+        allocation
+            .write(0, &(0..4096).map(|i| (i % 251) as u8).collect::<Vec<_>>())
+            .unwrap();
+        let whole = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let tile = CanonicalByteTile::new(64, 4, (0..256).map(|i| (i % 64) * 4 + i / 64).collect())
+            .unwrap();
+        for tile in [None, Some(tile)] {
+            let layout = CanonicalByteLayout {
+                base: 0,
+                columns: 19,
+                rows: 9,
+                element_bytes: 4,
+                source_element_bytes: 4,
+                source_byte_offset: 0,
+                source_row_pitch: 96,
+                tile,
+            };
+            let make = |layout| CanonicalBackingRange::mapped(whole.clone(), layout).unwrap();
+            let source = make(layout.clone());
+            let target_layout = CanonicalByteLayout {
+                columns: 17,
+                rows: 7,
+                ..layout.clone()
+            };
+            let target = make(target_layout.clone());
+            assert!(source.same_rectangular_bytes(76, &target, 68, 68, 7));
+            assert!(target.same_rectangular_bytes(68, &source, 76, 68, 7));
+            for row in 0..7 {
+                assert_eq!(
+                    source.snapshot_subrange(row * 76, 68).unwrap().segments(),
+                    target.snapshot_subrange(row * 68, 68).unwrap().segments()
+                );
+            }
+            for changed in [
+                CanonicalByteLayout {
+                    base: 64,
+                    ..target_layout.clone()
+                },
+                CanonicalByteLayout {
+                    source_byte_offset: 1,
+                    ..target_layout.clone()
+                },
+                CanonicalByteLayout {
+                    source_row_pitch: 160,
+                    columns: 33,
+                    ..target_layout.clone()
+                },
+            ] {
+                let pitch = u64::from(changed.columns) * 4;
+                assert!(!source.same_rectangular_bytes(76, &make(changed), pitch, 68, 7));
+            }
+            assert!(!source.same_rectangular_bytes(76, &target, 68, 68, 8));
+            assert!(!source.same_rectangular_bytes(76, &target, 68, 72, 7));
+        }
+        assert!(!whole.same_rectangular_bytes(16, &whole, 16, 16, 257));
+    }
     #[test]
     fn physical_page_overlap_is_conservative_and_independent_of_logical_order() {
         let allocation = CanonicalAllocation::zeroed(256, 64).unwrap();

@@ -524,6 +524,17 @@ impl VulkanResidency {
         push: &[u8],
         descriptors: Option<&mut DescriptorCache>,
     ) -> Result<WorkTicket, VulkanError> {
+        let result = self.record_draws_inner(prepared, draws, push, descriptors);
+        self.device.submission.release_stream_uploads();
+        result
+    }
+    fn record_draws_inner(
+        &mut self,
+        prepared: &PreparedDraw,
+        draws: &[Draw],
+        push: &[u8],
+        descriptors: Option<&mut DescriptorCache>,
+    ) -> Result<WorkTicket, VulkanError> {
         if draws.is_empty() {
             return Err(VulkanError::InvalidResource("empty draw group"));
         }

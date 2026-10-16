@@ -118,11 +118,12 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     })?;
     log::debug!("SD card host directory: {}", sd_card_root.display());
     let scan_started = Instant::now();
-    let library = Library::scan(&config)?;
+    let mut library = Library::scan(&config)?;
     log::debug!(
         "configured title library scanned in {:?}",
         scan_started.elapsed()
     );
+    library.prepare_for_launch(&identifier, &config.library)?;
     let title = library
         .find(&identifier)
         .ok_or_else(|| format!("unknown title ID or name: {identifier}"))?;
@@ -372,7 +373,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         frontend
     };
     let frontend =
-        frontend.with_screenshots(title.name.clone(), PathBuf::from("dump/screenshots/nixe"));
+        frontend.with_screenshots(title.name.clone(), config.filesystem.screenshots.clone());
 
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");

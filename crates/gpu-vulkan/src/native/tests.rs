@@ -123,6 +123,12 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             depth_stencil_format: None,
             samples: SampleCount::One,
             extent: [8, 8],
+            render_area: ScissorRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
             topology: PrimitiveTopology::Triangles,
             restart: false,
             provoking_first: false,
@@ -577,10 +583,102 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         .wait_for_completion_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
+    render_area_preserves_undefined_padding(&mut execution, &state);
     drop(pixels);
     execution.teardown().unwrap();
     drop(execution);
     monitor.check().unwrap();
+}
+
+fn render_area_preserves_undefined_padding(
+    execution: &mut NativeGpuExecution,
+    state: &Arc<GuestDrawState>,
+) {
+    let (_, backing) = backing_allocation(256, 256, 0x73);
+    let mut draw = (**state).clone();
+    draw.identity = PreparedStateId::new(100, 1);
+    draw.colors[0].planes = Arc::from([GuestImagePlane {
+        backing: backing.clone(),
+        ..draw.colors[0].planes[0].clone()
+    }]);
+    draw.colors[0].canonical_texels = false;
+    let parameters = Arc::make_mut(&mut draw.parameters);
+    parameters.identity = PreparedStateId::new(101, 1);
+    parameters.render_area = ScissorRect {
+        x: 1,
+        y: 1,
+        width: 5,
+        height: 4,
+    };
+    parameters.scissor = parameters.render_area;
+    parameters.scissor.width = 2;
+    let image = draw.colors[0].clone();
+    let area = parameters.render_area;
+    let arguments = DrawArguments::NonIndexed {
+        first_vertex: 0,
+        vertex_count: 3,
+        first_instance: 0,
+        instance_count: 1,
+    };
+    let first = NativeSubmission {
+        frontend: FrontendSubmissionId::new(100),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: false,
+        commands: vec![
+            NativeCommand::Clear {
+                image: image.clone(),
+                rectangle: area,
+                value: ClearValue::Color([0., 0., 1., 1.]),
+            },
+            NativeCommand::Draw {
+                state: Arc::new(draw.clone()),
+                arguments,
+            },
+        ],
+    };
+    let parameters = Arc::make_mut(&mut draw.parameters);
+    parameters.identity = PreparedStateId::new(102, 1);
+    parameters.scissor.x = 3;
+    draw.identity = PreparedStateId::new(103, 1);
+    let second = NativeSubmission {
+        frontend: FrontendSubmissionId::new(101),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: false,
+        commands: vec![NativeCommand::Draw {
+            state: Arc::new(draw),
+            arguments,
+        }],
+    };
+    let scopes = execution.recording_statistics().rendering_scopes;
+    for submission in [&first, &second] {
+        ready(execution, submission);
+        execution
+            .submit(ExecutionBatch {
+                commands: submission,
+                definitions: &[],
+                retirements: &[],
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        execution.recording_statistics().rendering_scopes - scopes,
+        1
+    );
+    // Both dynamic scissors share one scope. Neither the attachment's
+    // physical padding nor viewport coordinates change with the render area.
+    let bytes = cpu_read(&mut execution.residency, &backing);
+    for (index, pixel) in bytes.chunks_exact(4).enumerate() {
+        let (x, y) = (index % 8, index / 8);
+        if (1..6).contains(&x) && (1..5).contains(&y) {
+            if x == 5 {
+                assert_eq!(pixel, [0, 0, 255, 255]);
+            } else {
+                assert_eq!(pixel, [0, 255, 0, 255]);
+            }
+        } else {
+            assert_eq!(pixel, [0x73; 4]);
+        }
+    }
 }
 
 fn uniform_color_shader() -> Box<[ssa::Function]> {

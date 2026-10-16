@@ -33,7 +33,7 @@ pub struct NixeConfig {
     pub version: u32,
     /// Title-library locations and discovery behavior.
     pub library: LibraryConfig,
-    /// Host-backed filesystem locations exposed to the emulated system.
+    /// Host filesystem locations for guest storage and screenshots.
     pub filesystem: FileSystemConfig,
     /// System-wide preferences and caller-owned key location.
     pub system: SystemConfig,
@@ -91,10 +91,13 @@ impl NixeConfig {
                     .collect(),
                 recursive_scan: raw.library.recursive_scan,
                 follow_symlinks: raw.library.follow_symlinks,
+                convert_solid_to_blocks: raw.library.convert_solid_to_blocks,
+                keep_solid_backup: raw.library.keep_solid_backup,
             },
             filesystem: FileSystemConfig {
                 sd_card: resolve_path(base_directory, raw.filesystem.sd_card),
                 save_data: resolve_path(base_directory, raw.filesystem.save_data),
+                screenshots: resolve_path(base_directory, raw.filesystem.screenshots),
             },
             system: SystemConfig {
                 preferred_languages: raw.system.preferred_languages,
@@ -166,6 +169,10 @@ pub struct LibraryConfig {
     pub recursive_scan: bool,
     /// Whether discovery follows symbolic links to files and directories.
     pub follow_symlinks: bool,
+    /// Convert solid NCZ entries in the selected title's NSZ packages before launch.
+    pub convert_solid_to_blocks: bool,
+    /// Preserve converted packages' original files with a `.solid` suffix.
+    pub keep_solid_backup: bool,
 }
 
 impl LibraryConfig {
@@ -177,13 +184,15 @@ impl LibraryConfig {
     }
 }
 
-/// Host-backed filesystem locations exposed through Horizon services.
+/// Host filesystem locations for guest storage and application output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileSystemConfig {
     /// Directory exposed to the guest as the removable `sdmc:` filesystem.
     pub sd_card: PathBuf,
     /// Persistent application save-data volumes, isolated by application/user.
     pub save_data: PathBuf,
+    /// Directory for screenshots captured by the host frontend.
+    pub screenshots: PathBuf,
 }
 
 /// System-wide preferences shared by applications.
@@ -446,6 +455,10 @@ struct RawLibraryConfig {
     recursive_scan: bool,
     #[serde(default = "default_follow_symlinks")]
     follow_symlinks: bool,
+    #[serde(default = "default_true")]
+    convert_solid_to_blocks: bool,
+    #[serde(default = "default_true")]
+    keep_solid_backup: bool,
 }
 
 #[derive(Deserialize)]
@@ -455,6 +468,8 @@ struct RawFileSystemConfig {
     sd_card: PathBuf,
     #[serde(default = "default_save_data_path")]
     save_data: PathBuf,
+    #[serde(default = "default_screenshots_path")]
+    screenshots: PathBuf,
 }
 
 impl Default for RawFileSystemConfig {
@@ -462,6 +477,7 @@ impl Default for RawFileSystemConfig {
         Self {
             sd_card: default_sd_card_path(),
             save_data: default_save_data_path(),
+            screenshots: default_screenshots_path(),
         }
     }
 }
@@ -516,6 +532,10 @@ const fn default_follow_symlinks() -> bool {
     true
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 const fn default_recursive_scan() -> bool {
     true
 }
@@ -526,6 +546,10 @@ fn default_timezone() -> String {
 
 fn default_save_data_path() -> PathBuf {
     PathBuf::from("./storage/save")
+}
+
+fn default_screenshots_path() -> PathBuf {
+    PathBuf::from("./storage/screenshots")
 }
 
 fn default_sd_card_path() -> PathBuf {
@@ -777,9 +801,12 @@ mod tests {
                 paths = ["./roms", "other"]
                 recursive_scan = false
                 follow_symlinks = false
+                convert_solid_to_blocks = false
+                keep_solid_backup = false
                 [filesystem]
                 sd_card = "./custom-sd"
                 save_data = "./custom-save"
+                screenshots = "./custom-screenshots"
                 [system]
                 preferred_languages = ["Spanish", "AmericanEnglish"]
                 keys = "./keys"
@@ -797,8 +824,14 @@ mod tests {
         assert_eq!(config.library.paths[1], base.join("other"));
         assert!(!config.library.scan_options().recursive);
         assert!(!config.library.scan_options().follow_symlinks);
+        assert!(!config.library.convert_solid_to_blocks);
+        assert!(!config.library.keep_solid_backup);
         assert_eq!(config.filesystem.sd_card, base.join("./custom-sd"));
         assert_eq!(config.filesystem.save_data, base.join("./custom-save"));
+        assert_eq!(
+            config.filesystem.screenshots,
+            base.join("./custom-screenshots")
+        );
         assert_eq!(
             config.system.preferred_languages,
             vec![NacpLanguage::Spanish, NacpLanguage::AmericanEnglish]
@@ -910,6 +943,12 @@ mod tests {
         assert!(config.library.recursive_scan);
         assert!(config.library.follow_symlinks);
         assert!(config.library.scan_options().follow_symlinks);
+        assert!(config.library.convert_solid_to_blocks);
+        assert!(config.library.keep_solid_backup);
+        assert_eq!(
+            config.filesystem.screenshots,
+            file.path.parent().unwrap().join("./storage/screenshots")
+        );
         assert_eq!(
             config.filesystem.sd_card,
             file.path.parent().unwrap().join("./storage/sdmc")

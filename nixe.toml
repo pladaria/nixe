@@ -10,6 +10,12 @@ recursive_scan = true
 # Follow symbolic links to files and directories, skipping already visited directories.
 # Linked subdirectories are scanned only when recursive_scan is true.
 follow_symlinks = true
+# Before launch, convert solid NCZ entries in the selected title's NSZ packages
+# to independent 1 MiB blocks. The first conversion can take some time.
+convert_solid_to_blocks = true
+# Keep the original NSZ as <filename>.nsz.solid after a verified conversion.
+# When false, the converted NSZ replaces the original without retaining a backup.
+keep_solid_backup = true
 
 [filesystem]
 # Host directory exposed to the guest as the removable sdmc: filesystem.
@@ -17,6 +23,8 @@ follow_symlinks = true
 sd_card = "./storage/sdmc"
 # Persistent save volumes, isolated by application and user.
 save_data = "./storage/save"
+# Host screenshot directory; relative to this configuration file.
+screenshots = "./storage/screenshots"
 
 [system]
 dictionary = "assets/dict.toml"

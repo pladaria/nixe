@@ -43,7 +43,7 @@ pub use nca::{
 };
 pub use ncz::{NczArchive, NczBlockInfo, NczCompressionKind, NczLoader, NczSection};
 pub use nsp::{NspArchive, NspLoader};
-pub use nsz::{NszArchive, NszLoader};
+pub use nsz::{NszArchive, NszLoader, prepare_nsz_for_random_access};
 pub use pfs0::{Pfs0Archive, Pfs0Entry, Pfs0Loader};
 pub use romfs::{RomFsArchive, RomFsFile, RomFsLoader};
 pub use version::{

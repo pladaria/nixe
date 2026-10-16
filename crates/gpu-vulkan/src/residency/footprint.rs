@@ -5,6 +5,7 @@ use super::*;
 use rustc_hash::FxHashMap;
 struct PagePlan {
     page: CanonicalPageId,
+    slot: super::index::PageSlot,
     spans: Arc<Spans>,
     binding_revision: u64,
 }
@@ -122,6 +123,7 @@ impl VulkanResidency {
                     );
                     Some(PagePlan {
                         page: page.page,
+                        slot: page.slot,
                         spans,
                         binding_revision: 0,
                     })
@@ -132,6 +134,7 @@ impl VulkanResidency {
                 .pages()
                 .map(|page| PagePlan {
                     page: page.identity(),
+                    slot: self.index.pages.ensure(page.identity()),
                     binding_revision: 0,
                     spans: Arc::new(Spans::image(
                         backing.clone(),
@@ -231,11 +234,7 @@ impl VulkanResidency {
         // unchanged plans no longer walk/hash every physical page twice.
         let mut rebuild_aliases = plan.aliases.is_none();
         for p in plan.pages.iter_mut() {
-            let page = self
-                .index
-                .pages
-                .get_mut(&p.page)
-                .expect("indexed write plan");
+            let page = self.index.pages.at_mut(p.slot);
             rebuild_aliases |= p.binding_revision != page.revision;
             p.binding_revision = page.revision;
             page.record_image_write(source, &p.spans, point);
@@ -243,7 +242,7 @@ impl VulkanResidency {
         if rebuild_aliases {
             let mut aliases = FxHashMap::<Resource, Vec<(u64, u64)>>::default();
             for p in plan.pages.iter() {
-                let page = self.index.pages.get(&p.page).expect("indexed write plan");
+                let page = self.index.pages.at(p.slot);
                 for group in page.binding_groups() {
                     if (group.resource == source
                         && (Arc::ptr_eq(group.spans, &p.spans)

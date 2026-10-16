@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nixe_config::NixeConfig;
-use nixe_loader_content::{NacpLoader, NcaKeySet};
+use nixe_loader_content::{NacpLoader, NcaKeySet, prepare_nsz_for_random_access};
 use nixe_loader_executable::NroLoader;
 use nixe_loader_storage::{FileStorage, FormatLoader};
 use nixe_loader_title::{
@@ -113,10 +113,59 @@ impl Library {
 
     /// Finds a title by identifier first, then by its displayed name.
     pub fn find(&self, candidate: &str) -> Option<&LibraryTitle> {
+        self.title_index(candidate).map(|index| &self.titles[index])
+    }
+
+    /// Prepares only the selected title's NSZ packages before opening launch
+    /// content. Scanning and listing the library never modify its files.
+    pub fn prepare_for_launch(
+        &mut self,
+        candidate: &str,
+        config: &nixe_config::LibraryConfig,
+    ) -> Result<(), String> {
+        let index = self
+            .title_index(candidate)
+            .ok_or_else(|| format!("unknown title ID or name: {candidate}"))?;
+        if !config.convert_solid_to_blocks {
+            return Ok(());
+        }
+        let LibraryTitleSource::Installed(title) = &mut self.titles[index].source else {
+            return Ok(());
+        };
+        let mut sources = BTreeMap::new();
+        for package in std::iter::once(&mut title.base)
+            .chain(title.patch.iter_mut())
+            .chain(title.add_ons.iter_mut())
+        {
+            let Some(path) = package
+                .source_path()
+                .filter(|path| has_extension(path, "nsz"))
+            else {
+                continue;
+            };
+            let source = match sources.entry(path.to_owned()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    prepare_nsz_for_random_access(path, config.keep_solid_backup).map_err(
+                        |error| format!("cannot prepare {} for launch: {error}", path.display()),
+                    )?;
+                    // Another process may have completed the conversion while
+                    // this one waited. Always reopen the current path.
+                    let source: nixe_loader_storage::StorageRef =
+                        Arc::new(FileStorage::open(path).map_err(|error| error.to_string())?);
+                    entry.insert(source)
+                }
+            };
+            package.source = source.clone();
+        }
+        Ok(())
+    }
+
+    fn title_index(&self, candidate: &str) -> Option<usize> {
         self.titles
             .iter()
-            .find(|title| title.identifier.matches(candidate))
-            .or_else(|| self.titles.iter().find(|title| title.name == candidate))
+            .position(|title| title.identifier.matches(candidate))
+            .or_else(|| self.titles.iter().position(|title| title.name == candidate))
     }
 }
 
@@ -406,5 +455,7 @@ mod tests {
         assert!(is_package(Path::new("game.nSp")));
         assert!(has_extension(Path::new("homebrew.NRO"), "nro"));
         assert!(!is_package(Path::new("ignored.nro")));
+        assert!(!is_package(Path::new("game.nsz.solid")));
+        assert!(!is_package(Path::new("game.NSZ.solid")));
     }
 }

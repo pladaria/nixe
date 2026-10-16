@@ -188,5 +188,6 @@ mod tests {
         assert_eq!(package_format(Path::new("c.Xci")), Some(PackageFormat::Xci));
         assert_eq!(package_format(Path::new("d.xCZ")), Some(PackageFormat::Xcz));
         assert_eq!(package_format(Path::new("standalone.ncz")), None);
+        assert_eq!(package_format(Path::new("game.nsz.solid")), None);
     }
 }

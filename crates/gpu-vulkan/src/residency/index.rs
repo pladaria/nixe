@@ -269,9 +269,60 @@ impl Page {
         self.shared_writes.len()
     }
 }
+#[derive(Clone, Copy)]
+pub(super) struct PageSlot(usize);
+/// Canonical identities locate pages when bindings change. Retained image
+/// footprints use dense slots instead of hashing those identities on every draw.
+/// A slot remains live while any resource binds the page; its image write plans
+/// are destroyed with that binding before the slot can be recycled.
+#[derive(Default)]
+pub(super) struct Pages {
+    identities: FxHashMap<CanonicalPageId, PageSlot>,
+    slots: Vec<Page>,
+    free: Vec<usize>,
+}
+impl Pages {
+    pub fn ensure(&mut self, identity: CanonicalPageId) -> PageSlot {
+        *self.identities.entry(identity).or_insert_with(|| {
+            PageSlot(self.free.pop().unwrap_or_else(|| {
+                self.slots.push(Page::default());
+                self.slots.len() - 1
+            }))
+        })
+    }
+    pub fn get(&self, identity: &CanonicalPageId) -> Option<&Page> {
+        self.identities.get(identity).map(|slot| self.at(*slot))
+    }
+    pub fn get_mut(&mut self, identity: &CanonicalPageId) -> Option<&mut Page> {
+        let slot = *self.identities.get(identity)?;
+        Some(self.at_mut(slot))
+    }
+    pub fn at(&self, slot: PageSlot) -> &Page {
+        &self.slots[slot.0]
+    }
+    pub fn at_mut(&mut self, slot: PageSlot) -> &mut Page {
+        &mut self.slots[slot.0]
+    }
+    pub fn values(&self) -> impl Iterator<Item = &Page> {
+        self.identities.values().map(|slot| self.at(*slot))
+    }
+    fn remove(&mut self, identity: &CanonicalPageId) {
+        if let Some(slot) = self.identities.remove(identity) {
+            self.slots[slot.0] = Page::default();
+            self.free.push(slot.0);
+        }
+    }
+}
+#[cfg(test)]
+impl std::ops::Index<&CanonicalPageId> for Pages {
+    type Output = Page;
+    fn index(&self, identity: &CanonicalPageId) -> &Page {
+        self.get(identity).expect("indexed page")
+    }
+}
 #[derive(Default)]
 pub(super) struct CanonicalIndex {
-    pub pages: FxHashMap<CanonicalPageId, Page>,
+    pub pages: Pages,
 }
 impl CanonicalIndex {
     pub fn insert(&mut self, resource: Resource, range: &CanonicalBackingRange) {
@@ -318,7 +369,8 @@ impl CanonicalIndex {
         });
     }
     fn register(&mut self, page: CanonicalPageId) -> &mut Page {
-        let page = self.pages.entry(page).or_default();
+        let slot = self.pages.ensure(page);
+        let page = self.pages.at_mut(slot);
         page.revision = page
             .revision
             .checked_add(1)
@@ -471,6 +523,53 @@ mod tests {
             slot,
             generation: 1,
         })
+    }
+    #[test]
+    fn retained_page_slots_survive_rehash_and_release_only_after_last_binding() {
+        use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+        let allocation = CanonicalAllocation::zeroed(4096, 16).unwrap();
+        let backing = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let identities = backing.pages().map(|p| p.identity()).collect::<Vec<_>>();
+        let first = identities[0];
+        let mut index = CanonicalIndex::default();
+        index.insert_span(source(0), first, 0, 16, 0);
+        index.insert_span(source(1), first, 0, 16, 0);
+        let slot = index.pages.ensure(first);
+        for &id in &identities[1..] {
+            index.insert_span(source(2), id, 0, 16, 0);
+        }
+        assert_eq!(index.pages.at(slot).resources().count(), 2);
+        let first_range = backing.logical_view(0, 16).unwrap();
+        index.remove(source(0), &first_range);
+        assert_eq!(
+            index
+                .pages
+                .at(slot)
+                .resources()
+                .copied()
+                .collect::<Vec<_>>(),
+            [source(1)]
+        );
+        index.remove(source(1), &first_range);
+        assert!(index.pages.get(&first).is_none());
+        assert_eq!(index.pages.free, [slot.0]);
+        let capacity = index.pages.slots.len();
+        index.insert_span(source(3), first, 4, 8, 0);
+        assert_eq!(index.pages.ensure(first).0, slot.0);
+        assert_eq!(index.pages.slots.len(), capacity);
+        assert_eq!(
+            index
+                .pages
+                .at(slot)
+                .resources()
+                .copied()
+                .collect::<Vec<_>>(),
+            [source(3)]
+        );
+        assert_eq!(index.pages.at(slot).revision, 1);
+        assert!(!index.pages.at(slot).has_writes());
     }
     #[test]
     fn complete_producer_proof_rejects_holes_and_combines_adjacent_writers() {

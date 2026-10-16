@@ -155,6 +155,8 @@ impl VulkanResidency {
             let binding = (Arc::clone(&stream.buffer), stream.offset);
             self.statistics.cpu_stream_hits += 1;
             self.touch(Resource::Buffer(id));
+            let slot = self.device.submission.recording.expect("stream recording");
+            self.device.submission.retain_stream_upload(slot);
             return Ok(Some(binding));
         }
         // Descriptor records can outlive a submission. Restrict direct streams
@@ -194,6 +196,7 @@ impl VulkanResidency {
             .device
             .submission
             .reserve_upload_aligned(&bytes, alignment.max(4))?;
+        self.device.submission.retain_stream_upload(slot);
         let buffer = self.device.submission.slots[slot].upload_lease(slice);
         let work = self.device.work_ticket()?;
         let contents = self.contents_mut(Resource::Buffer(id));

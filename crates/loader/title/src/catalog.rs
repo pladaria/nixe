@@ -253,7 +253,7 @@ fn add_package_contents<C: PackageContent + ?Sized>(
                 });
             }
         };
-        package.set_source_format(source_format);
+        package.set_source(source_format, path);
         let control_metadata = load_control_metadata(contents, &content_meta, key_provider)
             .map_err(|source| TitleError::Package {
                 path: path.to_owned(),
